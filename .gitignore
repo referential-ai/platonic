@@ -1,4 +1,4 @@
 /target/
+.plato/
 events.jsonl
 plato.toml
-

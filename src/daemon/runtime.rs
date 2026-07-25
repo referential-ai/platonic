@@ -34,12 +34,25 @@ pub(super) struct DaemonRuntime {
 pub(super) struct RuntimeState {
     pub(super) runs: HashMap<String, Arc<RunRecord>>,
     shutdown_accepted: bool,
+    issue_prep_active: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum RunAdmissionError {
     ShuttingDown,
     SessionActive { run_id: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum IssuePrepAdmissionError {
+    ShuttingDown,
+    Active,
+}
+
+#[must_use]
+#[derive(Debug)]
+pub(super) struct IssuePrepReservation {
+    state: Arc<Mutex<RuntimeState>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,17 +96,35 @@ impl DaemonRuntime {
         Ok(())
     }
 
+    pub(super) fn reserve_issue_prep(
+        &self,
+    ) -> Result<IssuePrepReservation, IssuePrepAdmissionError> {
+        let mut state = self.state.lock().expect("runtime state lock poisoned");
+        if state.shutdown_accepted {
+            return Err(IssuePrepAdmissionError::ShuttingDown);
+        }
+        if state.issue_prep_active {
+            return Err(IssuePrepAdmissionError::Active);
+        }
+        state.issue_prep_active = true;
+        Ok(IssuePrepReservation {
+            state: self.state.clone(),
+        })
+    }
+
     pub(super) fn shutdown_if_idle(&self) -> ShutdownIfIdleDecision {
         let mut state = self.state.lock().expect("runtime state lock poisoned");
         if state.shutdown_accepted {
             return ShutdownIfIdleDecision::AlreadyShuttingDown;
         }
-        if state.runs.values().any(|record| {
-            matches!(
-                record.status().state,
-                RunStateName::Running | RunStateName::CancelRequested
-            )
-        }) {
+        if state.issue_prep_active
+            || state.runs.values().any(|record| {
+                matches!(
+                    record.status().state,
+                    RunStateName::Running | RunStateName::CancelRequested
+                )
+            })
+        {
             return ShutdownIfIdleDecision::RefusedActive;
         }
         state.shutdown_accepted = true;
@@ -118,6 +149,15 @@ impl DaemonRuntime {
         if let Some(barrier) = barrier {
             barrier.wait();
         }
+    }
+}
+
+impl Drop for IssuePrepReservation {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .expect("runtime state lock poisoned")
+            .issue_prep_active = false;
     }
 }
 
@@ -385,6 +425,81 @@ mod tests {
                     )
             ));
         }
+    }
+
+    #[test]
+    fn shutdown_and_issue_prep_admission_linearize() {
+        for _ in 0..256 {
+            let runtime = runtime();
+            let barrier = Arc::new(Barrier::new(3));
+            let admit_runtime = runtime.clone();
+            let admit_barrier = barrier.clone();
+            let admission = thread::spawn(move || {
+                admit_barrier.wait();
+                admit_runtime.reserve_issue_prep()
+            });
+            let shutdown_runtime = runtime.clone();
+            let shutdown_barrier = barrier.clone();
+            let shutdown = thread::spawn(move || {
+                shutdown_barrier.wait();
+                shutdown_runtime.shutdown_if_idle()
+            });
+
+            barrier.wait();
+            let admission = admission.join().unwrap();
+            let shutdown = shutdown.join().unwrap();
+            match (admission, shutdown) {
+                (Ok(reservation), ShutdownIfIdleDecision::RefusedActive) => drop(reservation),
+                (Err(IssuePrepAdmissionError::ShuttingDown), ShutdownIfIdleDecision::Shutdown) => {}
+                unexpected => panic!("issue-prep/shutdown race did not linearize: {unexpected:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn issue_prep_reservation_rejects_duplicates_and_releases() {
+        let runtime = runtime();
+        let reservation = runtime.reserve_issue_prep().unwrap();
+
+        assert!(matches!(
+            runtime.reserve_issue_prep(),
+            Err(IssuePrepAdmissionError::Active)
+        ));
+        assert_eq!(
+            runtime.shutdown_if_idle(),
+            ShutdownIfIdleDecision::RefusedActive
+        );
+
+        drop(reservation);
+        let later = runtime.reserve_issue_prep().unwrap();
+        drop(later);
+        assert_eq!(runtime.shutdown_if_idle(), ShutdownIfIdleDecision::Shutdown);
+        assert!(matches!(
+            runtime.reserve_issue_prep(),
+            Err(IssuePrepAdmissionError::ShuttingDown)
+        ));
+    }
+
+    #[test]
+    fn issue_prep_reservation_releases_on_success_and_error_paths() {
+        let success_runtime = runtime();
+        {
+            let _reservation = success_runtime.reserve_issue_prep().unwrap();
+        }
+        assert!(success_runtime.reserve_issue_prep().is_ok());
+
+        let failed_runtime = runtime();
+        let failed: Result<(), &'static str> = {
+            let _reservation = failed_runtime.reserve_issue_prep().unwrap();
+            Err("provider failed")
+        };
+        assert_eq!(failed, Err("provider failed"));
+        let later = failed_runtime.reserve_issue_prep().unwrap();
+        drop(later);
+        assert_eq!(
+            failed_runtime.shutdown_if_idle(),
+            ShutdownIfIdleDecision::Shutdown
+        );
     }
 
     #[test]

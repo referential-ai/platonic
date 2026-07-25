@@ -53,6 +53,16 @@ pub enum AppError {
     #[error("run did not finish: {0}")]
     RunFailed(String),
 
+    #[error("issue-prep artifact conflict: {0}")]
+    IssuePrepArtifactConflict(PathBuf),
+
+    #[error("issue-prep blocked at {stage}: {reasons}; see {run_dir}")]
+    IssuePrepBlocked {
+        stage: String,
+        reasons: String,
+        run_dir: PathBuf,
+    },
+
     #[error("daemon lock held at {path}: {owner}")]
     DaemonLockHeld { path: PathBuf, owner: String },
 

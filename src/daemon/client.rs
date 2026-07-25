@@ -3,9 +3,10 @@ use crate::{
     daemon::{
         protocol::{
             ApprovalDecideParams, CommandAcceptedResult, Envelope, EnvelopeKind,
-            EventsStreamParams, EventsStreamResult, HelloParams, HelloResult, MessageAppendParams,
-            PROTOCOL_VERSION, RunCancelParams, RunStartParams, RunStartResult, SessionSummary,
-            SessionsListResult, ShutdownIfIdleResult, TranscriptReadParams, TranscriptReadResult,
+            EventsStreamParams, EventsStreamResult, HelloParams, HelloResult, IssuePrepStartParams,
+            IssuePrepStartResult, MessageAppendParams, PROTOCOL_VERSION, RunCancelParams,
+            RunStartParams, RunStartResult, SessionSummary, SessionsListResult,
+            ShutdownIfIdleResult, TranscriptReadParams, TranscriptReadResult,
         },
         transport::{self, Stream},
     },
@@ -152,6 +153,17 @@ impl DaemonClient {
                 config_path,
                 wait: Some(wait),
             },
+        )
+    }
+
+    pub fn issue_prep_start(
+        &mut self,
+        input: String,
+        config_path: Option<String>,
+    ) -> AppResult<IssuePrepStartResult> {
+        self.request(
+            "issue-prep.start",
+            IssuePrepStartParams { input, config_path },
         )
     }
 
@@ -692,6 +704,56 @@ mod tests {
         assert_eq!(events.events.len(), 1);
         assert_eq!(tail.from_offset, 3);
         assert!(tail.events.is_empty());
+    }
+
+    #[test]
+    fn client_sends_issue_prep_start_request() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+
+            let request = read_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some("issue-prep.start"));
+            assert_eq!(
+                request.params,
+                Some(json!({
+                    "input": "rough issue",
+                    "config_path": "plato.toml"
+                }))
+            );
+            write_response(
+                &mut writer,
+                request.id,
+                "issue-prep.start",
+                json!({
+                    "run_dir": "/work/.plato/issue-prep/run_1",
+                    "outcome": {
+                        "status": "candidate",
+                        "markdown": "# Prepared issue"
+                    }
+                }),
+            );
+        });
+
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        let result = client
+            .issue_prep_start("rough issue".into(), Some("plato.toml".into()))
+            .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(
+            result,
+            IssuePrepStartResult {
+                run_dir: "/work/.plato/issue-prep/run_1".into(),
+                outcome: crate::daemon::protocol::IssuePrepResult::Candidate {
+                    markdown: "# Prepared issue".into()
+                }
+            }
+        );
     }
 
     #[test]

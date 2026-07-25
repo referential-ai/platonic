@@ -5,6 +5,7 @@ pub mod config;
 pub mod daemon;
 pub mod discord_gateway;
 pub mod error;
+pub mod issue_prep;
 pub mod ledger;
 pub mod model;
 pub mod paths;
@@ -22,4 +23,5 @@ pub use app::{
     RunOutcome, RunSession, new_run_id, new_session_id, run_question,
 };
 pub use error::{AppError, AppResult};
+pub use issue_prep::{IssuePrepOptions, IssuePrepOutcome, run_issue_prep};
 pub use replay::{replay_default_sqlite, replay_file, replay_sqlite, replay_sqlite_session};
