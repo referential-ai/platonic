@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use plato_agent::{
-    AppError, ApprovalMode, RunLedger, RunOptions, RunOutcome, RunSession,
+    AppError, ApprovalMode, IssuePrepOptions, IssuePrepOutcome, RunLedger, RunOptions, RunOutcome,
+    RunSession,
     daemon::{
         client::{DaemonClient, DaemonConnectionConfig},
         lock::ensure_workspace_unlocked,
@@ -10,12 +11,12 @@ use plato_agent::{
     ledger::{latest_default_sqlite_session_id, latest_sqlite_session_id},
     new_session_id,
     paths::default_sqlite,
-    replay_default_sqlite, replay_file, replay_sqlite, run_question,
+    replay_default_sqlite, replay_file, replay_sqlite, run_issue_prep, run_question,
     tui::{TuiOptions, run_tui},
 };
 use platonic_core::RunId;
 use std::{
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -82,6 +83,20 @@ enum Command {
         #[arg(value_name = "FILE")]
         file: Option<PathBuf>,
     },
+    /// Run the fixed, file-backed issue preparation pipeline.
+    IssuePrep {
+        #[command(subcommand)]
+        command: IssuePrepCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IssuePrepCommand {
+    /// Create a run from Markdown on stdin and process it.
+    Start {
+        #[arg(value_name = "RUN_DIR", help = "New artifact directory")]
+        run_dir: PathBuf,
+    },
 }
 
 fn main() {
@@ -97,10 +112,16 @@ fn run() -> plato_agent::AppResult<()> {
     if cli.tui {
         return run_tui_mode(cli, workspace_root);
     }
+    if matches!(&cli.command, Some(Command::IssuePrep { .. })) {
+        validate_issue_prep_cli(&cli)?;
+    }
     match cli.command {
         Some(Command::Replay { run, file }) => {
             let ledger = replay_ledger(cli.db, file, &workspace_root)?;
             write_replay_output(&mut io::stdout(), ledger, run.as_deref(), &workspace_root)
+        }
+        Some(Command::IssuePrep { command }) => {
+            run_issue_prep_cli(command, cli.config, workspace_root)
         }
         None => {
             let question = cli.question.join(" ");
@@ -120,6 +141,59 @@ fn run() -> plato_agent::AppResult<()> {
             })?;
             write_run_success_output(&mut io::stdout(), &mut io::stderr(), &outcome, &ledger)
         }
+    }
+}
+
+fn validate_issue_prep_cli(cli: &Cli) -> plato_agent::AppResult<()> {
+    if cli.events.is_some() || cli.db.is_some() || cli.yolo || cli.continue_session {
+        return Err(AppError::Config(
+            "plato issue-prep cannot be combined with --events, --db, --yolo, or -c".into(),
+        ));
+    }
+    if !cli.question.is_empty() {
+        return Err(AppError::Config(
+            "plato issue-prep cannot be combined with a question".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn run_issue_prep_cli(
+    command: IssuePrepCommand,
+    config_path: Option<PathBuf>,
+    workspace_root: PathBuf,
+) -> plato_agent::AppResult<()> {
+    let run_dir = match command {
+        IssuePrepCommand::Start { run_dir } => resolve_cli_path(run_dir, &workspace_root),
+    };
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    let outcome = run_issue_prep(IssuePrepOptions {
+        workspace_root,
+        config_path,
+        run_dir: run_dir.clone(),
+        input,
+    })?;
+    write_issue_prep_output(&mut io::stdout(), &mut io::stderr(), outcome, &run_dir)
+}
+
+fn write_issue_prep_output(
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    outcome: IssuePrepOutcome,
+    run_dir: &Path,
+) -> plato_agent::AppResult<()> {
+    match outcome {
+        IssuePrepOutcome::Candidate { markdown } => {
+            stdout.write_all(markdown.as_bytes())?;
+            writeln!(stderr, "run_dir: {}", run_dir.display())?;
+            Ok(())
+        }
+        IssuePrepOutcome::Blocked { stage, reasons } => Err(AppError::IssuePrepBlocked {
+            stage,
+            reasons: reasons.join("; "),
+            run_dir: run_dir.to_path_buf(),
+        }),
     }
 }
 
@@ -463,6 +537,96 @@ mod tests {
 
         assert_eq!(String::from_utf8(stdout).unwrap(), "done\n");
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn issue_prep_exposes_only_a_fresh_start_command() {
+        let cli = Cli::try_parse_from(["plato", "issue-prep", "start", "runs/123"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(Command::IssuePrep {
+                command: IssuePrepCommand::Start { run_dir },
+            }) if run_dir == Path::new("runs/123")
+        ));
+        assert!(Cli::try_parse_from(["plato", "issue-prep", "resume", "runs/123"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "plato",
+                "issue-prep",
+                "start",
+                "runs/123",
+                "--issue",
+                "referential-ai/plato-agent#123",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn issue_prep_rejects_one_shot_run_options() {
+        let cli =
+            Cli::try_parse_from(["plato", "--db", "issue-prep", "start", "runs/123"]).unwrap();
+
+        let error = validate_issue_prep_cli(&cli).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Config(message)
+                if message
+                    == "plato issue-prep cannot be combined with --events, --db, --yolo, or -c"
+        ));
+    }
+
+    #[test]
+    fn issue_prep_candidate_uses_stdout_and_reports_its_run_directory() {
+        let run_dir = Path::new("/tmp/issue-prep-123");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_issue_prep_output(
+            &mut stdout,
+            &mut stderr,
+            IssuePrepOutcome::Candidate {
+                markdown: "# Candidate\n".into(),
+            },
+            run_dir,
+        )
+        .unwrap();
+
+        assert_eq!(String::from_utf8(stdout).unwrap(), "# Candidate\n");
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "run_dir: /tmp/issue-prep-123\n"
+        );
+    }
+
+    #[test]
+    fn issue_prep_block_is_a_typed_error_without_stdout() {
+        let run_dir = Path::new("/tmp/issue-prep-123");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let error = write_issue_prep_output(
+            &mut stdout,
+            &mut stderr,
+            IssuePrepOutcome::Blocked {
+                stage: "review".into(),
+                reasons: vec!["proof is incomplete".into()],
+            },
+            run_dir,
+        )
+        .unwrap_err();
+
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        assert!(matches!(
+            error,
+            AppError::IssuePrepBlocked { stage, reasons, run_dir }
+                if stage == "review"
+                    && reasons == "proof is incomplete"
+                    && run_dir == Path::new("/tmp/issue-prep-123")
+        ));
     }
 
     #[test]

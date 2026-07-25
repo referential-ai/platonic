@@ -4,6 +4,7 @@ pub(crate) enum SlashCommandAction {
     Clear,
     Sessions,
     NewSession,
+    IssuePrep,
     Reconnect,
     Quit,
 }
@@ -35,6 +36,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "new",
         description: "start a fresh session",
         action: SlashCommandAction::NewSession,
+    },
+    SlashCommandSpec {
+        name: "issue-prep",
+        description: "prepare and review an issue",
+        action: SlashCommandAction::IssuePrep,
     },
     SlashCommandSpec {
         name: "reconnect",
@@ -74,7 +80,7 @@ pub(crate) fn has_slash_command_prefix(filter: &str) -> bool {
 pub(crate) fn footer_command_hint() -> String {
     SLASH_COMMANDS
         .iter()
-        .filter(|command| command.name != "exit")
+        .filter(|command| !matches!(command.name, "exit" | "issue-prep"))
         .map(|command| format!("/{}", command.name))
         .collect::<Vec<_>>()
         .join(" ")

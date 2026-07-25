@@ -3,18 +3,22 @@ use crate::{
     daemon::{
         protocol::{
             ApprovalDecideParams, ApprovalDecisionName, CommandAcceptedResult,
-            ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
-            ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED,
-            ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH, Envelope, EventsStreamParams,
-            EventsStreamResult, HelloParams, HelloResult, MessageAppendParams, RunCancelParams,
-            RunStartParams, RunStartResult, RunStateName, SessionSummary, SessionsListResult,
-            ShutdownIfIdleResult, ShutdownIfIdleResultName, TranscriptReadParams,
-            TranscriptReadResult, TypedRun, TypedTranscript, TypedTranscriptEntry, decode_request,
+            ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
+            ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
+            ERROR_SESSIONS_LIST_FAILED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH,
+            Envelope, EventsStreamParams, EventsStreamResult, HelloParams, HelloResult,
+            IssuePrepResult, IssuePrepStartParams, IssuePrepStartResult, MessageAppendParams,
+            RunCancelParams, RunStartParams, RunStartResult, RunStateName, SessionSummary,
+            SessionsListResult, ShutdownIfIdleResult, ShutdownIfIdleResultName,
+            TranscriptReadParams, TranscriptReadResult, TypedRun, TypedTranscript,
+            TypedTranscriptEntry, decode_request,
         },
         runtime::{
-            DaemonRuntime, RunAdmissionError, RunRecord, ShutdownIfIdleDecision, approval_handler,
+            DaemonRuntime, IssuePrepAdmissionError, RunAdmissionError, RunRecord,
+            ShutdownIfIdleDecision, approval_handler,
         },
     },
+    issue_prep::{IssuePrepOptions, IssuePrepOutcome, run_issue_prep},
     ledger::{SessionRunRecords, SqliteLedger},
     new_run_id, new_session_id,
     paths::DefaultSqlitePath,
@@ -48,6 +52,12 @@ fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
         Some("message.append") => {
             handle_with_params(runtime, request, "message.append", handle_message_append)
         }
+        Some("issue-prep.start") => handle_with_params(
+            runtime,
+            request,
+            "issue-prep.start",
+            handle_issue_prep_start,
+        ),
         Some("events.stream") => {
             handle_with_params(runtime, request, "events.stream", handle_events_stream)
         }
@@ -123,6 +133,7 @@ fn handle_hello(runtime: &DaemonRuntime, request: Envelope, params: HelloParams)
                 "hello".into(),
                 "run.start".into(),
                 "message.append".into(),
+                "issue-prep.start".into(),
                 "events.stream".into(),
                 "approval.decide".into(),
                 "run.cancel".into(),
@@ -188,6 +199,73 @@ fn handle_message_append(
         params.config_path,
         params.wait,
     )
+}
+
+fn handle_issue_prep_start(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: IssuePrepStartParams,
+) -> Envelope {
+    let _reservation = match runtime.reserve_issue_prep() {
+        Ok(reservation) => reservation,
+        Err(IssuePrepAdmissionError::ShuttingDown) => {
+            return shutting_down_response(request.id, "issue-prep.start");
+        }
+        Err(IssuePrepAdmissionError::Active) => {
+            return Envelope::error(
+                request.id,
+                Some("issue-prep.start".into()),
+                ERROR_OVERLOAD,
+                "issue prep is already active",
+            );
+        }
+    };
+    let run_id = match new_run_id() {
+        Ok(run_id) => run_id,
+        Err(error) => {
+            return Envelope::error(
+                request.id,
+                Some("issue-prep.start".into()),
+                ERROR_ISSUE_PREP_FAILED,
+                error.to_string(),
+            );
+        }
+    };
+    let run_dir = runtime
+        .paths
+        .workspace_root
+        .join(".plato")
+        .join("issue-prep")
+        .join(run_id.to_string());
+    let options = IssuePrepOptions {
+        workspace_root: runtime.paths.workspace_root.clone(),
+        config_path: params.config_path.map(PathBuf::from),
+        run_dir: run_dir.clone(),
+        input: params.input,
+    };
+    match run_issue_prep(options) {
+        Ok(outcome) => Envelope::response_from(
+            request.id,
+            Some("issue-prep.start".into()),
+            IssuePrepStartResult {
+                run_dir: run_dir.to_string_lossy().into_owned(),
+                outcome: match outcome {
+                    IssuePrepOutcome::Candidate { markdown } => {
+                        IssuePrepResult::Candidate { markdown }
+                    }
+                    IssuePrepOutcome::Blocked { stage, reasons } => {
+                        IssuePrepResult::Blocked { stage, reasons }
+                    }
+                },
+            },
+        ),
+        Err(error) => Envelope::error(
+            request.id,
+            Some("issue-prep.start".into()),
+            ERROR_ISSUE_PREP_FAILED,
+            format!("{error}; run directory: {}", run_dir.display()),
+        ),
+    }
 }
 
 fn start_run(

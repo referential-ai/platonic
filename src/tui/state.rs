@@ -1,4 +1,5 @@
 use crate::daemon::protocol::{HelloResult, RunStateName, SessionSummary, TranscriptReadResult};
+use std::time::Instant;
 
 use super::ApprovalModalView;
 
@@ -21,6 +22,7 @@ pub struct TuiState {
     pub slash_popup: Option<SlashPopupView>,
     pub session_picker: Option<SessionPickerView>,
     pub queued_messages: Vec<String>,
+    pub issue_prep_started_at: Option<Instant>,
     pub input_history: Vec<String>,
     pub history_index: Option<usize>,
     pub status_message: Option<String>,
@@ -81,6 +83,7 @@ impl TuiState {
             slash_popup: None,
             session_picker: None,
             queued_messages: Vec::new(),
+            issue_prep_started_at: None,
             input_history: Vec::new(),
             history_index: None,
             status_message: None,
