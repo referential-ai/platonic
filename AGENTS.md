@@ -18,6 +18,7 @@ technical identities remain unchanged.
 - Link every PR to its issue and include verification commands or manual proof.
 - A PR changing user-visible behavior must update `README.md` or `docs/QUICKSTART.md` in the same PR.
 - Merge authority follows the workspace-root `AGENTS.md`; CI must be green and every issue- or PR-specific review and proof gate must be satisfied.
+- The workspace-root [Simplicity Directive](https://github.com/referential-ai/platonic-workspace/blob/main/AGENTS.md#simplicity-directive) is binding: every changed line must serve named acceptance; stop before scope widens.
 - Do not use local TODOs, wiki pages, tmux pane names, or chat history as active-work authority.
 - Do not start implementation unless a GitHub issue or direct human task has clear scope, non-goals, acceptance, target surface, and proof.
 
