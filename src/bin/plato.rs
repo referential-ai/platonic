@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use plato_agent::{
     AppError, ApprovalMode, IssuePrepOptions, IssuePrepOutcome, RunLedger, RunOptions, RunOutcome,
-    RunSession,
+    RunOverrides, RunSession,
     daemon::{
         client::{DaemonClient, DaemonConnectionConfig},
         lock::ensure_workspace_unlocked,
@@ -130,6 +130,7 @@ fn run() -> plato_agent::AppResult<()> {
             let outcome = run_question(RunOptions {
                 question,
                 config_path: cli.config,
+                overrides: RunOverrides::default(),
                 ledger: ledger.clone(),
                 workspace_root,
                 approval_mode: ApprovalMode::from_yolo(cli.yolo),

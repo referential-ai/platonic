@@ -2,7 +2,10 @@ use crate::{
     AppError, AppResult,
     config::{Config, ProviderKind},
     ledger::{EventRecorder, SessionTurn, SqliteLedger},
-    model::{ModelBlock, ModelMessage, ModelRequest, ModelResponse, ModelStop, system_prompt},
+    model::{
+        ModelBlock, ModelMessage, ModelRequest, ModelResponse, ModelStop, RunOverrides,
+        system_prompt,
+    },
     paths::DefaultSqlitePath,
     provider::openai_compat::{OpenAiCompatibleClient, TokenLimitField},
     tool_catalog::{SHELL_EXEC, ToolSpec, effect_for_tool, tool_specs},
@@ -33,6 +36,7 @@ use std::{
 pub struct RunOptions {
     pub question: String,
     pub config_path: Option<PathBuf>,
+    pub overrides: RunOverrides,
     pub ledger: RunLedger,
     pub workspace_root: PathBuf,
     pub approval_mode: ApprovalMode,
@@ -300,7 +304,10 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         return Err(AppError::EmptyQuestion);
     }
 
-    let config = Config::load(&options.workspace_root, options.config_path.as_deref())?;
+    let mut config = Config::load(&options.workspace_root, options.config_path.as_deref())?;
+    if let Some(model) = &options.overrides.model {
+        config.provider.model = model.clone();
+    }
     let run_id = match options.run_id.clone() {
         Some(run_id) => run_id,
         None => new_run_id()?,
@@ -369,6 +376,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             model: config.provider.model.clone(),
             system: system_prompt().into(),
             max_output_tokens: config.limits.max_output_tokens,
+            reasoning_effort: options.overrides.reasoning_effort,
             messages: messages.clone(),
             tools: tools.clone(),
         };
@@ -1413,6 +1421,7 @@ base_url = "http://{}"
                 run_question(RunOptions {
                     question: "hello".into(),
                     config_path: None,
+                    overrides: RunOverrides::default(),
                     ledger: RunLedger::Jsonl(workspace.path().join("events.jsonl")),
                     workspace_root: workspace.path().to_path_buf(),
                     approval_mode: ApprovalMode::Deny { actor: "test" },
@@ -1614,6 +1623,7 @@ enabled = ["file.write"]
         let outcome = run_question(RunOptions {
             question: "write twice".into(),
             config_path: Some(config_path),
+            overrides: RunOverrides::default(),
             ledger: RunLedger::Jsonl(ledger_path.clone()),
             workspace_root: dir.path().to_path_buf(),
             approval_mode: ApprovalMode::external("test", move |request| {
@@ -1777,6 +1787,7 @@ enabled = ["file.write"]
         let outcome = run_question(RunOptions {
             question: "write twice".into(),
             config_path: Some(config_path),
+            overrides: RunOverrides::default(),
             ledger: RunLedger::Jsonl(ledger_path.clone()),
             workspace_root: dir.path().to_path_buf(),
             approval_mode: ApprovalMode::AutoApprove,
@@ -1938,6 +1949,7 @@ enabled = ["file.read"]
         let outcome = run_question(RunOptions {
             question: "read twice".into(),
             config_path: Some(config_path),
+            overrides: RunOverrides::default(),
             ledger: RunLedger::Jsonl(ledger_path.clone()),
             workspace_root: dir.path().to_path_buf(),
             approval_mode: ApprovalMode::Deny { actor: "test" },
@@ -2044,6 +2056,7 @@ enabled = ["file.write"]
         let error = run_question(RunOptions {
             question: "write twice".into(),
             config_path: Some(config_path),
+            overrides: RunOverrides::default(),
             ledger: RunLedger::Jsonl(ledger_path.clone()),
             workspace_root: dir.path().to_path_buf(),
             approval_mode: ApprovalMode::AutoApprove,
@@ -2136,6 +2149,7 @@ enabled = ["file.read"]
         let outcome = run_question(RunOptions {
             question: "read payload.txt".into(),
             config_path: Some(config_path),
+            overrides: RunOverrides::default(),
             ledger: RunLedger::Jsonl(ledger_path.clone()),
             workspace_root: dir.path().to_path_buf(),
             approval_mode: ApprovalMode::Deny { actor: "test" },
@@ -2229,6 +2243,7 @@ enabled = ["file.read"]
         let outcome = run_question(RunOptions {
             question: "say hello".into(),
             config_path: Some(config_path),
+            overrides: RunOverrides::default(),
             ledger: RunLedger::Jsonl(ledger_path.clone()),
             workspace_root: dir.path().to_path_buf(),
             approval_mode: ApprovalMode::Deny { actor: "test" },
@@ -2313,6 +2328,7 @@ enabled = ["file.read"]
         let options = RunOptions {
             question: "hello".into(),
             config_path: None,
+            overrides: RunOverrides::default(),
             ledger: RunLedger::Sqlite(ledger_path.clone()),
             workspace_root: dir.path().to_path_buf(),
             approval_mode: ApprovalMode::Deny { actor: "test" },
@@ -2392,6 +2408,7 @@ enabled = ["file.read"]
             run_question(RunOptions {
                 question: "say hello".into(),
                 config_path: Some(run_config_path),
+                overrides: RunOverrides::default(),
                 ledger: RunLedger::Sqlite(run_ledger_path),
                 workspace_root,
                 approval_mode: ApprovalMode::Deny { actor: "test" },
@@ -2474,6 +2491,7 @@ enabled = ["file.read"]
         RunOptions {
             question: "hello".into(),
             config_path: Some(config_path.to_path_buf()),
+            overrides: RunOverrides::default(),
             ledger,
             workspace_root,
             approval_mode: ApprovalMode::Deny { actor: "test" },

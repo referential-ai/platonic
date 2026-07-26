@@ -24,4 +24,5 @@ pub use app::{
 };
 pub use error::{AppError, AppResult};
 pub use issue_prep::{IssuePrepOptions, IssuePrepOutcome, run_issue_prep};
+pub use model::{ReasoningEffort, RunOverrides};
 pub use replay::{replay_default_sqlite, replay_file, replay_sqlite, replay_sqlite_session};
