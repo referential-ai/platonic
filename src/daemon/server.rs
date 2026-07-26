@@ -331,10 +331,10 @@ mod tests {
         daemon::{
             client::DaemonClient,
             protocol::{
-                ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
-                ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED,
-                ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind, ProtocolError, RunStateName,
-                ShutdownIfIdleResultName,
+                ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
+                ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
+                ERROR_SESSIONS_LIST_FAILED, ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind,
+                ProtocolError, RunStateName, ShutdownIfIdleResultName,
             },
             runtime::{MAX_EVENT_BUFFER, PendingApproval, RunRecord},
         },
@@ -503,6 +503,7 @@ mod tests {
                 "hello",
                 "run.start",
                 "message.append",
+                "issue-prep.start",
                 "events.stream",
                 "approval.decide",
                 "run.cancel",
@@ -548,6 +549,7 @@ mod tests {
             r#"{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{"question":"hello"}}"#,
             r#"{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{"message":"hello"}}"#,
             r#"{"v":1,"id":"append_2","kind":"request","method":"message.append","params":{"session_id":"session_1","message":"hello"}}"#,
+            r#"{"v":1,"id":"issue_prep_1","kind":"request","method":"issue-prep.start","params":{"input":"rough issue"}}"#,
         ] {
             let response = server.handle_line(request);
             assert_eq!(response.kind, EnvelopeKind::Error);
@@ -1162,6 +1164,42 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         assert_eq!(response.kind, EnvelopeKind::Error);
         assert_eq!(error.code, ERROR_MALFORMED_REQUEST);
+    }
+
+    #[test]
+    fn issue_prep_reports_validation_failure_and_run_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let config_path = workspace.path().join("test-plato.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let request = serde_json::to_string(&json!({
+            "v": 1,
+            "id": "issue_prep_1",
+            "kind": "request",
+            "method": "issue-prep.start",
+            "params": {
+                "input": "",
+                "config_path": config_path
+            }
+        }))
+        .unwrap();
+
+        let response = server.handle_line(&request);
+        let error = response.error.unwrap();
+
+        assert_eq!(response.kind, EnvelopeKind::Error);
+        assert_eq!(error.code, ERROR_ISSUE_PREP_FAILED);
+        assert!(error.message.contains("input must not be empty"));
+        assert!(error.message.contains(".plato/issue-prep/run_"));
+        assert!(!workspace.path().join(".plato").exists());
+
+        let shutdown = server.handle_line(
+            r#"{"v":1,"id":"shutdown","kind":"request","method":"daemon.shutdown_if_idle"}"#,
+        );
+        assert_eq!(shutdown.kind, EnvelopeKind::Response);
+        assert_eq!(shutdown.result.unwrap(), json!({"result": "shutdown"}));
     }
 
     #[test]

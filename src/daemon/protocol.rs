@@ -9,6 +9,7 @@ pub const ERROR_DAEMON_SHUTTING_DOWN: &str = "daemon_shutting_down";
 pub const ERROR_MALFORMED_REQUEST: &str = "malformed_request";
 pub const ERROR_LAGGED: &str = "lagged";
 pub const ERROR_INTERNAL: &str = "internal_error";
+pub const ERROR_ISSUE_PREP_FAILED: &str = "issue_prep_failed";
 pub const ERROR_NOT_FOUND: &str = "not_found";
 pub const ERROR_OVERLOAD: &str = "overload";
 pub const ERROR_RUN_FAILED: &str = "run_failed";
@@ -169,6 +170,27 @@ pub struct MessageAppendParams {
     pub config_path: Option<String>,
     #[serde(default)]
     pub wait: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuePrepStartParams {
+    pub input: String,
+    #[serde(default)]
+    pub config_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IssuePrepStartResult {
+    pub run_dir: String,
+    pub outcome: IssuePrepResult,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum IssuePrepResult {
+    Candidate { markdown: String },
+    Blocked { stage: String, reasons: Vec<String> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -392,6 +414,35 @@ mod tests {
                 state
             );
         }
+    }
+
+    #[test]
+    fn issue_prep_result_keeps_typed_wire_shape() {
+        let result = IssuePrepStartResult {
+            run_dir: "/work/.plato/issue-prep/run_1".into(),
+            outcome: IssuePrepResult::Blocked {
+                stage: "review".into(),
+                reasons: vec!["acceptance is not testable".into()],
+            },
+        };
+
+        let wire = serde_json::to_value(&result).unwrap();
+
+        assert_eq!(
+            wire,
+            json!({
+                "run_dir": "/work/.plato/issue-prep/run_1",
+                "outcome": {
+                    "status": "blocked",
+                    "stage": "review",
+                    "reasons": ["acceptance is not testable"]
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<IssuePrepStartResult>(wire).unwrap(),
+            result
+        );
     }
 
     #[test]

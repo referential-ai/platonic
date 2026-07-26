@@ -25,6 +25,7 @@ The bootstrap surface is intentionally small:
 - `plato replay <file>` validates and prints a deterministic JSONL readback without network calls or tool execution.
 - `plato replay [--run <id>]` replays the default SQLite ledger; omitted `--run` selects the latest session.
 - `plato replay --db[=<path>] [--run <id>]` replays an explicit SQLite ledger.
+- `plato issue-prep start <run-dir>` runs the fixed issue preparation pipeline from Markdown on stdin.
 
 ## Configuration
 
@@ -76,6 +77,47 @@ Use `--yolo` to auto-approve enabled workspace-write tools that would otherwise
 prompt. Yolo mode does not enable disabled or unknown tools, approve network
 tools, permit deny-class effects such as external side effects or secret access,
 approve `shell.exec`, or bypass workspace path checks.
+
+## Issue Preparation
+
+Issue preparation is one fixed pipeline: prepare, refine, then model review.
+Each stage writes its prompt, reads that file for the model request, records the
+result, and writes a hash-bound validation record. Rust enforces response shape
+and structural invariants; the final review is model-authored and is not
+independent semantic proof. There are no tools, retries, loops, or configurable
+nodes.
+
+```bash
+cat issue.md | cargo run --bin plato -- issue-prep start \
+  .plato/issue-prep/issue-123
+```
+
+From the TUI, submit `/issue-prep <rough issue>`. The daemon runs the same
+pipeline and returns the candidate or blocked reasons in the transcript.
+An animated elapsed indicator remains visible while it runs. Artifacts are
+written under `.plato/issue-prep/<run_id>/`.
+
+`start` requires a new run directory. A failed run remains unchanged; retry
+with a different directory. A successful candidate is written to stdout and
+`40-candidate.md`. A structurally blocked stage or model review with findings
+exits nonzero and leaves its reasons in the stage validation file.
+
+Every run uses this exact convention:
+
+```text
+00-manifest.json
+01-input.md
+10-prepare.prompt.md
+11-prepare.result.json
+12-prepare.validation.json
+20-refine.prompt.md
+21-refine.result.json
+22-refine.validation.json
+30-review.prompt.md
+31-review.result.json
+32-review.validation.json
+40-candidate.md
+```
 
 ## SQLite Ledgers
 
@@ -376,6 +418,9 @@ Keys:
 - `/sessions`: open the session picker. `Enter` resumes the focused session;
   `Esc` closes the picker.
 - `/new`: clear the selected session so the next submitted message starts fresh.
+- `/issue-prep <rough issue>`: prepare and review an implementation issue.
+  It is unavailable while another run or issue-prep command is active, and the
+  TUI waits for it before exiting.
 - `g` / `d`: grant or deny the focused approval request.
 - `Ctrl-C`: request `run.cancel` for the active run; a second `Ctrl-C` exits the
   TUI. Exiting the TUI does not stop the daemon.

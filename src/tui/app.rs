@@ -3,7 +3,8 @@ use crate::{
     daemon::client::{DaemonClient, DaemonConnectionConfig},
     daemon::protocol::{
         CommandAcceptedResult, ERROR_LAGGED, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
-        ERROR_WORKSPACE_MISMATCH, EventsStreamResult, RunStartResult, RunStateName,
+        ERROR_WORKSPACE_MISMATCH, EventsStreamResult, IssuePrepResult, IssuePrepStartResult,
+        RunStartResult, RunStateName,
     },
     tui::{ActiveRunView, TranscriptState, TranscriptView, TuiState, render, render_snapshot},
 };
@@ -110,6 +111,10 @@ fn handle_key_press(
     config_path: Option<String>,
 ) -> bool {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if state.issue_prep_started_at.is_some() {
+            state.status_message = Some("issue prep is still running".into());
+            return true;
+        }
         return request_cancel(commands, state);
     }
 
@@ -202,12 +207,12 @@ fn handle_key_press(
     }
 
     match key.code {
-        KeyCode::Esc => false,
+        KeyCode::Esc => handle_exit_request(state),
         KeyCode::Char('?') if state.composer.is_empty() => {
             state.help_visible = true;
             true
         }
-        KeyCode::Char('q') if state.composer.is_empty() => false,
+        KeyCode::Char('q') if state.composer.is_empty() => handle_exit_request(state),
         KeyCode::Char('r') if is_disconnected(state) => {
             reconnect(commands, state, initial_run_id);
             true
@@ -519,7 +524,15 @@ fn dispatch_selected_slash_command(
     let message = format!("/{}", command.name);
     record_input_history(state, &message);
     clear_composer(state);
-    dispatch_slash_command(commands, state, command.action, &message, initial_run_id)
+    dispatch_slash_command(
+        commands,
+        state,
+        command.action,
+        &message,
+        initial_run_id,
+        runtime,
+        config_path,
+    )
 }
 
 fn sync_slash_popup(state: &mut TuiState) {
@@ -1017,6 +1030,10 @@ enum ClientCommand {
         session_id: String,
         config_path: Option<String>,
     },
+    IssuePrepStart {
+        input: String,
+        config_path: Option<String>,
+    },
     PollEvents {
         run_id: String,
         from_offset: Option<u64>,
@@ -1039,6 +1056,7 @@ enum ClientCommand {
 enum ClientEvent {
     Loaded(Box<TuiState>),
     RunStarted(RunStartResult),
+    IssuePrepFinished(IssuePrepStartResult),
     EventsPolled(EventsStreamResult),
     ApprovalDecided(CommandAcceptedResult),
     RunCanceled(CommandAcceptedResult),
@@ -1087,6 +1105,12 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             client.message_append_to_session(message, Some(session_id), config_path, false)
         })
         .map_or_else(failed_event("message.append"), ClientEvent::RunStarted),
+        ClientCommand::IssuePrepStart { input, config_path } => {
+            with_client(config, |client| client.issue_prep_start(input, config_path)).map_or_else(
+                failed_event("issue-prep.start"),
+                ClientEvent::IssuePrepFinished,
+            )
+        }
         ClientCommand::PollEvents {
             run_id,
             from_offset,
@@ -1150,6 +1174,49 @@ fn drain_client_events(
             ClientEvent::RunStarted(result) => {
                 apply_run_response(state, runtime, result, "run started")
             }
+            ClientEvent::IssuePrepFinished(result) => {
+                state.issue_prep_started_at = None;
+                match result.outcome {
+                    IssuePrepResult::Candidate { markdown } => {
+                        push_live_event(
+                            state,
+                            crate::tui::LiveEventLine::assistant(None, markdown),
+                        );
+                        push_live_event(
+                            state,
+                            crate::tui::LiveEventLine::status(
+                                None,
+                                format!("issue-prep artifacts: {}", result.run_dir),
+                            ),
+                        );
+                        state.status_message =
+                            Some(format!("issue ready; artifacts: {}", result.run_dir));
+                    }
+                    IssuePrepResult::Blocked { stage, reasons } => {
+                        let reason_text = if reasons.is_empty() {
+                            String::new()
+                        } else {
+                            format!(":\n- {}", reasons.join("\n- "))
+                        };
+                        push_live_event(
+                            state,
+                            crate::tui::LiveEventLine::warning(
+                                None,
+                                format!(
+                                    "issue prep blocked at {stage}{reason_text}\nartifacts: {}",
+                                    result.run_dir
+                                ),
+                            ),
+                        );
+                        state.status_message = Some(format!(
+                            "issue prep blocked at {stage}; artifacts: {}",
+                            result.run_dir
+                        ));
+                    }
+                }
+                state.scroll_offset = 0;
+                start_next_queued(commands, state, runtime);
+            }
             ClientEvent::EventsPolled(result) => {
                 apply_events_result(state, runtime, commands, result)
             }
@@ -1174,6 +1241,7 @@ fn drain_client_events(
             }
             ClientEvent::Failed { context, error } => {
                 runtime.poll_in_flight = false;
+                let connection_error = is_connection_error(&error);
                 let lagged = matches!(
                     &error,
                     AppError::DaemonResponse(error) if error.code == ERROR_LAGGED
@@ -1191,7 +1259,7 @@ fn drain_client_events(
                 } else if context == "events.stream" && overloaded {
                     state.stream_warning = Some(message);
                 } else {
-                    if is_connection_error(&error) {
+                    if connection_error {
                         runtime.polling = false;
                         state.connection = crate::tui::ConnectionState::Disconnected {
                             error: message.clone(),
@@ -1200,7 +1268,15 @@ fn drain_client_events(
                     if context == "run.cancel" {
                         state.cancel_requested = false;
                     }
-                    state.status_message = Some(format!("{context} failed: {message}"));
+                    let failure = format!("{context} failed: {message}");
+                    state.status_message = Some(failure.clone());
+                    if context == "issue-prep.start" {
+                        state.issue_prep_started_at = None;
+                        push_live_event(state, crate::tui::LiveEventLine::warning(None, failure));
+                        if !connection_error {
+                            start_next_queued(commands, state, runtime);
+                        }
+                    }
                 }
             }
         }
@@ -1213,6 +1289,7 @@ fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
     loaded.composer_kill_buffer = state.composer_kill_buffer.clone();
     loaded.slash_popup = state.slash_popup.clone();
     loaded.queued_messages = std::mem::take(&mut state.queued_messages);
+    loaded.issue_prep_started_at = state.issue_prep_started_at;
     loaded.input_history = std::mem::take(&mut state.input_history);
     loaded.history_index = state.history_index;
     loaded.help_visible = state.help_visible;
@@ -1407,6 +1484,15 @@ fn request_cancel(commands: &Sender<ClientCommand>, state: &mut TuiState) -> boo
     true
 }
 
+fn handle_exit_request(state: &mut TuiState) -> bool {
+    if state.issue_prep_started_at.is_some() {
+        state.status_message = Some("issue prep is still running".into());
+        true
+    } else {
+        false
+    }
+}
+
 fn is_connection_error(error: &AppError) -> bool {
     match error {
         AppError::Io(_) | AppError::DaemonLockHeld { .. } | AppError::DaemonProtocol(_) => true,
@@ -1431,10 +1517,17 @@ fn submit_composer(
     }
     record_input_history(state, &message);
     clear_composer(state);
-    if let Some(keep_running) = handle_composer_command(commands, state, &message, initial_run_id) {
+    if let Some(keep_running) = handle_composer_command(
+        commands,
+        state,
+        &message,
+        initial_run_id,
+        runtime,
+        config_path.clone(),
+    ) {
         return keep_running;
     }
-    if runtime_is_busy(runtime) {
+    if runtime_is_busy(runtime, state) {
         state.queued_messages.push(message);
         state.status_message = Some("queued for next turn".into());
         return true;
@@ -1451,6 +1544,8 @@ fn handle_composer_command(
     state: &mut TuiState,
     message: &str,
     initial_run_id: Option<String>,
+    runtime: &UiRuntime,
+    config_path: Option<String>,
 ) -> Option<bool> {
     if !message.starts_with('/') {
         return None;
@@ -1471,6 +1566,8 @@ fn handle_composer_command(
         command.action,
         message,
         initial_run_id,
+        runtime,
+        config_path,
     ))
 }
 
@@ -1478,8 +1575,10 @@ fn dispatch_slash_command(
     commands: &Sender<ClientCommand>,
     state: &mut TuiState,
     action: SlashCommandAction,
-    _message: &str,
+    message: &str,
     initial_run_id: Option<String>,
+    runtime: &UiRuntime,
+    config_path: Option<String>,
 ) -> bool {
     match action {
         SlashCommandAction::Help => {
@@ -1500,6 +1599,10 @@ fn dispatch_slash_command(
             start_fresh_session(state);
             true
         }
+        SlashCommandAction::IssuePrep => {
+            start_issue_prep(commands, state, runtime, message, config_path);
+            true
+        }
         SlashCommandAction::Reconnect => {
             if is_disconnected(state) {
                 reconnect(commands, state, initial_run_id);
@@ -1508,7 +1611,7 @@ fn dispatch_slash_command(
             }
             true
         }
-        SlashCommandAction::Quit => false,
+        SlashCommandAction::Quit => handle_exit_request(state),
     }
 }
 
@@ -1529,8 +1632,50 @@ fn start_fresh_session(state: &mut TuiState) {
     state.status_message = Some("new session selected".into());
 }
 
-fn runtime_is_busy(runtime: &UiRuntime) -> bool {
-    runtime.polling || runtime.poll_in_flight
+fn start_issue_prep(
+    commands: &Sender<ClientCommand>,
+    state: &mut TuiState,
+    runtime: &UiRuntime,
+    message: &str,
+    config_path: Option<String>,
+) {
+    if state.issue_prep_started_at.is_some() {
+        state.status_message = Some("issue prep already running".into());
+        return;
+    }
+    if runtime.polling || runtime.poll_in_flight {
+        state.status_message = Some("issue prep is unavailable while a run is active".into());
+        return;
+    }
+    let input = message
+        .char_indices()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or("", |(index, _)| message[index..].trim());
+    if input.is_empty() {
+        state.status_message = Some("usage: /issue-prep <rough issue>".into());
+        return;
+    }
+
+    state.issue_prep_started_at = Some(Instant::now());
+    state.status_message = Some("issue prep running".into());
+    push_live_event(
+        state,
+        crate::tui::LiveEventLine::user(format!("/issue-prep {input}")),
+    );
+    if commands
+        .send(ClientCommand::IssuePrepStart {
+            input: input.into(),
+            config_path,
+        })
+        .is_err()
+    {
+        state.issue_prep_started_at = None;
+        state.status_message = Some("daemon client worker stopped".into());
+    }
+}
+
+fn runtime_is_busy(runtime: &UiRuntime, state: &TuiState) -> bool {
+    state.issue_prep_started_at.is_some() || runtime.polling || runtime.poll_in_flight
 }
 
 fn start_next_queued(
@@ -1538,7 +1683,7 @@ fn start_next_queued(
     state: &mut TuiState,
     runtime: &mut UiRuntime,
 ) {
-    if runtime_is_busy(runtime) || state.queued_messages.is_empty() {
+    if runtime_is_busy(runtime, state) || state.queued_messages.is_empty() {
         return;
     }
     let message = state.queued_messages.remove(0);
@@ -1818,6 +1963,126 @@ mod tests {
 
         assert!(state.help_visible);
         assert_eq!(state.status_message.as_deref(), Some("help opened"));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn issue_prep_command_sends_typed_daemon_request() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.composer = "/issue-prep make retries bounded and testable".into();
+        state.composer_cursor = state.composer.len();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(
+            &sender,
+            &mut state,
+            &runtime,
+            None,
+            Some("plato.toml".into())
+        ));
+
+        match receiver.try_recv().unwrap() {
+            ClientCommand::IssuePrepStart { input, config_path } => {
+                assert_eq!(input, "make retries bounded and testable");
+                assert_eq!(config_path.as_deref(), Some("plato.toml"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(state.issue_prep_started_at.is_some());
+        assert_eq!(state.status_message.as_deref(), Some("issue prep running"));
+        assert_eq!(
+            state.live_events.last().map(|event| event.text.as_str()),
+            Some("/issue-prep make retries bounded and testable")
+        );
+    }
+
+    #[test]
+    fn issue_prep_command_channel_failure_clears_activity() {
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        start_issue_prep(
+            &sender,
+            &mut state,
+            &runtime,
+            "/issue-prep make the proof deterministic",
+            None,
+        );
+
+        assert!(state.issue_prep_started_at.is_none());
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("daemon client worker stopped")
+        );
+    }
+
+    #[test]
+    fn issue_prep_command_requires_input() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.composer = "/issue-prep".into();
+        state.composer_cursor = state.composer.len();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+
+        assert!(state.issue_prep_started_at.is_none());
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("usage: /issue-prep <rough issue>")
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn issue_prep_command_rejects_concurrent_work() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.issue_prep_started_at = Some(Instant::now());
+        state.composer = "/issue-prep another issue".into();
+        state.composer_cursor = state.composer.len();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("issue prep already running")
+        );
+        assert!(receiver.try_recv().is_err());
+
+        state.issue_prep_started_at = None;
+        state.composer = "/issue-prep another issue".into();
+        state.composer_cursor = state.composer.len();
+        let mut runtime = UiRuntime::from_state(&state, None);
+        runtime.polling = true;
+
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("issue prep is unavailable while a run is active")
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn normal_message_queues_while_issue_prep_runs() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.issue_prep_started_at = Some(Instant::now());
+        state.composer = "follow up".into();
+        state.composer_cursor = state.composer.len();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+
+        assert_eq!(state.queued_messages, vec!["follow up"]);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("queued for next turn")
+        );
         assert!(receiver.try_recv().is_err());
     }
 
@@ -2667,6 +2932,107 @@ mod tests {
     }
 
     #[test]
+    fn issue_prep_candidate_is_rendered_with_artifact_path() {
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.issue_prep_started_at = Some(Instant::now());
+        let mut runtime = UiRuntime::from_state(&state, None);
+        event_sender
+            .send(ClientEvent::IssuePrepFinished(IssuePrepStartResult {
+                run_dir: "/tmp/workspace/.plato/issue-prep/run_1".into(),
+                outcome: IssuePrepResult::Candidate {
+                    markdown: "# Prepared issue".into(),
+                },
+            }))
+            .unwrap();
+
+        drain_client_events(&mut state, &mut runtime, &event_receiver, &command_sender);
+
+        assert!(state.issue_prep_started_at.is_none());
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("issue ready; artifacts: /tmp/workspace/.plato/issue-prep/run_1")
+        );
+        assert!(state.live_events.iter().any(|event| {
+            event.kind == crate::tui::LiveEventKind::Assistant && event.text == "# Prepared issue"
+        }));
+        assert!(state.live_events.iter().any(|event| {
+            event.kind == crate::tui::LiveEventKind::Status
+                && event.text.contains(".plato/issue-prep/run_1")
+        }));
+        assert!(command_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn issue_prep_daemon_error_clears_activity() {
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.issue_prep_started_at = Some(Instant::now());
+        let mut runtime = UiRuntime::from_state(&state, None);
+        event_sender
+            .send(ClientEvent::Failed {
+                context: "issue-prep.start",
+                error: crate::AppError::DaemonResponse(ProtocolError {
+                    code: "issue_prep_failed".into(),
+                    message: "provider failed".into(),
+                }),
+            })
+            .unwrap();
+
+        drain_client_events(&mut state, &mut runtime, &event_receiver, &command_sender);
+
+        assert!(state.issue_prep_started_at.is_none());
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some(
+                "issue-prep.start failed: daemon protocol error issue_prep_failed: provider failed"
+            )
+        );
+        assert!(state.live_events.iter().any(|event| {
+            event.kind == crate::tui::LiveEventKind::Warning
+                && event.text.contains("provider failed")
+        }));
+        assert!(command_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn issue_prep_block_is_rendered_with_reasons() {
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.issue_prep_started_at = Some(Instant::now());
+        let mut runtime = UiRuntime::from_state(&state, None);
+        event_sender
+            .send(ClientEvent::IssuePrepFinished(IssuePrepStartResult {
+                run_dir: "/tmp/workspace/.plato/issue-prep/run_2".into(),
+                outcome: IssuePrepResult::Blocked {
+                    stage: "review".into(),
+                    reasons: vec!["acceptance is not testable".into()],
+                },
+            }))
+            .unwrap();
+
+        drain_client_events(&mut state, &mut runtime, &event_receiver, &command_sender);
+
+        assert!(state.issue_prep_started_at.is_none());
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some(
+                "issue prep blocked at review; artifacts: \
+                 /tmp/workspace/.plato/issue-prep/run_2"
+            )
+        );
+        assert!(state.live_events.iter().any(|event| {
+            event.kind == crate::tui::LiveEventKind::Warning
+                && event.text.contains("acceptance is not testable")
+                && event.text.contains(".plato/issue-prep/run_2")
+        }));
+        assert!(command_receiver.try_recv().is_err());
+    }
+
+    #[test]
     fn lagged_stream_resumes_at_current_tip() {
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
@@ -2919,6 +3285,33 @@ mod tests {
         }
 
         assert!(!request_cancel(&sender, &mut state));
+    }
+
+    #[test]
+    fn issue_prep_prevents_graceful_exit_until_finished() {
+        let mut state = test_state();
+        state.issue_prep_started_at = Some(Instant::now());
+
+        assert!(handle_exit_request(&mut state));
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("issue prep is still running")
+        );
+
+        state.issue_prep_started_at = None;
+        assert!(!handle_exit_request(&mut state));
+    }
+
+    #[test]
+    fn state_reload_preserves_issue_prep_start_time() {
+        let mut state = test_state();
+        let started_at = Instant::now();
+        state.issue_prep_started_at = Some(started_at);
+        let loaded = test_state();
+
+        apply_loaded_state(&mut state, loaded);
+
+        assert_eq!(state.issue_prep_started_at, Some(started_at));
     }
 
     fn test_state() -> TuiState {
