@@ -363,6 +363,12 @@ export DISCORD_BOT_TOKEN="$(cat /path/to/discord-bot-token)"
 cargo run --bin plato-gateway-discord -- --workspace "$PWD"
 ```
 
+At startup, the gateway replaces the Discord application's global command
+registry with the commands this binary supports. The current registry contains
+only `/status`. For an allowed owner, `/status` responds ephemerally with
+gateway connectivity, daemon connectivity and version, workspace session
+count, and active run count. It does not invoke a model or mutate the ledger.
+
 Enable the bot's Message Content intent. Grant View Channel, Send Messages, Add
 Reactions, and Read Message History; also grant Send Messages in Threads when
 using threads. Messages from other user ids are ignored. For allowed messages,
