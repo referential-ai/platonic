@@ -40,6 +40,16 @@ error      shared error types
 
 The public contract is documented in the [crate rustdoc](https://docs.rs/platonic-core).
 
+## Minimal host
+
+Run the public kernel through one approval-gated tool turn and replay the resulting ledger:
+
+```bash
+cargo run --example minimal_host
+```
+
+The example simulates model and tool IO. It performs no file write or network call.
+
 ## Verify
 
 ```bash
