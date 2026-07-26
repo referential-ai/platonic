@@ -29,6 +29,12 @@ const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 const DISCORD_INTENTS: u64 = (1 << 9) | (1 << 12) | (1 << 15);
 const DISCORD_INPUT_LIMIT: usize = 4_096;
 const DISCORD_MESSAGE_LIMIT: usize = 2_000;
+const DISCORD_STATUS_COMMAND: &str = "status";
+const DISCORD_STATUS_DESCRIPTION: &str = "Show Plato Agent gateway and daemon status";
+const DISCORD_APPLICATION_COMMAND: u8 = 2;
+const DISCORD_CHAT_INPUT_COMMAND: u8 = 1;
+const DISCORD_DEFERRED_CHANNEL_MESSAGE: u8 = 5;
+const DISCORD_EPHEMERAL_FLAG: u64 = 64;
 const DISCORD_REJECTION_MESSAGE: &str = "Message rejected: unsafe or oversized Discord input.";
 const DISCORD_UNSAFE_MARKERS: [&str; 20] = [
     "act as",
@@ -92,7 +98,12 @@ pub fn run_discord_gateway(options: DiscordGatewayOptions) -> AppResult<()> {
         .ok_or_else(|| AppError::Config("gateway.discord configuration is required".into()))?;
     let token = gateway_token(&config, &discord, |name| std::env::var_os(name))?;
     let daemon = DaemonConnectionConfig::resolve(&options.workspace_root, options.socket_path)?;
-    let platform = DiscordPlatform::connect(DISCORD_API_BASE, token)?;
+    let platform = DiscordPlatform::connect(
+        DISCORD_API_BASE,
+        token,
+        daemon.clone(),
+        discord.owner_user_ids.clone(),
+    )?;
     let config_path = forwarded_config_path(resolved.as_ref());
     DiscordGateway::new(platform, daemon, config_path, discord).run()
 }
@@ -670,8 +681,15 @@ struct DiscordPlatform {
 }
 
 impl DiscordPlatform {
-    fn connect(api_base: &str, token: String) -> AppResult<Self> {
+    fn connect(
+        api_base: &str,
+        token: String,
+        daemon: DaemonConnectionConfig,
+        owner_user_ids: Vec<u64>,
+    ) -> AppResult<Self> {
         let rest = DiscordRestClient::new(api_base, token.clone());
+        let application_id = rest.application_id()?;
+        rest.replace_application_commands(application_id)?;
         let gateway_url = rest.gateway_url()?;
         let (sender, messages) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -680,6 +698,12 @@ impl DiscordPlatform {
             initial_url: gateway_url,
             read_timeout: GATEWAY_READ_TIMEOUT,
             reconnect_delay: GATEWAY_RECONNECT_DELAY,
+            status: DiscordStatusHandler {
+                api_base: api_base.trim_end_matches('/').into(),
+                application_id,
+                daemon,
+                owner_user_ids: owner_user_ids.into_iter().collect(),
+            },
         };
         let worker_stop = Arc::clone(&stop);
         let worker = thread::Builder::new()
@@ -758,6 +782,49 @@ impl DiscordRestClient {
             token,
             rate_limits: Cell::new(DiscordRateLimits::default()),
         }
+    }
+
+    fn application_id(&self) -> AppResult<u64> {
+        let response = self
+            .request(
+                self.agent
+                    .get(&format!("{}/oauth2/applications/@me", self.api_base)),
+            )
+            .call()
+            .map_err(|error| discord_http_error("application lookup", error))?;
+        let response: DiscordApplication = response.into_json().map_err(|_| {
+            AppError::Provider("discord application lookup returned invalid JSON".into())
+        })?;
+        response.id.parse().map_err(|_| {
+            AppError::Provider("discord application lookup returned an invalid id".into())
+        })
+    }
+
+    fn replace_application_commands(&self, application_id: u64) -> AppResult<()> {
+        let commands = [DiscordApplicationCommand {
+            kind: DISCORD_CHAT_INPUT_COMMAND,
+            name: DISCORD_STATUS_COMMAND,
+            description: DISCORD_STATUS_DESCRIPTION,
+        }];
+        let response = self
+            .request(self.agent.put(&format!(
+                "{}/applications/{application_id}/commands",
+                self.api_base
+            )))
+            .send_json(commands)
+            .map_err(|error| discord_http_error("command synchronization", error))?;
+        let registered: Vec<RegisteredApplicationCommand> = response.into_json().map_err(|_| {
+            AppError::Provider("discord command synchronization returned invalid JSON".into())
+        })?;
+        if registered.len() != 1
+            || registered[0].kind != DISCORD_CHAT_INPUT_COMMAND
+            || registered[0].name != DISCORD_STATUS_COMMAND
+        {
+            return Err(AppError::Provider(
+                "discord command synchronization returned an unexpected registry".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn gateway_url(&self) -> AppResult<String> {
@@ -1052,6 +1119,26 @@ struct GatewayBotResponse {
     url: String,
 }
 
+#[derive(Deserialize)]
+struct DiscordApplication {
+    id: String,
+}
+
+#[derive(Serialize)]
+struct DiscordApplicationCommand {
+    #[serde(rename = "type")]
+    kind: u8,
+    name: &'static str,
+    description: &'static str,
+}
+
+#[derive(Deserialize)]
+struct RegisteredApplicationCommand {
+    #[serde(rename = "type")]
+    kind: u8,
+    name: String,
+}
+
 #[derive(Serialize)]
 struct CreateMessage {
     content: String,
@@ -1078,11 +1165,131 @@ struct DiscordMessage {
     content: String,
 }
 
+#[derive(Clone)]
+struct DiscordStatusHandler {
+    api_base: String,
+    application_id: u64,
+    daemon: DaemonConnectionConfig,
+    owner_user_ids: HashSet<u64>,
+}
+
+impl DiscordStatusHandler {
+    fn handle(&self, interaction: InteractionCreateEvent) -> AppResult<()> {
+        if interaction.kind != DISCORD_APPLICATION_COMMAND {
+            return Ok(());
+        }
+        let Some(data) = interaction.data.as_ref() else {
+            return Err(AppError::Provider(
+                "discord status interaction omitted command data".into(),
+            ));
+        };
+        if data.kind != DISCORD_CHAT_INPUT_COMMAND || data.name != DISCORD_STATUS_COMMAND {
+            return Ok(());
+        }
+        let application_id = parse_snowflake(&interaction.application_id)?;
+        if application_id != self.application_id {
+            return Err(AppError::Provider(
+                "discord status interaction used an unexpected application id".into(),
+            ));
+        }
+        let author_id = interaction
+            .member
+            .as_ref()
+            .map(|member| &member.user)
+            .or(interaction.user.as_ref())
+            .map(|user| parse_snowflake(&user.id))
+            .transpose()?
+            .ok_or_else(|| {
+                AppError::Provider("discord status interaction omitted its author".into())
+            })?;
+        if !self.owner_user_ids.contains(&author_id) {
+            return Ok(());
+        }
+        let interaction_id = parse_snowflake(&interaction.id)?;
+        if interaction.token.is_empty() {
+            return Err(AppError::Provider(
+                "discord status interaction omitted its token".into(),
+            ));
+        }
+        let handler = self.clone();
+        thread::Builder::new()
+            .name("discord-status".into())
+            .spawn(move || {
+                if let Err(error) = handler.respond(interaction_id, &interaction.token) {
+                    eprintln!("discord status interaction failed: {error}");
+                }
+            })?;
+        Ok(())
+    }
+
+    fn respond(&self, interaction_id: u64, interaction_token: &str) -> AppResult<()> {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(PRESENTATION_TIMEOUT)
+            .build();
+        agent
+            .post(&format!(
+                "{}/interactions/{interaction_id}/{interaction_token}/callback",
+                self.api_base
+            ))
+            .send_json(DiscordInteractionResponse {
+                kind: DISCORD_DEFERRED_CHANNEL_MESSAGE,
+                data: DiscordInteractionResponseData {
+                    flags: DISCORD_EPHEMERAL_FLAG,
+                },
+            })
+            .map_err(|error| discord_http_error("status defer", error))?;
+
+        let content = self.status_content();
+        agent
+            .patch(&format!(
+                "{}/webhooks/{}/{interaction_token}/messages/@original",
+                self.api_base, self.application_id
+            ))
+            .send_json(CreateMessage {
+                content,
+                allowed_mentions: AllowedMentions { parse: Vec::new() },
+            })
+            .map_err(|error| discord_http_error("status response edit", error))?;
+        Ok(())
+    }
+
+    fn status_content(&self) -> String {
+        match self.daemon_status() {
+            Ok((version, sessions, active_runs)) => format!(
+                "Plato Agent status\nGateway: connected\nDaemon: connected\nDaemon version: {version}\nWorkspace sessions: {sessions}\nActive runs: {active_runs}"
+            ),
+            Err(_) => "Plato Agent status\nGateway: connected\nDaemon: unavailable".into(),
+        }
+    }
+
+    fn daemon_status(&self) -> AppResult<(String, usize, usize)> {
+        #[cfg(unix)]
+        let mut daemon =
+            DaemonClient::connect_with_timeout(&self.daemon.socket_path, Duration::from_secs(2))?;
+        #[cfg(windows)]
+        let mut daemon = DaemonClient::connect(&self.daemon.socket_path)?;
+        let hello = daemon.hello(&self.daemon.workspace_root)?;
+        require_capabilities(&hello)?;
+        let sessions = daemon.sessions_list()?;
+        let active_runs = sessions
+            .iter()
+            .filter(|session| {
+                matches!(
+                    session.status,
+                    RunStateName::Running | RunStateName::CancelRequested
+                )
+            })
+            .count();
+        Ok((hello.daemon_version, sessions.len(), active_runs))
+    }
+}
+
 struct DiscordGatewayReceiver {
     token: String,
     initial_url: String,
     read_timeout: Duration,
     reconnect_delay: Duration,
+    status: DiscordStatusHandler,
 }
 
 impl DiscordGatewayReceiver {
@@ -1246,6 +1453,16 @@ impl DiscordGatewayReceiver {
                             return GatewayControl::Stop;
                         }
                     }
+                    Some("INTERACTION_CREATE") => {
+                        let interaction: InteractionCreateEvent =
+                            match serde_json::from_value(payload.d) {
+                                Ok(interaction) => interaction,
+                                Err(_) => return invalid_gateway_payload(),
+                            };
+                        if let Err(error) = self.status.handle(interaction) {
+                            return GatewayControl::Fatal(error);
+                        }
+                    }
                     _ => {}
                 },
                 1 => {
@@ -1306,6 +1523,42 @@ struct MessageCreateEvent {
     channel_id: String,
     author: DiscordAuthor,
     content: String,
+}
+
+#[derive(Deserialize)]
+struct InteractionCreateEvent {
+    id: String,
+    application_id: String,
+    #[serde(rename = "type")]
+    kind: u8,
+    token: String,
+    data: Option<InteractionData>,
+    member: Option<InteractionMember>,
+    user: Option<DiscordAuthor>,
+}
+
+#[derive(Deserialize)]
+struct InteractionData {
+    #[serde(rename = "type")]
+    kind: u8,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct InteractionMember {
+    user: DiscordAuthor,
+}
+
+#[derive(Serialize)]
+struct DiscordInteractionResponse {
+    #[serde(rename = "type")]
+    kind: u8,
+    data: DiscordInteractionResponseData,
+}
+
+#[derive(Serialize)]
+struct DiscordInteractionResponseData {
+    flags: u64,
 }
 
 #[derive(Deserialize)]
@@ -2400,9 +2653,14 @@ mod tests {
 
     #[test]
     fn websocket_identifies_and_receives_messages() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("daemon.sock");
+        let daemon = spawn_status_query_daemon(&socket_path);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let websocket_url = format!("ws://{}", listener.local_addr().unwrap());
-        let rest = spawn_fake_rest(1, 200, Some(websocket_url.clone()));
+        let rest = spawn_fake_rest(5, 200, Some(websocket_url.clone()));
+        let (sent, sent_at) = mpsc::channel();
         let websocket = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             stream
@@ -2444,6 +2702,28 @@ mod tests {
                     }
                 }),
             );
+            send_websocket_json(
+                &mut socket,
+                json!({
+                    "op": 0,
+                    "s": 3,
+                    "t": "INTERACTION_CREATE",
+                    "d": {
+                        "id": "400",
+                        "application_id": "100",
+                        "type": DISCORD_APPLICATION_COMMAND,
+                        "token": "interaction-token",
+                        "data": {
+                            "type": DISCORD_CHAT_INPUT_COMMAND,
+                            "name": DISCORD_STATUS_COMMAND
+                        },
+                        "member": {
+                            "user": {"id": "42", "bot": false}
+                        }
+                    }
+                }),
+            );
+            sent.send(Instant::now()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(1);
             while Instant::now() < deadline {
                 let Some(payload) = read_websocket_json(&mut socket) else {
@@ -2451,7 +2731,7 @@ mod tests {
                 };
                 if payload["op"] == 1 {
                     send_websocket_json(&mut socket, json!({"op": 11, "d": null}));
-                    if payload["d"] == 2 {
+                    if payload["d"] == 3 {
                         return;
                     }
                 }
@@ -2459,15 +2739,98 @@ mod tests {
             panic!("discord gateway did not send a heartbeat");
         });
 
-        let platform = DiscordPlatform::connect(&rest.base_url, "test-token".into()).unwrap();
+        let platform = DiscordPlatform::connect(
+            &rest.base_url,
+            "test-token".into(),
+            DaemonConnectionConfig::resolve(workspace.path(), Some(socket_path)).unwrap(),
+            vec![42],
+        )
+        .unwrap();
         let message = platform.recv_message().unwrap();
+        let interaction_sent_at = sent_at.recv_timeout(Duration::from_secs(2)).unwrap();
 
         assert_eq!(message, discord_message(42, 200, "hello"));
+        daemon.join().unwrap();
         websocket.join().unwrap();
         drop(platform);
         let requests = rest.handle.join().unwrap();
-        assert_eq!(requests[0].path, "/gateway/bot");
+        assert_eq!(requests[0].path, "/oauth2/applications/@me");
         assert_eq!(requests[0].authorization, "Bot test-token");
+        assert_eq!(requests[1].method, "PUT");
+        assert_eq!(requests[1].path, "/applications/100/commands");
+        assert_eq!(
+            requests[1].body,
+            json!([{
+                "type": DISCORD_CHAT_INPUT_COMMAND,
+                "name": DISCORD_STATUS_COMMAND,
+                "description": DISCORD_STATUS_DESCRIPTION
+            }])
+        );
+        assert_eq!(requests[2].path, "/gateway/bot");
+        assert_eq!(requests[3].method, "POST");
+        assert_eq!(
+            requests[3].path,
+            "/interactions/400/interaction-token/callback"
+        );
+        assert_eq!(
+            requests[3].body,
+            json!({
+                "type": DISCORD_DEFERRED_CHANNEL_MESSAGE,
+                "data": {"flags": DISCORD_EPHEMERAL_FLAG}
+            })
+        );
+        assert!(
+            requests[3].received_at.duration_since(interaction_sent_at) < Duration::from_secs(3)
+        );
+        assert!(requests[3].authorization.is_empty());
+        assert_eq!(requests[4].method, "PATCH");
+        assert_eq!(
+            requests[4].path,
+            "/webhooks/100/interaction-token/messages/@original"
+        );
+        assert_eq!(
+            requests[4].body["content"],
+            "Plato Agent status\nGateway: connected\nDaemon: connected\nDaemon version: test\nWorkspace sessions: 3\nActive runs: 2"
+        );
+        assert_eq!(requests[4].body["allowed_mentions"]["parse"], json!([]));
+        assert!(requests[4].authorization.is_empty());
+    }
+
+    #[test]
+    fn status_interaction_reports_unavailable_daemon_after_defer() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let rest = spawn_fake_rest(2, 200, None);
+        let handler = test_status_handler(
+            &rest.base_url,
+            &workspace,
+            socket_dir.path().join("missing.sock"),
+        );
+
+        handler.handle(discord_status_interaction(42)).unwrap();
+
+        let requests = rest.handle.join().unwrap();
+        assert_eq!(requests[0].body["type"], DISCORD_DEFERRED_CHANNEL_MESSAGE);
+        assert_eq!(
+            requests[1].body["content"],
+            "Plato Agent status\nGateway: connected\nDaemon: unavailable"
+        );
+    }
+
+    #[test]
+    fn non_owner_status_interaction_is_ignored_before_rest_or_daemon_access() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let rest = spawn_fake_rest(0, 200, None);
+        let handler = test_status_handler(
+            &rest.base_url,
+            &workspace,
+            socket_dir.path().join("missing.sock"),
+        );
+
+        handler.handle(discord_status_interaction(99)).unwrap();
+
+        assert!(rest.handle.join().unwrap().is_empty());
     }
 
     #[test]
@@ -2622,6 +2985,39 @@ mod tests {
         }
     }
 
+    fn discord_status_interaction(author_id: u64) -> InteractionCreateEvent {
+        InteractionCreateEvent {
+            id: "400".into(),
+            application_id: "100".into(),
+            kind: DISCORD_APPLICATION_COMMAND,
+            token: "interaction-token".into(),
+            data: Some(InteractionData {
+                kind: DISCORD_CHAT_INPUT_COMMAND,
+                name: DISCORD_STATUS_COMMAND.into(),
+            }),
+            member: Some(InteractionMember {
+                user: DiscordAuthor {
+                    id: author_id.to_string(),
+                    bot: Some(false),
+                },
+            }),
+            user: None,
+        }
+    }
+
+    fn test_status_handler(
+        api_base: &str,
+        workspace: &tempfile::TempDir,
+        socket_path: PathBuf,
+    ) -> DiscordStatusHandler {
+        DiscordStatusHandler {
+            api_base: api_base.into(),
+            application_id: 100,
+            daemon: DaemonConnectionConfig::resolve(workspace.path(), Some(socket_path)).unwrap(),
+            owner_user_ids: HashSet::from([42]),
+        }
+    }
+
     fn assert_reaction(request: &HttpRequest, method: &str, emoji: &str) {
         let emoji = match emoji {
             EYES_EMOJI => "%F0%9F%91%80",
@@ -2700,10 +3096,13 @@ mod tests {
                     Err(error) => panic!("discord REST accept failed: {error}"),
                 };
                 let request = read_http_request(&mut stream);
-                let body = if request.path == "/gateway/bot" {
-                    json!({"url": gateway_url})
-                } else {
-                    json!({"id": "message_1"})
+                let body = match request.path.as_str() {
+                    "/oauth2/applications/@me" => json!({"id": "100"}),
+                    "/applications/100/commands" => {
+                        json!([{"name": DISCORD_STATUS_COMMAND, "type": 1}])
+                    }
+                    "/gateway/bot" => json!({"url": gateway_url}),
+                    _ => json!({"id": "message_1"}),
                 };
                 write_http_response(&mut stream, status, &body);
                 requests.push(request);
@@ -2878,6 +3277,15 @@ mod tests {
             initial_url: websocket_url.into(),
             read_timeout: TEST_GATEWAY_READ_TIMEOUT,
             reconnect_delay: Duration::from_millis(1),
+            status: DiscordStatusHandler {
+                api_base: "http://127.0.0.1".into(),
+                application_id: 100,
+                daemon: DaemonConnectionConfig {
+                    workspace_root: PathBuf::from("/"),
+                    socket_path: PathBuf::from("/tmp/missing-plato-agent.sock"),
+                },
+                owner_user_ids: HashSet::from([42]),
+            },
         };
         let worker_stop = Arc::clone(&stop);
         let worker = thread::spawn(move || receiver.run(sender, worker_stop));
@@ -3460,6 +3868,48 @@ mod tests {
                     "final_answer": null,
                     "transcript": "run_failed"
                 }),
+            );
+        })
+    }
+
+    fn spawn_status_query_daemon(socket_path: &Path) -> thread::JoinHandle<()> {
+        let listener = UnixListener::bind(socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let (stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "daemon query timed out");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("daemon query accept failed: {error}"),
+                }
+            };
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            respond_hello(&mut reader, &mut writer);
+            let sessions = read_daemon_request(&mut reader);
+            assert_eq!(sessions.method.as_deref(), Some("sessions.list"));
+            let sessions_result = ["running", "cancel_requested", "finished"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, status)| {
+                    json!({
+                        "session_id": format!("session_{index}"),
+                        "run_id": format!("run_{index}"),
+                        "status": status,
+                        "latest_question": format!("question {index}"),
+                        "ledger_path": "/tmp/agent.db"
+                    })
+                })
+                .collect::<Vec<_>>();
+            write_daemon_response(
+                &mut writer,
+                sessions.id,
+                "sessions.list",
+                json!({"sessions": sessions_result}),
             );
         })
     }
