@@ -9,7 +9,7 @@ use plato_agent::{
     daemon::{
         client::DaemonClient,
         installer_gate::InstallerStartupGate,
-        protocol::{RunStateName, ShutdownIfIdleResultName},
+        protocol::{RunStateName, ShutdownIfIdleResultName, StreamEvent},
         server::DaemonServer,
     },
     paths,
@@ -156,9 +156,11 @@ fn daemon_round_trip_streams_and_replays_after_clean_shutdown() {
         let page = client.events_stream(&started.run_id, offset, 128).unwrap();
         assert_eq!(page.run_id, started.run_id);
         saw_delta |= page.events.iter().any(|entry| {
-            entry["event"]["kind"] == "assistant_delta"
-                && entry["event"]["run_id"] == started.run_id
-                && entry["event"]["text"] == "Windows reply"
+            matches!(
+                &entry.event,
+                StreamEvent::AssistantDelta { run_id, text, .. }
+                    if run_id == &started.run_id && text == "Windows reply"
+            )
         });
         offset = Some(page.next_offset);
         if page.status == RunStateName::Finished {
