@@ -231,6 +231,7 @@ pub struct RunState {
     next_seq: u64,
     next_model_step: u32,
     last_turn_id: Option<TurnId>,
+    pending_compaction_turn_id: Option<TurnId>,
     phase: RunPhase,
 }
 
@@ -248,6 +249,7 @@ impl RunState {
             next_seq: 0,
             next_model_step: 0,
             last_turn_id: None,
+            pending_compaction_turn_id: None,
             phase: RunPhase::NotStarted,
         }
     }
@@ -315,6 +317,16 @@ impl RunState {
     }
 
     fn apply_event(&mut self, event: &HarnessEvent) -> Result<(), Error> {
+        if let Some(expected_turn_id) = &self.pending_compaction_turn_id {
+            match event {
+                HarnessEvent::ContextBuilt { turn_id, .. } => {
+                    ensure_turn(expected_turn_id, turn_id)?;
+                }
+                HarnessEvent::RunFailed { .. } => {}
+                _ => return Err(invalid(&self.phase, event)),
+            }
+        }
+
         match (&self.phase, event) {
             (RunPhase::NotStarted, HarnessEvent::RunStarted { run_id, .. }) => {
                 self.run_id = Some(run_id.clone());
@@ -330,7 +342,28 @@ impl RunState {
                 HarnessEvent::ContextBuilt {
                     turn_id, context, ..
                 },
-            ) => self.start_turn(turn_id, context),
+            ) => {
+                self.start_turn(turn_id, context)?;
+                self.pending_compaction_turn_id = None;
+                Ok(())
+            }
+            (
+                RunPhase::ReadyForContext
+                | RunPhase::TurnConcluded
+                | RunPhase::PolicyDenied { .. }
+                | RunPhase::ApprovalDenied { .. }
+                | RunPhase::ToolFailed { .. },
+                HarnessEvent::ContextCompacted {
+                    turn_id,
+                    dropped_turn_start,
+                    dropped_turn_end_exclusive,
+                    ..
+                },
+            ) => {
+                ensure_compaction_range(*dropped_turn_start, *dropped_turn_end_exclusive)?;
+                self.pending_compaction_turn_id = Some(turn_id.clone());
+                Ok(())
+            }
             (
                 RunPhase::ReadyToRequestModel {
                     turn_id,
@@ -465,6 +498,7 @@ impl RunState {
                 Ok(())
             }
             (phase, HarnessEvent::RunFailed { reason, .. }) if phase.can_fail() => {
+                self.pending_compaction_turn_id = None;
                 self.phase = RunPhase::Failed {
                     reason: reason.clone(),
                 };
@@ -534,6 +568,16 @@ fn ensure_new_turn(previous: Option<&TurnId>, actual: &TurnId) -> Result<(), Err
         });
     }
     Ok(())
+}
+
+fn ensure_compaction_range(start: u64, end_exclusive: u64) -> Result<(), Error> {
+    if start < end_exclusive {
+        return Ok(());
+    }
+    Err(Error::InvalidCompactionRange {
+        start,
+        end_exclusive,
+    })
 }
 
 fn ensure_step(expected: u32, actual: u32) -> Result<(), Error> {
@@ -713,6 +757,29 @@ mod tests {
                 run_id: run_id(),
                 turn_id,
                 context: context_with_content(10, content),
+            },
+        )
+    }
+
+    fn compaction_event(seq: u64, turn_id: TurnId) -> RecordedEvent {
+        compaction_event_for(seq, turn_id, 0, 2)
+    }
+
+    fn compaction_event_for(
+        seq: u64,
+        turn_id: TurnId,
+        dropped_turn_start: u64,
+        dropped_turn_end_exclusive: u64,
+    ) -> RecordedEvent {
+        rec(
+            seq,
+            HarnessEvent::ContextCompacted {
+                run_id: run_id(),
+                turn_id,
+                estimated_tokens_before: 160,
+                estimated_tokens_after: 80,
+                dropped_turn_start,
+                dropped_turn_end_exclusive,
             },
         )
     }
@@ -905,6 +972,207 @@ mod tests {
             state.apply(event).unwrap();
         }
         state
+    }
+
+    #[test]
+    fn compaction_precedes_matching_context_in_every_context_phase() {
+        let concluded = apply_all(&[
+            start_event(0),
+            context_event(1),
+            model_requested(2),
+            model_responded_with(3, turn_id(), 0, "done", vec![]),
+        ]);
+        let policy_denied = apply_all(&[
+            start_event(0),
+            context_event(1),
+            model_requested(2),
+            model_responded(3),
+            tool_proposed(4, EffectClass::ReadOnly),
+            deny_policy(5),
+        ]);
+        let approval_denied = apply_all(&[
+            start_event(0),
+            context_event(1),
+            model_requested(2),
+            model_responded(3),
+            tool_proposed(4, EffectClass::WorkspaceWrite),
+            require_approval(5),
+            rec(
+                6,
+                HarnessEvent::ApprovalDenied {
+                    run_id: run_id(),
+                    call_id: call_id(),
+                    actor_id: actor_id(),
+                    reason: "not approved".into(),
+                },
+            ),
+        ]);
+        let tool_failed_state = apply_all(&[
+            start_event(0),
+            context_event(1),
+            model_requested(2),
+            model_responded(3),
+            tool_proposed(4, EffectClass::ReadOnly),
+            allow_policy(5),
+            tool_started(6),
+            tool_failed(7),
+        ]);
+
+        for mut state in [
+            apply_all(&[start_event(0)]),
+            concluded,
+            policy_denied,
+            approval_denied,
+            tool_failed_state,
+        ] {
+            let phase = state.phase().clone();
+            let seq = state.next_seq();
+
+            state
+                .apply(&compaction_event(seq, other_turn_id()))
+                .unwrap();
+
+            assert_eq!(state.phase(), &phase);
+            assert!(state.pending_command().is_none());
+            state.apply(&second_context_event(seq + 1)).unwrap();
+            assert!(matches!(
+                state.phase(),
+                RunPhase::ReadyToRequestModel { turn_id, .. } if turn_id == &other_turn_id()
+            ));
+        }
+    }
+
+    #[test]
+    fn pending_compaction_rejects_duplicate_wrong_turn_and_other_events() {
+        let mut state = apply_all(&[start_event(0)]);
+        state.apply(&compaction_event(1, turn_id())).unwrap();
+
+        let mut duplicate = state.clone();
+        assert_eq!(
+            duplicate
+                .apply(&compaction_event(2, turn_id()))
+                .unwrap_err(),
+            Error::InvalidTransition {
+                phase: "ready_for_context",
+                event: "context_compacted"
+            }
+        );
+
+        let mut wrong_turn = state.clone();
+        assert_eq!(
+            wrong_turn.apply(&second_context_event(2)).unwrap_err(),
+            Error::TurnMismatch {
+                expected: "turn_1".into(),
+                actual: "turn_2".into()
+            }
+        );
+
+        let mut wrong_event = state.clone();
+        assert_eq!(
+            wrong_event.apply(&model_requested(2)).unwrap_err(),
+            Error::InvalidTransition {
+                phase: "ready_for_context",
+                event: "model_requested"
+            }
+        );
+
+        state.apply(&context_event(2)).unwrap();
+        state.apply(&model_requested(3)).unwrap();
+        state
+            .apply(&model_responded_with(4, turn_id(), 0, "done", vec![]))
+            .unwrap();
+        state.apply(&compaction_event(5, other_turn_id())).unwrap();
+        assert_eq!(state.phase(), &RunPhase::TurnConcluded);
+    }
+
+    #[test]
+    fn compaction_range_must_drop_at_least_one_turn() {
+        let state = apply_all(&[start_event(0)]);
+
+        for (start, end_exclusive) in [(0, 0), (3, 2)] {
+            let mut attempted = state.clone();
+            assert_eq!(
+                attempted
+                    .apply(&compaction_event_for(1, turn_id(), start, end_exclusive))
+                    .unwrap_err(),
+                Error::InvalidCompactionRange {
+                    start,
+                    end_exclusive
+                }
+            );
+            assert_eq!(attempted.next_seq(), 1);
+        }
+    }
+
+    #[test]
+    fn pending_compaction_may_end_with_run_failure() {
+        let mut state = apply_all(&[start_event(0)]);
+        state.apply(&compaction_event(1, turn_id())).unwrap();
+
+        state
+            .apply(&rec(
+                2,
+                HarnessEvent::RunFailed {
+                    run_id: run_id(),
+                    reason: "context build failed".into(),
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(
+            state.phase(),
+            &RunPhase::Failed {
+                reason: "context build failed".into()
+            }
+        );
+        assert!(state.pending_command().is_none());
+    }
+
+    #[test]
+    fn compaction_is_rejected_out_of_phase_and_after_terminal() {
+        let states = [
+            ("not_started", RunState::new()),
+            (
+                "ready_to_request_model",
+                apply_all(&[start_event(0), context_event(1)]),
+            ),
+            (
+                "finished",
+                apply_all(&[
+                    start_event(0),
+                    context_event(1),
+                    model_requested(2),
+                    model_responded_with(3, turn_id(), 0, "done", vec![]),
+                    rec(4, HarnessEvent::RunFinished { run_id: run_id() }),
+                ]),
+            ),
+            (
+                "failed",
+                apply_all(&[
+                    start_event(0),
+                    rec(
+                        1,
+                        HarnessEvent::RunFailed {
+                            run_id: run_id(),
+                            reason: "failed".into(),
+                        },
+                    ),
+                ]),
+            ),
+        ];
+
+        for (phase, mut state) in states {
+            let seq = state.next_seq();
+            assert_eq!(
+                state
+                    .apply(&compaction_event(seq, other_turn_id()))
+                    .unwrap_err(),
+                Error::InvalidTransition {
+                    phase,
+                    event: "context_compacted"
+                }
+            );
+        }
     }
 
     #[test]

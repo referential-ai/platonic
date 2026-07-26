@@ -38,6 +38,19 @@ impl RunReadback {
 /// One deterministic readback entry projected from the ledger.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReadbackEntry {
+    /// Prior turns omitted from the next model context.
+    ContextCompacted {
+        /// Turn whose context reflects the compaction.
+        turn_id: TurnId,
+        /// Estimated tokens before prior turns were dropped.
+        estimated_tokens_before: u32,
+        /// Estimated tokens after prior turns were dropped.
+        estimated_tokens_after: u32,
+        /// Zero-based first dropped prior-turn position.
+        dropped_turn_start: u64,
+        /// Exclusive end of the dropped prior-turn range.
+        dropped_turn_end_exclusive: u64,
+    },
     /// One host-built context fragment that entered a model turn.
     ContextFragment {
         /// Turn that received the fragment.
@@ -98,6 +111,22 @@ pub enum ReadbackEntry {
 
 fn collect_entry(event: &HarnessEvent, entries: &mut Vec<ReadbackEntry>) {
     match event {
+        HarnessEvent::ContextCompacted {
+            turn_id,
+            estimated_tokens_before,
+            estimated_tokens_after,
+            dropped_turn_start,
+            dropped_turn_end_exclusive,
+            ..
+        } => {
+            entries.push(ReadbackEntry::ContextCompacted {
+                turn_id: turn_id.clone(),
+                estimated_tokens_before: *estimated_tokens_before,
+                estimated_tokens_after: *estimated_tokens_after,
+                dropped_turn_start: *dropped_turn_start,
+                dropped_turn_end_exclusive: *dropped_turn_end_exclusive,
+            });
+        }
         HarnessEvent::ContextBuilt {
             turn_id, context, ..
         } => {
@@ -303,6 +332,61 @@ mod tests {
                 agent_id: agent_id(),
             },
         )
+    }
+
+    #[test]
+    fn compaction_precedes_its_context_fragments_in_readback() {
+        let events = vec![
+            start_event(0),
+            rec(
+                1,
+                HarnessEvent::ContextCompacted {
+                    run_id: run_id(),
+                    turn_id: turn_id(),
+                    estimated_tokens_before: 160,
+                    estimated_tokens_after: 80,
+                    dropped_turn_start: 0,
+                    dropped_turn_end_exclusive: 2,
+                },
+            ),
+            rec(2, context(turn_id(), "Keep recent turns")),
+            rec(3, model_requested(turn_id(), 0)),
+            rec(4, model_responded(turn_id(), 0, "done", vec![])),
+            rec(5, HarnessEvent::RunFinished { run_id: run_id() }),
+        ];
+
+        let readback = RunReadback::from_events(&events).unwrap();
+
+        assert_eq!(readback.final_phase, RunPhase::Finished);
+        assert_eq!(readback.next_seq, 6);
+        assert_eq!(
+            readback.entries,
+            vec![
+                ReadbackEntry::ContextCompacted {
+                    turn_id: turn_id(),
+                    estimated_tokens_before: 160,
+                    estimated_tokens_after: 80,
+                    dropped_turn_start: 0,
+                    dropped_turn_end_exclusive: 2,
+                },
+                ReadbackEntry::ContextFragment {
+                    turn_id: turn_id(),
+                    fragment: ContextFragment {
+                        lane: ContextLane::CurrentTask,
+                        source: "user".into(),
+                        content: "Keep recent turns".into(),
+                        estimated_tokens: 10,
+                    },
+                },
+                ReadbackEntry::ModelMessage {
+                    turn_id: turn_id(),
+                    message: Message {
+                        role: MessageRole::Assistant,
+                        content: "done".into(),
+                    },
+                },
+            ]
+        );
     }
 
     #[test]

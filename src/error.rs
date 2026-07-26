@@ -16,6 +16,15 @@ pub enum Error {
         budget: u32,
     },
 
+    /// A context compaction range was empty or reversed.
+    #[error("invalid compaction range: {start}..{end_exclusive}")]
+    InvalidCompactionRange {
+        /// Zero-based start position in the prior-turn list.
+        start: u64,
+        /// Exclusive end position in the prior-turn list.
+        end_exclusive: u64,
+    },
+
     /// A recorded event sequence number was not the expected next value.
     #[error("event sequence mismatch: expected {expected}, actual {actual}")]
     SequenceMismatch {

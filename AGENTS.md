@@ -1,6 +1,8 @@
 # Agent Instructions for platonic-core
 
-This repo is the small Rust harness kernel for the planned Platonic / Plato Agent stack under Referential.
+This repo is the small Rust harness kernel for the Platonic framework. The
+workspace [naming authority](https://github.com/referential-ai/platonic-workspace/blob/main/product/branding.md)
+owns the hierarchy and exact forms.
 
 ## Rules
 
@@ -11,9 +13,9 @@ This repo is the small Rust harness kernel for the planned Platonic / Plato Agen
 - No silent provider fallback. Fallback is policy plus event log entry.
 - No `unsafe` in the core crate.
 - Prefer explicit types over stringly runtime behavior.
-- If a feature feels like Hermes-style sprawl, put it in an outer crate or a doc until proven.
+- If a feature exceeds the kernel boundary, reject it from this repo; do not create an outer crate or placeholder doc without separately admitted work.
 - Merge authority follows the workspace-root `AGENTS.md`; CI must be green and every issue- or PR-specific review and proof gate must be satisfied.
-- Simplicity directive (binding): extremely terse and minimal everywhere. Full text: `AGENTS.md` in `referential-ai/platonic-workspace`.
+- The workspace-root [Simplicity Directive](https://github.com/referential-ai/platonic-workspace/blob/main/AGENTS.md#simplicity-directive) is binding: every changed line must serve named acceptance; stop before scope widens.
 - Candidate split repos are not active implementation targets until the workspace approves the split through a `Ready for dev` issue/design.
 
 ## Verification

@@ -1,10 +1,10 @@
 # Naming
 
-## Surface naming
+## Authority
 
-- **Referential** — umbrella/company/product suite.
-- **Platonic** — harness core and architecture: clean forms, bounded abstractions, disciplined execution.
-- **Plato Agent** — planned usable agent product built on Platonic.
+The workspace [naming authority](https://github.com/referential-ai/platonic-workspace/blob/main/product/branding.md)
+owns the hierarchy and exact forms. This document only records core-specific
+technical vocabulary.
 
 Preferred GitHub layout:
 
@@ -28,4 +28,6 @@ These names are available for architecture docs and module concepts, not public 
 - **Prohodos** — forward execution/procession.
 - **Epistrophe** — replay/return/correction loop.
 
-Brand lives on packages (`platonic-core`, `plato-agent`); all code stays generic (`AgentId`, not `HenadId`; `Error`, not `PlatonicError`). Deep terms are documentation color only — never type names, fields, or serialized values.
+Technical identities remain unchanged. All code stays generic (`AgentId`, not
+`HenadId`; `Error`, not `PlatonicError`). Deep terms are documentation color
+only — never type names, fields, or serialized values.

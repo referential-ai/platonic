@@ -48,6 +48,21 @@ pub enum HarnessEvent {
         /// Lane-labeled context that must pass budget validation.
         context: ContextPack,
     },
+    /// Records prior turns omitted from the next model context.
+    ContextCompacted {
+        /// Run receiving the compacted context.
+        run_id: RunId,
+        /// Turn whose context will reflect the compaction.
+        turn_id: TurnId,
+        /// Estimated tokens before prior turns were dropped.
+        estimated_tokens_before: u32,
+        /// Estimated tokens after prior turns were dropped.
+        estimated_tokens_after: u32,
+        /// Zero-based first dropped prior-turn position.
+        dropped_turn_start: u64,
+        /// Exclusive end of the dropped prior-turn range.
+        dropped_turn_end_exclusive: u64,
+    },
     /// Records that a model request crossed the provider boundary.
     ModelRequested {
         /// Run making the request.
@@ -155,6 +170,7 @@ impl HarnessEvent {
         match self {
             Self::RunStarted { run_id, .. }
             | Self::ContextBuilt { run_id, .. }
+            | Self::ContextCompacted { run_id, .. }
             | Self::ModelRequested { run_id, .. }
             | Self::ModelResponded { run_id, .. }
             | Self::ToolCallProposed { run_id, .. }
@@ -174,6 +190,7 @@ impl HarnessEvent {
         match self {
             Self::RunStarted { .. } => "run_started",
             Self::ContextBuilt { .. } => "context_built",
+            Self::ContextCompacted { .. } => "context_compacted",
             Self::ModelRequested { .. } => "model_requested",
             Self::ModelResponded { .. } => "model_responded",
             Self::ToolCallProposed { .. } => "tool_call_proposed",
@@ -191,41 +208,335 @@ impl HarnessEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{EffectClass, ToolCallId, ToolName};
+    use super::{HarnessEvent, ModelUsage, RecordedEvent};
+    use crate::{
+        ActorId, AgentId, ArtifactId, ContextFragment, ContextLane, ContextPack, EffectClass,
+        Message, MessageRole, ModelName, PolicyDecision, ResultVisibility, RunId, ToolCall,
+        ToolCallId, ToolName, ToolProposal, ToolResult, TurnId,
+    };
     use serde_json::json;
 
     #[test]
-    fn harness_events_round_trip_as_json() {
-        let event = HarnessEvent::ToolCallProposed {
-            run_id: RunId::new("run_1").unwrap(),
-            turn_id: TurnId::new("turn_1").unwrap(),
-            call: ToolCall {
-                id: ToolCallId::new("call_1").unwrap(),
-                tool: ToolName::new("file.read").unwrap(),
-                effect: EffectClass::ReadOnly,
-                input: json!({ "path": "README.md" }),
-            },
-        };
+    fn recorded_event_json_fixtures_are_bidirectional() {
+        let run_id = RunId::new("run_1").unwrap();
+        let turn_id = TurnId::new("turn_1").unwrap();
+        let call_id = ToolCallId::new("call_1").unwrap();
+        let tool = ToolName::new("file.read").unwrap();
 
-        let encoded = serde_json::to_string(&event).unwrap();
-        let decoded: HarnessEvent = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn recorded_events_round_trip_as_json() {
-        let event = RecordedEvent {
-            seq: 0,
-            occurred_at_ms: 1_700_000_000_000,
-            event: HarnessEvent::RunStarted {
-                run_id: RunId::new("run_1").unwrap(),
+        let events = [
+            HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
                 agent_id: AgentId::new("agent_1").unwrap(),
             },
-        };
+            HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                context: ContextPack {
+                    token_budget: 2_048,
+                    fragments: vec![
+                        ContextFragment {
+                            lane: ContextLane::CurrentTask,
+                            source: "user".into(),
+                            content: "Summarize README.md".into(),
+                            estimated_tokens: 5,
+                        },
+                        ContextFragment {
+                            lane: ContextLane::RetrievedContext,
+                            source: "README.md".into(),
+                            content: "Platonic core".into(),
+                            estimated_tokens: 3,
+                        },
+                    ],
+                },
+            },
+            HarnessEvent::ContextCompacted {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                estimated_tokens_before: 4_096,
+                estimated_tokens_after: 2_048,
+                dropped_turn_start: 0,
+                dropped_turn_end_exclusive: 3,
+            },
+            HarnessEvent::ModelRequested {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 1,
+                model: ModelName::new("model_1").unwrap(),
+            },
+            HarnessEvent::ModelResponded {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 1,
+                output: Message {
+                    role: MessageRole::Assistant,
+                    content: "Reading the file.".into(),
+                },
+                proposed_calls: vec![ToolProposal {
+                    tool: tool.clone(),
+                    input: json!({ "path": "README.md" }),
+                }],
+                usage: ModelUsage {
+                    input_tokens: 12,
+                    output_tokens: 4,
+                },
+            },
+            HarnessEvent::ToolCallProposed {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                call: ToolCall {
+                    id: call_id.clone(),
+                    tool: tool.clone(),
+                    effect: EffectClass::ReadOnly,
+                    input: json!({ "path": "README.md" }),
+                },
+            },
+            HarnessEvent::PolicyEvaluated {
+                run_id: run_id.clone(),
+                call_id: call_id.clone(),
+                decision: PolicyDecision::RequireApproval {
+                    reason: "workspace write requires approval".into(),
+                },
+            },
+            HarnessEvent::ApprovalGranted {
+                run_id: run_id.clone(),
+                call_id: call_id.clone(),
+                actor_id: ActorId::new("actor_1").unwrap(),
+            },
+            HarnessEvent::ApprovalDenied {
+                run_id: run_id.clone(),
+                call_id: call_id.clone(),
+                actor_id: ActorId::new("actor_1").unwrap(),
+                reason: "not approved".into(),
+            },
+            HarnessEvent::ToolStarted {
+                run_id: run_id.clone(),
+                call_id: call_id.clone(),
+            },
+            HarnessEvent::ToolFinished {
+                run_id: run_id.clone(),
+                result: ToolResult {
+                    call_id: call_id.clone(),
+                    summary: "read 13 bytes".into(),
+                    data: json!({ "contents": "Platonic core" }),
+                    artifacts: vec![ArtifactId::new("artifact_1").unwrap()],
+                    visibility: ResultVisibility::Both,
+                },
+            },
+            HarnessEvent::ToolFailed {
+                run_id: run_id.clone(),
+                call_id,
+                reason: "file not found".into(),
+            },
+            HarnessEvent::RunFinished {
+                run_id: run_id.clone(),
+            },
+            HarnessEvent::RunFailed {
+                run_id,
+                reason: "model unavailable".into(),
+            },
+        ];
 
-        let encoded = serde_json::to_string(&event).unwrap();
-        let decoded: RecordedEvent = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded, event);
+        for event in events {
+            let name = event.name();
+            let fixture = match &event {
+                HarnessEvent::RunStarted { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "run_started",
+                        "run_id": "run_1",
+                        "agent_id": "agent_1"
+                    }
+                }),
+                HarnessEvent::ContextBuilt { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "context_built",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "context": {
+                            "token_budget": 2_048,
+                            "fragments": [
+                                {
+                                    "lane": "current_task",
+                                    "source": "user",
+                                    "content": "Summarize README.md",
+                                    "estimated_tokens": 5
+                                },
+                                {
+                                    "lane": "retrieved_context",
+                                    "source": "README.md",
+                                    "content": "Platonic core",
+                                    "estimated_tokens": 3
+                                }
+                            ]
+                        }
+                    }
+                }),
+                HarnessEvent::ContextCompacted { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "context_compacted",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "estimated_tokens_before": 4_096,
+                        "estimated_tokens_after": 2_048,
+                        "dropped_turn_start": 0,
+                        "dropped_turn_end_exclusive": 3
+                    }
+                }),
+                HarnessEvent::ModelRequested { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "model_requested",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 1,
+                        "model": "model_1"
+                    }
+                }),
+                HarnessEvent::ModelResponded { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "model_responded",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 1,
+                        "output": {
+                            "role": "assistant",
+                            "content": "Reading the file."
+                        },
+                        "proposed_calls": [
+                            {
+                                "tool": "file.read",
+                                "input": { "path": "README.md" }
+                            }
+                        ],
+                        "usage": {
+                            "input_tokens": 12,
+                            "output_tokens": 4
+                        }
+                    }
+                }),
+                HarnessEvent::ToolCallProposed { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "tool_call_proposed",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "call": {
+                            "id": "call_1",
+                            "tool": "file.read",
+                            "effect": "read_only",
+                            "input": { "path": "README.md" }
+                        }
+                    }
+                }),
+                HarnessEvent::PolicyEvaluated { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "policy_evaluated",
+                        "run_id": "run_1",
+                        "call_id": "call_1",
+                        "decision": {
+                            "decision": "require_approval",
+                            "reason": "workspace write requires approval"
+                        }
+                    }
+                }),
+                HarnessEvent::ApprovalGranted { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "approval_granted",
+                        "run_id": "run_1",
+                        "call_id": "call_1",
+                        "actor_id": "actor_1"
+                    }
+                }),
+                HarnessEvent::ApprovalDenied { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "approval_denied",
+                        "run_id": "run_1",
+                        "call_id": "call_1",
+                        "actor_id": "actor_1",
+                        "reason": "not approved"
+                    }
+                }),
+                HarnessEvent::ToolStarted { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "tool_started",
+                        "run_id": "run_1",
+                        "call_id": "call_1"
+                    }
+                }),
+                HarnessEvent::ToolFinished { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "tool_finished",
+                        "run_id": "run_1",
+                        "result": {
+                            "call_id": "call_1",
+                            "summary": "read 13 bytes",
+                            "data": { "contents": "Platonic core" },
+                            "artifacts": ["artifact_1"],
+                            "visibility": "both"
+                        }
+                    }
+                }),
+                HarnessEvent::ToolFailed { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "tool_failed",
+                        "run_id": "run_1",
+                        "call_id": "call_1",
+                        "reason": "file not found"
+                    }
+                }),
+                HarnessEvent::RunFinished { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "run_finished",
+                        "run_id": "run_1"
+                    }
+                }),
+                HarnessEvent::RunFailed { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "run_failed",
+                        "run_id": "run_1",
+                        "reason": "model unavailable"
+                    }
+                }),
+            };
+
+            let expected = RecordedEvent {
+                seq: 7,
+                occurred_at_ms: 1_700_000_000_000,
+                event,
+            };
+            let decoded: RecordedEvent = serde_json::from_value(fixture.clone()).unwrap();
+
+            assert_eq!(decoded, expected, "failed to decode {name} fixture");
+            assert_eq!(
+                serde_json::to_value(&expected).unwrap(),
+                fixture,
+                "failed to encode {name} fixture"
+            );
+        }
     }
 }

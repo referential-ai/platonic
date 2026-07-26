@@ -134,6 +134,7 @@ Large raw output should be stored as an artifact and summarized for the model.
 The durable ledger. Initial events include:
 
 - `run_started`
+- `context_compacted`
 - `context_built`
 - `model_requested`
 - `model_responded`
@@ -149,6 +150,8 @@ The durable ledger. Initial events include:
 
 Events are recorded wrapped in `RecordedEvent { seq, occurred_at_ms, event }`; hosts supply both fields — core never reads clocks. `seq` is per-run and contiguous from 0; the run machine rejects gaps and regressions. Store append is idempotent on `(run_id, seq)`; ordering across runs is a store concern. Correlation: tool events carry `call_id`; model request/response pairs carry a per-run `step` counter. Ledger variants are never cargo-feature-gated: one schema, always readable.
 
+`context_compacted` records a non-empty prior-turn range and must be followed by `context_built` for the same turn, or by `run_failed`. It emits no command and leaves the public run phase unchanged.
+
 Future storage backends can persist these events to SQLite, Postgres, files, or an append-only log.
 
 ## Possible vocabulary, not committed modules
@@ -156,7 +159,6 @@ Future storage backends can persist these events to SQLite, Postgres, files, or 
 Hermes-shaped needs not every embedding wants. None exists until a run forces it; each enters as events/types only — engines stay outside core.
 
 - delegation — parent/child run linkage with budget inheritance (plausible early).
-- compaction — context compression proposed/applied as recorded policy events; never silent (plausible early).
 - memory — retrieval query/hit types entering via the `retrieved_context` lane; never a store (wait).
 - scheduling — job/trigger/triage vocabulary so unattended runs route findings to triage, not user spam (wait).
 
@@ -194,7 +196,7 @@ platonic-provider   model-provider adapter traits
 platonic-tools      tool registry and schema validation
 platonic-store      event store implementations
 platonic-replay     replay/caching engine
-plato-agent         CLI/product agent built on Platonic
+plato-agent         Plato Agent application/reference runtime
 ```
 
 Do not create these crates until the core contract needs them.
