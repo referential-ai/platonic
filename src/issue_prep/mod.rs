@@ -204,6 +204,7 @@ where
         model: manifest.model.clone(),
         system: manifest.system_prompt.clone(),
         max_output_tokens: manifest.max_output_tokens,
+        reasoning_effort: None,
         messages: vec![ModelMessage::user_text(&prompt)],
         tools: vec![],
     })?;

@@ -1,3 +1,4 @@
+use crate::model::RunOverrides;
 use platonic_core::EffectClass;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -147,6 +148,8 @@ pub struct RunStartParams {
     pub question: String,
     #[serde(default)]
     pub config_path: Option<String>,
+    #[serde(default, skip_serializing_if = "RunOverrides::is_empty")]
+    pub overrides: RunOverrides,
     #[serde(default)]
     pub wait: Option<bool>,
 }
@@ -168,6 +171,8 @@ pub struct MessageAppendParams {
     pub session_id: Option<String>,
     #[serde(default)]
     pub config_path: Option<String>,
+    #[serde(default, skip_serializing_if = "RunOverrides::is_empty")]
+    pub overrides: RunOverrides,
     #[serde(default)]
     pub wait: Option<bool>,
 }
@@ -414,6 +419,39 @@ mod tests {
                 state
             );
         }
+    }
+
+    #[test]
+    fn run_overrides_are_additive_and_omitted_by_default() {
+        let legacy: RunStartParams = serde_json::from_value(json!({
+            "question": "hello",
+            "wait": false
+        }))
+        .unwrap();
+        assert_eq!(legacy.overrides, RunOverrides::default());
+        assert!(
+            serde_json::to_value(legacy)
+                .unwrap()
+                .get("overrides")
+                .is_none()
+        );
+
+        let current = RunStartParams {
+            question: "hello".into(),
+            config_path: None,
+            overrides: RunOverrides {
+                model: Some("openai/gpt-5".into()),
+                reasoning_effort: Some(crate::model::ReasoningEffort::High),
+            },
+            wait: Some(false),
+        };
+        assert_eq!(
+            serde_json::to_value(current).unwrap()["overrides"],
+            json!({
+                "model": "openai/gpt-5",
+                "reasoning_effort": "high"
+            })
+        );
     }
 
     #[test]

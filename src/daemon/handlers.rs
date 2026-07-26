@@ -20,6 +20,7 @@ use crate::{
     },
     issue_prep::{IssuePrepOptions, IssuePrepOutcome, run_issue_prep},
     ledger::{SessionRunRecords, SqliteLedger},
+    model::RunOverrides,
     new_run_id, new_session_id,
     paths::DefaultSqlitePath,
     replay::{format_readback, format_session_readback},
@@ -155,12 +156,12 @@ fn handle_run_start(
     start_run(
         runtime,
         request.id,
-        "run.start",
         params.question,
         RunSession::Fresh {
             session_id: new_session_id(),
         },
         params.config_path,
+        params.overrides,
         params.wait,
     )
 }
@@ -193,10 +194,10 @@ fn handle_message_append(
     start_run(
         runtime,
         request.id,
-        "message.append",
         params.message,
         RunSession::Continue { session_id },
         params.config_path,
+        params.overrides,
         params.wait,
     )
 }
@@ -271,12 +272,16 @@ fn handle_issue_prep_start(
 fn start_run(
     runtime: &DaemonRuntime,
     request_id: Option<String>,
-    method: &'static str,
     question: String,
     session: RunSession,
     config_path: Option<String>,
+    overrides: RunOverrides,
     wait: Option<bool>,
 ) -> Envelope {
+    let method = match &session {
+        RunSession::Fresh { .. } => "run.start",
+        RunSession::Continue { .. } => "message.append",
+    };
     let session_id = session.session_id().to_string();
     let run_id = match new_run_id() {
         Ok(run_id) => run_id,
@@ -318,6 +323,7 @@ fn start_run(
     let options = RunOptions {
         question,
         config_path: config_path.map(PathBuf::from),
+        overrides,
         ledger: RunLedger::DefaultSqlite(runtime.paths.default_ledger()),
         workspace_root: runtime.paths.workspace_root.clone(),
         approval_mode: ApprovalMode::external("daemon", approval_handler(record.clone())),

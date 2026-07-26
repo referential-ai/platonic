@@ -1,6 +1,9 @@
 use crate::{
     AppError, AppResult,
-    model::{ModelBlock, ModelMessage, ModelRequest, ModelResponse, ModelRole, ModelStop},
+    model::{
+        ModelBlock, ModelMessage, ModelRequest, ModelResponse, ModelRole, ModelStop,
+        ReasoningEffort,
+    },
     tool_catalog::{ToolSpec, internal_name_for_provider, provider_name_for_internal},
 };
 use platonic_core::ModelUsage;
@@ -125,6 +128,10 @@ struct ChatCompletionRequest {
     tool_choice: &'static str,
     parallel_tool_calls: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<OpenRouterReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<ChatStreamOptions>,
@@ -132,6 +139,11 @@ struct ChatCompletionRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenRouterReasoning {
+    effort: ReasoningEffort,
 }
 
 #[derive(Debug, Serialize)]
@@ -282,12 +294,24 @@ impl ChatCompletionRequest {
             messages.push(ChatMessage::from_model_message(message)?);
         }
 
+        let (reasoning_effort, reasoning) = match token_limit_field {
+            TokenLimitField::MaxTokens => (
+                None,
+                request
+                    .reasoning_effort
+                    .map(|effort| OpenRouterReasoning { effort }),
+            ),
+            TokenLimitField::MaxCompletionTokens => (request.reasoning_effort, None),
+        };
+
         Ok(Self {
             model: request.model.clone(),
             messages,
             tools: request.tools.iter().map(ChatTool::from_tool_spec).collect(),
             tool_choice: "auto",
             parallel_tool_calls: false,
+            reasoning_effort,
+            reasoning,
             stream: None,
             stream_options: None,
             max_tokens: matches!(token_limit_field, TokenLimitField::MaxTokens)
@@ -749,14 +773,51 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_serializes_reasoning_as_nested_effort() {
+        let request = reasoning_request(Some(ReasoningEffort::High));
+
+        let body = ChatCompletionRequest::from_model_request(&request, TokenLimitField::MaxTokens)
+            .unwrap();
+        let value = serde_json::to_value(body).unwrap();
+
+        assert_eq!(value["reasoning"], json!({"effort": "high"}));
+        assert!(value.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn openai_serializes_reasoning_as_top_level_effort() {
+        let request = reasoning_request(Some(ReasoningEffort::Medium));
+
+        let body = ChatCompletionRequest::from_model_request(
+            &request,
+            TokenLimitField::MaxCompletionTokens,
+        )
+        .unwrap();
+        let value = serde_json::to_value(body).unwrap();
+
+        assert_eq!(value["reasoning_effort"], "medium");
+        assert!(value.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn provider_request_omits_unspecified_reasoning() {
+        for token_limit_field in [
+            TokenLimitField::MaxTokens,
+            TokenLimitField::MaxCompletionTokens,
+        ] {
+            let request = reasoning_request(None);
+            let body =
+                ChatCompletionRequest::from_model_request(&request, token_limit_field).unwrap();
+            let value = serde_json::to_value(body).unwrap();
+
+            assert!(value.get("reasoning").is_none());
+            assert!(value.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
     fn streaming_request_includes_usage_stream_options() {
-        let request = ModelRequest {
-            model: "test-model".into(),
-            system: "system".into(),
-            max_output_tokens: 32,
-            messages: vec![ModelMessage::user_text("hello")],
-            tools: Vec::new(),
-        };
+        let request = reasoning_request(None);
         let mut body =
             ChatCompletionRequest::from_model_request(&request, TokenLimitField::MaxTokens)
                 .unwrap();
@@ -769,6 +830,17 @@ mod tests {
         let value = serde_json::to_value(body).unwrap();
         assert_eq!(value["stream"], true);
         assert_eq!(value["stream_options"]["include_usage"], true);
+    }
+
+    fn reasoning_request(reasoning_effort: Option<ReasoningEffort>) -> ModelRequest {
+        ModelRequest {
+            model: "test-model".into(),
+            system: "system".into(),
+            max_output_tokens: 32,
+            reasoning_effort,
+            messages: vec![ModelMessage::user_text("hello")],
+            tools: Vec::new(),
+        }
     }
 
     #[test]

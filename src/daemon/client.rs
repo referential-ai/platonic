@@ -10,6 +10,7 @@ use crate::{
         },
         transport::{self, Stream},
     },
+    model::RunOverrides,
     paths,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -119,11 +120,22 @@ impl DaemonClient {
         config_path: Option<String>,
         wait: bool,
     ) -> AppResult<RunStartResult> {
+        self.run_start_with_overrides(question, config_path, RunOverrides::default(), wait)
+    }
+
+    pub fn run_start_with_overrides(
+        &mut self,
+        question: String,
+        config_path: Option<String>,
+        overrides: RunOverrides,
+        wait: bool,
+    ) -> AppResult<RunStartResult> {
         self.request(
             "run.start",
             RunStartParams {
                 question,
                 config_path,
+                overrides,
                 wait: Some(wait),
             },
         )
@@ -145,12 +157,30 @@ impl DaemonClient {
         config_path: Option<String>,
         wait: bool,
     ) -> AppResult<RunStartResult> {
+        self.message_append_to_session_with_overrides(
+            message,
+            session_id,
+            config_path,
+            RunOverrides::default(),
+            wait,
+        )
+    }
+
+    pub fn message_append_to_session_with_overrides(
+        &mut self,
+        message: String,
+        session_id: Option<String>,
+        config_path: Option<String>,
+        overrides: RunOverrides,
+        wait: bool,
+    ) -> AppResult<RunStartResult> {
         self.request(
             "message.append",
             MessageAppendParams {
                 message,
                 session_id,
                 config_path,
+                overrides,
                 wait: Some(wait),
             },
         )
