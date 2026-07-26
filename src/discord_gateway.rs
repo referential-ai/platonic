@@ -3,11 +3,13 @@ use crate::{
     config::{Config, DiscordGatewayConfig, ResolvedConfigPath, resolve_config},
     daemon::{
         client::{DaemonClient, DaemonConnectionConfig},
-        protocol::{HelloResult, RunStateName, TranscriptReadResult},
+        protocol::{
+            BufferedStreamEvent, HelloResult, RunStateName, StreamEvent, TranscriptReadResult,
+        },
     },
     model::{ReasoningEffort, RunOverrides},
 };
-use platonic_core::ModelName;
+use platonic_core::{HarnessEvent, ModelName};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -484,11 +486,11 @@ struct PendingApprovalNotification {
 }
 
 impl ApprovalNotifications {
-    fn fold(&mut self, entries: &[Value]) -> bool {
+    fn fold(&mut self, entries: &[BufferedStreamEvent]) -> bool {
         let mut canceled = false;
         for entry in entries {
-            let event = entry.get("event").unwrap_or(entry);
-            if event.get("kind").and_then(Value::as_str) == Some("canceled") {
+            let event = &entry.event;
+            if matches!(event, StreamEvent::Canceled { .. }) {
                 self.clear();
                 canceled = true;
                 continue;
@@ -496,26 +498,30 @@ impl ApprovalNotifications {
             if let Some((call_id, preview)) = tool_input_preview(event) {
                 self.input_previews.insert(call_id, preview);
             }
-            if event.get("kind").and_then(Value::as_str) == Some("approval_requested") {
-                let Some(call_id) = event.get("tool_call_id").and_then(Value::as_str) else {
-                    continue;
-                };
+            if let StreamEvent::ApprovalRequested {
+                tool_call_id,
+                tool_name,
+                effect,
+                diff_preview,
+                approval_preview,
+                ..
+            } = event
+            {
                 self.pending = Some(PendingApprovalNotification {
-                    call_id: call_id.into(),
-                    tool_name: event
-                        .get("tool_name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown tool")
-                        .into(),
-                    effect: event
-                        .get("effect")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown effect")
-                        .into(),
-                    preview: event
-                        .get("diff_preview")
-                        .and_then(non_empty_string)
-                        .or_else(|| event.get("approval_preview").and_then(non_empty_string))
+                    call_id: tool_call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    effect: serde_json::to_value(effect)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "unknown effect".into()),
+                    preview: diff_preview
+                        .as_deref()
+                        .filter(|preview| !preview.is_empty())
+                        .or_else(|| {
+                            approval_preview
+                                .as_deref()
+                                .filter(|preview| !preview.is_empty())
+                        })
                         .map(str::to_owned),
                     notified: false,
                 });
@@ -559,33 +565,26 @@ impl ApprovalNotifications {
     }
 }
 
-fn non_empty_string(value: &Value) -> Option<&str> {
-    value.as_str().filter(|value| !value.is_empty())
+fn tool_input_preview(event: &StreamEvent) -> Option<(String, String)> {
+    let StreamEvent::Ledger { record } = event else {
+        return None;
+    };
+    let HarnessEvent::ToolCallProposed { call, .. } = &record.event else {
+        return None;
+    };
+    let preview = serde_json::to_string_pretty(&call.input).ok()?;
+    Some((call.id.to_string(), preview))
 }
 
-fn tool_input_preview(event: &Value) -> Option<(String, String)> {
-    if event.get("kind").and_then(Value::as_str) != Some("ledger")
-        || event.pointer("/record/event/event").and_then(Value::as_str)
-            != Some("tool_call_proposed")
-    {
+fn approval_resolution_call_id(event: &StreamEvent) -> Option<&str> {
+    let StreamEvent::Ledger { record } = event else {
         return None;
+    };
+    match &record.event {
+        HarnessEvent::ApprovalGranted { call_id, .. }
+        | HarnessEvent::ApprovalDenied { call_id, .. } => Some(call_id.as_str()),
+        _ => None,
     }
-    let call_id = event.pointer("/record/event/call/id")?.as_str()?.to_owned();
-    let input = event.pointer("/record/event/call/input")?;
-    let preview = serde_json::to_string_pretty(input).ok()?;
-    Some((call_id, preview))
-}
-
-fn approval_resolution_call_id(event: &Value) -> Option<&str> {
-    if event.get("kind").and_then(Value::as_str) != Some("ledger")
-        || !matches!(
-            event.pointer("/record/event/event").and_then(Value::as_str),
-            Some("approval_granted" | "approval_denied")
-        )
-    {
-        return None;
-    }
-    event.pointer("/record/event/call_id")?.as_str()
 }
 
 fn approval_notification(tool_name: &str, effect: &str, preview: &str) -> String {
@@ -1965,6 +1964,32 @@ mod tests {
         protocol::{CloseFrame, frame::coding::CloseCode},
     };
 
+    fn buffered_event(offset: u64, event: Value) -> BufferedStreamEvent {
+        serde_json::from_value(json!({"offset": offset, "event": event})).unwrap()
+    }
+
+    fn ledger_event(offset: u64, event: Value) -> BufferedStreamEvent {
+        buffered_event(
+            offset,
+            json!({
+                "kind": "ledger",
+                "record": {
+                    "seq": offset,
+                    "occurred_at_ms": offset,
+                    "event": event
+                }
+            }),
+        )
+    }
+
+    fn buffered_event_json(offset: u64, event: Value) -> Value {
+        serde_json::to_value(buffered_event(offset, event)).unwrap()
+    }
+
+    fn ledger_event_json(offset: u64, event: Value) -> Value {
+        serde_json::to_value(ledger_event(offset, event)).unwrap()
+    }
+
     #[test]
     fn gateway_environment_rejects_provider_credentials() {
         let config = Config::default();
@@ -2466,39 +2491,43 @@ mod tests {
         let mut approvals = ApprovalNotifications::default();
         let long_preview = "界".repeat(DISCORD_MESSAGE_LIMIT);
         let _ = approvals.fold(&[
-            json!({
-                "event": {
+            buffered_event(
+                0,
+                json!({
                     "kind": "approval_requested",
+                    "run_id": "run_1",
                     "tool_call_id": "call_1",
                     "tool_name": "file.edit",
                     "effect": "workspace_write",
+                    "reason": "approval required",
                     "diff_preview": long_preview
-                }
-            }),
-            json!({
-                "event": {
-                    "kind": "ledger",
-                    "record": {
-                        "event": {
-                            "event": "approval_granted",
-                            "call_id": "call_1"
-                        }
-                    }
-                }
-            }),
+                }),
+            ),
+            ledger_event(
+                1,
+                json!({
+                    "event": "approval_granted",
+                    "run_id": "run_1",
+                    "call_id": "call_1",
+                    "actor_id": "human_1"
+                }),
+            ),
         ]);
 
         assert_eq!(approvals.take_notification(), None);
 
-        let _ = approvals.fold(&[json!({
-            "event": {
+        let _ = approvals.fold(&[buffered_event(
+            2,
+            json!({
                 "kind": "approval_requested",
+                "run_id": "run_1",
                 "tool_call_id": "call_2",
                 "tool_name": "file.edit",
                 "effect": "workspace_write",
+                "reason": "approval required",
                 "diff_preview": "界".repeat(DISCORD_MESSAGE_LIMIT)
-            }
-        })]);
+            }),
+        )]);
         let message = approvals.take_notification().unwrap();
         assert!(message.chars().count() <= DISCORD_MESSAGE_LIMIT);
         assert!(message.ends_with("Grant or deny it locally in `plato-tui`."));
@@ -2509,21 +2538,25 @@ mod tests {
     fn approval_fold_suppresses_a_request_canceled_while_status_is_running() {
         let mut approvals = ApprovalNotifications::default();
         let canceled = approvals.fold(&[
-            json!({
-                "event": {
+            buffered_event(
+                0,
+                json!({
                     "kind": "approval_requested",
+                    "run_id": "run_1",
                     "tool_call_id": "call_1",
                     "tool_name": "file.write",
                     "effect": "workspace_write",
+                    "reason": "approval required",
                     "approval_preview": "write note.txt"
-                }
-            }),
-            json!({
-                "event": {
+                }),
+            ),
+            buffered_event(
+                1,
+                json!({
                     "kind": "canceled",
                     "run_id": "run_1"
-                }
-            }),
+                }),
+            ),
         ]);
 
         assert_eq!(approvals.take_notification(), None);
@@ -2545,29 +2578,39 @@ mod tests {
     #[test]
     fn approval_fold_normalizes_transient_and_durable_call_ids() {
         let mut approvals = ApprovalNotifications::default();
-        let _ = approvals.fold(&[json!({
-            "event": {
+        let _ = approvals.fold(&[buffered_event(
+            0,
+            json!({
                 "kind": "approval_requested",
+                "run_id": "run_1",
                 "tool_call_id": "call_1",
                 "tool_name": "file.write",
                 "effect": "workspace_write",
+                "reason": "approval required",
                 "approval_preview": "write note.txt"
-            }
-        })]);
-        let _ = approvals.fold(&[json!({
-            "event": {
-                "kind": "ledger",
-                "record": {"event": {"event": "approval_denied", "call_id": "call_2"}}
-            }
-        })]);
+            }),
+        )]);
+        let _ = approvals.fold(&[ledger_event(
+            1,
+            json!({
+                "event": "approval_denied",
+                "run_id": "run_1",
+                "call_id": "call_2",
+                "actor_id": "human_1",
+                "reason": "denied"
+            }),
+        )]);
         assert!(approvals.pending.is_some());
 
-        let _ = approvals.fold(&[json!({
-            "event": {
-                "kind": "ledger",
-                "record": {"event": {"event": "approval_granted", "call_id": "call_1"}}
-            }
-        })]);
+        let _ = approvals.fold(&[ledger_event(
+            2,
+            json!({
+                "event": "approval_granted",
+                "run_id": "run_1",
+                "call_id": "call_1",
+                "actor_id": "human_1"
+            }),
+        )]);
         assert!(approvals.pending.is_none());
     }
 
@@ -4019,16 +4062,18 @@ mod tests {
             );
 
             let catch_up = read_daemon_request(&mut reader);
-            let mut events = vec![json!({
-                "offset": 0,
-                "event": {
+            let mut events = vec![buffered_event_json(
+                0,
+                json!({
                     "kind": "approval_requested",
+                    "run_id": "run_1",
                     "tool_call_id": "call_1",
                     "tool_name": "file.write",
                     "effect": "workspace_write",
+                    "reason": "approval required",
                     "approval_preview": "write note.txt"
-                }
-            })];
+                }),
+            )];
             events.extend(
                 (1..EVENT_PAGE_LIMIT)
                     .map(|offset| json!({"offset": offset, "event": {"kind": "delta"}})),
@@ -4047,15 +4092,15 @@ mod tests {
             );
 
             let resolution = read_daemon_request(&mut reader);
-            let mut events = vec![json!({
-                "offset": EVENT_PAGE_LIMIT,
-                "event": {
-                    "kind": "ledger",
-                    "record": {
-                        "event": {"event": "approval_granted", "call_id": "call_1"}
-                    }
-                }
-            })];
+            let mut events = vec![ledger_event_json(
+                EVENT_PAGE_LIMIT as u64,
+                json!({
+                    "event": "approval_granted",
+                    "run_id": "run_1",
+                    "call_id": "call_1",
+                    "actor_id": "human_1"
+                }),
+            )];
             events.extend((1..EVENT_PAGE_LIMIT).map(|offset| {
                 json!({
                     "offset": EVENT_PAGE_LIMIT + offset,
@@ -4158,34 +4203,28 @@ mod tests {
                     "next_offset": 2,
                     "status": "running",
                     "events": [
-                        {
-                            "offset": 0,
-                            "event": {
-                                "kind": "approval_requested",
-                                "run_id": "run_1",
-                                "tool_call_id": "call_1",
-                                "tool_name": "file.write",
+                        buffered_event_json(0, json!({
+                            "kind": "approval_requested",
+                            "run_id": "run_1",
+                            "tool_call_id": "call_1",
+                            "tool_name": "file.write",
+                            "effect": "workspace_write",
+                            "reason": "approval required"
+                        })),
+                        ledger_event_json(1, json!({
+                            "event": "tool_call_proposed",
+                            "run_id": "run_1",
+                            "turn_id": "turn_1",
+                            "call": {
+                                "id": "call_1",
+                                "tool": "file.write",
                                 "effect": "workspace_write",
-                                "reason": "approval required"
-                            }
-                        },
-                        {
-                            "offset": 1,
-                            "event": {
-                                "kind": "ledger",
-                                "record": {
-                                    "event": {
-                                        "event": "tool_call_proposed",
-                                        "call": {
-                                            "id": "call_1",
-                                            "tool": "file.write",
-                                            "effect": "workspace_write",
-                                            "input": {"path": "note.txt", "content": "hello"}
-                                        }
-                                    }
+                                "input": {
+                                    "path": "note.txt",
+                                    "content": "hello"
                                 }
                             }
-                        }
+                        }))
                     ]
                 }),
             );
@@ -4202,18 +4241,12 @@ mod tests {
                     "from_offset": 2,
                     "next_offset": 3,
                     "status": "running",
-                    "events": [{
-                        "offset": 2,
-                        "event": {
-                            "kind": "ledger",
-                            "record": {
-                                "event": {
-                                    "event": "approval_granted",
-                                    "call_id": "call_1"
-                                }
-                            }
-                        }
-                    }]
+                    "events": [ledger_event_json(2, json!({
+                        "event": "approval_granted",
+                        "run_id": "run_1",
+                        "call_id": "call_1",
+                        "actor_id": "human_1"
+                    }))]
                 }),
             );
 
@@ -4283,28 +4316,21 @@ mod tests {
                     "next_offset": 2,
                     "status": "finished",
                     "events": [
-                        {
-                            "offset": 0,
-                            "event": {
-                                "kind": "approval_requested",
-                                "tool_call_id": "call_1",
-                                "tool_name": "file.write",
-                                "effect": "workspace_write",
-                                "approval_preview": "write note.txt"
-                            }
-                        },
-                        {
-                            "offset": 1,
-                            "event": {
-                                "kind": "ledger",
-                                "record": {
-                                    "event": {
-                                        "event": "approval_granted",
-                                        "call_id": "call_1"
-                                    }
-                                }
-                            }
-                        }
+                        buffered_event_json(0, json!({
+                            "kind": "approval_requested",
+                            "run_id": "run_1",
+                            "tool_call_id": "call_1",
+                            "tool_name": "file.write",
+                            "effect": "workspace_write",
+                            "reason": "approval required",
+                            "approval_preview": "write note.txt"
+                        })),
+                        ledger_event_json(1, json!({
+                            "event": "approval_granted",
+                            "run_id": "run_1",
+                            "call_id": "call_1",
+                            "actor_id": "human_1"
+                        }))
                     ]
                 }),
             );
@@ -4499,17 +4525,19 @@ mod tests {
                     "next_offset": 2,
                     "status": "running",
                     "events": [
-                        {
-                            "offset": 0,
-                            "event": {
-                                "kind": "approval_requested",
-                                "tool_call_id": "call_1",
-                                "tool_name": "file.write",
-                                "effect": "workspace_write",
-                                "approval_preview": "write note.txt"
-                            }
-                        },
-                        {"offset": 1, "event": {"kind": "canceled", "run_id": "run_1"}}
+                        buffered_event_json(0, json!({
+                            "kind": "approval_requested",
+                            "run_id": "run_1",
+                            "tool_call_id": "call_1",
+                            "tool_name": "file.write",
+                            "effect": "workspace_write",
+                            "reason": "approval required",
+                            "approval_preview": "write note.txt"
+                        })),
+                        buffered_event_json(
+                            1,
+                            json!({"kind": "canceled", "run_id": "run_1"})
+                        )
                     ]
                 }),
             );
@@ -4639,16 +4667,15 @@ mod tests {
                         "from_offset": 0,
                         "next_offset": 1,
                         "status": "running",
-                        "events": [{
-                            "offset": 0,
-                            "event": {
-                                "kind": "approval_requested",
-                                "tool_call_id": "call_1",
-                                "tool_name": "file.write",
-                                "effect": "workspace_write",
-                                "approval_preview": "write note.txt"
-                            }
-                        }]
+                        "events": [buffered_event_json(0, json!({
+                            "kind": "approval_requested",
+                            "run_id": "run_1",
+                            "tool_call_id": "call_1",
+                            "tool_name": "file.write",
+                            "effect": "workspace_write",
+                            "reason": "approval required",
+                            "approval_preview": "write note.txt"
+                        }))]
                     }),
                 );
                 let reconnecting = read_daemon_request(&mut reader);
@@ -4758,16 +4785,15 @@ mod tests {
                     "from_offset": 0,
                     "next_offset": 1,
                     "status": "running",
-                    "events": [{
-                        "offset": 0,
-                        "event": {
-                            "kind": "approval_requested",
-                            "tool_call_id": "call_1",
-                            "tool_name": "file.write",
-                            "effect": "workspace_write",
-                            "approval_preview": "write note.txt"
-                        }
-                    }]
+                    "events": [buffered_event_json(0, json!({
+                        "kind": "approval_requested",
+                        "run_id": "run_1",
+                        "tool_call_id": "call_1",
+                        "tool_name": "file.write",
+                        "effect": "workspace_write",
+                        "reason": "approval required",
+                        "approval_preview": "write note.txt"
+                    }))]
                 }),
             );
             let lagged = read_daemon_request(&mut reader);

@@ -4,7 +4,7 @@ use crate::{
     daemon::protocol::{
         CommandAcceptedResult, ERROR_LAGGED, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
         ERROR_WORKSPACE_MISMATCH, EventsStreamResult, IssuePrepResult, IssuePrepStartResult,
-        RunStartResult, RunStateName,
+        RunStartResult, RunStateName, StreamEvent,
     },
     tui::{ActiveRunView, TranscriptState, TranscriptView, TuiState, render, render_snapshot},
 };
@@ -1358,11 +1358,12 @@ fn apply_events_result(
     runtime.polling = result.status == RunStateName::Running || needs_catch_up;
     state.stream_warning = None;
     state.active_run = Some(ActiveRunView::new(result.run_id.clone(), result.status));
-    for event in result.events {
-        if let Some(model) = crate::tui::model_from_event(&event) {
+    for buffered in result.events {
+        let event = &buffered.event;
+        if let Some(model) = crate::tui::model_from_event(event) {
             state.active_model = Some(model);
         }
-        if let Some((call_id, input_preview)) = crate::tui::tool_input_preview_from_event(&event) {
+        if let Some((call_id, input_preview)) = crate::tui::tool_input_preview_from_event(event) {
             runtime
                 .tool_inputs
                 .insert(call_id.clone(), input_preview.clone());
@@ -1373,16 +1374,17 @@ fn apply_events_result(
             }
         }
         if let Some(approval) = crate::tui::approval_from_event(
-            &event,
-            event
-                .get("event")
-                .and_then(|event| event.get("tool_call_id"))
-                .and_then(|call_id| call_id.as_str())
-                .and_then(|call_id| runtime.tool_inputs.get(call_id).cloned()),
+            event,
+            match event {
+                StreamEvent::ApprovalRequested { tool_call_id, .. } => {
+                    runtime.tool_inputs.get(tool_call_id).cloned()
+                }
+                _ => None,
+            },
         ) {
             state.approval = Some(approval);
         }
-        let line = crate::tui::live_event_line(&event);
+        let line = crate::tui::live_event_line(&buffered);
         push_live_event(state, line);
     }
     if needs_catch_up {
@@ -1792,10 +1794,28 @@ impl Drop for TerminalSession {
 mod tests {
     use super::*;
     use crate::{
-        daemon::protocol::{HelloResult, ProtocolError, SessionSummary},
+        daemon::protocol::{BufferedStreamEvent, HelloResult, ProtocolError, SessionSummary},
         tui::TranscriptState,
     };
     use serde_json::json;
+
+    fn buffered_event(offset: u64, event: serde_json::Value) -> BufferedStreamEvent {
+        serde_json::from_value(json!({"offset": offset, "event": event})).unwrap()
+    }
+
+    fn ledger_event(offset: u64, event: serde_json::Value) -> BufferedStreamEvent {
+        buffered_event(
+            offset,
+            json!({
+                "kind": "ledger",
+                "record": {
+                    "seq": offset,
+                    "occurred_at_ms": offset,
+                    "event": event
+                }
+            }),
+        )
+    }
 
     fn press_key(
         key: KeyEvent,
@@ -2621,17 +2641,10 @@ mod tests {
             from_offset: 0,
             next_offset: 2,
             status: RunStateName::Finished,
-            events: vec![json!({
-                "offset": 1,
-                "event": {
-                    "kind": "ledger",
-                    "record": {
-                        "event": {
-                            "event": "run_finished"
-                        }
-                    }
-                }
-            })],
+            events: vec![ledger_event(
+                1,
+                json!({"event": "run_finished", "run_id": "run_1"}),
+            )],
         };
 
         apply_events_result(&mut state, &mut runtime, &sender, result);
@@ -2661,17 +2674,17 @@ mod tests {
         };
         let events = (0..500)
             .map(|index| {
-                json!({
-                    "offset": index,
-                    "event": {
+                buffered_event(
+                    index,
+                    json!({
                         "kind": "assistant_delta",
                         "run_id": "run_1",
                         "turn_id": "turn_1",
                         "step": 0,
                         "delta_index": index,
                         "text": "x"
-                    }
-                })
+                    }),
+                )
             })
             .collect::<Vec<_>>();
 
@@ -2714,13 +2727,17 @@ mod tests {
         };
         let events = (0..EVENT_LIMIT)
             .map(|index| {
-                json!({
-                    "offset": index,
-                    "event": {
+                buffered_event(
+                    index as u64,
+                    json!({
                         "kind": "assistant_delta",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 0,
+                        "delta_index": index,
                         "text": "x"
-                    }
-                })
+                    }),
+                )
             })
             .collect::<Vec<_>>();
 
@@ -2775,18 +2792,16 @@ mod tests {
                 from_offset: 0,
                 next_offset: 1,
                 status: RunStateName::Running,
-                events: vec![json!({
-                    "offset": 0,
-                    "event": {
-                        "kind": "ledger",
-                        "record": {
-                            "event": {
-                                "event": "model_requested",
-                                "model": "openrouter/auto"
-                            }
-                        }
-                    }
-                })],
+                events: vec![ledger_event(
+                    0,
+                    json!({
+                        "event": "model_requested",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 0,
+                        "model": "openrouter/auto"
+                    }),
+                )],
             },
         );
 
@@ -3170,37 +3185,34 @@ mod tests {
             next_offset: 2,
             status: RunStateName::Running,
             events: vec![
-                json!({
-                    "offset": 1,
-                    "event": {
+                buffered_event(
+                    1,
+                    json!({
                         "kind": "approval_requested",
                         "run_id": "run_1",
                         "tool_call_id": "call_1",
                         "tool_name": "file.write",
-                        "effect": "WorkspaceWrite",
+                        "effect": "workspace_write",
                         "reason": "file.write requires approval"
-                    }
-                }),
-                json!({
-                    "offset": 2,
-                    "event": {
-                        "kind": "ledger",
-                        "record": {
-                            "event": {
-                                "event": "tool_call_proposed",
-                                "call": {
-                                    "id": "call_1",
-                                    "tool": "file.write",
-                                    "effect": "WorkspaceWrite",
-                                    "input": {
-                                        "path": "scratch/tui-preview.txt",
-                                        "content": "preview body"
-                                    }
-                                }
+                    }),
+                ),
+                ledger_event(
+                    2,
+                    json!({
+                        "event": "tool_call_proposed",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "call": {
+                            "id": "call_1",
+                            "tool": "file.write",
+                            "effect": "workspace_write",
+                            "input": {
+                                "path": "scratch/tui-preview.txt",
+                                "content": "preview body"
                             }
                         }
-                    }
-                }),
+                    }),
+                ),
             ],
         };
 

@@ -1,6 +1,6 @@
 use crate::model::RunOverrides;
-use platonic_core::EffectClass;
-use serde::{Deserialize, Serialize};
+use platonic_core::{EffectClass, RecordedEvent};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use serde_json::Value;
 use std::fmt;
 
@@ -209,12 +209,185 @@ pub struct EventsStreamParams {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BufferedStreamEvent {
+    pub offset: u64,
+    pub event: StreamEvent,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum StreamEvent {
+    Ledger {
+        record: RecordedEvent,
+    },
+    AssistantDelta {
+        run_id: String,
+        turn_id: String,
+        step: u32,
+        delta_index: u64,
+        text: String,
+    },
+    ApprovalRequested {
+        run_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        effect: EffectClass,
+        reason: String,
+        diff_preview: Option<String>,
+        approval_preview: Option<String>,
+    },
+    Canceled {
+        run_id: String,
+    },
+    Unknown(Value),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum KnownStreamEvent {
+    Ledger {
+        record: RecordedEvent,
+    },
+    AssistantDelta {
+        run_id: String,
+        turn_id: String,
+        step: u32,
+        delta_index: u64,
+        text: String,
+    },
+    ApprovalRequested {
+        run_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        effect: EffectClass,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff_preview: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_preview: Option<String>,
+    },
+    Canceled {
+        run_id: String,
+    },
+}
+
+impl Serialize for StreamEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Ledger { record } => KnownStreamEvent::Ledger {
+                record: record.clone(),
+            }
+            .serialize(serializer),
+            Self::AssistantDelta {
+                run_id,
+                turn_id,
+                step,
+                delta_index,
+                text,
+            } => KnownStreamEvent::AssistantDelta {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: *step,
+                delta_index: *delta_index,
+                text: text.clone(),
+            }
+            .serialize(serializer),
+            Self::ApprovalRequested {
+                run_id,
+                tool_call_id,
+                tool_name,
+                effect,
+                reason,
+                diff_preview,
+                approval_preview,
+            } => KnownStreamEvent::ApprovalRequested {
+                run_id: run_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                effect: effect.clone(),
+                reason: reason.clone(),
+                diff_preview: diff_preview.clone(),
+                approval_preview: approval_preview.clone(),
+            }
+            .serialize(serializer),
+            Self::Canceled { run_id } => KnownStreamEvent::Canceled {
+                run_id: run_id.clone(),
+            }
+            .serialize(serializer),
+            Self::Unknown(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StreamEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let kind = value
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| D::Error::custom("stream event kind must be a string"))?;
+        match kind {
+            "ledger" | "assistant_delta" | "approval_requested" | "canceled" => {
+                serde_json::from_value::<KnownStreamEvent>(value)
+                    .map(StreamEvent::from)
+                    .map_err(D::Error::custom)
+            }
+            _ => Ok(Self::Unknown(value)),
+        }
+    }
+}
+
+impl From<KnownStreamEvent> for StreamEvent {
+    fn from(event: KnownStreamEvent) -> Self {
+        match event {
+            KnownStreamEvent::Ledger { record } => Self::Ledger { record },
+            KnownStreamEvent::AssistantDelta {
+                run_id,
+                turn_id,
+                step,
+                delta_index,
+                text,
+            } => Self::AssistantDelta {
+                run_id,
+                turn_id,
+                step,
+                delta_index,
+                text,
+            },
+            KnownStreamEvent::ApprovalRequested {
+                run_id,
+                tool_call_id,
+                tool_name,
+                effect,
+                reason,
+                diff_preview,
+                approval_preview,
+            } => Self::ApprovalRequested {
+                run_id,
+                tool_call_id,
+                tool_name,
+                effect,
+                reason,
+                diff_preview,
+                approval_preview,
+            },
+            KnownStreamEvent::Canceled { run_id } => Self::Canceled { run_id },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EventsStreamResult {
     pub run_id: String,
     pub from_offset: u64,
     pub next_offset: u64,
     pub status: RunStateName,
-    pub events: Vec<Value>,
+    pub events: Vec<BufferedStreamEvent>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -733,5 +906,104 @@ mod tests {
                 "effect": "external_side_effect"
             })
         );
+    }
+
+    #[test]
+    fn stream_event_known_variants_keep_the_exact_wire_shape() {
+        let fixtures = [
+            json!({
+                "kind": "ledger",
+                "record": {
+                    "seq": 3,
+                    "occurred_at_ms": 42,
+                    "event": {
+                        "event": "run_finished",
+                        "run_id": "run_1"
+                    }
+                }
+            }),
+            json!({
+                "kind": "assistant_delta",
+                "run_id": "run_1",
+                "turn_id": "turn_1",
+                "step": 2,
+                "delta_index": 7,
+                "text": "hello"
+            }),
+            json!({
+                "kind": "approval_requested",
+                "run_id": "run_1",
+                "tool_call_id": "call_1",
+                "tool_name": "file.edit",
+                "effect": "workspace_write",
+                "reason": "approval required",
+                "diff_preview": "--- a/file\n+++ b/file\n",
+                "approval_preview": "edit file"
+            }),
+            json!({
+                "kind": "approval_requested",
+                "run_id": "run_1",
+                "tool_call_id": "call_2",
+                "tool_name": "file.write",
+                "effect": "workspace_write",
+                "reason": "approval required"
+            }),
+            json!({
+                "kind": "canceled",
+                "run_id": "run_1"
+            }),
+        ];
+
+        for fixture in fixtures {
+            let event: StreamEvent = serde_json::from_value(fixture.clone()).unwrap();
+            assert_eq!(serde_json::to_value(event).unwrap(), fixture);
+        }
+    }
+
+    #[test]
+    fn unknown_stream_event_preserves_its_complete_payload_and_offset() {
+        let fixture = json!({
+            "offset": 9,
+            "event": {
+                "kind": "future_event",
+                "run_id": "run_1",
+                "nested": {"answer": 42},
+                "optional": null
+            }
+        });
+
+        let buffered: BufferedStreamEvent = serde_json::from_value(fixture.clone()).unwrap();
+        assert!(matches!(
+            &buffered.event,
+            StreamEvent::Unknown(value) if value == &fixture["event"]
+        ));
+        assert_eq!(serde_json::to_value(buffered).unwrap(), fixture);
+    }
+
+    #[test]
+    fn malformed_known_stream_events_fail_decode() {
+        let malformed = [
+            json!({"kind": "ledger", "record": {}}),
+            json!({
+                "kind": "assistant_delta",
+                "run_id": "run_1",
+                "turn_id": "turn_1",
+                "step": 0,
+                "delta_index": 0
+            }),
+            json!({
+                "kind": "approval_requested",
+                "run_id": "run_1",
+                "tool_call_id": "call_1",
+                "tool_name": "file.write",
+                "effect": "workspace_write"
+            }),
+            json!({"kind": "canceled"}),
+            json!({"payload": "missing kind"}),
+        ];
+
+        for fixture in malformed {
+            assert!(serde_json::from_value::<StreamEvent>(fixture).is_err());
+        }
     }
 }

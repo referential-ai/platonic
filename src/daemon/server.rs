@@ -334,7 +334,7 @@ mod tests {
                 ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
                 ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
                 ERROR_SESSIONS_LIST_FAILED, ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind,
-                ProtocolError, RunStateName, ShutdownIfIdleResultName,
+                ProtocolError, RunStateName, ShutdownIfIdleResultName, StreamEvent,
             },
             runtime::{MAX_EVENT_BUFFER, PendingApproval, RunRecord},
         },
@@ -1213,7 +1213,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             "session_1".into(),
             server.paths().ledger_path.clone(),
         ));
-        record.push_event(json!({"kind": "test"}));
+        record.push_event(StreamEvent::Unknown(json!({"kind": "test"})));
         server
             .runtime
             .state
@@ -1244,8 +1244,8 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             "session_1".into(),
             server.paths().ledger_path.clone(),
         ));
-        record.push_event(json!({"kind": "first"}));
-        record.push_event(json!({"kind": "second"}));
+        record.push_event(StreamEvent::Unknown(json!({"kind": "first"})));
+        record.push_event(StreamEvent::Unknown(json!({"kind": "second"})));
         server
             .runtime
             .state
@@ -1281,7 +1281,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             server.paths().ledger_path.clone(),
         ));
         for index in 0..(MAX_EVENT_BUFFER + 1) {
-            record.push_event(json!({"index": index}));
+            record.push_event(StreamEvent::Unknown(json!({
+                "kind": "fixture",
+                "index": index
+            })));
         }
         server
             .runtime
@@ -1314,7 +1317,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         ));
         record.set_finished("done".into());
         for index in 0..(MAX_EVENT_BUFFER + 1) {
-            record.push_event(json!({"index": index}));
+            record.push_event(StreamEvent::Unknown(json!({
+                "kind": "fixture",
+                "index": index
+            })));
         }
         server
             .runtime
@@ -1401,7 +1407,9 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         let record = runtime.state.lock().unwrap().runs[&started.run_id].clone();
         for index in 0..(MAX_EVENT_BUFFER + 1) {
-            record.push_event(json!({"kind": "filler", "index": index}));
+            record.push_event(StreamEvent::Unknown(
+                json!({"kind": "filler", "index": index}),
+            ));
         }
         let error = client
             .events_stream(&started.run_id, Some(0), 16)

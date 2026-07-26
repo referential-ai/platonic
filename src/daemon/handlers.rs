@@ -9,7 +9,7 @@ use crate::{
             Envelope, EventsStreamParams, EventsStreamResult, HelloParams, HelloResult,
             IssuePrepResult, IssuePrepStartParams, IssuePrepStartResult, MessageAppendParams,
             RunCancelParams, RunStartParams, RunStartResult, RunStateName, SessionSummary,
-            SessionsListResult, ShutdownIfIdleResult, ShutdownIfIdleResultName,
+            SessionsListResult, ShutdownIfIdleResult, ShutdownIfIdleResultName, StreamEvent,
             TranscriptReadParams, TranscriptReadResult, TypedRun, TypedTranscript,
             TypedTranscriptEntry, decode_request,
         },
@@ -28,7 +28,6 @@ use crate::{
     tools::ApprovalOutcome,
 };
 use platonic_core::{ReadbackEntry, RunReadback};
-use serde_json::json;
 use std::{
     path::PathBuf,
     sync::{Arc, atomic::Ordering, mpsc},
@@ -548,10 +547,9 @@ fn handle_run_cancel(
     };
     let mut approvals = record.approvals.lock().expect("approvals lock poisoned");
     record.cancel.store(true, Ordering::SeqCst);
-    record.push_event(json!({
-        "kind": "canceled",
-        "run_id": record.run_id,
-    }));
+    record.push_event(StreamEvent::Canceled {
+        run_id: record.run_id.clone(),
+    });
     approvals.clear();
     record.approval_changed.notify_all();
     drop(approvals);
