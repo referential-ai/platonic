@@ -4,7 +4,9 @@ Core Rust harness primitives for disciplined, replayable agent execution.
 
 Platonic Core is **not** a chatbot, personal assistant, workflow SaaS, or “Agent OS.” It is the small kernel underneath those things: typed context assembly, tool-call boundaries, policy decisions, event logs, and replay/audit surfaces.
 
-Part of the Referential AI stack.
+Referential.ai is currently the public site and showcase for Platonic,
+Platonic Core, and Plato Agent; any future hosted or commercial role remains
+undecided.
 
 ## Naming
 
