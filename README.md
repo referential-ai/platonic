@@ -385,6 +385,8 @@ preview; grant or deny the request locally in `plato-tui`. The gateway never
 sends approval decisions. Failed runs post
 `Run failed. Inspect it locally with: plato replay`; canceled and interrupted
 runs stay silent.
+A Discord response-delivery failure is contained to that message, and the
+gateway continues processing subsequent messages.
 
 Allowed-owner messages over 4,096 UTF-8 bytes or matching the fixed unsafe-input
 markers are rejected before daemon access with `Message rejected: unsafe or
