@@ -211,8 +211,12 @@ impl DiscordGateway {
             return Ok(());
         }
         if discord_input_is_unsafe(&message.content) {
-            self.platform
-                .send_message(message.channel_id, DISCORD_REJECTION_MESSAGE)?;
+            if let Err(error) = self
+                .platform
+                .send_message(message.channel_id, DISCORD_REJECTION_MESSAGE)
+            {
+                report_response_delivery_failure(&error);
+            }
             return Ok(());
         }
         self.handle_message(message)
@@ -260,8 +264,12 @@ impl DiscordGateway {
         self.sessions.insert(channel_id, run.session_id.clone());
         let terminal = self.wait_for_run(&mut daemon, channel_id, &run.run_id, presentation)?;
         let terminal_status = terminal.status;
-        if let Some(message) = terminal_message(terminal)? {
-            self.platform.send_message(channel_id, &message)?;
+        if let Some(message) = terminal_message(terminal)?
+            && let Err(error) = self.platform.send_message(channel_id, &message)
+        {
+            presentation.abnormal_exit(&self.platform);
+            report_response_delivery_failure(&error);
+            return Ok(());
         }
         presentation.finish(&self.platform, terminal_status);
         Ok(())
@@ -293,8 +301,10 @@ impl DiscordGateway {
                     }
                     match events.status {
                         RunStateName::Running => {
-                            if let Some(message) = approvals.take_notification() {
-                                self.platform.send_message(channel_id, &message)?;
+                            if let Some(message) = approvals.take_notification()
+                                && let Err(error) = self.platform.send_message(channel_id, &message)
+                            {
+                                report_response_delivery_failure(&error);
                             }
                             presentation.observe_running(
                                 &self.platform,
@@ -308,8 +318,10 @@ impl DiscordGateway {
                         RunStateName::CancelRequested => {
                             canceling = true;
                             presentation.stop_typing();
-                            if let Some(message) = approvals.take_notification() {
-                                self.platform.send_message(channel_id, &message)?;
+                            if let Some(message) = approvals.take_notification()
+                                && let Err(error) = self.platform.send_message(channel_id, &message)
+                            {
+                                report_response_delivery_failure(&error);
                             }
                             if events.events.is_empty() {
                                 thread::sleep(self.event_poll_delay);
@@ -393,6 +405,10 @@ impl DiscordGateway {
             Err(error) => Err(error),
         }
     }
+}
+
+fn report_response_delivery_failure(error: &AppError) {
+    eprintln!("discord response delivery failed; gateway continues: {error}");
 }
 
 fn discord_input_is_unsafe(content: &str) -> bool {
@@ -2137,6 +2153,73 @@ mod tests {
     }
 
     #[test]
+    fn response_send_failure_does_not_stop_next_owner_message() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("daemon.sock");
+        let first_daemon =
+            spawn_finished_daemon(&socket_path, "run.start", "session_1", "first answer");
+        let respond = |status, body| {
+            FakeRestAction::Respond(FakeResponse {
+                status,
+                body,
+                headers: Vec::new(),
+            })
+        };
+        let rest = spawn_scripted_rest_actions(vec![
+            respond(429, json!({})),
+            FakeRestAction::Disconnect,
+            respond(204, Value::Null),
+            respond(204, Value::Null),
+            respond(204, Value::Null),
+            respond(200, json!({"id": "reply_2"})),
+            respond(204, Value::Null),
+            respond(204, Value::Null),
+        ]);
+        let platform = test_platform_messages(
+            &rest.base_url,
+            [
+                discord_message(42, 200, "first"),
+                discord_message(42, 200, "second"),
+            ],
+        );
+        let mut gateway = test_gateway(&workspace, socket_path.clone(), platform);
+
+        gateway.poll_once().unwrap();
+        let first = first_daemon.join().unwrap();
+        assert_eq!(first["question"], "first");
+        assert_eq!(gateway.sessions[&200], "session_1");
+
+        std::fs::remove_file(&socket_path).unwrap();
+        let second_daemon =
+            spawn_finished_daemon(&socket_path, "message.append", "session_1", "second answer");
+        gateway.poll_once().unwrap();
+        let second = second_daemon.join().unwrap();
+        assert_eq!(second["message"], "second");
+        assert_eq!(second["session_id"], "session_1");
+
+        let receiver_error = gateway.poll_once().unwrap_err();
+        assert!(
+            receiver_error
+                .to_string()
+                .contains("discord gateway receiver stopped")
+        );
+
+        let requests = rest.handle.join().unwrap();
+        assert_eq!(requests.len(), 8);
+        assert_reaction(&requests[0], "PUT", EYES_EMOJI);
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].body["content"], "first answer");
+        assert_reaction(&requests[2], "DELETE", EYES_EMOJI);
+        assert_reaction(&requests[3], "PUT", FAILURE_EMOJI);
+        assert_reaction(&requests[4], "PUT", EYES_EMOJI);
+        assert_eq!(requests[5].method, "POST");
+        assert_eq!(requests[5].body["content"], "second answer");
+        assert_reaction(&requests[6], "DELETE", EYES_EMOJI);
+        assert_reaction(&requests[7], "PUT", SUCCESS_EMOJI);
+    }
+
+    #[test]
     fn gateway_handoff_only_forwards_authorized_config_path() {
         temp_env::with_var("PLATO_CONFIG", None::<&str>, || {
             for explicit in [None, Some(PathBuf::from("plato.toml"))] {
@@ -2667,7 +2750,7 @@ mod tests {
     }
 
     #[test]
-    fn product_message_failure_attempts_cleanup_then_propagates() {
+    fn product_message_failure_attempts_cleanup_then_is_contained() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("daemon.sock");
@@ -2697,9 +2780,8 @@ mod tests {
         let platform = test_platform(&rest.base_url, discord_message(42, 200, "hello"));
         let mut gateway = test_gateway(&workspace, socket_path, platform);
 
-        let error = gateway.poll_once().unwrap_err();
+        gateway.poll_once().unwrap();
 
-        assert!(error.to_string().contains("message send returned HTTP 500"));
         daemon.join().unwrap();
         let requests = rest.handle.join().unwrap();
         assert_reaction(&requests[0], "PUT", EYES_EMOJI);
@@ -3514,8 +3596,17 @@ mod tests {
     }
 
     fn test_platform(api_base: &str, message: DiscordMessage) -> DiscordPlatform {
+        test_platform_messages(api_base, [message])
+    }
+
+    fn test_platform_messages(
+        api_base: &str,
+        messages_to_send: impl IntoIterator<Item = DiscordMessage>,
+    ) -> DiscordPlatform {
         let (sender, messages) = mpsc::channel();
-        sender.send(Ok(message)).unwrap();
+        for message in messages_to_send {
+            sender.send(Ok(message)).unwrap();
+        }
         DiscordPlatform {
             rest: DiscordRestClient::new(api_base, "test-token".into()),
             messages,
@@ -3559,6 +3650,11 @@ mod tests {
         status: u16,
         body: Value,
         headers: Vec<(&'static str, &'static str)>,
+    }
+
+    enum FakeRestAction {
+        Respond(FakeResponse),
+        Disconnect,
     }
 
     struct HttpRequest {
@@ -3612,13 +3708,17 @@ mod tests {
     }
 
     fn spawn_scripted_rest(responses: Vec<FakeResponse>) -> FakeRest {
+        spawn_scripted_rest_actions(responses.into_iter().map(FakeRestAction::Respond).collect())
+    }
+
+    fn spawn_scripted_rest_actions(actions: Vec<FakeRestAction>) -> FakeRest {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let handle = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut requests = Vec::new();
-            for response in responses {
+            for action in actions {
                 let (mut stream, _) = loop {
                     match listener.accept() {
                         Ok(connection) => break connection,
@@ -3630,12 +3730,14 @@ mod tests {
                     }
                 };
                 requests.push(read_http_request(&mut stream));
-                write_http_response_with_headers(
-                    &mut stream,
-                    response.status,
-                    &response.body,
-                    &response.headers,
-                );
+                if let FakeRestAction::Respond(response) = action {
+                    write_http_response_with_headers(
+                        &mut stream,
+                        response.status,
+                        &response.body,
+                        &response.headers,
+                    );
+                }
             }
             requests
         });
