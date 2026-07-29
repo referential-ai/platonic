@@ -341,14 +341,29 @@ pub(crate) fn delete_file_on_close(file: &File) -> io::Result<()> {
 }
 
 pub(crate) fn connect_current_user_pipe(path: &Path) -> io::Result<File> {
-    connect_current_user_pipe_inner(path, None)
+    connect_current_user_pipe_inner(path, None, Duration::from_secs(1))
+}
+
+pub(crate) fn connect_current_user_pipe_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> io::Result<File> {
+    let pipe = connect_current_user_pipe_inner(path, None, timeout)?;
+    set_pipe_nowait(&pipe)?;
+    Ok(pipe)
 }
 
 pub(crate) fn connect_current_user_pipe_for_pid(
     path: &Path,
     expected_server_pid: u32,
 ) -> io::Result<File> {
-    let pipe = connect_current_user_pipe_inner(path, Some(expected_server_pid))?;
+    let pipe =
+        connect_current_user_pipe_inner(path, Some(expected_server_pid), Duration::from_secs(1))?;
+    set_pipe_nowait(&pipe)?;
+    Ok(pipe)
+}
+
+fn set_pipe_nowait(pipe: &File) -> io::Result<()> {
     let mode = PIPE_NOWAIT;
     // SAFETY: pipe is a live client pipe handle and mode is readable for the call.
     if unsafe {
@@ -362,15 +377,16 @@ pub(crate) fn connect_current_user_pipe_for_pid(
     {
         return Err(io::Error::last_os_error());
     }
-    Ok(pipe)
+    Ok(())
 }
 
 fn connect_current_user_pipe_inner(
     path: &Path,
     expected_server_pid: Option<u32>,
+    timeout: Duration,
 ) -> io::Result<File> {
     let path_wide = path_wide(path, "Windows pipe path contains a NUL")?;
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + timeout;
     let handle = loop {
         // SAFETY: path_wide is NUL-terminated; the returned owned handle is checked below.
         let handle = unsafe {

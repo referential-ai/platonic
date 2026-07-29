@@ -18,6 +18,7 @@ use serde_json::Value;
 use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 pub struct DaemonClient {
@@ -25,8 +26,7 @@ pub struct DaemonClient {
     writer: Stream,
     next_id: u64,
     response_limit: Option<u64>,
-    #[cfg(unix)]
-    response_deadline: Option<std::time::Instant>,
+    request_timeout: Option<Duration>,
 }
 
 #[cfg(windows)]
@@ -34,42 +34,38 @@ const CONTROL_RESPONSE_LIMIT: u64 = 64 * 1024;
 impl DaemonClient {
     pub fn connect(socket_path: &Path) -> AppResult<Self> {
         let writer = transport::connect(socket_path)?;
-        Self::from_stream(writer, None)
+        Self::from_stream(writer, None, None)
     }
 
-    #[cfg(unix)]
-    pub fn connect_with_timeout(
-        socket_path: &Path,
-        timeout: std::time::Duration,
-    ) -> AppResult<Self> {
+    pub fn connect_with_timeout(socket_path: &Path, timeout: Duration) -> AppResult<Self> {
         let writer = transport::connect_with_timeout(socket_path, timeout)?;
-        let mut client = Self::from_stream(writer, None)?;
-        client.set_timeout(timeout)?;
-        Ok(client)
+        Self::from_stream(writer, None, Some(timeout))
     }
 
     #[cfg(unix)]
-    pub fn set_timeout(&mut self, timeout: std::time::Duration) -> AppResult<()> {
-        transport::set_timeout(&self.writer, timeout)?;
-        self.response_deadline = Some(std::time::Instant::now() + timeout);
+    pub fn set_timeout(&mut self, timeout: Duration) -> AppResult<()> {
+        self.request_timeout = Some(timeout);
         Ok(())
     }
 
     #[cfg(windows)]
     pub fn connect_expected_server(socket_path: &Path, expected_pid: u32) -> AppResult<Self> {
         let writer = transport::connect_expected_server(socket_path, expected_pid)?;
-        Self::from_stream(writer, Some(CONTROL_RESPONSE_LIMIT))
+        Self::from_stream(writer, Some(CONTROL_RESPONSE_LIMIT), None)
     }
 
-    fn from_stream(writer: Stream, response_limit: Option<u64>) -> AppResult<Self> {
+    fn from_stream(
+        writer: Stream,
+        response_limit: Option<u64>,
+        request_timeout: Option<Duration>,
+    ) -> AppResult<Self> {
         let reader = BufReader::new(transport::try_clone(&writer)?);
         Ok(Self {
             reader,
             writer,
             next_id: 1,
             response_limit,
-            #[cfg(unix)]
-            response_deadline: None,
+            request_timeout,
         })
     }
 
@@ -274,11 +270,6 @@ impl DaemonClient {
     where
         T: DeserializeOwned,
     {
-        #[cfg(windows)]
-        if self.response_limit.is_some() {
-            transport::reset_deadline(self.reader.get_mut());
-            transport::reset_deadline(&mut self.writer);
-        }
         let id = self.next_request_id(method);
         let envelope = Envelope {
             v: PROTOCOL_VERSION,
@@ -289,15 +280,27 @@ impl DaemonClient {
             result: None,
             error: None,
         };
-        serde_json::to_writer(&mut self.writer, &envelope)?;
-        self.writer.write_all(b"\n")?;
-        self.writer.flush()?;
+        let mut request = serde_json::to_vec(&envelope)?;
+        request.push(b'\n');
+        let deadline = self.request_timeout.map(|timeout| Instant::now() + timeout);
+        #[cfg(windows)]
+        if deadline.is_none() && self.response_limit.is_some() {
+            transport::reset_deadline(self.reader.get_mut());
+            transport::reset_deadline(&mut self.writer);
+        }
+        if let Some(deadline) = deadline {
+            transport::set_deadline(self.reader.get_mut(), deadline)?;
+            transport::set_deadline(&mut self.writer, deadline)?;
+            self.write_until_deadline(method, &request, deadline)?;
+        } else {
+            self.writer.write_all(&request)?;
+            self.writer.flush()?;
+        }
 
         let mut line = Vec::new();
-        #[cfg(unix)]
-        if self.response_deadline.is_some() {
+        if let Some(deadline) = deadline {
             let bytes_read =
-                self.read_line_until_deadline(method, self.response_limit, &mut line)?;
+                self.read_line_until_deadline(method, self.response_limit, deadline, &mut line)?;
             return self.decode_response(method, id, bytes_read, line);
         }
         let bytes_read = match self.response_limit {
@@ -372,27 +375,46 @@ impl DaemonClient {
         Ok(bytes_read)
     }
 
-    #[cfg(unix)]
+    fn write_until_deadline(
+        &mut self,
+        method: &str,
+        mut request: &[u8],
+        deadline: Instant,
+    ) -> AppResult<()> {
+        while !request.is_empty() {
+            Self::ensure_deadline(method, deadline)?;
+            transport::set_deadline(&mut self.writer, deadline)?;
+            let written = match self.writer.write(request) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => Self::deadline_io(method, result)?,
+            };
+            if written == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write daemon request",
+                )
+                .into());
+            }
+            request = &request[written..];
+        }
+        Self::ensure_deadline(method, deadline)?;
+        transport::set_deadline(&mut self.writer, deadline)?;
+        Self::deadline_io(method, self.writer.flush())?;
+        Self::ensure_deadline(method, deadline)
+    }
+
     fn read_line_until_deadline(
         &mut self,
         method: &str,
         limit: Option<u64>,
+        deadline: Instant,
         line: &mut Vec<u8>,
     ) -> AppResult<usize> {
-        let deadline = self
-            .response_deadline
-            .expect("deadline reader requires a response deadline");
         loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("{method} response timed out"),
-                )
-                .into());
-            }
-            transport::set_timeout(self.reader.get_ref(), remaining)?;
-            let available = self.reader.fill_buf()?;
+            Self::ensure_deadline(method, deadline)?;
+            transport::set_deadline(self.reader.get_mut(), deadline)?;
+            let available = Self::deadline_io(method, self.reader.fill_buf())?;
+            Self::ensure_deadline(method, deadline)?;
             if available.is_empty() {
                 return Ok(line.len());
             }
@@ -419,6 +441,34 @@ impl DaemonClient {
         }
     }
 
+    fn ensure_deadline(method: &str, deadline: Instant) -> AppResult<()> {
+        if Instant::now() >= deadline {
+            Err(Self::request_timeout(method).into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn deadline_io<T>(method: &str, result: std::io::Result<T>) -> AppResult<T> {
+        result.map_err(|error| {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) {
+                Self::request_timeout(method).into()
+            } else {
+                error.into()
+            }
+        })
+    }
+
+    fn request_timeout(method: &str) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("{method} request timed out"),
+        )
+    }
+
     fn next_request_id(&mut self, method: &str) -> String {
         let id = format!("{}_{}", method.replace('.', "_"), self.next_id);
         self.next_id += 1;
@@ -440,6 +490,162 @@ impl DaemonConnectionConfig {
             workspace_root,
             socket_path,
         })
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use crate::daemon::{protocol::Envelope, transport};
+    use serde_json::json;
+    use std::{
+        io::{BufRead, BufReader, Write},
+        path::PathBuf,
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const REQUEST_TIMEOUT: Duration = Duration::from_millis(150);
+
+    #[test]
+    fn timed_client_stops_when_response_has_no_newline() {
+        const TIMEOUT: Duration = Duration::from_millis(200);
+        const PROGRESS_INTERVAL: Duration = Duration::from_millis(80);
+
+        let endpoint = TestEndpoint::new("partial-response");
+        let listener = transport::bind(&endpoint.path).unwrap();
+        let server = thread::spawn(move || {
+            let mut stream = transport::accept(&listener).unwrap();
+            let mut reader = BufReader::new(transport::try_clone(&stream).unwrap());
+            read_request(&mut reader);
+            for byte in b"{\"partial" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                if stream.flush().is_err() {
+                    break;
+                }
+                thread::sleep(PROGRESS_INTERVAL);
+            }
+        });
+        let mut client = DaemonClient::connect_with_timeout(&endpoint.path, TIMEOUT).unwrap();
+
+        let started = Instant::now();
+        let error = client.sessions_list().unwrap_err();
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert_timed_out(error);
+        assert!(
+            elapsed < TIMEOUT + Duration::from_millis(75),
+            "partial progress extended the request to {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn timed_client_gives_successive_requests_fresh_deadlines() {
+        const TIMEOUT: Duration = Duration::from_millis(500);
+        const RESPONSE_DELAY: Duration = Duration::from_millis(300);
+
+        let endpoint = TestEndpoint::new("successive-requests");
+        let listener = transport::bind(&endpoint.path).unwrap();
+        let server = thread::spawn(move || {
+            let mut stream = transport::accept(&listener).unwrap();
+            let mut reader = BufReader::new(transport::try_clone(&stream).unwrap());
+            for _ in 0..2 {
+                let request = read_request(&mut reader);
+                thread::sleep(RESPONSE_DELAY);
+                write_sessions_response(&mut stream, request.id);
+            }
+        });
+        let mut client = DaemonClient::connect_with_timeout(&endpoint.path, TIMEOUT).unwrap();
+
+        let started = Instant::now();
+        assert!(client.sessions_list().unwrap().is_empty());
+        assert!(client.sessions_list().unwrap().is_empty());
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert!(
+            elapsed > TIMEOUT,
+            "two delayed requests did not outlive one budget: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn timed_client_stops_when_request_write_stalls() {
+        let endpoint = TestEndpoint::new("stalled-write");
+        let listener = transport::bind(&endpoint.path).unwrap();
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let _stream = transport::accept(&listener).unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let mut client =
+            DaemonClient::connect_with_timeout(&endpoint.path, REQUEST_TIMEOUT).unwrap();
+        let question = "x".repeat(8 * 1024 * 1024);
+
+        let started = Instant::now();
+        let error = client.run_start(question, None, false).unwrap_err();
+        let elapsed = started.elapsed();
+        release.send(()).unwrap();
+        server.join().unwrap();
+
+        assert_timed_out(error);
+        assert!(elapsed < Duration::from_secs(1), "request took {elapsed:?}");
+    }
+
+    fn read_request(reader: &mut BufReader<transport::Stream>) -> Envelope {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str(line.trim()).unwrap()
+    }
+
+    fn write_sessions_response(writer: &mut transport::Stream, id: Option<String>) {
+        let response =
+            Envelope::response(id, Some("sessions.list".into()), json!({"sessions": []}));
+        serde_json::to_writer(writer.by_ref(), &response).unwrap();
+        writer.write_all(b"\n").unwrap();
+        writer.flush().unwrap();
+    }
+
+    fn assert_timed_out(error: AppError) {
+        match error {
+            AppError::Io(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}")
+            }
+            error => panic!("expected I/O timeout, got {error}"),
+        }
+    }
+
+    struct TestEndpoint {
+        path: PathBuf,
+        _directory: Option<tempfile::TempDir>,
+    }
+
+    impl TestEndpoint {
+        fn new(name: &str) -> Self {
+            #[cfg(unix)]
+            {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join(format!("{name}.sock"));
+                Self {
+                    path,
+                    _directory: Some(directory),
+                }
+            }
+            #[cfg(windows)]
+            {
+                Self {
+                    path: PathBuf::from(format!(
+                        r"\\.\pipe\plato-agent-client-{name}-{}",
+                        std::process::id()
+                    )),
+                    _directory: None,
+                }
+            }
+        }
     }
 }
 
