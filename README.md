@@ -189,6 +189,9 @@ Do not remove a lock for a live daemon.
 Live assistant deltas are transient `events.stream` events and are not written
 to the ledger. After a `lagged` response, omitting `from_offset` resumes at the
 current tip; `transcript.read` returns ledger-backed status and final answer.
+The daemon retains event buffers for the newest 32 terminal runs in completion
+order. Older runs return `not_found` from `events.stream`; `transcript.read` and
+`sessions.list` remain ledger-backed.
 `hello` advertises `transcript.read.typed`. Successful `transcript.read`
 responses preserve the legacy `transcript` string and add ordered `typed.runs`
 with structured chat, tool, policy, and approval entries.
@@ -261,6 +264,8 @@ PY
 NDJSON `run.start` and `message.append` default to `wait: false`, returning a
 `running` response immediately. Send `"wait": true` only when the connection can
 block until the run finishes.
+The TUI, embedded-daemon CLI probe, and Discord gateway bound daemon connects
+and each complete request to three seconds.
 
 ## Desktop (Development)
 

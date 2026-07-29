@@ -19,6 +19,7 @@ use std::{
 };
 
 pub(super) const MAX_EVENT_BUFFER: usize = 256;
+pub(super) const MAX_TERMINAL_RUNS: usize = 32;
 
 #[derive(Clone, Debug)]
 pub(super) struct DaemonRuntime {
@@ -32,6 +33,7 @@ pub(super) struct DaemonRuntime {
 #[derive(Debug, Default)]
 pub(super) struct RuntimeState {
     pub(super) runs: HashMap<String, Arc<RunRecord>>,
+    terminal_runs: VecDeque<String>,
     shutdown_accepted: bool,
     issue_prep_active: bool,
 }
@@ -93,6 +95,42 @@ impl DaemonRuntime {
         }
         state.runs.insert(record.run_id.clone(), record);
         Ok(())
+    }
+
+    pub(super) fn finish_run(&self, record: &RunRecord, final_answer: String) {
+        self.complete_run(
+            record,
+            RunStatus {
+                state: RunStateName::Finished,
+                final_answer: Some(final_answer),
+                error: None,
+            },
+        );
+    }
+
+    pub(super) fn finish_run_with_error(&self, record: &RunRecord, error: &AppError) {
+        self.complete_run(
+            record,
+            RunStatus {
+                state: match error {
+                    AppError::RunCanceled => RunStateName::Canceled,
+                    _ => RunStateName::Failed,
+                },
+                final_answer: None,
+                error: Some(error.to_string()),
+            },
+        );
+    }
+
+    fn complete_run(&self, record: &RunRecord, status: RunStatus) {
+        let mut state = self.state.lock().expect("runtime state lock poisoned");
+        *record.status.lock().expect("run status lock poisoned") = status;
+        state.terminal_runs.push_back(record.run_id.clone());
+        while state.terminal_runs.len() > MAX_TERMINAL_RUNS {
+            if let Some(run_id) = state.terminal_runs.pop_front() {
+                state.runs.remove(&run_id);
+            }
+        }
     }
 
     pub(super) fn reserve_issue_prep(
@@ -270,23 +308,6 @@ impl RunRecord {
             .clone()
     }
 
-    pub(super) fn set_finished(&self, final_answer: String) {
-        let mut status = self.status.lock().expect("run status lock poisoned");
-        status.state = RunStateName::Finished;
-        status.final_answer = Some(final_answer);
-        status.error = None;
-    }
-
-    pub(super) fn set_terminal_error(&self, error: &AppError) {
-        let mut status = self.status.lock().expect("run status lock poisoned");
-        status.state = match error {
-            AppError::RunCanceled => RunStateName::Canceled,
-            _ => RunStateName::Failed,
-        };
-        status.final_answer = None;
-        status.error = Some(error.to_string());
-    }
-
     pub(super) fn pending_approval(&self) -> Option<PendingApprovalSnapshot> {
         let approvals = self.approvals.lock().expect("approvals lock poisoned");
         if self.cancel.load(Ordering::SeqCst) || self.status().state != RunStateName::Running {
@@ -371,15 +392,78 @@ mod tests {
 
     #[test]
     fn late_cancel_does_not_reclassify_failure() {
+        let runtime = runtime();
         let record = run_record(1);
+        runtime.reserve_run(record.clone()).unwrap();
         record.cancel.store(true, Ordering::SeqCst);
 
-        record.set_terminal_error(&AppError::RunFailed("provider failed".into()));
+        runtime.finish_run_with_error(&record, &AppError::RunFailed("provider failed".into()));
 
         assert_eq!(record.status().state, RunStateName::Failed);
         assert_eq!(
             record.status().error.as_deref(),
             Some("run did not finish: provider failed")
+        );
+    }
+
+    #[test]
+    fn terminal_retention_uses_completion_order_and_preserves_active_runs() {
+        let runtime = runtime();
+        let terminal_records = (0..=MAX_TERMINAL_RUNS).map(run_record).collect::<Vec<_>>();
+        for record in &terminal_records {
+            runtime.reserve_run(record.clone()).unwrap();
+        }
+        let approval_paused = run_record(100);
+        approval_paused.approvals.lock().unwrap().insert(
+            "call_1".into(),
+            PendingApproval::new(ApprovalRequest {
+                run_id: RunId::new("run_100").unwrap(),
+                call_id: ToolCallId::new("call_1").unwrap(),
+                tool_name: "file.write".into(),
+                effect: EffectClass::WorkspaceWrite,
+                reason: "file.write requires approval".into(),
+                input_preview: None,
+                approval_preview: None,
+                diff_preview: None,
+            }),
+        );
+        runtime.reserve_run(approval_paused.clone()).unwrap();
+        let cancel_requested = run_record(101);
+        cancel_requested.status.lock().unwrap().state = RunStateName::CancelRequested;
+        runtime.reserve_run(cancel_requested.clone()).unwrap();
+
+        runtime.finish_run(&terminal_records[1], "done 1".into());
+        runtime.finish_run(&terminal_records[0], "done 0".into());
+        for (index, record) in terminal_records.iter().enumerate().skip(2) {
+            runtime.finish_run(record, format!("done {index}"));
+        }
+
+        let state = runtime.state.lock().unwrap();
+        assert_eq!(state.terminal_runs.len(), MAX_TERMINAL_RUNS);
+        assert_eq!(
+            state.terminal_runs.front().map(String::as_str),
+            Some("run_0")
+        );
+        assert_eq!(
+            state.terminal_runs.back().map(String::as_str),
+            Some("run_32")
+        );
+        assert!(!state.runs.contains_key("run_1"));
+        assert!(state.runs.contains_key("run_0"));
+        assert!(state.runs.contains_key("run_32"));
+        assert!(state.runs.contains_key("run_100"));
+        assert!(state.runs.contains_key("run_101"));
+        assert_eq!(state.runs.len(), MAX_TERMINAL_RUNS + 2);
+        drop(state);
+
+        assert!(approval_paused.pending_approval().is_some());
+        assert_eq!(
+            cancel_requested.status().state,
+            RunStateName::CancelRequested
+        );
+        assert_eq!(
+            runtime.shutdown_if_idle(),
+            ShutdownIfIdleDecision::RefusedActive
         );
     }
 
@@ -521,7 +605,7 @@ mod tests {
             ShutdownIfIdleDecision::RefusedActive
         );
 
-        record.set_finished("done".into());
+        runtime.finish_run(&record, "done".into());
         assert_eq!(runtime.shutdown_if_idle(), ShutdownIfIdleDecision::Shutdown);
         assert_eq!(
             runtime.shutdown_if_idle(),
