@@ -1,13 +1,12 @@
 use crate::{
     AppError, AppResult, ApprovalRequest, AssistantDeltaEvent,
     daemon::{
-        protocol::{PendingApprovalSnapshot, RunStateName},
+        protocol::{BufferedStreamEvent, PendingApprovalSnapshot, RunStateName, StreamEvent},
         server::DaemonPaths,
     },
     tools::ApprovalOutcome,
 };
 use platonic_core::RecordedEvent;
-use serde_json::{Value, json};
 #[cfg(all(test, unix))]
 use std::sync::Barrier;
 use std::{
@@ -184,7 +183,7 @@ pub(super) struct RunStatus {
 pub(super) struct EventBuffer {
     pub(super) first_offset: u64,
     pub(super) next_offset: u64,
-    pub(super) events: VecDeque<Value>,
+    pub(super) events: VecDeque<BufferedStreamEvent>,
 }
 
 #[derive(Clone, Debug)]
@@ -237,7 +236,7 @@ impl RunRecord {
         }
     }
 
-    pub(super) fn push_event(&self, event: Value) {
+    pub(super) fn push_event(&self, event: StreamEvent) {
         let mut buffer = self.events.lock().expect("event buffer lock poisoned");
         if buffer.events.len() == MAX_EVENT_BUFFER {
             buffer.events.pop_front();
@@ -245,28 +244,23 @@ impl RunRecord {
         }
         let offset = buffer.next_offset;
         buffer.next_offset += 1;
-        buffer.events.push_back(json!({
-            "offset": offset,
-            "event": event,
-        }));
+        buffer
+            .events
+            .push_back(BufferedStreamEvent { offset, event });
     }
 
     pub(super) fn push_recorded_event(&self, record: RecordedEvent) {
-        self.push_event(json!({
-            "kind": "ledger",
-            "record": record,
-        }));
+        self.push_event(StreamEvent::Ledger { record });
     }
 
     pub(super) fn push_assistant_delta(&self, delta: AssistantDeltaEvent) {
-        self.push_event(json!({
-            "kind": "assistant_delta",
-            "run_id": delta.run_id.to_string(),
-            "turn_id": delta.turn_id.to_string(),
-            "step": delta.step,
-            "delta_index": delta.delta_index,
-            "text": delta.text,
-        }));
+        self.push_event(StreamEvent::AssistantDelta {
+            run_id: delta.run_id.to_string(),
+            turn_id: delta.turn_id.to_string(),
+            step: delta.step,
+            delta_index: delta.delta_index,
+            text: delta.text,
+        });
     }
 
     pub(super) fn status(&self) -> RunStatus {
@@ -339,22 +333,16 @@ pub(super) fn approval_handler(
     }
 }
 
-fn approval_requested_event(request: &ApprovalRequest) -> Value {
-    let mut event = json!({
-        "kind": "approval_requested",
-        "run_id": &request.run_id,
-        "tool_call_id": &request.call_id,
-        "tool_name": &request.tool_name,
-        "effect": &request.effect,
-        "reason": &request.reason,
-    });
-    if let Some(diff_preview) = &request.diff_preview {
-        event["diff_preview"] = json!(diff_preview);
+fn approval_requested_event(request: &ApprovalRequest) -> StreamEvent {
+    StreamEvent::ApprovalRequested {
+        run_id: request.run_id.to_string(),
+        tool_call_id: request.call_id.to_string(),
+        tool_name: request.tool_name.clone(),
+        effect: request.effect.clone(),
+        reason: request.reason.clone(),
+        diff_preview: request.diff_preview.clone(),
+        approval_preview: request.approval_preview.clone(),
     }
-    if let Some(approval_preview) = &request.approval_preview {
-        event["approval_preview"] = json!(approval_preview);
-    }
-    event
 }
 
 #[cfg(test)]
@@ -543,7 +531,7 @@ mod tests {
 
     #[test]
     fn approval_requested_event_carries_diff_preview_when_present() {
-        let event = approval_requested_event(&ApprovalRequest {
+        let event = serde_json::to_value(approval_requested_event(&ApprovalRequest {
             run_id: RunId::new("run_1").unwrap(),
             call_id: ToolCallId::new("call_1").unwrap(),
             tool_name: "file.edit".into(),
@@ -552,7 +540,8 @@ mod tests {
             input_preview: None,
             approval_preview: None,
             diff_preview: Some("--- a/note.txt\n+++ b/note.txt\n".into()),
-        });
+        }))
+        .unwrap();
 
         assert_eq!(event["kind"], "approval_requested");
         assert_eq!(event["diff_preview"], "--- a/note.txt\n+++ b/note.txt\n");
@@ -560,7 +549,7 @@ mod tests {
 
     #[test]
     fn approval_requested_event_omits_diff_preview_when_absent() {
-        let event = approval_requested_event(&ApprovalRequest {
+        let event = serde_json::to_value(approval_requested_event(&ApprovalRequest {
             run_id: RunId::new("run_1").unwrap(),
             call_id: ToolCallId::new("call_1").unwrap(),
             tool_name: "file.write".into(),
@@ -569,14 +558,15 @@ mod tests {
             input_preview: None,
             approval_preview: None,
             diff_preview: None,
-        });
+        }))
+        .unwrap();
 
         assert!(event.get("diff_preview").is_none());
     }
 
     #[test]
     fn approval_requested_event_carries_approval_preview_when_present() {
-        let event = approval_requested_event(&ApprovalRequest {
+        let event = serde_json::to_value(approval_requested_event(&ApprovalRequest {
             run_id: RunId::new("run_1").unwrap(),
             call_id: ToolCallId::new("call_1").unwrap(),
             tool_name: "shell.exec".into(),
@@ -585,7 +575,8 @@ mod tests {
             input_preview: None,
             approval_preview: Some("command: cargo test\ncwd: /tmp/work".into()),
             diff_preview: None,
-        });
+        }))
+        .unwrap();
 
         assert_eq!(
             event["approval_preview"],
@@ -695,12 +686,13 @@ mod tests {
 
         let buffer = record.events.lock().unwrap();
         assert_eq!(buffer.next_offset, 1);
-        assert_eq!(buffer.events[0]["offset"], 0);
-        assert_eq!(buffer.events[0]["event"]["kind"], "assistant_delta");
-        assert_eq!(buffer.events[0]["event"]["run_id"], "run_1");
-        assert_eq!(buffer.events[0]["event"]["turn_id"], "turn_1");
-        assert_eq!(buffer.events[0]["event"]["step"], 0);
-        assert_eq!(buffer.events[0]["event"]["delta_index"], 1);
-        assert_eq!(buffer.events[0]["event"]["text"], "hello");
+        let event = serde_json::to_value(&buffer.events[0]).unwrap();
+        assert_eq!(event["offset"], 0);
+        assert_eq!(event["event"]["kind"], "assistant_delta");
+        assert_eq!(event["event"]["run_id"], "run_1");
+        assert_eq!(event["event"]["turn_id"], "turn_1");
+        assert_eq!(event["event"]["step"], 0);
+        assert_eq!(event["event"]["delta_index"], 1);
+        assert_eq!(event["event"]["text"], "hello");
     }
 }

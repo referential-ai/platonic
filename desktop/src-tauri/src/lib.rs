@@ -3,9 +3,9 @@ use plato_agent::{
     daemon::{
         client::{DaemonClient, DaemonConnectionConfig},
         protocol::{
-            ApprovalDecisionName, CommandAcceptedResult, EventsStreamResult, HelloResult,
-            PendingApprovalSnapshot, RunStartResult, RunStateName, SessionSummary,
-            TranscriptReadResult, TypedRun, TypedTranscriptEntry,
+            ApprovalDecisionName, BufferedStreamEvent, CommandAcceptedResult, EventsStreamResult,
+            HelloResult, PendingApprovalSnapshot, RunStartResult, RunStateName, SessionSummary,
+            StreamEvent, TranscriptReadResult, TypedRun, TypedTranscriptEntry,
         },
     },
     paths,
@@ -1519,13 +1519,7 @@ fn normalize_event_page(
         ));
     }
     let mut events = Vec::new();
-    for (index, value) in page.events.into_iter().enumerate() {
-        let buffered = serde_json::from_value::<BufferedDaemonEvent>(value).map_err(|error| {
-            DesktopError::new(
-                "incompatible_daemon",
-                format!("Incompatible daemon: malformed run event: {error}"),
-            )
-        })?;
+    for (index, buffered) in page.events.into_iter().enumerate() {
         let expected_offset = page.from_offset + index as u64;
         if buffered.offset != expected_offset {
             return Err(DesktopError::new(
@@ -1536,7 +1530,7 @@ fn normalize_event_page(
                 ),
             ));
         }
-        if let Some(event) = buffered.into_desktop()? {
+        if let Some(event) = buffered_event_into_desktop(buffered)? {
             events.push(event);
         }
     }
@@ -1565,62 +1559,44 @@ fn validate_stream_run(
     ))
 }
 
-#[derive(Debug, Deserialize)]
-struct BufferedDaemonEvent {
-    offset: u64,
-    event: DaemonEvent,
-}
-
-impl BufferedDaemonEvent {
-    fn into_desktop(self) -> Result<Option<DesktopEvent>, DesktopError> {
-        let offset = self.offset;
-        let event = match self.event {
-            DaemonEvent::AssistantDelta {
-                step,
-                delta_index,
-                text,
-            } => Some(DesktopEvent::AssistantDelta {
+fn buffered_event_into_desktop(
+    buffered: BufferedStreamEvent,
+) -> Result<Option<DesktopEvent>, DesktopError> {
+    let offset = buffered.offset;
+    let event = match buffered.event {
+        StreamEvent::AssistantDelta {
+            step,
+            delta_index,
+            text,
+            ..
+        } => Some(DesktopEvent::AssistantDelta {
+            offset,
+            step,
+            delta_index,
+            text,
+        }),
+        StreamEvent::ApprovalRequested { tool_call_id, .. } => {
+            Some(DesktopEvent::ApprovalRequested {
                 offset,
-                step,
-                delta_index,
-                text,
-            }),
-            DaemonEvent::ApprovalRequested { tool_call_id } => {
-                Some(DesktopEvent::ApprovalRequested {
-                    offset,
-                    tool_call_id,
-                })
-            }
-            DaemonEvent::Canceled => Some(DesktopEvent::CancelRequested { offset }),
-            DaemonEvent::Ledger { record } => record.event.into_desktop(offset),
-            DaemonEvent::Ignored => None,
-        };
-        Ok(event)
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum DaemonEvent {
-    AssistantDelta {
-        step: u32,
-        delta_index: u64,
-        text: String,
-    },
-    ApprovalRequested {
-        tool_call_id: String,
-    },
-    Canceled,
-    Ledger {
-        record: DaemonRecordedEvent,
-    },
-    #[serde(other)]
-    Ignored,
-}
-
-#[derive(Debug, Deserialize)]
-struct DaemonRecordedEvent {
-    event: DaemonLedgerEvent,
+                tool_call_id,
+            })
+        }
+        StreamEvent::Canceled { .. } => Some(DesktopEvent::CancelRequested { offset }),
+        StreamEvent::Ledger { record } => {
+            let event = serde_json::from_value::<DaemonLedgerEvent>(
+                serde_json::to_value(record.event).expect("ledger event serializes"),
+            )
+            .map_err(|error| {
+                DesktopError::new(
+                    "incompatible_daemon",
+                    format!("Incompatible daemon: malformed ledger event: {error}"),
+                )
+            })?;
+            event.into_desktop(offset)
+        }
+        StreamEvent::Unknown(_) => None,
+    };
+    Ok(event)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2610,6 +2586,30 @@ mod tests {
     }
 
     #[test]
+    fn unknown_event_is_ignored_without_stalling_the_page_offset() {
+        let page = EventsStreamResult {
+            run_id: "run_1".into(),
+            from_offset: 4,
+            next_offset: 5,
+            status: RunStateName::Running,
+            events: vec![buffered_event(
+                4,
+                json!({
+                    "kind": "future_event",
+                    "run_id": "run_1",
+                    "payload": {"answer": 42}
+                }),
+            )],
+        };
+
+        let page = normalize_event_page("run_1", page).unwrap();
+
+        assert_eq!(page.from_offset, 4);
+        assert_eq!(page.next_offset, 5);
+        assert!(page.events.is_empty());
+    }
+
+    #[test]
     fn session_read_returns_all_runs_in_session_index_order() {
         let fixture = bridge_fixture();
         let listener = UnixListener::bind(&fixture.socket_path).unwrap();
@@ -3129,11 +3129,11 @@ mod tests {
         })
     }
 
-    fn buffered_event(offset: u64, event: Value) -> Value {
-        json!({"offset": offset, "event": event})
+    fn buffered_event(offset: u64, event: Value) -> BufferedStreamEvent {
+        serde_json::from_value(json!({"offset": offset, "event": event})).unwrap()
     }
 
-    fn ledger_event(offset: u64, event: Value) -> Value {
+    fn ledger_event(offset: u64, event: Value) -> BufferedStreamEvent {
         buffered_event(
             offset,
             json!({
