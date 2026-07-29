@@ -43,6 +43,7 @@ const DISCORD_REASONING_DESCRIPTION: &str = "Show or set this channel's reasonin
 const DISCORD_MODEL_OPTION: &str = "name";
 const DISCORD_REASONING_OPTION: &str = "effort";
 const DISCORD_DEFAULT_SETTING: &str = "default";
+const DAEMON_CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
 const DISCORD_APPLICATION_COMMAND: u8 = 2;
 const DISCORD_CHAT_INPUT_COMMAND: u8 = 1;
 const DISCORD_STRING_OPTION: u8 = 3;
@@ -247,7 +248,7 @@ impl DiscordGateway {
             .get(&channel_id)
             .cloned()
             .unwrap_or_default();
-        let mut daemon = self.connect_daemon()?;
+        let mut daemon = self.connect_daemon(DAEMON_CLIENT_TIMEOUT)?;
         let run = match self.sessions.get(&channel_id).cloned() {
             Some(session_id) => daemon.message_append_to_session_with_overrides(
                 message.content,
@@ -375,7 +376,7 @@ impl DiscordGateway {
 
     fn reconnect_daemon(&self) -> AppResult<DaemonClient> {
         for _ in 0..RECONNECT_ATTEMPTS {
-            match self.connect_daemon() {
+            match self.connect_daemon(DAEMON_CLIENT_TIMEOUT) {
                 Ok(client) => return Ok(client),
                 Err(error) if reconnectable(&error) => thread::sleep(self.reconnect_delay),
                 Err(error) => return Err(error),
@@ -386,8 +387,8 @@ impl DiscordGateway {
         ))
     }
 
-    fn connect_daemon(&self) -> AppResult<DaemonClient> {
-        let mut client = DaemonClient::connect(&self.daemon.socket_path)?;
+    fn connect_daemon(&self, timeout: Duration) -> AppResult<DaemonClient> {
+        let mut client = DaemonClient::connect_with_timeout(&self.daemon.socket_path, timeout)?;
         let hello = client.hello(&self.daemon.workspace_root)?;
         require_capabilities(&hello)?;
         Ok(client)
@@ -1486,11 +1487,8 @@ impl DiscordCommandHandler {
     }
 
     fn daemon_status(&self) -> AppResult<(String, usize, usize)> {
-        #[cfg(unix)]
         let mut daemon =
-            DaemonClient::connect_with_timeout(&self.daemon.socket_path, Duration::from_secs(2))?;
-        #[cfg(windows)]
-        let mut daemon = DaemonClient::connect(&self.daemon.socket_path)?;
+            DaemonClient::connect_with_timeout(&self.daemon.socket_path, DAEMON_CLIENT_TIMEOUT)?;
         let hello = daemon.hello(&self.daemon.workspace_root)?;
         require_capabilities(&hello)?;
         let sessions = daemon.sessions_list()?;
@@ -2004,6 +2002,35 @@ mod tests {
 
     fn ledger_event_json(offset: u64, event: Value) -> Value {
         serde_json::to_value(ledger_event(offset, event)).unwrap()
+    }
+
+    #[test]
+    fn discord_client_bounds_a_stalled_hello() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let _stream = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(150));
+        });
+        let platform = test_platform("http://127.0.0.1", discord_message(42, 200, "hello"));
+        let gateway = test_gateway(&workspace, socket_path, platform);
+
+        let started = Instant::now();
+        let error = match gateway.connect_daemon(Duration::from_millis(50)) {
+            Ok(_) => panic!("stalled daemon unexpectedly answered"),
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert!(matches!(
+            error,
+            AppError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(elapsed < Duration::from_secs(1), "request took {elapsed:?}");
+        assert_eq!(DAEMON_CLIENT_TIMEOUT, Duration::from_secs(3));
     }
 
     #[test]

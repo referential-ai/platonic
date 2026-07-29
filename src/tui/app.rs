@@ -34,6 +34,7 @@ use super::{
 };
 
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const DAEMON_CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
 const EVENT_LIMIT: usize = 128;
 const SCROLL_PAGE_LINES: usize = 10;
 
@@ -897,7 +898,7 @@ fn load_connected_state(
     run_id: Option<&str>,
     session_id: Option<&str>,
 ) -> AppResult<TuiState> {
-    let mut client = DaemonClient::connect(&config.socket_path)?;
+    let mut client = connect_daemon(config, DAEMON_CLIENT_TIMEOUT)?;
     let hello = client.hello(&config.workspace_root)?;
     let sessions = client.sessions_list()?;
     let selected_session_id = session_id
@@ -1150,9 +1151,13 @@ fn with_client<T>(
     config: &DaemonConnectionConfig,
     run: impl FnOnce(&mut DaemonClient) -> AppResult<T>,
 ) -> AppResult<T> {
-    let mut client = DaemonClient::connect(&config.socket_path)?;
+    let mut client = connect_daemon(config, DAEMON_CLIENT_TIMEOUT)?;
     client.hello(&config.workspace_root)?;
     run(&mut client)
+}
+
+fn connect_daemon(config: &DaemonConnectionConfig, timeout: Duration) -> AppResult<DaemonClient> {
+    DaemonClient::connect_with_timeout(&config.socket_path, timeout)
 }
 
 fn failed_event(context: &'static str) -> impl FnOnce(crate::AppError) -> ClientEvent {
@@ -1824,6 +1829,35 @@ mod tests {
         sender: &Sender<ClientCommand>,
     ) -> bool {
         handle_key_press(key, state, runtime, sender, None, None)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tui_client_bounds_a_stalled_hello() {
+        use std::os::unix::net::UnixListener;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let config = DaemonConnectionConfig::resolve(workspace.path(), Some(socket_path)).unwrap();
+        let server = thread::spawn(move || {
+            let _stream = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(150));
+        });
+        let mut client = connect_daemon(&config, Duration::from_millis(50)).unwrap();
+
+        let started = Instant::now();
+        let error = client.hello(&config.workspace_root).unwrap_err();
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert!(matches!(
+            error,
+            AppError::Io(error) if error.kind() == io::ErrorKind::TimedOut
+        ));
+        assert!(elapsed < Duration::from_secs(1), "request took {elapsed:?}");
+        assert_eq!(DAEMON_CLIENT_TIMEOUT, Duration::from_secs(3));
     }
 
     #[test]

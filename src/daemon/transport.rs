@@ -128,9 +128,13 @@ fn connect_timeout() -> io::Error {
 }
 
 #[cfg(unix)]
-pub(crate) fn set_timeout(stream: &Stream, timeout: std::time::Duration) -> io::Result<()> {
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))
+pub(crate) fn set_deadline(stream: &mut Stream, deadline: std::time::Instant) -> io::Result<()> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(request_io_timeout());
+    }
+    stream.set_read_timeout(Some(remaining))?;
+    stream.set_write_timeout(Some(remaining))
 }
 
 #[cfg(windows)]
@@ -144,6 +148,19 @@ pub(crate) fn connect(endpoint: &Path) -> io::Result<Stream> {
 }
 
 #[cfg(windows)]
+pub(crate) fn connect_with_timeout(
+    endpoint: &Path,
+    timeout: std::time::Duration,
+) -> io::Result<Stream> {
+    Ok(Stream {
+        inner: WindowsStream::Client(
+            crate::windows_security::connect_current_user_pipe_with_timeout(endpoint, timeout)?,
+        ),
+        deadline: None,
+    })
+}
+
+#[cfg(windows)]
 pub(crate) fn connect_expected_server(endpoint: &Path, expected_pid: u32) -> io::Result<Stream> {
     Ok(Stream {
         inner: WindowsStream::Client(crate::windows_security::connect_current_user_pipe_for_pid(
@@ -152,6 +169,12 @@ pub(crate) fn connect_expected_server(endpoint: &Path, expected_pid: u32) -> io:
         )?),
         deadline: Some(std::time::Instant::now() + CONTROL_IO_TIMEOUT),
     })
+}
+
+#[cfg(windows)]
+pub(crate) fn set_deadline(stream: &mut Stream, deadline: std::time::Instant) -> io::Result<()> {
+    stream.deadline = Some(deadline);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -314,6 +337,11 @@ fn pipe_io_timeout() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "named-pipe request timed out")
 }
 
+#[cfg(unix)]
+fn request_io_timeout() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "daemon request timed out")
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod unix_tests {
     use super::*;
@@ -444,5 +472,27 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(elapsed < CONTROL_IO_TIMEOUT + std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn timed_connect_stops_when_the_named_pipe_is_busy() {
+        let endpoint = PathBuf::from(format!(
+            r"\\.\pipe\plato-agent-transport-connect-timeout-test-{}",
+            std::process::id()
+        ));
+        let listener = bind(&endpoint).unwrap();
+        let client_endpoint = endpoint.clone();
+        let client = thread::spawn(move || connect(&client_endpoint).unwrap());
+        let server_stream = accept(&listener).unwrap();
+        let client_stream = client.join().unwrap();
+
+        let started = std::time::Instant::now();
+        let error =
+            connect_with_timeout(&endpoint, std::time::Duration::from_millis(100)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(client_stream);
+        drop(server_stream);
     }
 }

@@ -232,7 +232,7 @@ fn validate_tui_cli(cli: &Cli) -> plato_agent::AppResult<()> {
 
 fn ensure_tui_daemon(workspace_root: &Path) -> plato_agent::AppResult<Option<EmbeddedDaemon>> {
     let config = DaemonConnectionConfig::resolve(workspace_root, None)?;
-    if daemon_accepts_hello(&config) {
+    if daemon_accepts_hello(&config, EMBEDDED_DAEMON_TIMEOUT) {
         return Ok(None);
     }
     start_embedded_daemon(workspace_root, &config).map(Some)
@@ -262,7 +262,7 @@ fn wait_for_embedded_daemon(
 ) -> plato_agent::AppResult<()> {
     let deadline = Instant::now() + EMBEDDED_DAEMON_TIMEOUT;
     loop {
-        if daemon_accepts_hello(config) {
+        if daemon_accepts_hello(config, EMBEDDED_DAEMON_TIMEOUT) {
             return Ok(());
         }
         if daemon.handle.as_ref().is_some_and(JoinHandle::is_finished) {
@@ -278,8 +278,8 @@ fn wait_for_embedded_daemon(
     }
 }
 
-fn daemon_accepts_hello(config: &DaemonConnectionConfig) -> bool {
-    let Ok(mut client) = DaemonClient::connect(&config.socket_path) else {
+fn daemon_accepts_hello(config: &DaemonConnectionConfig, timeout: Duration) -> bool {
+    let Ok(mut client) = DaemonClient::connect_with_timeout(&config.socket_path, timeout) else {
         return false;
     };
     client.hello(&config.workspace_root).is_ok()
@@ -705,6 +705,30 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "embedded daemon drop took {elapsed:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_probe_bounds_a_stalled_hello() {
+        use std::os::unix::net::UnixListener;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let config = DaemonConnectionConfig::resolve(workspace.path(), Some(socket_path)).unwrap();
+        let server = thread::spawn(move || {
+            let _stream = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(150));
+        });
+
+        let started = Instant::now();
+        assert!(!daemon_accepts_hello(&config, Duration::from_millis(50)));
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert!(elapsed < Duration::from_secs(1), "probe took {elapsed:?}");
+        assert_eq!(EMBEDDED_DAEMON_TIMEOUT, Duration::from_secs(3));
     }
 
     #[test]
