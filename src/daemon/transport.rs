@@ -390,8 +390,10 @@ mod unix_tests {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use interprocess::os::windows::named_pipe::{PipeListenerOptions, pipe_mode};
     use std::{
         io::{Read, Write},
+        num::NonZeroU8,
         path::PathBuf,
         thread,
     };
@@ -480,10 +482,16 @@ mod tests {
             r"\\.\pipe\plato-agent-transport-connect-timeout-test-{}",
             std::process::id()
         ));
-        let listener = bind(&endpoint).unwrap();
+        let listener = PipeListenerOptions::new()
+            .path(endpoint.as_path())
+            .instance_limit(NonZeroU8::new(1))
+            .security_descriptor(Some(
+                crate::windows_security::current_user_pipe_descriptor().unwrap(),
+            ))
+            .create_duplex::<pipe_mode::Bytes>()
+            .unwrap();
         let client_endpoint = endpoint.clone();
         let client = thread::spawn(move || connect(&client_endpoint).unwrap());
-        let server_stream = accept(&listener).unwrap();
         let client_stream = client.join().unwrap();
 
         let started = std::time::Instant::now();
@@ -493,6 +501,6 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         drop(client_stream);
-        drop(server_stream);
+        drop(listener);
     }
 }
