@@ -501,6 +501,7 @@ mod timeout_tests {
     use std::{
         io::{BufRead, BufReader, Write},
         path::PathBuf,
+        sync::mpsc,
         thread,
         time::{Duration, Instant},
     };
@@ -576,9 +577,10 @@ mod timeout_tests {
     fn timed_client_stops_when_request_write_stalls() {
         let endpoint = TestEndpoint::new("stalled-write");
         let listener = transport::bind(&endpoint.path).unwrap();
+        let (release, released) = mpsc::channel();
         let server = thread::spawn(move || {
             let _stream = transport::accept(&listener).unwrap();
-            thread::sleep(REQUEST_TIMEOUT * 3);
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
         });
         let mut client =
             DaemonClient::connect_with_timeout(&endpoint.path, REQUEST_TIMEOUT).unwrap();
@@ -587,6 +589,7 @@ mod timeout_tests {
         let started = Instant::now();
         let error = client.run_start(question, None, false).unwrap_err();
         let elapsed = started.elapsed();
+        release.send(()).unwrap();
         server.join().unwrap();
 
         assert_timed_out(error);
@@ -608,10 +611,12 @@ mod timeout_tests {
     }
 
     fn assert_timed_out(error: AppError) {
-        assert!(matches!(
-            error,
-            AppError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut
-        ));
+        match error {
+            AppError::Io(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}")
+            }
+            error => panic!("expected I/O timeout, got {error}"),
+        }
     }
 
     struct TestEndpoint {
