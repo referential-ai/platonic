@@ -336,11 +336,11 @@ fn start_run(
     if wait.unwrap_or(false) {
         match run_question(options) {
             Ok(outcome) => {
-                record.set_finished(outcome.final_answer.clone());
+                runtime.finish_run(&record, outcome.final_answer.clone());
                 run_start_response(request_id, method, &record)
             }
             Err(error) => {
-                record.set_terminal_error(&error);
+                runtime.finish_run_with_error(&record, &error);
                 Envelope::error(
                     request_id,
                     Some(method.into()),
@@ -350,10 +350,11 @@ fn start_run(
             }
         }
     } else {
+        let worker_runtime = runtime.clone();
         let worker_record = record.clone();
         thread::spawn(move || match run_question(options) {
-            Ok(outcome) => worker_record.set_finished(outcome.final_answer),
-            Err(error) => worker_record.set_terminal_error(&error),
+            Ok(outcome) => worker_runtime.finish_run(&worker_record, outcome.final_answer),
+            Err(error) => worker_runtime.finish_run_with_error(&worker_record, &error),
         });
         run_start_response(request_id, method, &record)
     }

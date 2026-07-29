@@ -336,7 +336,7 @@ mod tests {
                 ERROR_SESSIONS_LIST_FAILED, ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind,
                 ProtocolError, RunStateName, ShutdownIfIdleResultName, StreamEvent,
             },
-            runtime::{MAX_EVENT_BUFFER, PendingApproval, RunRecord},
+            runtime::{MAX_EVENT_BUFFER, MAX_TERMINAL_RUNS, PendingApproval, RunRecord},
         },
         ledger::SqliteLedger,
         tools::ApprovalOutcome,
@@ -689,6 +689,7 @@ mod tests {
         let socket_path = socket_dir.path().join("agent.sock");
         let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
         let paths = server.paths().clone();
+        let runtime = server.runtime.clone();
         let record = Arc::new(RunRecord::new(
             "run_1".into(),
             "session_1".into(),
@@ -731,7 +732,7 @@ mod tests {
         .unwrap();
         assert_eq!(read_envelope(&mut reader).kind, EnvelopeKind::Response);
         record.approvals.lock().unwrap().clear();
-        record.set_finished("done".into());
+        runtime.finish_run(&record, "done".into());
         writeln!(
             stream,
             r#"{{"v":1,"id":"shutdown_2","kind":"request","method":"daemon.shutdown_if_idle","params":{{}}}}"#
@@ -1315,20 +1316,14 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             "session_1".into(),
             server.paths().ledger_path.clone(),
         ));
-        record.set_finished("done".into());
         for index in 0..(MAX_EVENT_BUFFER + 1) {
             record.push_event(StreamEvent::Unknown(json!({
                 "kind": "fixture",
                 "index": index
             })));
         }
-        server
-            .runtime
-            .state
-            .lock()
-            .unwrap()
-            .runs
-            .insert("run_1".into(), record);
+        server.runtime.reserve_run(record.clone()).unwrap();
+        server.runtime.finish_run(&record, "done".into());
         let handle = thread::spawn(move || server.serve_next().unwrap());
         let mut client = DaemonClient::connect(&socket_path).unwrap();
 
@@ -1350,6 +1345,66 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         drop(client);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn evicted_terminal_run_loses_only_transient_event_readback() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let server =
+            DaemonServer::bind(workspace.path(), Some(socket_dir.path().join("agent.sock")))
+                .unwrap();
+        seed_finished_session(
+            &server.paths().ledger_path,
+            "run_0",
+            "session_0",
+            "persisted answer",
+        );
+        for index in 0..=MAX_TERMINAL_RUNS {
+            let record = Arc::new(RunRecord::new(
+                format!("run_{index}"),
+                format!("session_{index}"),
+                server.paths().ledger_path.clone(),
+            ));
+            record.push_event(StreamEvent::Unknown(json!({
+                "kind": "fixture",
+                "index": index
+            })));
+            server.runtime.reserve_run(record.clone()).unwrap();
+            server
+                .runtime
+                .finish_run(&record, format!("answer {index}"));
+        }
+
+        let evicted = server.handle_line(
+            r#"{"v":1,"id":"events_old","kind":"request","method":"events.stream","params":{"run_id":"run_0"}}"#,
+        );
+        assert_eq!(evicted.kind, EnvelopeKind::Error);
+        assert_eq!(evicted.error.unwrap().code, ERROR_NOT_FOUND);
+
+        let retained = server.handle_line(&format!(
+            r#"{{"v":1,"id":"events_new","kind":"request","method":"events.stream","params":{{"run_id":"run_{}"}}}}"#,
+            MAX_TERMINAL_RUNS
+        ));
+        assert_eq!(retained.kind, EnvelopeKind::Response);
+        let retained = retained.result.unwrap();
+        assert_eq!(retained["from_offset"], 1);
+        assert_eq!(retained["next_offset"], 1);
+        assert_eq!(retained["events"], json!([]));
+        assert_eq!(retained["status"], "finished");
+
+        let transcript = server.handle_line(
+            r#"{"v":1,"id":"transcript","kind":"request","method":"transcript.read","params":{"run_id":"run_0"}}"#,
+        );
+        assert_eq!(transcript.kind, EnvelopeKind::Response);
+        let transcript = transcript.result.unwrap();
+        assert_eq!(transcript["status"], "finished");
+        assert_eq!(transcript["final_answer"], "persisted answer");
+
+        let sessions = server
+            .handle_line(r#"{"v":1,"id":"sessions","kind":"request","method":"sessions.list"}"#);
+        assert_eq!(sessions.kind, EnvelopeKind::Response);
+        assert_eq!(sessions.result.unwrap()["sessions"][0]["run_id"], "run_0");
     }
 
     #[test]
