@@ -7,6 +7,9 @@ issue: https://github.com/referential-ai/plato-agent/issues/93
 
 ## Authority
 - Human direction 2026-07-09: proceed with the gateway design track.
+- Human direction 2026-07-29: gateways are optional, explicitly started
+  connector processes managed outside the daemon; issue #259 owns the service
+  entry implementation.
 - Issue #93 is the scope contract.
 - Spine (`hermes-light-product-spine.md`): gateways are thin daemon clients, after the local spine; remote channels may notify or deny approvals, never grant.
 - MVP decisions (`mvp-decisions.md`): remote channels must not become a grant surface.
@@ -67,6 +70,69 @@ The gateway never sends an approve decision — structurally: the approve branch
 
 Optional, config-off by default: `remote_deny = true` lets allowlisted owners reply deny, relayed as `approval.decide` deny with reason `remote deny via <platform>`. Deny-only is safe: it can never cause a side effect.
 
+### D6. Connector lifecycle
+Gateways are optional per-channel connector processes. The operator starts each
+connector explicitly (`plato gateway discord` for Discord); there is no generic
+unqualified gateway entry. A gateway must verify the workspace daemon with
+`hello` and fail closed with a daemon-start hint when it is unavailable. It
+never starts, embeds, or supervises the daemon, and the daemon never embeds or
+supervises a gateway. The existing `plato-agentd` and
+`plato-gateway-discord` binary identities remain supported.
+
+Long-lived connectors belong under the OS service manager. The two systemd user
+unit templates below use a systemd-escaped absolute workspace path as the
+instance and keep provider credentials out of the gateway environment:
+
+```ini
+# ~/.config/systemd/user/plato-daemon@.service
+[Unit]
+Description=Plato Agent daemon for %f
+
+[Service]
+Type=simple
+WorkingDirectory=%f
+EnvironmentFile=-%h/.config/plato/daemon.env
+ExecStart=/absolute/path/to/plato daemon
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```ini
+# ~/.config/systemd/user/plato-gateway-discord@.service
+[Unit]
+Description=Plato Agent Discord gateway for %f
+Wants=plato-daemon@%i.service
+After=plato-daemon@%i.service
+
+[Service]
+Type=simple
+WorkingDirectory=%f
+EnvironmentFile=%h/.config/plato/discord.env
+ExecStart=/absolute/path/to/plato gateway discord
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+`daemon.env` holds provider credentials; `discord.env` holds only the Discord
+token. Start the connector with:
+
+```bash
+instance="$(systemd-escape --path "$PWD")"
+systemctl --user enable --now "plato-gateway-discord@${instance}.service"
+```
+
+`Wants` and `After` start and order the daemon unit; they do not replace the
+gateway's required `hello` readiness check. This process boundary keeps the
+remote transport and platform credential outside the provider/policy authority
+process. The pinned
+[reference security study](https://github.com/referential-ai/platonic-core/blob/main/docs/TECHNICAL-LESSONS.md#security-study-codex-ironclaw-openfang-goose-2026-07-12)
+validates the thin remote-adapter boundary and records two counterexamples where
+remote surfaces inherited or bypassed approval authority.
+
 ## Human Decision Slots
 
 ### Q1. Platform target
@@ -110,7 +176,7 @@ No implementation starts from this document; each slice needs its own `Ready for
 
 ## Acceptance Criteria
 - Both `Jerome:` slots answered; slice issues cut accordingly.
-- D1–D5 hold as written or are amended here before coding.
+- D1–D6 hold as written or are amended here before coding.
 
 ## Verifiable End Condition
 From the remote channel, the owner: sends a message, gets the final answer; triggers an approval-required effect, sees the notification, grants it locally in the TUI, sees the completed result remotely; a non-allowlisted sender gets nothing. `plato replay` shows one coherent session; the ledger shows no gateway-originated grant.
