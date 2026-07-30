@@ -474,8 +474,10 @@ Keys:
 
 - `Enter`: submit the composer to the daemon. A session can have only one
   active run.
-- `/sessions`: open the session picker. `Enter` resumes the focused session;
-  `Esc` closes the picker.
+- `/sessions`: open the session picker. Type to filter latest questions (`q` is
+  text); `Backspace` edits; `Up`/`Down` and `Ctrl-P`/`Ctrl-N` wrap through
+  matches; `Enter` resumes the focused match; `Esc` closes. With no matches,
+  `Enter` keeps the picker open.
 - `/new`: clear the selected session so the next submitted message starts fresh.
 - `/issue-prep <rough issue>`: prepare and review an implementation issue.
   It is unavailable while another run or issue-prep command is active, and the
@@ -484,7 +486,8 @@ Keys:
 - `Ctrl-C`: request `run.cancel` for the active run; a second `Ctrl-C` exits the
   TUI. Exiting the TUI does not stop the daemon.
 - `r`: reconnect and reload daemon state.
-- `q` or `Esc`: exit the TUI.
+- `q` (with an empty composer) or `Esc`: exit the TUI from the main view; the
+  session picker uses them as described above.
 
 ## Commands
 

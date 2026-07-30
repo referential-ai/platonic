@@ -530,28 +530,30 @@ fn render_help_modal(frame: &mut Frame<'_>, area: Rect) {
 
 fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let area = centered_rect(78, 64, area);
-    let selected = state
+    let picker = state
         .session_picker
         .as_ref()
-        .map(|picker| picker.selected)
-        .unwrap_or(0);
+        .expect("session picker is open");
+    let sessions = picker.matching_sessions(&state.sessions);
     let mut lines = vec![
         Line::from(vec![Span::styled(
             "Sessions",
             Style::default().add_modifier(Modifier::BOLD),
         )]),
-        Line::from("Enter resume    /new fresh    Esc close"),
+        Line::from("Type to filter    Backspace edit    Esc close"),
+        Line::from("Up/Down or Ctrl-P/Ctrl-N move    Enter resume"),
+        Line::from(format!("Filter: {}|", picker.filter)),
         Line::from(""),
     ];
-    if state.sessions.is_empty() {
+    if sessions.is_empty() && state.sessions.is_empty() && picker.filter.is_empty() {
         lines.push(Line::from("No sessions"));
+    } else if sessions.is_empty() {
+        lines.push(Line::from("No matching sessions"));
     } else {
         lines.extend(
-            state
-                .sessions
-                .iter()
-                .enumerate()
-                .map(|(index, session)| session_picker_row(state, session, index == selected)),
+            sessions.iter().enumerate().map(|(index, session)| {
+                session_picker_row(state, session, index == picker.selected)
+            }),
         );
     }
     frame.render_widget(Clear, area);
@@ -1150,15 +1152,71 @@ mod tests {
             TranscriptState::None,
         );
         state.selected_session_id = Some("session_1".into());
-        state.session_picker = Some(super::super::state::SessionPickerView { selected: 1 });
+        state.session_picker = Some(super::super::state::SessionPickerView {
+            filter: String::new(),
+            selected: 1,
+        });
 
         let output = render_to_text(&state);
 
         assert!(output.contains("Sessions"));
+        assert!(output.contains("Type to filter"));
+        assert!(output.contains("Ctrl-P/Ctrl-N"));
         assert!(output.contains("Enter resume"));
+        assert!(output.contains("Filter: |"));
         assert!(output.contains("read README"));
         assert!(output.contains("interrupted"));
         assert!(output.contains("continue docs"));
+    }
+
+    #[test]
+    fn session_picker_renders_filtered_sessions_and_explicit_no_match() {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            vec![
+                SessionSummary {
+                    session_id: "session_1".into(),
+                    run_id: "run_1".into(),
+                    status: RunStateName::Finished,
+                    latest_question: "prepare release notes".into(),
+                    ledger_path: "/tmp/agent.db".into(),
+                },
+                SessionSummary {
+                    session_id: "session_2".into(),
+                    run_id: "run_2".into(),
+                    status: RunStateName::Interrupted,
+                    latest_question: "continue docs".into(),
+                    ledger_path: "/tmp/agent.db".into(),
+                },
+            ],
+            TranscriptState::None,
+        );
+        state.session_picker = Some(super::super::state::SessionPickerView {
+            filter: "CONT".into(),
+            selected: 0,
+        });
+
+        let output = render_to_text(&state);
+
+        assert!(output.contains("Filter: CONT|"));
+        assert!(output.contains("continue docs"));
+        assert!(!output.contains("prepare release notes"));
+        assert!(!output.contains("No matching sessions"));
+
+        state.session_picker.as_mut().unwrap().filter = "missing".into();
+        let output = render_to_text(&state);
+
+        assert!(output.contains("Filter: missing|"));
+        assert!(output.contains("No matching sessions"));
+        assert!(!output.contains("prepare release notes"));
+        assert!(!output.contains("continue docs"));
     }
 
     #[test]
