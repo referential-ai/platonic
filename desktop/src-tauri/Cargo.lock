@@ -2562,9 +2562,9 @@ dependencies = [
 
 [[package]]
 name = "platonic-core"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdcd19080f94bf595a5ec4e0d7f325664468fc658cada5ff0b392e2087b71714"
+checksum = "1a7a6ac597bc173e67d6c850dd4ec2bec01d8cf39c4da407c6186446c3f1c874"
 dependencies = [
  "serde",
  "serde_json",

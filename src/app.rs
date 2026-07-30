@@ -470,7 +470,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                     content: response.text(),
                 },
                 proposed_calls: proposals.clone(),
-                usage: response.usage.clone(),
+                usage: Some(response.usage.clone()),
             },
         )?;
 
@@ -2300,7 +2300,7 @@ enabled = ["file.read"]
         let usage = records
             .iter()
             .find_map(|record| match &record.event {
-                HarnessEvent::ModelResponded { usage, .. } => Some(usage),
+                HarnessEvent::ModelResponded { usage, .. } => usage.as_ref(),
                 _ => None,
             })
             .expect("model response should record usage");

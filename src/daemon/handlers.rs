@@ -763,7 +763,10 @@ fn typed_entries(
     });
     for entry in readback_entries {
         let entry = match entry {
-            ReadbackEntry::ContextFragment { .. } => continue,
+            ReadbackEntry::ContextFragment { .. }
+            | ReadbackEntry::ContextCompacted { .. }
+            | ReadbackEntry::ModelFailed { .. }
+            | ReadbackEntry::ToolProposalsRejected { .. } => continue,
             ReadbackEntry::ModelMessage { message, .. } => TypedTranscriptEntry::Assistant {
                 text: message.content,
             },
