@@ -171,7 +171,7 @@ pub enum RunPhase {
 ///             content: "I will write the file.".into(),
 ///         },
 ///         proposed_calls: vec![proposal],
-///         usage: ModelUsage { input_tokens: 3, output_tokens: 5 },
+///         usage: Some(ModelUsage { input_tokens: 3, output_tokens: 5 }),
 ///     },
 ///     HarnessEvent::ToolCallProposed {
 ///         run_id: run_id.clone(),
@@ -733,11 +733,11 @@ mod tests {
         }
     }
 
-    fn usage() -> ModelUsage {
-        ModelUsage {
+    fn usage() -> Option<ModelUsage> {
+        Some(ModelUsage {
             input_tokens: 50,
             output_tokens: 10,
-        }
+        })
     }
 
     fn rec(seq: u64, event: HarnessEvent) -> RecordedEvent {
