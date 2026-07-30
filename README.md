@@ -94,6 +94,21 @@ prompt. Yolo mode does not enable disabled or unknown tools, approve network
 tools, permit deny-class effects such as external side effects or secret access,
 approve `shell.exec`, or bypass workspace path checks.
 
+## Workspace Memory
+
+If `<workspace-root>/PLATONIC.md` exists, Plato Agent snapshots its exact
+contents once at run start and includes that snapshot in every model turn for
+the run. Only that exact filename at the workspace root is recognized; aliases
+such as `PLATO.md` and files below the root are ignored. A missing file leaves
+provider requests unchanged.
+
+`PLATONIC.md` must be a regular file containing valid UTF-8 and no more than
+8,192 bytes. The final path component is opened without following symlinks,
+and content is never trimmed. Workspace memory counts against the context
+budget; older session turns may be dropped to make room, but the memory
+snapshot is not shortened. Changes made after a run starts apply to the next
+run, not later turns in the current run.
+
 ## Issue Preparation
 
 Issue preparation is one fixed pipeline: prepare, refine, then model review.

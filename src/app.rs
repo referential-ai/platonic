@@ -23,8 +23,9 @@ use serde_json::Value;
 use std::{
     collections::HashSet,
     fmt,
-    io::{self, Write},
-    path::PathBuf,
+    fs::{self, File},
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -187,6 +188,9 @@ impl ApprovalMode {
 }
 
 const SESSION_TRUNCATION_MARKER: &str = "[older session turns omitted to fit the context budget]";
+const PLATONIC_MEMORY_FILENAME: &str = "PLATONIC.md";
+const PLATONIC_MEMORY_MAX_BYTES: usize = 8_192;
+const PLATONIC_MEMORY_SEPARATOR: &str = "\n\n";
 const RUN_CANCELED_REASON: &str = "run canceled";
 const DEFAULT_PROVIDER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_PROVIDER_RETRY_DELAY_SECONDS: f64 = 30.0;
@@ -217,6 +221,7 @@ impl ActiveSessionRun {
         question: &str,
         config: &Config,
         tools: &[ToolSpec],
+        system_context: &str,
     ) -> AppResult<(Self, SessionHydration)> {
         let turns = ledger.begin_session_run(
             session.session_id(),
@@ -224,7 +229,7 @@ impl ActiveSessionRun {
             question,
             session.create_session(),
         )?;
-        let hydration = hydrated_messages(&turns, question, config, tools)?;
+        let hydration = hydrated_messages(&turns, question, config, tools, system_context)?;
         Ok((
             Self {
                 ledger,
@@ -266,16 +271,19 @@ fn hydrated_messages(
     question: &str,
     config: &Config,
     tools: &[ToolSpec],
+    system_context: &str,
 ) -> AppResult<SessionHydration> {
     let mut first_retained_turn = 0;
     let mut retained_messages = session_messages_from(turns, question, false);
-    let estimated_tokens_before = estimated_context_tokens(&retained_messages, tools)?;
+    let estimated_tokens_before =
+        estimated_context_tokens(system_context, &retained_messages, tools)?;
     let mut estimated_tokens_after = estimated_tokens_before;
 
     while estimated_tokens_after > config.limits.token_budget && first_retained_turn < turns.len() {
         first_retained_turn += 1;
         retained_messages = session_messages_from(&turns[first_retained_turn..], question, true);
-        estimated_tokens_after = estimated_context_tokens(&retained_messages, tools)?;
+        estimated_tokens_after =
+            estimated_context_tokens(system_context, &retained_messages, tools)?;
     }
 
     let dropped_turns = u64::try_from(first_retained_turn)
@@ -307,10 +315,95 @@ fn session_messages_from(
     messages
 }
 
-fn estimated_context_tokens(messages: &[ModelMessage], tools: &[ToolSpec]) -> AppResult<u32> {
+fn load_platonic_memory(workspace_root: &Path) -> AppResult<Option<String>> {
+    let path = workspace_root.join(PLATONIC_MEMORY_FILENAME);
+    let Some(mut file) = open_platonic_memory(&path)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::with_capacity(PLATONIC_MEMORY_MAX_BYTES + 1);
+    Read::by_ref(&mut file)
+        .take((PLATONIC_MEMORY_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > PLATONIC_MEMORY_MAX_BYTES {
+        return Err(AppError::PlatonicMemoryTooLarge {
+            path,
+            max_bytes: PLATONIC_MEMORY_MAX_BYTES,
+        });
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| AppError::PlatonicMemoryInvalidUtf8(path))
+}
+
+fn open_platonic_memory(path: &Path) -> AppResult<Option<File>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(AppError::PlatonicMemoryNotRegular(path.to_path_buf()));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+
+    let file = match open_final_component_no_follow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return match fs::symlink_metadata(path) {
+                Ok(metadata) if !metadata.file_type().is_file() => {
+                    Err(AppError::PlatonicMemoryNotRegular(path.to_path_buf()))
+                }
+                Err(current) if current.kind() == io::ErrorKind::NotFound => Ok(None),
+                _ => Err(error.into()),
+            };
+        }
+    };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(AppError::PlatonicMemoryNotRegular(path.to_path_buf()));
+    }
+    Ok(Some(file))
+}
+
+#[cfg(unix)]
+fn open_final_component_no_follow(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_final_component_no_follow(path: &Path) -> io::Result<File> {
+    crate::windows_security::open_file_for_identity(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_final_component_no_follow(_path: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "opening workspace memory without following the final component is unsupported",
+    ))
+}
+
+fn provider_system_context(platonic_memory: Option<&str>) -> String {
+    let mut context = system_prompt().to_string();
+    if let Some(content) = platonic_memory {
+        context.push_str(PLATONIC_MEMORY_SEPARATOR);
+        context.push_str(content);
+    }
+    context
+}
+
+fn estimated_context_tokens(
+    system_context: &str,
+    messages: &[ModelMessage],
+    tools: &[ToolSpec],
+) -> AppResult<u32> {
     let messages = serde_json::to_string(messages)?;
     let tools = serde_json::to_string(tools)?;
-    Ok(estimate_tokens(system_prompt())
+    Ok(estimate_tokens(system_context)
         .saturating_add(estimate_tokens(&messages))
         .saturating_add(estimate_tokens(&tools)))
 }
@@ -320,6 +413,8 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         return Err(AppError::EmptyQuestion);
     }
 
+    let platonic_memory = load_platonic_memory(&options.workspace_root)?;
+    let system_context = provider_system_context(platonic_memory.as_deref());
     let mut config = Config::load(&options.workspace_root, options.config_path.as_deref())?;
     if let Some(model) = &options.overrides.model {
         config.provider.model = model.clone();
@@ -347,6 +442,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 &options.question,
                 &config,
                 &tools,
+                &system_context,
             )?;
             (Some(session_run), Some(hydration))
         }
@@ -358,6 +454,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 &options.question,
                 &config,
                 &tools,
+                &system_context,
             )?;
             (Some(session_run), Some(hydration))
         }
@@ -392,13 +489,17 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         let turn_id = TurnId::new(format!("turn_{}", turn_index + 1))?;
         let request = ModelRequest {
             model: config.provider.model.clone(),
-            system: system_prompt().into(),
+            system: system_context.clone(),
             max_output_tokens: config.limits.max_output_tokens,
             reasoning_effort: options.overrides.reasoning_effort,
             messages: messages.clone(),
             tools: tools.clone(),
         };
-        let context = context_pack(&request, config.limits.token_budget)?;
+        let context = context_pack(
+            &request,
+            config.limits.token_budget,
+            platonic_memory.as_deref(),
+        )?;
         check_cancel(&mut recorder, &options, &run_id, &mut session_run)?;
         if turn_index == 0
             && let Some(hydration) = &session_hydration
@@ -1117,31 +1218,51 @@ fn evaluate_policy(enabled_tools: &[String], call: &ToolCall) -> PolicyDecision 
     }
 }
 
-fn context_pack(request: &ModelRequest, token_budget: u32) -> AppResult<ContextPack> {
+fn context_pack(
+    request: &ModelRequest,
+    token_budget: u32,
+    platonic_memory: Option<&str>,
+) -> AppResult<ContextPack> {
     let messages = serde_json::to_string(&request.messages)?;
     let tools = serde_json::to_string(&request.tools)?;
+    let mut system_contract = system_prompt().to_string();
+    if platonic_memory.is_some() {
+        system_contract.push_str(PLATONIC_MEMORY_SEPARATOR);
+    }
+    // Keep the fragment sum equal to the estimate of the concatenated provider system text.
+    let system_context_tokens = estimate_tokens(&request.system);
+    let system_contract_tokens = estimate_tokens(&system_contract);
+    let mut fragments = vec![ContextFragment {
+        lane: ContextLane::SystemContract,
+        source: "system_prompt".into(),
+        content: system_contract,
+        estimated_tokens: system_contract_tokens,
+    }];
+    if let Some(content) = platonic_memory {
+        fragments.push(ContextFragment {
+            lane: ContextLane::RetrievedContext,
+            source: PLATONIC_MEMORY_FILENAME.into(),
+            content: content.into(),
+            estimated_tokens: system_context_tokens.saturating_sub(system_contract_tokens),
+        });
+    }
+    fragments.extend([
+        ContextFragment {
+            lane: ContextLane::RecentTurns,
+            source: "model.messages".into(),
+            estimated_tokens: estimate_tokens(&messages),
+            content: messages,
+        },
+        ContextFragment {
+            lane: ContextLane::ToolSchemas,
+            source: "model.tools".into(),
+            estimated_tokens: estimate_tokens(&tools),
+            content: tools,
+        },
+    ]);
     Ok(ContextPack {
         token_budget,
-        fragments: vec![
-            ContextFragment {
-                lane: ContextLane::SystemContract,
-                source: "system_prompt".into(),
-                content: request.system.clone(),
-                estimated_tokens: estimate_tokens(&request.system),
-            },
-            ContextFragment {
-                lane: ContextLane::RecentTurns,
-                source: "model.messages".into(),
-                estimated_tokens: estimate_tokens(&messages),
-                content: messages,
-            },
-            ContextFragment {
-                lane: ContextLane::ToolSchemas,
-                source: "model.tools".into(),
-                estimated_tokens: estimate_tokens(&tools),
-                content: tools,
-            },
-        ],
+        fragments,
     })
 }
 
@@ -1542,6 +1663,348 @@ base_url = "http://{}"
     }
 
     #[test]
+    fn platonic_memory_accepts_exact_byte_cap_without_trimming() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join(PLATONIC_MEMORY_FILENAME);
+        let content = format!(" \n{} \n", "a".repeat(PLATONIC_MEMORY_MAX_BYTES - 4));
+        assert_eq!(content.len(), PLATONIC_MEMORY_MAX_BYTES);
+        std::fs::write(&path, &content).unwrap();
+
+        let loaded = load_platonic_memory(workspace.path()).unwrap();
+
+        assert_eq!(loaded.as_deref(), Some(content.as_str()));
+    }
+
+    #[test]
+    fn platonic_memory_rejects_cap_plus_one_and_counts_multibyte_utf8_bytes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join(PLATONIC_MEMORY_FILENAME);
+        for content in [
+            vec![b'a'; PLATONIC_MEMORY_MAX_BYTES + 1],
+            "\u{754c}".repeat(2_731).into_bytes(),
+        ] {
+            assert_eq!(content.len(), PLATONIC_MEMORY_MAX_BYTES + 1);
+            std::fs::write(&path, content).unwrap();
+
+            assert!(matches!(
+                load_platonic_memory(workspace.path()),
+                Err(AppError::PlatonicMemoryTooLarge {
+                    path: error_path,
+                    max_bytes: PLATONIC_MEMORY_MAX_BYTES,
+                }) if error_path == path
+            ));
+        }
+    }
+
+    #[test]
+    fn platonic_memory_rejects_invalid_utf8() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join(PLATONIC_MEMORY_FILENAME);
+        std::fs::write(&path, [b'v', 0xff]).unwrap();
+
+        assert!(matches!(
+            load_platonic_memory(workspace.path()),
+            Err(AppError::PlatonicMemoryInvalidUtf8(error_path)) if error_path == path
+        ));
+    }
+
+    #[test]
+    fn platonic_memory_rejects_directory_targets() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join(PLATONIC_MEMORY_FILENAME);
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(matches!(
+            load_platonic_memory(workspace.path()),
+            Err(AppError::PlatonicMemoryNotRegular(error_path)) if error_path == path
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn platonic_memory_rejects_symlink_and_other_non_regular_targets() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join(PLATONIC_MEMORY_FILENAME);
+        let target = workspace.path().join("memory-target.md");
+        std::fs::write(&target, "must not be followed").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert!(matches!(
+            load_platonic_memory(workspace.path()),
+            Err(AppError::PlatonicMemoryNotRegular(error_path)) if error_path == path
+        ));
+
+        std::fs::remove_file(&path).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(matches!(
+            load_platonic_memory(workspace.path()),
+            Err(AppError::PlatonicMemoryNotRegular(error_path)) if error_path == path
+        ));
+    }
+
+    #[test]
+    fn platonic_memory_loads_only_the_exact_workspace_root_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("PLATO.md"), "alias").unwrap();
+        std::fs::create_dir(workspace.path().join("nested")).unwrap();
+        std::fs::write(
+            workspace
+                .path()
+                .join("nested")
+                .join(PLATONIC_MEMORY_FILENAME),
+            "nested",
+        )
+        .unwrap();
+
+        assert_eq!(load_platonic_memory(workspace.path()).unwrap(), None);
+
+        std::fs::write(
+            workspace.path().join(PLATONIC_MEMORY_FILENAME),
+            "exact root",
+        )
+        .unwrap();
+        assert_eq!(
+            load_platonic_memory(workspace.path()).unwrap().as_deref(),
+            Some("exact root")
+        );
+    }
+
+    #[test]
+    fn platonic_memory_error_precedes_session_and_ledger_mutation() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join(PLATONIC_MEMORY_FILENAME),
+            vec![b'a'; PLATONIC_MEMORY_MAX_BYTES + 1],
+        )
+        .unwrap();
+        let ledger_path = workspace.path().join("events.db");
+
+        let error = run_question(RunOptions {
+            question: "hello".into(),
+            config_path: None,
+            overrides: RunOverrides::default(),
+            ledger: RunLedger::Sqlite(ledger_path.clone()),
+            workspace_root: workspace.path().to_path_buf(),
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(RunId::new("run_invalid_memory").unwrap()),
+            session: Some(RunSession::Fresh {
+                session_id: "session_invalid_memory".into(),
+            }),
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: None,
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, AppError::PlatonicMemoryTooLarge { .. }));
+        assert!(!ledger_path.exists());
+    }
+
+    #[test]
+    fn absent_platonic_memory_preserves_provider_request_and_context_shape() {
+        let provider = spawn_provider_sequence(vec![json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "done"}
+            }]
+        })]);
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("PLATO.md"), "ignored alias").unwrap();
+        std::fs::create_dir(workspace.path().join("nested")).unwrap();
+        std::fs::write(
+            workspace
+                .path()
+                .join("nested")
+                .join(PLATONIC_MEMORY_FILENAME),
+            "ignored nested memory",
+        )
+        .unwrap();
+        let config_path = workspace.path().join("plato.toml");
+        write_memory_test_config(&config_path, &provider.base_url, 1, 4_000);
+        let ledger_path = workspace.path().join("events.jsonl");
+
+        let outcome = run_question(memory_test_options(
+            workspace.path(),
+            &config_path,
+            &ledger_path,
+            "run_absent_memory",
+        ))
+        .unwrap();
+        let request = http_request_json(&provider.handle.join().unwrap()[0]);
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        let context = records
+            .iter()
+            .find_map(|record| match &record.event {
+                HarnessEvent::ContextBuilt { context, .. } => Some(context),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(outcome.final_answer, "done");
+        assert_eq!(provider_system_from_request(&request), system_prompt());
+        assert_eq!(
+            context
+                .fragments
+                .iter()
+                .map(|fragment| fragment.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["system_prompt", "model.messages", "model.tools"]
+        );
+        assert_eq!(context.fragments[0].content, system_prompt());
+        assert!(
+            context
+                .fragments
+                .iter()
+                .all(|fragment| fragment.lane != ContextLane::RetrievedContext)
+        );
+    }
+
+    #[test]
+    fn present_platonic_memory_is_one_snapshot_in_every_request_and_context_record() {
+        let workspace = tempfile::tempdir().unwrap();
+        let memory_path = workspace.path().join(PLATONIC_MEMORY_FILENAME);
+        let memory = "unique workspace memory\nwith trailing space \n";
+        let replacement = "changed after the first provider request";
+        std::fs::write(&memory_path, memory).unwrap();
+        std::fs::write(workspace.path().join("payload.txt"), "payload").unwrap();
+        let provider = spawn_memory_mutating_provider(memory_path.clone(), replacement.to_string());
+        let config_path = workspace.path().join("plato.toml");
+        write_memory_test_config(&config_path, &provider.base_url, 2, 4_000);
+        let ledger_path = workspace.path().join("events.jsonl");
+
+        let outcome = run_question(memory_test_options(
+            workspace.path(),
+            &config_path,
+            &ledger_path,
+            "run_present_memory",
+        ))
+        .unwrap();
+        let requests = provider.handle.join().unwrap();
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        let contexts = records
+            .iter()
+            .filter_map(|record| match &record.event {
+                HarnessEvent::ContextBuilt { context, .. } => Some(context),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let expected_system = provider_system_context(Some(memory));
+
+        assert_eq!(outcome.final_answer, "done");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(contexts.len(), requests.len());
+        assert_eq!(std::fs::read_to_string(&memory_path).unwrap(), replacement);
+
+        for request in &requests {
+            let request = http_request_json(request);
+            let system = provider_system_from_request(&request);
+            assert_eq!(system, expected_system);
+            assert_eq!(system.matches(memory).count(), 1);
+            assert!(
+                !request["messages"].as_array().unwrap()[1..]
+                    .iter()
+                    .any(|message| message.to_string().contains(memory))
+            );
+            assert!(!system.contains(replacement));
+        }
+
+        for context in contexts {
+            let retrieved = context
+                .fragments
+                .iter()
+                .filter(|fragment| fragment.lane == ContextLane::RetrievedContext)
+                .collect::<Vec<_>>();
+            assert_eq!(retrieved.len(), 1);
+            assert_eq!(retrieved[0].source, PLATONIC_MEMORY_FILENAME);
+            assert_eq!(retrieved[0].content, memory);
+            assert!(context.fragments.iter().all(|fragment| {
+                fragment.lane == ContextLane::RetrievedContext || !fragment.content.contains(memory)
+            }));
+            let recent_turns = context
+                .fragments
+                .iter()
+                .find(|fragment| fragment.lane == ContextLane::RecentTurns)
+                .unwrap();
+            assert!(!recent_turns.content.contains(memory));
+
+            let system_contract = context
+                .fragments
+                .iter()
+                .find(|fragment| fragment.lane == ContextLane::SystemContract)
+                .unwrap();
+            assert_eq!(
+                system_contract.content,
+                format!("{}{PLATONIC_MEMORY_SEPARATOR}", system_prompt())
+            );
+            assert_eq!(
+                system_contract.estimated_tokens + retrieved[0].estimated_tokens,
+                estimate_tokens(&expected_system)
+            );
+            assert_eq!(
+                context.estimated_tokens(),
+                estimate_tokens(&expected_system)
+                    + context
+                        .fragments
+                        .iter()
+                        .filter(|fragment| {
+                            matches!(
+                                fragment.lane,
+                                ContextLane::RecentTurns | ContextLane::ToolSchemas
+                            )
+                        })
+                        .map(|fragment| estimate_tokens(&fragment.content))
+                        .sum::<u32>()
+            );
+        }
+    }
+
+    #[test]
+    fn platonic_memory_budget_can_drop_oldest_turn_without_trimming_memory() {
+        let mut config = Config::default();
+        let tools = tool_specs(&config.tools.enabled);
+        let turns = vec![SessionTurn {
+            question: "old question ".repeat(40),
+            final_answer: "old answer ".repeat(40),
+        }];
+        let question = "current question";
+        let memory = "workspace memory ".repeat(30);
+        let system_context = provider_system_context(Some(&memory));
+        let all_messages = session_messages_from(&turns, question, false);
+        let without_memory =
+            estimated_context_tokens(system_prompt(), &all_messages, &tools).unwrap();
+        let with_memory = estimated_context_tokens(&system_context, &all_messages, &tools).unwrap();
+        assert!(with_memory > without_memory);
+        config.limits.token_budget = without_memory;
+
+        let hydration =
+            hydrated_messages(&turns, question, &config, &tools, &system_context).unwrap();
+
+        assert_eq!(hydration.dropped_turns, 1);
+        assert_eq!(hydration.estimated_tokens_before, with_memory);
+        assert!(hydration.estimated_tokens_after <= config.limits.token_budget);
+        let request = ModelRequest {
+            model: config.provider.model,
+            system: system_context,
+            max_output_tokens: config.limits.max_output_tokens,
+            reasoning_effort: None,
+            messages: hydration.retained_messages,
+            tools,
+        };
+        let context = context_pack(&request, config.limits.token_budget, Some(&memory)).unwrap();
+        context.validate_budget().unwrap();
+        assert_eq!(context.estimated_tokens(), hydration.estimated_tokens_after);
+        assert_eq!(
+            context
+                .fragments
+                .iter()
+                .find(|fragment| fragment.lane == ContextLane::RetrievedContext)
+                .unwrap()
+                .content,
+            memory
+        );
+    }
+
+    #[test]
     fn session_hydration_includes_prior_turns_and_current_question() {
         let config = Config::default();
         let tools = tool_specs(&config.tools.enabled);
@@ -1550,7 +2013,8 @@ base_url = "http://{}"
             final_answer: "first answer".into(),
         }];
 
-        let hydration = hydrated_messages(&turns, "second question", &config, &tools).unwrap();
+        let hydration =
+            hydrated_messages(&turns, "second question", &config, &tools, system_prompt()).unwrap();
         let messages = &hydration.retained_messages;
 
         assert_eq!(messages.len(), 3);
@@ -1564,7 +2028,7 @@ base_url = "http://{}"
         );
         assert_eq!(
             hydration.estimated_tokens_before,
-            estimated_context_tokens(messages, &tools).unwrap()
+            estimated_context_tokens(system_prompt(), messages, &tools).unwrap()
         );
     }
 
@@ -1589,13 +2053,18 @@ base_url = "http://{}"
         let expected_before_messages = session_messages_from(&turns, "current question", false);
         let one_drop_messages = session_messages_from(&turns[1..], "current question", true);
         let expected_after_messages = session_messages_from(&turns[2..], "current question", true);
-        let expected_before = estimated_context_tokens(&expected_before_messages, &tools).unwrap();
-        let one_drop = estimated_context_tokens(&one_drop_messages, &tools).unwrap();
-        let expected_after = estimated_context_tokens(&expected_after_messages, &tools).unwrap();
+        let expected_before =
+            estimated_context_tokens(system_prompt(), &expected_before_messages, &tools).unwrap();
+        let one_drop =
+            estimated_context_tokens(system_prompt(), &one_drop_messages, &tools).unwrap();
+        let expected_after =
+            estimated_context_tokens(system_prompt(), &expected_after_messages, &tools).unwrap();
         assert!(one_drop > expected_after);
         config.limits.token_budget = expected_after;
 
-        let hydration = hydrated_messages(&turns, "current question", &config, &tools).unwrap();
+        let hydration =
+            hydrated_messages(&turns, "current question", &config, &tools, system_prompt())
+                .unwrap();
         let serialized = serde_json::to_string(&hydration.retained_messages).unwrap();
 
         assert!(serialized.contains(SESSION_TRUNCATION_MARKER));
@@ -1631,14 +2100,21 @@ base_url = "http://{}"
         ];
         seed_finished_session(&ledger_path, session_id, &turns);
         let tools = tool_specs(&["file.read".into()]);
-        let expected_before =
-            estimated_context_tokens(&session_messages_from(&turns, question, false), &tools)
-                .unwrap();
-        let one_drop =
-            estimated_context_tokens(&session_messages_from(&turns[1..], question, true), &tools)
-                .unwrap();
+        let expected_before = estimated_context_tokens(
+            system_prompt(),
+            &session_messages_from(&turns, question, false),
+            &tools,
+        )
+        .unwrap();
+        let one_drop = estimated_context_tokens(
+            system_prompt(),
+            &session_messages_from(&turns[1..], question, true),
+            &tools,
+        )
+        .unwrap();
         let expected_after_messages = session_messages_from(&turns[2..], question, true);
-        let expected_after = estimated_context_tokens(&expected_after_messages, &tools).unwrap();
+        let expected_after =
+            estimated_context_tokens(system_prompt(), &expected_after_messages, &tools).unwrap();
         assert!(one_drop > expected_after);
 
         let provider = spawn_provider_sequence(vec![json!({
@@ -1725,9 +2201,12 @@ base_url = "http://{}"
         }];
         seed_finished_session(&ledger_path, session_id, &turns);
         let tools = tool_specs(&["file.read".into()]);
-        let token_budget =
-            estimated_context_tokens(&session_messages_from(&turns, question, false), &tools)
-                .unwrap();
+        let token_budget = estimated_context_tokens(
+            system_prompt(),
+            &session_messages_from(&turns, question, false),
+            &tools,
+        )
+        .unwrap();
         let provider = spawn_provider_sequence(vec![json!({
             "choices": [{
                 "finish_reason": "stop",
@@ -3269,6 +3748,7 @@ enabled = ["file.read"]
             "hello",
             &config,
             &tools,
+            system_prompt(),
         )
         .unwrap();
         let mut session_run = Some(session_run);
@@ -3448,6 +3928,52 @@ enabled = ["file.read"]
         }
     }
 
+    fn memory_test_options(
+        workspace_root: &Path,
+        config_path: &Path,
+        ledger_path: &Path,
+        run_id: &str,
+    ) -> RunOptions {
+        RunOptions {
+            question: "use workspace context".into(),
+            config_path: Some(config_path.to_path_buf()),
+            overrides: RunOverrides::default(),
+            ledger: RunLedger::Jsonl(ledger_path.to_path_buf()),
+            workspace_root: workspace_root.to_path_buf(),
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(RunId::new(run_id).unwrap()),
+            session: None,
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: None,
+        }
+    }
+
+    fn write_memory_test_config(path: &Path, base_url: &str, max_turns: u32, token_budget: u32) {
+        std::fs::write(
+            path,
+            format!(
+                r#"
+[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "{base_url}"
+timeout_ms = 5000
+
+[limits]
+token_budget = {token_budget}
+max_output_tokens = 32
+max_turns = {max_turns}
+
+[tools]
+enabled = ["file.read"]
+"#
+            ),
+        )
+        .unwrap();
+    }
+
     fn write_session_test_config(path: &Path, base_url: &str, token_budget: u32) {
         std::fs::write(
             path,
@@ -3533,6 +4059,61 @@ enabled = ["file.read"]
                 .map(|response| {
                     let (mut stream, _) = listener.accept().unwrap();
                     let request = read_http_request(&mut stream);
+                    let body = serde_json::to_string(&response).unwrap();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                    request
+                })
+                .collect()
+        });
+        SequenceProvider { base_url, handle }
+    }
+
+    fn spawn_memory_mutating_provider(
+        memory_path: PathBuf,
+        replacement: String,
+    ) -> SequenceProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let responses = [
+            json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "provider_read",
+                            "type": "function",
+                            "function": {
+                                "name": "file_read",
+                                "arguments": "{\"path\":\"payload.txt\"}"
+                            }
+                        }]
+                    }
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": "done"}
+                }]
+            }),
+        ];
+        let handle = thread::spawn(move || {
+            responses
+                .into_iter()
+                .enumerate()
+                .map(|(index, response)| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request = read_http_request(&mut stream);
+                    if index == 0 {
+                        std::fs::write(&memory_path, &replacement).unwrap();
+                    }
                     let body = serde_json::to_string(&response).unwrap();
                     write!(
                         stream,
@@ -3748,6 +4329,10 @@ enabled = ["file.read"]
 
     fn http_request_json(request: &str) -> Value {
         serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
+    }
+
+    fn provider_system_from_request(request: &Value) -> &str {
+        request["messages"][0]["content"].as_str().unwrap()
     }
 
     fn find_header_end(bytes: &[u8]) -> Option<usize> {

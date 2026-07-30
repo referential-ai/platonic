@@ -1157,6 +1157,65 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
     }
 
     #[test]
+    fn daemon_run_start_uses_shared_platonic_memory_context() {
+        let provider = spawn_text_provider("done");
+        let workspace = tempfile::tempdir().unwrap();
+        let memory = "daemon workspace memory";
+        std::fs::write(workspace.path().join("PLATONIC.md"), memory).unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let config_path = workspace.path().join("plato.toml");
+        write_provider_config(&config_path, &provider.base_url, "file.read");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+
+        let response = server.handle_line(&format!(
+            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"hello","config_path":"{}","wait":true}}}}"#,
+            config_path.display()
+        ));
+        let result = response.result.unwrap();
+        let request = http_request_json(&provider.handle.join().unwrap());
+        let ledger = SqliteLedger::open_readonly(&server.paths().ledger_path).unwrap();
+        let (_, records) = ledger.read_latest_run().unwrap();
+        let context = records
+            .iter()
+            .find_map(|record| match &record.event {
+                HarnessEvent::ContextBuilt { context, .. } => Some(context),
+                _ => None,
+            })
+            .unwrap();
+        let retrieved = context
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.lane == platonic_core::ContextLane::RetrievedContext)
+            .collect::<Vec<_>>();
+
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        assert_eq!(result["status"], "finished");
+        assert_eq!(
+            request["messages"][0]["content"],
+            format!("{}\n\n{memory}", crate::model::system_prompt())
+        );
+        assert_eq!(
+            request["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .matches(memory)
+                .count(),
+            1
+        );
+        assert_eq!(retrieved.len(), 1);
+        assert_eq!(retrieved[0].source, "PLATONIC.md");
+        assert_eq!(retrieved[0].content, memory);
+        assert!(
+            context
+                .fragments
+                .iter()
+                .find(|fragment| { fragment.lane == platonic_core::ContextLane::RecentTurns })
+                .is_some_and(|fragment| !fragment.content.contains(memory))
+        );
+    }
+
+    #[test]
     fn run_start_without_wait_exposes_and_clears_approval_on_same_connection() {
         let provider = spawn_tool_call_provider();
         let workspace = tempfile::tempdir().unwrap();
@@ -2474,6 +2533,11 @@ enabled = ["file.read"]
         handle: thread::JoinHandle<String>,
     }
 
+    struct TextProvider {
+        base_url: String,
+        handle: thread::JoinHandle<String>,
+    }
+
     struct ConcurrentTextProvider {
         base_url: String,
         handle: thread::JoinHandle<Vec<String>>,
@@ -2525,6 +2589,40 @@ enabled = ["{enabled_tool}"]
             request
         });
         ToolCallProvider { base_url, handle }
+    }
+
+    fn spawn_text_provider(answer: &str) -> TextProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let answer = answer.to_string();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            let content = json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": answer},
+                    "finish_reason": null
+                }]
+            });
+            let finish = json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            });
+            let body = format!("data: {content}\n\ndata: {finish}\n\ndata: [DONE]\n\n");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            request
+        });
+        TextProvider { base_url, handle }
     }
 
     fn spawn_concurrent_text_provider() -> ConcurrentTextProvider {
@@ -2748,6 +2846,10 @@ enabled = ["{enabled_tool}"]
             bytes.extend_from_slice(&buffer[..read]);
         }
         String::from_utf8(bytes).unwrap()
+    }
+
+    fn http_request_json(request: &str) -> serde_json::Value {
+        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
     }
 
     fn find_header_end(bytes: &[u8]) -> Option<usize> {

@@ -81,6 +81,15 @@ pub enum AppError {
     #[error("path escapes workspace: {0}")]
     PathEscapesWorkspace(PathBuf),
 
+    #[error("workspace memory exceeds the {max_bytes}-byte limit: {path}")]
+    PlatonicMemoryTooLarge { path: PathBuf, max_bytes: usize },
+
+    #[error("workspace memory is not valid UTF-8: {0}")]
+    PlatonicMemoryInvalidUtf8(PathBuf),
+
+    #[error("workspace memory target is not a regular file: {0}")]
+    PlatonicMemoryNotRegular(PathBuf),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
