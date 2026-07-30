@@ -65,6 +65,15 @@ pub enum ReadbackEntry {
         /// Normalized model-authored message.
         message: Message,
     },
+    /// Model request failed without terminating the run.
+    ModelFailed {
+        /// Turn of the failed model request.
+        turn_id: TurnId,
+        /// Model step of the failed request.
+        step: u32,
+        /// Recorded host-reported failure reason.
+        reason: String,
+    },
     /// Host rejected the whole pending model proposal batch.
     ToolProposalsRejected {
         /// Turn that produced the rejected proposals.
@@ -150,6 +159,18 @@ fn collect_entry(event: &HarnessEvent, entries: &mut Vec<ReadbackEntry>) {
             entries.push(ReadbackEntry::ModelMessage {
                 turn_id: turn_id.clone(),
                 message: output.clone(),
+            });
+        }
+        HarnessEvent::ModelFailed {
+            turn_id,
+            step,
+            reason,
+            ..
+        } => {
+            entries.push(ReadbackEntry::ModelFailed {
+                turn_id: turn_id.clone(),
+                step: *step,
+                reason: reason.clone(),
             });
         }
         HarnessEvent::ToolProposalsRejected {
@@ -294,6 +315,15 @@ mod tests {
         }
     }
 
+    fn model_failed(turn_id: TurnId, step: u32) -> HarnessEvent {
+        HarnessEvent::ModelFailed {
+            run_id: run_id(),
+            turn_id,
+            step,
+            reason: "provider unavailable".into(),
+        }
+    }
+
     fn model_responded(
         turn_id: TurnId,
         step: u32,
@@ -429,6 +459,50 @@ mod tests {
                         content: "What is in README?".into(),
                         estimated_tokens: 10,
                     },
+                },
+                ReadbackEntry::ModelMessage {
+                    turn_id: turn_id(),
+                    message: Message {
+                        role: MessageRole::Assistant,
+                        content: "It is a README.".into(),
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn model_failure_is_replay_visible_before_a_successful_retry() {
+        let events = vec![
+            start_event(0),
+            rec(1, context(turn_id(), "What is in README?")),
+            rec(2, model_requested(turn_id(), 0)),
+            rec(3, model_failed(turn_id(), 0)),
+            rec(4, model_requested(turn_id(), 0)),
+            rec(5, model_responded(turn_id(), 0, "It is a README.", vec![])),
+            rec(6, HarnessEvent::RunFinished { run_id: run_id() }),
+        ];
+
+        let readback = RunReadback::from_events(&events).unwrap();
+
+        assert_eq!(readback.final_phase, RunPhase::Finished);
+        assert_eq!(readback.next_seq, 7);
+        assert_eq!(
+            readback.entries,
+            vec![
+                ReadbackEntry::ContextFragment {
+                    turn_id: turn_id(),
+                    fragment: ContextFragment {
+                        lane: ContextLane::CurrentTask,
+                        source: "user".into(),
+                        content: "What is in README?".into(),
+                        estimated_tokens: 10,
+                    },
+                },
+                ReadbackEntry::ModelFailed {
+                    turn_id: turn_id(),
+                    step: 0,
+                    reason: "provider unavailable".into(),
                 },
                 ReadbackEntry::ModelMessage {
                     turn_id: turn_id(),

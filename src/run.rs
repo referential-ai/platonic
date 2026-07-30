@@ -53,6 +53,8 @@ pub enum RunPhase {
         turn_id: TurnId,
         /// Model step the response must match.
         step: u32,
+        /// Budget-validated context retained if the request fails.
+        context: ContextPack,
     },
     /// The model response contained at least one tool proposal.
     AwaitingToolCall {
@@ -119,6 +121,8 @@ pub enum RunPhase {
 ///
 /// The state machine performs no IO. Hosts inspect [`Self::pending_command`], perform
 /// the requested effect, and then apply the resulting recorded event.
+/// A [`HarnessEvent::ModelFailed`] restores the identical pending model command
+/// without advancing its step.
 ///
 /// # Examples
 ///
@@ -368,7 +372,7 @@ impl RunState {
                 RunPhase::ReadyToRequestModel {
                     turn_id,
                     step,
-                    context: _,
+                    context,
                 },
                 HarnessEvent::ModelRequested {
                     turn_id: actual_turn_id,
@@ -381,11 +385,33 @@ impl RunState {
                 self.phase = RunPhase::AwaitingModelResponse {
                     turn_id: turn_id.clone(),
                     step: *step,
+                    context: context.clone(),
                 };
                 Ok(())
             }
             (
-                RunPhase::AwaitingModelResponse { turn_id, step },
+                RunPhase::AwaitingModelResponse {
+                    turn_id,
+                    step,
+                    context,
+                },
+                HarnessEvent::ModelFailed {
+                    turn_id: actual_turn_id,
+                    step: actual_step,
+                    ..
+                },
+            ) => {
+                ensure_turn(turn_id, actual_turn_id)?;
+                ensure_step(*step, *actual_step)?;
+                self.phase = RunPhase::ReadyToRequestModel {
+                    turn_id: turn_id.clone(),
+                    step: *step,
+                    context: context.clone(),
+                };
+                Ok(())
+            }
+            (
+                RunPhase::AwaitingModelResponse { turn_id, step, .. },
                 HarnessEvent::ModelResponded {
                     turn_id: actual_turn_id,
                     step: actual_step,
@@ -828,6 +854,18 @@ mod tests {
         )
     }
 
+    fn model_failed_for(seq: u64, turn_id: TurnId, step: u32) -> RecordedEvent {
+        rec(
+            seq,
+            HarnessEvent::ModelFailed {
+                run_id: run_id(),
+                turn_id,
+                step,
+                reason: "provider unavailable".into(),
+            },
+        )
+    }
+
     fn model_responded(seq: u64) -> RecordedEvent {
         model_responded_with(
             seq,
@@ -1260,6 +1298,110 @@ mod tests {
         assert_eq!(state.phase(), &RunPhase::Finished);
         assert_eq!(state.next_seq(), 10);
         assert_eq!(apply_all(&events), state);
+    }
+
+    #[test]
+    fn model_failure_reemits_identical_request_and_step_advances_only_on_response() {
+        let mut state = apply_all(&[start_event(0), context_event(1)]);
+        let original_request = RunCommand::RequestModel {
+            turn_id: turn_id(),
+            step: 0,
+            context: context(10),
+        };
+        assert_eq!(state.pending_command(), Some(original_request.clone()));
+
+        state.apply(&model_requested(2)).unwrap();
+        assert!(state.pending_command().is_none());
+        state.apply(&model_failed_for(3, turn_id(), 0)).unwrap();
+        assert_eq!(state.pending_command(), Some(original_request));
+
+        state.apply(&model_requested(4)).unwrap();
+        state
+            .apply(&model_responded_with(5, turn_id(), 0, "done", vec![]))
+            .unwrap();
+        state.apply(&second_context_event(6)).unwrap();
+        assert_eq!(
+            state.pending_command(),
+            Some(RunCommand::RequestModel {
+                turn_id: other_turn_id(),
+                step: 1,
+                context: context_with_content(10, "tool result: read README"),
+            })
+        );
+
+        state.apply(&second_model_requested(7)).unwrap();
+        state.apply(&second_model_answer(8)).unwrap();
+        state
+            .apply(&rec(9, HarnessEvent::RunFinished { run_id: run_id() }))
+            .unwrap();
+        assert_eq!(state.phase(), &RunPhase::Finished);
+    }
+
+    #[test]
+    fn model_failure_requires_an_awaiting_request_with_matching_turn_and_step() {
+        let mut before_request = apply_all(&[start_event(0), context_event(1)]);
+        assert_eq!(
+            before_request
+                .apply(&model_failed_for(2, turn_id(), 0))
+                .unwrap_err(),
+            Error::InvalidTransition {
+                phase: "ready_to_request_model",
+                event: "model_failed",
+            }
+        );
+
+        let awaiting = apply_all(&[start_event(0), context_event(1), model_requested(2)]);
+        let mut wrong_turn = awaiting.clone();
+        assert_eq!(
+            wrong_turn
+                .apply(&model_failed_for(3, other_turn_id(), 0))
+                .unwrap_err(),
+            Error::TurnMismatch {
+                expected: "turn_1".into(),
+                actual: "turn_2".into(),
+            }
+        );
+        assert_eq!(wrong_turn, awaiting);
+
+        let mut wrong_step = awaiting.clone();
+        assert_eq!(
+            wrong_step
+                .apply(&model_failed_for(3, turn_id(), 1))
+                .unwrap_err(),
+            Error::StepMismatch {
+                expected: 0,
+                actual: 1,
+            }
+        );
+        assert_eq!(wrong_step, awaiting);
+    }
+
+    #[test]
+    fn replay_after_model_failure_reproduces_the_pending_request() {
+        let state = apply_all(&[
+            start_event(0),
+            context_event(1),
+            model_requested(2),
+            model_failed_for(3, turn_id(), 0),
+        ]);
+
+        assert_eq!(
+            state.phase(),
+            &RunPhase::ReadyToRequestModel {
+                turn_id: turn_id(),
+                step: 0,
+                context: context(10),
+            }
+        );
+        assert_eq!(
+            state.pending_command(),
+            Some(RunCommand::RequestModel {
+                turn_id: turn_id(),
+                step: 0,
+                context: context(10),
+            })
+        );
+        assert_eq!(state.next_seq(), 4);
     }
 
     #[test]

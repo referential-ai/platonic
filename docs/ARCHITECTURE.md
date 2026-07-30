@@ -90,7 +90,7 @@ A bounded agent unit (`AgentId`): not a personality blob, but an execution ident
 
 A durable execution instance. A run is event-log-first. Transcripts, metrics, replay, and audit views are derived from events. The run loop lives in `run` as a pure state machine; hosts drive it. `RunCommand` (desired effects) is a separate type from `HarnessEvent` (recorded facts); replay applies events only, so it can never re-emit IO.
 
-`RunReadback` lives in `projection` as a small pure view over a recorded ledger. It validates the ledger by replaying each `RecordedEvent` through `RunState`, then projects chronological context fragments, model messages, whole-batch proposal rejections, tool calls, tool results, policy denials, approval grants and denials, and tool failures. It does not store events, render output, execute tools, call providers, or read clocks.
+`RunReadback` lives in `projection` as a small pure view over a recorded ledger. It validates the ledger by replaying each `RecordedEvent` through `RunState`, then projects chronological context fragments, model failures and messages, whole-batch proposal rejections, tool calls, tool results, policy denials, approval grants and denials, and tool failures. It does not store events, render output, execute tools, call providers, or read clocks.
 
 ### ContextPack
 
@@ -137,6 +137,7 @@ The durable ledger. Initial events include:
 - `context_compacted`
 - `context_built`
 - `model_requested`
+- `model_failed`
 - `model_responded`
 - `tool_proposals_rejected`
 - `tool_call_proposed`
@@ -152,6 +153,8 @@ The durable ledger. Initial events include:
 Events are recorded wrapped in `RecordedEvent { seq, occurred_at_ms, event }`; hosts supply both fields — core never reads clocks. `seq` is per-run and contiguous from 0; the run machine rejects gaps and regressions. Store append is idempotent on `(run_id, seq)`; ordering across runs is a store concern. Correlation: tool events carry `call_id`; model request/response pairs carry a per-run `step` counter. Ledger variants are never cargo-feature-gated: one schema, always readable.
 
 `context_compacted` records a non-empty prior-turn range and must be followed by `context_built` for the same turn, or by `run_failed`. It emits no command and leaves the public run phase unchanged.
+
+`model_failed` records that the pending model request returned no response. It must match the pending turn and step, then makes the identical budget-validated context, turn, and step pending as `request_model` again. Only `model_responded` advances the model step; `run_failed` remains the terminal path.
 
 `tool_proposals_rejected` records that the host rejected the whole pending proposal batch from `model_responded`. It carries only the matching `turn_id` and a non-empty reason; the proposals remain recorded once in `model_responded`. The event is valid only while awaiting a host-validated call and concludes the turn without fabricating one.
 
