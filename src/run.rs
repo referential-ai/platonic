@@ -420,6 +420,19 @@ impl RunState {
                 Ok(())
             }
             (
+                RunPhase::AwaitingToolCall { turn_id, .. },
+                HarnessEvent::ToolProposalsRejected {
+                    turn_id: actual_turn_id,
+                    reason,
+                    ..
+                },
+            ) => {
+                ensure_turn(turn_id, actual_turn_id)?;
+                ensure_tool_proposals_rejection_reason(reason)?;
+                self.phase = RunPhase::TurnConcluded;
+                Ok(())
+            }
+            (
                 RunPhase::AwaitingPolicy { call },
                 HarnessEvent::PolicyEvaluated {
                     call_id, decision, ..
@@ -566,6 +579,13 @@ fn ensure_new_turn(previous: Option<&TurnId>, actual: &TurnId) -> Result<(), Err
         return Err(Error::TurnReused {
             turn_id: actual.to_string(),
         });
+    }
+    Ok(())
+}
+
+fn ensure_tool_proposals_rejection_reason(reason: &str) -> Result<(), Error> {
+    if reason.trim().is_empty() {
+        return Err(Error::EmptyToolProposalsRejectionReason);
     }
     Ok(())
 }
@@ -856,6 +876,17 @@ mod tests {
                 run_id: run_id(),
                 turn_id: turn_id(),
                 call: call(effect),
+            },
+        )
+    }
+
+    fn tool_proposals_rejected(seq: u64, turn_id: TurnId, reason: &str) -> RecordedEvent {
+        rec(
+            seq,
+            HarnessEvent::ToolProposalsRejected {
+                run_id: run_id(),
+                turn_id,
+                reason: reason.into(),
             },
         )
     }
@@ -1443,6 +1474,112 @@ mod tests {
                 event: "tool_call_proposed"
             })
         );
+    }
+
+    #[test]
+    fn whole_proposal_batch_rejection_concludes_turn_and_allows_a_later_turn() {
+        let mut state = apply_all(&[
+            start_event(0),
+            context_event(1),
+            model_requested(2),
+            model_responded_with(
+                3,
+                turn_id(),
+                0,
+                "I can read or write.",
+                vec![proposal(), write_proposal()],
+            ),
+        ]);
+
+        assert!(matches!(
+            state.phase(),
+            RunPhase::AwaitingToolCall { proposals, .. } if proposals.len() == 2
+        ));
+
+        state
+            .apply(&tool_proposals_rejected(
+                4,
+                turn_id(),
+                "proposal schema invalid",
+            ))
+            .unwrap();
+        assert_eq!(state.phase(), &RunPhase::TurnConcluded);
+        assert!(state.pending_command().is_none());
+
+        for event in &[
+            second_context_event(5),
+            second_model_requested(6),
+            second_model_answer(7),
+        ] {
+            state.apply(event).unwrap();
+        }
+        assert_eq!(state.phase(), &RunPhase::TurnConcluded);
+    }
+
+    #[test]
+    fn proposal_batch_rejection_requires_the_pending_turn() {
+        let mut state = apply_all(&[
+            start_event(0),
+            context_event(1),
+            model_requested(2),
+            model_responded(3),
+        ]);
+
+        assert_eq!(
+            state
+                .apply(&tool_proposals_rejected(
+                    4,
+                    other_turn_id(),
+                    "proposal schema invalid",
+                ))
+                .unwrap_err(),
+            Error::TurnMismatch {
+                expected: "turn_1".into(),
+                actual: "turn_2".into(),
+            }
+        );
+        assert_eq!(state.next_seq(), 4);
+    }
+
+    #[test]
+    fn proposal_batch_rejection_requires_a_non_empty_reason() {
+        let state = apply_all(&[
+            start_event(0),
+            context_event(1),
+            model_requested(2),
+            model_responded(3),
+        ]);
+
+        for reason in ["", "   "] {
+            let mut attempted = state.clone();
+            assert_eq!(
+                attempted
+                    .apply(&tool_proposals_rejected(4, turn_id(), reason))
+                    .unwrap_err(),
+                Error::EmptyToolProposalsRejectionReason
+            );
+            assert_eq!(attempted.next_seq(), 4);
+        }
+    }
+
+    #[test]
+    fn proposal_batch_rejection_is_rejected_outside_awaiting_tool_call() {
+        let mut state = apply_all(&[start_event(0), context_event(1)]);
+
+        assert_eq!(
+            state
+                .apply(&tool_proposals_rejected(
+                    2,
+                    turn_id(),
+                    "proposal schema invalid",
+                ))
+                .unwrap_err(),
+            Error::InvalidTransition {
+                phase: "ready_to_request_model",
+                event: "tool_proposals_rejected",
+            }
+        );
+        assert_eq!(state.next_seq(), 2);
     }
 
     #[test]
