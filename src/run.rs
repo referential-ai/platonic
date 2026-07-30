@@ -53,6 +53,8 @@ pub enum RunPhase {
         turn_id: TurnId,
         /// Model step the response must match.
         step: u32,
+        /// Budget-validated context retained if the request fails.
+        context: ContextPack,
     },
     /// The model response contained at least one tool proposal.
     AwaitingToolCall {
@@ -119,6 +121,8 @@ pub enum RunPhase {
 ///
 /// The state machine performs no IO. Hosts inspect [`Self::pending_command`], perform
 /// the requested effect, and then apply the resulting recorded event.
+/// A [`HarnessEvent::ModelFailed`] restores the identical pending model command
+/// without advancing its step.
 ///
 /// # Examples
 ///
@@ -171,7 +175,7 @@ pub enum RunPhase {
 ///             content: "I will write the file.".into(),
 ///         },
 ///         proposed_calls: vec![proposal],
-///         usage: ModelUsage { input_tokens: 3, output_tokens: 5 },
+///         usage: Some(ModelUsage { input_tokens: 3, output_tokens: 5 }),
 ///     },
 ///     HarnessEvent::ToolCallProposed {
 ///         run_id: run_id.clone(),
@@ -368,7 +372,7 @@ impl RunState {
                 RunPhase::ReadyToRequestModel {
                     turn_id,
                     step,
-                    context: _,
+                    context,
                 },
                 HarnessEvent::ModelRequested {
                     turn_id: actual_turn_id,
@@ -381,11 +385,33 @@ impl RunState {
                 self.phase = RunPhase::AwaitingModelResponse {
                     turn_id: turn_id.clone(),
                     step: *step,
+                    context: context.clone(),
                 };
                 Ok(())
             }
             (
-                RunPhase::AwaitingModelResponse { turn_id, step },
+                RunPhase::AwaitingModelResponse {
+                    turn_id,
+                    step,
+                    context,
+                },
+                HarnessEvent::ModelFailed {
+                    turn_id: actual_turn_id,
+                    step: actual_step,
+                    ..
+                },
+            ) => {
+                ensure_turn(turn_id, actual_turn_id)?;
+                ensure_step(*step, *actual_step)?;
+                self.phase = RunPhase::ReadyToRequestModel {
+                    turn_id: turn_id.clone(),
+                    step: *step,
+                    context: context.clone(),
+                };
+                Ok(())
+            }
+            (
+                RunPhase::AwaitingModelResponse { turn_id, step, .. },
                 HarnessEvent::ModelResponded {
                     turn_id: actual_turn_id,
                     step: actual_step,
@@ -417,6 +443,19 @@ impl RunState {
                 ensure_turn(turn_id, actual_turn_id)?;
                 ensure_proposed(proposals, call)?;
                 self.phase = RunPhase::AwaitingPolicy { call: call.clone() };
+                Ok(())
+            }
+            (
+                RunPhase::AwaitingToolCall { turn_id, .. },
+                HarnessEvent::ToolProposalsRejected {
+                    turn_id: actual_turn_id,
+                    reason,
+                    ..
+                },
+            ) => {
+                ensure_turn(turn_id, actual_turn_id)?;
+                ensure_tool_proposals_rejection_reason(reason)?;
+                self.phase = RunPhase::TurnConcluded;
                 Ok(())
             }
             (
@@ -570,6 +609,13 @@ fn ensure_new_turn(previous: Option<&TurnId>, actual: &TurnId) -> Result<(), Err
     Ok(())
 }
 
+fn ensure_tool_proposals_rejection_reason(reason: &str) -> Result<(), Error> {
+    if reason.trim().is_empty() {
+        return Err(Error::EmptyToolProposalsRejectionReason);
+    }
+    Ok(())
+}
+
 fn ensure_compaction_range(start: u64, end_exclusive: u64) -> Result<(), Error> {
     if start < end_exclusive {
         return Ok(());
@@ -713,11 +759,11 @@ mod tests {
         }
     }
 
-    fn usage() -> ModelUsage {
-        ModelUsage {
+    fn usage() -> Option<ModelUsage> {
+        Some(ModelUsage {
             input_tokens: 50,
             output_tokens: 10,
-        }
+        })
     }
 
     fn rec(seq: u64, event: HarnessEvent) -> RecordedEvent {
@@ -808,6 +854,18 @@ mod tests {
         )
     }
 
+    fn model_failed_for(seq: u64, turn_id: TurnId, step: u32) -> RecordedEvent {
+        rec(
+            seq,
+            HarnessEvent::ModelFailed {
+                run_id: run_id(),
+                turn_id,
+                step,
+                reason: "provider unavailable".into(),
+            },
+        )
+    }
+
     fn model_responded(seq: u64) -> RecordedEvent {
         model_responded_with(
             seq,
@@ -856,6 +914,17 @@ mod tests {
                 run_id: run_id(),
                 turn_id: turn_id(),
                 call: call(effect),
+            },
+        )
+    }
+
+    fn tool_proposals_rejected(seq: u64, turn_id: TurnId, reason: &str) -> RecordedEvent {
+        rec(
+            seq,
+            HarnessEvent::ToolProposalsRejected {
+                run_id: run_id(),
+                turn_id,
+                reason: reason.into(),
             },
         )
     }
@@ -1232,6 +1301,110 @@ mod tests {
     }
 
     #[test]
+    fn model_failure_reemits_identical_request_and_step_advances_only_on_response() {
+        let mut state = apply_all(&[start_event(0), context_event(1)]);
+        let original_request = RunCommand::RequestModel {
+            turn_id: turn_id(),
+            step: 0,
+            context: context(10),
+        };
+        assert_eq!(state.pending_command(), Some(original_request.clone()));
+
+        state.apply(&model_requested(2)).unwrap();
+        assert!(state.pending_command().is_none());
+        state.apply(&model_failed_for(3, turn_id(), 0)).unwrap();
+        assert_eq!(state.pending_command(), Some(original_request));
+
+        state.apply(&model_requested(4)).unwrap();
+        state
+            .apply(&model_responded_with(5, turn_id(), 0, "done", vec![]))
+            .unwrap();
+        state.apply(&second_context_event(6)).unwrap();
+        assert_eq!(
+            state.pending_command(),
+            Some(RunCommand::RequestModel {
+                turn_id: other_turn_id(),
+                step: 1,
+                context: context_with_content(10, "tool result: read README"),
+            })
+        );
+
+        state.apply(&second_model_requested(7)).unwrap();
+        state.apply(&second_model_answer(8)).unwrap();
+        state
+            .apply(&rec(9, HarnessEvent::RunFinished { run_id: run_id() }))
+            .unwrap();
+        assert_eq!(state.phase(), &RunPhase::Finished);
+    }
+
+    #[test]
+    fn model_failure_requires_an_awaiting_request_with_matching_turn_and_step() {
+        let mut before_request = apply_all(&[start_event(0), context_event(1)]);
+        assert_eq!(
+            before_request
+                .apply(&model_failed_for(2, turn_id(), 0))
+                .unwrap_err(),
+            Error::InvalidTransition {
+                phase: "ready_to_request_model",
+                event: "model_failed",
+            }
+        );
+
+        let awaiting = apply_all(&[start_event(0), context_event(1), model_requested(2)]);
+        let mut wrong_turn = awaiting.clone();
+        assert_eq!(
+            wrong_turn
+                .apply(&model_failed_for(3, other_turn_id(), 0))
+                .unwrap_err(),
+            Error::TurnMismatch {
+                expected: "turn_1".into(),
+                actual: "turn_2".into(),
+            }
+        );
+        assert_eq!(wrong_turn, awaiting);
+
+        let mut wrong_step = awaiting.clone();
+        assert_eq!(
+            wrong_step
+                .apply(&model_failed_for(3, turn_id(), 1))
+                .unwrap_err(),
+            Error::StepMismatch {
+                expected: 0,
+                actual: 1,
+            }
+        );
+        assert_eq!(wrong_step, awaiting);
+    }
+
+    #[test]
+    fn replay_after_model_failure_reproduces_the_pending_request() {
+        let state = apply_all(&[
+            start_event(0),
+            context_event(1),
+            model_requested(2),
+            model_failed_for(3, turn_id(), 0),
+        ]);
+
+        assert_eq!(
+            state.phase(),
+            &RunPhase::ReadyToRequestModel {
+                turn_id: turn_id(),
+                step: 0,
+                context: context(10),
+            }
+        );
+        assert_eq!(
+            state.pending_command(),
+            Some(RunCommand::RequestModel {
+                turn_id: turn_id(),
+                step: 0,
+                context: context(10),
+            })
+        );
+        assert_eq!(state.next_seq(), 4);
+    }
+
+    #[test]
     fn tool_result_can_feed_a_second_model_turn() {
         let events = vec![
             start_event(0),
@@ -1443,6 +1616,112 @@ mod tests {
                 event: "tool_call_proposed"
             })
         );
+    }
+
+    #[test]
+    fn whole_proposal_batch_rejection_concludes_turn_and_allows_a_later_turn() {
+        let mut state = apply_all(&[
+            start_event(0),
+            context_event(1),
+            model_requested(2),
+            model_responded_with(
+                3,
+                turn_id(),
+                0,
+                "I can read or write.",
+                vec![proposal(), write_proposal()],
+            ),
+        ]);
+
+        assert!(matches!(
+            state.phase(),
+            RunPhase::AwaitingToolCall { proposals, .. } if proposals.len() == 2
+        ));
+
+        state
+            .apply(&tool_proposals_rejected(
+                4,
+                turn_id(),
+                "proposal schema invalid",
+            ))
+            .unwrap();
+        assert_eq!(state.phase(), &RunPhase::TurnConcluded);
+        assert!(state.pending_command().is_none());
+
+        for event in &[
+            second_context_event(5),
+            second_model_requested(6),
+            second_model_answer(7),
+        ] {
+            state.apply(event).unwrap();
+        }
+        assert_eq!(state.phase(), &RunPhase::TurnConcluded);
+    }
+
+    #[test]
+    fn proposal_batch_rejection_requires_the_pending_turn() {
+        let mut state = apply_all(&[
+            start_event(0),
+            context_event(1),
+            model_requested(2),
+            model_responded(3),
+        ]);
+
+        assert_eq!(
+            state
+                .apply(&tool_proposals_rejected(
+                    4,
+                    other_turn_id(),
+                    "proposal schema invalid",
+                ))
+                .unwrap_err(),
+            Error::TurnMismatch {
+                expected: "turn_1".into(),
+                actual: "turn_2".into(),
+            }
+        );
+        assert_eq!(state.next_seq(), 4);
+    }
+
+    #[test]
+    fn proposal_batch_rejection_requires_a_non_empty_reason() {
+        let state = apply_all(&[
+            start_event(0),
+            context_event(1),
+            model_requested(2),
+            model_responded(3),
+        ]);
+
+        for reason in ["", "   "] {
+            let mut attempted = state.clone();
+            assert_eq!(
+                attempted
+                    .apply(&tool_proposals_rejected(4, turn_id(), reason))
+                    .unwrap_err(),
+                Error::EmptyToolProposalsRejectionReason
+            );
+            assert_eq!(attempted.next_seq(), 4);
+        }
+    }
+
+    #[test]
+    fn proposal_batch_rejection_is_rejected_outside_awaiting_tool_call() {
+        let mut state = apply_all(&[start_event(0), context_event(1)]);
+
+        assert_eq!(
+            state
+                .apply(&tool_proposals_rejected(
+                    2,
+                    turn_id(),
+                    "proposal schema invalid",
+                ))
+                .unwrap_err(),
+            Error::InvalidTransition {
+                phase: "ready_to_request_model",
+                event: "tool_proposals_rejected",
+            }
+        );
+        assert_eq!(state.next_seq(), 2);
     }
 
     #[test]

@@ -65,6 +65,22 @@ pub enum ReadbackEntry {
         /// Normalized model-authored message.
         message: Message,
     },
+    /// Model request failed without terminating the run.
+    ModelFailed {
+        /// Turn of the failed model request.
+        turn_id: TurnId,
+        /// Model step of the failed request.
+        step: u32,
+        /// Recorded host-reported failure reason.
+        reason: String,
+    },
+    /// Host rejected the whole pending model proposal batch.
+    ToolProposalsRejected {
+        /// Turn that produced the rejected proposals.
+        turn_id: TurnId,
+        /// Recorded host explanation for rejecting the whole batch.
+        reason: String,
+    },
     /// Host-validated tool call consumed for a turn.
     ToolCall {
         /// Turn that proposed the call.
@@ -143,6 +159,26 @@ fn collect_entry(event: &HarnessEvent, entries: &mut Vec<ReadbackEntry>) {
             entries.push(ReadbackEntry::ModelMessage {
                 turn_id: turn_id.clone(),
                 message: output.clone(),
+            });
+        }
+        HarnessEvent::ModelFailed {
+            turn_id,
+            step,
+            reason,
+            ..
+        } => {
+            entries.push(ReadbackEntry::ModelFailed {
+                turn_id: turn_id.clone(),
+                step: *step,
+                reason: reason.clone(),
+            });
+        }
+        HarnessEvent::ToolProposalsRejected {
+            turn_id, reason, ..
+        } => {
+            entries.push(ReadbackEntry::ToolProposalsRejected {
+                turn_id: turn_id.clone(),
+                reason: reason.clone(),
             });
         }
         HarnessEvent::ToolCallProposed { turn_id, call, .. } => {
@@ -239,11 +275,11 @@ mod tests {
         ActorId::new("human_1").unwrap()
     }
 
-    fn usage() -> ModelUsage {
-        ModelUsage {
+    fn usage() -> Option<ModelUsage> {
+        Some(ModelUsage {
             input_tokens: 20,
             output_tokens: 8,
-        }
+        })
     }
 
     fn rec(seq: u64, event: HarnessEvent) -> RecordedEvent {
@@ -276,6 +312,15 @@ mod tests {
             turn_id,
             step,
             model: ModelName::new("claude-fable-5").unwrap(),
+        }
+    }
+
+    fn model_failed(turn_id: TurnId, step: u32) -> HarnessEvent {
+        HarnessEvent::ModelFailed {
+            run_id: run_id(),
+            turn_id,
+            step,
+            reason: "provider unavailable".into(),
         }
     }
 
@@ -427,6 +472,50 @@ mod tests {
     }
 
     #[test]
+    fn model_failure_is_replay_visible_before_a_successful_retry() {
+        let events = vec![
+            start_event(0),
+            rec(1, context(turn_id(), "What is in README?")),
+            rec(2, model_requested(turn_id(), 0)),
+            rec(3, model_failed(turn_id(), 0)),
+            rec(4, model_requested(turn_id(), 0)),
+            rec(5, model_responded(turn_id(), 0, "It is a README.", vec![])),
+            rec(6, HarnessEvent::RunFinished { run_id: run_id() }),
+        ];
+
+        let readback = RunReadback::from_events(&events).unwrap();
+
+        assert_eq!(readback.final_phase, RunPhase::Finished);
+        assert_eq!(readback.next_seq, 7);
+        assert_eq!(
+            readback.entries,
+            vec![
+                ReadbackEntry::ContextFragment {
+                    turn_id: turn_id(),
+                    fragment: ContextFragment {
+                        lane: ContextLane::CurrentTask,
+                        source: "user".into(),
+                        content: "What is in README?".into(),
+                        estimated_tokens: 10,
+                    },
+                },
+                ReadbackEntry::ModelFailed {
+                    turn_id: turn_id(),
+                    step: 0,
+                    reason: "provider unavailable".into(),
+                },
+                ReadbackEntry::ModelMessage {
+                    turn_id: turn_id(),
+                    message: Message {
+                        role: MessageRole::Assistant,
+                        content: "It is a README.".into(),
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn two_turn_ledger_projects_tool_result_continuation() {
         let events = vec![
             start_event(0),
@@ -517,6 +606,83 @@ mod tests {
                     message: Message {
                         role: MessageRole::Assistant,
                         content: "README was read.".into(),
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn proposal_batch_rejection_is_replay_visible_and_allows_a_later_turn() {
+        let events = vec![
+            start_event(0),
+            rec(1, context(turn_id(), "Read README")),
+            rec(2, model_requested(turn_id(), 0)),
+            rec(
+                3,
+                model_responded(turn_id(), 0, "I will read it.", vec![proposal()]),
+            ),
+            rec(
+                4,
+                HarnessEvent::ToolProposalsRejected {
+                    run_id: run_id(),
+                    turn_id: turn_id(),
+                    reason: "proposal schema invalid".into(),
+                },
+            ),
+            rec(
+                5,
+                context(second_turn_id(), "The proposed call was invalid"),
+            ),
+            rec(6, model_requested(second_turn_id(), 1)),
+            rec(
+                7,
+                model_responded(second_turn_id(), 1, "Understood.", vec![]),
+            ),
+            rec(8, HarnessEvent::RunFinished { run_id: run_id() }),
+        ];
+
+        let readback = RunReadback::from_events(&events).unwrap();
+
+        assert_eq!(readback.final_phase, RunPhase::Finished);
+        assert_eq!(readback.next_seq, 9);
+        assert_eq!(
+            readback.entries,
+            vec![
+                ReadbackEntry::ContextFragment {
+                    turn_id: turn_id(),
+                    fragment: ContextFragment {
+                        lane: ContextLane::CurrentTask,
+                        source: "user".into(),
+                        content: "Read README".into(),
+                        estimated_tokens: 10,
+                    },
+                },
+                ReadbackEntry::ModelMessage {
+                    turn_id: turn_id(),
+                    message: Message {
+                        role: MessageRole::Assistant,
+                        content: "I will read it.".into(),
+                    },
+                },
+                ReadbackEntry::ToolProposalsRejected {
+                    turn_id: turn_id(),
+                    reason: "proposal schema invalid".into(),
+                },
+                ReadbackEntry::ContextFragment {
+                    turn_id: second_turn_id(),
+                    fragment: ContextFragment {
+                        lane: ContextLane::CurrentTask,
+                        source: "user".into(),
+                        content: "The proposed call was invalid".into(),
+                        estimated_tokens: 10,
+                    },
+                },
+                ReadbackEntry::ModelMessage {
+                    turn_id: second_turn_id(),
+                    message: Message {
+                        role: MessageRole::Assistant,
+                        content: "Understood.".into(),
                     },
                 },
             ]

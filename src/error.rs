@@ -77,6 +77,10 @@ pub enum Error {
         turn_id: String,
     },
 
+    /// A whole-batch tool proposal rejection omitted its explanation.
+    #[error("tool proposal rejection reason cannot be empty")]
+    EmptyToolProposalsRejectionReason,
+
     /// A tool event did not match the pending tool call.
     #[error("tool call mismatch: expected {expected}, actual {actual}")]
     ToolCallMismatch {

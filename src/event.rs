@@ -74,6 +74,17 @@ pub enum HarnessEvent {
         /// Host-selected model used for the request.
         model: ModelName,
     },
+    /// Records that the pending model request failed without terminating the run.
+    ModelFailed {
+        /// Run containing the pending request.
+        run_id: RunId,
+        /// Turn of the pending model request.
+        turn_id: TurnId,
+        /// Model step of the pending request.
+        step: u32,
+        /// Durable host-reported failure reason.
+        reason: String,
+    },
     /// Records the normalized result returned by the pending model request.
     ModelResponded {
         /// Run receiving the response.
@@ -86,8 +97,19 @@ pub enum HarnessEvent {
         output: Message,
         /// Unvalidated model proposals; an empty list concludes the turn.
         proposed_calls: Vec<ToolProposal>,
-        /// Provider-reported token usage for the response.
-        usage: ModelUsage,
+        /// Provider-reported token usage, or `None` when usage is unknown.
+        ///
+        /// Reported zero counts remain known usage rather than `None`.
+        usage: Option<ModelUsage>,
+    },
+    /// Rejects every unvalidated tool proposal in the pending model response.
+    ToolProposalsRejected {
+        /// Run containing the pending proposals.
+        run_id: RunId,
+        /// Turn that produced the pending proposals.
+        turn_id: TurnId,
+        /// Non-empty host explanation for rejecting the whole proposal batch.
+        reason: String,
     },
     /// Records a model proposal after host validation and effect classification.
     ToolCallProposed {
@@ -172,7 +194,9 @@ impl HarnessEvent {
             | Self::ContextBuilt { run_id, .. }
             | Self::ContextCompacted { run_id, .. }
             | Self::ModelRequested { run_id, .. }
+            | Self::ModelFailed { run_id, .. }
             | Self::ModelResponded { run_id, .. }
+            | Self::ToolProposalsRejected { run_id, .. }
             | Self::ToolCallProposed { run_id, .. }
             | Self::PolicyEvaluated { run_id, .. }
             | Self::ApprovalGranted { run_id, .. }
@@ -192,7 +216,9 @@ impl HarnessEvent {
             Self::ContextBuilt { .. } => "context_built",
             Self::ContextCompacted { .. } => "context_compacted",
             Self::ModelRequested { .. } => "model_requested",
+            Self::ModelFailed { .. } => "model_failed",
             Self::ModelResponded { .. } => "model_responded",
+            Self::ToolProposalsRejected { .. } => "tool_proposals_rejected",
             Self::ToolCallProposed { .. } => "tool_call_proposed",
             Self::PolicyEvaluated { .. } => "policy_evaluated",
             Self::ApprovalGranted { .. } => "approval_granted",
@@ -263,6 +289,12 @@ mod tests {
                 step: 1,
                 model: ModelName::new("model_1").unwrap(),
             },
+            HarnessEvent::ModelFailed {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 1,
+                reason: "provider unavailable".into(),
+            },
             HarnessEvent::ModelResponded {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
@@ -275,10 +307,15 @@ mod tests {
                     tool: tool.clone(),
                     input: json!({ "path": "README.md" }),
                 }],
-                usage: ModelUsage {
+                usage: Some(ModelUsage {
                     input_tokens: 12,
                     output_tokens: 4,
-                },
+                }),
+            },
+            HarnessEvent::ToolProposalsRejected {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                reason: "proposal schema invalid".into(),
             },
             HarnessEvent::ToolCallProposed {
                 run_id: run_id.clone(),
@@ -398,6 +435,17 @@ mod tests {
                         "model": "model_1"
                     }
                 }),
+                HarnessEvent::ModelFailed { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "model_failed",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 1,
+                        "reason": "provider unavailable"
+                    }
+                }),
                 HarnessEvent::ModelResponded { .. } => json!({
                     "seq": 7,
                     "occurred_at_ms": 1_700_000_000_000_u64,
@@ -420,6 +468,16 @@ mod tests {
                             "input_tokens": 12,
                             "output_tokens": 4
                         }
+                    }
+                }),
+                HarnessEvent::ToolProposalsRejected { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "tool_proposals_rejected",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "reason": "proposal schema invalid"
                     }
                 }),
                 HarnessEvent::ToolCallProposed { .. } => json!({
@@ -536,6 +594,110 @@ mod tests {
                 serde_json::to_value(&expected).unwrap(),
                 fixture,
                 "failed to encode {name} fixture"
+            );
+        }
+    }
+
+    #[test]
+    fn model_response_usage_json_fixtures_are_bidirectional() {
+        let fixtures = [
+            (
+                "known",
+                json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "model_responded",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 1,
+                        "output": {
+                            "role": "assistant",
+                            "content": "Done."
+                        },
+                        "proposed_calls": [],
+                        "usage": {
+                            "input_tokens": 12,
+                            "output_tokens": 4
+                        }
+                    }
+                }),
+                Some(ModelUsage {
+                    input_tokens: 12,
+                    output_tokens: 4,
+                }),
+            ),
+            (
+                "zero",
+                json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "model_responded",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 1,
+                        "output": {
+                            "role": "assistant",
+                            "content": "Done."
+                        },
+                        "proposed_calls": [],
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0
+                        }
+                    }
+                }),
+                Some(ModelUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                }),
+            ),
+            (
+                "unknown",
+                json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "model_responded",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 1,
+                        "output": {
+                            "role": "assistant",
+                            "content": "Done."
+                        },
+                        "proposed_calls": [],
+                        "usage": null
+                    }
+                }),
+                None,
+            ),
+        ];
+
+        for (name, fixture, usage) in fixtures {
+            let expected = RecordedEvent {
+                seq: 7,
+                occurred_at_ms: 1_700_000_000_000,
+                event: HarnessEvent::ModelResponded {
+                    run_id: RunId::new("run_1").unwrap(),
+                    turn_id: TurnId::new("turn_1").unwrap(),
+                    step: 1,
+                    output: Message {
+                        role: MessageRole::Assistant,
+                        content: "Done.".into(),
+                    },
+                    proposed_calls: vec![],
+                    usage,
+                },
+            };
+            let decoded: RecordedEvent = serde_json::from_value(fixture.clone()).unwrap();
+
+            assert_eq!(decoded, expected, "failed to decode {name} usage fixture");
+            assert_eq!(
+                serde_json::to_value(&expected).unwrap(),
+                fixture,
+                "failed to encode {name} usage fixture"
             );
         }
     }

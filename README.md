@@ -4,7 +4,9 @@ Core Rust harness primitives for disciplined, replayable agent execution.
 
 Platonic Core is **not** a chatbot, personal assistant, workflow SaaS, or “Agent OS.” It is the small kernel underneath those things: typed context assembly, tool-call boundaries, policy decisions, event logs, and replay/audit surfaces.
 
-Part of the Referential AI stack.
+Referential.ai is currently the public site and showcase for Platonic,
+Platonic Core, and Plato Agent; any future hosted or commercial role remains
+undecided.
 
 ## Naming
 
@@ -39,6 +41,16 @@ error      shared error types
 ```
 
 The public contract is documented in the [crate rustdoc](https://docs.rs/platonic-core).
+
+## Minimal host
+
+Run the public kernel through one approval-gated tool turn and replay the resulting ledger:
+
+```bash
+cargo run --example minimal_host
+```
+
+The example simulates model and tool IO. It performs no file write or network call.
 
 ## Verify
 
