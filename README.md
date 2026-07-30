@@ -50,6 +50,8 @@ against the workspace root. Built-in defaults use OpenRouter:
 kind = "open_router"
 model = "~openai/gpt-latest"
 api_key_env = "OPENROUTER_API_KEY"
+connect_timeout_ms = 30000
+stream_idle_timeout_ms = 120000
 
 [limits]
 token_budget = 4000
@@ -68,6 +70,11 @@ kind = "open_ai"
 model = "gpt-5.5"
 api_key_env = "OPENAI_API_KEY"
 ```
+
+`connect_timeout_ms` bounds each socket connection and request write.
+`stream_idle_timeout_ms` bounds each response read, so continued response
+progress receives a fresh idle window. The legacy `timeout_ms` name remains an
+alias for `stream_idle_timeout_ms`; setting both names is an error.
 
 `file.read` and `file.list` are auto-allowed. `file.write`, `file.edit`, and
 `shell.exec` require stdin approval and default to no. `shell.exec` runs from

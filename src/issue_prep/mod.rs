@@ -324,7 +324,8 @@ fn client_from_provider(config: &ProviderConfig) -> AppResult<OpenAiCompatibleCl
     OpenAiCompatibleClient::from_config(
         &config.api_key_env,
         config.base_url.clone(),
-        config.timeout_ms,
+        config.connect_timeout_ms,
+        config.stream_idle_timeout_ms,
         config.http_referer.clone(),
         config.app_title.clone(),
         match config.kind {

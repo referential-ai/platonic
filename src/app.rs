@@ -315,7 +315,8 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
     let client = OpenAiCompatibleClient::from_config(
         &config.provider.api_key_env,
         config.provider.base_url.clone(),
-        config.provider.timeout_ms,
+        config.provider.connect_timeout_ms,
+        config.provider.stream_idle_timeout_ms,
         config.provider.http_referer.clone(),
         config.provider.app_title.clone(),
         token_limit_field(&config.provider.kind),
