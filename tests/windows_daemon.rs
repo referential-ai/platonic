@@ -231,6 +231,31 @@ fn ctrl_break_stops_daemon_and_removes_lock() {
 }
 
 #[test]
+fn child_kill_removes_lock_and_allows_immediate_same_workspace_restart() {
+    let local_app_data = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let mut first = ProofDaemon::spawn(workspace.path(), local_app_data.path());
+    let lock_path = first.lock_path.clone();
+
+    first.child.kill().unwrap();
+    first.child.wait().unwrap();
+
+    assert!(!lock_path.exists());
+    let mut restarted = ProofDaemon::spawn(workspace.path(), local_app_data.path());
+    assert_eq!(restarted.lock_path, lock_path);
+
+    let mut client = connect_bounded(&restarted.socket_path);
+    client.hello(workspace.path()).unwrap();
+    assert_eq!(
+        client.shutdown_if_idle().unwrap().result,
+        ShutdownIfIdleResultName::Shutdown
+    );
+    drop(client);
+    assert!(restarted.wait_for_exit().success());
+    assert!(!lock_path.exists());
+}
+
+#[test]
 #[ignore = "temporarily reattaches the test process to the daemon console"]
 fn ctrl_c_stops_daemon_and_removes_lock() {
     let workspace = tempfile::tempdir().unwrap();

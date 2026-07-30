@@ -25,11 +25,10 @@ use windows_sys::Win32::{
         SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
     Storage::FileSystem::{
-        CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO,
+        CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_DELETE_ON_CLOSE,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FileDispositionInfo, FileIdInfo, GetDriveTypeW,
-        GetFileInformationByHandleEx, OPEN_EXISTING, SECURITY_IDENTIFICATION,
-        SECURITY_SQOS_PRESENT, SetFileInformationByHandle,
+        FILE_SHARE_WRITE, FileIdInfo, GetDriveTypeW, GetFileInformationByHandleEx, OPEN_EXISTING,
+        SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
     },
     System::{
         Pipes::{
@@ -284,7 +283,7 @@ pub(crate) fn create_current_user_file(path: &Path) -> io::Result<File> {
             FILE_SHARE_READ,
             &attributes,
             CREATE_NEW,
-            FILE_ATTRIBUTE_NORMAL,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE,
             ptr::null_mut(),
         )
     };
@@ -319,25 +318,6 @@ pub(crate) fn open_file_for_identity(path: &Path) -> io::Result<File> {
     }
     // SAFETY: CreateFileW returned a new owned handle and File assumes that ownership.
     Ok(unsafe { File::from_raw_handle(handle) })
-}
-
-pub(crate) fn delete_file_on_close(file: &File) -> io::Result<()> {
-    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-    // SAFETY: file is live and disposition points to initialized input of the declared size.
-    if unsafe {
-        SetFileInformationByHandle(
-            file.as_raw_handle(),
-            FileDispositionInfo,
-            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
-            mem::size_of::<FILE_DISPOSITION_INFO>()
-                .try_into()
-                .expect("FILE_DISPOSITION_INFO size fits u32"),
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 pub(crate) fn connect_current_user_pipe(path: &Path) -> io::Result<File> {
@@ -642,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn creates_current_user_file_atomically() {
+    fn creates_current_user_file_atomically_and_deletes_on_close() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.lock");
 
@@ -652,6 +632,7 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         drop(file);
+        assert!(!path.exists());
     }
 
     #[test]
