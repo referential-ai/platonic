@@ -8,9 +8,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
+    time::Duration,
 };
 
 #[cfg(windows)]
@@ -26,6 +27,36 @@ use std::{
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 #[cfg(unix)]
 const SOCKET_MODE: u32 = 0o600;
+const MAX_CONNECTION_HANDLERS: usize = 64;
+
+#[derive(Debug, Default)]
+struct HandlerCapacity {
+    live: AtomicUsize,
+}
+
+impl HandlerCapacity {
+    fn try_acquire(self: &Arc<Self>) -> Option<HandlerPermit> {
+        self.live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                (live < MAX_CONNECTION_HANDLERS).then_some(live + 1)
+            })
+            .ok()?;
+        Some(HandlerPermit {
+            capacity: Arc::clone(self),
+        })
+    }
+}
+
+struct HandlerPermit {
+    capacity: Arc<HandlerCapacity>,
+}
+
+impl Drop for HandlerPermit {
+    fn drop(&mut self) {
+        let previous = self.capacity.live.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonPaths {
@@ -59,6 +90,7 @@ impl DaemonPaths {
 pub struct DaemonServer {
     listener: transport::Listener,
     runtime: DaemonRuntime,
+    handlers: Arc<HandlerCapacity>,
     _lock: WorkspaceLock,
 }
 
@@ -109,6 +141,7 @@ impl DaemonServer {
         Ok(Self {
             listener,
             runtime,
+            handlers: Arc::new(HandlerCapacity::default()),
             _lock: lock,
         })
     }
@@ -118,20 +151,15 @@ impl DaemonServer {
     }
 
     pub fn serve_forever(&self, shutdown: Arc<AtomicBool>) -> AppResult<()> {
-        loop {
-            let stream = transport::accept(&self.listener)?;
-            if shutdown.load(Ordering::SeqCst) || self.runtime.stop_requested.load(Ordering::SeqCst)
-            {
-                break;
-            }
-            let runtime = self.runtime.clone();
-            thread::spawn(move || {
-                if let Err(error) = handle_stream(runtime, stream) {
-                    eprintln!("daemon connection error: {error}");
-                }
-            });
-        }
-        Ok(())
+        let runtime = self.runtime.clone();
+        serve_connections(
+            &shutdown,
+            &self.runtime.stop_requested,
+            Arc::clone(&self.handlers),
+            || transport::accept(&self.listener),
+            move |stream| handle_stream(runtime.clone(), stream),
+            thread::sleep,
+        )
     }
 
     pub fn serve_next(&self) -> AppResult<()> {
@@ -143,6 +171,66 @@ impl DaemonServer {
     fn handle_line(&self, line: &str) -> crate::daemon::protocol::Envelope {
         handle_line(&self.runtime, line)
     }
+}
+
+fn serve_connections<S, A, H, B>(
+    shutdown: &AtomicBool,
+    stop_requested: &AtomicBool,
+    handlers: Arc<HandlerCapacity>,
+    mut accept: A,
+    handle: H,
+    mut backoff: B,
+) -> AppResult<()>
+where
+    S: Send + 'static,
+    A: FnMut() -> std::io::Result<S>,
+    H: Fn(S) -> AppResult<()> + Send + Sync + 'static,
+    B: FnMut(Duration),
+{
+    let handle = Arc::new(handle);
+    loop {
+        let stream = match accept() {
+            Ok(stream) => stream,
+            Err(error) => match transport::accept_retry_delay(&error) {
+                Some(delay) => {
+                    if !delay.is_zero() {
+                        backoff(delay);
+                    }
+                    continue;
+                }
+                None => return Err(error.into()),
+            },
+        };
+        if shutdown.load(Ordering::SeqCst) || stop_requested.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let Some(permit) = handlers.try_acquire() else {
+            drop(stream);
+            continue;
+        };
+        drop(spawn_connection_handler(
+            permit,
+            stream,
+            Arc::clone(&handle),
+        ));
+    }
+}
+
+fn spawn_connection_handler<S, H>(
+    permit: HandlerPermit,
+    stream: S,
+    handle: Arc<H>,
+) -> thread::JoinHandle<()>
+where
+    S: Send + 'static,
+    H: Fn(S) -> AppResult<()> + Send + Sync + 'static,
+{
+    thread::spawn(move || {
+        let _permit = permit;
+        if let Err(error) = handle(stream) {
+            eprintln!("daemon connection error: {error}");
+        }
+    })
 }
 
 #[cfg(unix)]
@@ -320,6 +408,266 @@ impl Drop for DaemonServer {
     fn drop(&mut self) {
         #[cfg(unix)]
         let _ = fs::remove_file(&self.runtime.paths.socket_path);
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use crate::AppError;
+    use std::{
+        collections::VecDeque,
+        io,
+        sync::{Barrier, Mutex, mpsc},
+    };
+
+    const FATAL_ACCEPT_CODE: i32 = 12_345;
+
+    struct InjectedStream {
+        id: usize,
+        rejected: Arc<AtomicBool>,
+    }
+
+    impl Drop for InjectedStream {
+        fn drop(&mut self) {
+            if self.id == MAX_CONNECTION_HANDLERS {
+                self.rejected.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[test]
+    fn sixty_fifth_connection_closes_without_a_handler() {
+        let shutdown = AtomicBool::new(false);
+        let stop_requested = AtomicBool::new(false);
+        let handlers = Arc::new(HandlerCapacity::default());
+        let rejected = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(Barrier::new(MAX_CONNECTION_HANDLERS + 1));
+        let handled = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut next_id = 0;
+
+        let handler_barrier = Arc::clone(&barrier);
+        let handled_streams = Arc::clone(&handled);
+        let result = serve_connections(
+            &shutdown,
+            &stop_requested,
+            Arc::clone(&handlers),
+            || {
+                if next_id <= MAX_CONNECTION_HANDLERS {
+                    let stream = InjectedStream {
+                        id: next_id,
+                        rejected: Arc::clone(&rejected),
+                    };
+                    next_id += 1;
+                    Ok(stream)
+                } else {
+                    Err(io::Error::from_raw_os_error(FATAL_ACCEPT_CODE))
+                }
+            },
+            move |stream: InjectedStream| {
+                handled_streams.lock().unwrap().push(stream.id);
+                handler_barrier.wait();
+                done_tx.send(()).unwrap();
+                Ok(())
+            },
+            |_| panic!("fatal accept errors must not back off"),
+        );
+
+        assert!(matches!(
+            result,
+            Err(AppError::Io(error)) if error.raw_os_error() == Some(FATAL_ACCEPT_CODE)
+        ));
+        assert!(rejected.load(Ordering::SeqCst));
+        assert_eq!(
+            handlers.live.load(Ordering::SeqCst),
+            MAX_CONNECTION_HANDLERS
+        );
+
+        barrier.wait();
+        for _ in 0..MAX_CONNECTION_HANDLERS {
+            done_rx.recv().unwrap();
+        }
+        let mut handled = handled.lock().unwrap().clone();
+        handled.sort_unstable();
+        assert_eq!(handled, (0..MAX_CONNECTION_HANDLERS).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn handler_error_and_panic_release_capacity() {
+        let handlers = Arc::new(HandlerCapacity::default());
+        let permit = handlers.try_acquire().unwrap();
+        let error_handler = spawn_connection_handler(
+            permit,
+            (),
+            Arc::new(|()| -> AppResult<()> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected handler error").into())
+            }),
+        );
+        error_handler.join().unwrap();
+        assert_eq!(handlers.live.load(Ordering::SeqCst), 0);
+
+        let permit = handlers.try_acquire().unwrap();
+        let panic_handler = spawn_connection_handler(
+            permit,
+            (),
+            Arc::new(|()| -> AppResult<()> {
+                panic!("injected handler panic");
+            }),
+        );
+        assert!(panic_handler.join().is_err());
+        assert_eq!(handlers.live.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn listed_accept_errors_retry_and_serve_a_later_connection() {
+        let errors = retryable_accept_errors();
+        let retry_count = errors.len();
+        let mut outcomes = errors.into_iter().map(Err).collect::<VecDeque<_>>();
+        outcomes.push_back(Ok(7_u8));
+
+        let shutdown = AtomicBool::new(false);
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let handler_stop = Arc::clone(&stop_requested);
+        let served = Arc::new(AtomicBool::new(false));
+        let handler_served = Arc::clone(&served);
+        let (served_tx, served_rx) = mpsc::channel();
+        let mut backoffs = Vec::new();
+
+        serve_connections(
+            &shutdown,
+            &stop_requested,
+            Arc::new(HandlerCapacity::default()),
+            move || match outcomes.pop_front() {
+                Some(outcome) => outcome,
+                None => {
+                    served_rx.recv().unwrap();
+                    Ok(8)
+                }
+            },
+            move |stream| {
+                assert_eq!(stream, 7);
+                handler_served.store(true, Ordering::SeqCst);
+                handler_stop.store(true, Ordering::SeqCst);
+                served_tx.send(()).unwrap();
+                Ok(())
+            },
+            |delay| backoffs.push(delay),
+        )
+        .unwrap();
+
+        assert!(served.load(Ordering::SeqCst));
+        assert_eq!(backoffs, vec![Duration::from_millis(50); retry_count - 1]);
+    }
+
+    #[test]
+    fn unlisted_accept_error_is_returned_unchanged() {
+        let shutdown = AtomicBool::new(false);
+        let stop_requested = AtomicBool::new(false);
+        let mut error = Some(io::Error::from_raw_os_error(FATAL_ACCEPT_CODE));
+
+        let result = serve_connections(
+            &shutdown,
+            &stop_requested,
+            Arc::new(HandlerCapacity::default()),
+            || Err::<(), _>(error.take().unwrap()),
+            |()| panic!("fatal accept errors must not spawn handlers"),
+            |_| panic!("fatal accept errors must not back off"),
+        );
+
+        assert!(matches!(
+            result,
+            Err(AppError::Io(error)) if error.raw_os_error() == Some(FATAL_ACCEPT_CODE)
+        ));
+    }
+
+    #[test]
+    fn shutdown_flags_close_the_accepted_wake_connection() {
+        for (shutdown_set, stop_set) in [(true, false), (false, true)] {
+            let shutdown = AtomicBool::new(shutdown_set);
+            let stop_requested = AtomicBool::new(stop_set);
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let handled = Arc::new(AtomicUsize::new(0));
+            let accepted_count = Arc::clone(&accepted);
+            let dropped_count = Arc::clone(&dropped);
+            let handled_count = Arc::clone(&handled);
+
+            serve_connections(
+                &shutdown,
+                &stop_requested,
+                Arc::new(HandlerCapacity::default()),
+                move || {
+                    assert_eq!(accepted_count.fetch_add(1, Ordering::SeqCst), 0);
+                    Ok(DroppedStream(Arc::clone(&dropped_count)))
+                },
+                move |_stream| {
+                    handled_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                |_| panic!("shutdown must not back off"),
+            )
+            .unwrap();
+
+            assert_eq!(accepted.load(Ordering::SeqCst), 1);
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(handled.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    struct DroppedStream(Arc<AtomicUsize>);
+
+    impl Drop for DroppedStream {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn retryable_accept_errors() -> Vec<io::Error> {
+        let mut errors = vec![
+            io::Error::new(io::ErrorKind::Interrupted, "interrupted"),
+            io::Error::new(io::ErrorKind::WouldBlock, "would block"),
+            io::Error::new(io::ErrorKind::ConnectionAborted, "connection aborted"),
+        ];
+
+        #[cfg(unix)]
+        errors.extend(
+            [
+                rustix::io::Errno::MFILE,
+                rustix::io::Errno::NFILE,
+                rustix::io::Errno::NOBUFS,
+                rustix::io::Errno::NOMEM,
+            ]
+            .into_iter()
+            .map(|errno| io::Error::from_raw_os_error(errno.raw_os_error())),
+        );
+
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{
+                ERROR_COMMITMENT_LIMIT, ERROR_NO_SYSTEM_RESOURCES, ERROR_NONPAGED_SYSTEM_RESOURCES,
+                ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY,
+                ERROR_PAGED_SYSTEM_RESOURCES, ERROR_TOO_MANY_OPEN_FILES, ERROR_WORKING_SET_QUOTA,
+            };
+
+            errors.extend(
+                [
+                    ERROR_TOO_MANY_OPEN_FILES,
+                    ERROR_NOT_ENOUGH_MEMORY,
+                    ERROR_OUTOFMEMORY,
+                    ERROR_NO_SYSTEM_RESOURCES,
+                    ERROR_NONPAGED_SYSTEM_RESOURCES,
+                    ERROR_PAGED_SYSTEM_RESOURCES,
+                    ERROR_WORKING_SET_QUOTA,
+                    ERROR_COMMITMENT_LIMIT,
+                    ERROR_NOT_ENOUGH_QUOTA,
+                ]
+                .into_iter()
+                .map(|code| io::Error::from_raw_os_error(code as i32)),
+            );
+        }
+
+        errors
     }
 }
 

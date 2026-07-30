@@ -1,6 +1,6 @@
 #[cfg(windows)]
 use std::io::{Read as _, Write as _};
-use std::{io, path::Path};
+use std::{io, path::Path, time::Duration};
 
 #[cfg(unix)]
 pub(crate) use std::os::unix::net::{UnixListener as Listener, UnixStream as Stream};
@@ -26,6 +26,7 @@ enum WindowsStream {
 const CONTROL_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 #[cfg(all(windows, test))]
 const CONTROL_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+const ACCEPT_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 
 #[cfg(unix)]
 pub(crate) fn bind(endpoint: &Path) -> io::Result<Listener> {
@@ -189,6 +190,54 @@ pub(crate) fn accept(listener: &Listener) -> io::Result<Stream> {
     listener.accept().map(|stream| Stream {
         inner: WindowsStream::Server(stream),
         deadline: None,
+    })
+}
+
+pub(crate) fn accept_retry_delay(error: &io::Error) -> Option<Duration> {
+    match error.kind() {
+        io::ErrorKind::Interrupted => Some(Duration::ZERO),
+        io::ErrorKind::WouldBlock | io::ErrorKind::ConnectionAborted => Some(ACCEPT_RETRY_BACKOFF),
+        _ if is_platform_retryable_accept_error(error) => Some(ACCEPT_RETRY_BACKOFF),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn is_platform_retryable_accept_error(error: &io::Error) -> bool {
+    error.raw_os_error().is_some_and(|code| {
+        [
+            rustix::io::Errno::MFILE,
+            rustix::io::Errno::NFILE,
+            rustix::io::Errno::NOBUFS,
+            rustix::io::Errno::NOMEM,
+        ]
+        .into_iter()
+        .any(|errno| errno.raw_os_error() == code)
+    })
+}
+
+#[cfg(windows)]
+fn is_platform_retryable_accept_error(error: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_COMMITMENT_LIMIT, ERROR_NO_SYSTEM_RESOURCES, ERROR_NONPAGED_SYSTEM_RESOURCES,
+        ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY,
+        ERROR_PAGED_SYSTEM_RESOURCES, ERROR_TOO_MANY_OPEN_FILES, ERROR_WORKING_SET_QUOTA,
+    };
+
+    error.raw_os_error().is_some_and(|code| {
+        [
+            ERROR_TOO_MANY_OPEN_FILES,
+            ERROR_NOT_ENOUGH_MEMORY,
+            ERROR_OUTOFMEMORY,
+            ERROR_NO_SYSTEM_RESOURCES,
+            ERROR_NONPAGED_SYSTEM_RESOURCES,
+            ERROR_PAGED_SYSTEM_RESOURCES,
+            ERROR_WORKING_SET_QUOTA,
+            ERROR_COMMITMENT_LIMIT,
+            ERROR_NOT_ENOUGH_QUOTA,
+        ]
+        .into_iter()
+        .any(|retryable| retryable as i32 == code)
     })
 }
 
