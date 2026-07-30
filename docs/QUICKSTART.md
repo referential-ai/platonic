@@ -94,9 +94,26 @@ The screen is a chat-first transcript with a bottom status rule and composer.
 Manual two-terminal mode still works:
 
 ```bash
-plato-agentd --workspace "$PWD"                       # terminal A
+plato daemon                                          # terminal A
 plato-tui --workspace "$PWD" --config plato.toml      # terminal B
 ```
+
+`plato daemon` stays in the foreground and delegates to the supported sibling
+`plato-agentd`. Ctrl-C shuts it down cleanly (socket and lock removed).
+Quitting either TUI form never stops the daemon.
+
+Start the optional Discord connector from a separate environment:
+
+```bash
+unset OPENAI_API_KEY OPENROUTER_API_KEY
+export DISCORD_BOT_TOKEN="$(cat /path/to/discord-bot-token)"
+plato gateway discord --config ~/.config/plato/gateway.toml
+```
+
+The gateway entry requires a successful workspace daemon `hello`. Probe
+failures start no connector and point to `plato daemon`; the gateway never
+starts a daemon with its Discord environment. The direct
+`plato-gateway-discord --workspace "$PWD"` technical command remains supported.
 
 | Key | Does |
 | --- | --- |
@@ -106,9 +123,6 @@ plato-tui --workspace "$PWD" --config plato.toml      # terminal B
 | `r` | reconnect (only when the screen shows daemon unavailable) |
 | `q` / Esc | quit (`q` only with an empty composer, so it is typeable in words) |
 | Ctrl-U | clear the composer |
-
-Ctrl-C on a manually started daemon shuts down cleanly (socket and lock removed).
-Quitting either TUI form never stops the daemon.
 
 When `plato-gateway-discord` reaches an approval-required tool, Discord gets one
 bounded notification with the tool, effect, and preview. Grant or deny it

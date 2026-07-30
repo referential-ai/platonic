@@ -27,6 +27,8 @@ The bootstrap surface is intentionally small:
 - `plato replay [--run <id>]` replays the default SQLite ledger; omitted `--run` selects the latest session.
 - `plato replay --db[=<path>] [--run <id>]` replays an explicit SQLite ledger.
 - `plato issue-prep start <run-dir>` runs the fixed issue preparation pipeline from Markdown on stdin.
+- `plato daemon` runs the current workspace daemon in the foreground.
+- `plato gateway discord` checks that daemon, then runs the Discord connector.
 
 ## Configuration
 
@@ -162,11 +164,15 @@ cargo run --bin plato -- replay --db=/tmp/plato-agent.db --run run_123
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#runtime-topology) and issue
 [#11](https://github.com/referential-ai/plato-agent/issues/11).
 
-Start it for a workspace:
+Start it in the foreground for the current workspace:
 
 ```bash
-cargo run --bin plato-agentd -- --workspace "$PWD"
+plato daemon
 ```
+
+This delegates to the same-revision sibling `plato-agentd` and preserves its
+terminal, signals, output, and exit result. The direct
+`plato-agentd --workspace "$PWD"` technical command remains supported.
 
 On startup it prints:
 
@@ -390,9 +396,14 @@ that contains the bot token but no provider credentials:
 ```bash
 unset OPENAI_API_KEY OPENROUTER_API_KEY
 export DISCORD_BOT_TOKEN="$(cat /path/to/discord-bot-token)"
-cargo run --bin plato-gateway-discord -- \
-  --workspace "$PWD" --config ~/.config/plato/gateway.toml
+plato gateway discord --config ~/.config/plato/gateway.toml
 ```
+
+The service entry completes a compatible workspace `hello` before handing off
+to the same-revision sibling `plato-gateway-discord`. A failed probe starts no
+gateway and points to `plato daemon`; it never starts a daemon with the gateway
+environment. The direct `plato-gateway-discord --workspace "$PWD"` technical
+command remains supported.
 
 At startup, the gateway replaces the Discord application's global command
 registry with the commands this binary supports. The current registry contains
@@ -482,6 +493,8 @@ cargo run --bin plato -- "read README.md and summarize it"
 cargo run --bin plato -- -c "what did you just summarize?"
 cargo run --bin plato -- --yolo "write local-proof.txt with hello from Plato Agent"
 cargo run --bin plato -- "run cargo test --locked and summarize the result"
+cargo run --bin plato -- daemon
+cargo run --bin plato -- gateway discord --config ~/.config/plato/gateway.toml
 cargo run --bin plato -- replay
 cargo run --bin plato -- replay events.jsonl
 cargo run --bin plato -- --db "read README.md and summarize it"

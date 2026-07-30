@@ -5,11 +5,11 @@ use plato_agent::{
     daemon::{
         client::{DaemonClient, DaemonConnectionConfig},
         lock::ensure_workspace_unlocked,
-        protocol::{PendingApprovalSnapshot, RunStateName, StreamEvent},
+        protocol::{HelloResult, PendingApprovalSnapshot, RunStateName, StreamEvent},
     },
     ledger::{latest_default_sqlite_session_id, latest_sqlite_session_id},
     new_session_id,
-    paths::default_sqlite,
+    paths::{self, default_sqlite},
     replay_default_sqlite, replay_file, replay_sqlite, run_issue_prep, run_question,
     tui::{TuiOptions, run_tui},
 };
@@ -72,6 +72,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run the workspace daemon in the foreground.
+    Daemon {
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Run an explicit gateway connector.
+    Gateway {
+        #[command(subcommand)]
+        command: GatewayCommand,
+    },
     Replay {
         #[arg(long, value_name = "RUN_ID")]
         run: Option<String>,
@@ -83,6 +93,15 @@ enum Command {
     IssuePrep {
         #[command(subcommand)]
         command: IssuePrepCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GatewayCommand {
+    /// Run the Discord gateway for this workspace.
+    Discord {
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
     },
 }
 
@@ -113,7 +132,19 @@ fn run() -> plato_agent::AppResult<()> {
     if matches!(&cli.command, Some(Command::IssuePrep { .. })) {
         validate_issue_prep_cli(&cli)?;
     }
+    if matches!(&cli.command, Some(Command::Daemon { .. })) {
+        validate_daemon_cli(&cli)?;
+    }
+    if matches!(&cli.command, Some(Command::Gateway { .. })) {
+        validate_gateway_cli(&cli)?;
+    }
     match cli.command {
+        Some(Command::Daemon { socket }) => run_daemon_service(workspace_root, socket),
+        Some(Command::Gateway { command }) => match command {
+            GatewayCommand::Discord { socket } => {
+                run_discord_gateway_service(workspace_root, socket, cli.config)
+            }
+        },
         Some(Command::Replay { run, file }) => {
             let ledger = replay_ledger(cli.db, file, &workspace_root)?;
             write_replay_output(&mut io::stdout(), ledger, run.as_deref(), &workspace_root)
@@ -127,6 +158,97 @@ fn run() -> plato_agent::AppResult<()> {
 
 fn implicit_tui_requested(cli: &Cli, stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
     cli.command.is_none() && cli.question.is_empty() && stdin_is_terminal && stdout_is_terminal
+}
+
+fn validate_daemon_cli(cli: &Cli) -> plato_agent::AppResult<()> {
+    if cli.config.is_some()
+        || cli.events.is_some()
+        || cli.db.is_some()
+        || cli.yolo
+        || cli.continue_session
+        || !cli.question.is_empty()
+    {
+        return Err(AppError::Config(
+            "plato daemon cannot be combined with --config, --events, --db, --yolo, -c, or a question"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_gateway_cli(cli: &Cli) -> plato_agent::AppResult<()> {
+    if cli.events.is_some()
+        || cli.db.is_some()
+        || cli.yolo
+        || cli.continue_session
+        || !cli.question.is_empty()
+    {
+        return Err(AppError::Config(
+            "plato gateway cannot be combined with --events, --db, --yolo, -c, or a question"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn run_daemon_service(
+    workspace_root: PathBuf,
+    socket: Option<PathBuf>,
+) -> plato_agent::AppResult<()> {
+    let mut command = ProcessCommand::new(sibling_binary("plato-agentd")?);
+    command.arg("--workspace").arg(&workspace_root);
+    if let Some(socket) = socket {
+        command.arg("--socket").arg(socket);
+    }
+    command.current_dir(workspace_root);
+    handoff(command)
+}
+
+fn run_discord_gateway_service(
+    workspace_root: PathBuf,
+    socket: Option<PathBuf>,
+    config: Option<PathBuf>,
+) -> plato_agent::AppResult<()> {
+    let daemon = DaemonConnectionConfig::resolve(&workspace_root, socket.clone())?;
+    probe_gateway_daemon(&daemon, DAEMON_CLIENT_TIMEOUT).map_err(|error| {
+        let hint = match socket.as_deref() {
+            Some(socket) => format!(
+                "plato daemon --socket {}",
+                shell_quote(&socket.to_string_lossy())
+            ),
+            None => "plato daemon".into(),
+        };
+        AppError::Config(format!(
+            "workspace daemon is unavailable or incompatible at {}: {error}; start it with `{hint}`",
+            daemon.socket_path.display()
+        ))
+    })?;
+
+    let mut command = ProcessCommand::new(sibling_binary("plato-gateway-discord")?);
+    command
+        .arg("--workspace")
+        .arg(&daemon.workspace_root)
+        .current_dir(&daemon.workspace_root);
+    if let Some(socket) = socket {
+        command.arg("--socket").arg(socket);
+    }
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    }
+    handoff(command)
+}
+
+#[cfg(unix)]
+fn handoff(mut command: ProcessCommand) -> plato_agent::AppResult<()> {
+    use std::os::unix::process::CommandExt;
+
+    Err(command.exec().into())
+}
+
+#[cfg(windows)]
+fn handoff(mut command: ProcessCommand) -> plato_agent::AppResult<()> {
+    let status = command.status()?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn run_prompt(cli: Cli, workspace_root: PathBuf) -> plato_agent::AppResult<()> {
@@ -274,9 +396,42 @@ fn connect_serving_daemon_with_timeout(
     config: &DaemonConnectionConfig,
     timeout: Duration,
 ) -> Option<DaemonClient> {
-    let mut client = DaemonClient::connect_with_timeout(&config.socket_path, timeout).ok()?;
-    client.hello(&config.workspace_root).ok()?;
-    Some(client)
+    connect_workspace_daemon_with_timeout(config, timeout)
+        .ok()
+        .map(|(client, _hello)| client)
+}
+
+fn connect_workspace_daemon_with_timeout(
+    config: &DaemonConnectionConfig,
+    timeout: Duration,
+) -> plato_agent::AppResult<(DaemonClient, HelloResult)> {
+    let mut client = DaemonClient::connect_with_timeout(&config.socket_path, timeout)?;
+    let hello = client.hello(&config.workspace_root)?;
+    Ok((client, hello))
+}
+
+fn probe_gateway_daemon(
+    config: &DaemonConnectionConfig,
+    timeout: Duration,
+) -> plato_agent::AppResult<()> {
+    let (_client, hello) = connect_workspace_daemon_with_timeout(config, timeout)?;
+    let expected_workspace_id = paths::workspace_id(&config.workspace_root)?;
+    if hello.workspace_id != expected_workspace_id {
+        return Err(AppError::DaemonProtocol(format!(
+            "hello workspace_id mismatch: expected {expected_workspace_id}, got {}",
+            hello.workspace_id
+        )));
+    }
+    if !hello
+        .capabilities
+        .iter()
+        .any(|capability| capability == "hello")
+    {
+        return Err(AppError::DaemonProtocol(
+            "daemon does not advertise required capability hello".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn spawn_detached_daemon(workspace_root: &Path) -> plato_agent::AppResult<Child> {
@@ -732,6 +887,55 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn service_commands_parse_only_explicit_entries() {
+        let daemon =
+            Cli::try_parse_from(["plato", "daemon", "--socket", "runtime/agent.sock"]).unwrap();
+        assert!(matches!(
+            daemon.command,
+            Some(Command::Daemon { socket })
+                if socket.as_deref() == Some(Path::new("runtime/agent.sock"))
+        ));
+
+        let gateway = Cli::try_parse_from([
+            "plato",
+            "gateway",
+            "discord",
+            "--socket",
+            "runtime/agent.sock",
+            "--config",
+            "gateway.toml",
+        ])
+        .unwrap();
+        assert_eq!(gateway.config.as_deref(), Some(Path::new("gateway.toml")));
+        assert!(matches!(
+            gateway.command,
+            Some(Command::Gateway {
+                command: GatewayCommand::Discord { socket },
+            }) if socket.as_deref() == Some(Path::new("runtime/agent.sock"))
+        ));
+
+        assert!(Cli::try_parse_from(["plato", "gateway"]).is_err());
+        assert!(Cli::try_parse_from(["plato", "gateway", "telegram"]).is_err());
+    }
+
+    #[test]
+    fn service_commands_reject_unrelated_run_options() {
+        let daemon = Cli::try_parse_from(["plato", "--config", "plato.toml", "daemon"]).unwrap();
+        assert!(matches!(
+            validate_daemon_cli(&daemon),
+            Err(AppError::Config(message))
+                if message.starts_with("plato daemon cannot be combined")
+        ));
+
+        let gateway = Cli::try_parse_from(["plato", "--db", "gateway", "discord"]).unwrap();
+        assert!(matches!(
+            validate_gateway_cli(&gateway),
+            Err(AppError::Config(message))
+                if message.starts_with("plato gateway cannot be combined")
+        ));
     }
 
     #[test]
