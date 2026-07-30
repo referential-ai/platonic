@@ -154,6 +154,8 @@ Every run uses this exact convention:
 - With a live workspace daemon, default-ledger prompts delegate to it. Replay,
   explicit `--db=<path>`, and direct `--yolo` SQLite paths remain direct and
   fail closed if they conflict with the daemon-owned store.
+- Direct SQLite CLI operations hold the workspace lock before session lookup or
+  database open through final output, then release it when the CLI exits.
 
 Replay forms:
 
