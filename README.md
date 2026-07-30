@@ -181,11 +181,16 @@ clients. Windows clients limit server impersonation to identity inspection,
 authenticate the server's user before sending protocol bytes, and bound
 busy-pipe connection waits.
 
-The daemon holds the lock while it is active. SIGINT and SIGTERM on Unix, and
-Ctrl-C or Ctrl-Break on Windows, trigger a graceful shutdown: the daemon stops
-accepting new connections, then removes its endpoint and lock before exiting.
-On Windows the daemon keeps the exact lock file pinned until delete-on-close.
-Do not remove a lock for a live daemon.
+The daemon holds the workspace lock while it is active. On Unix, the lock is a
+persistent current-user `0600` regular file guarded by a nonblocking exclusive
+kernel advisory lock. Startup validates the file without following symlinks,
+then rewrites its diagnostic metadata only after acquiring the kernel lock.
+Normal and abrupt exits release the kernel lock but leave the file in place, so
+lock probes use kernel ownership rather than path existence. SIGINT and SIGTERM
+on Unix, and Ctrl-C or Ctrl-Break on Windows, trigger a graceful shutdown: the
+daemon stops accepting new connections, then removes its endpoint before
+exiting. On Windows the daemon keeps the exact lock file pinned until
+delete-on-close. Do not remove a lock for a live daemon.
 Live assistant deltas are transient `events.stream` events and are not written
 to the ledger. After a `lagged` response, omitting `from_offset` resumes at the
 current tip; `transcript.read` returns ledger-backed status and final answer.

@@ -128,7 +128,7 @@ cargo fmt --check
 
 | Symptom | Fix |
 | --- | --- |
-| daemon lock held | a daemon is running or died hard: check the pid inside `agent.lock`; if dead, delete `agent.lock` and any Unix `agent.sock` |
+| daemon lock held | on Unix, a live kernel lock owner or failed lock-file safety validation blocks startup; inspect the reported details. Crashed owners recover automatically. Never delete a live lock |
 | `--db /path` ignored | use the equals form: `--db=/path` |
 | provider api key env is not set | re-export `OPENROUTER_API_KEY` in this shell |
 | ledger already exists | JSONL ledgers never overwrite — pass a fresh `--events` name |
