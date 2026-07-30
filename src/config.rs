@@ -14,7 +14,8 @@ const DEFAULT_OPENROUTER_MODEL: &str = "~openai/gpt-latest";
 const DEFAULT_TOKEN_BUDGET: u32 = 4_000;
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 1_024;
 const DEFAULT_MAX_TURNS: u32 = 8;
-const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 120_000;
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const PLATO_CONFIG_ENV: &str = "PLATO_CONFIG";
@@ -73,7 +74,8 @@ pub struct ProviderConfig {
     pub model: String,
     pub api_key_env: String,
     pub base_url: String,
-    pub timeout_ms: u64,
+    pub connect_timeout_ms: u64,
+    pub stream_idle_timeout_ms: u64,
     pub http_referer: Option<String>,
     pub app_title: Option<String>,
 }
@@ -128,6 +130,8 @@ struct RawProviderConfig {
     model: Option<String>,
     api_key_env: Option<String>,
     base_url: Option<String>,
+    connect_timeout_ms: Option<u64>,
+    stream_idle_timeout_ms: Option<u64>,
     timeout_ms: Option<u64>,
     http_referer: Option<String>,
     app_title: Option<String>,
@@ -192,10 +196,23 @@ impl Config {
             limits.max_turns.unwrap_or(DEFAULT_MAX_TURNS),
             "limits.max_turns",
         )?;
-        let timeout_ms = positive(
-            provider.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
-            "provider.timeout_ms",
+        let connect_timeout_ms = positive(
+            provider
+                .connect_timeout_ms
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS),
+            "provider.connect_timeout_ms",
         )?;
+        let stream_idle_timeout_ms = match (provider.stream_idle_timeout_ms, provider.timeout_ms) {
+            (Some(_), Some(_)) => {
+                return Err(AppError::Config(
+                    "provider.timeout_ms and provider.stream_idle_timeout_ms cannot both be set"
+                        .into(),
+                ));
+            }
+            (Some(value), None) => positive(value, "provider.stream_idle_timeout_ms")?,
+            (None, Some(value)) => positive(value, "provider.timeout_ms")?,
+            (None, None) => DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+        };
         let kind = provider.kind.unwrap_or(ProviderKind::OpenRouter);
 
         let enabled = tools.enabled.unwrap_or_else(default_enabled_tools);
@@ -219,7 +236,8 @@ impl Config {
                 base_url: provider
                     .base_url
                     .unwrap_or_else(|| default_base_url(&kind).into()),
-                timeout_ms,
+                connect_timeout_ms,
+                stream_idle_timeout_ms,
                 http_referer: provider.http_referer,
                 app_title: provider.app_title,
                 kind,
@@ -243,7 +261,8 @@ impl Default for Config {
                 model: default_model(&kind).into(),
                 api_key_env: default_api_key_env(&kind).into(),
                 base_url: default_base_url(&kind).into(),
-                timeout_ms: DEFAULT_TIMEOUT_MS,
+                connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
+                stream_idle_timeout_ms: DEFAULT_STREAM_IDLE_TIMEOUT_MS,
                 http_referer: None,
                 app_title: None,
                 kind,
@@ -485,6 +504,14 @@ mod tests {
         assert_eq!(config.provider.model, "~openai/gpt-latest");
         assert_eq!(config.provider.api_key_env, "OPENROUTER_API_KEY");
         assert_eq!(config.provider.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(
+            config.provider.connect_timeout_ms,
+            DEFAULT_CONNECT_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.provider.stream_idle_timeout_ms,
+            DEFAULT_STREAM_IDLE_TIMEOUT_MS
+        );
         assert_eq!(config.limits.max_turns, 8);
         assert!(config.gateway.is_none());
         assert_eq!(
@@ -675,7 +702,11 @@ owner_user_ids = [42]
         assert_eq!(config.provider.model, "gpt-test");
         assert_eq!(config.provider.api_key_env, "OPENAI_API_KEY");
         assert_eq!(config.provider.base_url, OPENAI_BASE_URL);
-        assert_eq!(config.provider.timeout_ms, 3000);
+        assert_eq!(
+            config.provider.connect_timeout_ms,
+            DEFAULT_CONNECT_TIMEOUT_MS
+        );
+        assert_eq!(config.provider.stream_idle_timeout_ms, 3000);
         assert_eq!(config.limits.max_turns, 2);
         assert_eq!(config.tools.enabled, vec!["file.read"]);
         assert_eq!(config.gateway.unwrap().discord.owner_user_ids, vec![42]);
@@ -811,6 +842,84 @@ base_url = "https://provider.example/v1"
     }
 
     #[test]
+    fn parses_explicit_provider_timeouts() {
+        let raw = toml::from_str(
+            r#"
+[provider]
+connect_timeout_ms = 2500
+stream_idle_timeout_ms = 9000
+"#,
+        )
+        .unwrap();
+
+        let config = Config::from_raw(raw).unwrap();
+
+        assert_eq!(config.provider.connect_timeout_ms, 2500);
+        assert_eq!(config.provider.stream_idle_timeout_ms, 9000);
+    }
+
+    #[test]
+    fn legacy_provider_timeout_maps_to_stream_idle_budget() {
+        let raw = toml::from_str(
+            r#"
+[provider]
+connect_timeout_ms = 2500
+timeout_ms = 9000
+"#,
+        )
+        .unwrap();
+
+        let config = Config::from_raw(raw).unwrap();
+
+        assert_eq!(config.provider.connect_timeout_ms, 2500);
+        assert_eq!(config.provider.stream_idle_timeout_ms, 9000);
+    }
+
+    #[test]
+    fn rejects_legacy_and_explicit_stream_idle_timeouts_together() {
+        let raw = toml::from_str(
+            r#"
+[provider]
+timeout_ms = 9000
+stream_idle_timeout_ms = 9000
+"#,
+        )
+        .unwrap();
+
+        let error = Config::from_raw(raw).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Config(message)
+                if message
+                    == "provider.timeout_ms and provider.stream_idle_timeout_ms cannot both be set"
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_provider_timeouts() {
+        for (field, source) in [
+            (
+                "provider.connect_timeout_ms",
+                "[provider]\nconnect_timeout_ms = 0\n",
+            ),
+            (
+                "provider.stream_idle_timeout_ms",
+                "[provider]\nstream_idle_timeout_ms = 0\n",
+            ),
+            ("provider.timeout_ms", "[provider]\ntimeout_ms = 0\n"),
+        ] {
+            let raw = toml::from_str(source).unwrap();
+            let error = Config::from_raw(raw).unwrap_err();
+
+            assert!(matches!(
+                error,
+                AppError::Config(message) if message == format!("{field} must be positive")
+            ));
+        }
+    }
+
+    #[test]
     fn openrouter_defaults_to_openrouter_endpoint_and_key() {
         let raw = RawConfig {
             provider: Some(RawProviderConfig {
@@ -818,6 +927,8 @@ base_url = "https://provider.example/v1"
                 model: None,
                 api_key_env: None,
                 base_url: None,
+                connect_timeout_ms: None,
+                stream_idle_timeout_ms: None,
                 timeout_ms: None,
                 http_referer: None,
                 app_title: None,

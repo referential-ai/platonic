@@ -18,7 +18,8 @@ use std::{
 pub struct OpenAiCompatibleClient {
     api_key: String,
     base_url: String,
-    timeout: Duration,
+    connect_timeout: Duration,
+    stream_idle_timeout: Duration,
     http_referer: Option<String>,
     app_title: Option<String>,
     token_limit_field: TokenLimitField,
@@ -28,7 +29,8 @@ impl OpenAiCompatibleClient {
     pub fn from_config(
         api_key_env: &str,
         base_url: String,
-        timeout_ms: u64,
+        connect_timeout_ms: u64,
+        stream_idle_timeout_ms: u64,
         http_referer: Option<String>,
         app_title: Option<String>,
         token_limit_field: TokenLimitField,
@@ -40,15 +42,21 @@ impl OpenAiCompatibleClient {
                 "provider.base_url must not be empty".into(),
             ));
         }
-        if timeout_ms == 0 {
+        if connect_timeout_ms == 0 {
             return Err(AppError::Config(
-                "provider.timeout_ms must be positive".into(),
+                "provider.connect_timeout_ms must be positive".into(),
+            ));
+        }
+        if stream_idle_timeout_ms == 0 {
+            return Err(AppError::Config(
+                "provider.stream_idle_timeout_ms must be positive".into(),
             ));
         }
         Ok(Self {
             api_key,
             base_url,
-            timeout: Duration::from_millis(timeout_ms),
+            connect_timeout: Duration::from_millis(connect_timeout_ms),
+            stream_idle_timeout: Duration::from_millis(stream_idle_timeout_ms),
             http_referer,
             app_title,
             token_limit_field,
@@ -83,7 +91,11 @@ impl OpenAiCompatibleClient {
 
     fn post_completion(&self, body: ChatCompletionRequest) -> AppResult<ureq::Response> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(self.connect_timeout)
+            .timeout_write(self.connect_timeout)
+            .timeout_read(self.stream_idle_timeout)
+            .build();
         self.authorized_post(&agent, &url)
             .send_json(body)
             .map_err(provider_send_error)
@@ -623,7 +635,13 @@ fn text_from_blocks(blocks: &[ModelBlock]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::io::{BufReader, Cursor, ErrorKind};
+    use std::{
+        io::{BufReader, Cursor, ErrorKind, Read, Write},
+        net::{TcpListener, TcpStream},
+        sync::mpsc,
+        thread,
+        time::Instant,
+    };
 
     #[test]
     fn maps_openai_tool_calls_to_internal_tool_names() {
@@ -840,6 +858,236 @@ mod tests {
             reasoning_effort,
             messages: vec![ModelMessage::user_text("hello")],
             tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn request_write_stall_uses_connect_budget() {
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let (base_url, server) = spawn_loopback_provider(move |_stream| {
+            let _ = stop_receiver.recv_timeout(Duration::from_secs(5));
+        });
+        let client = timeout_test_client(base_url, 100, 2_000);
+        let mut request = reasoning_request(None);
+        request.system = "x".repeat(16 * 1024 * 1024);
+
+        let started = Instant::now();
+        let result = client.send(&request);
+        let elapsed = started.elapsed();
+        let _ = stop_sender.send(());
+        server.join().unwrap();
+
+        assert_timeout(result.unwrap_err());
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "request write took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_response_stall_uses_idle_budget() {
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let first = sse_delta("start");
+        let tail = sse_finish();
+        let response_length = first.len() + tail.len();
+        let (base_url, server) = spawn_loopback_provider(move |mut stream| {
+            read_provider_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {response_length}\r\nconnection: close\r\n\r\n{first}"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            let _ = stop_receiver.recv_timeout(Duration::from_secs(5));
+        });
+        let client = timeout_test_client(base_url, 2_000, 100);
+        let mut deltas = Vec::new();
+
+        let started = Instant::now();
+        let result = client.send_streaming(&reasoning_request(None), |delta| {
+            deltas.push(delta.to_string());
+            Ok(())
+        });
+        let elapsed = started.elapsed();
+        let _ = stop_sender.send(());
+        server.join().unwrap();
+
+        assert_timeout(result.unwrap_err());
+        assert_eq!(deltas, ["start"]);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "streaming response read took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_progress_receives_fresh_idle_windows() {
+        let chunks = ["a", "b", "c", "d", "e", "f"];
+        let events = chunks.map(sse_delta);
+        let finish = sse_finish();
+        let response_length = events.iter().map(String::len).sum::<usize>() + finish.len();
+        let (base_url, server) = spawn_loopback_provider(move |mut stream| {
+            read_provider_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {response_length}\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+            for event in events {
+                stream.write_all(event.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                thread::sleep(Duration::from_millis(100));
+            }
+            stream.write_all(finish.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+        let idle_budget = Duration::from_millis(500);
+        let client = timeout_test_client(base_url, 2_000, idle_budget.as_millis() as u64);
+
+        let started = Instant::now();
+        let response = client
+            .send_streaming(&reasoning_request(None), |_| Ok(()))
+            .unwrap();
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert_eq!(response.text(), "abcdef");
+        assert!(
+            elapsed > idle_budget,
+            "stream finished before exceeding the former total budget: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn non_streaming_response_stall_uses_idle_budget() {
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let body = r#"{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}"#;
+        let partial = &body[..body.len() / 2];
+        let response_length = body.len();
+        let (base_url, server) = spawn_loopback_provider(move |mut stream| {
+            read_provider_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {response_length}\r\nconnection: close\r\n\r\n{partial}"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            let _ = stop_receiver.recv_timeout(Duration::from_secs(5));
+        });
+        let client = timeout_test_client(base_url, 2_000, 100);
+
+        let started = Instant::now();
+        let result = client.send(&reasoning_request(None));
+        let elapsed = started.elapsed();
+        let _ = stop_sender.send(());
+        server.join().unwrap();
+
+        assert_timeout(result.unwrap_err());
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "non-streaming response read took {elapsed:?}"
+        );
+    }
+
+    fn timeout_test_client(
+        base_url: String,
+        connect_timeout_ms: u64,
+        stream_idle_timeout_ms: u64,
+    ) -> OpenAiCompatibleClient {
+        temp_env::with_var("PLATO_PROVIDER_TIMEOUT_TEST_KEY", Some("test-key"), || {
+            OpenAiCompatibleClient::from_config(
+                "PLATO_PROVIDER_TIMEOUT_TEST_KEY",
+                base_url,
+                connect_timeout_ms,
+                stream_idle_timeout_ms,
+                None,
+                None,
+                TokenLimitField::MaxTokens,
+            )
+            .unwrap()
+        })
+    }
+
+    fn spawn_loopback_provider(
+        handler: impl FnOnce(TcpStream) + Send + 'static,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handler(stream);
+        });
+        (base_url, handle)
+    }
+
+    fn read_provider_request(stream: &mut TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut received = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let header_end = loop {
+            let count = stream.read(&mut buffer).unwrap();
+            assert_ne!(count, 0, "provider request ended before headers");
+            received.extend_from_slice(&buffer[..count]);
+            if let Some(index) = received.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&received[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        let mut body_length = received.len() - header_end;
+        while body_length < content_length {
+            let count = stream.read(&mut buffer).unwrap();
+            assert_ne!(count, 0, "provider request ended before body");
+            body_length += count;
+        }
+    }
+
+    fn sse_delta(text: &str) -> String {
+        format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": text},
+                    "finish_reason": null
+                }]
+            })
+        )
+    }
+
+    fn sse_finish() -> String {
+        concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .into()
+    }
+
+    fn assert_timeout(error: AppError) {
+        match error {
+            AppError::Io(error) => assert!(
+                matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock),
+                "unexpected I/O error: {error}"
+            ),
+            AppError::Provider(message) => {
+                let message = message.to_ascii_lowercase();
+                assert!(
+                    message.contains("timed out")
+                        || message.contains("would block")
+                        || message.contains("temporarily unavailable"),
+                    "unexpected provider error: {message}"
+                );
+            }
+            error => panic!("unexpected timeout error: {error}"),
         }
     }
 
