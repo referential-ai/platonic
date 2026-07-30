@@ -5,8 +5,7 @@ use plato_agent::{
     daemon::{
         client::{DaemonClient, DaemonConnectionConfig},
         lock::ensure_workspace_unlocked,
-        server::DaemonServer,
-        wake_listener,
+        protocol::{PendingApprovalSnapshot, RunStateName, StreamEvent},
     },
     ledger::{latest_default_sqlite_session_id, latest_sqlite_session_id},
     new_session_id,
@@ -14,21 +13,18 @@ use plato_agent::{
     replay_default_sqlite, replay_file, replay_sqlite, run_issue_prep, run_question,
     tui::{TuiOptions, run_tui},
 };
-use platonic_core::RunId;
+use platonic_core::{HarnessEvent, RunId};
 use std::{
-    io::{self, Read, Write},
+    io::{self, BufRead, IsTerminal, Read, Write},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::{self, JoinHandle},
+    process::{Child, Command as ProcessCommand, Stdio},
+    thread,
     time::{Duration, Instant},
 };
 
-const EMBEDDED_DAEMON_TIMEOUT: Duration = Duration::from_secs(3);
-const EMBEDDED_DAEMON_POLL: Duration = Duration::from_millis(50);
-const EMBEDDED_DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+const DAEMON_CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
+const DAEMON_POLL: Duration = Duration::from_millis(50);
+const DAEMON_EVENT_PAGE: usize = 128;
 
 #[derive(Debug, Parser)]
 #[command(name = "plato")]
@@ -109,7 +105,9 @@ fn main() {
 fn run() -> plato_agent::AppResult<()> {
     let cli = Cli::parse();
     let workspace_root = std::env::current_dir()?;
-    if cli.tui {
+    let implicit_tui =
+        implicit_tui_requested(&cli, io::stdin().is_terminal(), io::stdout().is_terminal());
+    if cli.tui || implicit_tui {
         return run_tui_mode(cli, workspace_root);
     }
     if matches!(&cli.command, Some(Command::IssuePrep { .. })) {
@@ -123,26 +121,55 @@ fn run() -> plato_agent::AppResult<()> {
         Some(Command::IssuePrep { command }) => {
             run_issue_prep_cli(command, cli.config, workspace_root)
         }
-        None => {
-            let question = cli.question.join(" ");
-            let ledger = run_ledger(cli.events, cli.db, &workspace_root)?;
-            let session = run_session(cli.continue_session, &ledger)?;
-            let outcome = run_question(RunOptions {
+        None => run_prompt(cli, workspace_root),
+    }
+}
+
+fn implicit_tui_requested(cli: &Cli, stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
+    cli.command.is_none() && cli.question.is_empty() && stdin_is_terminal && stdout_is_terminal
+}
+
+fn run_prompt(cli: Cli, workspace_root: PathBuf) -> plato_agent::AppResult<()> {
+    let question = cli.question.join(" ");
+    if question.trim().is_empty() {
+        return Err(AppError::EmptyQuestion);
+    }
+    if daemon_prompt_eligible(&cli) {
+        let config = DaemonConnectionConfig::resolve(&workspace_root, None)?;
+        if let Some(mut client) = connect_serving_daemon(&config) {
+            let stdin = io::stdin();
+            return run_daemon_prompt(
+                &mut client,
                 question,
-                config_path: cli.config,
-                overrides: RunOverrides::default(),
-                ledger: ledger.clone(),
-                workspace_root,
-                approval_mode: ApprovalMode::from_yolo(cli.yolo),
-                run_id: None,
-                session,
-                event_sender: None,
-                stream_to_stderr: true,
-                cancel: None,
-            })?;
-            write_run_success_output(&mut io::stdout(), &mut io::stderr(), &outcome, &ledger)
+                cli.continue_session,
+                cli.config.as_deref(),
+                &mut stdin.lock(),
+                &mut io::stdout(),
+                &mut io::stderr(),
+            );
         }
     }
+
+    let ledger = run_ledger(cli.events, cli.db, &workspace_root)?;
+    let session = run_session(cli.continue_session, &ledger)?;
+    let outcome = run_question(RunOptions {
+        question,
+        config_path: cli.config,
+        overrides: RunOverrides::default(),
+        ledger: ledger.clone(),
+        workspace_root,
+        approval_mode: ApprovalMode::from_yolo(cli.yolo),
+        run_id: None,
+        session,
+        event_sender: None,
+        stream_to_stderr: true,
+        cancel: None,
+    })?;
+    write_run_success_output(&mut io::stdout(), &mut io::stderr(), &outcome, &ledger)
+}
+
+fn daemon_prompt_eligible(cli: &Cli) -> bool {
+    cli.events.is_none() && !matches!(cli.db, Some(Some(_))) && !cli.yolo
 }
 
 fn validate_issue_prep_cli(cli: &Cli) -> plato_agent::AppResult<()> {
@@ -200,7 +227,7 @@ fn write_issue_prep_output(
 
 fn run_tui_mode(cli: Cli, workspace_root: PathBuf) -> plato_agent::AppResult<()> {
     let options = tui_options_from_cli(&cli, &workspace_root)?;
-    let _embedded_daemon = ensure_tui_daemon(&workspace_root)?;
+    ensure_tui_daemon(&workspace_root)?;
     run_tui(options)
 }
 
@@ -230,98 +257,232 @@ fn validate_tui_cli(cli: &Cli) -> plato_agent::AppResult<()> {
     Ok(())
 }
 
-fn ensure_tui_daemon(workspace_root: &Path) -> plato_agent::AppResult<Option<EmbeddedDaemon>> {
+fn ensure_tui_daemon(workspace_root: &Path) -> plato_agent::AppResult<()> {
     let config = DaemonConnectionConfig::resolve(workspace_root, None)?;
-    if daemon_accepts_hello(&config, EMBEDDED_DAEMON_TIMEOUT) {
-        return Ok(None);
+    if connect_serving_daemon(&config).is_some() {
+        return Ok(());
     }
-    start_embedded_daemon(workspace_root, &config).map(Some)
+    let mut daemon = spawn_detached_daemon(workspace_root)?;
+    wait_for_persistent_daemon(&config, &mut daemon)
 }
 
-fn start_embedded_daemon(
-    workspace_root: &Path,
-    config: &DaemonConnectionConfig,
-) -> plato_agent::AppResult<EmbeddedDaemon> {
-    let server = DaemonServer::bind(workspace_root, None)?;
-    let socket_path = server.paths().socket_path.clone();
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let thread_shutdown = shutdown.clone();
-    let handle = thread::spawn(move || server.serve_forever(thread_shutdown));
-    let mut daemon = EmbeddedDaemon {
-        shutdown,
-        socket_path,
-        handle: Some(handle),
-    };
-    wait_for_embedded_daemon(config, &mut daemon)?;
-    Ok(daemon)
+fn connect_serving_daemon(config: &DaemonConnectionConfig) -> Option<DaemonClient> {
+    connect_serving_daemon_with_timeout(config, DAEMON_CLIENT_TIMEOUT)
 }
 
-fn wait_for_embedded_daemon(
+fn connect_serving_daemon_with_timeout(
     config: &DaemonConnectionConfig,
-    daemon: &mut EmbeddedDaemon,
+    timeout: Duration,
+) -> Option<DaemonClient> {
+    let mut client = DaemonClient::connect_with_timeout(&config.socket_path, timeout).ok()?;
+    client.hello(&config.workspace_root).ok()?;
+    Some(client)
+}
+
+fn spawn_detached_daemon(workspace_root: &Path) -> plato_agent::AppResult<Child> {
+    let binary = sibling_binary("plato-agentd")?;
+    let mut command = ProcessCommand::new(&binary);
+    command
+        .arg("--workspace")
+        .arg(workspace_root)
+        .current_dir(workspace_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    detach_command(&mut command);
+    command.spawn().map_err(|error| {
+        AppError::Config(format!(
+            "failed to start persistent {}: {error}",
+            binary.display()
+        ))
+    })
+}
+
+fn sibling_binary(name: &str) -> plato_agent::AppResult<PathBuf> {
+    let mut binary = std::env::current_exe()?;
+    binary.set_file_name(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    Ok(binary)
+}
+
+#[cfg(unix)]
+fn detach_command(command: &mut ProcessCommand) {
+    use std::os::unix::process::CommandExt;
+
+    // `setsid` is async-signal-safe and detaches the daemon from the TUI's terminal session.
+    unsafe {
+        command.pre_exec(|| rustix::process::setsid().map(|_| ()).map_err(Into::into));
+    }
+}
+
+#[cfg(windows)]
+fn detach_command(command: &mut ProcessCommand) {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+fn wait_for_persistent_daemon(
+    config: &DaemonConnectionConfig,
+    daemon: &mut Child,
 ) -> plato_agent::AppResult<()> {
-    let deadline = Instant::now() + EMBEDDED_DAEMON_TIMEOUT;
+    let deadline = Instant::now() + DAEMON_CLIENT_TIMEOUT;
     loop {
-        if daemon_accepts_hello(config, EMBEDDED_DAEMON_TIMEOUT) {
+        if connect_serving_daemon(config).is_some() {
             return Ok(());
         }
-        if daemon.handle.as_ref().is_some_and(JoinHandle::is_finished) {
-            return daemon_finished_before_ready(daemon);
+        if let Some(status) = daemon.try_wait()? {
+            return Err(AppError::Config(format!(
+                "persistent plato-agentd exited before accepting connections: {status}"
+            )));
         }
         if Instant::now() >= deadline {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
             return Err(AppError::Config(format!(
-                "timed out waiting for embedded plato-agentd at {}",
+                "timed out waiting for persistent plato-agentd at {}",
                 config.socket_path.display()
             )));
         }
-        thread::sleep(EMBEDDED_DAEMON_POLL);
+        thread::sleep(DAEMON_POLL);
     }
 }
 
-fn daemon_accepts_hello(config: &DaemonConnectionConfig, timeout: Duration) -> bool {
-    let Ok(mut client) = DaemonClient::connect_with_timeout(&config.socket_path, timeout) else {
-        return false;
+fn run_daemon_prompt(
+    client: &mut DaemonClient,
+    question: String,
+    continue_session: bool,
+    config_path: Option<&Path>,
+    stdin: &mut impl BufRead,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> plato_agent::AppResult<()> {
+    let config_path = config_path.map(|path| path.to_string_lossy().into_owned());
+    let started = if continue_session {
+        client.message_append(question, config_path, false)?
+    } else {
+        client.run_start(question, config_path, false)?
     };
-    client.hello(&config.workspace_root).is_ok()
-}
+    let run_id = RunId::new(started.run_id.clone())?;
+    let mut from_offset = Some(0);
+    let mut terminal_failure = None;
+    let mut wrote_stderr_delta = false;
 
-fn daemon_finished_before_ready(daemon: &mut EmbeddedDaemon) -> plato_agent::AppResult<()> {
-    let Some(handle) = daemon.handle.take() else {
-        return Err(AppError::Config(
-            "embedded plato-agentd stopped before accepting connections".into(),
-        ));
-    };
-    match handle.join() {
-        Ok(Ok(())) => Err(AppError::Config(
-            "embedded plato-agentd exited before accepting connections".into(),
-        )),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(AppError::Config(
-            "embedded plato-agentd panicked before accepting connections".into(),
-        )),
-    }
-}
+    loop {
+        let page = client.events_stream(&started.run_id, from_offset, DAEMON_EVENT_PAGE)?;
+        let event_count = page.events.len();
+        from_offset = Some(page.next_offset);
 
-struct EmbeddedDaemon {
-    shutdown: Arc<AtomicBool>,
-    socket_path: PathBuf,
-    handle: Option<JoinHandle<plato_agent::AppResult<()>>>,
-}
-
-impl Drop for EmbeddedDaemon {
-    fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        wake_listener(&self.socket_path);
-        if let Some(handle) = self.handle.take() {
-            let deadline = Instant::now() + EMBEDDED_DAEMON_SHUTDOWN_TIMEOUT;
-            while !handle.is_finished() && Instant::now() < deadline {
-                thread::sleep(EMBEDDED_DAEMON_POLL);
+        for buffered in page.events {
+            match buffered.event {
+                StreamEvent::AssistantDelta { text, .. } => {
+                    stderr.write_all(text.as_bytes())?;
+                    stderr.flush()?;
+                    wrote_stderr_delta = true;
+                }
+                StreamEvent::ApprovalRequested {
+                    run_id,
+                    tool_call_id,
+                    tool_name,
+                    effect,
+                    reason,
+                    approval_preview,
+                    diff_preview,
+                } => {
+                    let pending = client
+                        .transcript_read(&run_id)?
+                        .pending_approval
+                        .filter(|pending| pending.tool_call_id == tool_call_id)
+                        .unwrap_or(PendingApprovalSnapshot {
+                            run_id: run_id.clone(),
+                            tool_call_id: tool_call_id.clone(),
+                            tool_name,
+                            effect,
+                            reason: Some(reason),
+                            input_preview: None,
+                            approval_preview,
+                            diff_preview,
+                        });
+                    if prompt_daemon_approval(stdin, stderr, &pending)? {
+                        client.approval_grant(&run_id, &tool_call_id)?;
+                    } else {
+                        client.approval_deny(
+                            &run_id,
+                            &tool_call_id,
+                            "approval denied by stdin".into(),
+                        )?;
+                    }
+                }
+                StreamEvent::Ledger { record } => match record.event {
+                    HarnessEvent::ModelResponded { .. } if wrote_stderr_delta => {
+                        writeln!(stderr)?;
+                        wrote_stderr_delta = false;
+                    }
+                    HarnessEvent::RunFailed { reason, .. } => {
+                        terminal_failure = Some(reason);
+                    }
+                    _ => {}
+                },
+                StreamEvent::Canceled { .. } | StreamEvent::Unknown(_) => {}
             }
-            if handle.is_finished() {
-                let _ = handle.join();
+        }
+
+        if event_count == DAEMON_EVENT_PAGE {
+            continue;
+        }
+        match page.status {
+            RunStateName::Running | RunStateName::CancelRequested => {
+                thread::sleep(DAEMON_POLL);
+            }
+            RunStateName::Finished => {
+                if wrote_stderr_delta {
+                    writeln!(stderr)?;
+                }
+                let transcript = client.transcript_read(&started.run_id)?;
+                let final_answer = transcript.final_answer.ok_or_else(|| {
+                    AppError::DaemonProtocol(format!(
+                        "finished daemon run {} omitted its final answer",
+                        started.run_id
+                    ))
+                })?;
+                writeln!(stdout, "{final_answer}")?;
+                write_sqlite_replay_hint(stderr, &run_id, Path::new(&started.ledger_path))?;
+                return Ok(());
+            }
+            RunStateName::Canceled => return Err(AppError::RunCanceled),
+            RunStateName::Failed | RunStateName::Interrupted => {
+                return Err(AppError::RunFailed(terminal_failure.unwrap_or_else(|| {
+                    format!(
+                        "daemon run {} ended as {}",
+                        started.run_id,
+                        page.status.as_str()
+                    )
+                })));
             }
         }
     }
+}
+
+fn prompt_daemon_approval(
+    stdin: &mut impl BufRead,
+    stderr: &mut impl Write,
+    pending: &PendingApprovalSnapshot,
+) -> plato_agent::AppResult<bool> {
+    if let Some(preview) = pending.approval_preview.as_deref() {
+        write!(stderr, "Approve {}?\n{preview}\n[y/N] ", pending.tool_name)?;
+    } else if let Some(preview) = pending.input_preview.as_deref() {
+        write!(stderr, "Approve {} {preview}? [y/N] ", pending.tool_name)?;
+    } else {
+        write!(stderr, "Approve {}? [y/N] ", pending.tool_name)?;
+    }
+    stderr.flush()?;
+
+    let mut line = String::new();
+    stdin.read_line(&mut line)?;
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 fn run_ledger(
@@ -497,6 +658,15 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plato_agent::daemon::{server::DaemonServer, wake_listener};
+    use serde_json::{Value, json};
+    use std::{
+        net::{TcpListener, TcpStream},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     #[test]
     fn sqlite_success_hint_goes_to_stderr_without_changing_stdout() {
@@ -672,38 +842,68 @@ mod tests {
     }
 
     #[test]
-    fn embedded_daemon_drop_is_bounded_when_wake_connect_fails() {
-        let workspace = tempfile::tempdir().unwrap();
-        let release = Arc::new(AtomicBool::new(false));
-        let worker_release = release.clone();
-        let (started_sender, started_receiver) = std::sync::mpsc::channel();
-        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
-        let handle = thread::spawn(move || -> plato_agent::AppResult<()> {
-            started_sender.send(()).unwrap();
-            while !worker_release.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(10));
-            }
-            finished_sender.send(()).unwrap();
-            Ok(())
-        });
-        started_receiver.recv().unwrap();
-        let daemon = EmbeddedDaemon {
-            shutdown: Arc::new(AtomicBool::new(false)),
-            socket_path: workspace.path().join("missing.sock"),
-            handle: Some(handle),
+    fn implicit_tui_requires_both_terminals_and_no_explicit_entry() {
+        let bare = Cli::try_parse_from(["plato"]).unwrap();
+        assert!(implicit_tui_requested(&bare, true, true));
+        assert!(!implicit_tui_requested(&bare, false, true));
+        assert!(!implicit_tui_requested(&bare, true, false));
+        assert!(matches!(
+            run_prompt(bare, PathBuf::from(".")),
+            Err(AppError::EmptyQuestion)
+        ));
+
+        let prompt = Cli::try_parse_from(["plato", "hello"]).unwrap();
+        assert!(!implicit_tui_requested(&prompt, true, true));
+        let empty_prompt = Cli::try_parse_from(["plato", ""]).unwrap();
+        assert!(!implicit_tui_requested(&empty_prompt, true, true));
+        assert!(matches!(
+            run_prompt(empty_prompt, PathBuf::from(".")),
+            Err(AppError::EmptyQuestion)
+        ));
+        let replay = Cli::try_parse_from(["plato", "replay"]).unwrap();
+        assert!(!implicit_tui_requested(&replay, true, true));
+    }
+
+    #[test]
+    fn daemon_prompt_eligibility_keeps_explicit_run_modes_direct() {
+        for arguments in [
+            vec!["plato", "hello"],
+            vec!["plato", "--db", "hello"],
+            vec!["plato", "--config", "custom.toml", "hello"],
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            assert!(daemon_prompt_eligible(&cli));
+        }
+        for arguments in [
+            vec!["plato", "--events", "events.jsonl", "hello"],
+            vec!["plato", "--db=events.db", "hello"],
+            vec!["plato", "--yolo", "hello"],
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            assert!(!daemon_prompt_eligible(&cli));
+        }
+    }
+
+    #[test]
+    fn delegated_approval_keeps_stdin_default_no() {
+        let pending = PendingApprovalSnapshot {
+            run_id: "run_1".into(),
+            tool_call_id: "call_1".into(),
+            tool_name: "file.write".into(),
+            effect: platonic_core::EffectClass::WorkspaceWrite,
+            reason: Some("approval required".into()),
+            input_preview: Some(r#"{"path":"out.txt"}"#.into()),
+            approval_preview: None,
+            diff_preview: None,
         };
+        let mut stderr = Vec::new();
 
-        let started = Instant::now();
-        drop(daemon);
-        let elapsed = started.elapsed();
-        release.store(true, Ordering::SeqCst);
-        finished_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
+        let granted = prompt_daemon_approval(&mut "\n".as_bytes(), &mut stderr, &pending).unwrap();
 
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "embedded daemon drop took {elapsed:?}"
+        assert!(!granted);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            r#"Approve file.write {"path":"out.txt"}? [y/N] "#
         );
     }
 
@@ -723,12 +923,154 @@ mod tests {
         });
 
         let started = Instant::now();
-        assert!(!daemon_accepts_hello(&config, Duration::from_millis(50)));
+        assert!(connect_serving_daemon_with_timeout(&config, Duration::from_millis(50)).is_none());
         let elapsed = started.elapsed();
         server.join().unwrap();
 
         assert!(elapsed < Duration::from_secs(1), "probe took {elapsed:?}");
-        assert_eq!(EMBEDDED_DAEMON_TIMEOUT, Duration::from_secs(3));
+        assert_eq!(DAEMON_CLIENT_TIMEOUT, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn serving_daemon_handles_fresh_and_latest_continuation() {
+        let workspace = tempfile::tempdir().unwrap();
+        with_test_xdg(workspace.path(), || {
+            let provider = FakeProvider::start(vec![
+                text_stream(&["first ", "answer"]),
+                text_stream(&["second answer"]),
+            ]);
+            let config_path = workspace.path().join("custom.toml");
+            write_test_config(&config_path, &provider.base_url, "file.read");
+            let daemon = TestDaemon::start(workspace.path());
+            let mut client = daemon.client();
+            let mut first_stdout = Vec::new();
+            let mut first_stderr = Vec::new();
+
+            run_daemon_prompt(
+                &mut client,
+                "first question".into(),
+                false,
+                Some(&config_path),
+                &mut "".as_bytes(),
+                &mut first_stdout,
+                &mut first_stderr,
+            )
+            .unwrap();
+
+            let mut second_stdout = Vec::new();
+            let mut second_stderr = Vec::new();
+            run_daemon_prompt(
+                &mut client,
+                "follow up".into(),
+                true,
+                Some(&config_path),
+                &mut "".as_bytes(),
+                &mut second_stdout,
+                &mut second_stderr,
+            )
+            .unwrap();
+            daemon.stop();
+            let requests = provider.join();
+
+            assert_eq!(String::from_utf8(first_stdout).unwrap(), "first answer\n");
+            let first_stderr = String::from_utf8(first_stderr).unwrap();
+            assert!(first_stderr.starts_with("first answer\nrun_id: run_"));
+            assert!(first_stderr.contains("\nledger_path: "));
+            assert!(first_stderr.contains("\nreplay: plato replay --db="));
+            assert_eq!(String::from_utf8(second_stdout).unwrap(), "second answer\n");
+            assert!(
+                String::from_utf8(second_stderr)
+                    .unwrap()
+                    .starts_with("second answer\nrun_id: run_")
+            );
+            assert_eq!(requests[0]["model"], "test-model");
+            let continued_messages = requests[1]["messages"].to_string();
+            assert!(continued_messages.contains("first question"));
+            assert!(continued_messages.contains("first answer"));
+            assert!(continued_messages.contains("follow up"));
+        });
+    }
+
+    #[test]
+    fn delegated_prompt_bridges_stdin_grant_and_denial() {
+        for (stdin, final_answer, file_exists) in
+            [("y\n", "granted", true), ("\n", "denied", false)]
+        {
+            let workspace = tempfile::tempdir().unwrap();
+            with_test_xdg(workspace.path(), || {
+                let provider =
+                    FakeProvider::start(vec![tool_call_stream(), text_stream(&[final_answer])]);
+                let config_path = workspace.path().join("plato.toml");
+                write_test_config(&config_path, &provider.base_url, "file.write");
+                let daemon = TestDaemon::start(workspace.path());
+                let mut client = daemon.client();
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+
+                run_daemon_prompt(
+                    &mut client,
+                    "write the file".into(),
+                    false,
+                    Some(&config_path),
+                    &mut stdin.as_bytes(),
+                    &mut stdout,
+                    &mut stderr,
+                )
+                .unwrap();
+                daemon.stop();
+                let requests = provider.join();
+
+                assert_eq!(
+                    String::from_utf8(stdout).unwrap(),
+                    format!("{final_answer}\n")
+                );
+                assert!(String::from_utf8(stderr).unwrap().contains(
+                    r#"Approve file.write {"content":"hello","path":"out.txt"}? [y/N] "#
+                ));
+                assert_eq!(workspace.path().join("out.txt").exists(), file_exists);
+                let continuation = requests[1]["messages"].to_string();
+                if file_exists {
+                    assert!(continuation.contains(r#"\"path\":\"out.txt\""#));
+                    assert!(continuation.contains(r#"\"bytes\":5"#));
+                } else {
+                    assert!(continuation.contains("approval denied by stdin"));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn delegated_prompt_returns_terminal_daemon_failure() {
+        let workspace = tempfile::tempdir().unwrap();
+        with_test_xdg(workspace.path(), || {
+            let provider = FakeProvider::start(vec!["data: not-json\n\n".into()]);
+            let config_path = workspace.path().join("plato.toml");
+            write_test_config(&config_path, &provider.base_url, "file.read");
+            let daemon = TestDaemon::start(workspace.path());
+            let mut client = daemon.client();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let error = run_daemon_prompt(
+                &mut client,
+                "fail".into(),
+                false,
+                Some(&config_path),
+                &mut "".as_bytes(),
+                &mut stdout,
+                &mut stderr,
+            )
+            .unwrap_err();
+            daemon.stop();
+            provider.join();
+
+            assert!(stdout.is_empty());
+            assert!(matches!(
+                error,
+                AppError::RunFailed(reason)
+                    if reason.contains("provider returned invalid SSE JSON")
+            ));
+        });
     }
 
     #[test]
@@ -857,6 +1199,179 @@ mod tests {
             replay_ledger(None, Some(PathBuf::from("events.jsonl")), workspace.path()).unwrap();
 
         assert_eq!(ledger, RunLedger::Jsonl(PathBuf::from("events.jsonl")));
+    }
+
+    struct TestDaemon {
+        config: DaemonConnectionConfig,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<plato_agent::AppResult<()>>>,
+    }
+
+    impl TestDaemon {
+        fn start(workspace: &Path) -> Self {
+            let server = DaemonServer::bind(workspace, None).unwrap();
+            let config = DaemonConnectionConfig::resolve(workspace, None).unwrap();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let server_shutdown = Arc::clone(&shutdown);
+            let handle = thread::spawn(move || server.serve_forever(server_shutdown));
+            Self {
+                config,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+
+        fn client(&self) -> DaemonClient {
+            connect_serving_daemon(&self.config).unwrap()
+        }
+
+        fn stop(mut self) {
+            self.client().shutdown_if_idle().unwrap();
+            self.handle.take().unwrap().join().unwrap().unwrap();
+        }
+    }
+
+    impl Drop for TestDaemon {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                self.shutdown.store(true, Ordering::SeqCst);
+                wake_listener(&self.config.socket_path);
+                handle.join().unwrap().unwrap();
+            }
+        }
+    }
+
+    struct FakeProvider {
+        base_url: String,
+        handle: thread::JoinHandle<Vec<Value>>,
+    }
+
+    impl FakeProvider {
+        fn start(responses: Vec<String>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let handle = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut requests = Vec::new();
+                for body in responses {
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "timed out waiting for provider request"
+                                );
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(error) => panic!("provider accept failed: {error}"),
+                        }
+                    };
+                    let request = read_provider_request(&mut stream);
+                    requests.push(serde_json::from_str(&request).unwrap());
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                }
+                requests
+            });
+            Self { base_url, handle }
+        }
+
+        fn join(self) -> Vec<Value> {
+            self.handle.join().unwrap()
+        }
+    }
+
+    fn write_test_config(path: &Path, base_url: &str, enabled_tool: &str) {
+        std::fs::write(
+            path,
+            format!(
+                r#"
+[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "{base_url}"
+timeout_ms = 2000
+
+[limits]
+token_budget = 4000
+max_output_tokens = 32
+max_turns = 2
+
+[tools]
+enabled = ["{enabled_tool}"]
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn read_provider_request(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let header_end = loop {
+            let count = stream.read(&mut buffer).unwrap();
+            assert_ne!(count, 0, "provider request ended before headers");
+            bytes.extend_from_slice(&buffer[..count]);
+            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap();
+        while bytes.len() < header_end + content_length {
+            let count = stream.read(&mut buffer).unwrap();
+            assert_ne!(count, 0, "provider request ended before body");
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        String::from_utf8(bytes[header_end..header_end + content_length].to_vec()).unwrap()
+    }
+
+    fn text_stream(chunks: &[&str]) -> String {
+        let mut body = String::new();
+        for chunk in chunks {
+            body.push_str(&format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": chunk},
+                        "finish_reason": null
+                    }]
+                })
+            ));
+        }
+        body.push_str(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    fn tool_call_stream() -> String {
+        concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"file_write\",\"arguments\":\"{\\\"path\\\":\\\"out.txt\\\",\\\"content\\\":\\\"hello\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .into()
     }
 
     #[test]

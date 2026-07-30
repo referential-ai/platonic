@@ -19,7 +19,8 @@ identities remain unchanged.
 
 The bootstrap surface is intentionally small:
 
-- `plato "question"` runs one bounded CLI invocation, streams live assistant text to stderr, and writes the run ledger to the platform user-state path.
+- Bare `plato` in a terminal ensures the persistent workspace daemon and opens the TUI.
+- `plato "question"` runs directly when no daemon is serving, or delegates the same default-ledger run to a live daemon.
 - `plato -c "follow-up"` continues the latest workspace session from the SQLite ledger.
 - `plato --events <file> "question"` writes an explicit JSONL ledger.
 - `plato replay <file>` validates and prints a deterministic JSONL readback without network calls or tool execution.
@@ -134,7 +135,9 @@ Every run uses this exact convention:
 - `plato replay` without arguments replays the latest session from the default platform SQLite ledger.
 - `plato replay --run <id>` replays a single run.
 - `--events <file>` is the explicit JSONL export/debug path.
-- If the workspace daemon lock is held, SQLite CLI run/replay paths fail closed instead of competing with the daemon-owned store.
+- With a live workspace daemon, default-ledger prompts delegate to it. Replay,
+  explicit `--db=<path>`, and direct `--yolo` SQLite paths remain direct and
+  fail closed if they conflict with the daemon-owned store.
 
 Replay forms:
 
@@ -148,7 +151,7 @@ cargo run --bin plato -- replay --db=/tmp/plato-agent.db --run run_123
 ## Daemon
 
 `plato-agentd` is the local runtime daemon for session-facing clients such as
-the future `plato-tui`. The runtime topology and verb set are defined in
+`plato` and `plato-tui`. The runtime topology and verb set are defined in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#runtime-topology) and issue
 [#11](https://github.com/referential-ai/plato-agent/issues/11).
 
@@ -418,13 +421,14 @@ oversized Discord input.` Accepted messages are forwarded unchanged.
 
 ## TUI
 
-`plato --tui` is the interactive local entrypoint. It attaches to the workspace
-daemon if one is running, or starts an embedded daemon for the TUI session.
+Bare `plato` in a terminal is the interactive local entrypoint; `plato --tui`
+is its explicit equivalent. It attaches to a serving workspace daemon or starts
+the sibling `plato-agentd` detached. Exiting the TUI leaves that daemon running.
 It renders a chat-first transcript surface with an intro, live activity,
 status rule, composer, session picker, and approval modal.
 
 ```bash
-cargo run --bin plato -- --tui --config plato.toml
+cargo run --bin plato
 ```
 
 `plato-tui` remains a terminal client for a manually started `plato-agentd`. It
@@ -466,6 +470,7 @@ Keys:
 ## Commands
 
 ```bash
+cargo run --bin plato
 cargo run --bin plato -- "read README.md and summarize it"
 cargo run --bin plato -- -c "what did you just summarize?"
 cargo run --bin plato -- --yolo "write local-proof.txt with hello from Plato Agent"
