@@ -117,7 +117,10 @@ fn provisioned_shell_exit_detaches_active_daemon_and_cli_stays_locked() {
 
     let one_shot = Command::new(cli)
         .current_dir(&workspace_root)
-        .arg("--db")
+        .arg(format!(
+            "--db={}",
+            workspace_root.join("direct-proof.db").display()
+        ))
         .arg("this must fail before provider access")
         .output()
         .unwrap();
