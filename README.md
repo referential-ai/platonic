@@ -78,6 +78,12 @@ api_key_env = "OPENAI_API_KEY"
 progress receives a fresh idle window. The legacy `timeout_ms` name remains an
 alias for `stream_idle_timeout_ms`; setting both names is an error.
 
+A completion POST rejected with HTTP 429 before any response body or streaming
+delta retries once and records the failed attempt plus repeated request at the
+same turn and step. A finite, nonnegative numeric `Retry-After` of at most 30
+seconds is honored; a missing or invalid value waits one second, and a value
+over 30 seconds is not retried. Other provider failures are not retried.
+
 `file.read` and `file.list` are auto-allowed. `file.write`, `file.edit`, and
 `shell.exec` require stdin approval and default to no. `shell.exec` runs from
 the workspace root with a scrubbed child environment, no provider credentials,

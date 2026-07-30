@@ -118,12 +118,22 @@ impl OpenAiCompatibleClient {
 
 fn provider_send_error(error: ureq::Error) -> AppError {
     match error {
+        ureq::Error::Status(429, response) => AppError::ProviderCompletionRateLimited {
+            retry_after_seconds: response
+                .header("Retry-After")
+                .and_then(parse_retry_after_seconds),
+        },
         ureq::Error::Status(status, response) => {
             let body = response.into_string().unwrap_or_default();
             AppError::Provider(format!("provider returned http {status}: {body}"))
         }
         error => AppError::Provider(error.to_string()),
     }
+}
+
+fn parse_retry_after_seconds(value: &str) -> Option<f64> {
+    let seconds = value.trim().parse::<f64>().ok()?;
+    (seconds.is_finite() && seconds >= 0.0).then_some(seconds)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -859,6 +869,51 @@ mod tests {
             messages: vec![ModelMessage::user_text("hello")],
             tools: Vec::new(),
         }
+    }
+
+    #[test]
+    fn retry_after_parser_accepts_only_finite_nonnegative_numbers() {
+        assert_eq!(parse_retry_after_seconds("0"), Some(0.0));
+        assert_eq!(parse_retry_after_seconds("0.25"), Some(0.25));
+        assert_eq!(parse_retry_after_seconds("30"), Some(30.0));
+        assert_eq!(
+            parse_retry_after_seconds("30.000000000000004"),
+            Some(f64::from_bits(30.0_f64.to_bits() + 1))
+        );
+        assert_eq!(parse_retry_after_seconds("1e300"), Some(1e300));
+        assert_eq!(parse_retry_after_seconds("-1"), None);
+        assert_eq!(parse_retry_after_seconds("NaN"), None);
+        assert_eq!(parse_retry_after_seconds("inf"), None);
+        assert_eq!(parse_retry_after_seconds("tomorrow"), None);
+    }
+
+    #[test]
+    fn completion_429_is_typed_without_exposing_response_body() {
+        let body = "provider-secret-body";
+        let (base_url, server) = spawn_loopback_provider(move |mut stream| {
+            read_provider_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 429 Too Many Requests\r\nretry-after: 0.25\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let client = timeout_test_client(base_url, 2_000, 2_000);
+
+        let error = client.send(&reasoning_request(None)).unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            "provider completion POST returned http 429 before response body"
+        );
+        assert!(matches!(
+            error,
+            AppError::ProviderCompletionRateLimited {
+                retry_after_seconds: Some(seconds)
+            } if seconds == 0.25
+        ));
     }
 
     #[test]
