@@ -2085,6 +2085,34 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_id_mismatches_are_rejected() {
+        let mut state = apply_all(&[
+            start_event(0),
+            context_event(1),
+            model_requested(2),
+            model_responded(3),
+            tool_proposed(4, EffectClass::ReadOnly),
+        ]);
+
+        assert_eq!(
+            state
+                .apply(&rec(
+                    5,
+                    HarnessEvent::PolicyEvaluated {
+                        run_id: run_id(),
+                        call_id: ToolCallId::new("call_2").unwrap(),
+                        decision: PolicyDecision::Allow,
+                    },
+                ))
+                .unwrap_err(),
+            Error::ToolCallMismatch {
+                expected: "call_1".into(),
+                actual: "call_2".into(),
+            }
+        );
+    }
+
+    #[test]
     fn terminal_runs_emit_no_commands_and_reject_more_events() {
         let mut events = base_until_approval_required();
         events.push(approval_granted(6));

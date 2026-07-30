@@ -5,7 +5,10 @@ use crate::{
     RunPhase, RunState, ToolCall, ToolCallId, ToolResult, TurnId,
 };
 
-/// Replay-validated readback for one run ledger.
+/// Replay-validated, all-visibility audit view for one run ledger.
+///
+/// Tool results retain their recorded `ResultVisibility` metadata; this projection does not
+/// filter entries for a model or user audience.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunReadback {
     /// Chronological entries useful for replay output.
