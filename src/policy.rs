@@ -70,4 +70,12 @@ mod tests {
             PolicyDecision::Allow
         ));
     }
+
+    #[test]
+    fn workspace_writes_require_approval_by_default() {
+        assert!(matches!(
+            EffectClass::WorkspaceWrite.default_policy(),
+            PolicyDecision::RequireApproval { .. }
+        ));
+    }
 }
