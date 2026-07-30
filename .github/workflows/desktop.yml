@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - release/**
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
@@ -233,6 +234,10 @@ jobs:
 
   windows-installer:
     name: Windows unsigned installer
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/heads/release/'))
     runs-on: windows-2025
     timeout-minutes: 60
     defaults:
