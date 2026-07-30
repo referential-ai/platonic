@@ -2043,6 +2043,20 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             .insert("run_1".into(), record.clone());
         assert!(record.pending_approval().is_some());
 
+        for invalid_params in [
+            r#"{"run_id":"run_1","tool_call_id":"call_1","decision":"granted"}"#,
+            r#"{"run_id":"run_1","tool_call_id":"call_1","decision":"grant","extra":true}"#,
+        ] {
+            let response = server.handle_line(&format!(
+                r#"{{"v":1,"id":"invalid","kind":"request","method":"approval.decide","params":{invalid_params}}}"#
+            ));
+
+            assert_eq!(response.kind, EnvelopeKind::Error);
+            assert_eq!(response.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+            assert_eq!(record.approvals.lock().unwrap()["call_1"].decision, None);
+            assert!(record.pending_approval().is_some());
+        }
+
         let response = server.handle_line(
             r#"{"v":1,"id":"approval_1","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"grant"}}"#,
         );
@@ -2062,6 +2076,22 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(
             record.approvals.lock().unwrap()["call_1"].decision,
             Some(ApprovalOutcome::Granted)
+        );
+        assert_eq!(record.pending_approval(), None);
+
+        record.approvals.lock().unwrap().insert(
+            "call_2".into(),
+            PendingApproval::new(pending_request("run_1", "call_2")),
+        );
+        let denied = server.handle_line(
+            r#"{"v":1,"id":"approval_3","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_2","decision":"deny"}}"#,
+        );
+        assert_eq!(denied.kind, EnvelopeKind::Response);
+        assert_eq!(
+            record.approvals.lock().unwrap()["call_2"].decision,
+            Some(ApprovalOutcome::Denied {
+                reason: "approval denied by daemon client".into()
+            })
         );
         assert_eq!(record.pending_approval(), None);
     }

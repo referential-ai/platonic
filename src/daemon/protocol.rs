@@ -390,12 +390,19 @@ pub struct EventsStreamResult {
     pub events: Vec<BufferedStreamEvent>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    Grant,
+    Deny,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalDecideParams {
     pub run_id: String,
     pub tool_call_id: String,
-    pub decision: String,
+    pub decision: ApprovalDecision,
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -592,6 +599,23 @@ mod tests {
                 state
             );
         }
+    }
+
+    #[test]
+    fn approval_decisions_keep_exact_v1_wire_values() {
+        let cases = [
+            (ApprovalDecision::Grant, "grant"),
+            (ApprovalDecision::Deny, "deny"),
+        ];
+
+        for (decision, wire_value) in cases {
+            assert_eq!(serde_json::to_value(decision).unwrap(), wire_value);
+            assert_eq!(
+                serde_json::from_value::<ApprovalDecision>(wire_value.into()).unwrap(),
+                decision
+            );
+        }
+        assert!(serde_json::from_value::<ApprovalDecision>(json!("granted")).is_err());
     }
 
     #[test]
