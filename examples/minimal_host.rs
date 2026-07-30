@@ -60,10 +60,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 content: "I will write the file.".into(),
             },
             proposed_calls: vec![proposal],
-            usage: ModelUsage {
+            usage: Some(ModelUsage {
                 input_tokens: 6,
                 output_tokens: 6,
-            },
+            }),
         },
         HarnessEvent::ToolCallProposed {
             run_id: run_id.clone(),

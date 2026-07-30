@@ -86,8 +86,10 @@ pub enum HarnessEvent {
         output: Message,
         /// Unvalidated model proposals; an empty list concludes the turn.
         proposed_calls: Vec<ToolProposal>,
-        /// Provider-reported token usage for the response.
-        usage: ModelUsage,
+        /// Provider-reported token usage, or `None` when usage is unknown.
+        ///
+        /// Reported zero counts remain known usage rather than `None`.
+        usage: Option<ModelUsage>,
     },
     /// Rejects every unvalidated tool proposal in the pending model response.
     ToolProposalsRejected {
@@ -286,10 +288,10 @@ mod tests {
                     tool: tool.clone(),
                     input: json!({ "path": "README.md" }),
                 }],
-                usage: ModelUsage {
+                usage: Some(ModelUsage {
                     input_tokens: 12,
                     output_tokens: 4,
-                },
+                }),
             },
             HarnessEvent::ToolProposalsRejected {
                 run_id: run_id.clone(),
@@ -562,6 +564,110 @@ mod tests {
                 serde_json::to_value(&expected).unwrap(),
                 fixture,
                 "failed to encode {name} fixture"
+            );
+        }
+    }
+
+    #[test]
+    fn model_response_usage_json_fixtures_are_bidirectional() {
+        let fixtures = [
+            (
+                "known",
+                json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "model_responded",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 1,
+                        "output": {
+                            "role": "assistant",
+                            "content": "Done."
+                        },
+                        "proposed_calls": [],
+                        "usage": {
+                            "input_tokens": 12,
+                            "output_tokens": 4
+                        }
+                    }
+                }),
+                Some(ModelUsage {
+                    input_tokens: 12,
+                    output_tokens: 4,
+                }),
+            ),
+            (
+                "zero",
+                json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "model_responded",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 1,
+                        "output": {
+                            "role": "assistant",
+                            "content": "Done."
+                        },
+                        "proposed_calls": [],
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0
+                        }
+                    }
+                }),
+                Some(ModelUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                }),
+            ),
+            (
+                "unknown",
+                json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "model_responded",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 1,
+                        "output": {
+                            "role": "assistant",
+                            "content": "Done."
+                        },
+                        "proposed_calls": [],
+                        "usage": null
+                    }
+                }),
+                None,
+            ),
+        ];
+
+        for (name, fixture, usage) in fixtures {
+            let expected = RecordedEvent {
+                seq: 7,
+                occurred_at_ms: 1_700_000_000_000,
+                event: HarnessEvent::ModelResponded {
+                    run_id: RunId::new("run_1").unwrap(),
+                    turn_id: TurnId::new("turn_1").unwrap(),
+                    step: 1,
+                    output: Message {
+                        role: MessageRole::Assistant,
+                        content: "Done.".into(),
+                    },
+                    proposed_calls: vec![],
+                    usage,
+                },
+            };
+            let decoded: RecordedEvent = serde_json::from_value(fixture.clone()).unwrap();
+
+            assert_eq!(decoded, expected, "failed to decode {name} usage fixture");
+            assert_eq!(
+                serde_json::to_value(&expected).unwrap(),
+                fixture,
+                "failed to encode {name} usage fixture"
             );
         }
     }

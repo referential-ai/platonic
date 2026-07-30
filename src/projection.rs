@@ -254,11 +254,11 @@ mod tests {
         ActorId::new("human_1").unwrap()
     }
 
-    fn usage() -> ModelUsage {
-        ModelUsage {
+    fn usage() -> Option<ModelUsage> {
+        Some(ModelUsage {
             input_tokens: 20,
             output_tokens: 8,
-        }
+        })
     }
 
     fn rec(seq: u64, event: HarnessEvent) -> RecordedEvent {

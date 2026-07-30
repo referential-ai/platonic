@@ -151,6 +151,8 @@ The durable ledger. Initial events include:
 
 Events are recorded wrapped in `RecordedEvent { seq, occurred_at_ms, event }`; hosts supply both fields — core never reads clocks. `seq` is per-run and contiguous from 0; the run machine rejects gaps and regressions. Store append is idempotent on `(run_id, seq)`; ordering across runs is a store concern. Correlation: tool events carry `call_id`; model request/response pairs carry a per-run `step` counter. Ledger variants are never cargo-feature-gated: one schema, always readable.
 
+`model_responded.usage` keeps its 0.1 object shape when known, including reported zero counts, and is `null` when usage is unknown.
+
 `context_compacted` records a non-empty prior-turn range and must be followed by `context_built` for the same turn, or by `run_failed`. It emits no command and leaves the public run phase unchanged.
 
 `tool_proposals_rejected` records that the host rejected the whole pending proposal batch from `model_responded`. It carries only the matching `turn_id` and a non-empty reason; the proposals remain recorded once in `model_responded`. The event is valid only while awaiting a host-validated call and concludes the turn without fabricating one.
