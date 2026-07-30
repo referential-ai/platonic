@@ -539,9 +539,11 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             );
         }
 
-        if emitted_delta_count == 0 && !response.text().trim().is_empty() {
-            eprintln!("{}", response.text());
-        }
+        print_fallback_assistant_text(
+            options.stream_to_stderr,
+            emitted_delta_count,
+            &response.text(),
+        );
 
         messages.push(ModelMessage::assistant_blocks(response.content.clone()));
         let mut tool_uses = tool_uses.into_iter();
@@ -848,6 +850,12 @@ fn stream_enabled(options: &RunOptions) -> bool {
     options.stream_to_stderr || options.event_sender.is_some()
 }
 
+fn print_fallback_assistant_text(stream_to_stderr: bool, emitted_delta_count: u64, text: &str) {
+    if stream_to_stderr && emitted_delta_count == 0 && !text.trim().is_empty() {
+        eprintln!("{text}");
+    }
+}
+
 fn emit_assistant_delta(options: &RunOptions, delta: AssistantDeltaEvent) {
     if let Some(sender) = &options.event_sender {
         let _ = sender.send(RunEvent::AssistantDelta(delta));
@@ -1098,9 +1106,14 @@ mod tests {
         io::{Read, Write},
         net::TcpListener,
         path::Path,
+        process::Command,
         sync::Mutex,
         thread,
     };
+
+    const FALLBACK_ASSISTANT_TEXT: &str = "fallback assistant text";
+    const FALLBACK_CAPTURE_RUN_ID: &str = "run_fallback_stderr";
+    const FALLBACK_CAPTURE_SESSION_ID: &str = "session_fallback_stderr";
 
     #[test]
     fn generated_run_and_session_ids_are_unique() {
@@ -2302,6 +2315,175 @@ enabled = ["file.read"]
             1
         );
         assert!(replay.contains("assistant: Hello"));
+    }
+
+    #[test]
+    fn fallback_assistant_text_obeys_stream_to_stderr_without_changing_state() {
+        let shown_fallback = capture_fallback_output(true);
+        let hidden_fallback = capture_fallback_output(false);
+        assert_child_succeeded(&shown_fallback);
+        assert_child_succeeded(&hidden_fallback);
+        assert_eq!(
+            String::from_utf8(shown_fallback.stderr).unwrap(),
+            format!("{FALLBACK_ASSISTANT_TEXT}\n")
+        );
+        assert!(hidden_fallback.stderr.is_empty());
+
+        let shown_state = run_fallback_state(true);
+        let hidden_state = run_fallback_state(false);
+        assert_eq!(shown_state, hidden_state);
+        assert_eq!(
+            shown_state
+                .0
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    HarnessEvent::ModelResponded { output, .. }
+                        if output.content == FALLBACK_ASSISTANT_TEXT
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            shown_state.1,
+            vec![SessionTurn {
+                question: "read input.txt".into(),
+                final_answer: "done".into(),
+            }]
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for deterministic stderr capture"]
+    fn fallback_assistant_text_capture_child() {
+        let stream_to_stderr = std::env::var("PLATO_FALLBACK_CAPTURE_STREAM").unwrap() == "true";
+        print_fallback_assistant_text(stream_to_stderr, 0, FALLBACK_ASSISTANT_TEXT);
+    }
+
+    fn run_fallback_state(stream_to_stderr: bool) -> (Vec<HarnessEvent>, Vec<SessionTurn>) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("input.txt"), "fixture").unwrap();
+
+        let provider = if stream_to_stderr {
+            spawn_streaming_provider_sequence(vec![
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fallback assistant text\",\"tool_calls\":[{\"index\":0,\"id\":\"provider_call\",\"function\":{\"name\":\"file_read\",\"arguments\":\"{\\\"path\\\":\\\"input.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n",
+                ),
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n",
+                ),
+            ])
+        } else {
+            spawn_provider_sequence(vec![
+                json!({
+                    "choices": [{
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "content": FALLBACK_ASSISTANT_TEXT,
+                            "tool_calls": [{
+                                "id": "provider_call",
+                                "type": "function",
+                                "function": {
+                                    "name": "file_read",
+                                    "arguments": "{\"path\":\"input.txt\"}"
+                                }
+                            }]
+                        }
+                    }]
+                }),
+                json!({
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"content": "done"}
+                    }]
+                }),
+            ])
+        };
+        let config_path = root.path().join("plato.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "{}"
+timeout_ms = 5000
+
+[limits]
+token_budget = 4000
+max_output_tokens = 32
+max_turns = 2
+
+[tools]
+enabled = ["file.read"]
+"#,
+                provider.base_url
+            ),
+        )
+        .unwrap();
+
+        let outcome = run_question(RunOptions {
+            question: "read input.txt".into(),
+            config_path: Some(config_path),
+            overrides: RunOverrides::default(),
+            ledger: RunLedger::Sqlite(root.path().join("events.db")),
+            workspace_root: root.path().to_path_buf(),
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(RunId::new(FALLBACK_CAPTURE_RUN_ID).unwrap()),
+            session: Some(RunSession::Fresh {
+                session_id: FALLBACK_CAPTURE_SESSION_ID.into(),
+            }),
+            event_sender: None,
+            stream_to_stderr,
+            cancel: None,
+        })
+        .unwrap();
+
+        assert_eq!(outcome.final_answer, "done");
+        assert_eq!(provider.handle.join().unwrap().len(), 2);
+        fallback_capture_state(root.path())
+    }
+
+    fn capture_fallback_output(stream_to_stderr: bool) -> std::process::Output {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "app::tests::fallback_assistant_text_capture_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(
+                "PLATO_FALLBACK_CAPTURE_STREAM",
+                stream_to_stderr.to_string(),
+            )
+            .output()
+            .unwrap()
+    }
+
+    fn assert_child_succeeded(output: &std::process::Output) {
+        assert!(
+            output.status.success(),
+            "stderr capture child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn fallback_capture_state(root: &Path) -> (Vec<HarnessEvent>, Vec<SessionTurn>) {
+        let ledger = SqliteLedger::open_readonly(&root.join("events.db")).unwrap();
+        let events = ledger
+            .read_run(FALLBACK_CAPTURE_RUN_ID)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.event)
+            .collect();
+        let turns = ledger.session_turns(FALLBACK_CAPTURE_SESSION_ID).unwrap();
+        (events, turns)
     }
 
     #[test]
