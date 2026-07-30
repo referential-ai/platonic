@@ -12,6 +12,7 @@ use crate::{
     tools::{
         ApprovalOutcome, ToolExecutionContext, approval_command_preview, approval_diff_preview,
         approval_input_preview, ask_for_approval, execute_tool_with_context,
+        targets_platonic_memory,
     },
 };
 use platonic_core::{
@@ -158,12 +159,18 @@ impl ApprovalMode {
         }
     }
 
-    fn auto_grant_actor(&self, call: &ToolCall, policy: &PolicyDecision) -> Option<&'static str> {
+    fn auto_grant_actor(
+        &self,
+        workspace_root: &Path,
+        call: &ToolCall,
+        policy: &PolicyDecision,
+    ) -> Option<&'static str> {
         match (self, policy) {
             (Self::AutoApprove, PolicyDecision::RequireApproval { .. })
                 if call.effect == EffectClass::WorkspaceWrite =>
             {
-                Some("yolo")
+                (!targets_platonic_memory(workspace_root, call.tool.as_str(), &call.input))
+                    .then_some("yolo")
             }
             _ => None,
         }
@@ -188,8 +195,8 @@ impl ApprovalMode {
 }
 
 const SESSION_TRUNCATION_MARKER: &str = "[older session turns omitted to fit the context budget]";
-const PLATONIC_MEMORY_FILENAME: &str = "PLATONIC.md";
-const PLATONIC_MEMORY_MAX_BYTES: usize = 8_192;
+pub(crate) const PLATONIC_MEMORY_FILENAME: &str = "PLATONIC.md";
+pub(crate) const PLATONIC_MEMORY_MAX_BYTES: usize = 8_192;
 const PLATONIC_MEMORY_SEPARATOR: &str = "\n\n";
 const RUN_CANCELED_REASON: &str = "run canceled";
 const DEFAULT_PROVIDER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -748,7 +755,11 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 call.clone(),
             )?,
             PolicyDecision::RequireApproval { ref reason } => {
-                if let Some(actor) = options.approval_mode.auto_grant_actor(&call, &policy) {
+                if let Some(actor) =
+                    options
+                        .approval_mode
+                        .auto_grant_actor(&options.workspace_root, &call, &policy)
+                {
                     let actor_id = ActorId::new(actor)?;
                     record_event(
                         &mut recorder,
@@ -1408,14 +1419,72 @@ mod tests {
         };
 
         assert_eq!(
-            ApprovalMode::AutoApprove.auto_grant_actor(&call, &policy),
+            ApprovalMode::AutoApprove.auto_grant_actor(Path::new("."), &call, &policy),
             Some("yolo")
         );
-        assert_eq!(ApprovalMode::Prompt.auto_grant_actor(&call, &policy), None);
         assert_eq!(
-            (ApprovalMode::Deny { actor: "daemon" }).auto_grant_actor(&call, &policy),
+            ApprovalMode::Prompt.auto_grant_actor(Path::new("."), &call, &policy),
             None
         );
+        assert_eq!(
+            (ApprovalMode::Deny { actor: "daemon" }).auto_grant_actor(
+                Path::new("."),
+                &call,
+                &policy
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn yolo_routes_platonic_memory_write_and_edit_aliases_to_prompt() {
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = PolicyDecision::RequireApproval {
+            reason: "requires approval".into(),
+        };
+        assert!(!workspace.path().join(PLATONIC_MEMORY_FILENAME).exists());
+
+        for tool in ["file.write", "file.edit"] {
+            for path in ["PLATONIC.md", "./PLATONIC.md", "././PLATONIC.md"] {
+                let call = ToolCall {
+                    id: ToolCallId::new("call_1").unwrap(),
+                    tool: ToolName::new(tool).unwrap(),
+                    effect: EffectClass::WorkspaceWrite,
+                    input: json!({"path": path, "content": "hello"}),
+                };
+
+                assert_eq!(
+                    ApprovalMode::AutoApprove.auto_grant_actor(workspace.path(), &call, &policy),
+                    None,
+                    "{tool} {path} was auto-granted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn yolo_still_auto_grants_unrelated_workspace_writes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = PolicyDecision::RequireApproval {
+            reason: "requires approval".into(),
+        };
+
+        for (tool, path) in [
+            ("file.write", "PLATO.md"),
+            ("file.edit", "nested/PLATONIC.md"),
+        ] {
+            let call = ToolCall {
+                id: ToolCallId::new("call_1").unwrap(),
+                tool: ToolName::new(tool).unwrap(),
+                effect: EffectClass::WorkspaceWrite,
+                input: json!({"path": path, "content": "hello"}),
+            };
+
+            assert_eq!(
+                ApprovalMode::AutoApprove.auto_grant_actor(workspace.path(), &call, &policy),
+                Some("yolo")
+            );
+        }
     }
 
     #[test]
@@ -1431,7 +1500,7 @@ mod tests {
         };
 
         assert_eq!(
-            ApprovalMode::AutoApprove.auto_grant_actor(&call, &policy),
+            ApprovalMode::AutoApprove.auto_grant_actor(Path::new("."), &call, &policy),
             None
         );
     }
@@ -1448,7 +1517,7 @@ mod tests {
 
         assert!(matches!(policy, PolicyDecision::RequireApproval { .. }));
         assert_eq!(
-            ApprovalMode::AutoApprove.auto_grant_actor(&call, &policy),
+            ApprovalMode::AutoApprove.auto_grant_actor(Path::new("."), &call, &policy),
             None
         );
     }
@@ -1467,7 +1536,7 @@ mod tests {
             };
 
             assert_eq!(
-                ApprovalMode::AutoApprove.auto_grant_actor(&call, &policy),
+                ApprovalMode::AutoApprove.auto_grant_actor(Path::new("."), &call, &policy),
                 None
             );
         }
@@ -1500,7 +1569,7 @@ mod tests {
         };
 
         assert_eq!(
-            ApprovalMode::AutoApprove.auto_grant_actor(&call, &policy),
+            ApprovalMode::AutoApprove.auto_grant_actor(Path::new("."), &call, &policy),
             None
         );
     }
@@ -2329,6 +2398,156 @@ base_url = "http://{}"
         assert_context_budget_terminal_records(&records);
         let replay = crate::replay::replay_sqlite(&ledger_path, Some("run_budget_sqlite")).unwrap();
         assert!(replay.contains("final_phase: Failed"));
+    }
+
+    #[test]
+    fn external_approval_grants_exact_cap_platonic_memory_write_and_edit() {
+        let write_content = "é".repeat(PLATONIC_MEMORY_MAX_BYTES / "é".len());
+        let edit_content = format!("{}aa", "界".repeat(2_730));
+        assert_eq!(write_content.len(), PLATONIC_MEMORY_MAX_BYTES);
+        assert_eq!(edit_content.len(), PLATONIC_MEMORY_MAX_BYTES);
+
+        let provider = spawn_provider_sequence(vec![
+            mutation_tool_response(
+                "provider_write",
+                "file_write",
+                "./PLATONIC.md",
+                &write_content,
+            ),
+            mutation_tool_response("provider_edit", "file_edit", "PLATONIC.md", &edit_content),
+            provider_stop_response(),
+        ]);
+        let workspace = tempfile::tempdir().unwrap();
+        let config_path = workspace.path().join("plato.toml");
+        let ledger_path = workspace.path().join("events.jsonl");
+        write_mutation_test_config(&config_path, &provider.base_url, 3);
+        let approvals = Arc::new(Mutex::new(Vec::new()));
+        let captured_approvals = approvals.clone();
+
+        let outcome = run_question(mutation_test_options(
+            workspace.path(),
+            &config_path,
+            &ledger_path,
+            ApprovalMode::external("test", move |request| {
+                captured_approvals.lock().unwrap().push(request.tool_name);
+                Ok(ApprovalOutcome::Granted)
+            }),
+            "run_platonic_external_grant",
+        ))
+        .unwrap();
+        provider.handle.join().unwrap();
+
+        assert_eq!(outcome.final_answer, "done");
+        assert_eq!(
+            fs::read_to_string(workspace.path().join(PLATONIC_MEMORY_FILENAME)).unwrap(),
+            edit_content
+        );
+        assert_eq!(
+            *approvals.lock().unwrap(),
+            vec!["file.write".to_string(), "file.edit".to_string()]
+        );
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.event, HarnessEvent::ApprovalGranted { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.event, HarnessEvent::ToolFinished { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn external_approval_denial_leaves_platonic_memory_unchanged() {
+        let provider = spawn_provider_sequence(vec![
+            mutation_tool_response("provider_edit", "file_edit", "./PLATONIC.md", "replacement"),
+            provider_stop_response(),
+        ]);
+        let workspace = tempfile::tempdir().unwrap();
+        let memory_path = workspace.path().join(PLATONIC_MEMORY_FILENAME);
+        fs::write(&memory_path, "prior").unwrap();
+        let config_path = workspace.path().join("plato.toml");
+        let ledger_path = workspace.path().join("events.jsonl");
+        write_mutation_test_config(&config_path, &provider.base_url, 2);
+        let approval_count = Arc::new(Mutex::new(0));
+        let captured_count = approval_count.clone();
+
+        let outcome = run_question(mutation_test_options(
+            workspace.path(),
+            &config_path,
+            &ledger_path,
+            ApprovalMode::external("test", move |_| {
+                *captured_count.lock().unwrap() += 1;
+                Ok(ApprovalOutcome::Denied {
+                    reason: "not approved".into(),
+                })
+            }),
+            "run_platonic_external_deny",
+        ))
+        .unwrap();
+        provider.handle.join().unwrap();
+
+        assert_eq!(outcome.final_answer, "done");
+        assert_eq!(*approval_count.lock().unwrap(), 1);
+        assert_eq!(fs::read_to_string(memory_path).unwrap(), "prior");
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.event, HarnessEvent::ApprovalDenied { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(record.event, HarnessEvent::ToolStarted { .. }))
+        );
+    }
+
+    #[test]
+    fn deny_approval_mode_leaves_absent_platonic_memory_absent() {
+        let provider = spawn_provider_sequence(vec![
+            mutation_tool_response("provider_write", "file_write", "PLATONIC.md", "replacement"),
+            provider_stop_response(),
+        ]);
+        let workspace = tempfile::tempdir().unwrap();
+        let memory_path = workspace.path().join(PLATONIC_MEMORY_FILENAME);
+        let config_path = workspace.path().join("plato.toml");
+        let ledger_path = workspace.path().join("events.jsonl");
+        write_mutation_test_config(&config_path, &provider.base_url, 2);
+
+        let outcome = run_question(mutation_test_options(
+            workspace.path(),
+            &config_path,
+            &ledger_path,
+            ApprovalMode::Deny { actor: "test" },
+            "run_platonic_deny_mode",
+        ))
+        .unwrap();
+        provider.handle.join().unwrap();
+
+        assert_eq!(outcome.final_answer, "done");
+        assert!(!memory_path.exists());
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.event, HarnessEvent::ApprovalDenied { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(record.event, HarnessEvent::ToolStarted { .. }))
+        );
     }
 
     #[test]
@@ -4048,6 +4267,87 @@ enabled = ["file.read"]
     struct SequenceProvider {
         base_url: String,
         handle: thread::JoinHandle<Vec<String>>,
+    }
+
+    fn mutation_tool_response(
+        provider_call_id: &str,
+        provider_tool_name: &str,
+        path: &str,
+        content: &str,
+    ) -> Value {
+        let arguments = json!({"path": path, "content": content}).to_string();
+        json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": provider_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": provider_tool_name,
+                            "arguments": arguments
+                        }
+                    }]
+                }
+            }]
+        })
+    }
+
+    fn provider_stop_response() -> Value {
+        json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "done"}
+            }]
+        })
+    }
+
+    fn write_mutation_test_config(path: &Path, base_url: &str, max_turns: u32) {
+        fs::write(
+            path,
+            format!(
+                r#"
+[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "{base_url}"
+timeout_ms = 5000
+
+[limits]
+token_budget = 100000
+max_output_tokens = 32
+max_turns = {max_turns}
+
+[tools]
+enabled = ["file.write", "file.edit"]
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn mutation_test_options(
+        workspace_root: &Path,
+        config_path: &Path,
+        ledger_path: &Path,
+        approval_mode: ApprovalMode,
+        run_id: &str,
+    ) -> RunOptions {
+        RunOptions {
+            question: "update workspace memory".into(),
+            config_path: Some(config_path.to_path_buf()),
+            overrides: RunOverrides::default(),
+            ledger: RunLedger::Jsonl(ledger_path.to_path_buf()),
+            workspace_root: workspace_root.to_path_buf(),
+            approval_mode,
+            run_id: Some(RunId::new(run_id).unwrap()),
+            session: None,
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: None,
+        }
     }
 
     fn spawn_provider_sequence(responses: Vec<Value>) -> SequenceProvider {

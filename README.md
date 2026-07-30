@@ -92,7 +92,8 @@ bounded stdout/stderr, and a timeout. It uses `sh -c` on Unix and
 Use `--yolo` to auto-approve enabled workspace-write tools that would otherwise
 prompt. Yolo mode does not enable disabled or unknown tools, approve network
 tools, permit deny-class effects such as external side effects or secret access,
-approve `shell.exec`, or bypass workspace path checks.
+approve `shell.exec`, auto-approve direct changes to root `PLATONIC.md`, or
+bypass workspace path checks.
 
 ## Workspace Memory
 
@@ -108,6 +109,11 @@ and content is never trimmed. Workspace memory counts against the context
 budget; older session turns may be dropped to make room, but the memory
 snapshot is not shortened. Changes made after a run starts apply to the next
 run, not later turns in the current run.
+
+Direct `file.write` and `file.edit` calls to this reserved file always require
+approval, including under `--yolo`. The complete proposed content is checked
+against the same UTF-8 and 8,192-byte limits before either tool writes; failed
+validation leaves an existing or absent target unchanged.
 
 ## Issue Preparation
 
