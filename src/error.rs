@@ -14,6 +14,9 @@ pub enum AppError {
     #[error("provider error: {0}")]
     Provider(String),
 
+    #[error("provider completion POST returned http 429 before response body")]
+    ProviderCompletionRateLimited { retry_after_seconds: Option<f64> },
+
     #[error("tool error: {0}")]
     Tool(String),
 

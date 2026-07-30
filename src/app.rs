@@ -188,6 +188,8 @@ impl ApprovalMode {
 
 const SESSION_TRUNCATION_MARKER: &str = "[older session turns omitted to fit the context budget]";
 const RUN_CANCELED_REASON: &str = "run canceled";
+const DEFAULT_PROVIDER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const MAX_PROVIDER_RETRY_DELAY_SECONDS: f64 = 30.0;
 const EXTRA_TOOL_CALL_ERROR: &str = "not executed: at most one tool call runs per response; re-issue this call alone if still needed";
 const TOOL_OUTPUT_LIMIT: usize = 65_536;
 const TOOL_OUTPUT_TRUNCATION_MARKER: &str = "\n... output truncated";
@@ -397,35 +399,66 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
 
         let mut emitted_delta_count = 0_u64;
         let mut wrote_stderr_delta = false;
-        let response_result = if stream_enabled(&options) {
-            let delta_run_id = run_id.clone();
-            let delta_turn_id = turn_id.clone();
-            client.send_streaming(&request, |text| {
-                if cancel_requested(&options) {
-                    return Err(AppError::RunCanceled);
-                }
-                if text.is_empty() {
-                    return Ok(());
-                }
-                let delta = AssistantDeltaEvent {
-                    run_id: delta_run_id.clone(),
-                    turn_id: delta_turn_id.clone(),
-                    step: turn_index,
-                    delta_index: emitted_delta_count,
-                    text: text.into(),
-                };
-                emitted_delta_count += 1;
-                emit_assistant_delta(&options, delta);
-                if options.stream_to_stderr {
-                    eprint!("{text}");
-                    io::stderr().flush()?;
-                    wrote_stderr_delta = true;
-                }
-                Ok(())
-            })
-        } else {
-            client.send(&request)
+        let mut send_request = || {
+            if stream_enabled(&options) {
+                let delta_run_id = run_id.clone();
+                let delta_turn_id = turn_id.clone();
+                client.send_streaming(&request, |text| {
+                    if cancel_requested(&options) {
+                        return Err(AppError::RunCanceled);
+                    }
+                    if text.is_empty() {
+                        return Ok(());
+                    }
+                    let delta = AssistantDeltaEvent {
+                        run_id: delta_run_id.clone(),
+                        turn_id: delta_turn_id.clone(),
+                        step: turn_index,
+                        delta_index: emitted_delta_count,
+                        text: text.into(),
+                    };
+                    emitted_delta_count += 1;
+                    emit_assistant_delta(&options, delta);
+                    if options.stream_to_stderr {
+                        eprint!("{text}");
+                        io::stderr().flush()?;
+                        wrote_stderr_delta = true;
+                    }
+                    Ok(())
+                })
+            } else {
+                client.send(&request)
+            }
         };
+        let mut response_result = send_request();
+        let retry = response_result.as_ref().err().and_then(|error| {
+            completion_retry_delay(error).map(|delay| (delay, error.to_string()))
+        });
+        if let Some((delay, reason)) = retry {
+            check_cancel(&mut recorder, &options, &run_id, &mut session_run)?;
+            record_event(
+                &mut recorder,
+                &options,
+                HarnessEvent::ModelFailed {
+                    run_id: run_id.clone(),
+                    turn_id: turn_id.clone(),
+                    step: turn_index,
+                    reason,
+                },
+            )?;
+            std::thread::sleep(delay);
+            record_event(
+                &mut recorder,
+                &options,
+                HarnessEvent::ModelRequested {
+                    run_id: run_id.clone(),
+                    turn_id: turn_id.clone(),
+                    step: turn_index,
+                    model: model.clone(),
+                },
+            )?;
+            response_result = send_request();
+        }
         if wrote_stderr_delta {
             eprintln!();
         }
@@ -849,6 +882,22 @@ fn fail_run<T>(
 
 fn stream_enabled(options: &RunOptions) -> bool {
     options.stream_to_stderr || options.event_sender.is_some()
+}
+
+fn completion_retry_delay(error: &AppError) -> Option<std::time::Duration> {
+    let AppError::ProviderCompletionRateLimited {
+        retry_after_seconds,
+    } = error
+    else {
+        return None;
+    };
+
+    match retry_after_seconds {
+        Some(seconds) if seconds.is_finite() && *seconds >= 0.0 => (*seconds
+            <= MAX_PROVIDER_RETRY_DELAY_SECONDS)
+            .then(|| std::time::Duration::from_secs_f64(*seconds)),
+        Some(_) | None => Some(DEFAULT_PROVIDER_RETRY_DELAY),
+    }
 }
 
 fn print_fallback_assistant_text(stream_to_stderr: bool, emitted_delta_count: u64, text: &str) {
@@ -2319,6 +2368,422 @@ enabled = ["file.read"]
     }
 
     #[test]
+    fn completion_retry_delay_boundaries_are_exact() {
+        let retry_delay = |retry_after_seconds| {
+            completion_retry_delay(&AppError::ProviderCompletionRateLimited {
+                retry_after_seconds,
+            })
+        };
+
+        assert_eq!(retry_delay(None), Some(std::time::Duration::from_secs(1)));
+        assert_eq!(
+            retry_delay(Some(f64::NAN)),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            retry_delay(Some(-1.0)),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(retry_delay(Some(0.0)), Some(std::time::Duration::ZERO));
+        assert_eq!(
+            retry_delay(Some(30.0)),
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            retry_delay(Some(f64::from_bits(30.0_f64.to_bits() + 1))),
+            None
+        );
+        assert_eq!(retry_delay(Some(1e300)), None);
+        assert_eq!(
+            completion_retry_delay(&AppError::Provider("provider transport failed".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn completion_429_retries_identical_request_with_same_step_ledger_evidence_and_replay() {
+        let secret = "rate-limit-secret-body";
+        let server = spawn_raw_provider_sequence(vec![
+            rate_limit_response(Some("0"), secret),
+            successful_provider_response("retried answer"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        let ledger_path = dir.path().join("events.jsonl");
+        write_retry_test_config(&config_path, &server.base_url, 2_000, 2_000);
+
+        let outcome = run_question(retry_test_options(
+            config_path,
+            ledger_path.clone(),
+            dir.path().to_path_buf(),
+            "run_retry_success",
+            None,
+            None,
+        ))
+        .unwrap();
+        let requests = server.handle.join().unwrap();
+
+        assert_eq!(outcome.final_answer, "retried answer");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            http_request_json(&requests[0]),
+            http_request_json(&requests[1])
+        );
+
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        assert_eq!(
+            model_event_sequence(&records),
+            vec![
+                ("requested", "turn_1".into(), 0),
+                ("failed", "turn_1".into(), 0),
+                ("requested", "turn_1".into(), 0),
+                ("responded", "turn_1".into(), 0),
+            ]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.event, HarnessEvent::ContextBuilt { .. }))
+                .count(),
+            1
+        );
+        let retry_reason = records
+            .iter()
+            .find_map(|record| match &record.event {
+                HarnessEvent::ModelFailed { reason, .. } => Some(reason.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            retry_reason,
+            "provider completion POST returned http 429 before response body"
+        );
+        assert!(!serde_json::to_string(&records).unwrap().contains(secret));
+
+        let replay = crate::replay::replay_file(&ledger_path).unwrap();
+        assert!(replay.contains("final_phase: Finished"));
+        assert!(replay.contains("assistant: retried answer"));
+    }
+
+    #[test]
+    fn second_completion_429_is_one_terminal_failure_without_third_post() {
+        let secret = "second-rate-limit-secret";
+        let server = spawn_raw_provider_sequence(vec![
+            rate_limit_response(Some("0"), "first"),
+            rate_limit_response(Some("0"), secret),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        let ledger_path = dir.path().join("events.jsonl");
+        write_retry_test_config(&config_path, &server.base_url, 2_000, 2_000);
+
+        let error = run_question(retry_test_options(
+            config_path,
+            ledger_path.clone(),
+            dir.path().to_path_buf(),
+            "run_retry_second_429",
+            None,
+            None,
+        ))
+        .unwrap_err();
+        let requests = server.handle.join().unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            error.to_string(),
+            "provider completion POST returned http 429 before response body"
+        );
+        assert!(!error.to_string().contains(secret));
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        assert_eq!(
+            model_event_sequence(&records),
+            vec![
+                ("requested", "turn_1".into(), 0),
+                ("failed", "turn_1".into(), 0),
+                ("requested", "turn_1".into(), 0),
+            ]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.event, HarnessEvent::RunFailed { .. }))
+                .count(),
+            1
+        );
+        assert!(!serde_json::to_string(&records).unwrap().contains(secret));
+    }
+
+    #[test]
+    fn missing_retry_after_waits_one_second_before_retry() {
+        let server = spawn_raw_provider_sequence(vec![
+            rate_limit_response(None, ""),
+            successful_provider_response("after default delay"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        let ledger_path = dir.path().join("events.jsonl");
+        write_retry_test_config(&config_path, &server.base_url, 2_000, 2_000);
+
+        let started = std::time::Instant::now();
+        let outcome = run_question(retry_test_options(
+            config_path,
+            ledger_path,
+            dir.path().to_path_buf(),
+            "run_retry_default_delay",
+            None,
+            None,
+        ))
+        .unwrap();
+        let elapsed = started.elapsed();
+        let requests = server.handle.join().unwrap();
+
+        assert_eq!(outcome.final_answer, "after default delay");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "default retry delay was too short: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "default retry delay exceeded its bounded proof window: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn ineligible_completion_failures_do_not_retry() {
+        let invalid_json = "{not-json";
+        let cases = vec![
+            (
+                "429-over-limit",
+                rate_limit_response(Some("30.000001"), "over limit"),
+            ),
+            (
+                "401",
+                "HTTP/1.1 401 Unauthorized\r\ncontent-length: 12\r\nconnection: close\r\n\r\nunauthorized"
+                    .to_string(),
+            ),
+            (
+                "500",
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 6\r\nconnection: close\r\n\r\nfailed"
+                    .to_string(),
+            ),
+            (
+                "transport",
+                String::new(),
+            ),
+            (
+                "parse",
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{invalid_json}",
+                    invalid_json.len()
+                ),
+            ),
+        ];
+
+        for (index, (name, response)) in cases.into_iter().enumerate() {
+            let server = spawn_raw_provider_sequence(vec![response]);
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join("plato.toml");
+            let ledger_path = dir.path().join("events.jsonl");
+            write_retry_test_config(&config_path, &server.base_url, 500, 500);
+            let run_id = format!("run_no_retry_{index}");
+
+            let error = run_question(retry_test_options(
+                config_path,
+                ledger_path.clone(),
+                dir.path().to_path_buf(),
+                &run_id,
+                None,
+                None,
+            ))
+            .unwrap_err();
+            let requests = server.handle.join().unwrap();
+            let records = crate::ledger::read_records(&ledger_path).unwrap();
+
+            assert_eq!(requests.len(), 1, "{name}: {error}");
+            assert_eq!(
+                model_event_sequence(&records),
+                vec![("requested", "turn_1".into(), 0)],
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_stream_failure_does_not_retry() {
+        let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let server = spawn_raw_provider_sequence(vec![response]);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        let ledger_path = dir.path().join("events.jsonl");
+        write_retry_test_config(&config_path, &server.base_url, 2_000, 2_000);
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+
+        let error = run_question(retry_test_options(
+            config_path,
+            ledger_path.clone(),
+            dir.path().to_path_buf(),
+            "run_no_retry_partial_stream",
+            Some(event_sender),
+            None,
+        ))
+        .unwrap_err();
+        let requests = server.handle.join().unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert!(
+            error
+                .to_string()
+                .contains("provider stream ended before [DONE]")
+        );
+        let deltas = event_receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                RunEvent::AssistantDelta(delta) => Some(delta.text),
+                RunEvent::Ledger(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deltas, ["partial"]);
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        assert_eq!(
+            model_event_sequence(&records),
+            vec![("requested", "turn_1".into(), 0)]
+        );
+    }
+
+    #[test]
+    fn cancellation_observed_after_first_429_uses_terminal_path_without_retry_evidence() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let server_cancel = cancel.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let response = rate_limit_response(Some("0"), "");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            server_cancel.store(true, Ordering::SeqCst);
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            vec![request]
+        });
+        let server = SequenceProvider { base_url, handle };
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        let ledger_path = dir.path().join("events.jsonl");
+        write_retry_test_config(&config_path, &server.base_url, 2_000, 2_000);
+
+        let error = run_question(retry_test_options(
+            config_path,
+            ledger_path.clone(),
+            dir.path().to_path_buf(),
+            "run_retry_canceled",
+            None,
+            Some(cancel),
+        ))
+        .unwrap_err();
+        let requests = server.handle.join().unwrap();
+
+        assert!(matches!(error, AppError::RunCanceled));
+        assert_eq!(requests.len(), 1);
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        assert_eq!(
+            model_event_sequence(&records),
+            vec![("requested", "turn_1".into(), 0)]
+        );
+        assert!(records.iter().any(|record| matches!(
+            &record.event,
+            HarnessEvent::RunFailed { reason, .. } if reason == RUN_CANCELED_REASON
+        )));
+    }
+
+    #[test]
+    fn retried_stream_keeps_resettable_idle_timeout_progress() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let first_response = rate_limit_response(Some("0"), "");
+        let handle = thread::spawn(move || {
+            let (mut first_stream, _) = listener.accept().unwrap();
+            let first_request = read_http_request(&mut first_stream);
+            first_stream.write_all(first_response.as_bytes()).unwrap();
+            first_stream.flush().unwrap();
+
+            let (mut second_stream, _) = listener.accept().unwrap();
+            let second_request = read_http_request(&mut second_stream);
+            let events = ["a", "b", "c", "d", "e", "f"].map(|text| {
+                format!(
+                    "data: {}\n\n",
+                    json!({
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": text},
+                            "finish_reason": null
+                        }]
+                    })
+                )
+            });
+            let finish = concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let response_length = events.iter().map(String::len).sum::<usize>() + finish.len();
+            write!(
+                second_stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {response_length}\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+            second_stream.flush().unwrap();
+            for event in events {
+                second_stream.write_all(event.as_bytes()).unwrap();
+                second_stream.flush().unwrap();
+                thread::sleep(std::time::Duration::from_millis(100));
+            }
+            second_stream.write_all(finish.as_bytes()).unwrap();
+            second_stream.flush().unwrap();
+            vec![first_request, second_request]
+        });
+        let server = SequenceProvider { base_url, handle };
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        let ledger_path = dir.path().join("events.jsonl");
+        let idle_budget = std::time::Duration::from_millis(500);
+        write_retry_test_config(
+            &config_path,
+            &server.base_url,
+            2_000,
+            idle_budget.as_millis() as u64,
+        );
+        let (event_sender, _event_receiver) = std::sync::mpsc::channel();
+
+        let started = std::time::Instant::now();
+        let outcome = run_question(retry_test_options(
+            config_path,
+            ledger_path,
+            dir.path().to_path_buf(),
+            "run_retry_stream_progress",
+            Some(event_sender),
+            None,
+        ))
+        .unwrap();
+        let elapsed = started.elapsed();
+        let requests = server.handle.join().unwrap();
+
+        assert_eq!(outcome.final_answer, "abcdef");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            http_request_json(&requests[0]),
+            http_request_json(&requests[1])
+        );
+        assert!(
+            elapsed > idle_budget,
+            "retried stream finished before exceeding the former total budget: {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn fallback_assistant_text_obeys_stream_to_stderr_without_changing_state() {
         let shown_fallback = capture_fallback_output(true);
         let hidden_fallback = capture_fallback_output(false);
@@ -2741,6 +3206,122 @@ enabled = ["file.read"]
                 .collect()
         });
         SequenceProvider { base_url, handle }
+    }
+
+    fn spawn_raw_provider_sequence(responses: Vec<String>) -> SequenceProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            responses
+                .into_iter()
+                .map(|response| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request = read_http_request(&mut stream);
+                    if !response.is_empty() {
+                        stream.write_all(response.as_bytes()).unwrap();
+                        stream.flush().unwrap();
+                    }
+                    request
+                })
+                .collect()
+        });
+        SequenceProvider { base_url, handle }
+    }
+
+    fn rate_limit_response(retry_after: Option<&str>, body: &str) -> String {
+        let retry_after = retry_after
+            .map(|value| format!("retry-after: {value}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "HTTP/1.1 429 Too Many Requests\r\n{retry_after}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn successful_provider_response(text: &str) -> String {
+        let body = json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": text}
+            }]
+        })
+        .to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn write_retry_test_config(
+        path: &Path,
+        base_url: &str,
+        connect_timeout_ms: u64,
+        stream_idle_timeout_ms: u64,
+    ) {
+        std::fs::write(
+            path,
+            format!(
+                r#"
+[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "{base_url}"
+connect_timeout_ms = {connect_timeout_ms}
+stream_idle_timeout_ms = {stream_idle_timeout_ms}
+
+[limits]
+token_budget = 4000
+max_output_tokens = 32
+max_turns = 1
+
+[tools]
+enabled = ["file.read"]
+"#,
+            ),
+        )
+        .unwrap();
+    }
+
+    fn retry_test_options(
+        config_path: PathBuf,
+        ledger_path: PathBuf,
+        workspace_root: PathBuf,
+        run_id: &str,
+        event_sender: Option<Sender<RunEvent>>,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> RunOptions {
+        RunOptions {
+            question: "say hello".into(),
+            config_path: Some(config_path),
+            overrides: RunOverrides::default(),
+            ledger: RunLedger::Jsonl(ledger_path),
+            workspace_root,
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(RunId::new(run_id).unwrap()),
+            session: None,
+            event_sender,
+            stream_to_stderr: false,
+            cancel,
+        }
+    }
+
+    fn model_event_sequence(records: &[RecordedEvent]) -> Vec<(&'static str, String, u32)> {
+        records
+            .iter()
+            .filter_map(|record| match &record.event {
+                HarnessEvent::ModelRequested { turn_id, step, .. } => {
+                    Some(("requested", turn_id.to_string(), *step))
+                }
+                HarnessEvent::ModelFailed { turn_id, step, .. } => {
+                    Some(("failed", turn_id.to_string(), *step))
+                }
+                HarnessEvent::ModelResponded { turn_id, step, .. } => {
+                    Some(("responded", turn_id.to_string(), *step))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn spawn_cancelable_streaming_provider(
