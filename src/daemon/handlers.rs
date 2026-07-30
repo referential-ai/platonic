@@ -2,7 +2,7 @@ use crate::{
     AppError, AppResult, ApprovalMode, RunEvent, RunLedger, RunOptions, RunSession,
     daemon::{
         protocol::{
-            ApprovalDecideParams, ApprovalDecisionName, CommandAcceptedResult,
+            ApprovalDecideParams, ApprovalDecision, ApprovalDecisionName, CommandAcceptedResult,
             ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
             ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
             ERROR_SESSIONS_LIST_FAILED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH,
@@ -509,21 +509,13 @@ fn handle_approval_decide(
             format!("pending approval not found: {}", params.tool_call_id),
         );
     }
-    pending.decision = Some(match params.decision.as_str() {
-        "grant" => ApprovalOutcome::Granted,
-        "deny" => ApprovalOutcome::Denied {
+    pending.decision = Some(match params.decision {
+        ApprovalDecision::Grant => ApprovalOutcome::Granted,
+        ApprovalDecision::Deny => ApprovalOutcome::Denied {
             reason: params
                 .reason
                 .unwrap_or_else(|| "approval denied by daemon client".into()),
         },
-        other => {
-            return Envelope::error(
-                request.id,
-                Some("approval.decide".into()),
-                ERROR_MALFORMED_REQUEST,
-                format!("approval decision must be grant or deny, got {other}"),
-            );
-        }
     });
     record.approval_changed.notify_all();
     drop(approvals);

@@ -2,7 +2,7 @@ use crate::{
     AppError, AppResult,
     daemon::{
         protocol::{
-            ApprovalDecideParams, CommandAcceptedResult, Envelope, EnvelopeKind,
+            ApprovalDecideParams, ApprovalDecision, CommandAcceptedResult, Envelope, EnvelopeKind,
             EventsStreamParams, EventsStreamResult, HelloParams, HelloResult, IssuePrepStartParams,
             IssuePrepStartResult, MessageAppendParams, PROTOCOL_VERSION, RunCancelParams,
             RunStartParams, RunStartResult, SessionSummary, SessionsListResult,
@@ -219,7 +219,7 @@ impl DaemonClient {
             ApprovalDecideParams {
                 run_id: run_id.into(),
                 tool_call_id: tool_call_id.into(),
-                decision: "grant".into(),
+                decision: ApprovalDecision::Grant,
                 reason: None,
             },
         )
@@ -236,7 +236,7 @@ impl DaemonClient {
             ApprovalDecideParams {
                 run_id: run_id.into(),
                 tool_call_id: tool_call_id.into(),
-                decision: "deny".into(),
+                decision: ApprovalDecision::Deny,
                 reason: Some(reason),
             },
         )
