@@ -39,10 +39,10 @@ fn response(text: &str) -> ModelResponse {
     ModelResponse {
         content: vec![ModelBlock::Text { text: text.into() }],
         stop: ModelStop::EndTurn,
-        usage: ModelUsage {
+        usage: Some(ModelUsage {
             input_tokens: 10,
             output_tokens: 20,
-        },
+        }),
     }
 }
 

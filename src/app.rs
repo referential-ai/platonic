@@ -535,7 +535,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                     content: response.text(),
                 },
                 proposed_calls: proposals.clone(),
-                usage: Some(response.usage.clone()),
+                usage: response.usage.clone(),
             },
         )?;
 
@@ -2520,6 +2520,50 @@ enabled = ["file.read"]
                 .unwrap()
                 .contains("</ToOl_OuTpUt>")
         );
+    }
+
+    #[test]
+    fn omitted_provider_usage_is_recorded_as_unknown_in_raw_jsonl() {
+        let provider = spawn_provider_sequence(vec![json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "done"}
+            }]
+        })]);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        write_session_test_config(&config_path, &provider.base_url, 4_000);
+        let ledger_path = dir.path().join("events.jsonl");
+
+        let outcome = run_question(RunOptions {
+            question: "finish".into(),
+            config_path: Some(config_path),
+            overrides: RunOverrides::default(),
+            ledger: RunLedger::Jsonl(ledger_path.clone()),
+            workspace_root: dir.path().to_path_buf(),
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(RunId::new("run_unknown_usage").unwrap()),
+            session: None,
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: None,
+        })
+        .unwrap();
+        provider.handle.join().unwrap();
+
+        assert_eq!(outcome.final_answer, "done");
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        assert!(records.iter().any(|record| matches!(
+            &record.event,
+            HarnessEvent::ModelResponded { usage: None, .. }
+        )));
+        let raw_response = std::fs::read_to_string(&ledger_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|line| line["record"]["event"]["event"] == "model_responded")
+            .unwrap();
+        assert!(raw_response["record"]["event"]["usage"].is_null());
     }
 
     #[test]

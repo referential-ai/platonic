@@ -147,7 +147,9 @@ Every run uses this exact convention:
 - Replay shows final assistant messages, not partial streaming deltas.
 - Replay renders dropped oldest session turns as `[<turn_id>] context_compacted estimated_tokens=<before>-><after> dropped_turns=<start>..<end>`; the zero-based range has an exclusive end and the token values are host estimates of the complete context before and after compaction.
 - Ledger, approval, replay, and typed-transcript tool call ids are host-minted per run; provider ids remain provider-facing.
-- Streamed runs request provider usage chunks; providers that omit usage still record zero usage.
+- Streamed runs request provider usage chunks. Usage is recorded only when the
+  provider reports both token counts; reported zeros remain known, while
+  omitted or partial usage is recorded as unknown.
 - `plato replay` without arguments replays the latest session from the default platform SQLite ledger.
 - `plato replay --run <id>` replays a single run.
 - `--events <file>` is the explicit JSONL export/debug path.

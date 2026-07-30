@@ -16,7 +16,8 @@ use std::{
     path::PathBuf,
 };
 
-pub const LEDGER_VERSION: u32 = 1;
+const LEGACY_LEDGER_VERSION: u32 = 1;
+pub const LEDGER_VERSION: u32 = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_SCHEMA_VERSION: u32 = 2;
 #[cfg(unix)]
@@ -598,7 +599,7 @@ fn session_run_metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Se
 
 fn sqlite_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordedEvent> {
     let version: u32 = row.get(2)?;
-    if version != LEDGER_VERSION {
+    if !supported_ledger_version(version) {
         return Err(rusqlite::Error::InvalidQuery);
     }
     let event_json: String = row.get(3)?;
@@ -987,6 +988,10 @@ fn next_record(state: &mut RunState, event: HarnessEvent) -> AppResult<RecordedE
     Ok(record)
 }
 
+fn supported_ledger_version(version: u32) -> bool {
+    matches!(version, LEGACY_LEDGER_VERSION | LEDGER_VERSION)
+}
+
 pub fn read_records(path: &Path) -> AppResult<Vec<RecordedEvent>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -998,7 +1003,7 @@ pub fn read_records(path: &Path) -> AppResult<Vec<RecordedEvent>> {
             continue;
         }
         let line: LedgerLine = serde_json::from_str(&line)?;
-        if line.v != LEDGER_VERSION {
+        if !supported_ledger_version(line.v) {
             return Err(AppError::LedgerVersion {
                 expected: LEDGER_VERSION,
                 actual: line.v,
@@ -1088,7 +1093,11 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use platonic_core::{AgentId, HarnessEvent, RunId};
+    use platonic_core::{
+        AgentId, ContextPack, HarnessEvent, Message, MessageRole, ModelName, ModelUsage, RunId,
+        TurnId,
+    };
+    use serde_json::Value;
     use std::{
         sync::atomic::{AtomicBool, Ordering},
         thread,
@@ -1357,21 +1366,73 @@ mod tests {
         let records = read_records(&path).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].seq, 0);
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["v"], LEDGER_VERSION);
     }
 
     #[test]
     fn rejects_wrong_ledger_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
-        std::fs::write(&path, r#"{"v":2,"record":{"seq":0,"occurred_at_ms":0,"event":{"event":"run_started","run_id":"run_1","agent_id":"plato"}}}"#).unwrap();
+        std::fs::write(&path, r#"{"v":3,"record":{"seq":0,"occurred_at_ms":0,"event":{"event":"run_started","run_id":"run_1","agent_id":"plato"}}}"#).unwrap();
 
         assert!(matches!(
             read_records(&path),
             Err(AppError::LedgerVersion {
                 expected: LEDGER_VERSION,
-                actual: 2
+                actual: 3
             })
         ));
+    }
+
+    #[test]
+    fn new_jsonl_and_sqlite_ledgers_write_v2_with_null_unknown_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl_path = dir.path().join("events.jsonl");
+        let sqlite_path = dir.path().join("events.db");
+        let run_id = RunId::new("run_unknown_usage").unwrap();
+        let mut jsonl = JsonlEventRecorder::create(&jsonl_path).unwrap();
+        let mut sqlite = SqliteEventRecorder::create(&sqlite_path, &run_id).unwrap();
+
+        for event in response_run_events(&run_id, None) {
+            jsonl.record(event.clone()).unwrap();
+            sqlite.record(event).unwrap();
+        }
+        drop(jsonl);
+        drop(sqlite);
+
+        let jsonl_lines = std::fs::read_to_string(&jsonl_path).unwrap();
+        let jsonl_response = jsonl_lines
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|line| line["record"]["event"]["event"] == "model_responded")
+            .unwrap();
+        assert_eq!(jsonl_response["v"], LEDGER_VERSION);
+        assert!(jsonl_response["record"]["event"]["usage"].is_null());
+
+        let connection = Connection::open(&sqlite_path).unwrap();
+        let (version, event_json): (u32, String) = connection
+            .query_row(
+                "SELECT v, event_json
+                 FROM ledger_events
+                 WHERE run_id = ?1 AND seq = 3",
+                params![run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(version, LEDGER_VERSION);
+        let sqlite_response: Value = serde_json::from_str(&event_json).unwrap();
+        assert!(sqlite_response["usage"].is_null());
+
+        for records in [
+            read_records(&jsonl_path).unwrap(),
+            read_sqlite_records(&sqlite_path, Some(run_id.as_str())).unwrap(),
+        ] {
+            assert!(matches!(
+                &records[3].event,
+                HarnessEvent::ModelResponded { usage: None, .. }
+            ));
+        }
     }
 
     #[test]
@@ -1729,5 +1790,43 @@ mod tests {
                 agent_id: AgentId::new("plato").unwrap(),
             },
         }
+    }
+
+    fn response_run_events(run_id: &RunId, usage: Option<ModelUsage>) -> Vec<HarnessEvent> {
+        let turn_id = TurnId::new("turn_1").unwrap();
+        vec![
+            HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: AgentId::new("plato").unwrap(),
+            },
+            HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                context: ContextPack {
+                    token_budget: 4_000,
+                    fragments: vec![],
+                },
+            },
+            HarnessEvent::ModelRequested {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 0,
+                model: ModelName::new("test-model").unwrap(),
+            },
+            HarnessEvent::ModelResponded {
+                run_id: run_id.clone(),
+                turn_id,
+                step: 0,
+                output: Message {
+                    role: MessageRole::Assistant,
+                    content: "answer".into(),
+                },
+                proposed_calls: vec![],
+                usage,
+            },
+            HarnessEvent::RunFinished {
+                run_id: run_id.clone(),
+            },
+        ]
     }
 }

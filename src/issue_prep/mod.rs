@@ -65,7 +65,7 @@ struct StageResult {
     stop: ModelStop,
     text: String,
     tool_call_count: usize,
-    usage: ModelUsage,
+    usage: Option<ModelUsage>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
