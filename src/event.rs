@@ -74,6 +74,17 @@ pub enum HarnessEvent {
         /// Host-selected model used for the request.
         model: ModelName,
     },
+    /// Records that the pending model request failed without terminating the run.
+    ModelFailed {
+        /// Run containing the pending request.
+        run_id: RunId,
+        /// Turn of the pending model request.
+        turn_id: TurnId,
+        /// Model step of the pending request.
+        step: u32,
+        /// Durable host-reported failure reason.
+        reason: String,
+    },
     /// Records the normalized result returned by the pending model request.
     ModelResponded {
         /// Run receiving the response.
@@ -183,6 +194,7 @@ impl HarnessEvent {
             | Self::ContextBuilt { run_id, .. }
             | Self::ContextCompacted { run_id, .. }
             | Self::ModelRequested { run_id, .. }
+            | Self::ModelFailed { run_id, .. }
             | Self::ModelResponded { run_id, .. }
             | Self::ToolProposalsRejected { run_id, .. }
             | Self::ToolCallProposed { run_id, .. }
@@ -204,6 +216,7 @@ impl HarnessEvent {
             Self::ContextBuilt { .. } => "context_built",
             Self::ContextCompacted { .. } => "context_compacted",
             Self::ModelRequested { .. } => "model_requested",
+            Self::ModelFailed { .. } => "model_failed",
             Self::ModelResponded { .. } => "model_responded",
             Self::ToolProposalsRejected { .. } => "tool_proposals_rejected",
             Self::ToolCallProposed { .. } => "tool_call_proposed",
@@ -275,6 +288,12 @@ mod tests {
                 turn_id: turn_id.clone(),
                 step: 1,
                 model: ModelName::new("model_1").unwrap(),
+            },
+            HarnessEvent::ModelFailed {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 1,
+                reason: "provider unavailable".into(),
             },
             HarnessEvent::ModelResponded {
                 run_id: run_id.clone(),
@@ -414,6 +433,17 @@ mod tests {
                         "turn_id": "turn_1",
                         "step": 1,
                         "model": "model_1"
+                    }
+                }),
+                HarnessEvent::ModelFailed { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "model_failed",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 1,
+                        "reason": "provider unavailable"
                     }
                 }),
                 HarnessEvent::ModelResponded { .. } => json!({
