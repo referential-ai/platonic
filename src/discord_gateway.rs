@@ -78,6 +78,7 @@ const GATEWAY_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const EVENT_PAGE_LIMIT: usize = 64;
 const EVENT_POLL_DELAY: Duration = Duration::from_millis(100);
 const PRESENTATION_TIMEOUT: Duration = Duration::from_millis(1_500);
+const PRODUCT_MESSAGE_RETRY_LIMIT: Duration = Duration::from_secs(30);
 const TERMINAL_REACTION_WAIT_LIMIT: Duration = Duration::from_secs(2);
 const TYPING_INTERVAL: Duration = Duration::from_secs(8);
 const APPROVAL_FIELD_LIMIT: usize = 80;
@@ -930,19 +931,33 @@ impl DiscordRestClient {
 
     fn send_message(&self, channel_id: u64, text: &str) -> AppResult<()> {
         for content in discord_chunks(text) {
-            self.require_product_allowed()?;
-            self.request(
-                self.agent
-                    .post(&format!("{}/channels/{channel_id}/messages", self.api_base)),
-            )
-            .send_json(CreateMessage {
-                content,
-                allowed_mentions: AllowedMentions { parse: Vec::new() },
-            })
-            .map_err(|error| {
-                self.discord_http_error("message send", RestClass::Product, error)
-                    .app_error
-            })?;
+            let mut retry_available = true;
+            loop {
+                self.require_product_allowed()?;
+                match self
+                    .request(
+                        self.agent
+                            .post(&format!("{}/channels/{channel_id}/messages", self.api_base)),
+                    )
+                    .send_json(CreateMessage {
+                        content: content.clone(),
+                        allowed_mentions: AllowedMentions { parse: Vec::new() },
+                    }) {
+                    Ok(_) => break,
+                    Err(error) => {
+                        let error =
+                            self.discord_http_error("message send", RestClass::Product, error);
+                        if retry_available
+                            && let Some(delay) = product_message_retry_delay(error.rate_limit)
+                        {
+                            retry_available = false;
+                            thread::sleep(delay);
+                            continue;
+                        }
+                        return Err(error.app_error);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1107,6 +1122,12 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 
 fn parse_retry_after_number(value: f64) -> Option<Duration> {
     Duration::try_from_secs_f64(value).ok()
+}
+
+fn product_message_retry_delay(rate_limit: Option<DiscordRateLimit>) -> Option<Duration> {
+    rate_limit
+        .map(|rate_limit| rate_limit.retry_after)
+        .filter(|delay| *delay <= PRODUCT_MESSAGE_RETRY_LIMIT)
 }
 
 fn terminal_reaction_wait(rate_limit: DiscordRateLimit) -> Option<Duration> {
@@ -2219,8 +2240,9 @@ mod tests {
             })
         };
         let rest = spawn_scripted_rest_actions(vec![
-            respond(429, json!({})),
-            FakeRestAction::Disconnect,
+            respond(204, Value::Null),
+            respond(429, json!({"retry_after": 0.0, "global": false})),
+            respond(429, json!({"retry_after": 0.0, "global": false})),
             respond(204, Value::Null),
             respond(204, Value::Null),
             respond(204, Value::Null),
@@ -2258,17 +2280,18 @@ mod tests {
         );
 
         let requests = rest.handle.join().unwrap();
-        assert_eq!(requests.len(), 8);
+        assert_eq!(requests.len(), 9);
         assert_reaction(&requests[0], "PUT", EYES_EMOJI);
         assert_eq!(requests[1].method, "POST");
         assert_eq!(requests[1].body["content"], "first answer");
-        assert_reaction(&requests[2], "DELETE", EYES_EMOJI);
-        assert_reaction(&requests[3], "PUT", FAILURE_EMOJI);
-        assert_reaction(&requests[4], "PUT", EYES_EMOJI);
-        assert_eq!(requests[5].method, "POST");
-        assert_eq!(requests[5].body["content"], "second answer");
-        assert_reaction(&requests[6], "DELETE", EYES_EMOJI);
-        assert_reaction(&requests[7], "PUT", SUCCESS_EMOJI);
+        assert_eq!(requests[2].body["content"], "first answer");
+        assert_reaction(&requests[3], "DELETE", EYES_EMOJI);
+        assert_reaction(&requests[4], "PUT", FAILURE_EMOJI);
+        assert_reaction(&requests[5], "PUT", EYES_EMOJI);
+        assert_eq!(requests[6].method, "POST");
+        assert_eq!(requests[6].body["content"], "second answer");
+        assert_reaction(&requests[7], "DELETE", EYES_EMOJI);
+        assert_reaction(&requests[8], "PUT", SUCCESS_EMOJI);
     }
 
     #[test]
@@ -2304,6 +2327,156 @@ mod tests {
                 rest.handle.join().unwrap();
             }
         });
+    }
+
+    #[test]
+    fn product_message_retries_once_after_header_or_body_retry_after() {
+        for first_response in [
+            FakeResponse {
+                status: 429,
+                body: json!({}),
+                headers: vec![("Retry-After", "0.02")],
+            },
+            FakeResponse {
+                status: 429,
+                body: json!({"retry_after": 0.02, "global": true}),
+                headers: Vec::new(),
+            },
+        ] {
+            let rest = spawn_scripted_rest(vec![
+                first_response,
+                FakeResponse {
+                    status: 200,
+                    body: json!({"id": "message_1"}),
+                    headers: Vec::new(),
+                },
+            ]);
+            let client = DiscordRestClient::new(&rest.base_url, "test-token".into());
+
+            client.send_message(200, "same chunk").unwrap();
+
+            let requests = rest.handle.join().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].body, requests[1].body);
+            assert_eq!(requests[0].body["content"], "same chunk");
+            let retry_delay = requests[1]
+                .received_at
+                .duration_since(requests[0].received_at);
+            assert!(retry_delay >= Duration::from_millis(20));
+            assert!(retry_delay < Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn product_message_retry_requires_a_usable_bounded_delay() {
+        for invalid in ["", "later", "-1", "NaN", "inf"] {
+            assert_eq!(parse_retry_after(invalid), None);
+        }
+        assert_eq!(parse_retry_after("0"), Some(Duration::ZERO));
+        assert_eq!(
+            product_message_retry_delay(Some(DiscordRateLimit {
+                retry_after: PRODUCT_MESSAGE_RETRY_LIMIT,
+                global: true,
+            })),
+            Some(PRODUCT_MESSAGE_RETRY_LIMIT)
+        );
+        assert_eq!(
+            product_message_retry_delay(Some(DiscordRateLimit {
+                retry_after: PRODUCT_MESSAGE_RETRY_LIMIT + Duration::from_millis(1),
+                global: false,
+            })),
+            None
+        );
+        assert_eq!(product_message_retry_delay(None), None);
+    }
+
+    #[test]
+    fn product_message_does_not_retry_unusable_429_delays() {
+        for response in [
+            FakeResponse {
+                status: 429,
+                body: json!({}),
+                headers: Vec::new(),
+            },
+            FakeResponse {
+                status: 429,
+                body: json!("invalid"),
+                headers: vec![("Retry-After", "later")],
+            },
+            FakeResponse {
+                status: 429,
+                body: json!({"retry_after": -1.0}),
+                headers: Vec::new(),
+            },
+            FakeResponse {
+                status: 429,
+                body: json!({}),
+                headers: vec![("Retry-After", "NaN")],
+            },
+            FakeResponse {
+                status: 429,
+                body: json!({"retry_after": 30.001}),
+                headers: Vec::new(),
+            },
+        ] {
+            let rest = spawn_observed_rest(vec![FakeRestAction::Respond(response)]);
+            let client = DiscordRestClient::new(&rest.base_url, "test-token".into());
+
+            let result = client.send_message(200, "one attempt");
+            let requests = rest.finish();
+
+            assert!(result.is_err());
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].body["content"], "one attempt");
+        }
+    }
+
+    #[test]
+    fn product_message_second_429_stops_and_abandons_later_chunks() {
+        let rate_limited = || {
+            FakeRestAction::Respond(FakeResponse {
+                status: 429,
+                body: json!({"retry_after": 0.0, "global": false}),
+                headers: Vec::new(),
+            })
+        };
+        let rest = spawn_observed_rest(vec![rate_limited(), rate_limited()]);
+        let client = DiscordRestClient::new(&rest.base_url, "secret-token".into());
+        let first_chunk = "a".repeat(DISCORD_MESSAGE_LIMIT);
+        let message = format!("{first_chunk}later");
+
+        let error = client.send_message(200, &message).unwrap_err();
+        let requests = rest.finish();
+
+        assert!(!error.to_string().contains("secret-token"));
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.body["content"] == first_chunk)
+        );
+    }
+
+    #[test]
+    fn product_message_does_not_retry_ambiguous_failures() {
+        for action in [
+            FakeRestAction::Respond(FakeResponse {
+                status: 500,
+                body: json!({}),
+                headers: Vec::new(),
+            }),
+            FakeRestAction::Disconnect,
+        ] {
+            let rest = spawn_observed_rest(vec![action]);
+            let client = DiscordRestClient::new(&rest.base_url, "test-token".into());
+
+            let result = client.send_message(200, "one attempt");
+            let requests = rest.finish();
+
+            assert!(result.is_err());
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].body["content"], "one attempt");
+        }
     }
 
     #[test]
@@ -3716,6 +3889,19 @@ mod tests {
         handle: thread::JoinHandle<Vec<HttpRequest>>,
     }
 
+    struct ObservedRest {
+        base_url: String,
+        stop: Sender<()>,
+        handle: thread::JoinHandle<Vec<HttpRequest>>,
+    }
+
+    impl ObservedRest {
+        fn finish(self) -> Vec<HttpRequest> {
+            self.stop.send(()).unwrap();
+            self.handle.join().unwrap()
+        }
+    }
+
     struct FakeResponse {
         status: u16,
         body: Value,
@@ -3812,6 +3998,53 @@ mod tests {
             requests
         });
         FakeRest { base_url, handle }
+    }
+
+    fn spawn_observed_rest(actions: Vec<FakeRestAction>) -> ObservedRest {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (stop, stopped) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut actions = actions.into_iter();
+            let mut requests = Vec::new();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        requests.push(read_http_request(&mut stream));
+                        match actions.next() {
+                            Some(FakeRestAction::Respond(response)) => {
+                                write_http_response_with_headers(
+                                    &mut stream,
+                                    response.status,
+                                    &response.body,
+                                    &response.headers,
+                                );
+                            }
+                            Some(FakeRestAction::Disconnect) => {}
+                            None => {
+                                write_http_response(&mut stream, 200, &json!({"id": "unexpected"}));
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        match stopped.try_recv() {
+                            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                            Err(mpsc::TryRecvError::Empty) => {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                        }
+                    }
+                    Err(error) => panic!("discord REST accept failed: {error}"),
+                }
+            }
+            requests
+        });
+        ObservedRest {
+            base_url,
+            stop,
+            handle,
+        }
     }
 
     fn spawn_stalled_rest(delay: Duration) -> FakeRest {
