@@ -396,7 +396,10 @@ sends approval decisions. Failed runs post
 `Run failed. Inspect it locally with: plato replay`; canceled and interrupted
 runs stay silent.
 A Discord response-delivery failure is contained to that message, and the
-gateway continues processing subsequent messages.
+gateway continues processing subsequent messages. A definitely rejected HTTP
+429 with a valid `Retry-After` of at most 30 seconds waits the full delay and
+retries that message chunk once; transport failures and HTTP 5xx responses are
+not retried.
 
 Allowed-owner messages over 4,096 UTF-8 bytes or matching the fixed unsafe-input
 markers are rejected before daemon access with `Message rejected: unsafe or
