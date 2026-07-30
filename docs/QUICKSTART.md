@@ -72,20 +72,23 @@ plato replay                # replays the latest session
 ```
 
 Explicit SQLite paths need the equals form: `--db=/tmp/run.db`. If the
-workspace daemon lock is held, SQLite CLI run/replay paths fail closed instead
-of competing with the daemon-owned store. Replay shows final assistant messages,
-not partial live deltas.
+workspace daemon is live, default-ledger prompts delegate to it. Replay,
+explicit `--db=<path>`, and direct `--yolo` SQLite paths remain direct and fail
+closed if they conflict with the daemon-owned store. Replay shows final
+assistant messages, not partial live deltas.
 
 ## 4. The full experience: TUI
 
 One terminal, same workspace:
 
 ```bash
-plato --tui --config plato.toml
+plato
 ```
 
 This attaches to the workspace daemon if one is already running. Otherwise it
-starts an embedded daemon for this TUI session.
+starts the sibling `plato-agentd` detached. Quitting the TUI leaves that daemon
+running. `plato --tui --config plato.toml` is the explicit form when selecting
+a config.
 The screen is a chat-first transcript with a bottom status rule and composer.
 
 Manual two-terminal mode still works:
@@ -104,8 +107,8 @@ plato-tui --workspace "$PWD" --config plato.toml      # terminal B
 | `q` / Esc | quit (`q` only with an empty composer, so it is typeable in words) |
 | Ctrl-U | clear the composer |
 
-Ctrl-C on the daemon shuts down cleanly (socket and lock removed).
-Quitting a manually attached TUI never stops the daemon.
+Ctrl-C on a manually started daemon shuts down cleanly (socket and lock removed).
+Quitting either TUI form never stops the daemon.
 
 When `plato-gateway-discord` reaches an approval-required tool, Discord gets one
 bounded notification with the tool, effect, and preview. Grant or deny it
