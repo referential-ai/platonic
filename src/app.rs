@@ -200,6 +200,13 @@ struct ActiveSessionRun {
     closed: bool,
 }
 
+struct SessionHydration {
+    retained_messages: Vec<ModelMessage>,
+    dropped_turns: u64,
+    estimated_tokens_before: u32,
+    estimated_tokens_after: u32,
+}
+
 impl ActiveSessionRun {
     fn begin(
         mut ledger: SqliteLedger,
@@ -208,21 +215,21 @@ impl ActiveSessionRun {
         question: &str,
         config: &Config,
         tools: &[ToolSpec],
-    ) -> AppResult<(Self, Vec<ModelMessage>)> {
+    ) -> AppResult<(Self, SessionHydration)> {
         let turns = ledger.begin_session_run(
             session.session_id(),
             run_id,
             question,
             session.create_session(),
         )?;
-        let messages = hydrated_messages(&turns, question, config, tools)?;
+        let hydration = hydrated_messages(&turns, question, config, tools)?;
         Ok((
             Self {
                 ledger,
                 run_id: run_id.clone(),
                 closed: false,
             },
-            messages,
+            hydration,
         ))
     }
 
@@ -257,19 +264,26 @@ fn hydrated_messages(
     question: &str,
     config: &Config,
     tools: &[ToolSpec],
-) -> AppResult<Vec<ModelMessage>> {
-    let mut first_turn = 0;
-    let mut truncated = false;
-    loop {
-        let messages = session_messages_from(&turns[first_turn..], question, truncated);
-        if estimated_context_tokens(&messages, tools)? <= config.limits.token_budget
-            || first_turn == turns.len()
-        {
-            return Ok(messages);
-        }
-        first_turn += 1;
-        truncated = true;
+) -> AppResult<SessionHydration> {
+    let mut first_retained_turn = 0;
+    let mut retained_messages = session_messages_from(turns, question, false);
+    let estimated_tokens_before = estimated_context_tokens(&retained_messages, tools)?;
+    let mut estimated_tokens_after = estimated_tokens_before;
+
+    while estimated_tokens_after > config.limits.token_budget && first_retained_turn < turns.len() {
+        first_retained_turn += 1;
+        retained_messages = session_messages_from(&turns[first_retained_turn..], question, true);
+        estimated_tokens_after = estimated_context_tokens(&retained_messages, tools)?;
     }
+
+    let dropped_turns = u64::try_from(first_retained_turn)
+        .map_err(|_| AppError::Config("session history exceeds compaction range".into()))?;
+    Ok(SessionHydration {
+        retained_messages,
+        dropped_turns,
+        estimated_tokens_before,
+        estimated_tokens_after,
+    })
 }
 
 fn session_messages_from(
@@ -322,9 +336,9 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         token_limit_field(&config.provider.kind),
     )?;
     let tools = tool_specs(&config.tools.enabled);
-    let (mut session_run, mut messages) = match (&options.ledger, &options.session) {
+    let (mut session_run, mut session_hydration) = match (&options.ledger, &options.session) {
         (RunLedger::Sqlite(path), Some(session)) => {
-            let (session_run, messages) = ActiveSessionRun::begin(
+            let (session_run, hydration) = ActiveSessionRun::begin(
                 SqliteLedger::open_or_create(path)?,
                 session,
                 &run_id,
@@ -332,10 +346,10 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 &config,
                 &tools,
             )?;
-            (Some(session_run), messages)
+            (Some(session_run), Some(hydration))
         }
         (RunLedger::DefaultSqlite(path), Some(session)) => {
-            let (session_run, messages) = ActiveSessionRun::begin(
+            let (session_run, hydration) = ActiveSessionRun::begin(
                 SqliteLedger::open_or_create_default(path)?,
                 session,
                 &run_id,
@@ -343,16 +357,17 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 &config,
                 &tools,
             )?;
-            (Some(session_run), messages)
+            (Some(session_run), Some(hydration))
         }
         (RunLedger::Jsonl(_), Some(_)) => {
             return Err(AppError::Config("sessions require a SQLite ledger".into()));
         }
-        (_, None) => (
-            None,
-            vec![ModelMessage::user_text(options.question.clone())],
-        ),
+        (_, None) => (None, None),
     };
+    let mut messages = session_hydration
+        .as_mut()
+        .map(|hydration| std::mem::take(&mut hydration.retained_messages))
+        .unwrap_or_else(|| vec![ModelMessage::user_text(options.question.clone())]);
     let mut recorder = match &options.ledger {
         RunLedger::Jsonl(path) => EventRecorder::create_jsonl(path)?,
         RunLedger::Sqlite(path) => EventRecorder::create_sqlite(path, &run_id)?,
@@ -383,6 +398,23 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         };
         let context = context_pack(&request, config.limits.token_budget)?;
         check_cancel(&mut recorder, &options, &run_id, &mut session_run)?;
+        if turn_index == 0
+            && let Some(hydration) = &session_hydration
+            && hydration.dropped_turns > 0
+        {
+            record_event(
+                &mut recorder,
+                &options,
+                HarnessEvent::ContextCompacted {
+                    run_id: run_id.clone(),
+                    turn_id: turn_id.clone(),
+                    estimated_tokens_before: hydration.estimated_tokens_before,
+                    estimated_tokens_after: hydration.estimated_tokens_after,
+                    dropped_turn_start: 0,
+                    dropped_turn_end_exclusive: hydration.dropped_turns,
+                },
+            )?;
+        }
         record_context_built(&mut recorder, &options, &run_id, turn_id.clone(), context)?;
         record_event(
             &mut recorder,
@@ -1469,18 +1501,27 @@ base_url = "http://{}"
             final_answer: "first answer".into(),
         }];
 
-        let messages = hydrated_messages(&turns, "second question", &config, &tools).unwrap();
+        let hydration = hydrated_messages(&turns, "second question", &config, &tools).unwrap();
+        let messages = &hydration.retained_messages;
 
         assert_eq!(messages.len(), 3);
         assert_eq!(text(&messages[0]), "first question");
         assert_eq!(text(&messages[1]), "first answer");
         assert_eq!(text(&messages[2]), "second question");
+        assert_eq!(hydration.dropped_turns, 0);
+        assert_eq!(
+            hydration.estimated_tokens_before,
+            hydration.estimated_tokens_after
+        );
+        assert_eq!(
+            hydration.estimated_tokens_before,
+            estimated_context_tokens(messages, &tools).unwrap()
+        );
     }
 
     #[test]
     fn session_hydration_drops_oldest_turns_with_marker() {
         let mut config = Config::default();
-        config.limits.token_budget = 1_000;
         let tools = tool_specs(&config.tools.enabled);
         let turns = vec![
             SessionTurn {
@@ -1488,18 +1529,233 @@ base_url = "http://{}"
                 final_answer: "old answer ".repeat(400),
             },
             SessionTurn {
+                question: "middle question ".repeat(400),
+                final_answer: "middle answer ".repeat(400),
+            },
+            SessionTurn {
                 question: "recent question".into(),
                 final_answer: "recent answer".into(),
             },
         ];
+        let expected_before_messages = session_messages_from(&turns, "current question", false);
+        let one_drop_messages = session_messages_from(&turns[1..], "current question", true);
+        let expected_after_messages = session_messages_from(&turns[2..], "current question", true);
+        let expected_before = estimated_context_tokens(&expected_before_messages, &tools).unwrap();
+        let one_drop = estimated_context_tokens(&one_drop_messages, &tools).unwrap();
+        let expected_after = estimated_context_tokens(&expected_after_messages, &tools).unwrap();
+        assert!(one_drop > expected_after);
+        config.limits.token_budget = expected_after;
 
-        let messages = hydrated_messages(&turns, "current question", &config, &tools).unwrap();
-        let serialized = serde_json::to_string(&messages).unwrap();
+        let hydration = hydrated_messages(&turns, "current question", &config, &tools).unwrap();
+        let serialized = serde_json::to_string(&hydration.retained_messages).unwrap();
 
         assert!(serialized.contains(SESSION_TRUNCATION_MARKER));
         assert!(!serialized.contains("old question"));
+        assert!(!serialized.contains("middle question"));
         assert!(serialized.contains("recent question"));
         assert!(serialized.contains("current question"));
+        assert_eq!(hydration.dropped_turns, 2);
+        assert_eq!(hydration.estimated_tokens_before, expected_before);
+        assert_eq!(hydration.estimated_tokens_after, expected_after);
+        assert_eq!(hydration.retained_messages, expected_after_messages);
+    }
+
+    #[test]
+    fn truncating_session_run_records_one_compaction_before_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("events.db");
+        let session_id = "session_compacted";
+        let question = "current question";
+        let turns = vec![
+            SessionTurn {
+                question: "old question ".repeat(400),
+                final_answer: "old answer ".repeat(400),
+            },
+            SessionTurn {
+                question: "middle question ".repeat(400),
+                final_answer: "middle answer ".repeat(400),
+            },
+            SessionTurn {
+                question: "recent question".into(),
+                final_answer: "recent answer".into(),
+            },
+        ];
+        seed_finished_session(&ledger_path, session_id, &turns);
+        let tools = tool_specs(&["file.read".into()]);
+        let expected_before =
+            estimated_context_tokens(&session_messages_from(&turns, question, false), &tools)
+                .unwrap();
+        let one_drop =
+            estimated_context_tokens(&session_messages_from(&turns[1..], question, true), &tools)
+                .unwrap();
+        let expected_after_messages = session_messages_from(&turns[2..], question, true);
+        let expected_after = estimated_context_tokens(&expected_after_messages, &tools).unwrap();
+        assert!(one_drop > expected_after);
+
+        let provider = spawn_provider_sequence(vec![json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "done"}
+            }]
+        })]);
+        let config_path = dir.path().join("plato.toml");
+        write_session_test_config(&config_path, &provider.base_url, expected_after);
+
+        let outcome = run_question(continued_session_options(
+            dir.path(),
+            &config_path,
+            &ledger_path,
+            session_id,
+            "run_compacted",
+            question,
+        ))
+        .unwrap();
+        let requests = provider.handle.join().unwrap();
+
+        assert_eq!(outcome.final_answer, "done");
+        assert_eq!(requests.len(), 1);
+        let request = http_request_json(&requests[0]);
+        let request_messages = request["messages"].to_string();
+        assert!(request_messages.contains(SESSION_TRUNCATION_MARKER));
+        assert!(request_messages.contains("recent question"));
+        assert!(!request_messages.contains("old question"));
+        assert!(!request_messages.contains("middle question"));
+
+        let records =
+            crate::ledger::read_sqlite_records(&ledger_path, Some("run_compacted")).unwrap();
+        assert!(matches!(records[0].event, HarnessEvent::RunStarted { .. }));
+        match &records[1].event {
+            HarnessEvent::ContextCompacted {
+                turn_id,
+                estimated_tokens_before,
+                estimated_tokens_after,
+                dropped_turn_start,
+                dropped_turn_end_exclusive,
+                ..
+            } => {
+                assert_eq!(turn_id.as_str(), "turn_1");
+                assert_eq!(*estimated_tokens_before, expected_before);
+                assert_eq!(*estimated_tokens_after, expected_after);
+                assert_eq!(*dropped_turn_start, 0);
+                assert_eq!(*dropped_turn_end_exclusive, 2);
+            }
+            event => panic!("expected context_compacted, got {event:?}"),
+        }
+        match &records[2].event {
+            HarnessEvent::ContextBuilt { context, .. } => {
+                let messages = context
+                    .fragments
+                    .iter()
+                    .find(|fragment| fragment.source == "model.messages")
+                    .unwrap();
+                assert_eq!(
+                    messages.content,
+                    serde_json::to_string(&expected_after_messages).unwrap()
+                );
+            }
+            event => panic!("expected context_built, got {event:?}"),
+        }
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.event, HarnessEvent::ContextCompacted { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn fitting_session_run_records_no_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("events.db");
+        let session_id = "session_fitting";
+        let question = "second question";
+        let turns = vec![SessionTurn {
+            question: "first question".into(),
+            final_answer: "first answer".into(),
+        }];
+        seed_finished_session(&ledger_path, session_id, &turns);
+        let tools = tool_specs(&["file.read".into()]);
+        let token_budget =
+            estimated_context_tokens(&session_messages_from(&turns, question, false), &tools)
+                .unwrap();
+        let provider = spawn_provider_sequence(vec![json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "done"}
+            }]
+        })]);
+        let config_path = dir.path().join("plato.toml");
+        write_session_test_config(&config_path, &provider.base_url, token_budget);
+
+        run_question(continued_session_options(
+            dir.path(),
+            &config_path,
+            &ledger_path,
+            session_id,
+            "run_fitting",
+            question,
+        ))
+        .unwrap();
+        provider.handle.join().unwrap();
+
+        let records =
+            crate::ledger::read_sqlite_records(&ledger_path, Some("run_fitting")).unwrap();
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(record.event, HarnessEvent::ContextCompacted { .. }))
+        );
+        assert!(matches!(records[0].event, HarnessEvent::RunStarted { .. }));
+        assert!(matches!(
+            records[1].event,
+            HarnessEvent::ContextBuilt { .. }
+        ));
+    }
+
+    #[test]
+    fn over_budget_after_session_truncation_records_compaction_then_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("events.db");
+        let session_id = "session_over_budget";
+        seed_finished_session(
+            &ledger_path,
+            session_id,
+            &[SessionTurn {
+                question: "old question ".repeat(400),
+                final_answer: "old answer ".repeat(400),
+            }],
+        );
+        let config_path = dir.path().join("plato.toml");
+        write_session_test_config(&config_path, "https://example.invalid", 1);
+
+        let error = run_question(continued_session_options(
+            dir.path(),
+            &config_path,
+            &ledger_path,
+            session_id,
+            "run_compacted_over_budget",
+            "current question",
+        ))
+        .unwrap_err();
+
+        assert_context_budget_error(&error);
+        let records =
+            crate::ledger::read_sqlite_records(&ledger_path, Some("run_compacted_over_budget"))
+                .unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(matches!(records[0].event, HarnessEvent::RunStarted { .. }));
+        assert!(matches!(
+            records[1].event,
+            HarnessEvent::ContextCompacted {
+                dropped_turn_start: 0,
+                dropped_turn_end_exclusive: 1,
+                ..
+            }
+        ));
+        assert!(matches!(records[2].event, HarnessEvent::RunFailed { .. }));
+        let readback = RunReadback::from_events(&records).unwrap();
+        assert!(matches!(readback.final_phase, RunPhase::Failed { .. }));
     }
 
     #[test]
@@ -2643,6 +2899,69 @@ enabled = ["file.read"]
             summaries[0].status,
             crate::daemon::protocol::RunStateName::Canceled
         );
+    }
+
+    fn seed_finished_session(path: &Path, session_id: &str, turns: &[SessionTurn]) {
+        let mut ledger = SqliteLedger::open_or_create(path).unwrap();
+        for (index, turn) in turns.iter().enumerate() {
+            let run_id = RunId::new(format!("seed_run_{index}")).unwrap();
+            ledger
+                .begin_session_run(session_id, &run_id, &turn.question, index == 0)
+                .unwrap();
+            ledger
+                .finish_session_run(&run_id, &turn.final_answer)
+                .unwrap();
+        }
+    }
+
+    fn continued_session_options(
+        workspace_root: &Path,
+        config_path: &Path,
+        ledger_path: &Path,
+        session_id: &str,
+        run_id: &str,
+        question: &str,
+    ) -> RunOptions {
+        RunOptions {
+            question: question.into(),
+            config_path: Some(config_path.to_path_buf()),
+            overrides: RunOverrides::default(),
+            ledger: RunLedger::Sqlite(ledger_path.to_path_buf()),
+            workspace_root: workspace_root.to_path_buf(),
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(RunId::new(run_id).unwrap()),
+            session: Some(RunSession::Continue {
+                session_id: session_id.into(),
+            }),
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: None,
+        }
+    }
+
+    fn write_session_test_config(path: &Path, base_url: &str, token_budget: u32) {
+        std::fs::write(
+            path,
+            format!(
+                r#"
+[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "{base_url}"
+timeout_ms = 5000
+
+[limits]
+token_budget = {token_budget}
+max_output_tokens = 32
+max_turns = 1
+
+[tools]
+enabled = ["file.read"]
+"#
+            ),
+        )
+        .unwrap();
     }
 
     fn write_over_budget_config(path: &Path) {

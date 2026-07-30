@@ -139,6 +139,7 @@ Every run uses this exact convention:
 - Use `=` for explicit paths because `--db` also has a bare default form.
 - Live assistant text, `run_id`, `ledger_path`, and replay hints print to stderr. Stdout remains only the final answer.
 - Replay shows final assistant messages, not partial streaming deltas.
+- Replay renders dropped oldest session turns as `[<turn_id>] context_compacted estimated_tokens=<before>-><after> dropped_turns=<start>..<end>`; the zero-based range has an exclusive end and the token values are host estimates of the complete context before and after compaction.
 - Ledger, approval, replay, and typed-transcript tool call ids are host-minted per run; provider ids remain provider-facing.
 - Streamed runs request provider usage chunks; providers that omit usage still record zero usage.
 - `plato replay` without arguments replays the latest session from the default platform SQLite ledger.
