@@ -1211,6 +1211,67 @@ mod tests {
     }
 
     #[test]
+    fn delegated_prompt_tolerates_context_compaction_ledger_event() {
+        let workspace = tempfile::tempdir().unwrap();
+        with_test_xdg(workspace.path(), || {
+            let old_answer = "old answer ".repeat(800);
+            let provider = FakeProvider::start(vec![
+                text_stream(&[&old_answer]),
+                text_stream(&["current answer"]),
+            ]);
+            let config_path = workspace.path().join("custom.toml");
+            write_test_config_with_budget(&config_path, &provider.base_url, "file.read", 1_000);
+            let daemon = TestDaemon::start(workspace.path());
+            let mut client = daemon.client();
+
+            run_daemon_prompt(
+                &mut client,
+                "old question".into(),
+                false,
+                Some(&config_path),
+                &mut "".as_bytes(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let mut stdout = Vec::new();
+            run_daemon_prompt(
+                &mut client,
+                "current question".into(),
+                true,
+                Some(&config_path),
+                &mut "".as_bytes(),
+                &mut stdout,
+                &mut Vec::new(),
+            )
+            .unwrap();
+            daemon.stop();
+            let requests = provider.join();
+
+            assert_eq!(String::from_utf8(stdout).unwrap(), "current answer\n");
+            let continued_messages = requests[1]["messages"].to_string();
+            assert!(
+                continued_messages
+                    .contains("[older session turns omitted to fit the context budget]")
+            );
+            assert!(!continued_messages.contains("old question"));
+            let ledger_path = default_sqlite(workspace.path()).unwrap();
+            let ledger =
+                plato_agent::ledger::SqliteLedger::open_default_readonly(&ledger_path).unwrap();
+            let session = ledger.read_latest_session().unwrap();
+            let continued_run = session.runs.last().unwrap();
+            assert_eq!(
+                continued_run
+                    .records
+                    .iter()
+                    .filter(|record| matches!(record.event, HarnessEvent::ContextCompacted { .. }))
+                    .count(),
+                1
+            );
+        });
+    }
+
+    #[test]
     fn delegated_prompt_bridges_stdin_grant_and_denial() {
         for (stdin, final_answer, file_exists) in
             [("y\n", "granted", true), ("\n", "denied", false)]
@@ -1541,6 +1602,15 @@ mod tests {
     }
 
     fn write_test_config(path: &Path, base_url: &str, enabled_tool: &str) {
+        write_test_config_with_budget(path, base_url, enabled_tool, 4000);
+    }
+
+    fn write_test_config_with_budget(
+        path: &Path,
+        base_url: &str,
+        enabled_tool: &str,
+        token_budget: u32,
+    ) {
         std::fs::write(
             path,
             format!(
@@ -1553,7 +1623,7 @@ base_url = "{base_url}"
 timeout_ms = 2000
 
 [limits]
-token_budget = 4000
+token_budget = {token_budget}
 max_output_tokens = 32
 max_turns = 2
 
