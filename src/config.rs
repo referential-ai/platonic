@@ -4,6 +4,7 @@ use crate::{
 };
 use serde::Deserialize;
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -63,6 +64,7 @@ pub struct GatewayConfig {
 pub struct DiscordGatewayConfig {
     pub api_key_env: String,
     pub owner_user_ids: Vec<u64>,
+    pub channel_configs: HashMap<u64, PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,6 +117,8 @@ struct RawGatewayConfig {
 struct RawDiscordGatewayConfig {
     api_key_env: String,
     owner_user_ids: Vec<u64>,
+    #[serde(default)]
+    channel_configs: HashMap<String, PathBuf>,
 }
 
 #[derive(Default, Debug, Deserialize)]
@@ -281,10 +285,38 @@ impl GatewayConfig {
                 "gateway.discord.owner_user_ids must contain positive integers".into(),
             ));
         }
+        let mut channel_configs = HashMap::new();
+        for (channel_id, path) in raw.discord.channel_configs {
+            if !channel_id.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(AppError::Config(
+                    "gateway.discord.channel_configs keys must be positive numeric Discord channel IDs"
+                        .into(),
+                ));
+            }
+            let channel_id = channel_id.parse::<u64>().map_err(|_| {
+                AppError::Config(
+                    "gateway.discord.channel_configs keys must be positive numeric Discord channel IDs"
+                        .into(),
+                )
+            })?;
+            if channel_id == 0 {
+                return Err(AppError::Config(
+                    "gateway.discord.channel_configs keys must be positive numeric Discord channel IDs"
+                        .into(),
+                ));
+            }
+            if channel_configs.insert(channel_id, path).is_some() {
+                return Err(AppError::Config(
+                    "gateway.discord.channel_configs contains a duplicate numeric Discord channel ID"
+                        .into(),
+                ));
+            }
+        }
         Ok(Self {
             discord: DiscordGatewayConfig {
                 api_key_env: raw.discord.api_key_env,
                 owner_user_ids: raw.discord.owner_user_ids,
+                channel_configs,
             },
         })
     }
@@ -477,6 +509,9 @@ mod tests {
 [gateway.discord]
 api_key_env = "DISCORD_BOT_TOKEN"
 owner_user_ids = [123456789]
+
+[gateway.discord.channel_configs]
+"111111111111111111" = "~/.config/plato/channels/news.toml"
 "#,
         )
         .unwrap();
@@ -487,6 +522,98 @@ owner_user_ids = [123456789]
 
         assert_eq!(discord.api_key_env, "DISCORD_BOT_TOKEN");
         assert_eq!(discord.owner_user_ids, vec![123456789]);
+        assert_eq!(
+            discord.channel_configs,
+            HashMap::from([(
+                111111111111111111,
+                PathBuf::from("~/.config/plato/channels/news.toml")
+            )])
+        );
+    }
+
+    #[test]
+    fn rejects_zero_and_nonnumeric_discord_channel_config_keys() {
+        for channel_id in ["0", "+1", "not-a-channel"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("plato.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    r#"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [123456789]
+
+[gateway.discord.channel_configs]
+"{channel_id}" = "channel.toml"
+"#
+                ),
+            )
+            .unwrap();
+
+            let resolved = ResolvedConfigPath::Authorized(path);
+            let error = Config::load_resolved(Some(&resolved)).unwrap_err();
+
+            assert!(matches!(
+                error,
+                AppError::Config(message)
+                    if message
+                        == "gateway.discord.channel_configs keys must be positive numeric Discord channel IDs"
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_discord_channel_config_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plato.toml");
+        std::fs::write(
+            &path,
+            r#"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [123456789]
+
+[gateway.discord.channel_configs]
+"111111111111111111" = "news.toml"
+"111111111111111111" = "dev.toml"
+"#,
+        )
+        .unwrap();
+
+        let resolved = ResolvedConfigPath::Authorized(path);
+        let error = Config::load_resolved(Some(&resolved)).unwrap_err();
+
+        assert!(matches!(error, AppError::Toml(_)));
+    }
+
+    #[test]
+    fn rejects_discord_channel_config_keys_with_duplicate_numeric_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plato.toml");
+        std::fs::write(
+            &path,
+            r#"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [123456789]
+
+[gateway.discord.channel_configs]
+"1" = "news.toml"
+"01" = "dev.toml"
+"#,
+        )
+        .unwrap();
+
+        let resolved = ResolvedConfigPath::Authorized(path);
+        let error = Config::load_resolved(Some(&resolved)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Config(message)
+                if message
+                    == "gateway.discord.channel_configs contains a duplicate numeric Discord channel ID"
+        ));
     }
 
     #[test]

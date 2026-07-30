@@ -356,13 +356,23 @@ are not a public community launch. Build the AppImage on Ubuntu 24.04 with
 
 `plato-gateway-discord` receives Discord messages over an outbound WebSocket
 and sends replies through Discord's REST API. Add the bot token variable name
-and numeric owner user ids to `plato.toml`:
+and numeric owner user ids to an authorized config:
 
 ```toml
 [gateway.discord]
 api_key_env = "DISCORD_BOT_TOKEN"
 owner_user_ids = [123456789]
+
+[gateway.discord.channel_configs]
+"111111111111111111" = "~/.config/plato/channels/news.toml"
 ```
+
+Channel mappings are accepted from `--config`, `PLATO_CONFIG`, or the user
+config, not auto-discovered workspace `plato.toml`. Each mapped file is an
+ordinary Plato config and may omit `[gateway]`. Mapped paths are resolved and
+validated when the gateway starts, so mapping changes require a restart. The
+daemon loads the selected file for each fresh or continued run, so file-content
+changes do not require a gateway restart.
 
 With the workspace daemon already running, start the gateway in an environment
 that contains the bot token but no provider credentials:
@@ -370,7 +380,8 @@ that contains the bot token but no provider credentials:
 ```bash
 unset OPENAI_API_KEY OPENROUTER_API_KEY
 export DISCORD_BOT_TOKEN="$(cat /path/to/discord-bot-token)"
-cargo run --bin plato-gateway-discord -- --workspace "$PWD"
+cargo run --bin plato-gateway-discord -- \
+  --workspace "$PWD" --config ~/.config/plato/gateway.toml
 ```
 
 At startup, the gateway replaces the Discord application's global command
