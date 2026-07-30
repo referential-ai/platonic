@@ -61,6 +61,17 @@ pub fn format_readback(readback: &RunReadback) -> String {
 
     for entry in &readback.entries {
         match entry {
+            ReadbackEntry::ContextCompacted {
+                turn_id,
+                estimated_tokens_before,
+                estimated_tokens_after,
+                dropped_turn_start,
+                dropped_turn_end_exclusive,
+            } => {
+                lines.push(format!(
+                    "[{turn_id}] context_compacted estimated_tokens={estimated_tokens_before}->{estimated_tokens_after} dropped_turns={dropped_turn_start}..{dropped_turn_end_exclusive}"
+                ));
+            }
             ReadbackEntry::ContextFragment { turn_id, fragment } => {
                 lines.push(format!(
                     "[{turn_id}] context {:?} {}: {}",
@@ -104,9 +115,7 @@ pub fn format_readback(readback: &RunReadback) -> String {
             ReadbackEntry::ToolFailed { call_id, reason } => {
                 lines.push(format!("tool_failed {call_id}: {reason}"));
             }
-            ReadbackEntry::ContextCompacted { .. }
-            | ReadbackEntry::ModelFailed { .. }
-            | ReadbackEntry::ToolProposalsRejected { .. } => {}
+            ReadbackEntry::ModelFailed { .. } | ReadbackEntry::ToolProposalsRejected { .. } => {}
         }
     }
 
@@ -205,6 +214,58 @@ mod tests {
         assert!(replay.contains("run_id: run_1"));
         assert!(replay.contains("run_id: run_2"));
         assert_eq!(replay.matches("final_phase: Failed").count(), 2);
+    }
+
+    #[test]
+    fn replay_formats_context_compaction_with_all_fields() {
+        let run_id = RunId::new("run_1").unwrap();
+        let turn_id = TurnId::new("turn_1").unwrap();
+        let records = vec![
+            record(
+                0,
+                HarnessEvent::RunStarted {
+                    run_id: run_id.clone(),
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+            ),
+            record(
+                1,
+                HarnessEvent::ContextCompacted {
+                    run_id: run_id.clone(),
+                    turn_id: turn_id.clone(),
+                    estimated_tokens_before: 321,
+                    estimated_tokens_after: 123,
+                    dropped_turn_start: 0,
+                    dropped_turn_end_exclusive: 2,
+                },
+            ),
+            record(
+                2,
+                HarnessEvent::ContextBuilt {
+                    run_id: run_id.clone(),
+                    turn_id,
+                    context: ContextPack {
+                        token_budget: 500,
+                        fragments: vec![],
+                    },
+                },
+            ),
+            record(
+                3,
+                HarnessEvent::RunFailed {
+                    run_id,
+                    reason: "synthetic failure".into(),
+                },
+            ),
+        ];
+        let readback = RunReadback::from_events(&records).unwrap();
+
+        let replay = format_readback(&readback);
+
+        assert_eq!(replay, format_readback(&readback));
+        assert!(replay.lines().any(|line| {
+            line == "[turn_1] context_compacted estimated_tokens=321->123 dropped_turns=0..2"
+        }));
     }
 
     #[test]
