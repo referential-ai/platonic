@@ -63,3 +63,7 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 temp-env = "0.3"
 tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+pty-process = "0.5.3"
+vt100 = "0.15.2"
