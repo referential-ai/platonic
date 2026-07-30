@@ -89,6 +89,15 @@ pub enum HarnessEvent {
         /// Provider-reported token usage for the response.
         usage: ModelUsage,
     },
+    /// Rejects every unvalidated tool proposal in the pending model response.
+    ToolProposalsRejected {
+        /// Run containing the pending proposals.
+        run_id: RunId,
+        /// Turn that produced the pending proposals.
+        turn_id: TurnId,
+        /// Non-empty host explanation for rejecting the whole proposal batch.
+        reason: String,
+    },
     /// Records a model proposal after host validation and effect classification.
     ToolCallProposed {
         /// Run containing the proposal.
@@ -173,6 +182,7 @@ impl HarnessEvent {
             | Self::ContextCompacted { run_id, .. }
             | Self::ModelRequested { run_id, .. }
             | Self::ModelResponded { run_id, .. }
+            | Self::ToolProposalsRejected { run_id, .. }
             | Self::ToolCallProposed { run_id, .. }
             | Self::PolicyEvaluated { run_id, .. }
             | Self::ApprovalGranted { run_id, .. }
@@ -193,6 +203,7 @@ impl HarnessEvent {
             Self::ContextCompacted { .. } => "context_compacted",
             Self::ModelRequested { .. } => "model_requested",
             Self::ModelResponded { .. } => "model_responded",
+            Self::ToolProposalsRejected { .. } => "tool_proposals_rejected",
             Self::ToolCallProposed { .. } => "tool_call_proposed",
             Self::PolicyEvaluated { .. } => "policy_evaluated",
             Self::ApprovalGranted { .. } => "approval_granted",
@@ -279,6 +290,11 @@ mod tests {
                     input_tokens: 12,
                     output_tokens: 4,
                 },
+            },
+            HarnessEvent::ToolProposalsRejected {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                reason: "proposal schema invalid".into(),
             },
             HarnessEvent::ToolCallProposed {
                 run_id: run_id.clone(),
@@ -420,6 +436,16 @@ mod tests {
                             "input_tokens": 12,
                             "output_tokens": 4
                         }
+                    }
+                }),
+                HarnessEvent::ToolProposalsRejected { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "tool_proposals_rejected",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "reason": "proposal schema invalid"
                     }
                 }),
                 HarnessEvent::ToolCallProposed { .. } => json!({
