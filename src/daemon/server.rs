@@ -637,11 +637,11 @@ mod tests {
             outcome => panic!("post-ack connection did not close: {outcome:?}"),
         }
         assert!(!socket_path.exists());
-        assert!(!lock_path.exists());
+        assert!(lock_path.exists());
     }
 
     #[test]
-    fn two_workspaces_flush_shutdown_responses_then_remove_their_paths() {
+    fn two_workspaces_flush_shutdown_responses_and_leave_persistent_locks() {
         let first_workspace = tempfile::tempdir().unwrap();
         let second_workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
@@ -677,8 +677,11 @@ mod tests {
         first_handle.join().unwrap();
         second_handle.join().unwrap();
 
-        for path in [first_socket, first_lock, second_socket, second_lock] {
+        for path in [first_socket, second_socket] {
             assert!(!path.exists(), "shutdown left {}", path.display());
+        }
+        for path in [first_lock, second_lock] {
+            assert!(path.exists(), "shutdown removed {}", path.display());
         }
     }
 
@@ -744,7 +747,7 @@ mod tests {
 
         handle.join().unwrap();
         assert!(!socket_path.exists());
-        assert!(!paths.lock_path.exists());
+        assert!(paths.lock_path.exists());
     }
 
     #[test]
