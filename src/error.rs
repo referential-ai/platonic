@@ -70,7 +70,7 @@ pub enum Error {
         actual: String,
     },
 
-    /// A new turn reused the previous concluded turn id.
+    /// A new turn reused an earlier turn id from the same run.
     #[error("turn id was reused: {turn_id}")]
     TurnReused {
         /// Reused turn identifier.
@@ -88,6 +88,13 @@ pub enum Error {
         expected: String,
         /// Tool call named by the rejected event.
         actual: String,
+    },
+
+    /// A validated tool call reused an earlier call id from the same run.
+    #[error("tool call id was reused: {call_id}")]
+    ToolCallReused {
+        /// Reused tool-call identifier.
+        call_id: String,
     },
 
     /// A validated tool call did not match any pending model proposal.
