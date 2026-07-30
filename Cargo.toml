@@ -2,6 +2,7 @@
 name = "plato-agent"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 publish = ["crates-io"]
 description = "Plato Agent runtime and CLI built on the Platonic framework."
 license = "MIT OR Apache-2.0"
