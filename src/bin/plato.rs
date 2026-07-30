@@ -4,7 +4,7 @@ use plato_agent::{
     RunOverrides, RunSession,
     daemon::{
         client::{DaemonClient, DaemonConnectionConfig},
-        lock::ensure_workspace_unlocked,
+        lock::WorkspaceLock,
         protocol::{HelloResult, PendingApprovalSnapshot, RunStateName, StreamEvent},
     },
     ledger::{latest_default_sqlite_session_id, latest_sqlite_session_id},
@@ -115,13 +115,15 @@ enum IssuePrepCommand {
 }
 
 fn main() {
-    if let Err(error) = run() {
+    let mut workspace_lock = None;
+    if let Err(error) = run(&mut workspace_lock) {
         eprintln!("error: {error}");
+        drop(workspace_lock);
         std::process::exit(1);
     }
 }
 
-fn run() -> plato_agent::AppResult<()> {
+fn run(workspace_lock: &mut Option<WorkspaceLock>) -> plato_agent::AppResult<()> {
     let cli = Cli::parse();
     let workspace_root = std::env::current_dir()?;
     let implicit_tui =
@@ -147,12 +149,13 @@ fn run() -> plato_agent::AppResult<()> {
         },
         Some(Command::Replay { run, file }) => {
             let ledger = replay_ledger(cli.db, file, &workspace_root)?;
-            write_replay_output(&mut io::stdout(), ledger, run.as_deref(), &workspace_root)
+            *workspace_lock = acquire_sqlite_cli_lock(&ledger, &workspace_root)?;
+            write_replay_output(&mut io::stdout(), ledger, run.as_deref())
         }
         Some(Command::IssuePrep { command }) => {
             run_issue_prep_cli(command, cli.config, workspace_root)
         }
-        None => run_prompt(cli, workspace_root),
+        None => run_prompt(cli, workspace_root, workspace_lock),
     }
 }
 
@@ -251,7 +254,11 @@ fn handoff(mut command: ProcessCommand) -> plato_agent::AppResult<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-fn run_prompt(cli: Cli, workspace_root: PathBuf) -> plato_agent::AppResult<()> {
+fn run_prompt(
+    cli: Cli,
+    workspace_root: PathBuf,
+    workspace_lock: &mut Option<WorkspaceLock>,
+) -> plato_agent::AppResult<()> {
     let question = cli.question.join(" ");
     if question.trim().is_empty() {
         return Err(AppError::EmptyQuestion);
@@ -273,6 +280,7 @@ fn run_prompt(cli: Cli, workspace_root: PathBuf) -> plato_agent::AppResult<()> {
     }
 
     let ledger = run_ledger(cli.events, cli.db, &workspace_root)?;
+    *workspace_lock = acquire_sqlite_cli_lock(&ledger, &workspace_root)?;
     let session = run_session(cli.continue_session, &ledger)?;
     let outcome = run_question(RunOptions {
         question,
@@ -652,10 +660,19 @@ fn run_ledger(
     }
     match events {
         Some(path) => Ok(RunLedger::Jsonl(path)),
-        None => {
-            let ledger = sqlite_ledger(db, workspace_root)?;
-            ensure_workspace_unlocked(workspace_root)?;
-            Ok(ledger)
+        None => sqlite_ledger(db, workspace_root),
+    }
+}
+
+fn acquire_sqlite_cli_lock(
+    ledger: &RunLedger,
+    workspace_root: &Path,
+) -> plato_agent::AppResult<Option<WorkspaceLock>> {
+    match ledger {
+        RunLedger::Jsonl(_) => Ok(None),
+        RunLedger::Sqlite(_) | RunLedger::DefaultSqlite(_) => {
+            let socket_path = paths::default_socket_path(workspace_root)?;
+            WorkspaceLock::acquire_for_workspace(workspace_root, &socket_path).map(Some)
         }
     }
 }
@@ -749,15 +766,12 @@ fn write_replay_output(
     stdout: &mut impl Write,
     ledger: RunLedger,
     run: Option<&str>,
-    workspace_root: &Path,
 ) -> plato_agent::AppResult<()> {
     match ledger {
         RunLedger::Sqlite(path) => {
-            ensure_workspace_unlocked(workspace_root)?;
             writeln!(stdout, "{}", replay_sqlite(&path, run)?)?;
         }
         RunLedger::DefaultSqlite(path) => {
-            ensure_workspace_unlocked(workspace_root)?;
             writeln!(stdout, "{}", replay_default_sqlite(&path, run)?)?;
         }
         RunLedger::Jsonl(file) => {
@@ -1048,11 +1062,12 @@ mod tests {
     #[test]
     fn implicit_tui_requires_both_terminals_and_no_explicit_entry() {
         let bare = Cli::try_parse_from(["plato"]).unwrap();
+        let mut workspace_lock = None;
         assert!(implicit_tui_requested(&bare, true, true));
         assert!(!implicit_tui_requested(&bare, false, true));
         assert!(!implicit_tui_requested(&bare, true, false));
         assert!(matches!(
-            run_prompt(bare, PathBuf::from(".")),
+            run_prompt(bare, PathBuf::from("."), &mut workspace_lock),
             Err(AppError::EmptyQuestion)
         ));
 
@@ -1061,7 +1076,7 @@ mod tests {
         let empty_prompt = Cli::try_parse_from(["plato", ""]).unwrap();
         assert!(!implicit_tui_requested(&empty_prompt, true, true));
         assert!(matches!(
-            run_prompt(empty_prompt, PathBuf::from(".")),
+            run_prompt(empty_prompt, PathBuf::from("."), &mut workspace_lock),
             Err(AppError::EmptyQuestion)
         ));
         let replay = Cli::try_parse_from(["plato", "replay"]).unwrap();
@@ -1310,7 +1325,8 @@ mod tests {
             )
             .unwrap();
 
-            let error = run_ledger(None, None, workspace.path()).unwrap_err();
+            let ledger = run_ledger(None, None, workspace.path()).unwrap();
+            let error = acquire_sqlite_cli_lock(&ledger, workspace.path()).unwrap_err();
 
             assert!(matches!(error, AppError::DaemonLockHeld { .. }));
         });
@@ -1331,6 +1347,38 @@ mod tests {
                 run_ledger(Some(PathBuf::from("events.jsonl")), None, workspace.path()).unwrap();
 
             assert_eq!(ledger, RunLedger::Jsonl(PathBuf::from("events.jsonl")));
+            assert!(
+                acquire_sqlite_cli_lock(&ledger, workspace.path())
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn direct_sqlite_error_returns_with_lock_held_for_final_stderr() {
+        let workspace = tempfile::tempdir().unwrap();
+        with_test_xdg(workspace.path(), || {
+            let cli = Cli::try_parse_from([
+                "plato",
+                "--db=agent.db",
+                "--config",
+                "missing.toml",
+                "question",
+            ])
+            .unwrap();
+            let mut workspace_lock = None;
+
+            run_prompt(cli, workspace.path().to_path_buf(), &mut workspace_lock).unwrap_err();
+
+            assert!(workspace_lock.is_some());
+            let socket_path = paths::default_socket_path(workspace.path()).unwrap();
+            assert!(matches!(
+                WorkspaceLock::acquire_for_workspace(workspace.path(), &socket_path),
+                Err(AppError::DaemonLockHeld { .. })
+            ));
+            drop(workspace_lock.take());
+            drop(WorkspaceLock::acquire_for_workspace(workspace.path(), &socket_path).unwrap());
         });
     }
 
@@ -1589,13 +1637,10 @@ enabled = ["{enabled_tool}"]
             )
             .unwrap();
             let ledger = RunLedger::DefaultSqlite(default_sqlite(workspace.path()).unwrap());
-            let mut stdout = Vec::new();
 
-            let error =
-                write_replay_output(&mut stdout, ledger, None, workspace.path()).unwrap_err();
+            let error = acquire_sqlite_cli_lock(&ledger, workspace.path()).unwrap_err();
 
             assert!(matches!(error, AppError::DaemonLockHeld { .. }));
-            assert!(stdout.is_empty());
         });
     }
 
