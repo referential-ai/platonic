@@ -2685,10 +2685,10 @@ enabled = ["{enabled_tool}"]
                     content: answer.into(),
                 },
                 proposed_calls: vec![],
-                usage: ModelUsage {
+                usage: Some(ModelUsage {
                     input_tokens: 0,
                     output_tokens: 0,
-                },
+                }),
             },
             HarnessEvent::RunFinished {
                 run_id: run_id.clone(),

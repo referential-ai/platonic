@@ -104,6 +104,9 @@ pub fn format_readback(readback: &RunReadback) -> String {
             ReadbackEntry::ToolFailed { call_id, reason } => {
                 lines.push(format!("tool_failed {call_id}: {reason}"));
             }
+            ReadbackEntry::ContextCompacted { .. }
+            | ReadbackEntry::ModelFailed { .. }
+            | ReadbackEntry::ToolProposalsRejected { .. } => {}
         }
     }
 
@@ -371,10 +374,10 @@ mod tests {
                         tool: ToolName::new("shell.exec").unwrap(),
                         input: json!({"command": "cargo test"}),
                     }],
-                    usage: ModelUsage {
+                    usage: Some(ModelUsage {
                         input_tokens: 0,
                         output_tokens: 0,
-                    },
+                    }),
                 },
             ),
             record(

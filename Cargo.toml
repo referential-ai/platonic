@@ -28,7 +28,7 @@ path = "src/bin/plato-gateway-discord.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28.1"
-platonic-core = "0.1.0"
+platonic-core = "0.2.0"
 ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 rustix = { version = "1", features = ["event", "fs", "net", "process", "time"] }
