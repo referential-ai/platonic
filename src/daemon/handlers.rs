@@ -892,10 +892,96 @@ fn error_response(request_id: Option<String>, method: &'static str, message: Str
 mod tests {
     use super::*;
     use platonic_core::{
-        ActorId, ContextFragment, ContextLane, EffectClass, Message, MessageRole, ResultVisibility,
-        ToolCall, ToolCallId, ToolName, ToolResult, TurnId,
+        ActorId, ContextFragment, ContextLane, EffectClass, HarnessEvent, Message, MessageRole,
+        RecordedEvent, ResultVisibility, RunId, ToolCall, ToolCallId, ToolName, ToolResult, TurnId,
     };
     use serde_json::json;
+
+    #[test]
+    fn typed_entries_omit_context_compaction() {
+        let entries = typed_entries(
+            "current question",
+            vec![ReadbackEntry::ContextCompacted {
+                turn_id: TurnId::new("turn_1").unwrap(),
+                estimated_tokens_before: 321,
+                estimated_tokens_after: 123,
+                dropped_turn_start: 0,
+                dropped_turn_end_exclusive: 2,
+            }],
+        );
+
+        assert_eq!(
+            entries,
+            vec![TypedTranscriptEntry::User {
+                text: "current question".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn context_compaction_uses_v1_ledger_stream_envelope() {
+        let runtime = DaemonRuntime::new(crate::daemon::server::DaemonPaths {
+            workspace_root: PathBuf::from("/tmp/workspace"),
+            workspace_id: "workspace-1".into(),
+            socket_path: PathBuf::from("/tmp/agent.sock"),
+            lock_path: PathBuf::from("/tmp/agent.lock"),
+            ledger_path: PathBuf::from("/tmp/agent.db"),
+        });
+        let record = Arc::new(RunRecord::new(
+            "run_1".into(),
+            "session_1".into(),
+            PathBuf::from("/tmp/agent.db"),
+        ));
+        runtime.reserve_run(record.clone()).unwrap();
+        record.push_recorded_event(RecordedEvent {
+            seq: 1,
+            occurred_at_ms: 42,
+            event: HarnessEvent::ContextCompacted {
+                run_id: RunId::new("run_1").unwrap(),
+                turn_id: TurnId::new("turn_1").unwrap(),
+                estimated_tokens_before: 321,
+                estimated_tokens_after: 123,
+                dropped_turn_start: 0,
+                dropped_turn_end_exclusive: 2,
+            },
+        });
+
+        let response = handle_events_stream(
+            &runtime,
+            Envelope {
+                v: 1,
+                id: Some("stream_1".into()),
+                kind: crate::daemon::protocol::EnvelopeKind::Request,
+                method: Some("events.stream".into()),
+                params: None,
+                result: None,
+                error: None,
+            },
+            EventsStreamParams {
+                run_id: "run_1".into(),
+                from_offset: Some(0),
+                limit: Some(1),
+            },
+        );
+
+        assert_eq!(response.v, 1);
+        let result: EventsStreamResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(result.events.len(), 1);
+        let wire = serde_json::to_value(&result.events[0]).unwrap();
+        assert_eq!(wire["event"]["kind"], "ledger");
+        assert_eq!(
+            wire["event"]["record"]["event"],
+            json!({
+                "event": "context_compacted",
+                "run_id": "run_1",
+                "turn_id": "turn_1",
+                "estimated_tokens_before": 321,
+                "estimated_tokens_after": 123,
+                "dropped_turn_start": 0,
+                "dropped_turn_end_exclusive": 2
+            })
+        );
+    }
 
     #[test]
     fn typed_entries_map_all_human_readback_facts_in_order() {
