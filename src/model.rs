@@ -123,7 +123,7 @@ pub enum ModelStop {
 pub struct ModelResponse {
     pub content: Vec<ModelBlock>,
     pub stop: ModelStop,
-    pub usage: ModelUsage,
+    pub usage: Option<ModelUsage>,
 }
 
 impl ModelMessage {
@@ -214,6 +214,13 @@ mod tests {
 
         assert_eq!(response.text(), "I will read it.");
         assert_eq!(response.tool_uses().len(), 1);
+        assert_eq!(
+            response.usage,
+            Some(ModelUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+            })
+        );
     }
 
     #[test]

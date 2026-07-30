@@ -572,15 +572,12 @@ fn stop_from_finish(finish_reason: ChatFinishReason) -> ModelStop {
     }
 }
 
-fn usage_from(usage: Option<ChatUsage>) -> ModelUsage {
-    let usage = usage.unwrap_or(ChatUsage {
-        prompt_tokens: Some(0),
-        completion_tokens: Some(0),
-    });
-    ModelUsage {
-        input_tokens: usage.prompt_tokens.unwrap_or(0),
-        output_tokens: usage.completion_tokens.unwrap_or(0),
-    }
+fn usage_from(usage: Option<ChatUsage>) -> Option<ModelUsage> {
+    let usage = usage?;
+    Some(ModelUsage {
+        input_tokens: usage.prompt_tokens?,
+        output_tokens: usage.completion_tokens?,
+    })
 }
 
 fn model_response(
@@ -688,6 +685,28 @@ mod tests {
                 json!({"path": "README.md"})
             )]
         );
+    }
+
+    #[test]
+    fn non_streaming_usage_is_known_only_when_both_counts_are_reported() {
+        for (fixture, raw_usage, expected) in usage_fixtures() {
+            let mut raw_response = json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": "done"
+                    }
+                }]
+            });
+            if let Some(raw_usage) = raw_usage {
+                raw_response["usage"] = raw_usage;
+            }
+
+            let response: ChatCompletionResponse = serde_json::from_value(raw_response).unwrap();
+            let response = response.into_model_response().unwrap();
+
+            assert_eq!(response.usage, expected, "fixture: {fixture}");
+        }
     }
 
     #[test]
@@ -1167,8 +1186,35 @@ mod tests {
         assert_eq!(deltas, vec!["Hel", "lo"]);
         assert_eq!(response.text(), "Hello");
         assert_eq!(response.stop, ModelStop::EndTurn);
-        assert_eq!(response.usage.input_tokens, 4);
-        assert_eq!(response.usage.output_tokens, 2);
+        assert_eq!(
+            response.usage,
+            Some(ModelUsage {
+                input_tokens: 4,
+                output_tokens: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn streaming_usage_is_known_only_when_both_counts_are_reported() {
+        for (fixture, raw_usage, expected) in usage_fixtures() {
+            let mut raw = concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )
+            .to_string();
+            if let Some(raw_usage) = raw_usage {
+                raw.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"choices": [], "usage": raw_usage})
+                ));
+            }
+            raw.push_str("data: [DONE]\n\n");
+
+            let response = parse_chat_completion_stream(Cursor::new(raw), &mut |_| Ok(())).unwrap();
+
+            assert_eq!(response.usage, expected, "fixture: {fixture}");
+        }
     }
 
     #[test]
@@ -1189,8 +1235,7 @@ mod tests {
 
         assert!(deltas.is_empty());
         assert_eq!(response.stop, ModelStop::ToolUse);
-        assert_eq!(response.usage.input_tokens, 0);
-        assert_eq!(response.usage.output_tokens, 0);
+        assert_eq!(response.usage, None);
         assert_eq!(
             response.tool_uses(),
             vec![(
@@ -1285,5 +1330,43 @@ mod tests {
             assert_eq!(response.text(), "h\u{e9}\u{754c}");
             assert_eq!(response.stop, ModelStop::EndTurn);
         }
+    }
+
+    fn usage_fixtures() -> Vec<(&'static str, Option<Value>, Option<ModelUsage>)> {
+        vec![
+            (
+                "reported",
+                Some(json!({
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5
+                })),
+                Some(ModelUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                }),
+            ),
+            (
+                "reported_zero",
+                Some(json!({
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0
+                })),
+                Some(ModelUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                }),
+            ),
+            ("omitted", None, None),
+            (
+                "partial_prompt_only",
+                Some(json!({"prompt_tokens": 10})),
+                None,
+            ),
+            (
+                "partial_completion_only",
+                Some(json!({"completion_tokens": 5})),
+                None,
+            ),
+        ]
     }
 }

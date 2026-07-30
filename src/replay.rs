@@ -141,7 +141,50 @@ mod tests {
         ModelUsage, PolicyDecision, ResultVisibility, RunId, ToolCall, ToolCallId, ToolName,
         ToolProposal, ToolResult, TurnId,
     };
+    use rusqlite::{Connection, params};
     use serde_json::json;
+
+    const V1_JSONL_FIXTURE: &str = concat!(
+        r#"{"v":1,"record":{"seq":0,"occurred_at_ms":0,"event":{"event":"run_started","run_id":"run_v1","agent_id":"plato"}}}"#,
+        "\n",
+        r#"{"v":1,"record":{"seq":1,"occurred_at_ms":1,"event":{"event":"context_built","run_id":"run_v1","turn_id":"turn_1","context":{"fragments":[],"token_budget":4000}}}}"#,
+        "\n",
+        r#"{"v":1,"record":{"seq":2,"occurred_at_ms":2,"event":{"event":"model_requested","run_id":"run_v1","turn_id":"turn_1","step":0,"model":"test-model"}}}"#,
+        "\n",
+        r#"{"v":1,"record":{"seq":3,"occurred_at_ms":3,"event":{"event":"model_responded","run_id":"run_v1","turn_id":"turn_1","step":0,"output":{"role":"assistant","content":"old answer"},"proposed_calls":[],"usage":{"input_tokens":8,"output_tokens":3}}}}"#,
+        "\n",
+        r#"{"v":1,"record":{"seq":4,"occurred_at_ms":4,"event":{"event":"run_finished","run_id":"run_v1"}}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn replay_reads_v1_jsonl_and_maps_usage_object_to_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1-events.jsonl");
+        std::fs::write(&path, V1_JSONL_FIXTURE).unwrap();
+
+        let records = ledger::read_records(&path).unwrap();
+        assert_v1_usage_is_known(&records);
+
+        let replay = replay_file(&path).unwrap();
+        assert!(replay.contains("final_phase: Finished"));
+        assert!(replay.contains("[turn_1] assistant: old answer"));
+    }
+
+    #[test]
+    fn replay_reads_v1_sqlite_and_maps_usage_object_to_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1-events.db");
+        write_v1_sqlite_fixture(&path);
+
+        let records = ledger::read_sqlite_records(&path, Some("run_v1")).unwrap();
+        assert_v1_usage_is_known(&records);
+
+        let replay = replay_sqlite(&path, Some("run_v1")).unwrap();
+        assert!(replay.contains("final_phase: Finished"));
+        assert!(replay.contains("[turn_1] assistant: old answer"));
+        assert_eq!(replay_sqlite(&path, None).unwrap(), replay);
+    }
 
     #[test]
     fn sqlite_replay_without_run_reads_latest_session() {
@@ -457,6 +500,41 @@ mod tests {
             seq,
             occurred_at_ms: seq,
             event,
+        }
+    }
+
+    fn assert_v1_usage_is_known(records: &[platonic_core::RecordedEvent]) {
+        assert!(matches!(
+            &records[3].event,
+            HarnessEvent::ModelResponded {
+                usage: Some(ModelUsage {
+                    input_tokens: 8,
+                    output_tokens: 3,
+                }),
+                ..
+            }
+        ));
+    }
+
+    fn write_v1_sqlite_fixture(path: &Path) {
+        drop(SqliteLedger::open_or_create(path).unwrap());
+        let connection = Connection::open(path).unwrap();
+        for line in V1_JSONL_FIXTURE.lines() {
+            let line: serde_json::Value = serde_json::from_str(line).unwrap();
+            let record = &line["record"];
+            connection
+                .execute(
+                    "INSERT INTO ledger_events (run_id, seq, occurred_at_ms, v, event_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        "run_v1",
+                        record["seq"].as_i64().unwrap(),
+                        record["occurred_at_ms"].as_i64().unwrap(),
+                        line["v"].as_i64().unwrap(),
+                        serde_json::to_string(&record["event"]).unwrap(),
+                    ],
+                )
+                .unwrap();
         }
     }
 }
