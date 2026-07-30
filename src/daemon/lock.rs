@@ -111,8 +111,6 @@ impl WorkspaceLock {
             .and_then(|()| serde_json::to_writer(&mut file, &metadata))
             .and_then(|()| file.write_all(b"\n").map_err(serde_json::Error::io))
         {
-            #[cfg(windows)]
-            let _ = crate::windows_security::delete_file_on_close(&file);
             drop(file);
             return Err(Box::new(LockConflict {
                 path,
@@ -252,13 +250,6 @@ fn lock_unix_file(file: &File) -> std::io::Result<()> {
 #[cfg(windows)]
 fn create_lock_file(path: &Path) -> std::io::Result<File> {
     crate::windows_security::create_current_user_file(path)
-}
-
-impl Drop for WorkspaceLock {
-    fn drop(&mut self) {
-        #[cfg(windows)]
-        let _ = crate::windows_security::delete_file_on_close(&self._file);
-    }
 }
 
 #[cfg(unix)]
