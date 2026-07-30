@@ -414,12 +414,30 @@ fn handle_session_picker_key(
         }
         KeyEvent {
             code: KeyCode::Esc, ..
-        }
-        | KeyEvent {
-            code: KeyCode::Char('q'),
-            ..
         } => {
             state.session_picker = None;
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Backspace,
+            ..
+        } => {
+            let picker = state.session_picker.as_mut().expect("picker is open");
+            if picker.filter.pop().is_some() {
+                picker.selected = 0;
+            }
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Char(character),
+            modifiers,
+            ..
+        } if !character.is_control()
+            && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            let picker = state.session_picker.as_mut().expect("picker is open");
+            picker.filter.push(character);
+            picker.selected = 0;
             true
         }
         _ => true,
@@ -438,16 +456,21 @@ fn open_session_picker(state: &mut TuiState) {
         })
         .unwrap_or(0);
     state.session_picker = Some(SessionPickerView {
+        filter: String::new(),
         selected: selected.min(state.sessions.len().saturating_sub(1)),
     });
     state.status_message = Some("session picker opened".into());
 }
 
 fn move_session_picker_selection(state: &mut TuiState, delta: isize) {
+    let count = state
+        .session_picker
+        .as_ref()
+        .map(|picker| picker.matching_sessions(&state.sessions).len())
+        .unwrap_or(0);
     let Some(picker) = state.session_picker.as_mut() else {
         return;
     };
-    let count = state.sessions.len();
     picker.selected = wrapped_selection(picker.selected, count, delta);
 }
 
@@ -455,11 +478,14 @@ fn select_picker_session(commands: &Sender<ClientCommand>, state: &mut TuiState)
     let Some(session) = state
         .session_picker
         .as_ref()
-        .and_then(|picker| state.sessions.get(picker.selected))
+        .and_then(|picker| {
+            picker
+                .matching_sessions(&state.sessions)
+                .into_iter()
+                .nth(picker.selected)
+        })
         .cloned()
     else {
-        state.session_picker = None;
-        state.status_message = Some("no sessions".into());
         return;
     };
     state.session_picker = None;
@@ -2248,7 +2274,10 @@ mod tests {
 
         assert_eq!(
             state.session_picker,
-            Some(SessionPickerView { selected: 0 })
+            Some(SessionPickerView {
+                filter: String::new(),
+                selected: 0,
+            })
         );
         assert_eq!(
             state.status_message.as_deref(),
@@ -2258,22 +2287,19 @@ mod tests {
     }
 
     #[test]
-    fn session_picker_enter_loads_selected_session() {
+    fn session_picker_enter_loads_focused_filtered_session() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
         state.sessions = vec![
             test_session("session_1", "run_1", RunStateName::Finished, "first"),
             test_session("session_2", "run_2", RunStateName::Interrupted, "second"),
         ];
-        state.session_picker = Some(SessionPickerView { selected: 0 });
+        state.session_picker = Some(SessionPickerView {
+            filter: "sec".into(),
+            selected: 0,
+        });
         let runtime = UiRuntime::from_state(&state, None);
 
-        assert!(press_key(
-            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
-            &mut state,
-            &runtime,
-            &sender,
-        ));
         assert!(press_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
             &mut state,
@@ -2287,6 +2313,117 @@ mod tests {
             ClientCommand::LoadSession { session_id } => assert_eq!(session_id, "session_2"),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_picker_filter_edit_is_local_and_resets_selection() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.sessions = vec![
+            test_session("session_1", "run_1", RunStateName::Finished, "question one"),
+            test_session("session_2", "run_2", RunStateName::Finished, "question two"),
+        ];
+        state.session_picker = Some(SessionPickerView {
+            filter: String::new(),
+            selected: 1,
+        });
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert_eq!(
+            state.session_picker,
+            Some(SessionPickerView {
+                filter: "q".into(),
+                selected: 0,
+            })
+        );
+        assert!(receiver.try_recv().is_err());
+
+        state.session_picker.as_mut().unwrap().selected = 1;
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert_eq!(
+            state.session_picker,
+            Some(SessionPickerView {
+                filter: String::new(),
+                selected: 0,
+            })
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn session_picker_navigation_wraps_filtered_results() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.sessions = vec![
+            test_session("session_1", "run_1", RunStateName::Finished, "alpha"),
+            test_session("session_2", "run_2", RunStateName::Finished, "unrelated"),
+            test_session("session_3", "run_3", RunStateName::Finished, "ALPINE"),
+        ];
+        state.session_picker = Some(SessionPickerView {
+            filter: "alp".into(),
+            selected: 0,
+        });
+        let runtime = UiRuntime::from_state(&state, None);
+
+        for (key, expected) in [
+            (KeyEvent::new(KeyCode::Up, KeyModifiers::empty()), 1),
+            (KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL), 0),
+            (KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), 1),
+            (KeyEvent::new(KeyCode::Down, KeyModifiers::empty()), 0),
+        ] {
+            assert!(press_key(key, &mut state, &runtime, &sender));
+            assert_eq!(
+                state.session_picker.as_ref().map(|picker| picker.selected),
+                Some(expected)
+            );
+        }
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn session_picker_no_match_enter_stays_open_and_escape_closes() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.sessions = vec![test_session(
+            "session_1",
+            "run_1",
+            RunStateName::Finished,
+            "first",
+        )];
+        state.session_picker = Some(SessionPickerView {
+            filter: "missing".into(),
+            selected: 0,
+        });
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert!(state.session_picker.is_some());
+        assert!(receiver.try_recv().is_err());
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert!(state.session_picker.is_none());
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

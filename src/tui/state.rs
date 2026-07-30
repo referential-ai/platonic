@@ -103,7 +103,18 @@ pub struct SlashPopupView {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionPickerView {
+    pub filter: String,
     pub selected: usize,
+}
+
+impl SessionPickerView {
+    pub fn matching_sessions<'a>(&self, sessions: &'a [SessionSummary]) -> Vec<&'a SessionSummary> {
+        let filter = self.filter.to_lowercase();
+        sessions
+            .iter()
+            .filter(|session| session.latest_question.to_lowercase().contains(&filter))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -217,4 +228,73 @@ pub enum LiveEventKind {
     Tool,
     Status,
     Warning,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_picker_matches_unicode_lowercase_substrings_in_source_order() {
+        let sessions = vec![
+            session("session_1", "First STRAẞE task"),
+            session("session_2", "unrelated"),
+            session("session_3", "Third Straße follow-up"),
+        ];
+        let mut picker = SessionPickerView {
+            filter: String::new(),
+            selected: 0,
+        };
+
+        assert_eq!(
+            session_ids(picker.matching_sessions(&sessions)),
+            vec!["session_1", "session_2", "session_3"]
+        );
+
+        picker.filter = "straße".into();
+        assert_eq!(
+            session_ids(picker.matching_sessions(&sessions)),
+            vec!["session_1", "session_3"]
+        );
+    }
+
+    #[test]
+    fn session_picker_does_not_normalize_unicode_or_apply_locale_rules() {
+        let sessions = vec![
+            session("session_1", "Review Café"),
+            session("session_2", "Visit İSTANBUL"),
+        ];
+        let mut picker = SessionPickerView {
+            filter: "cafe\u{301}".into(),
+            selected: 0,
+        };
+
+        assert!(picker.matching_sessions(&sessions).is_empty());
+
+        picker.filter = "istanbul".into();
+        assert!(picker.matching_sessions(&sessions).is_empty());
+
+        picker.filter = "i\u{307}stanbul".into();
+        assert_eq!(
+            session_ids(picker.matching_sessions(&sessions)),
+            vec!["session_2"]
+        );
+    }
+
+    fn session(session_id: &str, latest_question: &str) -> SessionSummary {
+        SessionSummary {
+            session_id: session_id.into(),
+            run_id: format!("run_{session_id}"),
+            status: RunStateName::Finished,
+            latest_question: latest_question.into(),
+            ledger_path: "/tmp/agent.db".into(),
+        }
+    }
+
+    fn session_ids(sessions: Vec<&SessionSummary>) -> Vec<&str> {
+        sessions
+            .into_iter()
+            .map(|session| session.session_id.as_str())
+            .collect()
+    }
 }
