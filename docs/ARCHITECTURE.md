@@ -187,7 +187,7 @@ The multi-turn proof extends that contract without adding IO or runtime machiner
 - a successful tool result can conclude one turn and feed a later host-built context/model turn;
 - whole-batch proposal rejection, policy denial, approval denial, and tool failure can also conclude a turn and continue through later host-built context;
 - each turn consumes at most one host-validated tool call, while `model_responded` records all proposals as ledger facts;
-- immediate `turn_id` reuse after a concluded turn is rejected;
+- `turn_id` and host-validated `ToolCallId` reuse anywhere later in the same run is rejected;
 - model `step` sequencing continues across turns;
 - replay over a two-turn ledger still emits zero model calls and zero tool executions.
 - readback projection is derived from replay-validated ledgers and rejects invalid event streams instead of producing partial transcripts.
