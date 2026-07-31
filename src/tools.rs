@@ -1098,6 +1098,8 @@ mod tests {
 
     #[cfg(windows)]
     const WINDOWS_PROCESS_REPEAT_COUNT: usize = 25;
+    #[cfg(windows)]
+    const WINDOWS_DESCENDANT_TIMEOUT_SECONDS: u64 = 5;
 
     struct InstrumentedReader {
         bytes: Vec<u8>,
@@ -2180,15 +2182,17 @@ mod tests {
             SHELL_EXEC,
             json!({
                 "command": r#"set "PATH=path-without-ping"&&.\descendant-probe.cmd"#,
-                "timeout_seconds": 1
+                "timeout_seconds": WINDOWS_DESCENDANT_TIMEOUT_SECONDS
             }),
         )
         .unwrap_err();
+        let expected_error =
+            format!("shell.exec timed out after {WINDOWS_DESCENDANT_TIMEOUT_SECONDS}s");
 
         assert!(
             matches!(
                 &err,
-                AppError::Tool(message) if message == "shell.exec timed out after 1s"
+                AppError::Tool(message) if message == &expected_error
             ),
             "descendant fixture {} returned {err}",
             dir.path().display()
