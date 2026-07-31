@@ -20,6 +20,8 @@ const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const PLATO_CONFIG_ENV: &str = "PLATO_CONFIG";
 const WORKSPACE_PROVIDER_OVERRIDE_ERROR: &str = "workspace plato.toml cannot set provider.api_key_env or provider.base_url; use --config, PLATO_CONFIG, or user config";
+const WORKSPACE_GATEWAY_ERROR: &str =
+    "workspace plato.toml cannot set [gateway]; use --config, PLATO_CONFIG, or user config";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ResolvedConfigPath {
@@ -37,13 +39,6 @@ impl ResolvedConfigPath {
     fn into_path(self) -> PathBuf {
         match self {
             Self::Authorized(path) | Self::Workspace(path) => path,
-        }
-    }
-
-    pub(crate) fn forwarded_path(&self) -> Option<&Path> {
-        match self {
-            Self::Authorized(path) => Some(path),
-            Self::Workspace(_) => None,
         }
     }
 }
@@ -162,6 +157,9 @@ impl Config {
             return Ok(Self::default());
         };
         let raw = Self::read_raw(resolved.path())?;
+        if matches!(resolved, ResolvedConfigPath::Workspace(_)) && raw.gateway.is_some() {
+            return Err(AppError::Config(WORKSPACE_GATEWAY_ERROR.into()));
+        }
         if matches!(resolved, ResolvedConfigPath::Workspace(_))
             && raw.provider.as_ref().is_some_and(|provider| {
                 provider.api_key_env.is_some() || provider.base_url.is_some()
@@ -302,6 +300,11 @@ impl GatewayConfig {
         if raw.discord.owner_user_ids.contains(&0) {
             return Err(AppError::Config(
                 "gateway.discord.owner_user_ids must contain positive integers".into(),
+            ));
+        }
+        if raw.discord.channel_configs.is_empty() {
+            return Err(AppError::Config(
+                "gateway.discord.channel_configs must not be empty".into(),
             ));
         }
         let mut channel_configs = HashMap::new();
@@ -559,6 +562,30 @@ owner_user_ids = [123456789]
     }
 
     #[test]
+    fn rejects_empty_discord_channel_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gateway.toml");
+        std::fs::write(
+            &path,
+            r#"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [123456789]
+"#,
+        )
+        .unwrap();
+
+        let resolved = ResolvedConfigPath::Authorized(path);
+        let error = Config::load_resolved(Some(&resolved)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Config(message)
+                if message == "gateway.discord.channel_configs must not be empty"
+        ));
+    }
+
+    #[test]
     fn rejects_zero_and_nonnumeric_discord_channel_config_keys() {
         for channel_id in ["0", "+1", "not-a-channel"] {
             let dir = tempfile::tempdir().unwrap();
@@ -660,13 +687,39 @@ owner_user_ids = [123456789]
                 .unwrap();
 
             assert!(matches!(&resolved, ResolvedConfigPath::Workspace(_)));
-            assert_eq!(resolved.forwarded_path(), None);
             let error = Config::load_resolved(Some(&resolved)).unwrap_err();
             assert!(matches!(
                 error,
                 AppError::Config(message) if message == WORKSPACE_PROVIDER_OVERRIDE_ERROR
             ));
         }
+    }
+
+    #[test]
+    fn auto_workspace_config_rejects_the_gateway_table() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("plato.toml"),
+            r#"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [42]
+
+[gateway.discord.channel_configs]
+"200" = "channel.toml"
+"#,
+        )
+        .unwrap();
+        let resolved = resolve_config_with(workspace.path(), None, None, None, None)
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(&resolved, ResolvedConfigPath::Workspace(_)));
+        let error = Config::load_resolved(Some(&resolved)).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Config(message) if message == WORKSPACE_GATEWAY_ERROR
+        ));
     }
 
     #[test]
@@ -685,10 +738,6 @@ max_turns = 2
 
 [tools]
 enabled = ["file.read"]
-
-[gateway.discord]
-api_key_env = "DISCORD_BOT_TOKEN"
-owner_user_ids = [42]
 "#,
         )
         .unwrap();
@@ -709,11 +758,11 @@ owner_user_ids = [42]
         assert_eq!(config.provider.stream_idle_timeout_ms, 3000);
         assert_eq!(config.limits.max_turns, 2);
         assert_eq!(config.tools.enabled, vec!["file.read"]);
-        assert_eq!(config.gateway.unwrap().discord.owner_user_ids, vec![42]);
+        assert!(config.gateway.is_none());
     }
 
     #[test]
-    fn explicit_environment_and_user_configs_allow_sensitive_provider_fields() {
+    fn explicit_environment_and_user_configs_allow_trusted_fields() {
         for source in ["explicit", "environment", "user"] {
             let workspace = tempfile::tempdir().unwrap();
             let name = if source == "explicit" {
@@ -728,6 +777,13 @@ owner_user_ids = [42]
 [provider]
 api_key_env = "AUTHORIZED_SECRET"
 base_url = "https://provider.example/v1"
+
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [42]
+
+[gateway.discord.channel_configs]
+"200" = "channel.toml"
 "#,
             )
             .unwrap();
@@ -751,10 +807,18 @@ base_url = "https://provider.example/v1"
 
             let config = Config::load_resolved(Some(&resolved)).unwrap();
 
-            assert!(matches!(&resolved, ResolvedConfigPath::Authorized(_)));
-            assert_eq!(resolved.forwarded_path(), Some(path.as_path()));
+            assert!(matches!(
+                &resolved,
+                ResolvedConfigPath::Authorized(resolved_path) if resolved_path == &path
+            ));
             assert_eq!(config.provider.api_key_env, "AUTHORIZED_SECRET");
             assert_eq!(config.provider.base_url, "https://provider.example/v1");
+            let discord = config.gateway.unwrap().discord;
+            assert_eq!(discord.owner_user_ids, vec![42]);
+            assert_eq!(
+                discord.channel_configs,
+                HashMap::from([(200, PathBuf::from("channel.toml"))])
+            );
         }
     }
 
