@@ -32,7 +32,8 @@ use windows_sys::Win32::{
     },
     System::{
         Pipes::{
-            GetNamedPipeServerProcessId, PIPE_NOWAIT, SetNamedPipeHandleState, WaitNamedPipeW,
+            GetNamedPipeServerProcessId, PIPE_NOWAIT, PIPE_WAIT, SetNamedPipeHandleState,
+            WaitNamedPipeW,
         },
         SystemInformation::GetSystemDirectoryW,
         Threading::{
@@ -344,7 +345,14 @@ pub(crate) fn connect_current_user_pipe_for_pid(
 }
 
 fn set_pipe_nowait(pipe: &File) -> io::Result<()> {
-    let mode = PIPE_NOWAIT;
+    set_pipe_mode(pipe, PIPE_NOWAIT)
+}
+
+pub(crate) fn set_pipe_wait(pipe: &File) -> io::Result<()> {
+    set_pipe_mode(pipe, PIPE_WAIT)
+}
+
+fn set_pipe_mode(pipe: &File, mode: u32) -> io::Result<()> {
     // SAFETY: pipe is a live client pipe handle and mode is readable for the call.
     if unsafe {
         SetNamedPipeHandleState(

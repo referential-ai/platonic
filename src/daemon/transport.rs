@@ -186,6 +186,9 @@ pub(crate) fn set_deadline(stream: &mut Stream, deadline: std::time::Instant) ->
 
 #[cfg(windows)]
 pub(crate) fn clear_deadline(stream: &mut Stream) -> io::Result<()> {
+    if let WindowsStream::Client(pipe) = &stream.inner {
+        crate::windows_security::set_pipe_wait(pipe)?;
+    }
     stream.deadline = None;
     Ok(())
 }
