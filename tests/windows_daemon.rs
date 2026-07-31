@@ -3,7 +3,10 @@
 
 use interprocess::{
     local_socket::{GenericFilePath, ListenerOptions, Stream, prelude::*},
-    os::windows::{local_socket::ListenerOptionsExt, security_descriptor::SecurityDescriptor},
+    os::windows::{
+        local_socket::ListenerOptionsExt,
+        security_descriptor::{AsSecurityDescriptorExt, SecurityDescriptor},
+    },
 };
 use plato_agent::{
     daemon::{
@@ -19,7 +22,11 @@ use std::{
     env,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
-    os::windows::{ffi::OsStrExt, process::CommandExt},
+    os::windows::{
+        ffi::OsStrExt,
+        io::{FromRawHandle, OwnedHandle},
+        process::CommandExt,
+    },
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
     ptr,
@@ -33,11 +40,14 @@ use std::{
 };
 use widestring::U16CString;
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HANDLE, SetLastError,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
+    },
     Security::{
         GetTokenInformation, ImpersonateLoggedOnUser, LOGON32_LOGON_NETWORK,
-        LOGON32_PROVIDER_DEFAULT, LogonUserW, RevertToSelf, SECURITY_IMPERSONATION_LEVEL,
-        SecurityIdentification, TOKEN_QUERY, TokenImpersonationLevel,
+        LOGON32_PROVIDER_DEFAULT, LogonUserW, RevertToSelf, SECURITY_ATTRIBUTES,
+        SECURITY_IMPERSONATION_LEVEL, SecurityIdentification, TOKEN_QUERY, TokenImpersonationLevel,
     },
     System::{
         Console::{
@@ -45,7 +55,7 @@ use windows_sys::Win32::{
             GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
         },
         Threading::{
-            CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+            CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CreateMutexW,
             CreateProcessWithLogonW, GetCurrentThread, GetExitCodeProcess, OpenThreadToken,
             PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
         },
@@ -53,33 +63,128 @@ use windows_sys::Win32::{
 };
 
 const PROOF_TIMEOUT: Duration = Duration::from_secs(15);
+const WINDOWS_REPEAT_COUNT: usize = 25;
 static DAEMON_STARTUP: Mutex<()> = Mutex::new(());
 
 #[test]
 #[ignore = "holds the process-global installer gate; run serially"]
 fn installer_gate_refuses_daemon_before_endpoint_or_lock_creation() {
+    for iteration in 1..=WINDOWS_REPEAT_COUNT {
+        eprintln!("installer-gate process proof {iteration}/{WINDOWS_REPEAT_COUNT}");
+        installer_gate_timeout_fails_closed();
+        installer_gate_release_starts_waiting_daemon();
+        installer_gate_abandonment_starts_waiting_daemon();
+    }
+}
+
+fn installer_gate_timeout_fails_closed() {
     let gate = InstallerStartupGate::acquire().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let lock_path = paths::default_lock_path(workspace.path()).unwrap();
     let socket_path = paths::default_socket_path(workspace.path()).unwrap();
 
     let started = Instant::now();
-    let output = Command::new(env!("CARGO_BIN_EXE_plato-agentd"))
-        .arg("--workspace")
-        .arg(workspace.path())
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
+    let mut child = daemon_command(workspace.path()).spawn().unwrap();
+    let pid = child.id();
+    let status = wait_bounded(&mut child, PROOF_TIMEOUT).unwrap_or_else(|error| {
+        panic!(
+            "daemon {pid} did not reach installer-gate timeout for fixture {}: {error}",
+            lock_path.display()
+        )
+    });
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
         .unwrap();
 
-    assert!(started.elapsed() < Duration::from_secs(3));
-    assert!(!output.status.success());
+    let elapsed = started.elapsed();
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("Plato Agent installation or update is in progress")
+        elapsed >= Duration::from_secs(4) && elapsed < PROOF_TIMEOUT,
+        "installer-gate timeout was not fixed and bounded for fixture {}: {elapsed:?}",
+        lock_path.display()
     );
-    assert!(!lock_path.exists());
+    assert!(
+        !status.success(),
+        "daemon {pid} bypassed held installer gate for fixture {}",
+        lock_path.display()
+    );
+    assert!(
+        stderr.contains("Plato Agent installation or update is in progress"),
+        "daemon did not report installer-gate timeout for fixture {}: {}",
+        lock_path.display(),
+        stderr
+    );
+    assert!(
+        !lock_path.exists(),
+        "timed-out daemon created fixture lock {}",
+        lock_path.display()
+    );
     assert!(DaemonClient::connect(&socket_path).is_err());
     drop(gate);
+}
+
+fn installer_gate_release_starts_waiting_daemon() {
+    let gate = InstallerStartupGate::acquire().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let lock_path = paths::default_lock_path(workspace.path()).unwrap();
+    let socket_path = paths::default_socket_path(workspace.path()).unwrap();
+    let child = daemon_command(workspace.path()).spawn().unwrap();
+    let mut daemon = ProofDaemon::from_waiting_child(
+        child,
+        workspace.path(),
+        lock_path.clone(),
+        socket_path.clone(),
+    );
+
+    assert_daemon_waiting_on_gate(&mut daemon.child, &lock_path, &socket_path);
+    drop(gate);
+    wait_for_path(&lock_path, &mut daemon.child);
+    wait_for_installer_gate_release(&lock_path, &mut daemon.child);
+    stop_daemon_and_assert_cleanup(
+        &mut daemon.child,
+        workspace.path(),
+        &lock_path,
+        &socket_path,
+    );
+}
+
+fn installer_gate_abandonment_starts_waiting_daemon() {
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir.path().join("installer-gate-owner-ready");
+    let mut owner = GateOwnerProcess::spawn(&marker);
+    owner.wait_until_ready(&marker);
+    let observer = open_existing_installer_gate();
+
+    let workspace = tempfile::tempdir().unwrap();
+    let lock_path = paths::default_lock_path(workspace.path()).unwrap();
+    let socket_path = paths::default_socket_path(workspace.path()).unwrap();
+    let child = daemon_command(workspace.path()).spawn().unwrap();
+    let mut daemon = ProofDaemon::from_waiting_child(
+        child,
+        workspace.path(),
+        lock_path.clone(),
+        socket_path.clone(),
+    );
+    assert_daemon_waiting_on_gate(&mut daemon.child, &lock_path, &socket_path);
+
+    let owner_pid = owner.id();
+    let status = owner.abandon();
+    assert!(
+        !status.success(),
+        "installer-gate owner {owner_pid} was not terminated for abandonment proof"
+    );
+    wait_for_path(&lock_path, &mut daemon.child);
+    wait_for_installer_gate_release(&lock_path, &mut daemon.child);
+    drop(observer);
+    stop_daemon_and_assert_cleanup(
+        &mut daemon.child,
+        workspace.path(),
+        &lock_path,
+        &socket_path,
+    );
 }
 
 #[test]
@@ -87,9 +192,16 @@ fn installer_gate_refuses_daemon_before_endpoint_or_lock_creation() {
 fn installer_gate_is_isolated_per_current_user() {
     let username = env::var("PLATO_WINDOWS_SECOND_USER").unwrap();
     let password = env::var("PLATO_WINDOWS_SECOND_PASSWORD").unwrap();
+    for iteration in 1..=WINDOWS_REPEAT_COUNT {
+        eprintln!("installer-gate owner proof {iteration}/{WINDOWS_REPEAT_COUNT}");
+        installer_gate_owner_validation_once(&username, &password, iteration);
+    }
+}
+
+fn installer_gate_owner_validation_once(username: &str, password: &str, iteration: usize) {
     let public = env::var_os("PUBLIC").expect("PUBLIC is required for the cross-user proof");
     let shared = tempfile::Builder::new()
-        .prefix("plato-149-")
+        .prefix(&format!("plato-300-owner-{iteration}-"))
         .tempdir_in(public)
         .unwrap();
     let grant = Command::new("icacls.exe")
@@ -107,8 +219,8 @@ fn installer_gate_is_isolated_per_current_user() {
 
     let gate = InstallerStartupGate::acquire().unwrap();
     let mut child = LoggedOnProcess::spawn_test(
-        &username,
-        &password,
+        username,
+        password,
         &helper,
         shared.path(),
         "installer_gate_second_user_child",
@@ -116,12 +228,55 @@ fn installer_gate_is_isolated_per_current_user() {
     .unwrap();
     assert_eq!(child.wait_bounded(PROOF_TIMEOUT).unwrap(), 0);
     drop(gate);
+
+    let hostile_gate = create_second_user_owned_installer_gate(username, password);
+    let workspace = tempfile::tempdir().unwrap();
+    let lock_path = paths::default_lock_path(workspace.path()).unwrap();
+    let socket_path = paths::default_socket_path(workspace.path()).unwrap();
+    let started = Instant::now();
+    let output = daemon_command(workspace.path()).output().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "daemon waited on invalid-owner installer gate for fixture {}",
+        lock_path.display()
+    );
+    assert!(
+        !output.status.success(),
+        "daemon accepted invalid-owner installer gate for fixture {}",
+        lock_path.display()
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("kernel object is not owned by the current user"),
+        "daemon did not report invalid installer-gate ownership for fixture {}: {}",
+        lock_path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !lock_path.exists(),
+        "invalid-owner daemon created fixture lock {}",
+        lock_path.display()
+    );
+    assert!(DaemonClient::connect(&socket_path).is_err());
+    drop(hostile_gate);
+    drop(InstallerStartupGate::acquire().unwrap());
 }
 
 #[test]
 #[ignore = "child process for the cross-user installer-gate proof"]
 fn installer_gate_second_user_child() {
     drop(InstallerStartupGate::acquire().unwrap());
+}
+
+#[test]
+#[ignore = "child process that abandons the installer gate"]
+fn installer_gate_abandonment_child() {
+    let marker = env::var_os("PLATO_INSTALLER_GATE_READY").unwrap();
+    let _gate = InstallerStartupGate::acquire().unwrap();
+    fs::write(&marker, format!("pid={}\n", std::process::id())).unwrap();
+    loop {
+        thread::park();
+    }
 }
 
 #[test]
@@ -232,6 +387,13 @@ fn ctrl_break_stops_daemon_and_removes_lock() {
 
 #[test]
 fn child_kill_removes_lock_and_allows_immediate_same_workspace_restart() {
+    for iteration in 1..=WINDOWS_REPEAT_COUNT {
+        eprintln!("daemon child-kill proof {iteration}/{WINDOWS_REPEAT_COUNT}");
+        child_kill_removes_lock_and_allows_immediate_same_workspace_restart_once();
+    }
+}
+
+fn child_kill_removes_lock_and_allows_immediate_same_workspace_restart_once() {
     let local_app_data = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let mut first = ProofDaemon::spawn(workspace.path(), local_app_data.path());
@@ -767,6 +929,223 @@ fn assert_access_denied<T>(result: io::Result<T>) {
     }
 }
 
+fn daemon_command(workspace: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_plato-agentd"));
+    command
+        .arg("--workspace")
+        .arg(workspace)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn assert_daemon_waiting_on_gate(child: &mut Child, lock_path: &Path, socket_path: &Path) {
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!(
+                "daemon {} exited instead of waiting on installer gate for fixture {} ({status}): {stderr}",
+                child.id(),
+                lock_path.display()
+            );
+        }
+        assert!(
+            !lock_path.exists(),
+            "daemon {} created fixture lock {} while installer gate was held",
+            child.id(),
+            lock_path.display()
+        );
+        assert!(
+            DaemonClient::connect(socket_path).is_err(),
+            "daemon {} created fixture endpoint {} while installer gate was held",
+            child.id(),
+            socket_path.display()
+        );
+        if Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn stop_daemon_and_assert_cleanup(
+    child: &mut Child,
+    workspace: &Path,
+    lock_path: &Path,
+    socket_path: &Path,
+) {
+    let pid = child.id();
+    let mut client = connect_bounded(socket_path);
+    client.hello(workspace).unwrap();
+    assert_eq!(
+        client.shutdown_if_idle().unwrap().result,
+        ShutdownIfIdleResultName::Shutdown
+    );
+    drop(client);
+    let status = wait_bounded(child, PROOF_TIMEOUT).unwrap();
+    assert!(
+        status.success(),
+        "daemon {pid} failed after installer-gate release for fixture {}: {status}",
+        lock_path.display()
+    );
+    assert!(
+        !lock_path.exists(),
+        "daemon {pid} left fixture lock {}",
+        lock_path.display()
+    );
+    assert!(DaemonClient::connect(socket_path).is_err());
+}
+
+fn current_user_installer_gate_name() -> U16CString {
+    let whoami = Path::new(&env::var_os("SystemRoot").unwrap()).join("System32/whoami.exe");
+    let output = Command::new(&whoami)
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {}: {error}", whoami.display()));
+    assert!(
+        output.status.success(),
+        "{} failed: {}",
+        whoami.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let row = String::from_utf8(output.stdout).unwrap();
+    let sid = row
+        .trim()
+        .rsplit_once(',')
+        .map(|(_, sid)| sid.trim_matches('"'))
+        .filter(|sid| sid.starts_with("S-1-"))
+        .unwrap_or_else(|| panic!("{} returned invalid SID row: {row:?}", whoami.display()));
+    U16CString::from_str(format!(r"Global\plato-agent-installer-{sid}")).unwrap()
+}
+
+fn open_existing_installer_gate() -> OwnedHandle {
+    let name = current_user_installer_gate_name();
+    // SAFETY: name is NUL-terminated and the returned handle is checked and owned below.
+    unsafe { SetLastError(ERROR_SUCCESS) };
+    let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
+    let error = unsafe { GetLastError() };
+    assert!(!handle.is_null(), "failed to open installer gate: {error}");
+    assert_eq!(
+        error, ERROR_ALREADY_EXISTS,
+        "installer-gate owner fixture was not present"
+    );
+    // SAFETY: CreateMutexW returned a new owned handle.
+    unsafe { OwnedHandle::from_raw_handle(handle) }
+}
+
+fn create_second_user_owned_installer_gate(username: &str, password: &str) -> OwnedHandle {
+    let name = current_user_installer_gate_name();
+    // Windows fills the absent owner from the impersonation token; the open DACL lets the
+    // primary user reach production owner validation instead of failing during CreateMutexW.
+    let descriptor = U16CString::from_str("D:P(A;;GA;;;WD)").unwrap();
+    let descriptor = SecurityDescriptor::deserialize(&descriptor).unwrap();
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>()
+            .try_into()
+            .expect("SECURITY_ATTRIBUTES size fits u32"),
+        lpSecurityDescriptor: ptr::null_mut(),
+        bInheritHandle: 0,
+    };
+    descriptor.write_to_security_attributes(&mut attributes);
+    let impersonation = Impersonation::start(username, password).unwrap();
+    // SAFETY: attributes and name remain live for this call; the returned handle is checked.
+    unsafe { SetLastError(ERROR_SUCCESS) };
+    let handle = unsafe { CreateMutexW(&attributes, 0, name.as_ptr()) };
+    let error = unsafe { GetLastError() };
+    drop(impersonation);
+    assert!(
+        !handle.is_null(),
+        "second user failed to create hostile installer gate: {error}"
+    );
+    assert_eq!(
+        error, ERROR_SUCCESS,
+        "hostile installer-gate fixture collided with an existing object"
+    );
+    // SAFETY: CreateMutexW returned a new owned handle.
+    unsafe { OwnedHandle::from_raw_handle(handle) }
+}
+
+struct GateOwnerProcess {
+    child: Option<Child>,
+}
+
+impl GateOwnerProcess {
+    fn spawn(marker: &Path) -> Self {
+        let child = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "installer_gate_abandonment_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("PLATO_INSTALLER_GATE_READY", marker)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        Self { child: Some(child) }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.as_ref().unwrap().id()
+    }
+
+    fn wait_until_ready(&mut self, marker: &Path) {
+        let deadline = Instant::now() + PROOF_TIMEOUT;
+        let child = self.child.as_mut().unwrap();
+        loop {
+            if marker.exists() {
+                return;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                let mut stderr = String::new();
+                child
+                    .stderr
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut stderr)
+                    .unwrap();
+                panic!(
+                    "installer-gate owner {} exited before creating marker {} ({status}): {stderr}",
+                    child.id(),
+                    marker.display()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "installer-gate owner {} did not create marker {}",
+                child.id(),
+                marker.display()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn abandon(mut self) -> ExitStatus {
+        let mut child = self.child.take().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap()
+    }
+}
+
+impl Drop for GateOwnerProcess {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 fn connect_bounded(path: &Path) -> DaemonClient {
     let deadline = Instant::now() + PROOF_TIMEOUT;
     loop {
@@ -893,6 +1272,22 @@ struct ProofDaemon {
 }
 
 impl ProofDaemon {
+    fn from_waiting_child(
+        child: Child,
+        workspace_root: &Path,
+        lock_path: std::path::PathBuf,
+        socket_path: std::path::PathBuf,
+    ) -> Self {
+        let workspace_root = workspace_root.canonicalize().unwrap();
+        Self {
+            child,
+            workspace_id: paths::workspace_id(&workspace_root).unwrap(),
+            workspace_root,
+            socket_path,
+            lock_path,
+        }
+    }
+
     fn spawn(workspace_root: &Path, local_app_data: &Path) -> Self {
         let workspace_root = workspace_root.canonicalize().unwrap();
         let workspace_id = paths::workspace_id(&workspace_root).unwrap();

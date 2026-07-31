@@ -1096,6 +1096,9 @@ mod tests {
     use super::*;
     use platonic_core::ToolCallId;
 
+    #[cfg(windows)]
+    const WINDOWS_PROCESS_REPEAT_COUNT: usize = 25;
+
     struct InstrumentedReader {
         bytes: Vec<u8>,
         position: usize,
@@ -2156,6 +2159,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn shell_exec_timeout_kills_windows_descendants() {
+        for iteration in 1..=WINDOWS_PROCESS_REPEAT_COUNT {
+            eprintln!("shell timeout descendant proof {iteration}/{WINDOWS_PROCESS_REPEAT_COUNT}");
+            shell_exec_timeout_kills_windows_descendants_once();
+        }
+    }
+
+    #[cfg(windows)]
+    fn shell_exec_timeout_kills_windows_descendants_once() {
         let dir = tempfile::tempdir().unwrap();
         write_windows_descendant_probe(dir.path());
         let path_without_ping = dir.path().join("path-without-ping");
@@ -2198,6 +2209,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn shell_exec_cancel_kills_windows_descendants() {
+        for iteration in 1..=WINDOWS_PROCESS_REPEAT_COUNT {
+            eprintln!("shell cancel descendant proof {iteration}/{WINDOWS_PROCESS_REPEAT_COUNT}");
+            shell_exec_cancel_kills_windows_descendants_once();
+        }
+    }
+
+    #[cfg(windows)]
+    fn shell_exec_cancel_kills_windows_descendants_once() {
         let dir = tempfile::tempdir().unwrap();
         write_windows_descendant_probe(dir.path());
         let path_without_ping = dir.path().join("path-without-ping");
