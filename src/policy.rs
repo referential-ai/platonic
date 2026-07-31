@@ -34,8 +34,10 @@ impl EffectClass {
 }
 
 /// Policy decision for a proposed model or tool action.
+///
+/// The tagged JSON schema rejects unknown fields rather than discarding policy data.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "decision")]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "decision")]
 pub enum PolicyDecision {
     /// Action may proceed.
     Allow,
@@ -54,6 +56,27 @@ pub enum PolicyDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ACCEPTED_V0_2_0_POLICY_DECISION_JSON: &str =
+        r#"{"decision":"require_approval","reason":"operator confirmation required"}"#;
+    const REJECTED_UNKNOWN_FIELD_POLICY_DECISION_JSON: &str = r#"{"decision":"require_approval","reason":"operator confirmation required","future_field":true}"#;
+
+    #[test]
+    fn policy_decision_json_schema_is_fail_closed_and_v0_2_0_compatible() {
+        let accepted: PolicyDecision =
+            serde_json::from_str(ACCEPTED_V0_2_0_POLICY_DECISION_JSON).unwrap();
+        assert_eq!(
+            accepted,
+            PolicyDecision::RequireApproval {
+                reason: "operator confirmation required".into(),
+            }
+        );
+
+        let error =
+            serde_json::from_str::<PolicyDecision>(REJECTED_UNKNOWN_FIELD_POLICY_DECISION_JSON)
+                .unwrap_err();
+        assert!(error.to_string().contains("unknown field `future_field`"));
+    }
 
     #[test]
     fn external_side_effects_fail_closed_by_default() {

@@ -29,8 +29,10 @@ pub struct RecordedEvent {
 }
 
 /// Durable event log entries. Transcript, metrics, replay, and audit views are derived from this log.
+///
+/// The tagged JSON schema rejects unknown fields rather than discarding durable data.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "event")]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "event")]
 pub enum HarnessEvent {
     /// Binds a fresh state machine to one run and agent.
     RunStarted {
@@ -241,6 +243,28 @@ mod tests {
         ToolCallId, ToolName, ToolProposal, ToolResult, TurnId,
     };
     use serde_json::json;
+
+    const ACCEPTED_V0_2_0_HARNESS_EVENT_JSON: &str =
+        r#"{"event":"run_started","run_id":"run_1","agent_id":"agent_1"}"#;
+    const REJECTED_UNKNOWN_FIELD_HARNESS_EVENT_JSON: &str =
+        r#"{"event":"run_started","run_id":"run_1","agent_id":"agent_1","future_field":true}"#;
+
+    #[test]
+    fn harness_event_json_schema_is_fail_closed_and_v0_2_0_compatible() {
+        let accepted: HarnessEvent =
+            serde_json::from_str(ACCEPTED_V0_2_0_HARNESS_EVENT_JSON).unwrap();
+        assert_eq!(
+            accepted,
+            HarnessEvent::RunStarted {
+                run_id: RunId::new("run_1").unwrap(),
+                agent_id: AgentId::new("agent_1").unwrap(),
+            }
+        );
+
+        let error = serde_json::from_str::<HarnessEvent>(REJECTED_UNKNOWN_FIELD_HARNESS_EVENT_JSON)
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown field `future_field`"));
+    }
 
     #[test]
     fn recorded_event_json_fixtures_are_bidirectional() {
