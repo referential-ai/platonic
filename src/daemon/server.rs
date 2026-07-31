@@ -111,9 +111,10 @@ impl DaemonServer {
     }
 
     fn bind_inner(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<Self> {
-        #[cfg(unix)]
-        let reclaim_default_socket = socket_path.is_none();
         let paths = DaemonPaths::resolve(workspace_root, socket_path)?;
+        #[cfg(unix)]
+        let reclaim_default_socket =
+            paths.socket_path == crate::paths::default_socket_path(&paths.workspace_root)?;
         #[cfg(unix)]
         {
             let (runtime_home, is_fallback) = paths::runtime_home_and_fallback();
@@ -1000,13 +1001,26 @@ mod tests {
 
     #[test]
     fn default_bind_recovers_a_stale_current_user_socket() {
+        assert_stale_default_socket_recovers(false);
+    }
+
+    #[test]
+    fn explicit_default_bind_recovers_a_stale_current_user_socket() {
+        assert_stale_default_socket_recovers(true);
+    }
+
+    fn assert_stale_default_socket_recovers(explicit_default: bool) {
         let workspace = tempfile::tempdir().unwrap();
         let socket_path = test_default_socket_path(workspace.path());
         fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
         let stale_listener = UnixListener::bind(&socket_path).unwrap();
         drop(stale_listener);
 
-        let server = DaemonServer::bind(workspace.path(), None).unwrap();
+        let server = DaemonServer::bind(
+            workspace.path(),
+            explicit_default.then(|| socket_path.clone()),
+        )
+        .unwrap();
 
         assert_eq!(server.paths().socket_path, socket_path);
         assert_eq!(mode(&socket_path), SOCKET_MODE);
