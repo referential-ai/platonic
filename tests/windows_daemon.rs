@@ -24,7 +24,7 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     ptr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::AtomicBool,
         mpsc::{self, Receiver, SyncSender},
     },
@@ -53,6 +53,7 @@ use windows_sys::Win32::{
 };
 
 const PROOF_TIMEOUT: Duration = Duration::from_secs(15);
+static DAEMON_STARTUP: Mutex<()> = Mutex::new(());
 
 #[test]
 #[ignore = "holds the process-global installer gate; run serially"]
@@ -207,16 +208,15 @@ fn ctrl_break_stops_daemon_and_removes_lock() {
     let workspace = tempfile::tempdir().unwrap();
     let lock_path = paths::default_lock_path(workspace.path()).unwrap();
     let socket_path = paths::default_socket_path(workspace.path()).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_plato-agentd"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_plato-agentd"));
+    command
         .arg("--workspace")
         .arg(workspace.path())
         .creation_flags(CREATE_NEW_PROCESS_GROUP)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    let mut child = spawn_daemon_after_installer_gate_release(command, &lock_path);
 
-    wait_for_path(&lock_path, &mut child);
     let mut client = connect_bounded(&socket_path);
     client.hello(workspace.path()).unwrap();
     drop(client);
@@ -240,7 +240,11 @@ fn child_kill_removes_lock_and_allows_immediate_same_workspace_restart() {
     first.child.kill().unwrap();
     first.child.wait().unwrap();
 
-    assert!(!lock_path.exists());
+    assert!(
+        !lock_path.exists(),
+        "killed daemon left fixture lock {}",
+        lock_path.display()
+    );
     let mut restarted = ProofDaemon::spawn(workspace.path(), local_app_data.path());
     assert_eq!(restarted.lock_path, lock_path);
 
@@ -252,7 +256,11 @@ fn child_kill_removes_lock_and_allows_immediate_same_workspace_restart() {
     );
     drop(client);
     assert!(restarted.wait_for_exit().success());
-    assert!(!lock_path.exists());
+    assert!(
+        !lock_path.exists(),
+        "restarted daemon left fixture lock {}",
+        lock_path.display()
+    );
 }
 
 #[test]
@@ -261,16 +269,15 @@ fn ctrl_c_stops_daemon_and_removes_lock() {
     let workspace = tempfile::tempdir().unwrap();
     let lock_path = paths::default_lock_path(workspace.path()).unwrap();
     let socket_path = paths::default_socket_path(workspace.path()).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_plato-agentd"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_plato-agentd"));
+    command
         .arg("--workspace")
         .arg(workspace.path())
         .creation_flags(CREATE_NEW_CONSOLE)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    let mut child = spawn_daemon_after_installer_gate_release(command, &lock_path);
 
-    wait_for_path(&lock_path, &mut child);
     let mut client = connect_bounded(&socket_path);
     client.hello(workspace.path()).unwrap();
     drop(client);
@@ -790,9 +797,74 @@ fn wait_for_path(path: &Path, child: &mut Child) {
                 .unwrap()
                 .read_to_string(&mut stderr)
                 .unwrap();
-            panic!("daemon exited before creating its lock ({status}): {stderr}");
+            panic!(
+                "daemon exited before creating fixture lock {} ({status}): {stderr}",
+                path.display()
+            );
         }
-        assert!(Instant::now() < deadline, "daemon did not create its lock");
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("daemon did not create fixture lock {}", path.display());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn spawn_daemon_after_installer_gate_release(mut command: Command, lock_path: &Path) -> Child {
+    let _startup = DAEMON_STARTUP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut child = command.spawn().unwrap_or_else(|error| {
+        panic!(
+            "failed to spawn daemon for fixture {}: {error}",
+            lock_path.display()
+        )
+    });
+    wait_for_path(lock_path, &mut child);
+    wait_for_installer_gate_release(lock_path, &mut child);
+    child
+}
+
+fn wait_for_installer_gate_release(lock_path: &Path, child: &mut Child) {
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    loop {
+        match InstallerStartupGate::acquire() {
+            Ok(gate) => {
+                drop(gate);
+                return;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "failed to probe installer gate for fixture {}: {error}",
+                    lock_path.display()
+                );
+            }
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!(
+                "daemon exited before releasing installer gate for fixture {} ({status}): {stderr}",
+                lock_path.display()
+            );
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "installer gate remained held for fixture {}",
+                lock_path.display()
+            );
+        }
         thread::sleep(Duration::from_millis(20));
     }
 }
@@ -830,23 +902,22 @@ impl ProofDaemon {
             .join("workspaces")
             .join(&workspace_id)
             .join("agent.lock");
-        let child = Command::new(env!("CARGO_BIN_EXE_plato-agentd"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_plato-agentd"));
+        command
             .arg("--workspace")
             .arg(&workspace_root)
             .env("LOCALAPPDATA", local_app_data)
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut daemon = Self {
+            .stderr(Stdio::piped());
+        let child = spawn_daemon_after_installer_gate_release(command, &lock_path);
+        let daemon = Self {
             child,
             workspace_root,
             workspace_id,
             socket_path,
             lock_path,
         };
-        wait_for_path(&daemon.lock_path, &mut daemon.child);
         let mut client = connect_bounded(&daemon.socket_path);
         client.hello(&daemon.workspace_root).unwrap();
         daemon

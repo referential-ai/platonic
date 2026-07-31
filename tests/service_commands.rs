@@ -6,22 +6,25 @@ use plato_agent::{
 };
 use serde_json::{Value, json};
 use std::{
-    fs,
-    io::{BufRead, BufReader, Write},
+    fs::{self, File},
+    io::{self, BufRead, BufReader, Write},
     os::unix::{
         fs::PermissionsExt,
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Output, Stdio},
+    sync::{Mutex, MutexGuard},
     thread,
     time::{Duration, Instant},
 };
 
+static EXECUTABLE_FIXTURE_SETUP: Mutex<()> = Mutex::new(());
+
 #[test]
 fn daemon_command_execs_sibling_with_argv_output_and_exit_status() {
     let workspace = tempfile::tempdir().unwrap();
-    let plato = install_plato(workspace.path());
+    let (plato, fixture_setup) = install_plato(workspace.path(), "daemon-exit-status");
     let args_path = workspace.path().join("daemon-args");
     let environment_path = workspace.path().join("daemon-environment");
     let socket_path = workspace.path().join("custom.sock");
@@ -36,15 +39,15 @@ exit 23
 "#,
     );
 
-    let output = Command::new(&plato)
+    let mut command = Command::new(&plato);
+    command
         .args(["daemon", "--socket"])
         .arg(&socket_path)
         .current_dir(workspace.path())
         .env("PLATO_TEST_ARGS", &args_path)
         .env("PLATO_TEST_DAEMON_ENV", "provider-only")
-        .env("PLATO_TEST_DAEMON_ENV_OUT", &environment_path)
-        .output()
-        .unwrap();
+        .env("PLATO_TEST_DAEMON_ENV_OUT", &environment_path);
+    let output = fixture_output(command, &plato, fixture_setup);
 
     assert_eq!(output.status.code(), Some(23));
     assert_eq!(output.stdout, b"daemon stdout\n");
@@ -67,7 +70,7 @@ exit 23
 #[test]
 fn daemon_command_is_replaced_by_the_signal_target() {
     let workspace = tempfile::tempdir().unwrap();
-    let plato = install_plato(workspace.path());
+    let (plato, fixture_setup) = install_plato(workspace.path(), "daemon-signal");
     let ready_path = workspace.path().join("ready");
     let signal_path = workspace.path().join("signal");
     write_executable(
@@ -78,18 +81,18 @@ printf ready > "$PLATO_TEST_READY"
 while :; do sleep 1; done
 "#,
     );
-    let mut child = Command::new(&plato)
+    let mut command = Command::new(&plato);
+    command
         .arg("daemon")
         .current_dir(workspace.path())
         .env("PLATO_TEST_READY", &ready_path)
-        .env("PLATO_TEST_SIGNAL", &signal_path)
-        .spawn()
-        .unwrap();
+        .env("PLATO_TEST_SIGNAL", &signal_path);
+    let mut child = spawn_fixture(command, &plato, fixture_setup);
     wait_for_path(&ready_path, &mut child);
 
     let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
     rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
-    let status = wait_for_exit(&mut child);
+    let status = wait_for_exit(&mut child, &signal_path);
 
     assert_eq!(status.code(), Some(42));
     assert_eq!(fs::read_to_string(signal_path).unwrap(), "term");
@@ -98,7 +101,7 @@ while :; do sleep 1; done
 #[test]
 fn gateway_command_hellos_then_execs_sibling_with_environment_and_exit_status() {
     let workspace = tempfile::tempdir().unwrap();
-    let plato = install_plato(workspace.path());
+    let (plato, fixture_setup) = install_plato(workspace.path(), "gateway-exit-status");
     let socket_path = workspace.path().join("agent.sock");
     let config_path = Path::new("gateway.toml");
     let args_path = workspace.path().join("gateway-args");
@@ -150,14 +153,14 @@ exit 99
 "#,
     );
 
-    let output = gateway_command(&plato, workspace.path(), &socket_path)
+    let mut command = gateway_command(&plato, workspace.path(), &socket_path);
+    command
         .args(["--config", config_path.to_str().unwrap()])
         .env("PLATO_TEST_ARGS", &args_path)
         .env("PLATO_TEST_GATEWAY_ENV", "discord-only")
         .env("PLATO_TEST_GATEWAY_ENV_OUT", &environment_path)
-        .env("PLATO_TEST_DAEMON_LAUNCH", &daemon_launch_path)
-        .output()
-        .unwrap();
+        .env("PLATO_TEST_DAEMON_LAUNCH", &daemon_launch_path);
+    let output = fixture_output(command, &plato, fixture_setup);
     let request = hello.join().unwrap();
 
     assert_eq!(output.status.code(), Some(37));
@@ -202,38 +205,13 @@ exit 99
 #[test]
 fn gateway_probe_failures_never_launch_a_service_binary() {
     let workspace = tempfile::tempdir().unwrap();
-    let plato = install_plato(workspace.path());
-    let gateway_launch_path = workspace.path().join("gateway-launch");
-    let daemon_launch_path = workspace.path().join("daemon-launch");
-    write_launch_marker(
-        &plato.with_file_name("plato-gateway-discord"),
-        "PLATO_TEST_GATEWAY_LAUNCH",
-    );
-    write_launch_marker(
-        &plato.with_file_name("plato-agentd"),
-        "PLATO_TEST_DAEMON_LAUNCH",
-    );
 
     let missing = workspace.path().join("missing.sock");
-    assert_probe_failure(
-        &plato,
-        workspace.path(),
-        &missing,
-        &gateway_launch_path,
-        &daemon_launch_path,
-        None,
-    );
+    assert_probe_failure(workspace.path(), &missing, "missing-endpoint", None);
 
     let closed = workspace.path().join("closed.sock");
     let server = spawn_endpoint(&closed, |request, _stream| request);
-    assert_probe_failure(
-        &plato,
-        workspace.path(),
-        &closed,
-        &gateway_launch_path,
-        &daemon_launch_path,
-        Some(server),
-    );
+    assert_probe_failure(workspace.path(), &closed, "closed-endpoint", Some(server));
 
     let incompatible = workspace.path().join("incompatible.sock");
     let server = spawn_endpoint(&incompatible, |request, stream| {
@@ -250,11 +228,9 @@ fn gateway_probe_failures_never_launch_a_service_binary() {
         request
     });
     assert_probe_failure(
-        &plato,
         workspace.path(),
         &incompatible,
-        &gateway_launch_path,
-        &daemon_launch_path,
+        "incompatible-protocol",
         Some(server),
     );
 
@@ -276,11 +252,9 @@ fn gateway_probe_failures_never_launch_a_service_binary() {
         request
     });
     assert_probe_failure(
-        &plato,
         workspace.path(),
         &wrong_workspace,
-        &gateway_launch_path,
-        &daemon_launch_path,
+        "workspace-error",
         Some(server),
     );
 
@@ -304,11 +278,9 @@ fn gateway_probe_failures_never_launch_a_service_binary() {
         request
     });
     assert_probe_failure(
-        &plato,
         workspace.path(),
         &wrong_result,
-        &gateway_launch_path,
-        &daemon_launch_path,
+        "wrong-workspace-result",
         Some(server),
     );
 
@@ -335,11 +307,9 @@ fn gateway_probe_failures_never_launch_a_service_binary() {
         }
     });
     assert_probe_failure(
-        &plato,
         workspace.path(),
         &missing_capability,
-        &gateway_launch_path,
-        &daemon_launch_path,
+        "missing-capability",
         Some(server),
     );
 
@@ -348,41 +318,65 @@ fn gateway_probe_failures_never_launch_a_service_binary() {
         thread::sleep(Duration::from_millis(3_100));
         request
     });
-    assert_probe_failure(
-        &plato,
-        workspace.path(),
-        &stalled,
-        &gateway_launch_path,
-        &daemon_launch_path,
-        Some(server),
-    );
+    assert_probe_failure(workspace.path(), &stalled, "stalled-hello", Some(server));
 }
 
 fn assert_probe_failure(
-    plato: &Path,
     workspace: &Path,
     socket_path: &Path,
-    gateway_launch_path: &Path,
-    daemon_launch_path: &Path,
+    fixture_name: &str,
     server: Option<thread::JoinHandle<Value>>,
 ) {
-    let output = gateway_command(plato, workspace, socket_path)
-        .env("PLATO_TEST_GATEWAY_LAUNCH", gateway_launch_path)
-        .env("PLATO_TEST_DAEMON_LAUNCH", daemon_launch_path)
-        .env("PLATO_TEST_GATEWAY_ENV", "discord-only")
-        .output()
-        .unwrap();
+    let (plato, fixture_setup) = install_plato(workspace, fixture_name);
+    let gateway_launch_path = plato.with_file_name("gateway-launch");
+    let daemon_launch_path = plato.with_file_name("daemon-launch");
+    write_launch_marker(
+        &plato.with_file_name("plato-gateway-discord"),
+        "PLATO_TEST_GATEWAY_LAUNCH",
+    );
+    write_launch_marker(
+        &plato.with_file_name("plato-agentd"),
+        "PLATO_TEST_DAEMON_LAUNCH",
+    );
+    let mut command = gateway_command(&plato, workspace, socket_path);
+    command
+        .env("PLATO_TEST_GATEWAY_LAUNCH", &gateway_launch_path)
+        .env("PLATO_TEST_DAEMON_LAUNCH", &daemon_launch_path)
+        .env("PLATO_TEST_GATEWAY_ENV", "discord-only");
+    let output = fixture_output(command, &plato, fixture_setup);
     if let Some(server) = server {
         server.join().unwrap();
     }
 
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert!(
+        !output.status.success(),
+        "{fixture_name} fixture unexpectedly succeeded at {}",
+        plato.display()
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "{fixture_name} fixture wrote stdout at {}",
+        plato.display()
+    );
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("workspace daemon is unavailable or incompatible"));
-    assert!(stderr.contains("plato daemon --socket"));
-    assert!(!gateway_launch_path.exists());
-    assert!(!daemon_launch_path.exists());
+    assert!(
+        stderr.contains("workspace daemon is unavailable or incompatible"),
+        "{fixture_name} fixture stderr did not name daemon incompatibility: {stderr}"
+    );
+    assert!(
+        stderr.contains("plato daemon --socket"),
+        "{fixture_name} fixture stderr did not contain the socket hint: {stderr}"
+    );
+    assert!(
+        !gateway_launch_path.exists(),
+        "{fixture_name} fixture launched gateway marker {}",
+        gateway_launch_path.display()
+    );
+    assert!(
+        !daemon_launch_path.exists(),
+        "{fixture_name} fixture launched daemon marker {}",
+        daemon_launch_path.display()
+    );
 }
 
 fn gateway_command(plato: &Path, workspace: &Path, socket_path: &Path) -> Command {
@@ -394,15 +388,94 @@ fn gateway_command(plato: &Path, workspace: &Path, socket_path: &Path) -> Comman
     command
 }
 
-fn install_plato(workspace: &Path) -> PathBuf {
-    let bin_dir = workspace.join("bin");
-    fs::create_dir(&bin_dir).unwrap();
+fn install_plato(workspace: &Path, fixture_name: &str) -> (PathBuf, MutexGuard<'static, ()>) {
+    // Forked test children inherit writers from every thread. Hold this only
+    // through fixture writes and the initial exec, not the child lifetime.
+    let fixture_setup = EXECUTABLE_FIXTURE_SETUP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let bin_dir = tempfile::Builder::new()
+        .prefix(&format!("{fixture_name}-"))
+        .tempdir_in(workspace)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to create {fixture_name} executable fixture under {}: {error}",
+                workspace.display()
+            )
+        })
+        .keep();
     let plato = bin_dir.join("plato");
-    fs::copy(env!("CARGO_BIN_EXE_plato"), &plato).unwrap();
-    let mut permissions = fs::metadata(&plato).unwrap().permissions();
+    let source_path = Path::new(env!("CARGO_BIN_EXE_plato"));
+    let mut source = File::open(source_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to open {fixture_name} source executable {}: {error}",
+            source_path.display()
+        )
+    });
+    let mut destination = File::create(&plato).unwrap_or_else(|error| {
+        panic!(
+            "failed to create {fixture_name} executable fixture {}: {error}",
+            plato.display()
+        )
+    });
+    io::copy(&mut source, &mut destination).unwrap_or_else(|error| {
+        panic!(
+            "failed to copy {fixture_name} executable fixture {}: {error}",
+            plato.display()
+        )
+    });
+    drop(destination);
+    drop(source);
+    let mut permissions = fs::metadata(&plato)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read {fixture_name} executable fixture {}: {error}",
+                plato.display()
+            )
+        })
+        .permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(&plato, permissions).unwrap();
-    plato
+    fs::set_permissions(&plato, permissions).unwrap_or_else(|error| {
+        panic!(
+            "failed to set {fixture_name} executable permissions on {}: {error}",
+            plato.display()
+        )
+    });
+    (plato, fixture_setup)
+}
+
+fn fixture_output(
+    mut command: Command,
+    fixture: &Path,
+    fixture_setup: MutexGuard<'static, ()>,
+) -> Output {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    spawn_fixture(command, fixture, fixture_setup)
+        .wait_with_output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to collect service fixture output from {}: {error}",
+                fixture.display()
+            )
+        })
+}
+
+fn spawn_fixture(
+    mut command: Command,
+    fixture: &Path,
+    fixture_setup: MutexGuard<'static, ()>,
+) -> Child {
+    let child = command.spawn().unwrap_or_else(|error| {
+        panic!(
+            "failed to execute service fixture {}: {error}",
+            fixture.display()
+        )
+    });
+    drop(fixture_setup);
+    child
 }
 
 fn write_launch_marker(path: &Path, environment_name: &str) {
@@ -413,14 +486,36 @@ fn write_launch_marker(path: &Path, environment_name: &str) {
 }
 
 fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    let mut permissions = fs::metadata(path).unwrap().permissions();
+    fs::write(path, body).unwrap_or_else(|error| {
+        panic!(
+            "failed to write service executable fixture {}: {error}",
+            path.display()
+        )
+    });
+    let mut permissions = fs::metadata(path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read service executable fixture {}: {error}",
+                path.display()
+            )
+        })
+        .permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).unwrap();
+    fs::set_permissions(path, permissions).unwrap_or_else(|error| {
+        panic!(
+            "failed to set service executable permissions on {}: {error}",
+            path.display()
+        )
+    });
 }
 
 fn read_lines(path: &Path) -> Vec<String> {
-    let contents = fs::read_to_string(path).unwrap();
+    let contents = fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read service fixture output {}: {error}",
+            path.display()
+        )
+    });
     contents.lines().map(str::to_owned).collect()
 }
 
@@ -449,17 +544,21 @@ fn wait_for_path(path: &Path, child: &mut std::process::Child) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while !path.exists() {
         if let Some(status) = child.try_wait().unwrap() {
-            panic!("service command exited before becoming ready: {status}");
+            panic!(
+                "service command exited before fixture {} became ready: {status}",
+                path.display()
+            );
         }
         assert!(
             Instant::now() < deadline,
-            "service command did not become ready"
+            "service command fixture {} did not become ready",
+            path.display()
         );
         thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn wait_for_exit(child: &mut std::process::Child) -> std::process::ExitStatus {
+fn wait_for_exit(child: &mut std::process::Child, resource: &Path) -> std::process::ExitStatus {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -467,7 +566,10 @@ fn wait_for_exit(child: &mut std::process::Child) -> std::process::ExitStatus {
         }
         if Instant::now() >= deadline {
             child.kill().unwrap();
-            panic!("service command did not exit");
+            panic!(
+                "service command fixture {} did not exit",
+                resource.display()
+            );
         }
         thread::sleep(Duration::from_millis(10));
     }
