@@ -2277,35 +2277,18 @@ mod tests {
 
     #[cfg(windows)]
     fn write_windows_descendant_probe(workspace: &Path) {
-        let helper = workspace.join("descendant-probe-helper.exe");
-        {
-            let source_path = env::current_exe().unwrap();
-            let mut source = fs::File::open(&source_path).unwrap_or_else(|error| {
-                panic!(
-                    "failed to open descendant helper {}: {error}",
-                    source_path.display()
-                )
-            });
-            let mut destination = fs::File::create(&helper).unwrap_or_else(|error| {
-                panic!(
-                    "failed to create descendant helper {}: {error}",
-                    helper.display()
-                )
-            });
-            io::copy(&mut source, &mut destination).unwrap_or_else(|error| {
-                panic!(
-                    "failed to copy descendant helper {}: {error}",
-                    helper.display()
-                )
-            });
-        }
+        let helper = env::current_exe()
+            .unwrap_or_else(|error| panic!("failed to locate Windows descendant helper: {error}"));
         let script = workspace.join("descendant-probe.cmd");
         fs::write(
             &script,
-            concat!(
-                "@echo off\r\n",
-                "\".\\descendant-probe-helper.exe\" ",
-                "--exact tools::tests::windows_descendant_probe_child --ignored --nocapture\r\n",
+            format!(
+                concat!(
+                    "@echo off\r\n",
+                    "\"{}\" ",
+                    "--exact tools::tests::windows_descendant_probe_child --ignored --nocapture\r\n",
+                ),
+                helper.display()
             ),
         )
         .unwrap_or_else(|error| {
