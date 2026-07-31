@@ -1,5 +1,6 @@
 use crate::daemon::protocol::{HelloResult, RunStateName, SessionSummary, TranscriptReadResult};
-use std::time::Instant;
+use ratatui::text::Line;
+use std::{fmt, sync::RwLock, time::Instant};
 
 use super::ApprovalModalView;
 
@@ -13,6 +14,7 @@ pub struct TuiState {
     pub transcript: TranscriptState,
     pub active_run: Option<ActiveRunView>,
     pub live_events: Vec<LiveEventLine>,
+    pub(super) history_rows: HistoryRowsCache,
     pub scroll_offset: usize,
     pub active_model: Option<String>,
     pub active_run_elapsed_secs: Option<u64>,
@@ -52,7 +54,7 @@ impl TuiState {
         );
         state.sessions = sessions;
         state.selected_session_id = selected_session_id;
-        state.transcript = transcript;
+        state.replace_transcript(transcript);
         state
     }
 
@@ -74,6 +76,7 @@ impl TuiState {
             transcript: TranscriptState::None,
             active_run: None,
             live_events: Vec::new(),
+            history_rows: HistoryRowsCache::default(),
             scroll_offset: 0,
             active_model: None,
             active_run_elapsed_secs: None,
@@ -93,7 +96,58 @@ impl TuiState {
             cancel_requested: false,
         }
     }
+
+    pub(super) fn replace_transcript(&mut self, transcript: TranscriptState) {
+        self.transcript = transcript;
+        let _ = self
+            .history_rows
+            .transcript
+            .get_mut()
+            .expect("transcript row cache lock poisoned")
+            .take();
+    }
+
+    pub(super) fn clear_live_events(&mut self) {
+        self.live_events.clear();
+        self.invalidate_live_event_rows();
+    }
+
+    pub(super) fn invalidate_live_event_rows(&mut self) {
+        let _ = self
+            .history_rows
+            .live_events
+            .get_mut()
+            .expect("live event row cache lock poisoned")
+            .take();
+    }
 }
+
+#[derive(Default)]
+pub(super) struct HistoryRowsCache {
+    pub(super) transcript: RwLock<Option<(String, Vec<Line<'static>>)>>,
+    pub(super) live_events: RwLock<Option<(Vec<LiveEventLine>, Vec<Line<'static>>)>>,
+}
+
+// These rows are derived from public source fields and are not semantic TUI state.
+impl Clone for HistoryRowsCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl fmt::Debug for HistoryRowsCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HistoryRowsCache")
+    }
+}
+
+impl PartialEq for HistoryRowsCache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for HistoryRowsCache {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlashPopupView {

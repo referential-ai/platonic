@@ -1071,16 +1071,16 @@ fn dispatch_slash_command(
 }
 
 fn clear_visible_transcript(state: &mut TuiState) {
-    state.transcript = TranscriptState::None;
-    state.live_events.clear();
+    state.replace_transcript(TranscriptState::None);
+    state.clear_live_events();
     state.stream_warning = None;
     state.scroll_offset = 0;
 }
 
 fn start_fresh_session(state: &mut TuiState) {
     state.selected_session_id = None;
-    state.transcript = TranscriptState::None;
-    state.live_events.clear();
+    state.replace_transcript(TranscriptState::None);
+    state.clear_live_events();
     state.stream_warning = None;
     state.session_picker = None;
     state.scroll_offset = 0;
@@ -1193,6 +1193,7 @@ fn update_elapsed(state: &mut TuiState, runtime: &UiRuntime) {
 pub(super) fn push_live_event(state: &mut TuiState, mut line: crate::tui::LiveEventLine) {
     use crate::tui::LiveEventKind;
 
+    state.invalidate_live_event_rows();
     if line.kind == LiveEventKind::AssistantDelta {
         if let Some(last) = state.live_events.last_mut()
             && last.kind == LiveEventKind::Assistant
@@ -1262,6 +1263,7 @@ mod tests {
             BufferedStreamEvent, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
             ERROR_WORKSPACE_MISMATCH, EventsStreamResult, HelloResult, IssuePrepResult,
             IssuePrepStartResult, ProtocolError, RunStartResult, SessionSummary,
+            TranscriptReadResult,
         },
         tui::TranscriptState,
     };
@@ -1610,21 +1612,25 @@ mod tests {
     fn clear_command_clears_visible_transcript_only() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.transcript = TranscriptState::Unavailable {
-            run_id: "run_1".into(),
-            error: "boom".into(),
-        };
+        state.replace_transcript(loaded_transcript("run_1", "[turn_1] user: hello\n"));
         state.live_events = vec![crate::tui::LiveEventLine::assistant(Some(1), "hello")];
         state.stream_warning = Some("lagged".into());
         state.scroll_offset = 10;
         state.composer = "/clear".into();
         state.composer_cursor = state.composer.len();
         let runtime = UiRuntime::from_state(&state, None);
+        render_snapshot(&state, 100, 24).unwrap();
+        assert_cached_rows(&state, true, true);
+        state.transcript = TranscriptState::Unavailable {
+            run_id: "run_1".into(),
+            error: "boom".into(),
+        };
 
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
 
         assert_eq!(state.transcript, TranscriptState::None);
         assert!(state.live_events.is_empty());
+        assert_cached_rows(&state, false, false);
         assert!(state.stream_warning.is_none());
         assert_eq!(state.scroll_offset, 0);
         assert_eq!(
@@ -1871,15 +1877,19 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
         state.selected_session_id = Some("session_1".into());
+        state.replace_transcript(loaded_transcript("run_1", "[turn_1] user: old\n"));
         state.live_events = vec![crate::tui::LiveEventLine::assistant(None, "old")];
         state.composer = "/new".into();
         state.composer_cursor = state.composer.len();
         let runtime = UiRuntime::from_state(&state, None);
+        render_snapshot(&state, 100, 24).unwrap();
+        assert_cached_rows(&state, true, true);
 
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
 
         assert!(state.selected_session_id.is_none());
         assert!(state.live_events.is_empty());
+        assert_cached_rows(&state, false, false);
         assert_eq!(
             state.status_message.as_deref(),
             Some("new session selected")
@@ -2267,6 +2277,34 @@ mod tests {
             ClientCommand::Load { run_id } => assert_eq!(run_id.as_deref(), Some("run_1")),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn new_live_event_invalidates_only_live_event_rows() {
+        let mut state = test_state();
+        state.replace_transcript(loaded_transcript(
+            "run_1",
+            "[turn_1] assistant: cached answer\n",
+        ));
+        push_live_event(
+            &mut state,
+            crate::tui::LiveEventLine::user("cached question"),
+        );
+        render_snapshot(&state, 100, 24).unwrap();
+        let transcript_rows_ptr = cached_transcript_rows_ptr(&state);
+        assert_cached_rows(&state, true, true);
+
+        push_live_event(
+            &mut state,
+            crate::tui::LiveEventLine::tool(Some(1), "new tool event"),
+        );
+
+        assert_eq!(cached_transcript_rows_ptr(&state), transcript_rows_ptr);
+        assert_cached_rows(&state, true, false);
+        let output = render_snapshot(&state, 100, 24).unwrap();
+        assert!(output.contains("cached question"));
+        assert!(output.contains("new tool event"));
+        assert_cached_rows(&state, true, true);
     }
 
     #[test]
@@ -2937,6 +2975,35 @@ mod tests {
         assert_eq!(state.issue_prep_started_at, Some(started_at));
     }
 
+    #[test]
+    fn state_reload_replaces_transcript_cache_and_preserves_live_event_cache() {
+        let mut state = test_state();
+        state.replace_transcript(loaded_transcript(
+            "run_1",
+            "[turn_1] assistant: old answer\n",
+        ));
+        push_live_event(
+            &mut state,
+            crate::tui::LiveEventLine::status(Some(1), "live status"),
+        );
+        render_snapshot(&state, 100, 24).unwrap();
+        let live_event_rows_ptr = cached_live_event_rows_ptr(&state);
+
+        let mut loaded = test_state();
+        loaded.replace_transcript(loaded_transcript(
+            "run_2",
+            "[turn_2] assistant: new answer\n",
+        ));
+        apply_loaded_state(&mut state, loaded);
+
+        assert_cached_rows(&state, false, true);
+        assert_eq!(cached_live_event_rows_ptr(&state), live_event_rows_ptr);
+        let output = render_snapshot(&state, 100, 24).unwrap();
+        assert!(output.contains("new answer"));
+        assert!(!output.contains("old answer"));
+        assert!(output.contains("live status"));
+    }
+
     fn test_state() -> TuiState {
         TuiState::connected(
             "/tmp/workspace".into(),
@@ -2949,6 +3016,55 @@ mod tests {
             },
             Vec::new(),
             TranscriptState::None,
+        )
+    }
+
+    fn assert_cached_rows(state: &TuiState, transcript: bool, live_events: bool) {
+        assert_eq!(
+            state.history_rows.transcript.read().unwrap().is_some(),
+            transcript
+        );
+        assert_eq!(
+            state.history_rows.live_events.read().unwrap().is_some(),
+            live_events
+        );
+    }
+
+    fn cached_transcript_rows_ptr(state: &TuiState) -> *const ratatui::text::Line<'static> {
+        state
+            .history_rows
+            .transcript
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .as_ptr()
+    }
+
+    fn cached_live_event_rows_ptr(state: &TuiState) -> *const ratatui::text::Line<'static> {
+        state
+            .history_rows
+            .live_events
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .as_ptr()
+    }
+
+    fn loaded_transcript(run_id: &str, transcript: &str) -> TranscriptState {
+        TranscriptState::Loaded(
+            TranscriptReadResult {
+                run_id: run_id.into(),
+                status: RunStateName::Finished,
+                final_answer: None,
+                transcript: transcript.into(),
+                typed: None,
+                pending_approval: None,
+            }
+            .into(),
         )
     }
 
