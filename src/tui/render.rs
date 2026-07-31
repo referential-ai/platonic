@@ -67,9 +67,10 @@ fn history_lines(state: &TuiState) -> Vec<Line<'static>> {
         TranscriptState::Loaded(transcript) => {
             lines.push(status_row(format!("run {}", transcript.run_id)));
             lines.push(Line::from(""));
-            lines.extend(readback_lines(&transcript.content));
+            append_transcript_rows(&mut lines, state, &transcript.content);
         }
         TranscriptState::Unavailable { run_id, error } => {
+            clear_transcript_rows(state);
             lines.push(Line::from(vec![
                 Span::styled(
                     "transcript unavailable ",
@@ -80,9 +81,11 @@ fn history_lines(state: &TuiState) -> Vec<Line<'static>> {
             lines.push(Line::from(error.clone()));
         }
         TranscriptState::None if matches!(state.connection, ConnectionState::Connected { .. }) => {
+            clear_transcript_rows(state);
             lines.extend(intro_lines(state));
         }
         TranscriptState::None => {
+            clear_transcript_rows(state);
             lines.push(Line::from(vec![Span::styled(
                 "daemon unavailable",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -104,6 +107,48 @@ fn history_lines(state: &TuiState) -> Vec<Line<'static>> {
     append_live_transcript(&mut lines, state);
     append_queue_preview(&mut lines, state);
     lines
+}
+
+fn clear_transcript_rows(state: &TuiState) {
+    if state
+        .history_rows
+        .transcript
+        .read()
+        .expect("transcript row cache lock poisoned")
+        .is_some()
+    {
+        let _ = state
+            .history_rows
+            .transcript
+            .write()
+            .expect("transcript row cache lock poisoned")
+            .take();
+    }
+}
+
+fn append_transcript_rows(lines: &mut Vec<Line<'static>>, state: &TuiState, content: &str) {
+    let changed = state
+        .history_rows
+        .transcript
+        .read()
+        .expect("transcript row cache lock poisoned")
+        .as_ref()
+        .is_none_or(|(cached_content, _)| cached_content != content);
+    if changed {
+        let cached = (content.to_owned(), readback_lines(content));
+        *state
+            .history_rows
+            .transcript
+            .write()
+            .expect("transcript row cache lock poisoned") = Some(cached);
+    }
+    let cached = state
+        .history_rows
+        .transcript
+        .read()
+        .expect("transcript row cache lock poisoned");
+    let (_, rows) = cached.as_ref().expect("transcript rows were initialized");
+    lines.extend(rows.iter().cloned());
 }
 
 fn intro_lines(state: &TuiState) -> Vec<Line<'static>> {
@@ -159,6 +204,7 @@ fn append_live_transcript(lines: &mut Vec<Line<'static>>, state: &TuiState) {
         || state.stream_warning.is_some()
         || !state.live_events.is_empty();
     if !has_activity {
+        clear_live_event_rows(state);
         return;
     }
 
@@ -182,7 +228,50 @@ fn append_live_transcript(lines: &mut Vec<Line<'static>>, state: &TuiState) {
     if let Some(warning) = &state.stream_warning {
         lines.push(warning_row(format!("stream warning {warning}")));
     }
-    lines.extend(state.live_events.iter().flat_map(event_rows));
+    append_live_event_rows(lines, state);
+}
+
+fn clear_live_event_rows(state: &TuiState) {
+    if state
+        .history_rows
+        .live_events
+        .read()
+        .expect("live event row cache lock poisoned")
+        .is_some()
+    {
+        let _ = state
+            .history_rows
+            .live_events
+            .write()
+            .expect("live event row cache lock poisoned")
+            .take();
+    }
+}
+
+fn append_live_event_rows(lines: &mut Vec<Line<'static>>, state: &TuiState) {
+    let changed = state
+        .history_rows
+        .live_events
+        .read()
+        .expect("live event row cache lock poisoned")
+        .as_ref()
+        .is_none_or(|(cached_events, _)| cached_events != &state.live_events);
+    if changed {
+        let rows = state.live_events.iter().flat_map(event_rows).collect();
+        let cached = (state.live_events.clone(), rows);
+        *state
+            .history_rows
+            .live_events
+            .write()
+            .expect("live event row cache lock poisoned") = Some(cached);
+    }
+    let cached = state
+        .history_rows
+        .live_events
+        .read()
+        .expect("live event row cache lock poisoned");
+    let (_, rows) = cached.as_ref().expect("live event rows were initialized");
+    lines.extend(rows.iter().cloned());
 }
 
 fn append_queue_preview(lines: &mut Vec<Line<'static>>, state: &TuiState) {
@@ -792,6 +881,75 @@ mod tests {
     }
 
     #[test]
+    fn reuses_cached_history_rows_while_dynamic_rows_change() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TuiState>();
+
+        let mut state = history_cache_state(
+            "[turn_1] user: cached question\n[turn_1] assistant: cached answer\n",
+            LiveEventLine::tool(Some(1), "cached tool event"),
+        );
+
+        let equal_before_render = state.clone();
+        let first = render_to_text(&state);
+        assert_eq!(state, equal_before_render);
+        let cloned = state.clone();
+        assert_eq!(cloned, state);
+        assert!(cloned.history_rows.transcript.read().unwrap().is_none());
+        assert!(cloned.history_rows.live_events.read().unwrap().is_none());
+        assert_eq!(render_to_text(&cloned), first);
+        let cached_ptrs = cached_row_ptrs(&state);
+
+        state.status_message = Some("dynamic status".into());
+        state.stream_warning = Some("dynamic warning".into());
+        state.queued_messages.push("dynamic queue".into());
+        let second = render_to_text(&state);
+
+        assert_ne!(first, second);
+        assert!(second.contains("dynamic status"));
+        assert!(second.contains("dynamic warning"));
+        assert!(second.contains("dynamic queue"));
+        assert_eq!(cached_row_ptrs(&state), cached_ptrs);
+    }
+
+    #[test]
+    fn refreshes_cached_rows_after_direct_public_source_mutation() {
+        let mut state = history_cache_state(
+            "[turn_1] assistant: old transcript\n",
+            LiveEventLine::status(Some(1), "old live event"),
+        );
+        let first = render_to_text(&state);
+        assert!(first.contains("old transcript"));
+        assert!(first.contains("old live event"));
+
+        let TranscriptState::Loaded(transcript) = &mut state.transcript else {
+            panic!("expected loaded transcript");
+        };
+        transcript.content = "[turn_1] assistant: new transcript\n".into();
+        state.live_events[0].text = "new live event".into();
+        state
+            .live_events
+            .push(LiveEventLine::tool(Some(2), "directly pushed event"));
+
+        let second = render_to_text(&state);
+
+        assert!(second.contains("new transcript"));
+        assert!(!second.contains("old transcript"));
+        assert!(second.contains("new live event"));
+        assert!(!second.contains("old live event"));
+        assert!(second.contains("directly pushed event"));
+
+        state.transcript = TranscriptState::None;
+        state.live_events.clear();
+        let cleared = render_to_text(&state);
+
+        assert!(!cleared.contains("new transcript"));
+        assert!(!cleared.contains("new live event"));
+        assert!(state.history_rows.transcript.read().unwrap().is_none());
+        assert!(state.history_rows.live_events.read().unwrap().is_none());
+    }
+
+    #[test]
     fn renders_transcript_error_for_selected_run() {
         let state = TuiState::connected(
             "/tmp/work".into(),
@@ -1355,6 +1513,42 @@ mod tests {
         assert!(output.contains("command: cargo test"));
         assert!(output.contains("cwd: /tmp/work"));
         assert!(!output.contains("input preview:"));
+    }
+
+    fn history_cache_state(transcript: &str, live_event: LiveEventLine) -> TuiState {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            Vec::new(),
+            TranscriptState::Loaded(
+                TranscriptReadResult {
+                    run_id: "run_1".into(),
+                    status: RunStateName::Finished,
+                    final_answer: None,
+                    transcript: transcript.into(),
+                    typed: None,
+                    pending_approval: None,
+                }
+                .into(),
+            ),
+        );
+        state.live_events.push(live_event);
+        state
+    }
+
+    fn cached_row_ptrs(state: &TuiState) -> (*const Line<'static>, *const Line<'static>) {
+        let transcript = state.history_rows.transcript.read().unwrap();
+        let live_events = state.history_rows.live_events.read().unwrap();
+        (
+            transcript.as_ref().unwrap().1.as_ptr(),
+            live_events.as_ref().unwrap().1.as_ptr(),
+        )
     }
 
     fn render_to_text(state: &TuiState) -> String {

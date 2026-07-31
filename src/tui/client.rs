@@ -447,7 +447,8 @@ pub(super) fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
         loaded.stream_warning = state.stream_warning.clone();
     }
     if loaded.live_events.is_empty() {
-        loaded.live_events = state.live_events.clone();
+        loaded.live_events = std::mem::take(&mut state.live_events);
+        loaded.history_rows.live_events = std::mem::take(&mut state.history_rows.live_events);
     }
     loaded.scroll_offset = state.scroll_offset;
     if loaded.active_model.is_none() {
