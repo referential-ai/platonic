@@ -1177,7 +1177,7 @@ fn extract_typed_run(
 }
 
 fn connect_client(config: &DaemonConnectionConfig) -> Result<DaemonClient, DesktopError> {
-    DaemonClient::connect(&config.socket_path)
+    DaemonClient::connect_with_timeout(&config.socket_path, DAEMON_ATTACH_TIMEOUT)
         .map_err(|error| DesktopError::daemon("Unable to connect to plato-agentd", error))
 }
 
@@ -1856,6 +1856,366 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Plato Agent desktop");
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod daemon_deadline_tests {
+    use super::*;
+    use plato_agent::daemon::protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION};
+    use serde_json::json;
+    use std::{
+        io::{BufRead, BufReader, Write},
+        path::{Path, PathBuf},
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const DEADLINE_EARLY_TOLERANCE: Duration = Duration::from_millis(250);
+    const DEADLINE_LATE_TOLERANCE: Duration = Duration::from_secs(1);
+    const NEAR_DEADLINE_DELAY: Duration = Duration::from_millis(2_500);
+    const OUTER_WATCHDOG: Duration = Duration::from_secs(8);
+
+    #[test]
+    fn normal_desktop_hello_byte_drip_cannot_extend_the_deadline() {
+        let fixture = DeadlineFixture::new("hello-byte-drip");
+        let listener = bind_endpoint(&fixture.endpoint.path);
+        let server = thread::spawn(move || {
+            let mut stream = accept_endpoint(&listener);
+            let mut reader = BufReader::new(clone_stream(&stream));
+            let hello = read_request(&mut reader);
+            assert_eq!(hello.method.as_deref(), Some("hello"));
+            for _ in 0..20 {
+                if stream.write_all(b" ").is_err() || stream.flush().is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let workspace_root = fixture.workspace_root.clone();
+        let socket_path = fixture.endpoint.path.clone();
+
+        let (result, elapsed) = run_with_watchdog(move || {
+            with_workspace_client(&workspace_root, Some(socket_path), |_| Ok(()))
+        });
+
+        assert_bounded_daemon_unavailable(result, elapsed);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn normal_desktop_read_stalled_newline_releases_its_worker() {
+        let fixture = DeadlineFixture::new("read-stalled-newline");
+        let listener = bind_endpoint(&fixture.endpoint.path);
+        let workspace_id = fixture.workspace_id.clone();
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut stream = accept_endpoint(&listener);
+            let mut reader = BufReader::new(clone_stream(&stream));
+            answer_hello(&mut reader, &mut stream, &workspace_id, Duration::ZERO);
+            let request = read_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some("transcript.read"));
+            stream.write_all(b"{\"v\":1").unwrap();
+            stream.flush().unwrap();
+            released.recv_timeout(OUTER_WATCHDOG).unwrap();
+        });
+        let workspace_root = fixture.workspace_root.clone();
+        let socket_path = fixture.endpoint.path.clone();
+
+        let (result, elapsed) = run_with_watchdog(move || {
+            read_run_from_workspace(&workspace_root, "run_read", Some(socket_path))
+        });
+
+        assert_bounded_daemon_unavailable(result, elapsed);
+        release.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn normal_desktop_mutation_stalled_newline_has_no_false_success_or_retry() {
+        let fixture = DeadlineFixture::new("mutation-stalled-newline");
+        let listener = bind_endpoint(&fixture.endpoint.path);
+        let workspace_id = fixture.workspace_id.clone();
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut stream = accept_endpoint(&listener);
+            let mut reader = BufReader::new(clone_stream(&stream));
+            answer_hello(&mut reader, &mut stream, &workspace_id, Duration::ZERO);
+            let request = read_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some("run.start"));
+            assert_eq!(request.params.as_ref().unwrap()["question"], "mutate once");
+            stream.write_all(b"{").unwrap();
+            stream.flush().unwrap();
+            released.recv_timeout(OUTER_WATCHDOG).unwrap();
+
+            let mut unexpected_retry = String::new();
+            let retry_read = reader.read_line(&mut unexpected_retry);
+            assert!(
+                !matches!(retry_read, Ok(bytes) if bytes > 0),
+                "desktop retried a mutation after its response timed out"
+            );
+        });
+        let workspace_root = fixture.workspace_root.clone();
+        let socket_path = fixture.endpoint.path.clone();
+
+        let (result, elapsed) = run_with_watchdog(move || {
+            submit_message_from_workspace(
+                &workspace_root,
+                "mutate once".into(),
+                None,
+                Some(socket_path),
+            )
+        });
+
+        assert_bounded_daemon_unavailable(result, elapsed);
+        release.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn normal_desktop_mutation_stalled_write_releases_its_worker() {
+        let fixture = DeadlineFixture::new("mutation-stalled-write");
+        let listener = bind_endpoint(&fixture.endpoint.path);
+        let workspace_id = fixture.workspace_id.clone();
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut stream = accept_endpoint(&listener);
+            let mut reader = BufReader::new(clone_stream(&stream));
+            answer_hello(&mut reader, &mut stream, &workspace_id, Duration::ZERO);
+            released.recv_timeout(OUTER_WATCHDOG).unwrap();
+        });
+        let workspace_root = fixture.workspace_root.clone();
+        let socket_path = fixture.endpoint.path.clone();
+        let message = "x".repeat(8 * 1024 * 1024);
+
+        let (result, elapsed) = run_with_watchdog(move || {
+            submit_message_from_workspace(&workspace_root, message, None, Some(socket_path))
+        });
+
+        assert_bounded_daemon_unavailable(result, elapsed);
+        release.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn normal_desktop_read_accepts_near_deadline_hello_and_command_responses() {
+        let fixture = DeadlineFixture::new("near-deadline-success");
+        let listener = bind_endpoint(&fixture.endpoint.path);
+        let workspace_id = fixture.workspace_id.clone();
+        let server = thread::spawn(move || {
+            let mut stream = accept_endpoint(&listener);
+            let mut reader = BufReader::new(clone_stream(&stream));
+            answer_hello(&mut reader, &mut stream, &workspace_id, NEAR_DEADLINE_DELAY);
+            let request = read_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some("transcript.read"));
+            thread::sleep(NEAR_DEADLINE_DELAY);
+            write_response(
+                &mut stream,
+                request.id,
+                "transcript.read",
+                json!({
+                    "run_id": "run_read",
+                    "status": "finished",
+                    "final_answer": "near deadline",
+                    "transcript": "near deadline",
+                    "typed": {"runs": [{
+                        "run_id": "run_read",
+                        "session_index": 0,
+                        "status": "finished",
+                        "entries": []
+                    }]},
+                    "pending_approval": null
+                }),
+            );
+        });
+        let workspace_root = fixture.workspace_root.clone();
+        let socket_path = fixture.endpoint.path.clone();
+
+        let (result, elapsed) = run_with_watchdog(move || {
+            read_run_from_workspace(&workspace_root, "run_read", Some(socket_path))
+        });
+
+        let run = result.unwrap();
+        assert_eq!(run.run_id, "run_read");
+        assert!(
+            elapsed > DAEMON_ATTACH_TIMEOUT,
+            "fresh hello and command budgets shared one deadline: {elapsed:?}"
+        );
+        server.join().unwrap();
+    }
+
+    fn assert_bounded_daemon_unavailable<T: std::fmt::Debug>(
+        result: Result<T, DesktopError>,
+        elapsed: Duration,
+    ) {
+        let error = result.expect_err("stalled daemon request reported success");
+        assert_eq!(error.code, "daemon_unavailable", "{error:?}");
+        assert!(
+            elapsed >= DAEMON_ATTACH_TIMEOUT - DEADLINE_EARLY_TOLERANCE,
+            "daemon request timed out before its budget: {elapsed:?}"
+        );
+        assert!(
+            elapsed < DAEMON_ATTACH_TIMEOUT + DEADLINE_LATE_TOLERANCE,
+            "daemon request exceeded its budget plus scheduler tolerance: {elapsed:?}"
+        );
+    }
+
+    fn run_with_watchdog<T, F>(run: F) -> (T, Duration)
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let started = Instant::now();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || sender.send(run()).unwrap());
+        let result = receiver
+            .recv_timeout(OUTER_WATCHDOG)
+            .expect("desktop blocking worker outlived the outer watchdog");
+        let elapsed = started.elapsed();
+        worker.join().unwrap();
+        (result, elapsed)
+    }
+
+    fn answer_hello<R: BufRead, W: Write>(
+        reader: &mut R,
+        writer: &mut W,
+        workspace_id: &str,
+        delay: Duration,
+    ) {
+        let hello = read_request(reader);
+        assert_eq!(hello.method.as_deref(), Some("hello"));
+        thread::sleep(delay);
+        write_response(
+            writer,
+            hello.id,
+            "hello",
+            json!({
+                "daemon_version": "0.1.0",
+                "workspace_id": workspace_id,
+                "ledger_path": "/work/agent.db",
+                "capabilities": REQUIRED_CAPABILITIES
+            }),
+        );
+    }
+
+    fn read_request<R: BufRead>(reader: &mut R) -> Envelope {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        let envelope: Envelope = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(envelope.kind, EnvelopeKind::Request);
+        envelope
+    }
+
+    fn write_response<W: Write>(writer: &mut W, id: Option<String>, method: &str, result: Value) {
+        let response = Envelope {
+            v: PROTOCOL_VERSION,
+            id,
+            kind: EnvelopeKind::Response,
+            method: Some(method.into()),
+            params: None,
+            result: Some(result),
+            error: None,
+        };
+        serde_json::to_writer(writer.by_ref(), &response).unwrap();
+        writer.write_all(b"\n").unwrap();
+        writer.flush().unwrap();
+    }
+
+    struct DeadlineFixture {
+        _workspace: tempfile::TempDir,
+        endpoint: TestEndpoint,
+        workspace_root: PathBuf,
+        workspace_id: String,
+    }
+
+    impl DeadlineFixture {
+        fn new(name: &str) -> Self {
+            let workspace = tempfile::tempdir().unwrap();
+            let workspace_root = workspace.path().canonicalize().unwrap();
+            let workspace_id = paths::workspace_id(&workspace_root).unwrap();
+            Self {
+                _workspace: workspace,
+                endpoint: TestEndpoint::new(name),
+                workspace_root,
+                workspace_id,
+            }
+        }
+    }
+
+    struct TestEndpoint {
+        path: PathBuf,
+        _directory: Option<tempfile::TempDir>,
+    }
+
+    impl TestEndpoint {
+        fn new(name: &str) -> Self {
+            #[cfg(unix)]
+            {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join(format!("{name}.sock"));
+                Self {
+                    path,
+                    _directory: Some(directory),
+                }
+            }
+            #[cfg(windows)]
+            {
+                Self {
+                    path: PathBuf::from(format!(
+                        r"\\.\pipe\plato-agent-desktop-{name}-{}",
+                        std::process::id()
+                    )),
+                    _directory: None,
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    type TestListener = std::os::unix::net::UnixListener;
+    #[cfg(unix)]
+    type TestStream = std::os::unix::net::UnixStream;
+    #[cfg(windows)]
+    type TestListener = interprocess::local_socket::Listener;
+    #[cfg(windows)]
+    type TestStream = interprocess::local_socket::Stream;
+
+    #[cfg(unix)]
+    fn bind_endpoint(path: &Path) -> TestListener {
+        TestListener::bind(path).unwrap()
+    }
+
+    #[cfg(windows)]
+    fn bind_endpoint(path: &Path) -> TestListener {
+        use interprocess::local_socket::{GenericFilePath, ListenerOptions, prelude::*};
+
+        ListenerOptions::new()
+            .name(path.as_os_str().to_fs_name::<GenericFilePath>().unwrap())
+            .create_sync()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn accept_endpoint(listener: &TestListener) -> TestStream {
+        listener.accept().unwrap().0
+    }
+
+    #[cfg(windows)]
+    fn accept_endpoint(listener: &TestListener) -> TestStream {
+        use interprocess::local_socket::prelude::*;
+
+        listener.accept().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn clone_stream(stream: &TestStream) -> TestStream {
+        stream.try_clone().unwrap()
+    }
+
+    #[cfg(windows)]
+    fn clone_stream(stream: &TestStream) -> TestStream {
+        interprocess::TryClone::try_clone(stream).unwrap()
+    }
 }
 
 #[cfg(all(test, unix))]

@@ -335,8 +335,9 @@ PY
 NDJSON `run.start` and `message.append` default to `wait: false`, returning a
 `running` response immediately. Send `"wait": true` only when the connection can
 block until the run finishes.
-The TUI, embedded-daemon CLI probe, and Discord gateway bound daemon connects
-and each complete request to three seconds.
+The TUI, desktop shell, embedded-daemon CLI probe, and Discord gateway bound
+daemon connects and each complete request to three seconds. The desktop uses a
+fresh budget for hello and every normal read or mutation.
 
 ## Desktop (Development)
 
