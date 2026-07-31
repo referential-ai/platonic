@@ -7,6 +7,7 @@ use platonic_core::{
     AgentId, ContextPack, HarnessEvent, Message, MessageRole, ModelName, ModelUsage, RecordedEvent,
     RunId, TurnId,
 };
+use rusqlite::{Connection, params};
 use serde_json::json;
 use std::{
     ffi::OsString,
@@ -270,6 +271,58 @@ fn direct_replay_holds_lock_through_final_stdout() {
     assert!(stdout.contains("END LARGE REPLAY"));
 
     ProofDaemon::start(&proof).stop();
+}
+
+#[test]
+fn replay_cli_reads_literal_v1_without_mutation_and_rejects_future_schema() {
+    let proof = ProofContext::new();
+    let workspace_id = paths::workspace_id(&proof.workspace).unwrap();
+    #[cfg(unix)]
+    let v1_path = proof
+        .state_root
+        .join("plato-agent")
+        .join("workspaces")
+        .join(&workspace_id)
+        .join("agent.db");
+    #[cfg(windows)]
+    let v1_path = proof
+        .local_app_data
+        .join("plato-agent")
+        .join("workspaces")
+        .join(&workspace_id)
+        .join("agent.db");
+    write_literal_v1_sqlite(&v1_path);
+    let bytes_before = fs::read(&v1_path).unwrap();
+
+    let latest = proof.cli_output(&["replay".into()]);
+    assert_success("literal v1 latest replay", &latest);
+    let exact = proof.cli_output(&["replay".into(), "--run".into(), "run_v1".into()]);
+    assert_success("literal v1 exact replay", &exact);
+    assert_eq!(latest.stdout, exact.stdout);
+    assert!(
+        String::from_utf8(latest.stdout)
+            .unwrap()
+            .contains("assistant: old answer")
+    );
+    assert_eq!(fs::read(&v1_path).unwrap(), bytes_before);
+
+    let v3_path = proof.workspace.join("schema-v3.db");
+    let connection = Connection::open(&v3_path).unwrap();
+    connection.pragma_update(None, "user_version", 3).unwrap();
+    drop(connection);
+    let v3_bytes_before = fs::read(&v3_path).unwrap();
+    let future = proof.cli_output(&[
+        "replay".into(),
+        format!("--db={}", v3_path.display()).into(),
+    ]);
+    assert!(!future.status.success());
+    assert!(future.stdout.is_empty());
+    assert!(
+        String::from_utf8(future.stderr)
+            .unwrap()
+            .contains("sqlite schema version mismatch: expected 2, actual 3")
+    );
+    assert_eq!(fs::read(&v3_path).unwrap(), v3_bytes_before);
 }
 
 struct ProofContext {
@@ -691,6 +744,42 @@ enabled = ["file.read"]
         ),
     )
     .unwrap();
+}
+
+fn write_literal_v1_sqlite(path: &Path) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE ledger_events (
+              run_id TEXT NOT NULL,
+              seq INTEGER NOT NULL,
+              occurred_at_ms INTEGER NOT NULL,
+              v INTEGER NOT NULL,
+              event_json TEXT NOT NULL,
+              PRIMARY KEY (run_id, seq)
+            );
+            PRAGMA user_version = 1;
+            "#,
+        )
+        .unwrap();
+    let events = [
+        r#"{"event":"run_started","run_id":"run_v1","agent_id":"plato"}"#,
+        r#"{"event":"context_built","run_id":"run_v1","turn_id":"turn_1","context":{"fragments":[],"token_budget":4000}}"#,
+        r#"{"event":"model_requested","run_id":"run_v1","turn_id":"turn_1","step":0,"model":"test-model"}"#,
+        r#"{"event":"model_responded","run_id":"run_v1","turn_id":"turn_1","step":0,"output":{"role":"assistant","content":"old answer"},"proposed_calls":[],"usage":{"input_tokens":8,"output_tokens":3}}"#,
+        r#"{"event":"run_finished","run_id":"run_v1"}"#,
+    ];
+    for (seq, event_json) in events.into_iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO ledger_events (run_id, seq, occurred_at_ms, v, event_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["run_v1", seq as i64, seq as i64, 1, event_json],
+            )
+            .unwrap();
+    }
 }
 
 fn seed_sqlite_session(path: &Path, session_id: &str, run_id: &str, question: &str, answer: &str) {

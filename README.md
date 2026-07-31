@@ -176,6 +176,9 @@ Every run uses this exact convention:
 - `plato replay` without arguments replays the latest session from the default platform SQLite ledger.
 - `plato replay --run <id>` replays a single run.
 - `--events <file>` is the explicit JSONL export/debug path.
+- Read-only SQLite replay reads `user_version` first: schema v1 uses only
+  `ledger_events`, schema v2 keeps session selection, and newer schemas fail
+  without migration. Write-open remains the sole v1-to-v2 migration path.
 - With a live workspace daemon, default-ledger prompts delegate to it. Replay,
   explicit `--db=<path>`, and direct `--yolo` SQLite paths remain direct and
   fail closed if they conflict with the daemon-owned store.

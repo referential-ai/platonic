@@ -23,6 +23,9 @@ pub enum AppError {
     #[error("ledger version mismatch: expected {expected}, actual {actual}")]
     LedgerVersion { expected: u32, actual: u32 },
 
+    #[error("sqlite schema version mismatch: expected {expected}, actual {actual}")]
+    SqliteSchemaVersion { expected: u32, actual: u32 },
+
     #[error("ledger path is empty")]
     EmptyLedger,
 

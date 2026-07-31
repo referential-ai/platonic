@@ -13,27 +13,24 @@ pub fn replay_file(path: &Path) -> AppResult<String> {
 }
 
 pub fn replay_sqlite(path: &Path, run_id: Option<&str>) -> AppResult<String> {
-    if let Some(run_id) = run_id {
-        let records = ledger::read_sqlite_records(path, Some(run_id))?;
-        let readback = RunReadback::from_events(&records)?;
-        return Ok(format_readback(&readback));
-    }
-
-    match ledger::read_latest_sqlite_session(path) {
-        Ok(session) => format_session_readback(&session),
-        Err(AppError::NoSqliteSessions) => {
-            let records = ledger::read_sqlite_records(path, None)?;
-            let readback = RunReadback::from_events(&records)?;
-            Ok(format_readback(&readback))
-        }
-        Err(error) => Err(error),
-    }
+    let ledger = SqliteLedger::open_readonly(path)?;
+    replay_open_sqlite(&ledger, run_id)
 }
 
 pub fn replay_default_sqlite(path: &DefaultSqlitePath, run_id: Option<&str>) -> AppResult<String> {
     let ledger = SqliteLedger::open_default_readonly(path)?;
+    replay_open_sqlite(&ledger, run_id)
+}
+
+fn replay_open_sqlite(ledger: &SqliteLedger, run_id: Option<&str>) -> AppResult<String> {
     if let Some(run_id) = run_id {
         let records = ledger.read_run(run_id)?;
+        let readback = RunReadback::from_events(&records)?;
+        return Ok(format_readback(&readback));
+    }
+
+    if ledger.is_legacy_schema() {
+        let (_, records) = ledger.read_latest_run()?;
         let readback = RunReadback::from_events(&records)?;
         return Ok(format_readback(&readback));
     }
@@ -156,6 +153,17 @@ mod tests {
         r#"{"v":1,"record":{"seq":4,"occurred_at_ms":4,"event":{"event":"run_finished","run_id":"run_v1"}}}"#,
         "\n",
     );
+    const V1_SQLITE_SCHEMA: &str = r#"
+        CREATE TABLE ledger_events (
+          run_id TEXT NOT NULL,
+          seq INTEGER NOT NULL,
+          occurred_at_ms INTEGER NOT NULL,
+          v INTEGER NOT NULL,
+          event_json TEXT NOT NULL,
+          PRIMARY KEY (run_id, seq)
+        );
+        PRAGMA user_version = 1;
+    "#;
 
     #[test]
     fn replay_reads_v1_jsonl_and_maps_usage_object_to_known() {
@@ -176,24 +184,139 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v1-events.db");
         write_v1_sqlite_fixture(&path);
+        let bytes_before = std::fs::read(&path).unwrap();
 
         let records = ledger::read_sqlite_records(&path, Some("run_v1")).unwrap();
         assert_v1_usage_is_known(&records);
 
-        let replay = replay_sqlite(&path, Some("run_v1")).unwrap();
+        let replay = replay_sqlite(&path, None).unwrap();
         assert!(replay.contains("final_phase: Finished"));
         assert!(replay.contains("[turn_1] assistant: old answer"));
-        assert_eq!(replay_sqlite(&path, None).unwrap(), replay);
+        assert_eq!(replay_sqlite(&path, Some("run_v1")).unwrap(), replay);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
     }
 
     #[test]
-    fn sqlite_replay_without_run_reads_latest_session() {
+    fn write_open_migrates_literal_v1_once_and_preserves_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1-events.db");
+        write_v1_sqlite_fixture(&path);
+        let replay_before = replay_sqlite(&path, None).unwrap();
+
+        let ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let records = ledger.read_run("run_v1").unwrap();
+        assert_v1_usage_is_known(&records);
+        drop(ledger);
+
+        let connection = Connection::open(&path).unwrap();
+        let schema_version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema_version, 2);
+        let tables = connection
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table'
+                 ORDER BY name ASC",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(tables, ["ledger_events", "session_runs", "sessions"]);
+        let envelope_versions = connection
+            .prepare("SELECT v FROM ledger_events ORDER BY seq ASC")
+            .unwrap()
+            .query_map([], |row| row.get::<_, u32>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(envelope_versions, vec![1; 5]);
+        drop(connection);
+
+        let bytes_after_migration = std::fs::read(&path).unwrap();
+        drop(SqliteLedger::open_or_create(&path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes_after_migration);
+        assert_eq!(replay_sqlite(&path, None).unwrap(), replay_before);
+    }
+
+    #[test]
+    fn replay_rejects_future_schema_before_table_queries_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3-events.db");
+        let connection = Connection::open(&path).unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
+        drop(connection);
+        let bytes_before = std::fs::read(&path).unwrap();
+
+        assert!(matches!(
+            replay_sqlite(&path, None),
+            Err(AppError::SqliteSchemaVersion {
+                expected: 2,
+                actual: 3
+            })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+    }
+
+    #[test]
+    fn replay_preserves_typed_future_row_envelope_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future-envelope.db");
+        drop(SqliteLedger::open_or_create(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO ledger_events (run_id, seq, occurred_at_ms, v, event_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "run_future",
+                    0,
+                    0,
+                    3,
+                    r#"{"event":"run_started","run_id":"run_future","agent_id":"plato"}"#
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            replay_sqlite(&path, Some("run_future")),
+            Err(AppError::LedgerVersion {
+                expected: 2,
+                actual: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn sqlite_v2_replay_preserves_latest_session_and_exact_run_selection() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.db");
         let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let run_0 = RunId::new("run_0").unwrap();
         let run_1 = RunId::new("run_1").unwrap();
         let run_2 = RunId::new("run_2").unwrap();
 
+        ledger
+            .begin_session_run("session_0", &run_0, "older", true)
+            .unwrap();
+        ledger
+            .append(
+                "run_0",
+                &record(
+                    0,
+                    HarnessEvent::RunStarted {
+                        run_id: run_0.clone(),
+                        agent_id: AgentId::new("plato").unwrap(),
+                    },
+                ),
+            )
+            .unwrap();
+        ledger
+            .fail_session_run(&run_0, "older synthetic failure", false)
+            .unwrap();
         ledger
             .begin_session_run("session_1", &run_1, "first", true)
             .unwrap();
@@ -205,18 +328,6 @@ mod tests {
                     HarnessEvent::RunStarted {
                         run_id: run_1.clone(),
                         agent_id: AgentId::new("plato").unwrap(),
-                    },
-                ),
-            )
-            .unwrap();
-        ledger
-            .append(
-                "run_1",
-                &record(
-                    1,
-                    HarnessEvent::RunFailed {
-                        run_id: run_1.clone(),
-                        reason: "synthetic failure".into(),
                     },
                 ),
             )
@@ -244,9 +355,13 @@ mod tests {
                 "run_2",
                 &record(
                     1,
-                    HarnessEvent::RunFailed {
+                    HarnessEvent::ContextBuilt {
                         run_id: run_2.clone(),
-                        reason: "synthetic failure".into(),
+                        turn_id: TurnId::new("turn_2").unwrap(),
+                        context: ContextPack {
+                            fragments: vec![],
+                            token_budget: 4_000,
+                        },
                     },
                 ),
             )
@@ -255,12 +370,21 @@ mod tests {
             .fail_session_run(&run_2, "synthetic failure", false)
             .unwrap();
 
-        let replay = replay_sqlite(&path, None).unwrap();
+        let exact = replay_sqlite(&path, Some("run_1")).unwrap();
+        let latest = replay_sqlite(&path, None).unwrap();
 
-        assert!(replay.contains("session_id: session_1"));
-        assert!(replay.contains("run_id: run_1"));
-        assert!(replay.contains("run_id: run_2"));
-        assert_eq!(replay.matches("final_phase: Failed").count(), 2);
+        assert_eq!(
+            exact,
+            "final_phase: Failed { reason: \"synthetic failure\" }\nnext_seq: 2"
+        );
+        assert!(latest.contains("session_id: session_1"));
+        assert!(!latest.contains("session_id: session_0"));
+        assert!(!latest.contains("run_id: run_0"));
+        assert!(latest.contains("run_id: run_1"));
+        assert!(latest.contains("run_id: run_2"));
+        assert!(latest.contains("next_seq: 2"));
+        assert!(latest.contains("next_seq: 3"));
+        assert_eq!(latest.matches("final_phase: Failed").count(), 2);
     }
 
     #[test]
@@ -521,8 +645,8 @@ mod tests {
     }
 
     fn write_v1_sqlite_fixture(path: &Path) {
-        drop(SqliteLedger::open_or_create(path).unwrap());
         let connection = Connection::open(path).unwrap();
+        connection.execute_batch(V1_SQLITE_SCHEMA).unwrap();
         for line in V1_JSONL_FIXTURE.lines() {
             let line: serde_json::Value = serde_json::from_str(line).unwrap();
             let record = &line["record"];
