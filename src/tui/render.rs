@@ -7,17 +7,19 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
-use super::{ApprovalModalView, ConnectionState, LiveEventKind, TranscriptState, TuiState};
-use crate::daemon::protocol::RunStateName;
-use crate::tui::commands::{SLASH_COMMANDS, footer_command_hint, matching_slash_commands};
+use super::{
+    ApprovalModalView, ConnectionState, LiveEventKind, TranscriptState, TuiState,
+    state::DisplayMode,
+};
+use crate::daemon::protocol::{RunStateName, TypedRun, TypedTranscriptEntry};
+use crate::tui::commands::{SLASH_COMMANDS, matching_slash_commands};
 use std::time::Duration;
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
-    let [header, history, status, composer] = vertical(frame.area(), state);
-    render_header(frame, header, state);
+    let [history, composer, status] = vertical(frame.area(), state);
     render_history(frame, history, state);
-    render_status_rule(frame, status, state);
     render_composer(frame, composer, state);
+    render_status_line(frame, status, state);
     if state.help_visible {
         render_help_modal(frame, frame.area());
     }
@@ -62,12 +64,19 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 }
 
 fn history_lines(state: &TuiState) -> Vec<Line<'static>> {
+    match state.display_mode {
+        DisplayMode::Conversation => conversation_history_lines(state),
+        DisplayMode::Audit => audit_history_lines(state),
+    }
+}
+
+fn audit_history_lines(state: &TuiState) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match &state.transcript {
         TranscriptState::Loaded(transcript) => {
             lines.push(status_row(format!("run {}", transcript.run_id)));
             lines.push(Line::from(""));
-            append_transcript_rows(&mut lines, state, &transcript.content);
+            append_transcript_rows(&mut lines, state, transcript, DisplayMode::Audit);
         }
         TranscriptState::Unavailable { run_id, error } => {
             clear_transcript_rows(state);
@@ -104,7 +113,52 @@ fn history_lines(state: &TuiState) -> Vec<Line<'static>> {
         }
     }
 
-    append_live_transcript(&mut lines, state);
+    append_audit_live_transcript(&mut lines, state);
+    append_queue_preview(&mut lines, state);
+    lines
+}
+
+fn conversation_history_lines(state: &TuiState) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut latest_transcript = None;
+    match &state.transcript {
+        TranscriptState::Loaded(transcript) => {
+            append_transcript_rows(&mut lines, state, transcript, DisplayMode::Conversation);
+            latest_transcript = Some(transcript);
+        }
+        TranscriptState::Unavailable { run_id, error } => {
+            clear_transcript_rows(state);
+            lines.push(Line::from(vec![Span::styled(
+                "Transcript unavailable",
+                Style::default().fg(Color::Yellow),
+            )]));
+            lines.push(Line::from(error.replace(run_id, "selected run")));
+        }
+        TranscriptState::None if matches!(state.connection, ConnectionState::Connected { .. }) => {
+            clear_transcript_rows(state);
+            lines.extend(intro_lines(state));
+        }
+        TranscriptState::None => {
+            clear_transcript_rows(state);
+            lines.push(Line::from(vec![Span::styled(
+                "daemon unavailable",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )]));
+            if let ConnectionState::Disconnected { error } = &state.connection {
+                lines.push(Line::from(error.clone()));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(
+                "Start plato-agentd manually, then press r to reconnect.",
+            ));
+            lines.push(Line::from(format!(
+                "cargo run --bin plato-agentd -- --workspace {}",
+                state.workspace_root
+            )));
+        }
+    }
+
+    append_conversation_activity(&mut lines, state, latest_transcript);
     append_queue_preview(&mut lines, state);
     lines
 }
@@ -126,16 +180,25 @@ fn clear_transcript_rows(state: &TuiState) {
     }
 }
 
-fn append_transcript_rows(lines: &mut Vec<Line<'static>>, state: &TuiState, content: &str) {
+fn append_transcript_rows(
+    lines: &mut Vec<Line<'static>>,
+    state: &TuiState,
+    transcript: &super::TranscriptView,
+    mode: DisplayMode,
+) {
     let changed = state
         .history_rows
         .transcript
         .read()
         .expect("transcript row cache lock poisoned")
         .as_ref()
-        .is_none_or(|(cached_content, _)| cached_content != content);
+        .is_none_or(|(cached_transcript, _)| cached_transcript != transcript);
     if changed {
-        let cached = (content.to_owned(), readback_lines(content));
+        let rows = match mode {
+            DisplayMode::Conversation => conversation_transcript_lines(transcript),
+            DisplayMode::Audit => readback_lines(&transcript.content),
+        };
+        let cached = (transcript.clone(), rows);
         *state
             .history_rows
             .transcript
@@ -148,7 +211,11 @@ fn append_transcript_rows(lines: &mut Vec<Line<'static>>, state: &TuiState, cont
         .read()
         .expect("transcript row cache lock poisoned");
     let (_, rows) = cached.as_ref().expect("transcript rows were initialized");
-    lines.extend(rows.iter().cloned());
+    if mode == DisplayMode::Conversation {
+        append_spaced_rows(lines, rows.iter().cloned());
+    } else {
+        lines.extend(rows.iter().cloned());
+    }
 }
 
 fn intro_lines(state: &TuiState) -> Vec<Line<'static>> {
@@ -198,7 +265,7 @@ fn intro_lines(state: &TuiState) -> Vec<Line<'static>> {
     lines
 }
 
-fn append_live_transcript(lines: &mut Vec<Line<'static>>, state: &TuiState) {
+fn append_audit_live_transcript(lines: &mut Vec<Line<'static>>, state: &TuiState) {
     let has_activity = state.active_run.is_some()
         || state.status_message.is_some()
         || state.stream_warning.is_some()
@@ -228,7 +295,7 @@ fn append_live_transcript(lines: &mut Vec<Line<'static>>, state: &TuiState) {
     if let Some(warning) = &state.stream_warning {
         lines.push(warning_row(format!("stream warning {warning}")));
     }
-    append_live_event_rows(lines, state);
+    append_audit_live_event_rows(lines, state);
 }
 
 fn clear_live_event_rows(state: &TuiState) {
@@ -248,17 +315,19 @@ fn clear_live_event_rows(state: &TuiState) {
     }
 }
 
-fn append_live_event_rows(lines: &mut Vec<Line<'static>>, state: &TuiState) {
+fn append_audit_live_event_rows(lines: &mut Vec<Line<'static>>, state: &TuiState) {
     let changed = state
         .history_rows
         .live_events
         .read()
         .expect("live event row cache lock poisoned")
         .as_ref()
-        .is_none_or(|(cached_events, _)| cached_events != &state.live_events);
+        .is_none_or(|(cached_events, committed, _)| {
+            cached_events != &state.live_events || !committed.is_empty()
+        });
     if changed {
         let rows = state.live_events.iter().flat_map(event_rows).collect();
-        let cached = (state.live_events.clone(), rows);
+        let cached = (state.live_events.clone(), Vec::new(), rows);
         *state
             .history_rows
             .live_events
@@ -270,8 +339,401 @@ fn append_live_event_rows(lines: &mut Vec<Line<'static>>, state: &TuiState) {
         .live_events
         .read()
         .expect("live event row cache lock poisoned");
-    let (_, rows) = cached.as_ref().expect("live event rows were initialized");
+    let (_, _, rows) = cached.as_ref().expect("live event rows were initialized");
     lines.extend(rows.iter().cloned());
+}
+
+fn conversation_transcript_lines(transcript: &super::TranscriptView) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(typed) = &transcript.typed {
+        for run in &typed.runs {
+            for entry in &run.entries {
+                match entry {
+                    TypedTranscriptEntry::User { text } => {
+                        push_message_rows(&mut lines, LiveEventKind::User, text);
+                    }
+                    TypedTranscriptEntry::Assistant { text } => {
+                        push_message_rows(&mut lines, LiveEventKind::Assistant, text);
+                    }
+                    TypedTranscriptEntry::ToolCall { .. }
+                    | TypedTranscriptEntry::ToolResult { .. }
+                    | TypedTranscriptEntry::Approval { .. }
+                    | TypedTranscriptEntry::PolicyDenied { .. }
+                    | TypedTranscriptEntry::ToolFailed { .. } => {}
+                }
+            }
+            if run.run_id != transcript.run_id
+                && let Some(summary) =
+                    trace_summary(Some(run), &[], None, Some(run.status), false, false)
+            {
+                push_trace_row(&mut lines, summary);
+            }
+        }
+    } else {
+        for line in transcript.content.lines() {
+            if let Some(text) = turn_text(line, "user: ") {
+                push_message_rows(&mut lines, LiveEventKind::User, text);
+            } else if let Some(text) = turn_text(line, "assistant: ") {
+                push_message_rows(&mut lines, LiveEventKind::Assistant, text);
+            }
+        }
+    }
+    lines
+}
+
+fn append_conversation_activity(
+    lines: &mut Vec<Line<'static>>,
+    state: &TuiState,
+    transcript: Option<&super::TranscriptView>,
+) {
+    let latest_run = transcript.and_then(latest_typed_run);
+    let live_run_id = state
+        .active_run
+        .as_ref()
+        .map(|run| run.run_id.as_str())
+        .or_else(|| {
+            state
+                .live_events
+                .iter()
+                .rev()
+                .find_map(|event| event.run_id.as_deref())
+        });
+    let live_matches_latest = transcript
+        .is_some_and(|transcript| live_run_id.is_some_and(|run_id| run_id == transcript.run_id));
+
+    if !live_matches_latest
+        && let Some(transcript) = transcript
+        && let Some(summary) =
+            trace_summary(latest_run, &[], None, Some(transcript.status), false, false)
+    {
+        push_trace_row(lines, summary);
+    }
+
+    if state.live_events.is_empty() {
+        clear_live_event_rows(state);
+    } else {
+        let committed = committed_message_keys(transcript);
+        append_conversation_live_event_rows(lines, state, committed);
+    }
+
+    let live_status = state
+        .active_run
+        .as_ref()
+        .filter(|run| live_run_id == Some(run.run_id.as_str()))
+        .map(|run| run.status)
+        .or_else(|| {
+            live_matches_latest
+                .then(|| transcript.map(|transcript| transcript.status))
+                .flatten()
+        });
+    let typed = live_matches_latest.then_some(latest_run).flatten();
+    if let Some(summary) = trace_summary(
+        typed,
+        &state.live_events,
+        live_run_id,
+        live_status,
+        state.stream_warning.is_some(),
+        state.approval.is_some(),
+    ) {
+        push_trace_row(lines, summary);
+    }
+}
+
+fn latest_typed_run(transcript: &super::TranscriptView) -> Option<&TypedRun> {
+    transcript
+        .typed
+        .as_ref()?
+        .runs
+        .iter()
+        .find(|run| run.run_id == transcript.run_id)
+}
+
+fn committed_message_keys(
+    transcript: Option<&super::TranscriptView>,
+) -> Vec<(String, LiveEventKind, String)> {
+    let Some(transcript) = transcript else {
+        return Vec::new();
+    };
+    if let Some(typed) = &transcript.typed {
+        return typed
+            .runs
+            .iter()
+            .flat_map(|run| {
+                run.entries.iter().filter_map(|entry| match entry {
+                    TypedTranscriptEntry::User { text } => {
+                        Some((run.run_id.clone(), LiveEventKind::User, text.clone()))
+                    }
+                    TypedTranscriptEntry::Assistant { text } => {
+                        Some((run.run_id.clone(), LiveEventKind::Assistant, text.clone()))
+                    }
+                    TypedTranscriptEntry::ToolCall { .. }
+                    | TypedTranscriptEntry::ToolResult { .. }
+                    | TypedTranscriptEntry::Approval { .. }
+                    | TypedTranscriptEntry::PolicyDenied { .. }
+                    | TypedTranscriptEntry::ToolFailed { .. } => None,
+                })
+            })
+            .collect();
+    }
+    transcript
+        .content
+        .lines()
+        .filter_map(|line| {
+            turn_text(line, "user: ")
+                .map(|text| {
+                    (
+                        transcript.run_id.clone(),
+                        LiveEventKind::User,
+                        text.to_owned(),
+                    )
+                })
+                .or_else(|| {
+                    turn_text(line, "assistant: ").map(|text| {
+                        (
+                            transcript.run_id.clone(),
+                            LiveEventKind::Assistant,
+                            text.to_owned(),
+                        )
+                    })
+                })
+        })
+        .collect()
+}
+
+fn append_conversation_live_event_rows(
+    lines: &mut Vec<Line<'static>>,
+    state: &TuiState,
+    committed: Vec<(String, LiveEventKind, String)>,
+) {
+    let changed = state
+        .history_rows
+        .live_events
+        .read()
+        .expect("live event row cache lock poisoned")
+        .as_ref()
+        .is_none_or(|(cached_events, cached_committed, _)| {
+            cached_events != &state.live_events || cached_committed != &committed
+        });
+    if changed {
+        let rows = conversation_live_event_lines(&state.live_events, &committed);
+        let cached = (state.live_events.clone(), committed, rows);
+        *state
+            .history_rows
+            .live_events
+            .write()
+            .expect("live event row cache lock poisoned") = Some(cached);
+    }
+    let cached = state
+        .history_rows
+        .live_events
+        .read()
+        .expect("live event row cache lock poisoned");
+    let (_, _, rows) = cached.as_ref().expect("live event rows were initialized");
+    append_spaced_rows(lines, rows.iter().cloned());
+}
+
+fn conversation_live_event_lines(
+    events: &[super::LiveEventLine],
+    committed: &[(String, LiveEventKind, String)],
+) -> Vec<Line<'static>> {
+    let mut committed = committed.to_vec();
+    let mut lines = Vec::new();
+    for event in events {
+        let kind = match event.kind {
+            LiveEventKind::User => LiveEventKind::User,
+            LiveEventKind::Assistant | LiveEventKind::AssistantDelta => LiveEventKind::Assistant,
+            LiveEventKind::Status | LiveEventKind::Warning
+                if event.offset.is_none()
+                    && ((event.kind == LiveEventKind::Warning
+                        && (event.text.starts_with("issue prep")
+                            || event.text.starts_with("issue-prep")))
+                        || (event.kind == LiveEventKind::Status
+                            && event.text.starts_with("issue-prep artifacts:"))) =>
+            {
+                let color = if event.kind == LiveEventKind::Warning {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                };
+                push_notice_rows(&mut lines, &event.text, color);
+                continue;
+            }
+            LiveEventKind::Tool | LiveEventKind::Status | LiveEventKind::Warning => continue,
+        };
+        if let Some(run_id) = event.run_id.as_deref() {
+            if let Some(index) =
+                committed
+                    .iter()
+                    .position(|(committed_run_id, committed_kind, text)| {
+                        committed_run_id == run_id && *committed_kind == kind && text == &event.text
+                    })
+            {
+                committed.remove(index);
+                continue;
+            }
+        }
+        push_message_rows(&mut lines, kind, &event.text);
+    }
+    lines
+}
+
+fn push_notice_rows(lines: &mut Vec<Line<'static>>, text: &str, color: Color) {
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        "Notice",
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )));
+    lines.extend(text.lines().map(|line| {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(line.to_owned(), Style::default().fg(color)),
+        ])
+    }));
+}
+
+fn push_message_rows(lines: &mut Vec<Line<'static>>, kind: LiveEventKind, text: &str) {
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    let (label, label_style, text_style) = match kind {
+        LiveEventKind::User => (
+            "You",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Cyan),
+        ),
+        LiveEventKind::Assistant | LiveEventKind::AssistantDelta => (
+            "Plato",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+            Style::default(),
+        ),
+        LiveEventKind::Tool | LiveEventKind::Status | LiveEventKind::Warning => return,
+    };
+    lines.push(Line::from(Span::styled(label, label_style)));
+    let mut text_lines = text.lines().peekable();
+    if text_lines.peek().is_none() {
+        lines.push(Line::from("  "));
+    } else {
+        lines.extend(text_lines.map(|line| {
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line.to_owned(), text_style),
+            ])
+        }));
+    }
+}
+
+fn trace_summary(
+    typed: Option<&TypedRun>,
+    live_events: &[super::LiveEventLine],
+    live_run_id: Option<&str>,
+    status: Option<RunStateName>,
+    stream_warning: bool,
+    approval_pending: bool,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(run) = typed {
+        for entry in &run.entries {
+            match entry {
+                TypedTranscriptEntry::ToolCall { .. } | TypedTranscriptEntry::ToolResult { .. } => {
+                    push_trace_part(&mut parts, "tools");
+                }
+                TypedTranscriptEntry::Approval { .. } => {
+                    push_trace_part(&mut parts, "approval");
+                }
+                TypedTranscriptEntry::PolicyDenied { .. } => {
+                    push_trace_part(&mut parts, "policy denied");
+                }
+                TypedTranscriptEntry::ToolFailed { .. } => {
+                    push_trace_part(&mut parts, "tool failed");
+                }
+                TypedTranscriptEntry::User { .. } | TypedTranscriptEntry::Assistant { .. } => {}
+            }
+        }
+    }
+    let mut has_live_detail = false;
+    for event in live_events {
+        if event.run_id.as_deref() != live_run_id {
+            continue;
+        }
+        if event.offset.is_none()
+            && (event.text.starts_with("issue prep") || event.text.starts_with("issue-prep"))
+        {
+            continue;
+        }
+        match event.kind {
+            LiveEventKind::Tool => {
+                has_live_detail = true;
+                push_trace_part(&mut parts, "tools");
+            }
+            LiveEventKind::Warning => {
+                has_live_detail = true;
+                push_trace_part(&mut parts, "warning");
+            }
+            LiveEventKind::Status => has_live_detail = true,
+            LiveEventKind::User | LiveEventKind::Assistant | LiveEventKind::AssistantDelta => {}
+        }
+    }
+    if stream_warning {
+        has_live_detail = true;
+        push_trace_part(&mut parts, "stream warning");
+    }
+    if approval_pending {
+        has_live_detail = true;
+        push_trace_part(&mut parts, "approval pending");
+    }
+    match status {
+        Some(RunStateName::Finished) if !parts.is_empty() || has_live_detail => {
+            push_trace_part(&mut parts, "finished");
+        }
+        Some(RunStateName::Failed) => push_trace_part(&mut parts, "failed"),
+        Some(RunStateName::Canceled) => push_trace_part(&mut parts, "canceled"),
+        Some(RunStateName::CancelRequested) => {
+            push_trace_part(&mut parts, "cancel requested");
+        }
+        Some(RunStateName::Interrupted) => push_trace_part(&mut parts, "interrupted"),
+        Some(RunStateName::Running) if !parts.is_empty() || has_live_detail => {
+            push_trace_part(&mut parts, "running");
+        }
+        Some(RunStateName::Finished | RunStateName::Running) | None => {}
+    }
+    if parts.is_empty() && has_live_detail {
+        parts.push("activity");
+    }
+    (!parts.is_empty()).then(|| parts.join(" | "))
+}
+
+fn push_trace_part(parts: &mut Vec<&'static str>, part: &'static str) {
+    if !parts.contains(&part) {
+        parts.push(part);
+    }
+}
+
+fn push_trace_row(lines: &mut Vec<Line<'static>>, summary: String) {
+    let row = Line::from(vec![
+        Span::styled("Trace  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(summary, Style::default().fg(Color::DarkGray)),
+    ]);
+    append_spaced_rows(lines, std::iter::once(row));
+}
+
+fn append_spaced_rows(
+    lines: &mut Vec<Line<'static>>,
+    rows: impl IntoIterator<Item = Line<'static>>,
+) {
+    let rows = rows.into_iter().collect::<Vec<_>>();
+    if rows.is_empty() {
+        return;
+    }
+    if lines.last().is_some_and(|line| line.width() > 0) {
+        lines.push(Line::from(""));
+    }
+    lines.extend(rows);
 }
 
 fn append_queue_preview(lines: &mut Vec<Line<'static>>, state: &TuiState) {
@@ -293,15 +755,11 @@ fn append_queue_preview(lines: &mut Vec<Line<'static>>, state: &TuiState) {
     );
 }
 
-fn render_status_rule(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    frame.render_widget(Paragraph::new(status_rule(state)), area);
+fn render_status_line(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    frame.render_widget(Paragraph::new(status_line(state, area.width)), area);
 }
 
-fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    frame.render_widget(Paragraph::new(header_rule(state)), area);
-}
-
-fn header_rule(state: &TuiState) -> Line<'static> {
+fn status_line(state: &TuiState, width: u16) -> Line<'static> {
     let (run_status, elapsed) = if let Some((marker, elapsed)) = issue_prep_activity(state) {
         (format!("issue prep {marker}"), format_elapsed(elapsed))
     } else {
@@ -319,52 +777,50 @@ fn header_rule(state: &TuiState) -> Line<'static> {
         )
     };
     let model = state.active_model.as_deref().unwrap_or("model pending");
-    let workspace = match &state.connection {
-        ConnectionState::Connected { workspace_id, .. } => workspace_id.as_str(),
+    let connection = match &state.connection {
+        ConnectionState::Connected { .. } => "online",
         ConnectionState::Disconnected { .. } => "offline",
     };
-    Line::from(vec![
-        Span::styled(
-            "Plato Agent",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(
-            " | {run_status} | {elapsed} | {model} | {workspace}"
-        )),
-    ])
+    let queued = state.queued_messages.len();
+    let mode = match state.display_mode {
+        DisplayMode::Conversation => "conversation",
+        DisplayMode::Audit => "audit",
+    };
+    let full =
+        format!("{connection} | {run_status} {elapsed} | {model} | queued {queued} | {mode}");
+    let medium = format!("{connection} | {run_status} | {model} | q {queued} | {mode}");
+    let short_connection = if connection == "online" { "on" } else { "off" };
+    let short_mode = if state.display_mode == DisplayMode::Conversation {
+        "chat"
+    } else {
+        "audit"
+    };
+    let short = format!("{short_connection} | {run_status} | {model} | q{queued} | {short_mode}");
+    let text = [full, medium, short]
+        .into_iter()
+        .find(|candidate| candidate.chars().count() <= usize::from(width))
+        .unwrap_or_else(|| format!("{short_connection} {run_status} q{queued} {short_mode}"));
+    Line::from(Span::styled(
+        bounded_status_text(text, width),
+        Style::default().fg(Color::DarkGray),
+    ))
 }
 
-fn status_rule(state: &TuiState) -> Line<'static> {
-    let queued = state.queued_messages.len();
-    let status = match &state.connection {
-        ConnectionState::Connected { workspace_id, .. } => {
-            let run_status = issue_prep_activity(state).map_or_else(
-                || {
-                    state
-                        .active_run
-                        .as_ref()
-                        .map(|run| run.status.as_str())
-                        .unwrap_or("ready")
-                        .into()
-                },
-                |(marker, _)| format!("issue prep {marker}"),
-            );
-            format!(
-                "-- {run_status} | plato | queued {queued} | {} session{} | {} -- {}",
-                state.sessions.len(),
-                plural(state.sessions.len()),
-                workspace_id,
-                state.workspace_root
-            )
+fn bounded_status_text(mut text: String, width: u16) -> String {
+    let width = usize::from(width);
+    if Line::from(text.as_str()).width() <= width {
+        return text;
+    }
+    if width == 0 {
+        return String::new();
+    }
+    while Line::from(text.as_str()).width() >= width {
+        if text.pop().is_none() {
+            break;
         }
-        ConnectionState::Disconnected { .. } => format!(
-            "-- offline | plato | press r to reconnect -- {}",
-            state.workspace_root
-        ),
-    };
-    Line::from(Span::styled(status, Style::default().fg(Color::DarkGray)))
+    }
+    text.push('~');
+    text
 }
 
 fn issue_prep_activity(state: &TuiState) -> Option<(&'static str, u64)> {
@@ -418,14 +874,6 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .collect()
     };
     lines.append(&mut composer_lines);
-    lines.push(Line::from(Span::styled(
-        format!(
-            "? help | {} | Enter submits | Shift-Enter newline | queued {}",
-            footer_command_hint(),
-            state.queued_messages.len()
-        ),
-        Style::default().fg(Color::DarkGray),
-    )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
@@ -578,7 +1026,7 @@ fn format_elapsed(seconds: u64) -> String {
 }
 
 fn render_help_modal(frame: &mut Frame<'_>, area: Rect) {
-    let area = centered_rect(68, 82, area);
+    let area = centered_rect(68, 92, area);
     let mut lines = vec![Line::from(vec![Span::styled(
         "Commands",
         Style::default().add_modifier(Modifier::BOLD),
@@ -603,6 +1051,7 @@ fn render_help_modal(frame: &mut Frame<'_>, area: Rect) {
         Line::from("Alt-Enter    newline"),
         Line::from("Ctrl-J/M     newline"),
         Line::from("Tab          complete command or submit/queue"),
+        Line::from("v            toggle conversation/audit"),
         Line::from("PgUp/PgDown  scroll"),
         Line::from("Up/Down      input history"),
         Line::from("Ctrl-C       cancel active run"),
@@ -769,15 +1218,14 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn vertical(area: Rect, state: &TuiState) -> [Rect; 4] {
+fn vertical(area: Rect, state: &TuiState) -> [Rect; 3] {
     let composer_height = composer_height(state);
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Min(8),
-            Constraint::Length(1),
+            Constraint::Min(1),
             Constraint::Length(composer_height),
+            Constraint::Length(1),
         ])
         .areas(area)
 }
@@ -793,14 +1241,15 @@ fn composer_height(state: &TuiState) -> u16 {
         .as_ref()
         .map(|popup| matching_slash_commands(&popup.filter).len().clamp(1, 5))
         .unwrap_or(0);
-    (draft_lines + popup_lines + 1).clamp(2, 10) as u16
+    (draft_lines + popup_lines).clamp(1, 9) as u16
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::daemon::protocol::{
-        HelloResult, PendingApprovalSnapshot, SessionSummary, TranscriptReadResult,
+        HelloResult, PendingApprovalSnapshot, SessionSummary, TranscriptReadResult, TypedRun,
+        TypedTranscript, TypedTranscriptEntry,
     };
     use platonic_core::EffectClass;
 
@@ -828,13 +1277,38 @@ mod tests {
         assert!(output.contains("Local Rust agent runtime"));
         assert!(output.contains("work-1234"));
         assert!(output.contains("model pending"));
-        assert!(output.contains("ready | plato"));
+        assert!(output.contains("online | ready"));
         assert!(output.contains("Try \"read README.md and summarize it\""));
-        assert!(output.contains("? help"));
+        assert!(!output.contains("? help"));
+        assert!(!output.contains("v toggle"));
         assert!(!output.contains("Status"));
         assert!(!output.contains("Sessions"));
         assert!(!output.contains("Live Events"));
         assert!(!output.contains("Composer"));
+    }
+
+    #[test]
+    fn status_chrome_stays_one_bounded_row() {
+        let mut state = conversation_fixture();
+        state.active_run = Some(ActiveRunView {
+            run_id: "run_hidden_identifier".into(),
+            status: RunStateName::Running,
+        });
+        state.active_model = Some("model-with-a-very-long-display-name".into());
+        state.queued_messages = vec!["one".into(), "two".into()];
+
+        for width in [0, 8, 24, 48, 96] {
+            let line = status_line(&state, width);
+            assert!(line.width() <= usize::from(width));
+            assert!(!line.to_string().contains("run_hidden_identifier"));
+            assert!(!line.to_string().contains("? help"));
+            assert!(!line.to_string().contains("v toggle"));
+        }
+
+        let [history, composer, status] = vertical(Rect::new(0, 0, 48, 12), &state);
+        assert_eq!(history.height, 10);
+        assert_eq!(composer.height, 1);
+        assert_eq!(status.height, 1);
     }
 
     #[test]
@@ -873,15 +1347,120 @@ mod tests {
         let output = render_to_text(&state);
 
         assert!(output.contains("ready"));
-        assert!(output.contains("run_1"));
-        assert!(output.contains("user"));
+        assert!(!output.contains("run_1"));
+        assert!(output.contains("You"));
         assert!(output.contains("read README"));
-        assert!(output.contains("assistant"));
+        assert!(output.contains("Plato"));
         assert!(output.contains("README summary"));
         assert!(!output.contains("final_phase"));
         assert!(!output.contains("next_seq"));
         assert!(!output.contains("ToolSchemas"));
         assert!(!output.contains("file_read"));
+    }
+
+    #[test]
+    fn conversation_and_audit_snapshots_at_normal_and_narrow_widths() {
+        let mut state = conversation_fixture();
+        let normal_conversation = focused_snapshot(&state, 96, 24);
+        let narrow_conversation = focused_snapshot(&state, 48, 24);
+        assert_eq!(
+            normal_conversation,
+            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow widths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n> | Try \"read README.md and summarize it\"\nonline | ready 0s | openrouter/auto | queued 0 | conversation"
+        );
+        assert_eq!(
+            narrow_conversation,
+            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow\nwidths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n> | Try \"read README.md and summarize it\"\non | ready | openrouter/auto | q0 | chat"
+        );
+        for snapshot in [&normal_conversation, &narrow_conversation] {
+            assert_eq!(snapshot.lines().filter(|line| *line == "You").count(), 2);
+            assert_eq!(snapshot.lines().filter(|line| *line == "Plato").count(), 2);
+            assert_eq!(
+                snapshot
+                    .lines()
+                    .filter(|line| line.starts_with("Trace  "))
+                    .count(),
+                2
+            );
+            assert!(!snapshot.contains("run_alpha_full_identifier"));
+            assert!(!snapshot.contains("run_beta_full_identifier"));
+            assert!(!snapshot.contains("#41"));
+            assert!(!snapshot.contains("#42"));
+        }
+
+        state.toggle_display_mode();
+        let normal_audit = focused_snapshot(&state, 96, 24);
+        let narrow_audit = focused_snapshot(&state, 48, 24);
+        assert_eq!(
+            normal_audit,
+            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise summary.\ntool      call_alpha file.read {\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at narrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission denied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\nonline | ready 0s | openrouter/auto | queued 0 | audit"
+        );
+        assert_eq!(
+            narrow_audit,
+            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise\nsummary.\ntool      call_alpha file.read\n{\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at\nnarrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission\ndenied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\nonline | ready | openrouter/auto | q 0 | audit"
+        );
+        for snapshot in [&normal_audit, &narrow_audit] {
+            assert!(snapshot.contains("run_alpha_full_identifier"));
+            assert!(snapshot.contains("run_beta_full_identifier"));
+            assert!(snapshot.contains("#41"));
+            assert!(snapshot.contains("#42"));
+            assert!(snapshot.contains("call_alpha"));
+        }
+    }
+
+    #[test]
+    fn conversation_labels_have_distinct_literal_styles() {
+        let state = conversation_fixture();
+        let TranscriptState::Loaded(transcript) = &state.transcript else {
+            panic!("expected loaded transcript");
+        };
+        let rows = conversation_transcript_lines(transcript);
+        let you = rows
+            .iter()
+            .find(|line| line.spans.first().is_some_and(|span| span.content == "You"))
+            .unwrap();
+        let plato = rows
+            .iter()
+            .find(|line| {
+                line.spans
+                    .first()
+                    .is_some_and(|span| span.content == "Plato")
+            })
+            .unwrap();
+
+        assert_eq!(
+            you.spans[0].style,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            plato.spans[0].style,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        );
+        assert_ne!(you.spans[0].style, plato.spans[0].style);
+    }
+
+    #[test]
+    fn conversation_deduplicates_committed_live_messages_across_runs() {
+        let mut state = conversation_fixture();
+        state.live_events.insert(
+            0,
+            LiveEventLine::assistant(Some(40), "First answer is short and clear.")
+                .with_run_id("run_alpha_full_identifier"),
+        );
+
+        let output = render_to_text(&state);
+
+        assert_eq!(
+            output.matches("First answer is short and clear.").count(),
+            1
+        );
+        assert_eq!(output.matches("Second answer stays readable.").count(), 1);
+        assert_eq!(output.matches("Trace").count(), 2);
+        assert!(!output.contains("#40"));
+        assert!(!output.contains("#41"));
     }
 
     #[test]
@@ -910,8 +1489,9 @@ mod tests {
         let second = render_to_text(&state);
 
         assert_ne!(first, second);
-        assert!(second.contains("dynamic status"));
-        assert!(second.contains("dynamic warning"));
+        assert!(!second.contains("dynamic status"));
+        assert!(second.contains("stream warning"));
+        assert!(!second.contains("dynamic warning"));
         assert!(second.contains("dynamic queue"));
         assert_eq!(cached_row_ptrs(&state), cached_ptrs);
     }
@@ -920,7 +1500,7 @@ mod tests {
     fn refreshes_cached_rows_after_direct_public_source_mutation() {
         let mut state = history_cache_state(
             "[turn_1] assistant: old transcript\n",
-            LiveEventLine::status(Some(1), "old live event"),
+            LiveEventLine::assistant(Some(1), "old live event"),
         );
         let first = render_to_text(&state);
         assert!(first.contains("old transcript"));
@@ -933,7 +1513,7 @@ mod tests {
         state.live_events[0].text = "new live event".into();
         state
             .live_events
-            .push(LiveEventLine::tool(Some(2), "directly pushed event"));
+            .push(LiveEventLine::assistant(Some(2), "directly pushed event"));
 
         let second = render_to_text(&state);
 
@@ -979,8 +1559,9 @@ mod tests {
 
         let output = render_to_text(&state);
 
-        assert!(output.contains("transcript unavailable"));
-        assert!(output.contains("run_1"));
+        assert!(output.contains("Transcript unavailable"));
+        assert!(!output.contains("run_1"));
+        assert!(output.contains("selected run"));
     }
 
     #[test]
@@ -996,7 +1577,7 @@ mod tests {
         assert!(output.contains("daemon unavailable"));
         assert!(output.contains("cargo run --bin plato-agentd"));
         assert!(output.contains("press r to reconnect"));
-        assert!(output.contains("offline | plato"));
+        assert!(output.contains("offline | ready"));
     }
 
     #[test]
@@ -1026,7 +1607,7 @@ mod tests {
         let output = render_to_text(&state);
 
         assert!(output.contains("running"));
-        assert!(output.contains("run_1"));
+        assert!(!output.contains("run_1"));
         assert!(output.contains("assistant response"));
         assert!(output.contains("> summarize| this file"));
     }
@@ -1173,12 +1754,13 @@ mod tests {
 
         assert!(output.contains("1m05s"));
         assert!(output.contains("openrouter/auto"));
-        assert!(output.contains("user"));
+        assert!(output.contains("You"));
         assert!(output.contains("read README"));
-        assert!(output.contains("tool"));
-        assert!(output.contains("file.read finished"));
+        assert!(output.contains("Trace"));
+        assert!(output.contains("tools"));
+        assert!(!output.contains("file.read finished"));
         assert!(output.contains("warning"));
-        assert!(output.contains("approval pending shell.exec"));
+        assert!(!output.contains("approval pending shell.exec"));
     }
 
     #[test]
@@ -1198,7 +1780,8 @@ mod tests {
         state.live_events = (0..30)
             .map(|index| LiveEventLine::status(Some(index), format!("line {index}")))
             .collect();
-        state.scroll_offset = 10;
+        state.toggle_display_mode();
+        state.scroll_history_up(10);
 
         let output = render_snapshot(&state, 100, 12).unwrap();
 
@@ -1225,7 +1808,7 @@ mod tests {
         let output = render_to_text(&state);
 
         assert!(output.contains("stream warning"));
-        assert!(output.contains("lagged"));
+        assert!(!output.contains("lagged"));
     }
 
     #[test]
@@ -1253,6 +1836,7 @@ mod tests {
         assert!(output.contains("/reconnect"));
         assert!(output.contains("/quit"));
         assert!(output.contains("PgUp/PgDown"));
+        assert!(output.contains("toggle conversation/audit"));
         assert!(output.contains("Ctrl-C"));
     }
 
@@ -1281,7 +1865,7 @@ mod tests {
 
         assert!(output.contains("/clear"));
         assert!(output.contains("clear the visible transcript"));
-        assert!(output.contains("/help /clear /sessions /new /reconnect /quit"));
+        assert!(output.contains("conversation"));
     }
 
     #[test]
@@ -1546,12 +2130,110 @@ mod tests {
         state
     }
 
+    fn conversation_fixture() -> TuiState {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            Vec::new(),
+            TranscriptState::Loaded(
+                TranscriptReadResult {
+                    run_id: "run_beta_full_identifier".into(),
+                    status: RunStateName::Failed,
+                    final_answer: Some("Second answer stays readable.".into()),
+                    transcript: "run_id: run_alpha_full_identifier\n[turn_alpha] user: First question asks for a concise summary.\n[turn_alpha] tool_call call_alpha file.read {\\\"path\\\":\\\"README.md\\\"}\ntool_result call_alpha README loaded\n[turn_alpha] assistant: First answer is short and clear.\nrun_id: run_beta_full_identifier\n[turn_beta] user: Second question remains readable at narrow widths.\n[turn_beta] assistant: Second answer stays readable.\ntool_failed call_beta: permission denied\n".into(),
+                    typed: Some(TypedTranscript {
+                        runs: vec![
+                            TypedRun {
+                                run_id: "run_alpha_full_identifier".into(),
+                                session_index: 0,
+                                status: RunStateName::Finished,
+                                entries: vec![
+                                    TypedTranscriptEntry::User {
+                                        text: "First question asks for a concise summary.".into(),
+                                    },
+                                    TypedTranscriptEntry::ToolCall {
+                                        call_id: "call_alpha".into(),
+                                        tool: "file.read".into(),
+                                        input: serde_json::json!({"path": "README.md"}),
+                                    },
+                                    TypedTranscriptEntry::ToolResult {
+                                        call_id: "call_alpha".into(),
+                                        summary: "README loaded".into(),
+                                    },
+                                    TypedTranscriptEntry::Assistant {
+                                        text: "First answer is short and clear.".into(),
+                                    },
+                                ],
+                            },
+                            TypedRun {
+                                run_id: "run_beta_full_identifier".into(),
+                                session_index: 1,
+                                status: RunStateName::Failed,
+                                entries: vec![
+                                    TypedTranscriptEntry::User {
+                                        text: "Second question remains readable at narrow widths."
+                                            .into(),
+                                    },
+                                    TypedTranscriptEntry::Assistant {
+                                        text: "Second answer stays readable.".into(),
+                                    },
+                                    TypedTranscriptEntry::ToolFailed {
+                                        call_id: "call_beta".into(),
+                                        error: "permission denied".into(),
+                                    },
+                                ],
+                            },
+                        ],
+                    }),
+                    pending_approval: None,
+                }
+                .into(),
+            ),
+        );
+        state.active_model = Some("openrouter/auto".into());
+        state.live_events = vec![
+            LiveEventLine::assistant(Some(41), "Second answer stays readable.")
+                .with_run_id("run_beta_full_identifier"),
+            LiveEventLine::warning(Some(42), "permission denied for call_beta")
+                .with_run_id("run_beta_full_identifier"),
+        ];
+        state
+    }
+
+    fn focused_snapshot(state: &TuiState, width: u16, height: u16) -> String {
+        let output = render_snapshot(state, width, height).unwrap();
+        let mut lines = Vec::new();
+        for line in output.lines().map(str::trim_end) {
+            if line.is_empty()
+                && lines
+                    .last()
+                    .is_some_and(|previous: &&str| previous.is_empty())
+            {
+                continue;
+            }
+            lines.push(line);
+        }
+        while lines.first().is_some_and(|line| line.is_empty()) {
+            lines.remove(0);
+        }
+        while lines.last().is_some_and(|line| line.is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
     fn cached_row_ptrs(state: &TuiState) -> (*const Line<'static>, *const Line<'static>) {
         let transcript = state.history_rows.transcript.read().unwrap();
         let live_events = state.history_rows.live_events.read().unwrap();
         (
             transcript.as_ref().unwrap().1.as_ptr(),
-            live_events.as_ref().unwrap().1.as_ptr(),
+            live_events.as_ref().unwrap().2.as_ptr(),
         )
     }
 

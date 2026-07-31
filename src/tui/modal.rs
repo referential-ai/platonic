@@ -68,7 +68,17 @@ pub fn tool_input_preview_from_event(event: &StreamEvent) -> Option<(String, Str
 
 pub fn live_event_line(buffered: &BufferedStreamEvent) -> LiveEventLine {
     let offset = Some(buffered.offset);
-    match &buffered.event {
+    let run_id = match &buffered.event {
+        StreamEvent::Ledger { record } => Some(record.event.run_id().to_string()),
+        StreamEvent::AssistantDelta { run_id, .. }
+        | StreamEvent::ApprovalRequested { run_id, .. }
+        | StreamEvent::Canceled { run_id } => Some(run_id.clone()),
+        StreamEvent::Unknown(event) => event
+            .get("run_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    };
+    let mut line = match &buffered.event {
         StreamEvent::Ledger { record } => ledger_event_line(offset, &record.event),
         StreamEvent::ApprovalRequested {
             tool_name, effect, ..
@@ -88,7 +98,9 @@ pub fn live_event_line(buffered: &BufferedStreamEvent) -> LiveEventLine {
                 serde_json::to_string(event).unwrap_or_else(|_| "unrenderable event".into()),
             ),
         },
-    }
+    };
+    line.run_id = run_id;
+    line
 }
 
 pub fn model_from_event(event: &StreamEvent) -> Option<String> {
@@ -202,9 +214,16 @@ mod tests {
         assert_eq!(
             approval,
             LiveEventLine::warning(Some(4), "approval pending file.write (workspace_write)")
+                .with_run_id("run_1")
         );
-        assert_eq!(ledger, LiveEventLine::tool(Some(5), "file.read proposed"));
-        assert_eq!(delta, LiveEventLine::assistant_delta(Some(6), "hello"));
+        assert_eq!(
+            ledger,
+            LiveEventLine::tool(Some(5), "file.read proposed").with_run_id("run_1")
+        );
+        assert_eq!(
+            delta,
+            LiveEventLine::assistant_delta(Some(6), "hello").with_run_id("run_1")
+        );
     }
 
     #[test]

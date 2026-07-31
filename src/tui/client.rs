@@ -424,7 +424,7 @@ pub(super) fn drain_client_events(
                         ));
                     }
                 }
-                state.scroll_offset = 0;
+                state.reset_scroll();
                 start_next_queued(commands, state, runtime);
             }
             ClientEvent::EventsPolled(result) => {
@@ -446,7 +446,8 @@ pub(super) fn drain_client_events(
                     crate::tui::LiveEventLine::status(
                         None,
                         format!("cancel requested: {}", result.run_id),
-                    ),
+                    )
+                    .with_run_id(result.run_id),
                 );
             }
             ClientEvent::Failed { operation, error } => {
@@ -526,6 +527,7 @@ pub(super) fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
     loaded.input_history = std::mem::take(&mut state.input_history);
     loaded.history_index = state.history_index;
     loaded.help_visible = state.help_visible;
+    loaded.display_mode = state.display_mode;
     if loaded.status_message.is_none() {
         loaded.status_message = state.status_message.clone();
     }
@@ -538,6 +540,8 @@ pub(super) fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
             loaded.history_rows.live_events = std::mem::take(&mut state.history_rows.live_events);
         }
         loaded.scroll_offset = state.scroll_offset;
+        loaded.conversation_scroll_offset = state.conversation_scroll_offset;
+        loaded.audit_scroll_offset = state.audit_scroll_offset;
         if loaded.active_model.is_none() {
             loaded.active_model = state.active_model.clone();
         }
@@ -586,11 +590,13 @@ pub(super) fn apply_run_response(
     state.cancel_requested = false;
     state.approval = None;
     state.active_run = Some(ActiveRunView::new(run_id.clone(), status));
+    state.bind_latest_user_to_run(&run_id);
     push_live_event(
         state,
-        crate::tui::LiveEventLine::status(None, format!("{message}: {run_id}")),
+        crate::tui::LiveEventLine::status(None, format!("{message}: {run_id}"))
+            .with_run_id(run_id.clone()),
     );
-    state.scroll_offset = 0;
+    state.reset_scroll();
     runtime.active_run_id = Some(run_id);
     runtime.next_offset = 0;
     runtime.poll_in_flight = false;
@@ -644,6 +650,11 @@ pub(super) fn apply_events_result(
             state.approval = Some(approval);
         }
         let line = crate::tui::live_event_line(&buffered);
+        let line = if line.run_id.is_some() {
+            line
+        } else {
+            line.with_run_id(result.run_id.clone())
+        };
         push_live_event(state, line);
     }
     if needs_catch_up {

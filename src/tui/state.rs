@@ -1,5 +1,6 @@
 use crate::daemon::protocol::{
     HelloResult, PendingApprovalSnapshot, RunStateName, SessionSummary, TranscriptReadResult,
+    TypedTranscript,
 };
 use platonic_core::EffectClass;
 use ratatui::text::Line;
@@ -9,6 +10,13 @@ use super::{
     ApprovalModalView,
     commands::{SlashCommandSpec, has_slash_command_prefix, matching_slash_commands},
 };
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum DisplayMode {
+    #[default]
+    Conversation,
+    Audit,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TuiState {
@@ -22,6 +30,9 @@ pub struct TuiState {
     pub live_events: Vec<LiveEventLine>,
     pub(super) history_rows: HistoryRowsCache,
     pub scroll_offset: usize,
+    pub(super) display_mode: DisplayMode,
+    pub(super) conversation_scroll_offset: usize,
+    pub(super) audit_scroll_offset: usize,
     pub active_model: Option<String>,
     pub active_run_elapsed_secs: Option<u64>,
     pub composer: String,
@@ -84,6 +95,9 @@ impl TuiState {
             live_events: Vec::new(),
             history_rows: HistoryRowsCache::default(),
             scroll_offset: 0,
+            display_mode: DisplayMode::Conversation,
+            conversation_scroll_offset: 0,
+            audit_scroll_offset: 0,
             active_model: None,
             active_run_elapsed_secs: None,
             composer: String::new(),
@@ -402,9 +416,75 @@ impl TuiState {
             .take();
     }
 
+    pub(super) fn toggle_display_mode(&mut self) {
+        match self.display_mode {
+            DisplayMode::Conversation => {
+                self.conversation_scroll_offset = self.scroll_offset;
+                self.scroll_offset = self.audit_scroll_offset;
+                self.display_mode = DisplayMode::Audit;
+            }
+            DisplayMode::Audit => {
+                self.audit_scroll_offset = self.scroll_offset;
+                self.scroll_offset = self.conversation_scroll_offset;
+                self.display_mode = DisplayMode::Conversation;
+            }
+        }
+        self.invalidate_history_rows();
+    }
+
+    pub(super) fn scroll_history_up(&mut self, lines: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_add(lines);
+        self.remember_scroll_offset();
+    }
+
+    pub(super) fn scroll_history_down(&mut self, lines: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+        self.remember_scroll_offset();
+    }
+
+    pub(super) fn reset_scroll(&mut self) {
+        self.scroll_offset = 0;
+        self.remember_scroll_offset();
+    }
+
+    pub(super) fn reset_all_scroll(&mut self) {
+        self.scroll_offset = 0;
+        self.conversation_scroll_offset = 0;
+        self.audit_scroll_offset = 0;
+    }
+
+    fn remember_scroll_offset(&mut self) {
+        match self.display_mode {
+            DisplayMode::Conversation => self.conversation_scroll_offset = self.scroll_offset,
+            DisplayMode::Audit => self.audit_scroll_offset = self.scroll_offset,
+        }
+    }
+
+    fn invalidate_history_rows(&mut self) {
+        let _ = self
+            .history_rows
+            .transcript
+            .get_mut()
+            .expect("transcript row cache lock poisoned")
+            .take();
+        self.invalidate_live_event_rows();
+    }
+
     pub(super) fn clear_live_events(&mut self) {
         self.live_events.clear();
         self.invalidate_live_event_rows();
+    }
+
+    pub(super) fn bind_latest_user_to_run(&mut self, run_id: &str) {
+        if let Some(event) = self
+            .live_events
+            .iter_mut()
+            .rev()
+            .find(|event| event.kind == LiveEventKind::User && event.run_id.is_none())
+        {
+            event.run_id = Some(run_id.to_owned());
+            self.invalidate_live_event_rows();
+        }
     }
 
     pub(super) fn invalidate_live_event_rows(&mut self) {
@@ -497,10 +577,16 @@ fn nth_char_boundary(value: &str, start: usize, end: usize, column: usize) -> us
         .unwrap_or(end)
 }
 
+type CachedLiveEventRows = (
+    Vec<LiveEventLine>,
+    Vec<(String, LiveEventKind, String)>,
+    Vec<Line<'static>>,
+);
+
 #[derive(Default)]
 pub(super) struct HistoryRowsCache {
-    pub(super) transcript: RwLock<Option<(String, Vec<Line<'static>>)>>,
-    pub(super) live_events: RwLock<Option<(Vec<LiveEventLine>, Vec<Line<'static>>)>>,
+    pub(super) transcript: RwLock<Option<(TranscriptView, Vec<Line<'static>>)>>,
+    pub(super) live_events: RwLock<Option<CachedLiveEventRows>>,
 }
 
 // These rows are derived from public source fields and are not semantic TUI state.
@@ -561,14 +647,18 @@ pub enum ConnectionState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranscriptView {
     pub run_id: String,
+    pub status: RunStateName,
     pub content: String,
+    pub typed: Option<TypedTranscript>,
 }
 
 impl From<TranscriptReadResult> for TranscriptView {
     fn from(transcript: TranscriptReadResult) -> Self {
         Self {
             run_id: transcript.run_id,
+            status: transcript.status,
             content: transcript.transcript,
+            typed: transcript.typed,
         }
     }
 }
@@ -618,6 +708,7 @@ impl ActiveRunView {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveEventLine {
+    pub run_id: Option<String>,
     pub offset: Option<u64>,
     pub kind: LiveEventKind,
     pub text: String,
@@ -626,6 +717,7 @@ pub struct LiveEventLine {
 impl LiveEventLine {
     pub fn user(text: impl Into<String>) -> Self {
         Self {
+            run_id: None,
             offset: None,
             kind: LiveEventKind::User,
             text: text.into(),
@@ -634,6 +726,7 @@ impl LiveEventLine {
 
     pub fn assistant(offset: Option<u64>, text: impl Into<String>) -> Self {
         Self {
+            run_id: None,
             offset,
             kind: LiveEventKind::Assistant,
             text: text.into(),
@@ -642,6 +735,7 @@ impl LiveEventLine {
 
     pub fn assistant_delta(offset: Option<u64>, text: impl Into<String>) -> Self {
         Self {
+            run_id: None,
             offset,
             kind: LiveEventKind::AssistantDelta,
             text: text.into(),
@@ -650,6 +744,7 @@ impl LiveEventLine {
 
     pub fn tool(offset: Option<u64>, text: impl Into<String>) -> Self {
         Self {
+            run_id: None,
             offset,
             kind: LiveEventKind::Tool,
             text: text.into(),
@@ -658,6 +753,7 @@ impl LiveEventLine {
 
     pub fn status(offset: Option<u64>, text: impl Into<String>) -> Self {
         Self {
+            run_id: None,
             offset,
             kind: LiveEventKind::Status,
             text: text.into(),
@@ -666,10 +762,16 @@ impl LiveEventLine {
 
     pub fn warning(offset: Option<u64>, text: impl Into<String>) -> Self {
         Self {
+            run_id: None,
             offset,
             kind: LiveEventKind::Warning,
             text: text.into(),
         }
+    }
+
+    pub(super) fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
+        self.run_id = Some(run_id.into());
+        self
     }
 }
 
