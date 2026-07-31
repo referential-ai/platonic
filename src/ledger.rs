@@ -19,6 +19,7 @@ use std::{
 const LEGACY_LEDGER_VERSION: u32 = 1;
 pub const LEDGER_VERSION: u32 = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const LEGACY_SQLITE_SCHEMA_VERSION: u32 = 1;
 const SQLITE_SCHEMA_VERSION: u32 = 2;
 pub(crate) const RUN_CANCELED_REASON: &str = "run canceled";
 const ORPHANED_RUN_ERROR: &str = "daemon restarted before run completed";
@@ -254,6 +255,7 @@ impl Drop for SqliteEventRecorder {
 
 pub struct SqliteLedger {
     connection: Connection,
+    schema_version: u32,
     #[cfg(test)]
     terminal_fault: Option<TerminalFaultBoundary>,
 }
@@ -301,6 +303,7 @@ impl SqliteLedger {
         migrate_sqlite(&mut connection)?;
         Ok(Self {
             connection,
+            schema_version: SQLITE_SCHEMA_VERSION,
             #[cfg(test)]
             terminal_fault: None,
         })
@@ -321,8 +324,10 @@ impl SqliteLedger {
         let connection =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         configure_sqlite_connection(&connection)?;
+        let schema_version = read_sqlite_schema_version(&connection)?;
         Ok(Self {
             connection,
+            schema_version,
             #[cfg(test)]
             terminal_fault: None,
         })
@@ -363,6 +368,10 @@ impl SqliteLedger {
             .ok_or(AppError::NoSqliteRuns)?;
         let records = self.read_run(&run_id)?;
         Ok((run_id, records))
+    }
+
+    pub(crate) fn is_legacy_schema(&self) -> bool {
+        self.schema_version == LEGACY_SQLITE_SCHEMA_VERSION
     }
 
     pub fn latest_session_id(&self) -> AppResult<String> {
@@ -825,9 +834,11 @@ fn read_run_records_from(connection: &Connection, run_id: &str) -> AppResult<Vec
              WHERE run_id = ?1
              ORDER BY seq ASC",
     )?;
-    let records = statement
-        .query_map(params![run_id], sqlite_record_from_row)?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = statement.query(params![run_id])?;
+    let mut records = Vec::new();
+    while let Some(row) = rows.next()? {
+        records.push(sqlite_record_from_row(row)?);
+    }
     Ok(records)
 }
 
@@ -959,14 +970,21 @@ fn session_run_metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Se
     })
 }
 
-fn sqlite_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordedEvent> {
+fn sqlite_record_from_row(row: &rusqlite::Row<'_>) -> AppResult<RecordedEvent> {
     let version: u32 = row.get(2)?;
     if !supported_ledger_version(version) {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(AppError::LedgerVersion {
+            expected: LEDGER_VERSION,
+            actual: version,
+        });
     }
     let event_json: String = row.get(3)?;
     let event = serde_json::from_str(&event_json).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(error))
+        AppError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+            3,
+            Type::Text,
+            Box::new(error),
+        ))
     })?;
     Ok(RecordedEvent {
         seq: row_u64(row, 0, "seq")?,
@@ -1053,10 +1071,14 @@ fn open_private_default_sqlite(
         PRIVATE_FILE_MODE,
         current_uid(),
     )?;
-    configure_sqlite_connection(&connection)?;
-    if create {
+    let schema_version = if create {
+        configure_sqlite_connection(&connection)?;
         migrate_sqlite(&mut connection)?;
-    }
+        SQLITE_SCHEMA_VERSION
+    } else {
+        configure_sqlite_connection(&connection)?;
+        read_sqlite_schema_version(&connection)?
+    };
     restrict_existing_sidecars(location.as_path())?;
     verify_open_file(
         location.as_path(),
@@ -1066,6 +1088,7 @@ fn open_private_default_sqlite(
     )?;
     Ok(SqliteLedger {
         connection,
+        schema_version,
         #[cfg(test)]
         terminal_fault: None,
     })
@@ -1283,6 +1306,17 @@ fn configure_sqlite_connection(connection: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+fn read_sqlite_schema_version(connection: &Connection) -> AppResult<u32> {
+    let actual: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if actual > SQLITE_SCHEMA_VERSION {
+        return Err(AppError::SqliteSchemaVersion {
+            expected: SQLITE_SCHEMA_VERSION,
+            actual,
+        });
+    }
+    Ok(actual)
+}
+
 fn migrate_sqlite(connection: &mut Connection) -> AppResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: u32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -1291,7 +1325,7 @@ fn migrate_sqlite(connection: &mut Connection) -> AppResult<()> {
             "unsupported sqlite schema version: {version}"
         )));
     }
-    if version < 1 {
+    if version < LEGACY_SQLITE_SCHEMA_VERSION {
         transaction.execute_batch(
             r#"
             CREATE TABLE ledger_events (
@@ -1305,7 +1339,7 @@ fn migrate_sqlite(connection: &mut Connection) -> AppResult<()> {
             "#,
         )?;
     }
-    if version < 2 {
+    if version < SQLITE_SCHEMA_VERSION {
         create_session_tables(&transaction)?;
     }
     if version < SQLITE_SCHEMA_VERSION {
