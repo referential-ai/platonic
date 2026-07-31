@@ -133,6 +133,8 @@ From the TUI, submit `/issue-prep <rough issue>`. The daemon runs the same
 pipeline and returns the candidate or blocked reasons in the transcript.
 An animated elapsed indicator remains visible while it runs. Artifacts are
 written under `.plato/issue-prep/<run_id>/`.
+The TUI keeps connection setup and `hello` on its three-second deadline, then
+waits for the synchronous pipeline to finish under its existing provider bounds.
 
 `start` requires a new run directory. A failed run remains unchanged; retry
 with a different directory. A successful candidate is written to stdout and

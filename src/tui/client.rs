@@ -246,7 +246,13 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
         })
         .map_or_else(failed_event("message.append"), ClientEvent::RunStarted),
         ClientCommand::IssuePrepStart { input, config_path } => {
-            with_client(config, |client| client.issue_prep_start(input, config_path)).map_or_else(
+            let result = (|| {
+                let mut client = connect_daemon(config, DAEMON_CLIENT_TIMEOUT)?;
+                client.hello(&config.workspace_root)?;
+                client.clear_request_timeout()?;
+                client.issue_prep_start(input, config_path)
+            })();
+            result.map_or_else(
                 failed_event("issue-prep.start"),
                 ClientEvent::IssuePrepFinished,
             )
@@ -595,5 +601,299 @@ pub(super) fn is_connection_error(error: &AppError) -> bool {
             ERROR_UNSUPPORTED_VERSION | ERROR_WORKSPACE_MISMATCH
         ),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        daemon::{
+            protocol::{
+                ERROR_ISSUE_PREP_FAILED, Envelope, EnvelopeKind, HelloResult, PROTOCOL_VERSION,
+                ProtocolError,
+            },
+            transport,
+        },
+        tui::{ConnectionState, TranscriptState, render_snapshot},
+    };
+    use serde_json::json;
+    use std::{
+        io::{BufRead, BufReader, Write},
+        path::PathBuf,
+        sync::mpsc::{self, RecvTimeoutError},
+        thread::{self, JoinHandle},
+    };
+
+    const OUTER_WATCHDOG: Duration = Duration::from_secs(10);
+    const DEADLINE_MARGIN: Duration = Duration::from_millis(100);
+
+    #[test]
+    fn issue_prep_waits_past_short_deadline_for_delayed_success() {
+        let harness =
+            DelayedIssuePrepHarness::start("delayed-success", DelayedIssuePrepReply::Candidate);
+        let (commands, events) = spawn_client_worker(harness.config.clone());
+        let mut state = connected_state(&harness.config);
+        state.issue_prep_started_at = Some(Instant::now());
+        let mut runtime = UiRuntime::from_state(&state, None);
+        commands
+            .send(ClientCommand::IssuePrepStart {
+                input: "prepare a bounded issue".into(),
+                config_path: Some("plato.toml".into()),
+            })
+            .unwrap();
+
+        let event = harness.wait_past_short_deadline(&events);
+        apply_event(&commands, event, &mut state, &mut runtime);
+
+        assert!(matches!(
+            state.connection,
+            ConnectionState::Connected { .. }
+        ));
+        assert!(state.issue_prep_started_at.is_none());
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("issue ready; artifacts: /work/.plato/issue-prep/run_1")
+        );
+        let output = render_snapshot(&state, 100, 24).unwrap();
+        assert!(output.contains("Prepared issue"));
+
+        let live_events = state.live_events.clone();
+        let (_sender, empty_events) = mpsc::channel();
+        drain_client_events(&mut state, &mut runtime, &empty_events, &commands);
+        assert!(state.issue_prep_started_at.is_none());
+        assert_eq!(state.live_events, live_events);
+    }
+
+    #[test]
+    fn issue_prep_waits_past_short_deadline_for_delayed_typed_error() {
+        let harness =
+            DelayedIssuePrepHarness::start("delayed-error", DelayedIssuePrepReply::TypedError);
+        let (commands, events) = spawn_client_worker(harness.config.clone());
+        let mut state = connected_state(&harness.config);
+        state.issue_prep_started_at = Some(Instant::now());
+        let mut runtime = UiRuntime::from_state(&state, None);
+        commands
+            .send(ClientCommand::IssuePrepStart {
+                input: "prepare a bounded issue".into(),
+                config_path: None,
+            })
+            .unwrap();
+
+        let event = harness.wait_past_short_deadline(&events);
+        apply_event(&commands, event, &mut state, &mut runtime);
+
+        assert!(matches!(
+            state.connection,
+            ConnectionState::Connected { .. }
+        ));
+        assert!(state.issue_prep_started_at.is_none());
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some(
+                "issue-prep.start failed: daemon protocol error issue_prep_failed: \
+                 provider failed"
+            )
+        );
+        assert_eq!(
+            state
+                .live_events
+                .iter()
+                .filter(|event| event.text.contains("provider failed"))
+                .count(),
+            1
+        );
+        let output = render_snapshot(&state, 100, 24).unwrap();
+        assert!(output.contains("provider failed"));
+
+        let live_events = state.live_events.clone();
+        let (_sender, empty_events) = mpsc::channel();
+        drain_client_events(&mut state, &mut runtime, &empty_events, &commands);
+        assert!(state.issue_prep_started_at.is_none());
+        assert_eq!(state.live_events, live_events);
+    }
+
+    fn apply_event(
+        commands: &Sender<ClientCommand>,
+        event: ClientEvent,
+        state: &mut TuiState,
+        runtime: &mut UiRuntime,
+    ) {
+        let (event_sender, event_receiver) = mpsc::channel();
+        event_sender.send(event).unwrap();
+        drain_client_events(state, runtime, &event_receiver, commands);
+    }
+
+    fn connected_state(config: &DaemonConnectionConfig) -> TuiState {
+        TuiState::connected(
+            config.workspace_root.to_string_lossy().into_owned(),
+            config.socket_path.to_string_lossy().into_owned(),
+            HelloResult {
+                daemon_version: env!("CARGO_PKG_VERSION").into(),
+                workspace_id: crate::paths::workspace_id(&config.workspace_root).unwrap(),
+                ledger_path: "/work/agent.db".into(),
+                capabilities: vec!["hello".into(), "issue-prep.start".into()],
+            },
+            Vec::new(),
+            TranscriptState::None,
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    enum DelayedIssuePrepReply {
+        Candidate,
+        TypedError,
+    }
+
+    struct DelayedIssuePrepHarness {
+        config: DaemonConnectionConfig,
+        request_seen: Receiver<()>,
+        release: Sender<()>,
+        server: JoinHandle<()>,
+        _workspace: tempfile::TempDir,
+        _endpoint: TestEndpoint,
+    }
+
+    impl DelayedIssuePrepHarness {
+        fn start(name: &str, reply: DelayedIssuePrepReply) -> Self {
+            let workspace = tempfile::tempdir().unwrap();
+            let endpoint = TestEndpoint::new(name);
+            let listener = transport::bind(&endpoint.path).unwrap();
+            let config =
+                DaemonConnectionConfig::resolve(workspace.path(), Some(endpoint.path.clone()))
+                    .unwrap();
+            let workspace_id = crate::paths::workspace_id(&config.workspace_root).unwrap();
+            let (request_seen_sender, request_seen) = mpsc::channel();
+            let (release, release_receiver) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let mut stream = transport::accept(&listener).unwrap();
+                transport::set_deadline(&mut stream, Instant::now() + OUTER_WATCHDOG).unwrap();
+                let mut reader = BufReader::new(transport::try_clone(&stream).unwrap());
+
+                let hello = read_request(&mut reader);
+                assert_eq!(hello.method.as_deref(), Some("hello"));
+                write_envelope(
+                    &mut stream,
+                    &Envelope::response(
+                        hello.id,
+                        Some("hello".into()),
+                        json!({
+                            "daemon_version": env!("CARGO_PKG_VERSION"),
+                            "workspace_id": workspace_id,
+                            "ledger_path": "/work/agent.db",
+                            "capabilities": ["hello", "issue-prep.start"]
+                        }),
+                    ),
+                )
+                .unwrap();
+
+                let issue_prep = read_request(&mut reader);
+                assert_eq!(issue_prep.method.as_deref(), Some("issue-prep.start"));
+                assert_eq!(
+                    issue_prep.params.as_ref().unwrap()["input"],
+                    "prepare a bounded issue"
+                );
+                request_seen_sender.send(()).unwrap();
+                release_receiver.recv_timeout(OUTER_WATCHDOG).unwrap();
+
+                let response = match reply {
+                    DelayedIssuePrepReply::Candidate => Envelope::response(
+                        issue_prep.id,
+                        Some("issue-prep.start".into()),
+                        json!({
+                            "run_dir": "/work/.plato/issue-prep/run_1",
+                            "outcome": {
+                                "status": "candidate",
+                                "markdown": "# Prepared issue"
+                            }
+                        }),
+                    ),
+                    DelayedIssuePrepReply::TypedError => Envelope {
+                        v: PROTOCOL_VERSION,
+                        id: issue_prep.id,
+                        kind: EnvelopeKind::Error,
+                        method: Some("issue-prep.start".into()),
+                        params: None,
+                        result: None,
+                        error: Some(ProtocolError {
+                            code: ERROR_ISSUE_PREP_FAILED.into(),
+                            message: "provider failed".into(),
+                        }),
+                    },
+                };
+                let _ = write_envelope(&mut stream, &response);
+            });
+            Self {
+                config,
+                request_seen,
+                release,
+                server,
+                _workspace: workspace,
+                _endpoint: endpoint,
+            }
+        }
+
+        fn wait_past_short_deadline(self, events: &Receiver<ClientEvent>) -> ClientEvent {
+            self.request_seen.recv_timeout(OUTER_WATCHDOG).unwrap();
+            let premature = events.recv_timeout(DAEMON_CLIENT_TIMEOUT + DEADLINE_MARGIN);
+            self.release.send(()).unwrap();
+            let (crossed_deadline, event) = match premature {
+                Err(RecvTimeoutError::Timeout) => {
+                    (true, events.recv_timeout(OUTER_WATCHDOG).unwrap())
+                }
+                Ok(event) => (false, event),
+                Err(error) => panic!("client event channel failed: {error}"),
+            };
+            let server_result = self.server.join();
+
+            assert!(
+                crossed_deadline,
+                "issue prep completed before release: {event:?}"
+            );
+            server_result.unwrap();
+            event
+        }
+    }
+
+    fn read_request(reader: &mut BufReader<transport::Stream>) -> Envelope {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str(line.trim()).unwrap()
+    }
+
+    fn write_envelope(writer: &mut transport::Stream, envelope: &Envelope) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec(envelope).unwrap();
+        writer.write_all(&bytes)?;
+        writer.write_all(b"\n")?;
+        writer.flush()
+    }
+
+    struct TestEndpoint {
+        path: PathBuf,
+        _directory: Option<tempfile::TempDir>,
+    }
+
+    impl TestEndpoint {
+        fn new(name: &str) -> Self {
+            #[cfg(unix)]
+            {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join(format!("{name}.sock"));
+                Self {
+                    path,
+                    _directory: Some(directory),
+                }
+            }
+            #[cfg(windows)]
+            {
+                Self {
+                    path: PathBuf::from(format!(
+                        r"\\.\pipe\plato-agent-tui-{name}-{}",
+                        std::process::id()
+                    )),
+                    _directory: None,
+                }
+            }
+        }
     }
 }
