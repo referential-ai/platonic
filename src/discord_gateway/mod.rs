@@ -635,7 +635,7 @@ base_url = "https://provider.example/v1"
         let (paths, provider_envs) =
             resolve_channel_configs(workspace.path(), &channel_configs).unwrap();
 
-        assert_eq!(paths[&200], mapped_path.to_string_lossy());
+        assert_eq!(Path::new(&paths[&200]), mapped_path.as_path());
         assert_eq!(provider_envs, vec!["CHANNEL_PROVIDER_KEY"]);
     }
 
