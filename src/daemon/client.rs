@@ -48,6 +48,13 @@ impl DaemonClient {
         Ok(())
     }
 
+    pub(crate) fn clear_request_timeout(&mut self) -> AppResult<()> {
+        transport::clear_deadline(self.reader.get_mut())?;
+        transport::clear_deadline(&mut self.writer)?;
+        self.request_timeout = None;
+        Ok(())
+    }
+
     #[cfg(windows)]
     pub fn connect_expected_server(socket_path: &Path, expected_pid: u32) -> AppResult<Self> {
         let writer = transport::connect_expected_server(socket_path, expected_pid)?;
@@ -571,6 +578,54 @@ mod timeout_tests {
             elapsed > TIMEOUT,
             "two delayed requests did not outlive one budget: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn timed_client_can_clear_its_request_timeout() {
+        const TIMEOUT: Duration = Duration::from_millis(100);
+        const OUTER_WATCHDOG: Duration = Duration::from_secs(5);
+
+        let endpoint = TestEndpoint::new("clear-request-timeout");
+        let listener = transport::bind(&endpoint.path).unwrap();
+        let (request_seen_sender, request_seen_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut stream = transport::accept(&listener).unwrap();
+            let mut reader = BufReader::new(transport::try_clone(&stream).unwrap());
+            let first = read_request(&mut reader);
+            write_sessions_response(&mut stream, first.id);
+            let second = read_request(&mut reader);
+            request_seen_sender.send(()).unwrap();
+            release_receiver.recv_timeout(OUTER_WATCHDOG).unwrap();
+            write_sessions_response(&mut stream, second.id);
+        });
+        let mut client = DaemonClient::connect_with_timeout(&endpoint.path, TIMEOUT).unwrap();
+        assert!(client.sessions_list().unwrap().is_empty());
+        client.clear_request_timeout().unwrap();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let request = thread::spawn(move || {
+            result_sender.send(client.sessions_list()).unwrap();
+        });
+
+        request_seen_receiver.recv_timeout(OUTER_WATCHDOG).unwrap();
+        let premature = result_receiver.recv_timeout(TIMEOUT + Duration::from_millis(50));
+        release_sender.send(()).unwrap();
+        let (crossed_timeout, result) = match premature {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                (true, result_receiver.recv_timeout(OUTER_WATCHDOG).unwrap())
+            }
+            Ok(result) => (false, result),
+            Err(error) => panic!("request result channel failed: {error}"),
+        };
+        request.join().unwrap();
+        let server_result = server.join();
+
+        assert!(
+            crossed_timeout,
+            "request completed before the cleared timeout elapsed"
+        );
+        assert!(result.unwrap().is_empty());
+        server_result.unwrap();
     }
 
     #[test]

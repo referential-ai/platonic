@@ -138,6 +138,12 @@ pub(crate) fn set_deadline(stream: &mut Stream, deadline: std::time::Instant) ->
     stream.set_write_timeout(Some(remaining))
 }
 
+#[cfg(unix)]
+pub(crate) fn clear_deadline(stream: &mut Stream) -> io::Result<()> {
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)
+}
+
 #[cfg(windows)]
 pub(crate) fn connect(endpoint: &Path) -> io::Result<Stream> {
     Ok(Stream {
@@ -175,6 +181,15 @@ pub(crate) fn connect_expected_server(endpoint: &Path, expected_pid: u32) -> io:
 #[cfg(windows)]
 pub(crate) fn set_deadline(stream: &mut Stream, deadline: std::time::Instant) -> io::Result<()> {
     stream.deadline = Some(deadline);
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn clear_deadline(stream: &mut Stream) -> io::Result<()> {
+    if let WindowsStream::Client(pipe) = &stream.inner {
+        crate::windows_security::set_pipe_wait(pipe)?;
+    }
+    stream.deadline = None;
     Ok(())
 }
 
