@@ -11,9 +11,33 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
-    io::{BufRead, BufReader},
+    io::{self, BufRead, BufReader, Read},
     time::Duration,
 };
+
+const MAX_DECODED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_NON_STREAM_BODY_BYTES: usize = 1024 * 1024;
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+const MAX_ASSISTANT_TEXT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOOL_CALLS: usize = 64;
+const MAX_TOOL_CALL_INDEX: usize = MAX_TOOL_CALLS - 1;
+const MAX_TOOL_NAME_BYTES: usize = 256;
+const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
+const MAX_TOOL_ARGUMENTS_BYTES: usize = 4 * 1024 * 1024;
+
+const DECODED_RESPONSE_LIMIT_ERROR: &str =
+    "provider response exceeded the 8 MiB decoded data limit";
+const NON_STREAM_BODY_LIMIT_ERROR: &str =
+    "provider response exceeded the 1 MiB non-stream body limit";
+const SSE_EVENT_LIMIT_ERROR: &str = "provider response exceeded the 1 MiB SSE event limit";
+const ASSISTANT_TEXT_LIMIT_ERROR: &str =
+    "provider response exceeded the 4 MiB assistant text limit";
+const TOOL_CALL_LIMIT_ERROR: &str = "provider response exceeded the 64 tool call limit";
+const TOOL_NAME_LIMIT_ERROR: &str = "provider response exceeded the 256-byte tool name limit";
+const TOOL_ARGUMENT_LIMIT_ERROR: &str =
+    "provider response exceeded the 1 MiB per-call tool arguments limit";
+const TOOL_ARGUMENTS_LIMIT_ERROR: &str =
+    "provider response exceeded the 4 MiB aggregate tool arguments limit";
 
 pub struct OpenAiCompatibleClient {
     api_key: String,
@@ -83,8 +107,9 @@ impl OpenAiCompatibleClient {
     }
 
     fn send_body(&self, body: ChatCompletionRequest) -> AppResult<ModelResponse> {
-        self.post_completion(body)?
-            .into_json::<ChatCompletionResponse>()
+        let response = self.post_completion(body)?;
+        let body = read_non_stream_body(response.into_reader())?;
+        serde_json::from_slice::<ChatCompletionResponse>(&body)
             .map_err(|error| AppError::Provider(error.to_string()))?
             .into_model_response()
     }
@@ -123,12 +148,22 @@ fn provider_send_error(error: ureq::Error) -> AppError {
                 .header("Retry-After")
                 .and_then(parse_retry_after_seconds),
         },
-        ureq::Error::Status(status, response) => {
-            let body = response.into_string().unwrap_or_default();
-            AppError::Provider(format!("provider returned http {status}: {body}"))
+        ureq::Error::Status(status, _) => {
+            AppError::Provider(format!("provider returned http {status}"))
         }
         error => AppError::Provider(error.to_string()),
     }
+}
+
+fn read_non_stream_body(reader: impl Read) -> AppResult<Vec<u8>> {
+    let mut body = Vec::new();
+    reader
+        .take((MAX_NON_STREAM_BODY_BYTES + 1) as u64)
+        .read_to_end(&mut body)?;
+    if body.len() > MAX_NON_STREAM_BODY_BYTES {
+        return Err(AppError::Provider(NON_STREAM_BODY_LIMIT_ERROR.into()));
+    }
+    Ok(body)
 }
 
 fn parse_retry_after_seconds(value: &str) -> Option<f64> {
@@ -351,6 +386,7 @@ impl ChatCompletionRequest {
 struct StreamingAssembler {
     text: String,
     tool_calls: BTreeMap<usize, StreamingToolCall>,
+    tool_arguments_bytes: usize,
     finish_reason: Option<ChatFinishReason>,
     usage: Option<ChatUsage>,
 }
@@ -376,10 +412,58 @@ impl StreamingAssembler {
                 continue;
             }
             if let Some(text) = choice.delta.content.filter(|text| !text.is_empty()) {
+                if self
+                    .text
+                    .len()
+                    .checked_add(text.len())
+                    .is_none_or(|bytes| bytes > MAX_ASSISTANT_TEXT_BYTES)
+                {
+                    return Err(AppError::Provider(ASSISTANT_TEXT_LIMIT_ERROR.into()));
+                }
                 on_delta(&text)?;
                 self.text.push_str(&text);
             }
             for tool_call in choice.delta.tool_calls {
+                if tool_call.index > MAX_TOOL_CALL_INDEX {
+                    return Err(AppError::Provider(TOOL_CALL_LIMIT_ERROR.into()));
+                }
+                if !self.tool_calls.contains_key(&tool_call.index)
+                    && self.tool_calls.len() == MAX_TOOL_CALLS
+                {
+                    return Err(AppError::Provider(TOOL_CALL_LIMIT_ERROR.into()));
+                }
+
+                let current = self.tool_calls.get(&tool_call.index);
+                let added_arguments_bytes = tool_call
+                    .function
+                    .as_ref()
+                    .and_then(|function| function.arguments.as_ref())
+                    .map_or(0, String::len);
+                if let Some(function) = &tool_call.function {
+                    if let Some(name) = &function.name
+                        && current
+                            .map_or(0, |call| call.name.len())
+                            .checked_add(name.len())
+                            .is_none_or(|bytes| bytes > MAX_TOOL_NAME_BYTES)
+                    {
+                        return Err(AppError::Provider(TOOL_NAME_LIMIT_ERROR.into()));
+                    }
+                    if current
+                        .map_or(0, |call| call.arguments.len())
+                        .checked_add(added_arguments_bytes)
+                        .is_none_or(|bytes| bytes > MAX_TOOL_ARGUMENT_BYTES)
+                    {
+                        return Err(AppError::Provider(TOOL_ARGUMENT_LIMIT_ERROR.into()));
+                    }
+                    if self
+                        .tool_arguments_bytes
+                        .checked_add(added_arguments_bytes)
+                        .is_none_or(|bytes| bytes > MAX_TOOL_ARGUMENTS_BYTES)
+                    {
+                        return Err(AppError::Provider(TOOL_ARGUMENTS_LIMIT_ERROR.into()));
+                    }
+                }
+
                 let entry = self.tool_calls.entry(tool_call.index).or_default();
                 if let Some(id) = tool_call.id.filter(|id| !id.is_empty()) {
                     entry.id = Some(id);
@@ -392,6 +476,7 @@ impl StreamingAssembler {
                         entry.arguments.push_str(&arguments);
                     }
                 }
+                self.tool_arguments_bytes += added_arguments_bytes;
             }
             if let Some(reason) = choice.finish_reason {
                 self.finish_reason = Some(reason);
@@ -419,31 +504,54 @@ impl StreamingAssembler {
 }
 
 fn parse_chat_completion_stream(
-    reader: impl BufRead,
+    mut reader: impl BufRead,
     on_delta: &mut impl FnMut(&str) -> AppResult<()>,
 ) -> AppResult<ModelResponse> {
     let mut assembler = StreamingAssembler::default();
     let mut event_data = String::new();
+    let mut line = Vec::new();
+    let mut decoded_bytes = 0;
+    let mut event_bytes = 0;
     let mut saw_done = false;
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() {
-            if !event_data.is_empty() {
-                if process_stream_data(&event_data, &mut assembler, on_delta)? {
-                    saw_done = true;
-                    break;
+
+    loop {
+        let remaining =
+            (MAX_DECODED_RESPONSE_BYTES - decoded_bytes).min(MAX_SSE_EVENT_BYTES - event_bytes);
+        let read = Read::by_ref(&mut reader)
+            .take((remaining + 1) as u64)
+            .read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        decoded_bytes += read;
+        if decoded_bytes > MAX_DECODED_RESPONSE_BYTES {
+            return Err(AppError::Provider(DECODED_RESPONSE_LIMIT_ERROR.into()));
+        }
+        event_bytes += read;
+        if event_bytes > MAX_SSE_EVENT_BYTES {
+            return Err(AppError::Provider(SSE_EVENT_LIMIT_ERROR.into()));
+        }
+
+        if line.last() == Some(&b'\n') {
+            line.pop();
+            if append_stream_line(&line, &mut event_data)? {
+                if !event_data.is_empty() {
+                    if process_stream_data(&event_data, &mut assembler, on_delta)? {
+                        saw_done = true;
+                        break;
+                    }
+                    event_data.clear();
                 }
-                event_data.clear();
+                event_bytes = 0;
             }
-            continue;
+            line.clear();
         }
-        if let Some(data) = line.strip_prefix("data:") {
-            if !event_data.is_empty() {
-                event_data.push('\n');
-            }
-            event_data.push_str(data.trim_start());
-        }
+    }
+
+    if !line.is_empty() && !saw_done && append_stream_line(&line, &mut event_data)? {
+        saw_done =
+            !event_data.is_empty() && process_stream_data(&event_data, &mut assembler, on_delta)?;
+        event_data.clear();
     }
     if !event_data.is_empty() && !saw_done {
         saw_done = process_stream_data(&event_data, &mut assembler, on_delta)?;
@@ -454,6 +562,22 @@ fn parse_chat_completion_stream(
         ));
     }
     assembler.into_model_response()
+}
+
+fn append_stream_line(line: &[u8], event_data: &mut String) -> AppResult<bool> {
+    let line = std::str::from_utf8(line)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let line = line.trim_end_matches('\r');
+    if line.is_empty() {
+        return Ok(true);
+    }
+    if let Some(data) = line.strip_prefix("data:") {
+        if !event_data.is_empty() {
+            event_data.push('\n');
+        }
+        event_data.push_str(data.trim_start());
+    }
+    Ok(false)
 }
 
 fn process_stream_data(
@@ -549,6 +673,7 @@ fn tool_use_from_provider(id: String, name: String, arguments: String) -> AppRes
             "provider returned tool call without id".into(),
         ));
     }
+    validate_tool_call(&name, &arguments)?;
     let tool_name = internal_name_for_provider(&name)
         .ok_or_else(|| AppError::Provider(format!("provider returned unknown tool {name}")))?;
     let input = serde_json::from_str(&arguments).map_err(|error| {
@@ -561,6 +686,16 @@ fn tool_use_from_provider(id: String, name: String, arguments: String) -> AppRes
         name: tool_name.into(),
         input,
     })
+}
+
+fn validate_tool_call(name: &str, arguments: &str) -> AppResult<()> {
+    if name.len() > MAX_TOOL_NAME_BYTES {
+        return Err(AppError::Provider(TOOL_NAME_LIMIT_ERROR.into()));
+    }
+    if arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
+        return Err(AppError::Provider(TOOL_ARGUMENT_LIMIT_ERROR.into()));
+    }
+    Ok(())
 }
 
 fn stop_from_finish(finish_reason: ChatFinishReason) -> ModelStop {
@@ -612,11 +747,33 @@ impl ChatCompletionResponse {
             .into_iter()
             .next()
             .ok_or_else(|| AppError::Provider("provider returned no choices".into()))?;
+        let text = choice.message.content.filter(|text| !text.is_empty());
+        if text
+            .as_ref()
+            .is_some_and(|text| text.len() > MAX_ASSISTANT_TEXT_BYTES)
+        {
+            return Err(AppError::Provider(ASSISTANT_TEXT_LIMIT_ERROR.into()));
+        }
+        let tool_calls = choice.message.tool_calls.unwrap_or_default();
+        if tool_calls.len() > MAX_TOOL_CALLS {
+            return Err(AppError::Provider(TOOL_CALL_LIMIT_ERROR.into()));
+        }
+        let mut tool_arguments_bytes = 0_usize;
+        for call in &tool_calls {
+            validate_tool_call(&call.function.name, &call.function.arguments)?;
+            tool_arguments_bytes = tool_arguments_bytes
+                .checked_add(call.function.arguments.len())
+                .ok_or_else(|| AppError::Provider(TOOL_ARGUMENTS_LIMIT_ERROR.into()))?;
+            if tool_arguments_bytes > MAX_TOOL_ARGUMENTS_BYTES {
+                return Err(AppError::Provider(TOOL_ARGUMENTS_LIMIT_ERROR.into()));
+            }
+        }
+
         let mut content = Vec::new();
-        if let Some(text) = choice.message.content.filter(|text| !text.is_empty()) {
+        if let Some(text) = text {
             content.push(ModelBlock::Text { text });
         }
-        for call in choice.message.tool_calls.unwrap_or_default() {
+        for call in tool_calls {
             content.push(tool_use_from_provider(
                 call.id,
                 call.function.name,
@@ -936,6 +1093,38 @@ mod tests {
     }
 
     #[test]
+    fn non_429_status_errors_expose_only_status() {
+        for (status, reason) in [
+            (400, "Bad Request"),
+            (401, "Unauthorized"),
+            (403, "Forbidden"),
+            (500, "Internal Server Error"),
+        ] {
+            let body = format!("secret-for-{status}");
+            let response_body = body.clone();
+            let (base_url, server) = spawn_loopback_provider(move |mut stream| {
+                read_provider_request(&mut stream);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                )
+                .unwrap();
+            });
+            let client = timeout_test_client(base_url, 2_000, 2_000);
+
+            let error = client.send(&reasoning_request(None)).unwrap_err();
+            server.join().unwrap();
+
+            assert_eq!(
+                error.to_string(),
+                format!("provider error: provider returned http {status}")
+            );
+            assert!(!error.to_string().contains(&body));
+        }
+    }
+
+    #[test]
     fn request_write_stall_uses_connect_budget() {
         let (stop_sender, stop_receiver) = mpsc::channel();
         let (base_url, server) = spawn_loopback_provider(move |_stream| {
@@ -1061,6 +1250,26 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "non-streaming response read took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn non_stream_body_limit_is_exact() {
+        let exact = padded_non_stream_response(MAX_NON_STREAM_BODY_BYTES);
+        let body = read_non_stream_body(Cursor::new(exact)).unwrap();
+        let response = serde_json::from_slice::<ChatCompletionResponse>(&body)
+            .unwrap()
+            .into_model_response()
+            .unwrap();
+        assert_eq!(response.text(), "ok");
+
+        let error = read_non_stream_body(Cursor::new(padded_non_stream_response(
+            MAX_NON_STREAM_BODY_BYTES + 1,
+        )))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == NON_STREAM_BODY_LIMIT_ERROR
+        ));
     }
 
     fn timeout_test_client(
@@ -1329,6 +1538,581 @@ mod tests {
             assert_eq!(deltas, ["h\u{e9}\u{754c}"]);
             assert_eq!(response.text(), "h\u{e9}\u{754c}");
             assert_eq!(response.stop, ModelStop::EndTurn);
+        }
+    }
+
+    #[test]
+    fn streaming_aggregate_decoded_limit_is_exact() {
+        let exact = streaming_body_with_size(MAX_DECODED_RESPONSE_BYTES);
+        let response = parse_chat_completion_stream(Cursor::new(exact), &mut |_| Ok(())).unwrap();
+        assert_eq!(response.stop, ModelStop::EndTurn);
+
+        let mut deltas = Vec::new();
+        let error = parse_chat_completion_stream(
+            Cursor::new(streaming_body_with_size(MAX_DECODED_RESPONSE_BYTES + 1)),
+            &mut |delta| {
+                deltas.push(delta.to_string());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(deltas.is_empty());
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == DECODED_RESPONSE_LIMIT_ERROR
+        ));
+    }
+
+    #[test]
+    fn individual_sse_event_limit_is_exact_before_delta_emission() {
+        let chunk = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "within-limit"},
+                "finish_reason": null
+            }]
+        });
+        let mut exact = sse_event_with_size(&chunk, MAX_SSE_EVENT_BYTES);
+        exact.push_str(&sse_finish());
+        let mut deltas = Vec::new();
+        let response = parse_chat_completion_stream(Cursor::new(exact), &mut |delta| {
+            deltas.push(delta.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(deltas, ["within-limit"]);
+        assert_eq!(response.text(), "within-limit");
+
+        let mut over = sse_event_with_size(&chunk, MAX_SSE_EVENT_BYTES + 1);
+        over.push_str(&sse_finish());
+        let mut deltas = Vec::new();
+        let error = parse_chat_completion_stream(Cursor::new(over), &mut |delta| {
+            deltas.push(delta.to_string());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(deltas.is_empty());
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == SSE_EVENT_LIMIT_ERROR
+        ));
+    }
+
+    #[test]
+    fn fragmented_unicode_streaming_text_limit_is_exact_before_delta_emission() {
+        let fragments = (0..8)
+            .map(|_| utf8_string_with_bytes(MAX_ASSISTANT_TEXT_BYTES / 8))
+            .collect::<Vec<_>>();
+        let mut exact = fragments
+            .iter()
+            .map(|text| sse_delta(text))
+            .collect::<String>();
+        exact.push_str(&sse_finish());
+        let mut deltas = Vec::new();
+        let response = parse_chat_completion_stream(Cursor::new(exact), &mut |delta| {
+            deltas.push(delta.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(response.text().len(), MAX_ASSISTANT_TEXT_BYTES);
+        assert_eq!(
+            deltas.iter().map(String::len).sum::<usize>(),
+            MAX_ASSISTANT_TEXT_BYTES
+        );
+
+        let mut over = fragments
+            .iter()
+            .map(|text| sse_delta(text))
+            .collect::<String>();
+        over.push_str(&sse_delta("x"));
+        over.push_str(&sse_finish());
+        let mut deltas = Vec::new();
+        let error = parse_chat_completion_stream(Cursor::new(over), &mut |delta| {
+            deltas.push(delta.to_string());
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(
+            deltas.iter().map(String::len).sum::<usize>(),
+            MAX_ASSISTANT_TEXT_BYTES
+        );
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == ASSISTANT_TEXT_LIMIT_ERROR
+        ));
+    }
+
+    #[test]
+    fn non_streaming_normalization_limits_are_exact() {
+        let exact_text = utf8_string_with_bytes(MAX_ASSISTANT_TEXT_BYTES);
+        let response = non_stream_response(Some(exact_text), Vec::new())
+            .into_model_response()
+            .unwrap();
+        assert_eq!(response.text().len(), MAX_ASSISTANT_TEXT_BYTES);
+        let error = non_stream_response(
+            Some(utf8_string_with_bytes(MAX_ASSISTANT_TEXT_BYTES + 1)),
+            Vec::new(),
+        )
+        .into_model_response()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == ASSISTANT_TEXT_LIMIT_ERROR
+        ));
+
+        let exact_name = utf8_string_with_bytes(MAX_TOOL_NAME_BYTES);
+        validate_tool_call(&exact_name, "{}").unwrap();
+        let error =
+            validate_tool_call(&utf8_string_with_bytes(MAX_TOOL_NAME_BYTES + 1), "{}").unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == TOOL_NAME_LIMIT_ERROR
+        ));
+
+        let exact_arguments = fragmented_unicode_json_arguments(MAX_TOOL_ARGUMENT_BYTES).concat();
+        let response = non_stream_response(
+            None,
+            vec![provider_tool_call("call_0", "file_read", exact_arguments)],
+        )
+        .into_model_response()
+        .unwrap();
+        assert_eq!(response.tool_uses().len(), 1);
+        let error = non_stream_response(
+            None,
+            vec![provider_tool_call(
+                "call_0",
+                "file_read",
+                fragmented_unicode_json_arguments(MAX_TOOL_ARGUMENT_BYTES + 1).concat(),
+            )],
+        )
+        .into_model_response()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == TOOL_ARGUMENT_LIMIT_ERROR
+        ));
+
+        let exact_calls = (0..MAX_TOOL_CALLS)
+            .map(|index| provider_tool_call(&format!("call_{index}"), "file_read", "{}".into()))
+            .collect();
+        let response = non_stream_response(None, exact_calls)
+            .into_model_response()
+            .unwrap();
+        assert_eq!(response.tool_uses().len(), MAX_TOOL_CALLS);
+        let over_calls = (0..=MAX_TOOL_CALLS)
+            .map(|index| provider_tool_call(&format!("call_{index}"), "file_read", "{}".into()))
+            .collect();
+        let error = non_stream_response(None, over_calls)
+            .into_model_response()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == TOOL_CALL_LIMIT_ERROR
+        ));
+
+        let exact_calls = (0..4)
+            .map(|index| {
+                provider_tool_call(
+                    &format!("call_{index}"),
+                    "file_read",
+                    json_arguments_with_bytes(MAX_TOOL_ARGUMENT_BYTES),
+                )
+            })
+            .collect();
+        let response = non_stream_response(None, exact_calls)
+            .into_model_response()
+            .unwrap();
+        assert_eq!(response.tool_uses().len(), 4);
+        let mut over_calls = (0..4)
+            .map(|index| {
+                provider_tool_call(
+                    &format!("call_{index}"),
+                    "file_read",
+                    json_arguments_with_bytes(MAX_TOOL_ARGUMENT_BYTES),
+                )
+            })
+            .collect::<Vec<_>>();
+        over_calls.push(provider_tool_call("call_4", "file_read", "0".into()));
+        let error = non_stream_response(None, over_calls)
+            .into_model_response()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == TOOL_ARGUMENTS_LIMIT_ERROR
+        ));
+    }
+
+    #[test]
+    fn streaming_tool_name_and_argument_limits_count_assembled_utf8_bytes() {
+        let mut name_assembler = StreamingAssembler::default();
+        for (index, fragment) in [
+            utf8_string_with_bytes(MAX_TOOL_NAME_BYTES / 2),
+            utf8_string_with_bytes(MAX_TOOL_NAME_BYTES / 2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            name_assembler
+                .apply_chunk(
+                    tool_delta_chunk(
+                        0,
+                        (index == 0).then_some("call_0"),
+                        Some(fragment),
+                        (index == 0).then_some("{}".into()),
+                    ),
+                    &mut |_| Ok(()),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            name_assembler.tool_calls.get(&0).unwrap().name.len(),
+            MAX_TOOL_NAME_BYTES
+        );
+        let error = name_assembler
+            .apply_chunk(
+                tool_delta_chunk(0, None, Some("x".into()), None),
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == TOOL_NAME_LIMIT_ERROR
+        ));
+        assert_eq!(
+            name_assembler.tool_calls.get(&0).unwrap().name.len(),
+            MAX_TOOL_NAME_BYTES
+        );
+
+        let argument_fragments = fragmented_unicode_json_arguments(MAX_TOOL_ARGUMENT_BYTES);
+        let mut argument_assembler = StreamingAssembler::default();
+        for (index, fragment) in argument_fragments.into_iter().enumerate() {
+            argument_assembler
+                .apply_chunk(
+                    tool_delta_chunk(
+                        0,
+                        (index == 0).then_some("call_0"),
+                        (index == 0).then_some("file_read".into()),
+                        Some(fragment),
+                    ),
+                    &mut |_| Ok(()),
+                )
+                .unwrap();
+        }
+        argument_assembler.finish_reason = Some(ChatFinishReason::ToolCalls);
+        let response = argument_assembler.into_model_response().unwrap();
+        assert_eq!(response.tool_uses().len(), 1);
+
+        let mut over_assembler = StreamingAssembler::default();
+        for (index, fragment) in fragmented_unicode_json_arguments(MAX_TOOL_ARGUMENT_BYTES)
+            .into_iter()
+            .enumerate()
+        {
+            over_assembler
+                .apply_chunk(
+                    tool_delta_chunk(
+                        0,
+                        (index == 0).then_some("call_0"),
+                        (index == 0).then_some("file_read".into()),
+                        Some(fragment),
+                    ),
+                    &mut |_| Ok(()),
+                )
+                .unwrap();
+        }
+        let error = over_assembler
+            .apply_chunk(
+                tool_delta_chunk(0, None, None, Some("x".into())),
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == TOOL_ARGUMENT_LIMIT_ERROR
+        ));
+        assert_eq!(
+            over_assembler.tool_calls.get(&0).unwrap().arguments.len(),
+            MAX_TOOL_ARGUMENT_BYTES
+        );
+    }
+
+    #[test]
+    fn streaming_tool_count_indices_and_aggregate_arguments_are_bounded() {
+        let exact_calls = (0..MAX_TOOL_CALLS)
+            .map(|index| {
+                streaming_tool_delta(
+                    index,
+                    Some(format!("call_{index}")),
+                    Some("file_read".into()),
+                    Some("{}".into()),
+                )
+            })
+            .collect();
+        let mut assembler = StreamingAssembler::default();
+        assembler
+            .apply_chunk(
+                ChatCompletionChunk {
+                    choices: vec![ChatChunkChoice {
+                        index: 0,
+                        delta: ChatDelta {
+                            content: None,
+                            tool_calls: exact_calls,
+                        },
+                        finish_reason: Some(ChatFinishReason::ToolCalls),
+                    }],
+                    usage: None,
+                },
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        assert!(assembler.tool_calls.contains_key(&MAX_TOOL_CALL_INDEX));
+        let response = assembler.into_model_response().unwrap();
+        assert_eq!(response.tool_uses().len(), MAX_TOOL_CALLS);
+
+        for index in [MAX_TOOL_CALLS, usize::MAX] {
+            let mut assembler = StreamingAssembler::default();
+            let error = assembler
+                .apply_chunk(
+                    tool_delta_chunk(
+                        index,
+                        Some("call_sparse"),
+                        Some("file_read".into()),
+                        Some("{}".into()),
+                    ),
+                    &mut |_| Ok(()),
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                AppError::Provider(message) if message == TOOL_CALL_LIMIT_ERROR
+            ));
+            assert!(assembler.tool_calls.is_empty());
+        }
+
+        let over_calls = (0..=MAX_TOOL_CALLS)
+            .map(|index| {
+                streaming_tool_delta(
+                    index,
+                    Some(format!("call_{index}")),
+                    Some("file_read".into()),
+                    Some("{}".into()),
+                )
+            })
+            .collect();
+        let mut assembler = StreamingAssembler::default();
+        let error = assembler
+            .apply_chunk(
+                ChatCompletionChunk {
+                    choices: vec![ChatChunkChoice {
+                        index: 0,
+                        delta: ChatDelta {
+                            content: None,
+                            tool_calls: over_calls,
+                        },
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                },
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == TOOL_CALL_LIMIT_ERROR
+        ));
+        assert_eq!(assembler.tool_calls.len(), MAX_TOOL_CALLS);
+
+        let mut assembler = StreamingAssembler::default();
+        for index in 0..4 {
+            assembler
+                .apply_chunk(
+                    ChatCompletionChunk {
+                        choices: vec![ChatChunkChoice {
+                            index: 0,
+                            delta: ChatDelta {
+                                content: None,
+                                tool_calls: vec![streaming_tool_delta(
+                                    index,
+                                    Some(format!("call_{index}")),
+                                    Some("file_read".into()),
+                                    Some(json_arguments_with_bytes(MAX_TOOL_ARGUMENT_BYTES)),
+                                )],
+                            },
+                            finish_reason: None,
+                        }],
+                        usage: None,
+                    },
+                    &mut |_| Ok(()),
+                )
+                .unwrap();
+        }
+        assert_eq!(assembler.tool_arguments_bytes, MAX_TOOL_ARGUMENTS_BYTES);
+        let error = assembler
+            .apply_chunk(
+                tool_delta_chunk(
+                    4,
+                    Some("call_4"),
+                    Some("file_read".into()),
+                    Some("0".into()),
+                ),
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == TOOL_ARGUMENTS_LIMIT_ERROR
+        ));
+        assert!(!assembler.tool_calls.contains_key(&4));
+        assembler.finish_reason = Some(ChatFinishReason::ToolCalls);
+        let response = assembler.into_model_response().unwrap();
+        assert_eq!(response.tool_uses().len(), 4);
+    }
+
+    fn padded_non_stream_response(bytes: usize) -> Vec<u8> {
+        let mut body = json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "ok"}
+            }]
+        })
+        .to_string()
+        .into_bytes();
+        assert!(body.len() <= bytes);
+        body.resize(bytes, b' ');
+        body
+    }
+
+    fn streaming_body_with_size(bytes: usize) -> String {
+        let finish = sse_finish();
+        assert!(finish.len() + 3 <= bytes);
+        let mut remaining = bytes - finish.len();
+        let mut body = String::with_capacity(bytes);
+        while remaining > MAX_SSE_EVENT_BYTES {
+            let leftover = remaining - MAX_SSE_EVENT_BYTES;
+            let event_bytes = if leftover < 3 {
+                MAX_SSE_EVENT_BYTES - (3 - leftover)
+            } else {
+                MAX_SSE_EVENT_BYTES
+            };
+            body.push(':');
+            body.push_str(&"x".repeat(event_bytes - 3));
+            body.push_str("\n\n");
+            remaining -= event_bytes;
+        }
+        assert!(remaining >= 3);
+        body.push(':');
+        body.push_str(&"x".repeat(remaining - 3));
+        body.push_str("\n\n");
+        body.push_str(&finish);
+        assert_eq!(body.len(), bytes);
+        body
+    }
+
+    fn sse_event_with_size(chunk: &Value, bytes: usize) -> String {
+        let data_line = format!("data: {chunk}\n");
+        let fixed_bytes = data_line.len() + 3;
+        assert!(fixed_bytes <= bytes);
+        let event = format!(":{}\n{data_line}\n", "x".repeat(bytes - fixed_bytes));
+        assert_eq!(event.len(), bytes);
+        event
+    }
+
+    fn utf8_string_with_bytes(bytes: usize) -> String {
+        let mut value = "\u{754c}".repeat(bytes / "\u{754c}".len());
+        value.push_str(&"x".repeat(bytes % "\u{754c}".len()));
+        assert_eq!(value.len(), bytes);
+        value
+    }
+
+    fn fragmented_unicode_json_arguments(bytes: usize) -> [String; 2] {
+        const PREFIX: &str = "{\"value\":\"";
+        const SUFFIX: &str = "\"}";
+
+        let content_bytes = bytes
+            .checked_sub(PREFIX.len() + SUFFIX.len())
+            .expect("argument fixture must fit JSON framing");
+        let first_bytes = content_bytes / 2;
+        let second_bytes = content_bytes - first_bytes;
+        let fragments = [
+            format!("{PREFIX}{}", utf8_string_with_bytes(first_bytes)),
+            format!("{}{SUFFIX}", utf8_string_with_bytes(second_bytes)),
+        ];
+        assert_eq!(fragments.iter().map(String::len).sum::<usize>(), bytes);
+        fragments
+    }
+
+    fn json_arguments_with_bytes(bytes: usize) -> String {
+        assert!(bytes >= 2);
+        let arguments = format!("{{{}}}", " ".repeat(bytes - 2));
+        assert_eq!(arguments.len(), bytes);
+        arguments
+    }
+
+    fn non_stream_response(
+        text: Option<String>,
+        tool_calls: Vec<ChatToolCall>,
+    ) -> ChatCompletionResponse {
+        ChatCompletionResponse {
+            choices: vec![ChatChoice {
+                finish_reason: if tool_calls.is_empty() {
+                    ChatFinishReason::Stop
+                } else {
+                    ChatFinishReason::ToolCalls
+                },
+                message: ChatResponseMessage {
+                    content: text,
+                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                },
+            }],
+            usage: None,
+        }
+    }
+
+    fn provider_tool_call(id: &str, name: &str, arguments: String) -> ChatToolCall {
+        ChatToolCall {
+            id: id.into(),
+            tool_type: ChatToolType::Function,
+            function: ChatFunctionCall {
+                name: name.into(),
+                arguments,
+            },
+        }
+    }
+
+    fn streaming_tool_delta(
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        arguments: Option<String>,
+    ) -> ChatToolCallDelta {
+        ChatToolCallDelta {
+            index,
+            id,
+            function: (name.is_some() || arguments.is_some())
+                .then_some(ChatFunctionCallDelta { name, arguments }),
+        }
+    }
+
+    fn tool_delta_chunk(
+        index: usize,
+        id: Option<&str>,
+        name: Option<String>,
+        arguments: Option<String>,
+    ) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatDelta {
+                    content: None,
+                    tool_calls: vec![streaming_tool_delta(
+                        index,
+                        id.map(str::to_string),
+                        name,
+                        arguments,
+                    )],
+                },
+                finish_reason: None,
+            }],
+            usage: None,
         }
     }
 
