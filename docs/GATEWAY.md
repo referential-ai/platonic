@@ -61,7 +61,9 @@ command verifies the file mode without revealing the contents.
 In Discord, enable **User Settings > Advanced > Developer Mode**, then
 right-click your own user and select **Copy User ID**. Use the numeric ID of the
 human account that will send messages, not the application, bot, server, or
-channel ID.
+channel ID. Right-click the text channel used for this walkthrough, select
+**Copy Channel ID**, and choose a provider config already proven by the
+[Quickstart](QUICKSTART.md#0-one-time-setup) for runs from that channel.
 
 Use an authorized Plato config selected explicitly with `--config`. Create
 `~/.config/plato/gateway.toml`, retain the provider settings already proven in
@@ -71,10 +73,16 @@ the [Quickstart configuration](QUICKSTART.md#0-one-time-setup), and add:
 [gateway.discord]
 api_key_env = "DISCORD_BOT_TOKEN"
 owner_user_ids = [123456789]
+
+[gateway.discord.channel_configs]
+"111111111111111111" = "~/.config/plato/test-channel.toml"
 ```
 
-Replace the example integer with your user ID. It must remain an unquoted,
-positive TOML integer. The token itself does not belong in this file.
+Replace the first example with your user ID; it must remain an unquoted,
+positive TOML integer. Replace the quoted numeric channel ID with the copied
+test channel ID, and replace the mapped path with the mode-`0600` authorized
+provider config for that channel. The token itself does not belong in either
+config.
 
 ```bash
 GATEWAY_CONFIG="$HOME/.config/plato/gateway.toml"
@@ -85,9 +93,10 @@ chmod 600 "$GATEWAY_CONFIG"
 
 Passing this file with `--config` makes it an authorized config. The
 [configuration reference](../README.md#configuration) owns resolution order
-and provider settings. Exact-channel config mappings, when needed, are
-documented in the [Discord gateway reference](../README.md#discord-gateway);
-do not place those mappings in an auto-discovered workspace `plato.toml`.
+and provider settings. The
+[Discord gateway reference](../README.md#discord-gateway) owns channel-mapping
+behavior; do not place these settings in an auto-discovered workspace
+`plato.toml`.
 
 ## 4. Start the daemon and gateway
 
