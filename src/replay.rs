@@ -221,7 +221,9 @@ mod tests {
                 ),
             )
             .unwrap();
-        ledger.finish_session_run(&run_1, "first answer").unwrap();
+        ledger
+            .fail_session_run(&run_1, "synthetic failure", false)
+            .unwrap();
         ledger
             .begin_session_run("session_1", &run_2, "second", false)
             .unwrap();
@@ -249,7 +251,9 @@ mod tests {
                 ),
             )
             .unwrap();
-        ledger.finish_session_run(&run_2, "second answer").unwrap();
+        ledger
+            .fail_session_run(&run_2, "synthetic failure", false)
+            .unwrap();
 
         let replay = replay_sqlite(&path, None).unwrap();
 
