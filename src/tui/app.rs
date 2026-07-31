@@ -206,6 +206,10 @@ fn handle_key_press(
             state.help_visible = true;
             true
         }
+        KeyCode::Char('v') if state.composer.is_empty() && key.modifiers == KeyModifiers::NONE => {
+            state.toggle_display_mode();
+            true
+        }
         KeyCode::Char('q') if state.composer.is_empty() => handle_exit_request(state),
         KeyCode::Char('r') if is_disconnected(state) => {
             reconnect(commands, state, initial_run_id);
@@ -518,11 +522,11 @@ fn dispatch_selected_slash_command(
 }
 
 fn scroll_history_up(state: &mut TuiState) {
-    state.scroll_offset = state.scroll_offset.saturating_add(SCROLL_PAGE_LINES);
+    state.scroll_history_up(SCROLL_PAGE_LINES);
 }
 
 fn scroll_history_down(state: &mut TuiState) {
-    state.scroll_offset = state.scroll_offset.saturating_sub(SCROLL_PAGE_LINES);
+    state.scroll_history_down(SCROLL_PAGE_LINES);
 }
 
 enum ApprovalAction {
@@ -695,7 +699,7 @@ fn clear_visible_transcript(state: &mut TuiState) {
     state.replace_transcript(TranscriptState::None);
     state.clear_live_events();
     state.stream_warning = None;
-    state.scroll_offset = 0;
+    state.reset_all_scroll();
 }
 
 fn start_fresh_session(state: &mut TuiState) {
@@ -704,7 +708,7 @@ fn start_fresh_session(state: &mut TuiState) {
     state.clear_live_events();
     state.stream_warning = None;
     state.session_picker = None;
-    state.scroll_offset = 0;
+    state.reset_all_scroll();
     state.status_message = Some("new session selected".into());
 }
 
@@ -818,24 +822,26 @@ pub(super) fn push_live_event(state: &mut TuiState, mut line: crate::tui::LiveEv
     if line.kind == LiveEventKind::AssistantDelta {
         if let Some(last) = state.live_events.last_mut()
             && last.kind == LiveEventKind::Assistant
+            && last.run_id == line.run_id
         {
             last.text.push_str(&line.text);
             last.offset = line.offset;
-            state.scroll_offset = 0;
+            state.reset_scroll();
             return;
         }
         line.kind = LiveEventKind::Assistant;
     } else if line.kind == LiveEventKind::Assistant
         && let Some(last) = state.live_events.last_mut()
         && last.kind == LiveEventKind::Assistant
+        && last.run_id == line.run_id
     {
         last.text = line.text;
         last.offset = line.offset;
-        state.scroll_offset = 0;
+        state.reset_scroll();
         return;
     }
     state.live_events.push(line);
-    state.scroll_offset = 0;
+    state.reset_scroll();
 }
 
 struct TerminalSession {
@@ -877,6 +883,7 @@ mod tests {
     };
     #[cfg(unix)]
     use super::super::client::{DAEMON_CLIENT_TIMEOUT, connect_daemon};
+    use super::super::state::DisplayMode;
     use super::*;
     use crate::{
         AppError,
@@ -1091,6 +1098,74 @@ mod tests {
             None,
         ));
         assert!(!state.help_visible);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn empty_composer_v_toggles_local_projection_and_invalidates_rows() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.replace_transcript(loaded_transcript(
+            "run_1",
+            "[turn_1] user: question\n[turn_1] assistant: answer\n",
+        ));
+        state.live_events = vec![crate::tui::LiveEventLine::status(Some(7), "run finished")];
+        state.scroll_history_up(20);
+        let transcript = state.transcript.clone();
+        let live_events = state.live_events.clone();
+        let runtime = UiRuntime::from_state(&state, None);
+        render_snapshot(&state, 100, 24).unwrap();
+        assert_cached_rows(&state, true, true);
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+
+        assert_eq!(state.display_mode, DisplayMode::Audit);
+        assert_eq!(state.scroll_offset, 0);
+        assert_cached_rows(&state, false, false);
+        assert_eq!(state.transcript, transcript);
+        assert_eq!(state.live_events, live_events);
+        assert!(receiver.try_recv().is_err());
+
+        state.scroll_history_up(10);
+        render_snapshot(&state, 100, 24).unwrap();
+        assert_cached_rows(&state, true, true);
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+
+        assert_eq!(state.display_mode, DisplayMode::Conversation);
+        assert_eq!(state.scroll_offset, 20);
+        assert_cached_rows(&state, false, false);
+        assert_eq!(state.audit_scroll_offset, 10);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn v_in_nonempty_composer_remains_text_input() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.composer = "sa".into();
+        state.composer_cursor = state.composer.len();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+
+        assert_eq!(state.composer, "sav");
+        assert_eq!(state.composer_cursor, 3);
+        assert_eq!(state.display_mode, DisplayMode::Conversation);
         assert!(receiver.try_recv().is_err());
     }
 
@@ -1924,7 +1999,9 @@ mod tests {
         assert_cached_rows(&state, true, false);
         let output = render_snapshot(&state, 100, 24).unwrap();
         assert!(output.contains("cached question"));
-        assert!(output.contains("new tool event"));
+        assert!(output.contains("Trace"));
+        assert!(output.contains("tools"));
+        assert!(!output.contains("new tool event"));
         assert_cached_rows(&state, true, true);
     }
 
@@ -2082,6 +2159,7 @@ mod tests {
     fn run_response_selects_returned_session_for_continuation() {
         let mut state = test_state();
         let mut runtime = UiRuntime::from_state(&state, None);
+        push_live_event(&mut state, crate::tui::LiveEventLine::user("question"));
 
         apply_run_response(
             &mut state,
@@ -2098,6 +2176,33 @@ mod tests {
 
         assert_eq!(state.selected_session_id.as_deref(), Some("session_1"));
         assert_eq!(runtime.active_run_id.as_deref(), Some("run_1"));
+        assert_eq!(state.live_events.len(), 2);
+        assert!(
+            state
+                .live_events
+                .iter()
+                .all(|event| event.run_id.as_deref() == Some("run_1"))
+        );
+    }
+
+    #[test]
+    fn assistant_events_from_different_runs_do_not_merge() {
+        let mut state = test_state();
+        push_live_event(
+            &mut state,
+            crate::tui::LiveEventLine::assistant(Some(1), "first").with_run_id("run_1"),
+        );
+
+        push_live_event(
+            &mut state,
+            crate::tui::LiveEventLine::assistant_delta(Some(2), "second").with_run_id("run_2"),
+        );
+
+        assert_eq!(state.live_events.len(), 2);
+        assert_eq!(state.live_events[0].text, "first");
+        assert_eq!(state.live_events[1].text, "second");
+        assert_eq!(state.live_events[0].run_id.as_deref(), Some("run_1"));
+        assert_eq!(state.live_events[1].run_id.as_deref(), Some("run_2"));
     }
 
     #[test]
@@ -2743,7 +2848,8 @@ mod tests {
         state.stream_warning = Some("matching warning".into());
         state.active_model = Some("matching-model".into());
         state.active_run_elapsed_secs = Some(17);
-        state.scroll_offset = 10;
+        state.toggle_display_mode();
+        state.scroll_history_up(10);
         state.cancel_requested = true;
         state.approval = Some(test_approval("run_1", "call_1"));
         render_snapshot(&state, 100, 24).unwrap();
@@ -2767,7 +2873,9 @@ mod tests {
         assert_eq!(state.stream_warning.as_deref(), Some("matching warning"));
         assert_eq!(state.active_model.as_deref(), Some("matching-model"));
         assert_eq!(state.active_run_elapsed_secs, Some(17));
+        assert_eq!(state.display_mode, DisplayMode::Audit);
         assert_eq!(state.scroll_offset, 10);
+        assert_eq!(state.audit_scroll_offset, 10);
         assert!(state.cancel_requested);
         assert_eq!(
             state
@@ -2790,6 +2898,7 @@ mod tests {
     #[test]
     fn repeated_session_switches_clear_transcript_live_and_approval_state() {
         let mut state = selected_state("session_a", "run_a", "[turn_a] assistant: transcript-a\n");
+        state.toggle_display_mode();
 
         for (next_session, next_run, next_transcript) in [
             ("session_b", "run_b", "[turn_b] assistant: transcript-b\n"),
@@ -2807,7 +2916,7 @@ mod tests {
             state.active_model = Some(format!("old-model-{previous_session}"));
             state.active_run_elapsed_secs = Some(91);
             state.approval = Some(test_approval(&previous_run, "old-call"));
-            state.scroll_offset = 10;
+            state.scroll_history_up(10);
             render_snapshot(&state, 100, 24).unwrap();
             assert_cached_rows(&state, true, true);
 
@@ -2821,7 +2930,10 @@ mod tests {
             assert!(state.active_model.is_none());
             assert!(state.active_run_elapsed_secs.is_none());
             assert!(state.approval.is_none());
+            assert_eq!(state.display_mode, DisplayMode::Audit);
             assert_eq!(state.scroll_offset, 0);
+            assert_eq!(state.conversation_scroll_offset, 0);
+            assert_eq!(state.audit_scroll_offset, 0);
             assert_cached_rows(&state, false, false);
             let output = render_snapshot(&state, 100, 24).unwrap();
             assert!(output.contains(next_transcript.split(": ").last().unwrap().trim()));
@@ -2931,7 +3043,7 @@ mod tests {
             .unwrap()
             .as_ref()
             .unwrap()
-            .1
+            .2
             .as_ptr()
     }
 

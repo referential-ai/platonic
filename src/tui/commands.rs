@@ -76,12 +76,3 @@ pub(crate) fn matching_slash_commands(filter: &str) -> Vec<&'static SlashCommand
 pub(crate) fn has_slash_command_prefix(filter: &str) -> bool {
     !filter.contains('/') && matching_slash_commands(filter).into_iter().next().is_some()
 }
-
-pub(crate) fn footer_command_hint() -> String {
-    SLASH_COMMANDS
-        .iter()
-        .filter(|command| !matches!(command.name, "exit" | "issue-prep"))
-        .map(|command| format!("/{}", command.name))
-        .collect::<Vec<_>>()
-        .join(" ")
-}

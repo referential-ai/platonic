@@ -35,6 +35,7 @@ const MARKER: &str = "__PLATO_TUI_PTY_237__";
 const EXPECTED_DRAFT: &str = "ask hello café pasted text";
 const PENDING_RUN_ID: &str = "run_pty_pending";
 const PENDING_CALL_ID: &str = "call_pty_pending";
+const CONVERSATION_RUN_ID: &str = "run_pty_conversation_full_identifier";
 
 #[test]
 fn bare_plato_preserves_draft_and_restores_parent_terminal() {
@@ -199,11 +200,9 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
     assert_eq!(params["decision"], "deny");
     assert_eq!(params["reason"], "denied by plato-tui");
 
-    let decided = shell.wait_for_screen_text(
-        INITIAL_ROWS,
-        INITIAL_COLS,
-        "approval decision sent for run_pty_pending",
-    );
+    let decided = shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, PENDING_CALL_ID);
+    assert!(decided.contains("You"));
+    assert!(!decided.contains(PENDING_RUN_ID));
     assert!(!decided.contains(PENDING_CALL_ID));
     shell.write(b"q");
 
@@ -218,6 +217,74 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
         requests
             .iter()
             .filter(|request| request.method.as_deref() == Some("approval.decide"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+
+    let workspace_id = paths::workspace_id(&workspace).unwrap();
+    let endpoint = runtime
+        .join("plato-agent")
+        .join("workspaces")
+        .join(&workspace_id)
+        .join("agent.sock");
+    let ledger = state.join("fake-agent.db");
+    let fake = FakeDaemon::bind_conversation_audit(&endpoint, &workspace, &workspace_id, &ledger);
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        br#"pre=$(stty -g); printf '\n%sPRE:%s\n' "$PTY_MARK" "$pre"; "$PLATO_BIN"; status=$?; post=$(stty -g); printf '\n%sPOST:%s\n%sSTATUS:%s\n' "$PTY_MARK" "$post" "$PTY_MARK" "$status"
+"#,
+    );
+    let before_termios = shell.wait_for_marker("PRE");
+    fake.wait_for_request_count("events.stream", 1);
+    let default = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Trace");
+    assert!(default.contains("You"));
+    assert!(default.contains("Plato"));
+    assert!(default.contains("Conversation-first PTY question"));
+    assert!(default.contains("Conversation-first PTY answer"));
+    assert!(!default.contains(CONVERSATION_RUN_ID));
+    assert!(!default.contains("#7"));
+    assert_eq!(fake.requests_for("transcript.read").len(), 1);
+
+    for _ in 0..2 {
+        shell.write(b"v");
+        let audit = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, CONVERSATION_RUN_ID);
+        assert!(audit.contains("#7 model_stage"));
+        assert!(audit.contains("audit"));
+
+        shell.write(b"v");
+        let conversation = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "You");
+        assert!(conversation.contains("Plato"));
+        assert!(!conversation.contains(CONVERSATION_RUN_ID));
+        assert!(!conversation.contains("#7"));
+        assert!(conversation.contains("conversation"));
+    }
+    assert_eq!(fake.requests_for("transcript.read").len(), 1);
+
+    shell.write(b"q");
+    let after_termios = shell.wait_for_marker("POST");
+    assert_eq!(after_termios, before_termios);
+    assert_eq!(shell.wait_for_marker("STATUS"), "0");
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+
+    let requests = fake.finish();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method.as_deref() == Some("transcript.read"))
             .count(),
         1
     );
@@ -342,6 +409,27 @@ impl PtyShell {
         }
     }
 
+    fn wait_for_screen_without_text(&mut self, rows: u16, cols: u16, unexpected: &str) -> String {
+        let deadline = Instant::now() + PROOF_TIMEOUT;
+        loop {
+            let output = self.output.lock().unwrap().clone();
+            let screen = parsed_screen(&output, rows, cols, None);
+            let contents = screen.contents();
+            if !contents.contains(unexpected) {
+                assert_eq!(screen.size(), (rows, cols));
+                return contents;
+            }
+            self.assert_running(unexpected);
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {unexpected:?} to leave rendered screen\nrendered:\n{}\nraw:\n{}",
+                contents,
+                output_tail(&output)
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn assert_running(&mut self, context: &str) {
         if let Some(status) = self.child.try_wait().unwrap() {
             let output = self.output.lock().unwrap();
@@ -422,6 +510,7 @@ fn output_tail(output: &[u8]) -> String {
 enum FakeScenario {
     FreshRun,
     PendingApproval,
+    ConversationAudit,
 }
 
 struct FakeDaemon {
@@ -453,6 +542,21 @@ impl FakeDaemon {
             workspace_id,
             ledger,
             FakeScenario::PendingApproval,
+        )
+    }
+
+    fn bind_conversation_audit(
+        endpoint: &Path,
+        workspace: &Path,
+        workspace_id: &str,
+        ledger: &Path,
+    ) -> Self {
+        Self::bind_scenario(
+            endpoint,
+            workspace,
+            workspace_id,
+            ledger,
+            FakeScenario::ConversationAudit,
         )
     }
 
@@ -706,6 +810,7 @@ fn fake_response(
                     "events.stream",
                     "sessions.list",
                     "transcript.read",
+                    "transcript.read.typed",
                     "transcript.read.pending_approval",
                     "approval.decide"
                 ]
@@ -731,6 +836,15 @@ fn fake_response(
                     }
                 ]
             }),
+            FakeScenario::ConversationAudit => json!({
+                "sessions": [{
+                    "session_id": "session_pty_conversation",
+                    "run_id": CONVERSATION_RUN_ID,
+                    "status": "running",
+                    "latest_question": "Conversation-first PTY question",
+                    "ledger_path": ledger.to_string_lossy()
+                }]
+            }),
         },
         "transcript.read" if scenario == FakeScenario::PendingApproval => json!({
             "run_id": PENDING_RUN_ID,
@@ -747,6 +861,25 @@ fn fake_response(
                 "diff_preview": "-old PTY\n+new PTY\n"
             }
         }),
+        "transcript.read" if scenario == FakeScenario::ConversationAudit => json!({
+            "run_id": CONVERSATION_RUN_ID,
+            "status": "running",
+            "final_answer": null,
+            "transcript": format!(
+                "run_id: {CONVERSATION_RUN_ID}\n[turn_pty] user: Conversation-first PTY question\n[turn_pty] assistant: Conversation-first PTY answer\n"
+            ),
+            "typed": {
+                "runs": [{
+                    "run_id": CONVERSATION_RUN_ID,
+                    "session_index": 0,
+                    "status": "running",
+                    "entries": [
+                        {"kind": "user", "text": "Conversation-first PTY question"},
+                        {"kind": "assistant", "text": "Conversation-first PTY answer"}
+                    ]
+                }]
+            }
+        }),
         "run.start" => json!({
             "run_id": "run_tui_pty",
             "session_id": "session_tui_pty",
@@ -761,17 +894,23 @@ fn fake_response(
                 .and_then(|params| params.get("from_offset"))
                 .and_then(Value::as_u64)
                 .unwrap_or(9);
-            let run_id = if scenario == FakeScenario::PendingApproval {
-                PENDING_RUN_ID
-            } else {
-                "run_tui_pty"
+            let run_id = match scenario {
+                FakeScenario::PendingApproval => PENDING_RUN_ID,
+                FakeScenario::ConversationAudit => CONVERSATION_RUN_ID,
+                FakeScenario::FreshRun => "run_tui_pty",
             };
+            let (next_offset, events) =
+                if scenario == FakeScenario::ConversationAudit && first_stream_request {
+                    (8, json!([{"offset": 7, "event": {"kind": "model_stage"}}]))
+                } else {
+                    (from_offset, json!([]))
+                };
             json!({
                 "run_id": run_id,
                 "from_offset": from_offset,
-                "next_offset": from_offset,
+                "next_offset": next_offset,
                 "status": "running",
-                "events": []
+                "events": events
             })
         }
         "approval.decide" if scenario == FakeScenario::PendingApproval => json!({

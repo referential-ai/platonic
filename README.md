@@ -505,8 +505,10 @@ oversized Discord input.` Accepted messages are forwarded unchanged.
 Bare `plato` in a terminal is the interactive local entrypoint; `plato --tui`
 is its explicit equivalent. It attaches to a serving workspace daemon or starts
 the sibling `plato-agentd` detached. Exiting the TUI leaves that daemon running.
-It renders a chat-first transcript surface with an intro, live activity,
-status rule, composer, session picker, and approval modal.
+It renders a conversation-first transcript with distinct `You` and `Plato`
+messages, at most one subtle trace summary per run, one status row, a composer,
+session picker, and approval modal. Press `v` from an empty composer to toggle
+the complete ordered audit view without reloading the session.
 
 ```bash
 cargo run --bin plato
@@ -539,6 +541,8 @@ Keys:
 
 - `Enter`: submit the composer to the daemon. A session can have only one
   active run.
+- `v` (with an empty composer): toggle conversation and audit views. A `v`
+  typed into a nonempty composer remains input.
 - `/sessions`: open the session picker. Type to filter latest questions (`q` is
   text); `Backspace` edits; `Up`/`Down` and `Ctrl-P`/`Ctrl-N` wrap through
   matches; `Enter` resumes the focused match; `Esc` closes. With no matches,
