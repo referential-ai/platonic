@@ -8,6 +8,13 @@ description = "Core Rust harness primitives for disciplined, replayable agent ex
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/referential-ai/platonic-core"
 documentation = "https://docs.rs/platonic-core"
+include = [
+    "src/**",
+    "examples/**",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE-*",
+]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
