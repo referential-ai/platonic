@@ -1,8 +1,8 @@
 use crate::{
     AppError, AppResult, ApprovalRequest, AssistantDeltaEvent,
     daemon::{
+        DaemonPaths,
         protocol::{BufferedStreamEvent, PendingApprovalSnapshot, RunStateName, StreamEvent},
-        server::DaemonPaths,
     },
     tools::ApprovalOutcome,
 };

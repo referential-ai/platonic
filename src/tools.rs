@@ -1,4 +1,3 @@
-use crate::app::{PLATONIC_MEMORY_FILENAME, PLATONIC_MEMORY_MAX_BYTES};
 use crate::tool_catalog::{FILE_EDIT, FILE_LIST, FILE_READ, FILE_WRITE, SHELL_EXEC};
 use crate::{AppError, AppResult};
 use platonic_core::{ResultVisibility, ToolResult};
@@ -18,6 +17,8 @@ use std::{os::unix::process::CommandExt, process::Child};
 #[cfg(windows)]
 use {self::windows_shell::JobChild, std::os::windows::process::CommandExt};
 
+pub(crate) const PLATONIC_MEMORY_FILENAME: &str = "PLATONIC.md";
+pub(crate) const PLATONIC_MEMORY_MAX_BYTES: usize = 8_192;
 const MAX_READ_BYTES: usize = 64 * 1024;
 const READ_UTF8_LOOKAHEAD_BYTES: usize = 4;
 const MAX_LIST_ENTRIES: usize = 200;

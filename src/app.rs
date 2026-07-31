@@ -10,9 +10,9 @@ use crate::{
     provider::openai_compat::{OpenAiCompatibleClient, TokenLimitField},
     tool_catalog::{SHELL_EXEC, ToolSpec, effect_for_tool, tool_specs},
     tools::{
-        ApprovalOutcome, ToolExecutionContext, approval_command_preview, approval_diff_preview,
-        approval_input_preview, ask_for_approval, execute_tool_with_context,
-        targets_platonic_memory,
+        ApprovalOutcome, PLATONIC_MEMORY_FILENAME, PLATONIC_MEMORY_MAX_BYTES, ToolExecutionContext,
+        approval_command_preview, approval_diff_preview, approval_input_preview, ask_for_approval,
+        execute_tool_with_context, targets_platonic_memory,
     },
 };
 use platonic_core::{
@@ -195,8 +195,6 @@ impl ApprovalMode {
 }
 
 const SESSION_TRUNCATION_MARKER: &str = "[older session turns omitted to fit the context budget]";
-pub(crate) const PLATONIC_MEMORY_FILENAME: &str = "PLATONIC.md";
-pub(crate) const PLATONIC_MEMORY_MAX_BYTES: usize = 8_192;
 const PLATONIC_MEMORY_SEPARATOR: &str = "\n\n";
 const DEFAULT_PROVIDER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_PROVIDER_RETRY_DELAY_SECONDS: f64 = 30.0;

@@ -1,7 +1,9 @@
+pub use super::DaemonPaths;
+#[cfg(any(test, unix))]
+use crate::paths;
 use crate::{
     AppResult,
     daemon::{handlers::handle_line, lock::WorkspaceLock, runtime::DaemonRuntime, transport},
-    paths,
 };
 use std::{
     io::{BufRead, BufReader, Write},
@@ -55,34 +57,6 @@ impl Drop for HandlerPermit {
     fn drop(&mut self) {
         let previous = self.capacity.live.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DaemonPaths {
-    pub workspace_root: PathBuf,
-    pub workspace_id: String,
-    pub socket_path: PathBuf,
-    pub lock_path: PathBuf,
-    pub ledger_path: PathBuf,
-}
-
-impl DaemonPaths {
-    pub fn resolve(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<Self> {
-        let workspace_root = workspace_root.canonicalize()?;
-        let workspace_id = paths::workspace_id(&workspace_root)?;
-        let socket_path = socket_path.unwrap_or(paths::default_socket_path(&workspace_root)?);
-        Ok(Self {
-            lock_path: paths::default_lock_path(&workspace_root)?,
-            ledger_path: paths::default_sqlite_path(&workspace_root)?,
-            workspace_root,
-            workspace_id,
-            socket_path,
-        })
-    }
-
-    pub(crate) fn default_ledger(&self) -> paths::DefaultSqlitePath {
-        paths::DefaultSqlitePath::from_path(self.ledger_path.clone())
     }
 }
 
