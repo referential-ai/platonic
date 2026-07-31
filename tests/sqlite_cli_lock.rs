@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use plato_agent::daemon::installer_gate::InstallerStartupGate;
 use plato_agent::{
     daemon::{client::DaemonClient, lock::LockMetadata, protocol::ShutdownIfIdleResultName},
     ledger::SqliteLedger,
@@ -24,6 +26,67 @@ use std::{
 const PROOF_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const API_KEY_ENV: &str = "PLATO_SQLITE_LOCK_TEST_KEY";
+#[cfg(windows)]
+const WINDOWS_REPEAT_COUNT: usize = 25;
+
+#[cfg(windows)]
+#[test]
+fn independent_daemon_startups_wait_for_installer_gate_release() {
+    for iteration in 1..=WINDOWS_REPEAT_COUNT {
+        eprintln!("independent daemon-startup proof {iteration}/{WINDOWS_REPEAT_COUNT}");
+        independent_daemon_startups_wait_for_installer_gate_release_once();
+    }
+}
+
+#[cfg(windows)]
+fn independent_daemon_startups_wait_for_installer_gate_release_once() {
+    let gate = InstallerStartupGate::acquire_for_daemon_startup().unwrap();
+    let first_proof = ProofContext::new();
+    let second_proof = ProofContext::new();
+    let mut first = ProofDaemon::spawn_process(&first_proof);
+    let mut second = ProofDaemon::spawn_process(&second_proof);
+
+    first.assert_waiting_for_installer_gate(&first_proof);
+    second.assert_waiting_for_installer_gate(&second_proof);
+    drop(gate);
+
+    first.wait_until_ready();
+    second.wait_until_ready();
+    assert!(
+        first_proof.lock_path.exists(),
+        "first independent daemon {} did not own fixture lock {}",
+        first.id(),
+        first_proof.lock_path.display()
+    );
+    assert!(
+        second_proof.lock_path.exists(),
+        "second independent daemon {} did not own fixture lock {}",
+        second.id(),
+        second_proof.lock_path.display()
+    );
+    first.stop();
+    second.stop();
+    assert!(
+        !first_proof.lock_path.exists(),
+        "first independent daemon left fixture lock {}",
+        first_proof.lock_path.display()
+    );
+    assert!(
+        !second_proof.lock_path.exists(),
+        "second independent daemon left fixture lock {}",
+        second_proof.lock_path.display()
+    );
+    assert!(
+        DaemonClient::connect(&first_proof.socket_path).is_err(),
+        "first independent daemon left fixture endpoint {}",
+        first_proof.socket_path.display()
+    );
+    assert!(
+        DaemonClient::connect(&second_proof.socket_path).is_err(),
+        "second independent daemon left fixture endpoint {}",
+        second_proof.socket_path.display()
+    );
+}
 
 #[test]
 fn daemon_first_blocks_direct_sqlite_but_allows_jsonl_and_delegated_prompts() {
@@ -430,12 +493,57 @@ struct ProofDaemon {
 
 impl ProofDaemon {
     fn start(proof: &ProofContext) -> Self {
-        let mut child = proof.daemon_command().spawn().unwrap();
-        wait_for_daemon(&proof.socket_path, &proof.workspace, &mut child);
+        let mut daemon = Self::spawn_process(proof);
+        daemon.wait_until_ready();
+        daemon
+    }
+
+    fn spawn_process(proof: &ProofContext) -> Self {
         Self {
-            child: Some(child),
+            child: Some(proof.daemon_command().spawn().unwrap()),
             workspace: proof.workspace.clone(),
             socket_path: proof.socket_path.clone(),
+        }
+    }
+
+    fn wait_until_ready(&mut self) {
+        wait_for_daemon(
+            &self.socket_path,
+            &self.workspace,
+            self.child.as_mut().unwrap(),
+        );
+    }
+
+    #[cfg(windows)]
+    fn assert_waiting_for_installer_gate(&mut self, proof: &ProofContext) {
+        let child = self.child.as_mut().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                let stderr = read_pipe(child.stderr.take());
+                panic!(
+                    "independent daemon {} exited instead of waiting on installer gate for fixture {} ({status}): {}",
+                    child.id(),
+                    proof.lock_path.display(),
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            assert!(
+                !proof.lock_path.exists(),
+                "independent daemon {} created fixture lock {} while installer gate was held",
+                child.id(),
+                proof.lock_path.display()
+            );
+            assert!(
+                DaemonClient::connect(&proof.socket_path).is_err(),
+                "independent daemon {} created fixture endpoint {} while installer gate was held",
+                child.id(),
+                proof.socket_path.display()
+            );
+            if Instant::now() >= deadline {
+                return;
+            }
+            thread::sleep(POLL_INTERVAL);
         }
     }
 

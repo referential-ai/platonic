@@ -84,7 +84,8 @@ fn run() -> plato_agent::AppResult<()> {
     }
 
     #[cfg(windows)]
-    let installer_gate = plato_agent::daemon::installer_gate::InstallerStartupGate::acquire()?;
+    let installer_gate =
+        plato_agent::daemon::installer_gate::InstallerStartupGate::acquire_for_daemon_startup()?;
     let server = DaemonServer::bind(&cli.workspace, cli.socket)?;
     #[cfg(windows)]
     drop(installer_gate);

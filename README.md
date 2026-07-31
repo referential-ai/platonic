@@ -251,7 +251,10 @@ on Unix, and Ctrl-C or Ctrl-Break on Windows, trigger a graceful shutdown: the
 daemon stops accepting new connections, then removes its endpoint before
 exiting. On Windows the daemon creates the exact lock file with delete-on-close
 and holds its handle for the daemon lifetime, so normal or abrupt exit removes
-the path. Do not remove a lock for a live daemon.
+the path. Do not remove a lock for a live daemon. Ordinary Windows daemon
+startup may wait up to five seconds for a valid installer or update gate
+owner to release or abandon the gate. Invalid ownership or a timeout causes
+startup to fail closed before the daemon creates its endpoint or workspace lock.
 Live assistant deltas are transient `events.stream` events and are not written
 to the ledger. After a `lagged` response, omitting `from_offset` resumes at the
 current tip; `transcript.read` returns ledger-backed status and final answer.

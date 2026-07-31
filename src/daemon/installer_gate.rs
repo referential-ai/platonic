@@ -18,6 +18,7 @@ use windows_sys::Win32::{
 };
 
 const INSTALLER_GATE_PREFIX: &str = r"Global\plato-agent-installer";
+const DAEMON_STARTUP_WAIT_MS: u32 = 5_000;
 
 #[derive(Debug)]
 pub struct InstallerStartupGate {
@@ -26,6 +27,14 @@ pub struct InstallerStartupGate {
 
 impl InstallerStartupGate {
     pub fn acquire() -> io::Result<Self> {
+        Self::acquire_with_wait(0)
+    }
+
+    pub fn acquire_for_daemon_startup() -> io::Result<Self> {
+        Self::acquire_with_wait(DAEMON_STARTUP_WAIT_MS)
+    }
+
+    fn acquire_with_wait(wait_ms: u32) -> io::Result<Self> {
         let descriptor = windows_security::current_user_pipe_descriptor()?;
         let mut attributes = SECURITY_ATTRIBUTES {
             nLength: mem::size_of::<SECURITY_ATTRIBUTES>()
@@ -54,11 +63,15 @@ impl InstallerStartupGate {
         if create_error == ERROR_ALREADY_EXISTS {
             windows_security::validate_current_user_kernel_object(handle.as_raw_handle())?;
             // SAFETY: handle is a live mutex handle. Existing mutexes ignore initial ownership.
-            match unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } {
+            match unsafe { WaitForSingleObject(handle.as_raw_handle(), wait_ms) } {
                 WAIT_OBJECT_0 | WAIT_ABANDONED_0 => {}
                 WAIT_TIMEOUT => {
                     return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
+                        if wait_ms == 0 {
+                            io::ErrorKind::WouldBlock
+                        } else {
+                            io::ErrorKind::TimedOut
+                        },
                         "Plato Agent installation or update is in progress",
                     ));
                 }

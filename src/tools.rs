@@ -1096,6 +1096,11 @@ mod tests {
     use super::*;
     use platonic_core::ToolCallId;
 
+    #[cfg(windows)]
+    const WINDOWS_PROCESS_REPEAT_COUNT: usize = 25;
+    #[cfg(windows)]
+    const WINDOWS_DESCENDANT_TIMEOUT_SECONDS: u64 = 5;
+
     struct InstrumentedReader {
         bytes: Vec<u8>,
         position: usize,
@@ -2156,40 +2161,82 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn shell_exec_timeout_kills_windows_descendants() {
+        for iteration in 1..=WINDOWS_PROCESS_REPEAT_COUNT {
+            eprintln!("shell timeout descendant proof {iteration}/{WINDOWS_PROCESS_REPEAT_COUNT}");
+            shell_exec_timeout_kills_windows_descendants_once();
+        }
+    }
+
+    #[cfg(windows)]
+    fn shell_exec_timeout_kills_windows_descendants_once() {
         let dir = tempfile::tempdir().unwrap();
         write_windows_descendant_probe(dir.path());
+        let path_without_ping = dir.path().join("path-without-ping");
+        fs::create_dir(&path_without_ping).unwrap();
+        let started_path = dir.path().join("descendant-started.txt");
+        let survived_path = dir.path().join("descendant-survived.txt");
 
         let err = execute_tool(
             dir.path(),
             ToolCallId::new("call_1").unwrap(),
             SHELL_EXEC,
-            json!({"command": "descendant-probe.cmd", "timeout_seconds": 1}),
+            json!({
+                "command": r#"set "PATH=path-without-ping"&&.\descendant-probe.cmd"#,
+                "timeout_seconds": WINDOWS_DESCENDANT_TIMEOUT_SECONDS
+            }),
         )
         .unwrap_err();
+        let expected_error =
+            format!("shell.exec timed out after {WINDOWS_DESCENDANT_TIMEOUT_SECONDS}s");
 
-        assert!(matches!(
-            err,
-            AppError::Tool(message) if message == "shell.exec timed out after 1s"
-        ));
-        assert!(dir.path().join("descendant-started.txt").exists());
-        thread::sleep(Duration::from_secs(6));
-        assert!(!dir.path().join("descendant-survived.txt").exists());
+        assert!(
+            matches!(
+                &err,
+                AppError::Tool(message) if message == &expected_error
+            ),
+            "descendant fixture {} returned {err}",
+            dir.path().display()
+        );
+        assert!(
+            started_path.exists(),
+            "descendant fixture did not record its pid at {}",
+            started_path.display()
+        );
+        assert_windows_descendant_stopped(&started_path);
+        assert!(
+            !survived_path.exists(),
+            "descendant fixture survived timeout and wrote {}",
+            survived_path.display()
+        );
     }
 
     #[cfg(windows)]
     #[test]
     fn shell_exec_cancel_kills_windows_descendants() {
+        for iteration in 1..=WINDOWS_PROCESS_REPEAT_COUNT {
+            eprintln!("shell cancel descendant proof {iteration}/{WINDOWS_PROCESS_REPEAT_COUNT}");
+            shell_exec_cancel_kills_windows_descendants_once();
+        }
+    }
+
+    #[cfg(windows)]
+    fn shell_exec_cancel_kills_windows_descendants_once() {
         let dir = tempfile::tempdir().unwrap();
         write_windows_descendant_probe(dir.path());
+        let path_without_ping = dir.path().join("path-without-ping");
+        fs::create_dir(&path_without_ping).unwrap();
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let cancel_for_thread = std::sync::Arc::clone(&cancel);
         let started_path = dir.path().join("descendant-started.txt");
+        let survived_path = dir.path().join("descendant-survived.txt");
+        let started_for_canceler = started_path.clone();
         let canceler = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !started_path.exists() {
+            while !started_for_canceler.exists() {
                 assert!(
                     Instant::now() < deadline,
-                    "descendant did not start before cancel deadline"
+                    "descendant fixture did not record its pid before cancel deadline at {}",
+                    started_for_canceler.display()
                 );
                 thread::sleep(Duration::from_millis(20));
             }
@@ -2204,32 +2251,112 @@ mod tests {
             },
             ToolCallId::new("call_1").unwrap(),
             SHELL_EXEC,
-            json!({"command": "descendant-probe.cmd", "timeout_seconds": 10}),
+            json!({
+                "command": r#"set "PATH=path-without-ping"&&.\descendant-probe.cmd"#,
+                "timeout_seconds": 10
+            }),
         )
         .unwrap_err();
         canceler.join().unwrap();
 
-        assert!(matches!(
-            err,
-            AppError::Tool(message) if message == "shell.exec canceled"
-        ));
-        thread::sleep(Duration::from_secs(6));
-        assert!(!dir.path().join("descendant-survived.txt").exists());
+        assert!(
+            matches!(
+                &err,
+                AppError::Tool(message) if message == "shell.exec canceled"
+            ),
+            "descendant fixture {} returned {err}",
+            dir.path().display()
+        );
+        assert_windows_descendant_stopped(&started_path);
+        assert!(
+            !survived_path.exists(),
+            "descendant fixture survived cancellation and wrote {}",
+            survived_path.display()
+        );
     }
 
     #[cfg(windows)]
     fn write_windows_descendant_probe(workspace: &Path) {
+        let helper = env::current_exe()
+            .unwrap_or_else(|error| panic!("failed to locate Windows descendant helper: {error}"));
+        let script = workspace.join("descendant-probe.cmd");
         fs::write(
-            workspace.join("descendant-probe.cmd"),
-            concat!(
-                "@echo off\r\n",
-                "start \"\" /b cmd.exe /C ",
-                "\"echo started>descendant-started.txt ",
-                "& ping -n 5 127.0.0.1 >NUL ",
-                "& echo survived>descendant-survived.txt\"\r\n",
-                "ping -n 30 127.0.0.1 >NUL\r\n",
+            &script,
+            format!(
+                concat!(
+                    "@echo off\r\n",
+                    "\"{}\" ",
+                    "--exact tools::tests::windows_descendant_probe_child --ignored --nocapture\r\n",
+                ),
+                helper.display()
             ),
         )
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to write descendant command fixture {}: {error}",
+                script.display()
+            )
+        });
+    }
+
+    #[cfg(windows)]
+    fn assert_windows_descendant_stopped(started_path: &Path) {
+        let pid = fs::read_to_string(started_path)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to read descendant pid fixture {}: {error}",
+                    started_path.display()
+                )
+            })
+            .trim()
+            .parse()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "invalid descendant pid fixture {}: {error}",
+                    started_path.display()
+                )
+            });
+        let process =
+            crate::windows_security::CurrentUserProcess::open(pid).unwrap_or_else(|error| {
+                panic!(
+                    "failed to inspect descendant process {pid} from {}: {error}",
+                    started_path.display()
+                )
+            });
+        if let Some(process) = process {
+            assert!(
+                process
+                    .wait_until(Instant::now() + Duration::from_secs(5))
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "failed to wait for descendant process {pid} from {}: {error}",
+                            started_path.display()
+                        )
+                    }),
+                "descendant process {pid} from {} survived job termination",
+                started_path.display()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "subprocess child for the Windows descendant termination proof"]
+    fn windows_descendant_probe_child() {
+        let started_path = Path::new("descendant-started.txt");
+        fs::write(started_path, std::process::id().to_string()).unwrap_or_else(|error| {
+            panic!(
+                "failed to write descendant pid fixture {}: {error}",
+                started_path.display()
+            )
+        });
+        thread::sleep(Duration::from_secs(30));
+        let survived_path = Path::new("descendant-survived.txt");
+        fs::write(survived_path, b"survived").unwrap_or_else(|error| {
+            panic!(
+                "failed to write descendant survival fixture {}: {error}",
+                survived_path.display()
+            )
+        });
     }
 }
