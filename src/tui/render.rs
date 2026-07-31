@@ -786,9 +786,8 @@ fn status_line(state: &TuiState, width: u16) -> Line<'static> {
         DisplayMode::Conversation => "conversation",
         DisplayMode::Audit => "audit",
     };
-    let full = format!(
-        "{connection} | {run_status} {elapsed} | {model} | queued {queued} | {mode} | v toggle | ? help"
-    );
+    let full =
+        format!("{connection} | {run_status} {elapsed} | {model} | queued {queued} | {mode}");
     let medium = format!("{connection} | {run_status} | {model} | q {queued} | {mode}");
     let short_connection = if connection == "online" { "on" } else { "off" };
     let short_mode = if state.display_mode == DisplayMode::Conversation {
@@ -1280,7 +1279,8 @@ mod tests {
         assert!(output.contains("model pending"));
         assert!(output.contains("online | ready"));
         assert!(output.contains("Try \"read README.md and summarize it\""));
-        assert!(output.contains("? help"));
+        assert!(!output.contains("? help"));
+        assert!(!output.contains("v toggle"));
         assert!(!output.contains("Status"));
         assert!(!output.contains("Sessions"));
         assert!(!output.contains("Live Events"));
@@ -1301,6 +1301,8 @@ mod tests {
             let line = status_line(&state, width);
             assert!(line.width() <= usize::from(width));
             assert!(!line.to_string().contains("run_hidden_identifier"));
+            assert!(!line.to_string().contains("? help"));
+            assert!(!line.to_string().contains("v toggle"));
         }
 
         let [history, composer, status] = vertical(Rect::new(0, 0, 48, 12), &state);
@@ -1363,7 +1365,7 @@ mod tests {
         let narrow_conversation = focused_snapshot(&state, 48, 24);
         assert_eq!(
             normal_conversation,
-            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow widths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n> | Try \"read README.md and summarize it\"\nonline | ready 0s | openrouter/auto | queued 0 | conversation | v toggle | ? help"
+            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow widths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n> | Try \"read README.md and summarize it\"\nonline | ready 0s | openrouter/auto | queued 0 | conversation"
         );
         assert_eq!(
             narrow_conversation,
@@ -1390,7 +1392,7 @@ mod tests {
         let narrow_audit = focused_snapshot(&state, 48, 24);
         assert_eq!(
             normal_audit,
-            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise summary.\ntool      call_alpha file.read {\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at narrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission denied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\nonline | ready 0s | openrouter/auto | queued 0 | audit | v toggle | ? help"
+            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise summary.\ntool      call_alpha file.read {\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at narrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission denied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\nonline | ready 0s | openrouter/auto | queued 0 | audit"
         );
         assert_eq!(
             narrow_audit,
