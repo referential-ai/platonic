@@ -497,6 +497,9 @@ Session picker statuses are `running`, `finished`, `failed`, `canceled`, or
 session so it can be resumed.
 On attach, the TUI selects the latest session by default; submitted messages
 continue that session until `/new` clears the selection.
+Live rows, model status, warnings, and approvals remain bound to that selected
+session and run across reloads. A pending approval is restored from daemon
+readback, and a failed grant or deny remains available to retry.
 
 ```bash
 cargo run --bin plato-agentd -- --workspace "$PWD"

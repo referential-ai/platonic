@@ -549,7 +549,6 @@ fn decide_approval(commands: &Sender<ClientCommand>, state: &mut TuiState, actio
         ApprovalAction::Grant => format!("grant sent for {}", approval.tool_call_id),
         ApprovalAction::Deny => format!("deny sent for {}", approval.tool_call_id),
     });
-    state.approval = None;
     send_command(commands, command, state);
 }
 
@@ -873,8 +872,8 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::super::client::{
-        ACTIVE_POLL_INTERVAL, ClientEvent, EVENT_LIMIT, apply_events_result, apply_loaded_state,
-        apply_run_response, is_connection_error,
+        ACTIVE_POLL_INTERVAL, ClientEvent, ClientOperation, EVENT_LIMIT, apply_events_result,
+        apply_loaded_state, apply_run_response, is_connection_error,
     };
     #[cfg(unix)]
     use super::super::client::{DAEMON_CLIENT_TIMEOUT, connect_daemon};
@@ -2259,7 +2258,7 @@ mod tests {
         let mut runtime = UiRuntime::from_state(&state, None);
         event_sender
             .send(ClientEvent::Failed {
-                context: "issue-prep.start",
+                operation: ClientOperation::IssuePrepStart,
                 error: crate::AppError::DaemonResponse(ProtocolError {
                     code: "issue_prep_failed".into(),
                     message: "provider failed".into(),
@@ -2339,7 +2338,7 @@ mod tests {
         };
         event_sender
             .send(ClientEvent::Failed {
-                context: "events.stream",
+                operation: ClientOperation::EventsStream,
                 error: crate::AppError::DaemonResponse(ProtocolError {
                     code: "lagged".into(),
                     message: "offset is no longer buffered".into(),
@@ -2387,7 +2386,7 @@ mod tests {
         };
         event_sender
             .send(ClientEvent::Failed {
-                context: "events.stream",
+                operation: ClientOperation::EventsStream,
                 error: crate::AppError::Io(std::io::Error::new(
                     std::io::ErrorKind::ConnectionRefused,
                     "Connection refused",
@@ -2512,7 +2511,13 @@ mod tests {
 
         decide_approval(&sender, &mut state, ApprovalAction::Grant);
 
-        assert!(state.approval.is_none());
+        assert_eq!(
+            state
+                .approval
+                .as_ref()
+                .map(|approval| approval.tool_call_id.as_str()),
+            Some("call_1")
+        );
         match receiver.try_recv().unwrap() {
             ClientCommand::ApprovalGrant {
                 run_id,
@@ -2537,6 +2542,13 @@ mod tests {
 
         decide_approval(&sender, &mut state, ApprovalAction::Deny);
 
+        assert_eq!(
+            state
+                .approval
+                .as_ref()
+                .map(|approval| approval.tool_call_id.as_str()),
+            Some("call_2")
+        );
         match receiver.try_recv().unwrap() {
             ClientCommand::ApprovalDeny {
                 run_id,
@@ -2549,6 +2561,115 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn failed_grant_keeps_same_approval_retryable_until_success() {
+        assert_failed_approval_retry(true);
+    }
+
+    #[test]
+    fn failed_deny_keeps_same_approval_retryable_until_success() {
+        assert_failed_approval_retry(false);
+    }
+
+    fn assert_failed_approval_retry(grant: bool) {
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut state = test_state();
+        let approval = crate::tui::ApprovalModalView {
+            run_id: "run_retry".into(),
+            tool_call_id: "call_retry".into(),
+            tool_name: "file.write".into(),
+            effect: "workspace_write".into(),
+            reason: "requires approval".into(),
+            input_preview: r#"{"path":"retry.txt"}"#.into(),
+            approval_preview: None,
+            diff_preview: None,
+        };
+        state.approval = Some(approval.clone());
+        state.active_run = Some(crate::tui::ActiveRunView {
+            run_id: approval.run_id.clone(),
+            status: RunStateName::Running,
+        });
+        let mut runtime = UiRuntime::from_state(&state, None);
+        let assert_command = |command| match (grant, command) {
+            (
+                true,
+                ClientCommand::ApprovalGrant {
+                    run_id,
+                    tool_call_id,
+                },
+            ) => {
+                assert_eq!(run_id, "run_retry");
+                assert_eq!(tool_call_id, "call_retry");
+            }
+            (
+                false,
+                ClientCommand::ApprovalDeny {
+                    run_id,
+                    tool_call_id,
+                    reason,
+                },
+            ) => {
+                assert_eq!(run_id, "run_retry");
+                assert_eq!(tool_call_id, "call_retry");
+                assert_eq!(reason, "denied by plato-tui");
+            }
+            (_, other) => panic!("unexpected approval command: {other:?}"),
+        };
+
+        decide_approval(
+            &command_sender,
+            &mut state,
+            if grant {
+                ApprovalAction::Grant
+            } else {
+                ApprovalAction::Deny
+            },
+        );
+        assert_command(command_receiver.try_recv().unwrap());
+
+        event_sender
+            .send(ClientEvent::Failed {
+                operation: ClientOperation::ApprovalDecide,
+                error: crate::AppError::DaemonResponse(ProtocolError {
+                    code: "temporarily_unavailable".into(),
+                    message: "try the same decision again".into(),
+                }),
+            })
+            .unwrap();
+        drain_client_events(&mut state, &mut runtime, &event_receiver, &command_sender);
+
+        assert_eq!(state.approval.as_ref(), Some(&approval));
+        let failed = render_snapshot(&state, 100, 24).unwrap();
+        assert!(failed.contains("call_retry"));
+        assert!(failed.contains("g grant"));
+        assert!(failed.contains("d deny"));
+
+        decide_approval(
+            &command_sender,
+            &mut state,
+            if grant {
+                ApprovalAction::Grant
+            } else {
+                ApprovalAction::Deny
+            },
+        );
+        assert_command(command_receiver.try_recv().unwrap());
+        assert!(command_receiver.try_recv().is_err());
+        assert_eq!(state.approval.as_ref(), Some(&approval));
+
+        event_sender
+            .send(ClientEvent::ApprovalDecided(
+                crate::daemon::protocol::CommandAcceptedResult {
+                    run_id: "run_retry".into(),
+                    status: RunStateName::Running,
+                },
+            ))
+            .unwrap();
+        drain_client_events(&mut state, &mut runtime, &event_receiver, &command_sender);
+        assert!(state.approval.is_none());
     }
 
     #[test]
@@ -2598,8 +2719,19 @@ mod tests {
     }
 
     #[test]
-    fn state_reload_replaces_transcript_cache_and_preserves_live_event_cache() {
+    fn matching_selected_run_reload_preserves_live_state_and_cache() {
         let mut state = test_state();
+        state.sessions = vec![test_session(
+            "session_1",
+            "run_1",
+            RunStateName::Running,
+            "matching run",
+        )];
+        state.selected_session_id = Some("session_1".into());
+        state.active_run = Some(crate::tui::ActiveRunView {
+            run_id: "run_1".into(),
+            status: RunStateName::Running,
+        });
         state.replace_transcript(loaded_transcript(
             "run_1",
             "[turn_1] assistant: old answer\n",
@@ -2608,22 +2740,119 @@ mod tests {
             &mut state,
             crate::tui::LiveEventLine::status(Some(1), "live status"),
         );
+        state.stream_warning = Some("matching warning".into());
+        state.active_model = Some("matching-model".into());
+        state.active_run_elapsed_secs = Some(17);
+        state.scroll_offset = 10;
+        state.cancel_requested = true;
+        state.approval = Some(test_approval("run_1", "call_1"));
         render_snapshot(&state, 100, 24).unwrap();
         let live_event_rows_ptr = cached_live_event_rows_ptr(&state);
 
         let mut loaded = test_state();
+        loaded.sessions = state.sessions.clone();
+        loaded.selected_session_id = Some("session_1".into());
+        loaded.active_run = Some(crate::tui::ActiveRunView {
+            run_id: "run_1".into(),
+            status: RunStateName::Running,
+        });
         loaded.replace_transcript(loaded_transcript(
-            "run_2",
-            "[turn_2] assistant: new answer\n",
+            "run_1",
+            "[turn_2] assistant: refreshed answer\n",
         ));
         apply_loaded_state(&mut state, loaded);
 
         assert_cached_rows(&state, false, true);
         assert_eq!(cached_live_event_rows_ptr(&state), live_event_rows_ptr);
+        assert_eq!(state.stream_warning.as_deref(), Some("matching warning"));
+        assert_eq!(state.active_model.as_deref(), Some("matching-model"));
+        assert_eq!(state.active_run_elapsed_secs, Some(17));
+        assert_eq!(state.scroll_offset, 10);
+        assert!(state.cancel_requested);
+        assert_eq!(
+            state
+                .approval
+                .as_ref()
+                .map(|approval| approval.tool_call_id.as_str()),
+            Some("call_1")
+        );
+        assert_eq!(
+            state.live_events.first().map(|event| event.text.as_str()),
+            Some("live status")
+        );
+        state.approval = None;
         let output = render_snapshot(&state, 100, 24).unwrap();
-        assert!(output.contains("new answer"));
+        assert!(output.contains("refreshed answer"));
         assert!(!output.contains("old answer"));
         assert!(output.contains("live status"));
+    }
+
+    #[test]
+    fn repeated_session_switches_clear_transcript_live_and_approval_state() {
+        let mut state = selected_state("session_a", "run_a", "[turn_a] assistant: transcript-a\n");
+
+        for (next_session, next_run, next_transcript) in [
+            ("session_b", "run_b", "[turn_b] assistant: transcript-b\n"),
+            ("session_a", "run_a", "[turn_a] assistant: transcript-a\n"),
+            ("session_b", "run_b", "[turn_b] assistant: transcript-b\n"),
+        ] {
+            let previous_session = state.selected_session_id.clone().unwrap();
+            let previous_run = state.active_run.as_ref().unwrap().run_id.clone();
+            let old_marker = format!("old-live-{previous_session}");
+            state.live_events = vec![crate::tui::LiveEventLine::assistant(
+                Some(7),
+                old_marker.clone(),
+            )];
+            state.stream_warning = Some(format!("old-warning-{previous_session}"));
+            state.active_model = Some(format!("old-model-{previous_session}"));
+            state.active_run_elapsed_secs = Some(91);
+            state.approval = Some(test_approval(&previous_run, "old-call"));
+            state.scroll_offset = 10;
+            render_snapshot(&state, 100, 24).unwrap();
+            assert_cached_rows(&state, true, true);
+
+            apply_loaded_state(
+                &mut state,
+                selected_state(next_session, next_run, next_transcript),
+            );
+
+            assert!(state.live_events.is_empty());
+            assert!(state.stream_warning.is_none());
+            assert!(state.active_model.is_none());
+            assert!(state.active_run_elapsed_secs.is_none());
+            assert!(state.approval.is_none());
+            assert_eq!(state.scroll_offset, 0);
+            assert_cached_rows(&state, false, false);
+            let output = render_snapshot(&state, 100, 24).unwrap();
+            assert!(output.contains(next_transcript.split(": ").last().unwrap().trim()));
+            assert!(!output.contains(&old_marker));
+            assert!(!output.contains(&format!("old-warning-{previous_session}")));
+            assert!(!output.contains(&format!("old-model-{previous_session}")));
+            assert!(!output.contains("old-call"));
+        }
+    }
+
+    #[test]
+    fn reload_without_selected_identity_clears_live_state() {
+        let mut state = test_state();
+        state.live_events = vec![crate::tui::LiveEventLine::status(
+            None,
+            "unowned live state",
+        )];
+        state.stream_warning = Some("unowned warning".into());
+        state.active_model = Some("unowned-model".into());
+        state.active_run_elapsed_secs = Some(12);
+        state.approval = Some(test_approval("unowned-run", "unowned-call"));
+        render_snapshot(&state, 100, 24).unwrap();
+
+        apply_loaded_state(&mut state, test_state());
+
+        assert!(state.live_events.is_empty());
+        assert!(state.stream_warning.is_none());
+        assert!(state.active_model.is_none());
+        assert!(state.active_run_elapsed_secs.is_none());
+        assert!(state.approval.is_none());
+        assert_cached_rows(&state, false, false);
     }
 
     fn test_state() -> TuiState {
@@ -2639,6 +2868,36 @@ mod tests {
             Vec::new(),
             TranscriptState::None,
         )
+    }
+
+    fn selected_state(session_id: &str, run_id: &str, transcript: &str) -> TuiState {
+        let mut state = test_state();
+        state.sessions = vec![test_session(
+            session_id,
+            run_id,
+            RunStateName::Running,
+            transcript,
+        )];
+        state.selected_session_id = Some(session_id.into());
+        state.active_run = Some(crate::tui::ActiveRunView {
+            run_id: run_id.into(),
+            status: RunStateName::Running,
+        });
+        state.replace_transcript(loaded_transcript(run_id, transcript));
+        state
+    }
+
+    fn test_approval(run_id: &str, tool_call_id: &str) -> crate::tui::ApprovalModalView {
+        crate::tui::ApprovalModalView {
+            run_id: run_id.into(),
+            tool_call_id: tool_call_id.into(),
+            tool_name: "file.write".into(),
+            effect: "workspace_write".into(),
+            reason: "requires approval".into(),
+            input_preview: "{}".into(),
+            approval_preview: None,
+            diff_preview: None,
+        }
     }
 
     fn assert_cached_rows(state: &TuiState, transcript: bool, live_events: bool) {

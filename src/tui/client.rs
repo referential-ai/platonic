@@ -6,7 +6,7 @@ use crate::{
         ERROR_WORKSPACE_MISMATCH, EventsStreamResult, IssuePrepResult, IssuePrepStartResult,
         RunStartResult, RunStateName, StreamEvent,
     },
-    tui::{ActiveRunView, TranscriptState, TranscriptView, TuiState},
+    tui::{ActiveRunView, ApprovalModalView, TranscriptState, TranscriptView, TuiState},
 };
 use std::{
     collections::HashMap,
@@ -15,7 +15,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::app::{push_live_event, send_command, start_next_queued};
+use super::{
+    app::{push_live_event, send_command, start_next_queued},
+    state::approval_from_snapshot,
+};
 
 pub(super) const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 pub(super) const DAEMON_CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -51,26 +54,33 @@ fn load_connected_state(
             })
         })
         .or_else(|| sessions.first().map(|session| session.session_id.clone()));
-    let transcript = if let Some(session_id) = session_id.or(selected_session_id.as_deref()) {
-        match client.transcript_read_session(session_id) {
-            Ok(transcript) => TranscriptState::Loaded(TranscriptView::from(transcript)),
-            Err(error) => TranscriptState::Unavailable {
-                run_id: session_id.to_owned(),
-                error: error.to_string(),
-            },
-        }
-    } else {
-        match run_id {
-            Some(run_id) => match client.transcript_read(run_id) {
-                Ok(transcript) => TranscriptState::Loaded(TranscriptView::from(transcript)),
-                Err(error) => TranscriptState::Unavailable {
-                    run_id: run_id.to_owned(),
-                    error: error.to_string(),
+    let (transcript, approval) =
+        if let Some(session_id) = session_id.or(selected_session_id.as_deref()) {
+            match client.transcript_read_session(session_id) {
+                Ok(transcript) => loaded_transcript_state(transcript),
+                Err(error) => (
+                    TranscriptState::Unavailable {
+                        run_id: session_id.to_owned(),
+                        error: error.to_string(),
+                    },
+                    None,
+                ),
+            }
+        } else {
+            match run_id {
+                Some(run_id) => match client.transcript_read(run_id) {
+                    Ok(transcript) => loaded_transcript_state(transcript),
+                    Err(error) => (
+                        TranscriptState::Unavailable {
+                            run_id: run_id.to_owned(),
+                            error: error.to_string(),
+                        },
+                        None,
+                    ),
                 },
-            },
-            None => TranscriptState::None,
-        }
-    };
+                None => (TranscriptState::None, None),
+            }
+        };
     let mut state = TuiState::connected(
         config.workspace_root.to_string_lossy().into_owned(),
         config.socket_path.to_string_lossy().into_owned(),
@@ -79,24 +89,29 @@ fn load_connected_state(
         transcript,
     );
     state.selected_session_id = selected_session_id;
-    let active_session = state
-        .selected_session_id
-        .as_deref()
-        .and_then(|session_id| {
-            state.sessions.iter().find(|session| {
-                session.session_id == session_id && session.status == RunStateName::Running
-            })
+    state.approval = approval;
+    let active_session = state.selected_session_id.as_deref().and_then(|session_id| {
+        state.sessions.iter().find(|session| {
+            session.session_id == session_id && session.status == RunStateName::Running
         })
-        .or_else(|| {
-            state
-                .sessions
-                .iter()
-                .find(|session| session.status == RunStateName::Running)
-        });
+    });
     if let Some(session) = active_session {
         state.active_run = Some(ActiveRunView::new(session.run_id.clone(), session.status));
     }
     Ok(state)
+}
+
+fn loaded_transcript_state(
+    transcript: crate::daemon::protocol::TranscriptReadResult,
+) -> (TranscriptState, Option<ApprovalModalView>) {
+    let approval = transcript
+        .pending_approval
+        .clone()
+        .map(approval_from_snapshot);
+    (
+        TranscriptState::Loaded(TranscriptView::from(transcript)),
+        approval,
+    )
 }
 
 fn load_selected_session_state(config: &DaemonConnectionConfig, session_id: &str) -> TuiState {
@@ -201,9 +216,32 @@ pub(super) enum ClientEvent {
     ApprovalDecided(CommandAcceptedResult),
     RunCanceled(CommandAcceptedResult),
     Failed {
-        context: &'static str,
+        operation: ClientOperation,
         error: crate::AppError,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ClientOperation {
+    RunStart,
+    MessageAppend,
+    IssuePrepStart,
+    EventsStream,
+    ApprovalDecide,
+    RunCancel,
+}
+
+impl ClientOperation {
+    fn method(self) -> &'static str {
+        match self {
+            Self::RunStart => "run.start",
+            Self::MessageAppend => "message.append",
+            Self::IssuePrepStart => "issue-prep.start",
+            Self::EventsStream => "events.stream",
+            Self::ApprovalDecide => "approval.decide",
+            Self::RunCancel => "run.cancel",
+        }
+    }
 }
 
 pub(super) fn spawn_client_worker(
@@ -236,7 +274,10 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
         } => with_client(config, |client| {
             client.run_start(question, config_path, false)
         })
-        .map_or_else(failed_event("run.start"), ClientEvent::RunStarted),
+        .map_or_else(
+            failed_event(ClientOperation::RunStart),
+            ClientEvent::RunStarted,
+        ),
         ClientCommand::MessageAppend {
             message,
             session_id,
@@ -244,7 +285,10 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
         } => with_client(config, |client| {
             client.message_append_to_session(message, Some(session_id), config_path, false)
         })
-        .map_or_else(failed_event("message.append"), ClientEvent::RunStarted),
+        .map_or_else(
+            failed_event(ClientOperation::MessageAppend),
+            ClientEvent::RunStarted,
+        ),
         ClientCommand::IssuePrepStart { input, config_path } => {
             let result = (|| {
                 let mut client = connect_daemon(config, DAEMON_CLIENT_TIMEOUT)?;
@@ -253,7 +297,7 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
                 client.issue_prep_start(input, config_path)
             })();
             result.map_or_else(
-                failed_event("issue-prep.start"),
+                failed_event(ClientOperation::IssuePrepStart),
                 ClientEvent::IssuePrepFinished,
             )
         }
@@ -263,7 +307,10 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
         } => with_client(config, |client| {
             client.events_stream(&run_id, from_offset, EVENT_LIMIT)
         })
-        .map_or_else(failed_event("events.stream"), ClientEvent::EventsPolled),
+        .map_or_else(
+            failed_event(ClientOperation::EventsStream),
+            ClientEvent::EventsPolled,
+        ),
         ClientCommand::ApprovalGrant {
             run_id,
             tool_call_id,
@@ -271,7 +318,7 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             client.approval_grant(&run_id, &tool_call_id)
         })
         .map_or_else(
-            failed_event("approval.decide"),
+            failed_event(ClientOperation::ApprovalDecide),
             ClientEvent::ApprovalDecided,
         ),
         ClientCommand::ApprovalDeny {
@@ -282,12 +329,14 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             client.approval_deny(&run_id, &tool_call_id, reason)
         })
         .map_or_else(
-            failed_event("approval.decide"),
+            failed_event(ClientOperation::ApprovalDecide),
             ClientEvent::ApprovalDecided,
         ),
         ClientCommand::RunCancel { run_id } => {
-            with_client(config, |client| client.run_cancel(&run_id))
-                .map_or_else(failed_event("run.cancel"), ClientEvent::RunCanceled)
+            with_client(config, |client| client.run_cancel(&run_id)).map_or_else(
+                failed_event(ClientOperation::RunCancel),
+                ClientEvent::RunCanceled,
+            )
         }
     }
 }
@@ -308,8 +357,8 @@ pub(super) fn connect_daemon(
     DaemonClient::connect_with_timeout(&config.socket_path, timeout)
 }
 
-fn failed_event(context: &'static str) -> impl FnOnce(crate::AppError) -> ClientEvent {
-    move |error| ClientEvent::Failed { context, error }
+fn failed_event(operation: ClientOperation) -> impl FnOnce(crate::AppError) -> ClientEvent {
+    move |error| ClientEvent::Failed { operation, error }
 }
 
 pub(super) fn drain_client_events(
@@ -392,7 +441,7 @@ pub(super) fn drain_client_events(
                     ),
                 );
             }
-            ClientEvent::Failed { context, error } => {
+            ClientEvent::Failed { operation, error } => {
                 runtime.poll_in_flight = false;
                 let connection_error = is_connection_error(&error);
                 let lagged = matches!(
@@ -404,12 +453,12 @@ pub(super) fn drain_client_events(
                     AppError::DaemonResponse(error) if error.code == ERROR_OVERLOAD
                 );
                 let message = error.to_string();
-                if context == "events.stream" && lagged {
+                if operation == ClientOperation::EventsStream && lagged {
                     state.stream_warning = Some(format!("{message}; resuming at current tip"));
                     if let Some(run_id) = runtime.active_run_id.clone() {
                         poll_events_from(runtime, commands, run_id, None);
                     }
-                } else if context == "events.stream" && overloaded {
+                } else if operation == ClientOperation::EventsStream && overloaded {
                     state.stream_warning = Some(message);
                 } else {
                     if connection_error {
@@ -418,17 +467,26 @@ pub(super) fn drain_client_events(
                             error: message.clone(),
                         };
                     }
-                    if context == "run.cancel" {
-                        state.cancel_requested = false;
-                    }
-                    let failure = format!("{context} failed: {message}");
+                    let failure = format!("{} failed: {message}", operation.method());
                     state.status_message = Some(failure.clone());
-                    if context == "issue-prep.start" {
-                        state.issue_prep_started_at = None;
-                        push_live_event(state, crate::tui::LiveEventLine::warning(None, failure));
-                        if !connection_error {
-                            start_next_queued(commands, state, runtime);
+                    match operation {
+                        ClientOperation::RunCancel => {
+                            state.cancel_requested = false;
                         }
+                        ClientOperation::IssuePrepStart => {
+                            state.issue_prep_started_at = None;
+                            push_live_event(
+                                state,
+                                crate::tui::LiveEventLine::warning(None, failure),
+                            );
+                            if !connection_error {
+                                start_next_queued(commands, state, runtime);
+                            }
+                        }
+                        ClientOperation::RunStart
+                        | ClientOperation::MessageAppend
+                        | ClientOperation::EventsStream
+                        | ClientOperation::ApprovalDecide => {}
                     }
                 }
             }
@@ -437,6 +495,20 @@ pub(super) fn drain_client_events(
 }
 
 pub(super) fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
+    let matching_selected_run = matches!(
+        (
+            state.selected_session_id.as_deref(),
+            selected_run_id(state),
+            loaded.selected_session_id.as_deref(),
+            selected_run_id(&loaded),
+        ),
+        (
+            Some(current_session),
+            Some(current_run),
+            Some(loaded_session),
+            Some(loaded_run),
+        ) if current_session == loaded_session && current_run == loaded_run
+    );
     loaded.composer = std::mem::take(&mut state.composer);
     loaded.composer_cursor = state.composer_cursor;
     loaded.composer_kill_buffer = state.composer_kill_buffer.clone();
@@ -449,26 +521,47 @@ pub(super) fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
     if loaded.status_message.is_none() {
         loaded.status_message = state.status_message.clone();
     }
-    if loaded.stream_warning.is_none() {
-        loaded.stream_warning = state.stream_warning.clone();
-    }
-    if loaded.live_events.is_empty() {
-        loaded.live_events = std::mem::take(&mut state.live_events);
-        loaded.history_rows.live_events = std::mem::take(&mut state.history_rows.live_events);
-    }
-    loaded.scroll_offset = state.scroll_offset;
-    if loaded.active_model.is_none() {
-        loaded.active_model = state.active_model.clone();
-    }
-    if loaded.active_run_elapsed_secs.is_none() {
-        loaded.active_run_elapsed_secs = state.active_run_elapsed_secs;
-    }
-    if loaded.active_run.as_ref().map(|run| &run.run_id)
-        == state.active_run.as_ref().map(|run| &run.run_id)
-    {
+    if matching_selected_run {
+        if loaded.stream_warning.is_none() {
+            loaded.stream_warning = state.stream_warning.clone();
+        }
+        if loaded.live_events.is_empty() {
+            loaded.live_events = std::mem::take(&mut state.live_events);
+            loaded.history_rows.live_events = std::mem::take(&mut state.history_rows.live_events);
+        }
+        loaded.scroll_offset = state.scroll_offset;
+        if loaded.active_model.is_none() {
+            loaded.active_model = state.active_model.clone();
+        }
+        if loaded.active_run_elapsed_secs.is_none() {
+            loaded.active_run_elapsed_secs = state.active_run_elapsed_secs;
+        }
+        if loaded.approval.is_none() {
+            loaded.approval = state.approval.clone();
+        }
         loaded.cancel_requested = state.cancel_requested;
     }
     *state = loaded;
+}
+
+fn selected_run_id(state: &TuiState) -> Option<&str> {
+    state
+        .active_run
+        .as_ref()
+        .map(|run| run.run_id.as_str())
+        .or_else(|| {
+            let selected_session_id = state.selected_session_id.as_deref()?;
+            state
+                .sessions
+                .iter()
+                .find(|session| session.session_id == selected_session_id)
+                .map(|session| session.run_id.as_str())
+        })
+        .or(match &state.transcript {
+            TranscriptState::Loaded(transcript) => Some(transcript.run_id.as_str()),
+            TranscriptState::Unavailable { run_id, .. } => Some(run_id.as_str()),
+            TranscriptState::None => None,
+        })
 }
 
 pub(super) fn apply_run_response(
@@ -619,14 +712,397 @@ mod tests {
     };
     use serde_json::json;
     use std::{
+        collections::VecDeque,
         io::{BufRead, BufReader, Write},
         path::PathBuf,
-        sync::mpsc::{self, RecvTimeoutError},
+        sync::{
+            Arc, Mutex,
+            mpsc::{self, RecvTimeoutError},
+        },
         thread::{self, JoinHandle},
     };
 
     const OUTER_WATCHDOG: Duration = Duration::from_secs(10);
     const DEADLINE_MARGIN: Duration = Duration::from_millis(100);
+
+    #[test]
+    fn two_session_identity_matrix_polls_only_the_selected_running_session() {
+        let harness = ScriptedDaemon::start("two-session-identity", |workspace_id| {
+            vec![
+                hello_reply(workspace_id),
+                ScriptedReply::result(
+                    "sessions.list",
+                    json!({
+                        "sessions": [
+                            {
+                                "session_id": "session_finished",
+                                "run_id": "run_finished",
+                                "status": "finished",
+                                "latest_question": "finished selected",
+                                "ledger_path": "/work/agent.db"
+                            },
+                            {
+                                "session_id": "session_running",
+                                "run_id": "run_running",
+                                "status": "running",
+                                "latest_question": "other running",
+                                "ledger_path": "/work/agent.db"
+                            }
+                        ]
+                    }),
+                ),
+                ScriptedReply::result(
+                    "transcript.read",
+                    json!({
+                        "run_id": "run_finished",
+                        "status": "finished",
+                        "final_answer": "selected answer",
+                        "transcript": "[turn_finished] user: finished selected\n\
+                                       [turn_finished] assistant: selected answer\n"
+                    }),
+                ),
+                hello_reply(workspace_id),
+                ScriptedReply::result(
+                    "sessions.list",
+                    json!({
+                        "sessions": [
+                            {
+                                "session_id": "session_finished",
+                                "run_id": "run_finished",
+                                "status": "finished",
+                                "latest_question": "finished selected",
+                                "ledger_path": "/work/agent.db"
+                            },
+                            {
+                                "session_id": "session_running",
+                                "run_id": "run_running",
+                                "status": "running",
+                                "latest_question": "other running",
+                                "ledger_path": "/work/agent.db"
+                            }
+                        ]
+                    }),
+                ),
+                ScriptedReply::result(
+                    "transcript.read",
+                    json!({
+                        "run_id": "run_running",
+                        "status": "running",
+                        "final_answer": null,
+                        "transcript": "[turn_running] user: other running\n"
+                    }),
+                ),
+            ]
+        });
+
+        let finished = load_connected_state(&harness.config, None, None).unwrap();
+        assert_eq!(
+            finished.selected_session_id.as_deref(),
+            Some("session_finished")
+        );
+        assert!(finished.active_run.is_none());
+        let finished_output = render_snapshot(&finished, 100, 24).unwrap();
+        assert!(finished_output.contains("selected answer"));
+        assert!(!finished_output.contains("run_running"));
+
+        let (commands, command_receiver) = mpsc::channel();
+        let mut finished_runtime = UiRuntime::from_state(&finished, None);
+        finished_runtime.last_poll = Instant::now() - ACTIVE_POLL_INTERVAL;
+        maybe_poll_events(&mut finished_runtime, &commands);
+        assert!(command_receiver.try_recv().is_err());
+
+        let running = load_connected_state(&harness.config, None, Some("session_running")).unwrap();
+        assert_eq!(
+            running.selected_session_id.as_deref(),
+            Some("session_running")
+        );
+        assert_eq!(
+            running
+                .active_run
+                .as_ref()
+                .map(|active| active.run_id.as_str()),
+            Some("run_running")
+        );
+        let mut running_runtime = UiRuntime::from_state(&running, None);
+        running_runtime.last_poll = Instant::now() - ACTIVE_POLL_INTERVAL;
+        maybe_poll_events(&mut running_runtime, &commands);
+        assert!(matches!(
+            command_receiver.try_recv().unwrap(),
+            ClientCommand::PollEvents {
+                run_id,
+                from_offset: Some(0),
+            } if run_id == "run_running"
+        ));
+
+        let requests = harness.finish();
+        let transcript_targets = requests
+            .iter()
+            .filter(|request| request.method.as_deref() == Some("transcript.read"))
+            .map(|request| {
+                request
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("session_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            transcript_targets,
+            vec!["session_finished", "session_running"]
+        );
+    }
+
+    #[test]
+    fn lagged_reconnect_retains_pending_approval_through_failed_grant_retry() {
+        assert_lagged_approval_retry(true);
+    }
+
+    #[test]
+    fn lagged_reconnect_retains_pending_approval_through_failed_deny_retry() {
+        assert_lagged_approval_retry(false);
+    }
+
+    #[test]
+    fn operation_failure_state_matrix_is_exhaustive() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = DaemonConnectionConfig {
+            workspace_root: workspace.path().to_owned(),
+            socket_path: workspace.path().join("agent.sock"),
+        };
+        for operation in [
+            ClientOperation::RunStart,
+            ClientOperation::MessageAppend,
+            ClientOperation::IssuePrepStart,
+            ClientOperation::EventsStream,
+            ClientOperation::ApprovalDecide,
+            ClientOperation::RunCancel,
+        ] {
+            let (commands, _command_receiver) = mpsc::channel();
+            let mut state = connected_state(&config);
+            state.issue_prep_started_at = Some(Instant::now());
+            state.cancel_requested = true;
+            state.approval = Some(ApprovalModalView {
+                run_id: "run_selected".into(),
+                tool_call_id: "call_selected".into(),
+                tool_name: "file.edit".into(),
+                effect: "workspace_write".into(),
+                reason: "review selected edit".into(),
+                input_preview: "{}".into(),
+                approval_preview: None,
+                diff_preview: None,
+            });
+            let mut runtime = UiRuntime::from_state(&state, None);
+
+            apply_event(
+                &commands,
+                ClientEvent::Failed {
+                    operation,
+                    error: AppError::DaemonResponse(ProtocolError {
+                        code: "test_failure".into(),
+                        message: "expected failure".into(),
+                    }),
+                },
+                &mut state,
+                &mut runtime,
+            );
+
+            let expected_status = format!(
+                "{} failed: daemon protocol error test_failure: expected failure",
+                operation.method()
+            );
+            assert_eq!(
+                state.status_message.as_deref(),
+                Some(expected_status.as_str())
+            );
+            assert_eq!(
+                state.cancel_requested,
+                operation != ClientOperation::RunCancel
+            );
+            assert_eq!(
+                state.issue_prep_started_at.is_none(),
+                operation == ClientOperation::IssuePrepStart
+            );
+            assert_eq!(
+                state.live_events.len(),
+                usize::from(operation == ClientOperation::IssuePrepStart)
+            );
+            assert_eq!(
+                state
+                    .approval
+                    .as_ref()
+                    .map(|approval| approval.tool_call_id.as_str()),
+                Some("call_selected")
+            );
+        }
+    }
+
+    fn assert_lagged_approval_retry(grant: bool) {
+        let name = if grant {
+            "lagged-grant-retry"
+        } else {
+            "lagged-deny-retry"
+        };
+        let harness = ScriptedDaemon::start(name, |workspace_id| {
+            vec![
+                hello_reply(workspace_id),
+                ScriptedReply::result(
+                    "sessions.list",
+                    json!({
+                        "sessions": [{
+                            "session_id": "session_selected",
+                            "run_id": "run_selected",
+                            "status": "running",
+                            "latest_question": "approve selected work",
+                            "ledger_path": "/work/agent.db"
+                        }]
+                    }),
+                ),
+                ScriptedReply::result(
+                    "transcript.read",
+                    json!({
+                        "run_id": "run_selected",
+                        "status": "running",
+                        "final_answer": null,
+                        "transcript": "[turn_selected] user: approve selected work\n",
+                        "pending_approval": {
+                            "run_id": "run_selected",
+                            "tool_call_id": "call_selected",
+                            "tool_name": "file.edit",
+                            "effect": "workspace_write",
+                            "reason": "review selected edit",
+                            "input_preview": "{\"path\":\"selected.txt\"}",
+                            "approval_preview": "edit selected.txt",
+                            "diff_preview": "-old selected\n+new selected\n"
+                        }
+                    }),
+                ),
+                hello_reply(workspace_id),
+                ScriptedReply::error(
+                    "events.stream",
+                    ERROR_LAGGED,
+                    "offset is no longer buffered",
+                ),
+                hello_reply(workspace_id),
+                ScriptedReply::result(
+                    "events.stream",
+                    json!({
+                        "run_id": "run_selected",
+                        "from_offset": 12,
+                        "next_offset": 12,
+                        "status": "running",
+                        "events": []
+                    }),
+                ),
+                hello_reply(workspace_id),
+                ScriptedReply::error(
+                    "approval.decide",
+                    "temporarily_unavailable",
+                    "retry the exact decision",
+                ),
+                hello_reply(workspace_id),
+                ScriptedReply::result(
+                    "approval.decide",
+                    json!({
+                        "run_id": "run_selected",
+                        "status": "running"
+                    }),
+                ),
+            ]
+        });
+        let mut state = load_connected_state(&harness.config, None, None).unwrap();
+        let approval = state.approval.clone().expect("approval snapshot");
+        assert_eq!(approval.run_id, "run_selected");
+        assert_eq!(approval.tool_call_id, "call_selected");
+        assert_eq!(approval.tool_name, "file.edit");
+        assert_eq!(approval.effect, "workspace_write");
+        assert_eq!(approval.reason, "review selected edit");
+        assert_eq!(approval.input_preview, r#"{"path":"selected.txt"}"#);
+        assert_eq!(
+            approval.approval_preview.as_deref(),
+            Some("edit selected.txt")
+        );
+        assert_eq!(
+            approval.diff_preview.as_deref(),
+            Some("-old selected\n+new selected\n")
+        );
+
+        let (commands, events) = spawn_client_worker(harness.config.clone());
+        let mut runtime = UiRuntime::from_state(&state, None);
+        commands
+            .send(ClientCommand::PollEvents {
+                run_id: "run_selected".into(),
+                from_offset: Some(0),
+            })
+            .unwrap();
+        let lagged = events.recv_timeout(OUTER_WATCHDOG).unwrap();
+        apply_event(&commands, lagged, &mut state, &mut runtime);
+        let empty_tip = events.recv_timeout(OUTER_WATCHDOG).unwrap();
+        apply_event(&commands, empty_tip, &mut state, &mut runtime);
+        assert_eq!(state.approval.as_ref(), Some(&approval));
+
+        let decision = || {
+            if grant {
+                ClientCommand::ApprovalGrant {
+                    run_id: approval.run_id.clone(),
+                    tool_call_id: approval.tool_call_id.clone(),
+                }
+            } else {
+                ClientCommand::ApprovalDeny {
+                    run_id: approval.run_id.clone(),
+                    tool_call_id: approval.tool_call_id.clone(),
+                    reason: "denied by plato-tui".into(),
+                }
+            }
+        };
+        commands.send(decision()).unwrap();
+        let failed = events.recv_timeout(OUTER_WATCHDOG).unwrap();
+        apply_event(&commands, failed, &mut state, &mut runtime);
+        assert_eq!(state.approval.as_ref(), Some(&approval));
+
+        commands.send(decision()).unwrap();
+        let succeeded = events.recv_timeout(OUTER_WATCHDOG).unwrap();
+        assert_eq!(state.approval.as_ref(), Some(&approval));
+        apply_event(&commands, succeeded, &mut state, &mut runtime);
+        assert!(state.approval.is_none());
+
+        drop(commands);
+        let requests = harness.finish();
+        let stream_requests = requests
+            .iter()
+            .filter(|request| request.method.as_deref() == Some("events.stream"))
+            .collect::<Vec<_>>();
+        assert_eq!(stream_requests.len(), 2);
+        assert_eq!(
+            stream_requests[0].params.as_ref().unwrap()["from_offset"],
+            0
+        );
+        assert!(
+            stream_requests[1]
+                .params
+                .as_ref()
+                .unwrap()
+                .get("from_offset")
+                .is_none(),
+            "lag recovery must resume at the current tip"
+        );
+        let decisions = requests
+            .iter()
+            .filter(|request| request.method.as_deref() == Some("approval.decide"))
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 2);
+        for request in decisions {
+            let params = request.params.as_ref().unwrap();
+            assert_eq!(params["run_id"], "run_selected");
+            assert_eq!(params["tool_call_id"], "call_selected");
+            assert_eq!(params["decision"], if grant { "grant" } else { "deny" });
+            if grant {
+                assert_eq!(params["reason"], serde_json::Value::Null);
+            } else {
+                assert_eq!(params["reason"], "denied by plato-tui");
+            }
+        }
+    }
 
     #[test]
     fn issue_prep_waits_past_short_deadline_for_delayed_success() {
@@ -737,6 +1213,135 @@ mod tests {
             Vec::new(),
             TranscriptState::None,
         )
+    }
+
+    enum ScriptedReply {
+        Result {
+            method: &'static str,
+            result: serde_json::Value,
+        },
+        Error {
+            method: &'static str,
+            code: &'static str,
+            message: &'static str,
+        },
+    }
+
+    impl ScriptedReply {
+        fn result(method: &'static str, result: serde_json::Value) -> Self {
+            Self::Result { method, result }
+        }
+
+        fn error(method: &'static str, code: &'static str, message: &'static str) -> Self {
+            Self::Error {
+                method,
+                code,
+                message,
+            }
+        }
+
+        fn method(&self) -> &'static str {
+            match self {
+                Self::Result { method, .. } | Self::Error { method, .. } => method,
+            }
+        }
+
+        fn response(self, request: &Envelope) -> Envelope {
+            match self {
+                Self::Result { method, result } => {
+                    Envelope::response(request.id.clone(), Some(method.into()), result)
+                }
+                Self::Error {
+                    method,
+                    code,
+                    message,
+                } => Envelope::error(request.id.clone(), Some(method.into()), code, message),
+            }
+        }
+    }
+
+    fn hello_reply(workspace_id: &str) -> ScriptedReply {
+        ScriptedReply::result(
+            "hello",
+            json!({
+                "daemon_version": env!("CARGO_PKG_VERSION"),
+                "workspace_id": workspace_id,
+                "ledger_path": "/work/agent.db",
+                "capabilities": [
+                    "hello",
+                    "sessions.list",
+                    "transcript.read",
+                    "transcript.read.pending_approval",
+                    "events.stream",
+                    "approval.decide"
+                ]
+            }),
+        )
+    }
+
+    struct ScriptedDaemon {
+        config: DaemonConnectionConfig,
+        requests: Arc<Mutex<Vec<Envelope>>>,
+        server: JoinHandle<()>,
+        _workspace: tempfile::TempDir,
+        _endpoint: TestEndpoint,
+    }
+
+    impl ScriptedDaemon {
+        fn start(name: &str, replies: impl FnOnce(&str) -> Vec<ScriptedReply>) -> Self {
+            let workspace = tempfile::tempdir().unwrap();
+            let endpoint = TestEndpoint::new(name);
+            let listener = transport::bind(&endpoint.path).unwrap();
+            let config =
+                DaemonConnectionConfig::resolve(workspace.path(), Some(endpoint.path.clone()))
+                    .unwrap();
+            let workspace_id = crate::paths::workspace_id(&config.workspace_root).unwrap();
+            let replies = VecDeque::from(replies(&workspace_id));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let server_requests = Arc::clone(&requests);
+            let server =
+                thread::spawn(move || serve_scripted_daemon(listener, replies, server_requests));
+            Self {
+                config,
+                requests,
+                server,
+                _workspace: workspace,
+                _endpoint: endpoint,
+            }
+        }
+
+        fn finish(self) -> Vec<Envelope> {
+            self.server.join().unwrap();
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn serve_scripted_daemon(
+        listener: transport::Listener,
+        mut replies: VecDeque<ScriptedReply>,
+        requests: Arc<Mutex<Vec<Envelope>>>,
+    ) {
+        while !replies.is_empty() {
+            let mut stream = transport::accept(&listener).unwrap();
+            transport::set_deadline(&mut stream, Instant::now() + OUTER_WATCHDOG).unwrap();
+            let mut reader = BufReader::new(transport::try_clone(&stream).unwrap());
+            loop {
+                let mut line = String::new();
+                let read = reader.read_line(&mut line).unwrap();
+                if read == 0 {
+                    break;
+                }
+                let request: Envelope = serde_json::from_str(line.trim()).unwrap();
+                let reply = replies.pop_front().expect("unexpected daemon request");
+                assert_eq!(request.method.as_deref(), Some(reply.method()));
+                let response = reply.response(&request);
+                write_envelope(&mut stream, &response).unwrap();
+                requests.lock().unwrap().push(request);
+                if replies.is_empty() {
+                    return;
+                }
+            }
+        }
     }
 
     #[derive(Clone, Copy)]

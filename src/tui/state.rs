@@ -1,4 +1,7 @@
-use crate::daemon::protocol::{HelloResult, RunStateName, SessionSummary, TranscriptReadResult};
+use crate::daemon::protocol::{
+    HelloResult, PendingApprovalSnapshot, RunStateName, SessionSummary, TranscriptReadResult,
+};
+use platonic_core::EffectClass;
 use ratatui::text::Line;
 use std::{fmt, sync::RwLock, time::Instant};
 
@@ -570,6 +573,30 @@ impl From<TranscriptReadResult> for TranscriptView {
     }
 }
 
+pub(super) fn approval_from_snapshot(snapshot: PendingApprovalSnapshot) -> ApprovalModalView {
+    let effect = match snapshot.effect {
+        EffectClass::ReadOnly => "read_only",
+        EffectClass::WorkspaceWrite => "workspace_write",
+        EffectClass::Network => "network",
+        EffectClass::ExternalSideEffect => "external_side_effect",
+        EffectClass::SecretAccess => "secret_access",
+    };
+    ApprovalModalView {
+        run_id: snapshot.run_id,
+        tool_call_id: snapshot.tool_call_id,
+        tool_name: snapshot.tool_name,
+        effect: effect.into(),
+        reason: snapshot
+            .reason
+            .unwrap_or_else(|| "approval required".into()),
+        input_preview: snapshot
+            .input_preview
+            .unwrap_or_else(|| "input preview unavailable".into()),
+        approval_preview: snapshot.approval_preview,
+        diff_preview: snapshot.diff_preview,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranscriptState {
     None,
@@ -704,6 +731,32 @@ mod tests {
         assert_eq!(
             session_ids(picker.matching_sessions(&sessions)),
             vec!["session_2"]
+        );
+    }
+
+    #[test]
+    fn pending_approval_snapshot_maps_exact_modal_fields() {
+        let modal = approval_from_snapshot(PendingApprovalSnapshot {
+            run_id: "run_selected".into(),
+            tool_call_id: "call_selected".into(),
+            tool_name: "file.edit".into(),
+            effect: EffectClass::WorkspaceWrite,
+            reason: Some("review the selected edit".into()),
+            input_preview: Some(r#"{"path":"selected.txt"}"#.into()),
+            approval_preview: Some("edit selected.txt".into()),
+            diff_preview: Some("-old selected\n+new selected\n".into()),
+        });
+
+        assert_eq!(modal.run_id, "run_selected");
+        assert_eq!(modal.tool_call_id, "call_selected");
+        assert_eq!(modal.tool_name, "file.edit");
+        assert_eq!(modal.effect, "workspace_write");
+        assert_eq!(modal.reason, "review the selected edit");
+        assert_eq!(modal.input_preview, r#"{"path":"selected.txt"}"#);
+        assert_eq!(modal.approval_preview.as_deref(), Some("edit selected.txt"));
+        assert_eq!(
+            modal.diff_preview.as_deref(),
+            Some("-old selected\n+new selected\n")
         );
     }
 
