@@ -56,7 +56,7 @@ test "$(stat -c '%a' "$TOKEN_FILE")" = 600
 Never print or inspect the token to verify it. A successful final `test`
 command verifies the file mode without revealing the contents.
 
-## 3. Add the numeric owner allowlist
+## 3. Add the numeric owner and channel allowlists
 
 In Discord, enable **User Settings > Advanced > Developer Mode**, then
 right-click your own user and select **Copy User ID**. Use the numeric ID of the
@@ -82,7 +82,10 @@ Replace the first example with your user ID; it must remain an unquoted,
 positive TOML integer. Replace the quoted numeric channel ID with the copied
 test channel ID, and replace the mapped path with the mode-`0600` authorized
 provider config for that channel. The token itself does not belong in either
-config.
+config. `channel_configs` must have at least one entry and is the gateway's
+complete channel allowlist. A DM must be added by its numeric DM channel ID too;
+an owner message or interaction in any unmapped channel is ignored before
+content scanning or remote and daemon side effects.
 
 ```bash
 GATEWAY_CONFIG="$HOME/.config/plato/gateway.toml"
@@ -91,7 +94,9 @@ chmod 600 "$GATEWAY_CONFIG"
 "${EDITOR:-vi}" "$GATEWAY_CONFIG"
 ```
 
-Passing this file with `--config` makes it an authorized config. The
+Passing this file with `--config` makes it an authorized config. The entire
+`[gateway]` table, including the token variable name and owner IDs, is rejected
+from an auto-discovered workspace `plato.toml`. The
 [configuration reference](../README.md#configuration) owns resolution order
 and provider settings. The
 [Discord gateway reference](../README.md#discord-gateway) owns channel-mapping
@@ -134,7 +139,9 @@ plato gateway discord --config "$HOME/.config/plato/gateway.toml"
 
 Also unset any custom provider credential variable named by your config. The
 gateway fails closed if it can see a provider credential. Leave the gateway
-running.
+running. Before the first Discord REST request or WebSocket connection, both
+the wrapper and direct gateway require a bounded daemon `hello` with the exact
+workspace ID and all six daemon capabilities consumed by the connector.
 
 ## 5. Receive the first reply
 
@@ -147,9 +154,9 @@ Reply with one short greeting.
 
 Wait for the bot's final reply before continuing. Messages from every other
 user ID are silently ignored. During one gateway process, the first allowed
-message in a channel or DM starts one daemon session; later messages in that
-same channel or DM continue that session. A different channel or DM starts a
-separate session.
+message in a mapped channel or DM starts one daemon session; later messages in
+that same channel or DM continue that session. A different mapped channel or DM
+starts a separate session.
 
 ## Local-only approvals
 
@@ -196,6 +203,13 @@ new run to replay. Copy the sending human account's **User ID** again with
 Developer Mode enabled, replace the numeric `owner_user_ids` entry, and restart
 the gateway so it reloads the config. Do not substitute a display name or an
 application, bot, server, or channel ID.
+
+### Bot ignores the owner: channel is not mapped
+
+Messages and interactions are accepted only when their numeric channel ID is a
+key in `gateway.discord.channel_configs`. Add the text, thread, or DM channel ID
+and its provider config path to the authorized gateway config, then restart the
+gateway.
 
 ### Gateway closes with code 4014: Message Content intent is disabled
 

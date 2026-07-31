@@ -107,6 +107,19 @@ fn gateway_command_hellos_then_execs_sibling_with_environment_and_exit_status() 
     let args_path = workspace.path().join("gateway-args");
     let environment_path = workspace.path().join("gateway-environment");
     let daemon_launch_path = workspace.path().join("daemon-launch");
+    fs::write(workspace.path().join("mapped.toml"), "").unwrap();
+    fs::write(
+        workspace.path().join(config_path),
+        r#"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [42]
+
+[gateway.discord.channel_configs]
+"200" = "mapped.toml"
+"#,
+    )
+    .unwrap();
     let hello = spawn_endpoint(&socket_path, {
         let workspace_id = paths::workspace_id(workspace.path()).unwrap();
         move |request, stream| {
@@ -203,6 +216,57 @@ exit 99
 }
 
 #[test]
+fn gateway_wrapper_rejects_workspace_gateway_before_daemon_or_service_access() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (plato, fixture_setup) = install_plato(workspace.path(), "gateway-workspace-config");
+    let socket_path = workspace.path().join("agent.sock");
+    let daemon = UnixListener::bind(&socket_path).unwrap();
+    daemon.set_nonblocking(true).unwrap();
+    let gateway_launch_path = plato.with_file_name("gateway-launch");
+    let daemon_launch_path = plato.with_file_name("daemon-launch");
+    write_launch_marker(
+        &plato.with_file_name("plato-gateway-discord"),
+        "PLATO_TEST_GATEWAY_LAUNCH",
+    );
+    write_launch_marker(
+        &plato.with_file_name("plato-agentd"),
+        "PLATO_TEST_DAEMON_LAUNCH",
+    );
+    fs::write(
+        workspace.path().join("plato.toml"),
+        r#"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [42]
+
+[gateway.discord.channel_configs]
+"200" = "mapped.toml"
+"#,
+    )
+    .unwrap();
+
+    let mut command = gateway_command(&plato, workspace.path(), &socket_path);
+    command
+        .env("PLATO_TEST_GATEWAY_LAUNCH", &gateway_launch_path)
+        .env("PLATO_TEST_DAEMON_LAUNCH", &daemon_launch_path);
+    let output = fixture_output(command, &plato, fixture_setup);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("workspace plato.toml cannot set [gateway]")
+    );
+    assert!(matches!(
+        daemon.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert!(!gateway_launch_path.exists());
+    assert!(!daemon_launch_path.exists());
+}
+
+#[test]
 fn gateway_probe_failures_never_launch_a_service_binary() {
     let workspace = tempfile::tempdir().unwrap();
 
@@ -284,34 +348,51 @@ fn gateway_probe_failures_never_launch_a_service_binary() {
         Some(server),
     );
 
-    let missing_capability = workspace.path().join("missing-capability.sock");
-    let server = spawn_endpoint(&missing_capability, {
-        let workspace_id = paths::workspace_id(workspace.path()).unwrap();
-        move |request, stream| {
-            write_response(
-                stream,
-                json!({
-                    "v": PROTOCOL_VERSION,
-                    "id": request["id"],
-                    "kind": "response",
-                    "method": "hello",
-                    "result": {
-                        "daemon_version": "test",
-                        "workspace_id": workspace_id,
-                        "ledger_path": "/tmp/agent.db",
-                        "capabilities": []
-                    }
-                }),
-            );
-            request
-        }
-    });
-    assert_probe_failure(
-        workspace.path(),
-        &missing_capability,
-        "missing-capability",
-        Some(server),
-    );
+    let required_capabilities = [
+        "hello",
+        "run.start",
+        "message.append",
+        "events.stream",
+        "sessions.list",
+        "transcript.read",
+    ];
+    for missing in required_capabilities {
+        let socket = workspace
+            .path()
+            .join(format!("missing-{}.sock", missing.replace('.', "-")));
+        let capabilities = required_capabilities
+            .iter()
+            .filter(|capability| **capability != missing)
+            .copied()
+            .collect::<Vec<_>>();
+        let server = spawn_endpoint(&socket, {
+            let workspace_id = paths::workspace_id(workspace.path()).unwrap();
+            move |request, stream| {
+                write_response(
+                    stream,
+                    json!({
+                        "v": PROTOCOL_VERSION,
+                        "id": request["id"],
+                        "kind": "response",
+                        "method": "hello",
+                        "result": {
+                            "daemon_version": "test",
+                            "workspace_id": workspace_id,
+                            "ledger_path": "/tmp/agent.db",
+                            "capabilities": capabilities
+                        }
+                    }),
+                );
+                request
+            }
+        });
+        let fixture_name = format!("missing-{}", missing.replace('.', "-"));
+        let stderr = assert_probe_failure(workspace.path(), &socket, &fixture_name, Some(server));
+        assert!(
+            stderr.contains(&format!("required capability {missing}")),
+            "{fixture_name} fixture did not name the missing capability: {stderr}"
+        );
+    }
 
     let stalled = workspace.path().join("stalled.sock");
     let server = spawn_endpoint(&stalled, |request, _stream| {
@@ -326,7 +407,7 @@ fn assert_probe_failure(
     socket_path: &Path,
     fixture_name: &str,
     server: Option<thread::JoinHandle<Value>>,
-) {
+) -> String {
     let (plato, fixture_setup) = install_plato(workspace, fixture_name);
     let gateway_launch_path = plato.with_file_name("gateway-launch");
     let daemon_launch_path = plato.with_file_name("daemon-launch");
@@ -377,6 +458,7 @@ fn assert_probe_failure(
         "{fixture_name} fixture launched daemon marker {}",
         daemon_launch_path.display()
     );
+    stderr
 }
 
 fn gateway_command(plato: &Path, workspace: &Path, socket_path: &Path) -> Command {
@@ -384,7 +466,9 @@ fn gateway_command(plato: &Path, workspace: &Path, socket_path: &Path) -> Comman
     command
         .args(["gateway", "discord", "--socket"])
         .arg(socket_path)
-        .current_dir(workspace);
+        .current_dir(workspace)
+        .env_remove("PLATO_CONFIG")
+        .env("HOME", workspace);
     command
 }
 

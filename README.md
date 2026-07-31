@@ -40,9 +40,10 @@ Config resolution order:
 4. `~/.config/plato/config.toml` on Unix or `%APPDATA%\plato\config.toml` on Windows
 5. built-in defaults
 
-Auto-discovered `./plato.toml` cannot set `provider.api_key_env` or
-`provider.base_url`. Use `--config`, `$PLATO_CONFIG`, or the user config for
-provider credentials and custom endpoints.
+Auto-discovered `./plato.toml` cannot set `provider.api_key_env`,
+`provider.base_url`, or any `[gateway]` table. Use `--config`, `$PLATO_CONFIG`,
+or the user config for provider credentials, custom endpoints, and gateway
+trust settings.
 
 Leading `~` expands in explicit config paths. Relative explicit paths resolve
 against the workspace root. Built-in defaults use OpenRouter:
@@ -437,8 +438,12 @@ owner_user_ids = [123456789]
 "111111111111111111" = "~/.config/plato/channels/news.toml"
 ```
 
-Channel mappings are accepted from `--config`, `PLATO_CONFIG`, or the user
-config, not auto-discovered workspace `plato.toml`. Each mapped file is an
+The entire `[gateway]` table is accepted only from `--config`, `PLATO_CONFIG`,
+or the user config, not auto-discovered workspace `plato.toml`.
+`channel_configs` must contain at least one positive numeric channel ID and is
+the allowlist for messages and interactions, including DMs by their channel ID.
+Unmapped channels are ignored before input scanning, daemon access, Discord
+response work, or channel session and override changes. Each mapped file is an
 ordinary Plato config and may omit `[gateway]`. Mapped paths are resolved and
 validated when the gateway starts, so mapping changes require a restart. The
 daemon loads the selected file for each fresh or continued run, so file-content
@@ -453,11 +458,15 @@ export DISCORD_BOT_TOKEN="$(cat /path/to/discord-bot-token)"
 plato gateway discord --config ~/.config/plato/gateway.toml
 ```
 
-The service entry completes a compatible workspace `hello` before handing off
-to the same-revision sibling `plato-gateway-discord`. A failed probe starts no
-gateway and points to `plato daemon`; it never starts a daemon with the gateway
-environment. The direct `plato-gateway-discord --workspace "$PWD"` technical
-command remains supported.
+Both `plato gateway discord` and the direct gateway complete a bounded daemon
+`hello`, require the exact workspace ID plus `hello`, `run.start`,
+`message.append`, `events.stream`, `sessions.list`, and `transcript.read`, then
+begin Discord REST and WebSocket work. The service entry enforces that same
+preflight before handing off to the same-revision sibling
+`plato-gateway-discord`. A failed probe starts no gateway and points to
+`plato daemon`; it never starts a daemon with the gateway environment. The
+direct `plato-gateway-discord --workspace "$PWD"` technical command remains
+supported.
 
 At startup, the gateway replaces the Discord application's global command
 registry with the commands this binary supports. The current registry contains

@@ -2,11 +2,13 @@ use clap::{Parser, Subcommand};
 use plato_agent::{
     AppError, ApprovalMode, IssuePrepOptions, IssuePrepOutcome, RunLedger, RunOptions, RunOutcome,
     RunOverrides, RunSession,
+    config::Config,
     daemon::{
         client::{DaemonClient, DaemonConnectionConfig},
         lock::WorkspaceLock,
         protocol::{HelloResult, PendingApprovalSnapshot, RunStateName, StreamEvent},
     },
+    discord_gateway::preflight_discord_gateway_daemon,
     ledger::{latest_default_sqlite_session_id, latest_sqlite_session_id},
     new_session_id,
     paths::{self, default_sqlite},
@@ -212,8 +214,9 @@ fn run_discord_gateway_service(
     socket: Option<PathBuf>,
     config: Option<PathBuf>,
 ) -> plato_agent::AppResult<()> {
+    Config::load(&workspace_root, config.as_deref())?;
     let daemon = DaemonConnectionConfig::resolve(&workspace_root, socket.clone())?;
-    probe_gateway_daemon(&daemon, DAEMON_CLIENT_TIMEOUT).map_err(|error| {
+    preflight_discord_gateway_daemon(&daemon, DAEMON_CLIENT_TIMEOUT).map_err(|error| {
         let hint = match socket.as_deref() {
             Some(socket) => format!(
                 "plato daemon --socket {}",
@@ -416,30 +419,6 @@ fn connect_workspace_daemon_with_timeout(
     let mut client = DaemonClient::connect_with_timeout(&config.socket_path, timeout)?;
     let hello = client.hello(&config.workspace_root)?;
     Ok((client, hello))
-}
-
-fn probe_gateway_daemon(
-    config: &DaemonConnectionConfig,
-    timeout: Duration,
-) -> plato_agent::AppResult<()> {
-    let (_client, hello) = connect_workspace_daemon_with_timeout(config, timeout)?;
-    let expected_workspace_id = paths::workspace_id(&config.workspace_root)?;
-    if hello.workspace_id != expected_workspace_id {
-        return Err(AppError::DaemonProtocol(format!(
-            "hello workspace_id mismatch: expected {expected_workspace_id}, got {}",
-            hello.workspace_id
-        )));
-    }
-    if !hello
-        .capabilities
-        .iter()
-        .any(|capability| capability == "hello")
-    {
-        return Err(AppError::DaemonProtocol(
-            "daemon does not advertise required capability hello".into(),
-        ));
-    }
-    Ok(())
 }
 
 fn spawn_detached_daemon(workspace_root: &Path) -> plato_agent::AppResult<Child> {
