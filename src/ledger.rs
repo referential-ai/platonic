@@ -1,5 +1,5 @@
 use crate::{AppError, AppResult, daemon::protocol::RunStateName, paths::DefaultSqlitePath};
-use platonic_core::{HarnessEvent, RecordedEvent, RunId, RunState};
+use platonic_core::{HarnessEvent, MessageRole, RecordedEvent, RunId, RunPhase, RunState};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -20,6 +20,8 @@ const LEGACY_LEDGER_VERSION: u32 = 1;
 pub const LEDGER_VERSION: u32 = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_SCHEMA_VERSION: u32 = 2;
+pub(crate) const RUN_CANCELED_REASON: &str = "run canceled";
+const ORPHANED_RUN_ERROR: &str = "daemon restarted before run completed";
 #[cfg(unix)]
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 #[cfg(unix)]
@@ -54,10 +56,42 @@ impl EventRecorder {
         )?))
     }
 
+    pub(crate) fn from_session_sqlite(ledger: SqliteLedger, run_id: &RunId) -> Self {
+        Self::Sqlite(SqliteEventRecorder::from_session(ledger, run_id))
+    }
+
     pub fn record(&mut self, event: HarnessEvent) -> AppResult<RecordedEvent> {
         match self {
             Self::Jsonl(recorder) => recorder.record(event),
             Self::Sqlite(recorder) => recorder.record(event),
+        }
+    }
+
+    pub(crate) fn finish_run(
+        &mut self,
+        run_id: &RunId,
+        final_answer: &str,
+    ) -> AppResult<RecordedEvent> {
+        match self {
+            Self::Jsonl(recorder) => recorder.record(HarnessEvent::RunFinished {
+                run_id: run_id.clone(),
+            }),
+            Self::Sqlite(recorder) => recorder.finish_run(final_answer),
+        }
+    }
+
+    pub(crate) fn fail_run(
+        &mut self,
+        run_id: &RunId,
+        error: &str,
+        canceled: bool,
+    ) -> AppResult<RecordedEvent> {
+        match self {
+            Self::Jsonl(recorder) => recorder.record(HarnessEvent::RunFailed {
+                run_id: run_id.clone(),
+                reason: error.into(),
+            }),
+            Self::Sqlite(recorder) => recorder.fail_run(error, canceled),
         }
     }
 }
@@ -105,36 +139,123 @@ impl JsonlEventRecorder {
 
 pub struct SqliteEventRecorder {
     ledger: SqliteLedger,
-    run_id: String,
+    run_id: RunId,
     state: RunState,
+    session_run_open: bool,
+    terminal_attempted: bool,
 }
 
 impl SqliteEventRecorder {
     pub fn create(path: &Path, run_id: &RunId) -> AppResult<Self> {
         Ok(Self {
             ledger: SqliteLedger::open_or_create(path)?,
-            run_id: run_id.to_string(),
+            run_id: run_id.clone(),
             state: RunState::new(),
+            session_run_open: false,
+            terminal_attempted: false,
         })
     }
 
     pub fn create_default(path: &DefaultSqlitePath, run_id: &RunId) -> AppResult<Self> {
         Ok(Self {
             ledger: SqliteLedger::open_or_create_default(path)?,
-            run_id: run_id.to_string(),
+            run_id: run_id.clone(),
             state: RunState::new(),
+            session_run_open: false,
+            terminal_attempted: false,
         })
     }
 
+    fn from_session(ledger: SqliteLedger, run_id: &RunId) -> Self {
+        Self {
+            ledger,
+            run_id: run_id.clone(),
+            state: RunState::new(),
+            session_run_open: true,
+            terminal_attempted: false,
+        }
+    }
+
     pub fn record(&mut self, event: HarnessEvent) -> AppResult<RecordedEvent> {
-        let record = next_record(&mut self.state, event)?;
-        self.ledger.append(&self.run_id, &record)?;
+        if self.session_run_open
+            && matches!(
+                event,
+                HarnessEvent::RunFinished { .. } | HarnessEvent::RunFailed { .. }
+            )
+        {
+            return Err(AppError::Config(
+                "SQLite session terminal events require an atomic session outcome".into(),
+            ));
+        }
+        let mut next_state = self.state.clone();
+        let record = next_record(&mut next_state, event)?;
+        self.ledger.append(self.run_id.as_str(), &record)?;
+        self.state = next_state;
         Ok(record)
+    }
+
+    fn finish_run(&mut self, final_answer: &str) -> AppResult<RecordedEvent> {
+        self.record_terminal(
+            HarnessEvent::RunFinished {
+                run_id: self.run_id.clone(),
+            },
+            RunStateName::Finished,
+            Some(final_answer),
+            None,
+        )
+    }
+
+    fn fail_run(&mut self, error: &str, canceled: bool) -> AppResult<RecordedEvent> {
+        let status = if canceled {
+            RunStateName::Canceled
+        } else {
+            RunStateName::Failed
+        };
+        self.record_terminal(
+            HarnessEvent::RunFailed {
+                run_id: self.run_id.clone(),
+                reason: error.into(),
+            },
+            status,
+            None,
+            Some(error),
+        )
+    }
+
+    fn record_terminal(
+        &mut self,
+        event: HarnessEvent,
+        status: RunStateName,
+        final_answer: Option<&str>,
+        error: Option<&str>,
+    ) -> AppResult<RecordedEvent> {
+        if !self.session_run_open {
+            return self.record(event);
+        }
+
+        self.terminal_attempted = true;
+        let mut next_state = self.state.clone();
+        let record = next_record(&mut next_state, event)?;
+        self.ledger
+            .commit_session_terminal(&self.run_id, &record, status, final_answer, error)?;
+        self.state = next_state;
+        self.session_run_open = false;
+        Ok(record)
+    }
+}
+
+impl Drop for SqliteEventRecorder {
+    fn drop(&mut self) {
+        if self.session_run_open && !self.terminal_attempted {
+            let _ = self.fail_run("run ended before session status was closed", false);
+        }
     }
 }
 
 pub struct SqliteLedger {
     connection: Connection,
+    #[cfg(test)]
+    terminal_fault: Option<TerminalFaultBoundary>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,7 +299,11 @@ impl SqliteLedger {
         let mut connection = Connection::open(path)?;
         configure_sqlite_connection(&connection)?;
         migrate_sqlite(&mut connection)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            #[cfg(test)]
+            terminal_fault: None,
+        })
     }
 
     pub fn open_or_create_default(path: &DefaultSqlitePath) -> AppResult<Self> {
@@ -196,7 +321,11 @@ impl SqliteLedger {
         let connection =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         configure_sqlite_connection(&connection)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            #[cfg(test)]
+            terminal_fault: None,
+        })
     }
 
     pub fn open_default_readonly(path: &DefaultSqlitePath) -> AppResult<Self> {
@@ -211,40 +340,7 @@ impl SqliteLedger {
     }
 
     pub fn append(&mut self, run_id: &str, record: &RecordedEvent) -> AppResult<()> {
-        let event_json = serde_json::to_string(&record.event)?;
-        let seq = sqlite_i64(record.seq, "seq")?;
-        let occurred_at_ms = sqlite_i64(record.occurred_at_ms, "occurred_at_ms")?;
-        let inserted = self.connection.execute(
-            "INSERT OR IGNORE INTO ledger_events (run_id, seq, occurred_at_ms, v, event_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![run_id, seq, occurred_at_ms, LEDGER_VERSION, event_json],
-        )?;
-        if inserted == 1 {
-            return Ok(());
-        }
-
-        let existing = self.connection.query_row(
-            "SELECT occurred_at_ms, v, event_json FROM ledger_events WHERE run_id = ?1 AND seq = ?2",
-            params![run_id, seq],
-            |row| {
-                Ok(ExistingEvent {
-                    occurred_at_ms: row_u64(row, 0, "occurred_at_ms")?,
-                    version: row.get(1)?,
-                    event_json: row.get(2)?,
-                })
-            },
-        )?;
-        if existing.occurred_at_ms == record.occurred_at_ms
-            && existing.version == LEDGER_VERSION
-            && existing.event_json == event_json
-        {
-            Ok(())
-        } else {
-            Err(AppError::LedgerConflict {
-                run_id: run_id.into(),
-                seq: record.seq,
-            })
-        }
+        append_record_in(&self.connection, run_id, record)
     }
 
     pub fn read_run(&self, run_id: &str) -> AppResult<Vec<RecordedEvent>> {
@@ -361,7 +457,34 @@ impl SqliteLedger {
     }
 
     pub fn finish_session_run(&mut self, run_id: &RunId, final_answer: &str) -> AppResult<()> {
-        self.update_session_run(run_id, RunStateName::Finished, Some(final_answer), None)
+        let (records, mut state) = self.replay_run_state(run_id)?;
+        let record = match state.phase() {
+            RunPhase::Finished => {
+                let durable_answer = final_answer_from_records(run_id, &records)?;
+                if durable_answer != final_answer {
+                    return Err(AppError::Config(format!(
+                        "finished session run {run_id} answer does not match its ledger"
+                    )));
+                }
+                records
+                    .last()
+                    .expect("replayed run contains a terminal event")
+                    .clone()
+            }
+            _ => next_record(
+                &mut state,
+                HarnessEvent::RunFinished {
+                    run_id: run_id.clone(),
+                },
+            )?,
+        };
+        self.commit_session_terminal(
+            run_id,
+            &record,
+            RunStateName::Finished,
+            Some(final_answer),
+            None,
+        )
     }
 
     pub fn fail_session_run(
@@ -375,42 +498,93 @@ impl SqliteLedger {
         } else {
             RunStateName::Failed
         };
-        self.update_session_run(run_id, status, None, Some(error))
+        let (records, mut state) = self.replay_run_state(run_id)?;
+        let record = match state.phase() {
+            RunPhase::Failed { reason } => {
+                if reason != error {
+                    return Err(AppError::Config(format!(
+                        "failed session run {run_id} error does not match its ledger"
+                    )));
+                }
+                records
+                    .last()
+                    .expect("replayed run contains a terminal event")
+                    .clone()
+            }
+            _ => next_record(
+                &mut state,
+                HarnessEvent::RunFailed {
+                    run_id: run_id.clone(),
+                    reason: error.into(),
+                },
+            )?,
+        };
+        self.commit_session_terminal(run_id, &record, status, None, Some(error))
     }
 
     pub fn interrupt_running_session_runs(&mut self, error: &str) -> AppResult<usize> {
+        self.recover_running_session_runs(error)
+    }
+
+    fn recover_running_session_runs(&mut self, error: &str) -> AppResult<usize> {
         let now = sqlite_i64(now_ms(), "occurred_at_ms")?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let session_ids = {
+        let running_runs = {
             let mut statement = transaction.prepare(
-                "SELECT DISTINCT session_id
+                "SELECT session_id, run_id
                  FROM session_runs
-                 WHERE status = ?1",
+                 WHERE status = ?1
+                 ORDER BY session_id, session_index",
             )?;
             statement
                 .query_map(params![RunStateName::Running.as_str()], |row| {
-                    row.get::<_, String>(0)
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let updated = transaction.execute(
-            "UPDATE session_runs
-             SET status = ?2, error = ?3, updated_at_ms = ?4
-             WHERE status = ?1",
-            params![
-                RunStateName::Running.as_str(),
-                RunStateName::Interrupted.as_str(),
-                error,
-                now
-            ],
-        )?;
-        for session_id in session_ids {
-            touch_session(&transaction, &session_id, now)?;
+        for (session_id, run_id) in &running_runs {
+            let records = read_run_records_from(&transaction, run_id)?;
+            if records.is_empty() {
+                return Err(AppError::Config(format!(
+                    "running session run {run_id} has no ledger events"
+                )));
+            }
+            let mut state = replay_records(&records)?;
+            let (status, final_answer, stored_error) = match state.phase() {
+                RunPhase::Finished => (
+                    RunStateName::Finished,
+                    Some(final_answer_from_records_str(run_id, &records)?),
+                    None,
+                ),
+                RunPhase::Failed { reason } => {
+                    (failure_status(reason), None, Some(reason.as_str()))
+                }
+                _ => {
+                    let record = next_record(
+                        &mut state,
+                        HarnessEvent::RunFailed {
+                            run_id: RunId::new(run_id.clone())?,
+                            reason: error.into(),
+                        },
+                    )?;
+                    append_record_in(&transaction, run_id, &record)?;
+                    (RunStateName::Interrupted, None, Some(error))
+                }
+            };
+            update_running_session_outcome(
+                &transaction,
+                run_id,
+                status,
+                final_answer,
+                stored_error,
+                now,
+            )?;
+            touch_session(&transaction, session_id, now)?;
         }
         transaction.commit()?;
-        Ok(updated)
+        Ok(running_runs.len())
     }
 
     pub fn read_session(&self, session_id: &str) -> AppResult<SessionRecords> {
@@ -506,38 +680,81 @@ impl SqliteLedger {
         session_exists_in(&self.connection, session_id)
     }
 
-    fn update_session_run(
+    fn replay_run_state(&self, run_id: &RunId) -> AppResult<(Vec<RecordedEvent>, RunState)> {
+        let records = self.read_run(run_id.as_str())?;
+        let state = replay_records(&records)?;
+        Ok((records, state))
+    }
+
+    fn commit_session_terminal(
         &mut self,
         run_id: &RunId,
+        record: &RecordedEvent,
         status: RunStateName,
         final_answer: Option<&str>,
         error: Option<&str>,
     ) -> AppResult<()> {
         let now = sqlite_i64(now_ms(), "occurred_at_ms")?;
-        let transaction = self.connection.transaction()?;
-        let updated = transaction.execute(
-            "UPDATE session_runs
-             SET status = ?2, final_answer = ?3, error = ?4, updated_at_ms = ?5
-             WHERE run_id = ?1",
-            params![
-                run_id.to_string(),
-                status.as_str(),
-                final_answer,
-                error,
-                now
-            ],
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session_id: String = transaction
+            .query_row(
+                "SELECT session_id
+             FROM session_runs
+             WHERE run_id = ?1 AND status = ?2",
+                params![run_id.as_str(), RunStateName::Running.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| AppError::RunNotFound(run_id.to_string()))?;
+        #[cfg(test)]
+        inject_terminal_fault(
+            &mut self.terminal_fault,
+            TerminalFaultBoundary::BeforeEventInsert,
         )?;
-        if updated == 0 {
-            return Err(AppError::RunNotFound(run_id.to_string()));
-        }
-        let session_id: String = transaction.query_row(
-            "SELECT session_id FROM session_runs WHERE run_id = ?1",
-            params![run_id.to_string()],
-            |row| row.get(0),
+        append_record_in(&transaction, run_id.as_str(), record)?;
+        #[cfg(test)]
+        inject_terminal_fault(
+            &mut self.terminal_fault,
+            TerminalFaultBoundary::AfterEventInsert,
+        )?;
+        #[cfg(test)]
+        inject_terminal_fault(
+            &mut self.terminal_fault,
+            TerminalFaultBoundary::BeforeOutcomeUpdate,
+        )?;
+        update_running_session_outcome(
+            &transaction,
+            run_id.as_str(),
+            status,
+            final_answer,
+            error,
+            now,
+        )?;
+        #[cfg(test)]
+        inject_terminal_fault(
+            &mut self.terminal_fault,
+            TerminalFaultBoundary::AfterOutcomeUpdate,
+        )?;
+        #[cfg(test)]
+        inject_terminal_fault(
+            &mut self.terminal_fault,
+            TerminalFaultBoundary::BeforeSessionTouch,
         )?;
         touch_session(&transaction, &session_id, now)?;
+        #[cfg(test)]
+        inject_terminal_fault(
+            &mut self.terminal_fault,
+            TerminalFaultBoundary::AfterSessionTouch,
+        )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn inject_terminal_fault_at(&mut self, boundary: TerminalFaultBoundary) {
+        self.terminal_fault = Some(boundary);
     }
 
     #[cfg(test)]
@@ -549,7 +766,59 @@ impl SqliteLedger {
     }
 }
 
+fn append_record_in(
+    connection: &Connection,
+    run_id: &str,
+    record: &RecordedEvent,
+) -> AppResult<()> {
+    let event_json = serde_json::to_string(&record.event)?;
+    let seq = sqlite_i64(record.seq, "seq")?;
+    let occurred_at_ms = sqlite_i64(record.occurred_at_ms, "occurred_at_ms")?;
+    let inserted = connection.execute(
+        "INSERT OR IGNORE INTO ledger_events (run_id, seq, occurred_at_ms, v, event_json)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![run_id, seq, occurred_at_ms, LEDGER_VERSION, event_json],
+    )?;
+    if inserted == 1 {
+        return Ok(());
+    }
+
+    let existing = connection.query_row(
+        "SELECT occurred_at_ms, v, event_json
+         FROM ledger_events
+         WHERE run_id = ?1 AND seq = ?2",
+        params![run_id, seq],
+        |row| {
+            Ok(ExistingEvent {
+                occurred_at_ms: row_u64(row, 0, "occurred_at_ms")?,
+                version: row.get(1)?,
+                event_json: row.get(2)?,
+            })
+        },
+    )?;
+    if existing.occurred_at_ms == record.occurred_at_ms
+        && existing.version == LEDGER_VERSION
+        && existing.event_json == event_json
+    {
+        Ok(())
+    } else {
+        Err(AppError::LedgerConflict {
+            run_id: run_id.into(),
+            seq: record.seq,
+        })
+    }
+}
+
 fn read_run_from(connection: &Connection, run_id: &str) -> AppResult<Vec<RecordedEvent>> {
+    let records = read_run_records_from(connection, run_id)?;
+    if records.is_empty() {
+        Err(AppError::RunNotFound(run_id.into()))
+    } else {
+        Ok(records)
+    }
+}
+
+fn read_run_records_from(connection: &Connection, run_id: &str) -> AppResult<Vec<RecordedEvent>> {
     let mut statement = connection.prepare(
         "SELECT seq, occurred_at_ms, v, event_json
              FROM ledger_events
@@ -559,11 +828,104 @@ fn read_run_from(connection: &Connection, run_id: &str) -> AppResult<Vec<Recorde
     let records = statement
         .query_map(params![run_id], sqlite_record_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
-    if records.is_empty() {
-        Err(AppError::RunNotFound(run_id.into()))
-    } else {
-        Ok(records)
+    Ok(records)
+}
+
+fn replay_records(records: &[RecordedEvent]) -> AppResult<RunState> {
+    let mut state = RunState::new();
+    for record in records {
+        state.apply(record)?;
     }
+    Ok(state)
+}
+
+fn final_answer_from_records<'a>(
+    run_id: &RunId,
+    records: &'a [RecordedEvent],
+) -> AppResult<&'a str> {
+    final_answer_from_records_str(run_id.as_str(), records)
+}
+
+fn final_answer_from_records_str<'a>(
+    run_id: &str,
+    records: &'a [RecordedEvent],
+) -> AppResult<&'a str> {
+    records
+        .iter()
+        .rev()
+        .find_map(|record| match &record.event {
+            HarnessEvent::ModelResponded { output, .. }
+                if output.role == MessageRole::Assistant =>
+            {
+                Some(output.content.as_str())
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            AppError::Config(format!(
+                "finished session run {run_id} has no final assistant answer"
+            ))
+        })
+}
+
+fn failure_status(reason: &str) -> RunStateName {
+    if reason == RUN_CANCELED_REASON {
+        RunStateName::Canceled
+    } else {
+        RunStateName::Failed
+    }
+}
+
+fn update_running_session_outcome(
+    connection: &Connection,
+    run_id: &str,
+    status: RunStateName,
+    final_answer: Option<&str>,
+    error: Option<&str>,
+    now: i64,
+) -> AppResult<()> {
+    let updated = connection.execute(
+        "UPDATE session_runs
+         SET status = ?2, final_answer = ?3, error = ?4, updated_at_ms = ?5
+         WHERE run_id = ?1 AND status = ?6",
+        params![
+            run_id,
+            status.as_str(),
+            final_answer,
+            error,
+            now,
+            RunStateName::Running.as_str()
+        ],
+    )?;
+    if updated == 0 {
+        return Err(AppError::RunNotFound(run_id.into()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalFaultBoundary {
+    BeforeEventInsert,
+    AfterEventInsert,
+    BeforeOutcomeUpdate,
+    AfterOutcomeUpdate,
+    BeforeSessionTouch,
+    AfterSessionTouch,
+}
+
+#[cfg(test)]
+fn inject_terminal_fault(
+    configured: &mut Option<TerminalFaultBoundary>,
+    boundary: TerminalFaultBoundary,
+) -> AppResult<()> {
+    if *configured == Some(boundary) {
+        *configured = None;
+        return Err(AppError::Config(format!(
+            "injected terminal fault at {boundary:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn status_from_row(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<RunStateName> {
@@ -702,7 +1064,11 @@ fn open_private_default_sqlite(
         PRIVATE_FILE_MODE,
         current_uid(),
     )?;
-    Ok(SqliteLedger { connection })
+    Ok(SqliteLedger {
+        connection,
+        #[cfg(test)]
+        terminal_fault: None,
+    })
 }
 
 #[cfg(unix)]
@@ -1069,8 +1435,7 @@ pub fn interrupt_orphaned_sqlite_runs(path: &Path) -> AppResult<usize> {
     if !path.exists() {
         return Ok(0);
     }
-    SqliteLedger::open_or_create(path)?
-        .interrupt_running_session_runs("daemon restarted before run completed")
+    SqliteLedger::open_or_create(path)?.interrupt_running_session_runs(ORPHANED_RUN_ERROR)
 }
 
 pub fn interrupt_orphaned_default_sqlite_runs(path: &DefaultSqlitePath) -> AppResult<usize> {
@@ -1079,8 +1444,7 @@ pub fn interrupt_orphaned_default_sqlite_runs(path: &DefaultSqlitePath) -> AppRe
     {
         return Ok(0);
     }
-    SqliteLedger::open_or_create_default(path)?
-        .interrupt_running_session_runs("daemon restarted before run completed")
+    SqliteLedger::open_or_create_default(path)?.interrupt_running_session_runs(ORPHANED_RUN_ERROR)
 }
 
 fn now_ms() -> u64 {
@@ -1095,7 +1459,7 @@ mod tests {
     use super::*;
     use platonic_core::{
         AgentId, ContextPack, HarnessEvent, Message, MessageRole, ModelName, ModelUsage, RunId,
-        TurnId,
+        RunReadback, TurnId,
     };
     use serde_json::Value;
     use std::{
@@ -1503,6 +1867,7 @@ mod tests {
             .begin_session_run("session_1", &run_id, "hello", true)
             .unwrap();
         assert!(turns.is_empty());
+        append_response_prefix(&mut ledger, &run_id, "hi", 0);
         ledger.finish_session_run(&run_id, "hi").unwrap();
 
         assert_eq!(ledger.latest_session_id().unwrap(), "session_1");
@@ -1581,12 +1946,9 @@ mod tests {
             (&mut first_ledger, "run_1", 10, "answer one"),
             (&mut second_ledger, "run_2", 20, "answer two"),
         ] {
-            ledger
-                .append(run_id, &started_record(run_id, 0, occurred_at_ms))
-                .unwrap();
-            ledger
-                .finish_session_run(&RunId::new(run_id).unwrap(), answer)
-                .unwrap();
+            let run_id = RunId::new(run_id).unwrap();
+            append_response_prefix(ledger, &run_id, answer, occurred_at_ms);
+            ledger.finish_session_run(&run_id, answer).unwrap();
         }
         drop(first_ledger);
         drop(second_ledger);
@@ -1602,8 +1964,13 @@ mod tests {
             assert_eq!(session.runs[0].question, question);
             assert_eq!(session.runs[0].status, RunStateName::Finished);
             assert_eq!(session.runs[0].final_answer.as_deref(), Some(answer));
-            assert_eq!(session.runs[0].records.len(), 1);
-            assert_eq!(session.runs[0].records[0].event.run_id().as_str(), run_id);
+            assert_eq!(session.runs[0].records.len(), 5);
+            assert!(
+                session.runs[0]
+                    .records
+                    .iter()
+                    .all(|record| record.event.run_id().as_str() == run_id)
+            );
         }
     }
 
@@ -1618,9 +1985,7 @@ mod tests {
         ledger
             .begin_session_run("session_1", &first, "first question", true)
             .unwrap();
-        ledger
-            .append("run_1", &started_record("run_1", 0, 10))
-            .unwrap();
+        append_response_prefix(&mut ledger, &first, "first answer", 10);
         ledger.finish_session_run(&first, "first answer").unwrap();
         ledger
             .begin_session_run("session_1", &second, "second question", false)
@@ -1662,6 +2027,7 @@ mod tests {
         ledger
             .begin_session_run("session_1", &first_run, "first question", true)
             .unwrap();
+        append_response_prefix(&mut ledger, &first_run, "first answer", 0);
         ledger
             .finish_session_run(&first_run, "first answer")
             .unwrap();
@@ -1692,34 +2058,326 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_interrupts_running_session_runs() {
+    fn sqlite_terminal_outcomes_and_orphan_recovery_preserve_continuation_truth() {
+        const RECOVERY_ERROR: &str = "daemon restarted";
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.db");
         let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
-        let run_id = RunId::new("run_1").unwrap();
+        let finished = RunId::new("run_finished").unwrap();
+        let failed = RunId::new("run_failed").unwrap();
+        let canceled = RunId::new("run_canceled").unwrap();
+        let interrupted = RunId::new("run_interrupted").unwrap();
 
         ledger
-            .begin_session_run("session_1", &run_id, "first question", true)
+            .begin_session_run("session_1", &finished, "finished question", true)
+            .unwrap();
+        append_response_prefix(&mut ledger, &finished, "finished answer", 0);
+        ledger
+            .finish_session_run(&finished, "finished answer")
             .unwrap();
 
+        ledger
+            .begin_session_run("session_1", &failed, "failed question", false)
+            .unwrap();
+        ledger
+            .append(failed.as_str(), &started_record(failed.as_str(), 0, 10))
+            .unwrap();
+        ledger
+            .fail_session_run(&failed, "synthetic failure", false)
+            .unwrap();
+
+        ledger
+            .begin_session_run("session_1", &canceled, "canceled question", false)
+            .unwrap();
+        ledger
+            .append(canceled.as_str(), &started_record(canceled.as_str(), 0, 20))
+            .unwrap();
+        ledger
+            .fail_session_run(&canceled, RUN_CANCELED_REASON, true)
+            .unwrap();
+
+        ledger
+            .begin_session_run("session_1", &interrupted, "interrupted question", false)
+            .unwrap();
+        ledger
+            .append(
+                interrupted.as_str(),
+                &started_record(interrupted.as_str(), 0, 30),
+            )
+            .unwrap();
+        drop(ledger);
+
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
         assert_eq!(
-            ledger
-                .interrupt_running_session_runs("daemon restarted")
-                .unwrap(),
+            ledger.recover_running_session_runs(RECOVERY_ERROR).unwrap(),
             1
         );
         assert_eq!(
-            ledger.session_summaries().unwrap()[0].status,
-            RunStateName::Interrupted
+            session_outcome(&ledger, finished.as_str()),
+            (RunStateName::Finished, Some("finished answer".into()), None)
+        );
+        assert_eq!(
+            session_outcome(&ledger, failed.as_str()),
+            (RunStateName::Failed, None, Some("synthetic failure".into()))
+        );
+        assert_eq!(
+            session_outcome(&ledger, canceled.as_str()),
+            (
+                RunStateName::Canceled,
+                None,
+                Some(RUN_CANCELED_REASON.into())
+            )
+        );
+        assert_eq!(
+            session_outcome(&ledger, interrupted.as_str()),
+            (RunStateName::Interrupted, None, Some(RECOVERY_ERROR.into()))
+        );
+
+        for (run_id, expected_reason) in [
+            (&failed, "synthetic failure"),
+            (&canceled, RUN_CANCELED_REASON),
+            (&interrupted, RECOVERY_ERROR),
+        ] {
+            let records = ledger.read_run(run_id.as_str()).unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| matches!(record.event, HarnessEvent::RunFailed { .. }))
+                    .count(),
+                1
+            );
+            assert!(matches!(
+                RunReadback::from_events(&records).unwrap().final_phase,
+                RunPhase::Failed { reason } if reason == expected_reason
+            ));
+        }
+        assert!(matches!(
+            RunReadback::from_events(&ledger.read_run(finished.as_str()).unwrap())
+                .unwrap()
+                .final_phase,
+            RunPhase::Finished
+        ));
+        assert_eq!(
+            ledger.session_turns("session_1").unwrap(),
+            vec![SessionTurn {
+                question: "finished question".into(),
+                final_answer: "finished answer".into(),
+            }]
+        );
+
+        let interrupted_records = ledger.read_run(interrupted.as_str()).unwrap();
+        assert_eq!(
+            ledger.recover_running_session_runs(RECOVERY_ERROR).unwrap(),
+            0
+        );
+        assert_eq!(
+            ledger.read_run(interrupted.as_str()).unwrap(),
+            interrupted_records
+        );
+
+        let follow_up = RunId::new("run_follow_up").unwrap();
+        assert_eq!(
+            ledger
+                .begin_session_run("session_1", &follow_up, "follow up", false)
+                .unwrap(),
+            vec![SessionTurn {
+                question: "finished question".into(),
+                final_answer: "finished answer".into(),
+            }]
         );
         ledger
-            .begin_session_run(
-                "session_1",
-                &RunId::new("run_2").unwrap(),
-                "follow up",
-                false,
+            .append(
+                follow_up.as_str(),
+                &started_record(follow_up.as_str(), 0, 40),
             )
             .unwrap();
+        ledger
+            .fail_session_run(&follow_up, "follow up stopped", false)
+            .unwrap();
+    }
+
+    #[test]
+    fn sqlite_recovery_reconciles_existing_terminal_events_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let finished = RunId::new("run_existing_finished").unwrap();
+        let failed = RunId::new("run_existing_failed").unwrap();
+        let canceled = RunId::new("run_existing_canceled").unwrap();
+
+        ledger
+            .begin_session_run("session_finished", &finished, "question", true)
+            .unwrap();
+        append_response_prefix(&mut ledger, &finished, "durable answer", 0);
+        ledger
+            .append(
+                finished.as_str(),
+                &RecordedEvent {
+                    seq: 4,
+                    occurred_at_ms: 4,
+                    event: HarnessEvent::RunFinished {
+                        run_id: finished.clone(),
+                    },
+                },
+            )
+            .unwrap();
+
+        for (session_id, run_id, reason) in [
+            ("session_failed", &failed, "durable failure"),
+            ("session_canceled", &canceled, RUN_CANCELED_REASON),
+        ] {
+            ledger
+                .begin_session_run(session_id, run_id, "question", true)
+                .unwrap();
+            ledger
+                .append(run_id.as_str(), &started_record(run_id.as_str(), 0, 10))
+                .unwrap();
+            ledger
+                .append(
+                    run_id.as_str(),
+                    &RecordedEvent {
+                        seq: 1,
+                        occurred_at_ms: 11,
+                        event: HarnessEvent::RunFailed {
+                            run_id: run_id.clone(),
+                            reason: reason.into(),
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        drop(ledger);
+
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        assert_eq!(
+            ledger
+                .recover_running_session_runs("unused recovery error")
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            session_outcome(&ledger, finished.as_str()),
+            (RunStateName::Finished, Some("durable answer".into()), None)
+        );
+        assert_eq!(
+            session_outcome(&ledger, failed.as_str()),
+            (RunStateName::Failed, None, Some("durable failure".into()))
+        );
+        assert_eq!(
+            session_outcome(&ledger, canceled.as_str()),
+            (
+                RunStateName::Canceled,
+                None,
+                Some(RUN_CANCELED_REASON.into())
+            )
+        );
+        for run_id in [&finished, &failed, &canceled] {
+            let records = ledger.read_run(run_id.as_str()).unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| matches!(
+                        record.event,
+                        HarnessEvent::RunFinished { .. } | HarnessEvent::RunFailed { .. }
+                    ))
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            ledger
+                .recover_running_session_runs("unused recovery error")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn sqlite_terminal_statement_faults_roll_back_both_truths_before_recovery() {
+        const RECOVERY_ERROR: &str = "recovered after injected terminal fault";
+        let boundaries = [
+            TerminalFaultBoundary::BeforeEventInsert,
+            TerminalFaultBoundary::AfterEventInsert,
+            TerminalFaultBoundary::BeforeOutcomeUpdate,
+            TerminalFaultBoundary::AfterOutcomeUpdate,
+            TerminalFaultBoundary::BeforeSessionTouch,
+            TerminalFaultBoundary::AfterSessionTouch,
+        ];
+
+        for (boundary_index, boundary) in boundaries.into_iter().enumerate() {
+            for (outcome_index, outcome) in
+                ["finished", "failed", "canceled"].into_iter().enumerate()
+            {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir
+                    .path()
+                    .join(format!("terminal-{boundary_index}-{outcome_index}.db"));
+                let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+                let run_id = RunId::new(format!("run_{boundary_index}_{outcome_index}")).unwrap();
+                ledger
+                    .begin_session_run("session_1", &run_id, "question", true)
+                    .unwrap();
+                let prefix_len = if outcome == "finished" {
+                    append_response_prefix(&mut ledger, &run_id, "answer", 0);
+                    4
+                } else {
+                    ledger
+                        .append(run_id.as_str(), &started_record(run_id.as_str(), 0, 0))
+                        .unwrap();
+                    1
+                };
+                ledger.inject_terminal_fault_at(boundary);
+
+                let result = match outcome {
+                    "finished" => ledger.finish_session_run(&run_id, "answer"),
+                    "failed" => ledger.fail_session_run(&run_id, "terminal failure", false),
+                    "canceled" => ledger.fail_session_run(&run_id, RUN_CANCELED_REASON, true),
+                    _ => unreachable!(),
+                };
+                assert!(
+                    result.is_err(),
+                    "{outcome} unexpectedly crossed {boundary:?}"
+                );
+                assert_eq!(ledger.read_run(run_id.as_str()).unwrap().len(), prefix_len);
+                assert_eq!(
+                    session_outcome(&ledger, run_id.as_str()),
+                    (RunStateName::Running, None, None)
+                );
+                drop(ledger);
+
+                let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+                assert_eq!(
+                    ledger.recover_running_session_runs(RECOVERY_ERROR).unwrap(),
+                    1
+                );
+                let records = ledger.read_run(run_id.as_str()).unwrap();
+                assert_eq!(records.len(), prefix_len + 1);
+                assert_eq!(
+                    records
+                        .iter()
+                        .filter(|record| matches!(
+                            record.event,
+                            HarnessEvent::RunFinished { .. } | HarnessEvent::RunFailed { .. }
+                        ))
+                        .count(),
+                    1
+                );
+                assert!(matches!(
+                    RunReadback::from_events(&records).unwrap().final_phase,
+                    RunPhase::Failed { reason } if reason == RECOVERY_ERROR
+                ));
+                assert_eq!(
+                    session_outcome(&ledger, run_id.as_str()),
+                    (RunStateName::Interrupted, None, Some(RECOVERY_ERROR.into()))
+                );
+                assert_eq!(
+                    ledger.recover_running_session_runs(RECOVERY_ERROR).unwrap(),
+                    0
+                );
+                assert_eq!(ledger.read_run(run_id.as_str()).unwrap(), records);
+            }
+        }
     }
 
     #[test]
@@ -1792,7 +2450,56 @@ mod tests {
         }
     }
 
-    fn response_run_events(run_id: &RunId, usage: Option<ModelUsage>) -> Vec<HarnessEvent> {
+    fn session_outcome(
+        ledger: &SqliteLedger,
+        run_id: &str,
+    ) -> (RunStateName, Option<String>, Option<String>) {
+        ledger
+            .connection
+            .query_row(
+                "SELECT status, final_answer, error
+                 FROM session_runs
+                 WHERE run_id = ?1",
+                params![run_id],
+                |row| {
+                    Ok((
+                        status_from_row(row, 0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+    }
+
+    fn append_response_prefix(
+        ledger: &mut SqliteLedger,
+        run_id: &RunId,
+        answer: &str,
+        occurred_at_ms: u64,
+    ) {
+        for (seq, event) in response_run_prefix(run_id, answer, None)
+            .into_iter()
+            .enumerate()
+        {
+            ledger
+                .append(
+                    run_id.as_str(),
+                    &RecordedEvent {
+                        seq: seq as u64,
+                        occurred_at_ms: occurred_at_ms + seq as u64,
+                        event,
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    fn response_run_prefix(
+        run_id: &RunId,
+        answer: &str,
+        usage: Option<ModelUsage>,
+    ) -> Vec<HarnessEvent> {
         let turn_id = TurnId::new("turn_1").unwrap();
         vec![
             HarnessEvent::RunStarted {
@@ -1819,14 +2526,19 @@ mod tests {
                 step: 0,
                 output: Message {
                     role: MessageRole::Assistant,
-                    content: "answer".into(),
+                    content: answer.into(),
                 },
                 proposed_calls: vec![],
                 usage,
             },
-            HarnessEvent::RunFinished {
-                run_id: run_id.clone(),
-            },
         ]
+    }
+
+    fn response_run_events(run_id: &RunId, usage: Option<ModelUsage>) -> Vec<HarnessEvent> {
+        let mut events = response_run_prefix(run_id, "answer", usage);
+        events.push(HarnessEvent::RunFinished {
+            run_id: run_id.clone(),
+        });
+        events
     }
 }

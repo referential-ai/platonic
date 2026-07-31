@@ -2498,13 +2498,14 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let first_socket = socket_dir.path().join("agent-1.sock");
         let first_server = DaemonServer::bind(workspace.path(), Some(first_socket)).unwrap();
         let ledger_path = first_server.paths().ledger_path.clone();
-        let mut ledger = SqliteLedger::open_or_create(&ledger_path).unwrap();
-        let run_id = RunId::new("run_1").unwrap();
-        ledger
-            .begin_session_run("session_1", &run_id, "first question", true)
-            .unwrap();
-        ledger.finish_session_run(&run_id, "first answer").unwrap();
-        drop(ledger);
+        seed_finished_session_run(
+            &ledger_path,
+            "run_1",
+            "session_1",
+            "first question",
+            "first answer",
+            true,
+        );
         drop(first_server);
 
         let second_socket = socket_dir.path().join("agent-2.sock");
@@ -2564,12 +2565,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let first_socket = socket_dir.path().join("agent-1.sock");
         let first_server = DaemonServer::bind(workspace.path(), Some(first_socket)).unwrap();
         let ledger_path = first_server.paths().ledger_path.clone();
-        let mut ledger = SqliteLedger::open_or_create(&ledger_path).unwrap();
-        let run_id = RunId::new("run_1").unwrap();
-        ledger
-            .begin_session_run("session_1", &run_id, "first question", true)
-            .unwrap();
-        drop(ledger);
+        seed_running_session(&ledger_path, "run_1", "session_1", "first question");
         drop(first_server);
 
         let second_socket = socket_dir.path().join("agent-2.sock");
@@ -2591,16 +2587,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let first_socket = socket_dir.path().join("agent-1.sock");
         let first_server = DaemonServer::bind(workspace.path(), Some(first_socket)).unwrap();
         let ledger_path = first_server.paths().ledger_path.clone();
-        let mut ledger = SqliteLedger::open_or_create(&ledger_path).unwrap();
-        ledger
-            .begin_session_run(
-                "session_1",
-                &RunId::new("run_1").unwrap(),
-                "first question",
-                true,
-            )
-            .unwrap();
-        drop(ledger);
+        seed_running_session(&ledger_path, "run_1", "session_1", "first question");
         drop(first_server);
 
         let second_socket = socket_dir.path().join("agent-2.sock");
@@ -2627,14 +2614,15 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
         let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
-        let mut ledger = SqliteLedger::open_or_create(&server.paths().ledger_path).unwrap();
-        let run_id = RunId::new("run_1").unwrap();
         let long_question = format!("{}\nsecond line", "x".repeat(130));
-        ledger
-            .begin_session_run("session_1", &run_id, &long_question, true)
-            .unwrap();
-        ledger.finish_session_run(&run_id, "first answer").unwrap();
-        drop(ledger);
+        seed_finished_session_run(
+            &server.paths().ledger_path,
+            "run_1",
+            "session_1",
+            &long_question,
+            "first answer",
+            true,
+        );
 
         let response = server
             .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
@@ -2685,15 +2673,14 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let config_path = workspace.path().join("plato.toml");
         write_provider_config(&config_path, &provider.base_url, "file.write");
         let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
-        let mut ledger = SqliteLedger::open_or_create(&server.paths().ledger_path).unwrap();
-        let prior_run = RunId::new("run_prior").unwrap();
-        ledger
-            .begin_session_run("session_1", &prior_run, "first question", true)
-            .unwrap();
-        ledger
-            .finish_session_run(&prior_run, "first answer")
-            .unwrap();
-        drop(ledger);
+        seed_finished_session_run(
+            &server.paths().ledger_path,
+            "run_prior",
+            "session_1",
+            "first question",
+            "first answer",
+            true,
+        );
 
         let response = server.handle_line(&format!(
             r#"{{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{{"session_id":"session_1","message":"follow up","config_path":"{}"}}}}"#,
@@ -2752,15 +2739,14 @@ enabled = ["file.read"]
         )
         .unwrap();
         let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
-        let mut ledger = SqliteLedger::open_or_create(&server.paths().ledger_path).unwrap();
-        let prior_run = RunId::new("run_prior").unwrap();
-        ledger
-            .begin_session_run("session_1", &prior_run, "first question", true)
-            .unwrap();
-        ledger
-            .finish_session_run(&prior_run, "first answer")
-            .unwrap();
-        drop(ledger);
+        seed_finished_session_run(
+            &server.paths().ledger_path,
+            "run_prior",
+            "session_1",
+            "first question",
+            "first answer",
+            true,
+        );
 
         let response = server.handle_line(&format!(
             r#"{{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{{"session_id":"session_1","message":"follow up","config_path":"{}","wait":true}}}}"#,
@@ -2998,6 +2984,27 @@ enabled = ["{enabled_tool}"]
 
     fn seed_finished_session(path: &Path, run_id: &str, session_id: &str, answer: &str) {
         seed_finished_session_run(path, run_id, session_id, "question", answer, true);
+    }
+
+    fn seed_running_session(path: &Path, run_id: &str, session_id: &str, question: &str) {
+        let run_id = RunId::new(run_id).unwrap();
+        let mut ledger = SqliteLedger::open_or_create(path).unwrap();
+        ledger
+            .begin_session_run(session_id, &run_id, question, true)
+            .unwrap();
+        ledger
+            .append(
+                run_id.as_str(),
+                &RecordedEvent {
+                    seq: 0,
+                    occurred_at_ms: 0,
+                    event: HarnessEvent::RunStarted {
+                        run_id: run_id.clone(),
+                        agent_id: AgentId::new("agent_1").unwrap(),
+                    },
+                },
+            )
+            .unwrap();
     }
 
     fn seed_finished_session_run(

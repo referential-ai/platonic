@@ -1,7 +1,7 @@
 use crate::{
     AppError, AppResult,
     config::{Config, ProviderKind},
-    ledger::{EventRecorder, SessionTurn, SqliteLedger},
+    ledger::{EventRecorder, RUN_CANCELED_REASON, SessionTurn, SqliteLedger},
     model::{
         ModelBlock, ModelMessage, ModelRequest, ModelResponse, ModelStop, RunOverrides,
         system_prompt,
@@ -198,7 +198,6 @@ const SESSION_TRUNCATION_MARKER: &str = "[older session turns omitted to fit the
 pub(crate) const PLATONIC_MEMORY_FILENAME: &str = "PLATONIC.md";
 pub(crate) const PLATONIC_MEMORY_MAX_BYTES: usize = 8_192;
 const PLATONIC_MEMORY_SEPARATOR: &str = "\n\n";
-const RUN_CANCELED_REASON: &str = "run canceled";
 const DEFAULT_PROVIDER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_PROVIDER_RETRY_DELAY_SECONDS: f64 = 30.0;
 const EXTRA_TOOL_CALL_ERROR: &str = "not executed: at most one tool call runs per response; re-issue this call alone if still needed";
@@ -207,12 +206,6 @@ const TOOL_OUTPUT_TRUNCATION_MARKER: &str = "\n... output truncated";
 const TOOL_OUTPUT_CLOSE: &str = "\n</tool_output>";
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-struct ActiveSessionRun {
-    ledger: SqliteLedger,
-    run_id: RunId,
-    closed: bool,
-}
-
 struct SessionHydration {
     retained_messages: Vec<ModelMessage>,
     dropped_turns: u64,
@@ -220,57 +213,26 @@ struct SessionHydration {
     estimated_tokens_after: u32,
 }
 
-impl ActiveSessionRun {
-    fn begin(
-        mut ledger: SqliteLedger,
-        session: &RunSession,
-        run_id: &RunId,
-        question: &str,
-        config: &Config,
-        tools: &[ToolSpec],
-        system_context: &str,
-    ) -> AppResult<(Self, SessionHydration)> {
-        let turns = ledger.begin_session_run(
-            session.session_id(),
-            run_id,
-            question,
-            session.create_session(),
-        )?;
-        let hydration = hydrated_messages(&turns, question, config, tools, system_context)?;
-        Ok((
-            Self {
-                ledger,
-                run_id: run_id.clone(),
-                closed: false,
-            },
-            hydration,
-        ))
-    }
-
-    fn finish(&mut self, final_answer: &str) -> AppResult<()> {
-        self.ledger.finish_session_run(&self.run_id, final_answer)?;
-        self.closed = true;
-        Ok(())
-    }
-
-    fn fail(&mut self, error: &str, canceled: bool) -> AppResult<()> {
-        self.ledger
-            .fail_session_run(&self.run_id, error, canceled)?;
-        self.closed = true;
-        Ok(())
-    }
-}
-
-impl Drop for ActiveSessionRun {
-    fn drop(&mut self) {
-        if !self.closed {
-            let _ = self.ledger.fail_session_run(
-                &self.run_id,
-                "run ended before session status was closed",
-                false,
-            );
-        }
-    }
+fn begin_session_recorder(
+    mut ledger: SqliteLedger,
+    session: &RunSession,
+    run_id: &RunId,
+    question: &str,
+    config: &Config,
+    tools: &[ToolSpec],
+    system_context: &str,
+) -> AppResult<(EventRecorder, SessionHydration)> {
+    let turns = ledger.begin_session_run(
+        session.session_id(),
+        run_id,
+        question,
+        session.create_session(),
+    )?;
+    let hydration = hydrated_messages(&turns, question, config, tools, system_context)?;
+    Ok((
+        EventRecorder::from_session_sqlite(ledger, run_id),
+        hydration,
+    ))
 }
 
 fn hydrated_messages(
@@ -440,9 +402,9 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         token_limit_field(&config.provider.kind),
     )?;
     let tools = tool_specs(&config.tools.enabled);
-    let (mut session_run, mut session_hydration) = match (&options.ledger, &options.session) {
+    let (mut recorder, mut session_hydration) = match (&options.ledger, &options.session) {
         (RunLedger::Sqlite(path), Some(session)) => {
-            let (session_run, hydration) = ActiveSessionRun::begin(
+            let (recorder, hydration) = begin_session_recorder(
                 SqliteLedger::open_or_create(path)?,
                 session,
                 &run_id,
@@ -451,10 +413,10 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 &tools,
                 &system_context,
             )?;
-            (Some(session_run), Some(hydration))
+            (recorder, Some(hydration))
         }
         (RunLedger::DefaultSqlite(path), Some(session)) => {
-            let (session_run, hydration) = ActiveSessionRun::begin(
+            let (recorder, hydration) = begin_session_recorder(
                 SqliteLedger::open_or_create_default(path)?,
                 session,
                 &run_id,
@@ -463,22 +425,21 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 &tools,
                 &system_context,
             )?;
-            (Some(session_run), Some(hydration))
+            (recorder, Some(hydration))
         }
         (RunLedger::Jsonl(_), Some(_)) => {
             return Err(AppError::Config("sessions require a SQLite ledger".into()));
         }
-        (_, None) => (None, None),
+        (RunLedger::Jsonl(path), None) => (EventRecorder::create_jsonl(path)?, None),
+        (RunLedger::Sqlite(path), None) => (EventRecorder::create_sqlite(path, &run_id)?, None),
+        (RunLedger::DefaultSqlite(path), None) => {
+            (EventRecorder::create_default_sqlite(path, &run_id)?, None)
+        }
     };
     let mut messages = session_hydration
         .as_mut()
         .map(|hydration| std::mem::take(&mut hydration.retained_messages))
         .unwrap_or_else(|| vec![ModelMessage::user_text(options.question.clone())]);
-    let mut recorder = match &options.ledger {
-        RunLedger::Jsonl(path) => EventRecorder::create_jsonl(path)?,
-        RunLedger::Sqlite(path) => EventRecorder::create_sqlite(path, &run_id)?,
-        RunLedger::DefaultSqlite(path) => EventRecorder::create_default_sqlite(path, &run_id)?,
-    };
     let agent_id = AgentId::new("plato")?;
     let model = ModelName::new(config.provider.model.clone())?;
     let stdin_actor_id = ActorId::new("stdin")?;
@@ -507,7 +468,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             config.limits.token_budget,
             platonic_memory.as_deref(),
         )?;
-        check_cancel(&mut recorder, &options, &run_id, &mut session_run)?;
+        check_cancel(&mut recorder, &options, &run_id)?;
         if turn_index == 0
             && let Some(hydration) = &session_hydration
             && hydration.dropped_turns > 0
@@ -575,7 +536,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             completion_retry_delay(error).map(|delay| (delay, error.to_string()))
         });
         if let Some((delay, reason)) = retry {
-            check_cancel(&mut recorder, &options, &run_id, &mut session_run)?;
+            check_cancel(&mut recorder, &options, &run_id)?;
             record_event(
                 &mut recorder,
                 &options,
@@ -612,17 +573,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 } else {
                     error.to_string()
                 };
-                record_event(
-                    &mut recorder,
-                    &options,
-                    HarnessEvent::RunFailed {
-                        run_id,
-                        reason: reason.clone(),
-                    },
-                )?;
-                if let Some(session_run) = &mut session_run {
-                    session_run.fail(&reason, canceled)?;
-                }
+                record_terminal_failure(&mut recorder, &options, &run_id, &reason, canceled)?;
                 if canceled {
                     return Err(AppError::RunCanceled);
                 }
@@ -653,7 +604,6 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                     &mut recorder,
                     &options,
                     &run_id,
-                    &mut session_run,
                     "model reached max output tokens",
                     false,
                 );
@@ -663,7 +613,6 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                     &mut recorder,
                     &options,
                     &run_id,
-                    &mut session_run,
                     "model response was stopped by content filter",
                     false,
                 );
@@ -671,30 +620,20 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             ModelStop::EndTurn | ModelStop::ToolUse => {}
         }
 
-        check_cancel(&mut recorder, &options, &run_id, &mut session_run)?;
+        check_cancel(&mut recorder, &options, &run_id)?;
         let tool_uses = response.tool_uses();
         if response.stop == ModelStop::ToolUse && tool_uses.is_empty() {
             return fail_run(
                 &mut recorder,
                 &options,
                 &run_id,
-                &mut session_run,
                 "provider reported tool use without tool calls",
                 false,
             );
         }
         if tool_uses.is_empty() {
             let final_answer = response.text();
-            record_event(
-                &mut recorder,
-                &options,
-                HarnessEvent::RunFinished {
-                    run_id: run_id.clone(),
-                },
-            )?;
-            if let Some(session_run) = &mut session_run {
-                session_run.finish(&final_answer)?;
-            }
+            record_terminal_success(&mut recorder, &options, &run_id, &final_answer)?;
             return Ok(RunOutcome {
                 run_id,
                 final_answer,
@@ -707,7 +646,6 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 &mut recorder,
                 &options,
                 &run_id,
-                &mut session_run,
                 "provider returned duplicate tool call ids",
                 false,
             );
@@ -746,14 +684,9 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         )?;
 
         let tool_message = match policy {
-            PolicyDecision::Allow => execute_and_record_tool(
-                &mut recorder,
-                &options,
-                &config,
-                &run_id,
-                &mut session_run,
-                call.clone(),
-            )?,
+            PolicyDecision::Allow => {
+                execute_and_record_tool(&mut recorder, &options, &config, &run_id, call.clone())?
+            }
             PolicyDecision::RequireApproval { ref reason } => {
                 if let Some(actor) =
                     options
@@ -775,7 +708,6 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                         &options,
                         &config,
                         &run_id,
-                        &mut session_run,
                         call.clone(),
                     )?
                 } else if let Some(actor) = options.approval_mode.deny_actor(&policy) {
@@ -832,7 +764,6 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                                 &options,
                                 &config,
                                 &run_id,
-                                &mut session_run,
                                 call.clone(),
                             )?
                         }
@@ -876,7 +807,6 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                                 &options,
                                 &config,
                                 &run_id,
-                                &mut session_run,
                                 call.clone(),
                             )?
                         }
@@ -923,7 +853,6 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         &mut recorder,
         &options,
         &run_id,
-        &mut session_run,
         format!("exceeded maximum turn count of {}", config.limits.max_turns),
         false,
     )
@@ -991,9 +920,36 @@ fn record_event(
     event: HarnessEvent,
 ) -> AppResult<RecordedEvent> {
     let record = recorder.record(event)?;
+    emit_ledger_record(options, &record);
+    Ok(record)
+}
+
+fn emit_ledger_record(options: &RunOptions, record: &RecordedEvent) {
     if let Some(sender) = &options.event_sender {
         let _ = sender.send(RunEvent::Ledger(record.clone()));
     }
+}
+
+fn record_terminal_success(
+    recorder: &mut EventRecorder,
+    options: &RunOptions,
+    run_id: &RunId,
+    final_answer: &str,
+) -> AppResult<RecordedEvent> {
+    let record = recorder.finish_run(run_id, final_answer)?;
+    emit_ledger_record(options, &record);
+    Ok(record)
+}
+
+fn record_terminal_failure(
+    recorder: &mut EventRecorder,
+    options: &RunOptions,
+    run_id: &RunId,
+    reason: &str,
+    canceled: bool,
+) -> AppResult<RecordedEvent> {
+    let record = recorder.fail_run(run_id, reason, canceled)?;
+    emit_ledger_record(options, &record);
     Ok(record)
 }
 
@@ -1001,22 +957,11 @@ fn fail_run<T>(
     recorder: &mut EventRecorder,
     options: &RunOptions,
     run_id: &RunId,
-    session_run: &mut Option<ActiveSessionRun>,
     reason: impl Into<String>,
     canceled: bool,
 ) -> AppResult<T> {
     let reason = reason.into();
-    record_event(
-        recorder,
-        options,
-        HarnessEvent::RunFailed {
-            run_id: run_id.clone(),
-            reason: reason.clone(),
-        },
-    )?;
-    if let Some(session_run) = session_run.as_mut() {
-        session_run.fail(&reason, canceled)?;
-    }
+    record_terminal_failure(recorder, options, run_id, &reason, canceled)?;
     if canceled {
         Err(AppError::RunCanceled)
     } else {
@@ -1075,14 +1020,7 @@ fn record_context_built(
         Ok(_) => Ok(()),
         Err(AppError::Core(CoreError::ContextBudgetExceeded { used, budget })) => {
             let error = CoreError::ContextBudgetExceeded { used, budget };
-            record_event(
-                recorder,
-                options,
-                HarnessEvent::RunFailed {
-                    run_id: run_id.clone(),
-                    reason: error.to_string(),
-                },
-            )?;
+            record_terminal_failure(recorder, options, run_id, &error.to_string(), false)?;
             Err(AppError::Core(error))
         }
         Err(error) => Err(error),
@@ -1093,17 +1031,9 @@ fn check_cancel(
     recorder: &mut EventRecorder,
     options: &RunOptions,
     run_id: &RunId,
-    session_run: &mut Option<ActiveSessionRun>,
 ) -> AppResult<()> {
     if cancel_requested(options) {
-        return fail_run(
-            recorder,
-            options,
-            run_id,
-            session_run,
-            RUN_CANCELED_REASON,
-            true,
-        );
+        return fail_run(recorder, options, run_id, RUN_CANCELED_REASON, true);
     }
     Ok(())
 }
@@ -1120,10 +1050,9 @@ fn execute_and_record_tool(
     options: &RunOptions,
     config: &Config,
     run_id: &RunId,
-    session_run: &mut Option<ActiveSessionRun>,
     call: ToolCall,
 ) -> AppResult<ToolMessage> {
-    check_cancel(recorder, options, run_id, session_run)?;
+    check_cancel(recorder, options, run_id)?;
     let ToolCall {
         id: call_id,
         tool,
@@ -2256,6 +2185,20 @@ base_url = "http://{}"
                 .count(),
             1
         );
+        assert!(matches!(
+            records.last().map(|record| &record.event),
+            Some(HarnessEvent::RunFinished { .. })
+        ));
+        let run = SqliteLedger::open_readonly(&ledger_path)
+            .unwrap()
+            .read_session(session_id)
+            .unwrap()
+            .runs
+            .into_iter()
+            .find(|run| run.run_id == "run_compacted")
+            .unwrap();
+        assert_eq!(run.status, crate::daemon::protocol::RunStateName::Finished);
+        assert_eq!(run.final_answer.as_deref(), Some("done"));
     }
 
     #[test]
@@ -2353,6 +2296,16 @@ base_url = "http://{}"
         assert!(matches!(records[2].event, HarnessEvent::RunFailed { .. }));
         let readback = RunReadback::from_events(&records).unwrap();
         assert!(matches!(readback.final_phase, RunPhase::Failed { .. }));
+        let run = SqliteLedger::open_readonly(&ledger_path)
+            .unwrap()
+            .read_session(session_id)
+            .unwrap()
+            .runs
+            .into_iter()
+            .find(|run| run.run_id == "run_compacted_over_budget")
+            .unwrap();
+        assert_eq!(run.status, crate::daemon::protocol::RunStateName::Failed);
+        assert_eq!(run.final_answer, None);
     }
 
     #[test]
@@ -3960,7 +3913,7 @@ enabled = ["file.read"]
         };
         let config = Config::default();
         let tools = tool_specs(&config.tools.enabled);
-        let (session_run, _) = ActiveSessionRun::begin(
+        let (mut recorder, _) = begin_session_recorder(
             SqliteLedger::open_or_create(&ledger_path).unwrap(),
             &session,
             &run_id,
@@ -3970,8 +3923,6 @@ enabled = ["file.read"]
             system_prompt(),
         )
         .unwrap();
-        let mut session_run = Some(session_run);
-        let mut recorder = EventRecorder::create_sqlite(&ledger_path, &run_id).unwrap();
         let options = RunOptions {
             question: "hello".into(),
             config_path: None,
@@ -3995,7 +3946,7 @@ enabled = ["file.read"]
         )
         .unwrap();
 
-        let error = check_cancel(&mut recorder, &options, &run_id, &mut session_run).unwrap_err();
+        let error = check_cancel(&mut recorder, &options, &run_id).unwrap_err();
 
         assert!(matches!(error, AppError::RunCanceled));
         let records =
@@ -4116,6 +4067,50 @@ enabled = ["file.read"]
             ledger
                 .begin_session_run(session_id, &run_id, &turn.question, index == 0)
                 .unwrap();
+            let turn_id = TurnId::new("turn_1").unwrap();
+            let events = [
+                HarnessEvent::RunStarted {
+                    run_id: run_id.clone(),
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+                HarnessEvent::ContextBuilt {
+                    run_id: run_id.clone(),
+                    turn_id: turn_id.clone(),
+                    context: ContextPack {
+                        token_budget: 4_000,
+                        fragments: vec![],
+                    },
+                },
+                HarnessEvent::ModelRequested {
+                    run_id: run_id.clone(),
+                    turn_id: turn_id.clone(),
+                    step: 0,
+                    model: ModelName::new("test-model").unwrap(),
+                },
+                HarnessEvent::ModelResponded {
+                    run_id: run_id.clone(),
+                    turn_id,
+                    step: 0,
+                    output: Message {
+                        role: MessageRole::Assistant,
+                        content: turn.final_answer.clone(),
+                    },
+                    proposed_calls: vec![],
+                    usage: None,
+                },
+            ];
+            for (seq, event) in events.into_iter().enumerate() {
+                ledger
+                    .append(
+                        run_id.as_str(),
+                        &RecordedEvent {
+                            seq: seq as u64,
+                            occurred_at_ms: seq as u64,
+                            event,
+                        },
+                    )
+                    .unwrap();
+            }
             ledger
                 .finish_session_run(&run_id, &turn.final_answer)
                 .unwrap();

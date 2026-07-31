@@ -1477,6 +1477,50 @@ mod tests {
         ledger
             .begin_session_run("session_1", &run_id, "hello", true)
             .unwrap();
+        let turn_id = platonic_core::TurnId::new("turn_1").unwrap();
+        let events = [
+            HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: platonic_core::AgentId::new("plato").unwrap(),
+            },
+            HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                context: platonic_core::ContextPack {
+                    token_budget: 4_000,
+                    fragments: vec![],
+                },
+            },
+            HarnessEvent::ModelRequested {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 0,
+                model: platonic_core::ModelName::new("test-model").unwrap(),
+            },
+            HarnessEvent::ModelResponded {
+                run_id: run_id.clone(),
+                turn_id,
+                step: 0,
+                output: platonic_core::Message {
+                    role: platonic_core::MessageRole::Assistant,
+                    content: "hi".into(),
+                },
+                proposed_calls: vec![],
+                usage: None,
+            },
+        ];
+        for (seq, event) in events.into_iter().enumerate() {
+            ledger
+                .append(
+                    run_id.as_str(),
+                    &platonic_core::RecordedEvent {
+                        seq: seq as u64,
+                        occurred_at_ms: seq as u64,
+                        event,
+                    },
+                )
+                .unwrap();
+        }
         ledger.finish_session_run(&run_id, "hi").unwrap();
 
         let session = run_session(true, &RunLedger::Sqlite(path))

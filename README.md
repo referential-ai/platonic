@@ -181,6 +181,9 @@ Every run uses this exact convention:
   fail closed if they conflict with the daemon-owned store.
 - Direct SQLite CLI operations hold the workspace lock before session lookup or
   database open through final output, then release it when the CLI exits.
+- SQLite session terminal events and their matching outcomes commit together.
+  Daemon startup replays running session ledgers, reconciling an existing
+  terminal event or recording one interruption failure before closing the run.
 
 Replay forms:
 
