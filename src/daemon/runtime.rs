@@ -7,7 +7,7 @@ use crate::{
     tools::ApprovalOutcome,
 };
 use platonic_core::RecordedEvent;
-#[cfg(all(test, unix))]
+#[cfg(test)]
 use std::sync::Barrier;
 use std::{
     collections::{HashMap, VecDeque},
@@ -208,6 +208,8 @@ pub(super) struct RunRecord {
     pub(super) events: Mutex<EventBuffer>,
     pub(super) approvals: Mutex<HashMap<String, PendingApproval>>,
     pub(super) approval_changed: Condvar,
+    #[cfg(test)]
+    event_snapshot_barriers: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -271,6 +273,8 @@ impl RunRecord {
             }),
             approvals: Mutex::new(HashMap::new()),
             approval_changed: Condvar::new(),
+            #[cfg(test)]
+            event_snapshot_barriers: Mutex::new(None),
         }
     }
 
@@ -306,6 +310,20 @@ impl RunRecord {
             .lock()
             .expect("run status lock poisoned")
             .clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_event_snapshot_barriers(&self, reached: Arc<Barrier>, release: Arc<Barrier>) {
+        *self.event_snapshot_barriers.lock().unwrap() = Some((reached, release));
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_during_event_snapshot(&self) {
+        let barriers = self.event_snapshot_barriers.lock().unwrap().take();
+        if let Some((reached, release)) = barriers {
+            reached.wait();
+            release.wait();
+        }
     }
 
     pub(super) fn pending_approval(&self) -> Option<PendingApprovalSnapshot> {

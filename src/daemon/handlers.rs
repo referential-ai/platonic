@@ -458,39 +458,42 @@ fn handle_events_stream(
             format!("event stream limit exceeds maximum {MAX_EVENT_LIMIT}: {limit}"),
         );
     }
-    let buffer = record.events.lock().expect("event buffer lock poisoned");
-    let from_offset = params.from_offset.unwrap_or(buffer.next_offset);
-    if from_offset < buffer.first_offset {
-        return Envelope::error(
-            request.id,
-            Some("events.stream".into()),
-            ERROR_LAGGED,
-            format!(
-                "requested offset {from_offset} is no longer buffered; first available is {}",
-                buffer.first_offset
-            ),
-        );
-    }
-    let start = (from_offset - buffer.first_offset) as usize;
-    let events = buffer
-        .events
-        .iter()
-        .skip(start)
-        .take(limit)
-        .cloned()
-        .collect::<Vec<_>>();
-    let next_offset = from_offset + events.len() as u64;
-    Envelope::response_from(
-        request.id,
-        Some("events.stream".into()),
+    let result = {
+        // Terminal status is published only after collection, so snapshot status before events.
+        let status = record.status.lock().expect("run status lock poisoned");
+        let buffer = record.events.lock().expect("event buffer lock poisoned");
+        #[cfg(test)]
+        record.wait_during_event_snapshot();
+        let from_offset = params.from_offset.unwrap_or(buffer.next_offset);
+        if from_offset < buffer.first_offset {
+            return Envelope::error(
+                request.id,
+                Some("events.stream".into()),
+                ERROR_LAGGED,
+                format!(
+                    "requested offset {from_offset} is no longer buffered; first available is {}",
+                    buffer.first_offset
+                ),
+            );
+        }
+        let start = (from_offset - buffer.first_offset) as usize;
+        let events = buffer
+            .events
+            .iter()
+            .skip(start)
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        let next_offset = from_offset + events.len() as u64;
         EventsStreamResult {
             run_id: record.run_id.clone(),
             from_offset,
             next_offset,
-            status: record.status().state,
+            status: status.state,
             events,
-        },
-    )
+        }
+    };
+    Envelope::response_from(request.id, Some("events.stream".into()), result)
 }
 
 fn handle_approval_decide(
@@ -560,19 +563,39 @@ fn handle_run_cancel(
         Err(error) => return error_response(request.id, "run.cancel", error),
     };
     let mut approvals = record.approvals.lock().expect("approvals lock poisoned");
-    record.cancel.store(true, Ordering::SeqCst);
-    record.push_event(StreamEvent::Canceled {
-        run_id: record.run_id.clone(),
-    });
-    approvals.clear();
-    record.approval_changed.notify_all();
+    let status = {
+        let mut status = record.status.lock().expect("run status lock poisoned");
+        match status.state {
+            RunStateName::Running => {
+                status.state = RunStateName::CancelRequested;
+                record.cancel.store(true, Ordering::SeqCst);
+                record.push_event(StreamEvent::Canceled {
+                    run_id: record.run_id.clone(),
+                });
+                approvals.clear();
+                record.approval_changed.notify_all();
+            }
+            RunStateName::CancelRequested => {}
+            RunStateName::Finished
+            | RunStateName::Failed
+            | RunStateName::Canceled
+            | RunStateName::Interrupted => {
+                return error_response(
+                    request.id,
+                    "run.cancel",
+                    format!("run is not active: {}", record.run_id),
+                );
+            }
+        }
+        status.clone()
+    };
     drop(approvals);
     Envelope::response_from(
         request.id,
         Some("run.cancel".into()),
         CommandAcceptedResult {
             run_id: record.run_id.clone(),
-            status: RunStateName::CancelRequested,
+            status: status.state,
         },
     )
 }
@@ -613,7 +636,10 @@ fn session_summaries(runtime: &DaemonRuntime) -> crate::AppResult<Vec<SessionSum
         .values()
         .filter_map(|record| {
             let status = record.status();
-            if status.state != RunStateName::Running {
+            if !matches!(
+                status.state,
+                RunStateName::Running | RunStateName::CancelRequested
+            ) {
                 return None;
             }
             Some(SessionSummary {
@@ -1009,6 +1035,250 @@ mod tests {
         );
     }
 
+    #[test]
+    fn event_snapshot_before_collector_cannot_publish_a_stale_terminal_page() {
+        let runtime = test_runtime();
+        let record = test_run_record("snapshot_before_collector");
+        runtime.reserve_run(record.clone()).unwrap();
+        let snapshot_reached = Arc::new(Barrier::new(2));
+        let snapshot_release = Arc::new(Barrier::new(2));
+        record.set_event_snapshot_barriers(snapshot_reached.clone(), snapshot_release.clone());
+
+        let stream_runtime = runtime.clone();
+        let stream_record = record.clone();
+        let (stream_sender, stream_receiver) = mpsc::channel();
+        let stream = thread::spawn(move || {
+            stream_sender
+                .send(stream_run(
+                    &stream_runtime,
+                    "stream_before_collector",
+                    &stream_record.run_id,
+                ))
+                .unwrap();
+        });
+        snapshot_reached.wait();
+
+        let (event_sender, event_receiver) = mpsc::channel();
+        event_sender
+            .send(test_delta("snapshot_before_collector", 0))
+            .unwrap();
+        drop(event_sender);
+        let event_collector = spawn_event_collector(record.clone(), event_receiver);
+        let finisher_runtime = runtime.clone();
+        let finisher_record = record.clone();
+        let finish_started = Arc::new(Barrier::new(2));
+        let started = finish_started.clone();
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let finisher = thread::spawn(move || {
+            started.wait();
+            event_collector.join().unwrap();
+            finisher_runtime.finish_run(&finisher_record, "done".into());
+            finished_sender.send(()).unwrap();
+        });
+        finish_started.wait();
+        assert!(matches!(
+            finished_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        snapshot_release.wait();
+        let before_collector = stream_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        stream.join().unwrap();
+        assert_eq!(before_collector.status, RunStateName::Running);
+        assert_eq!(before_collector.from_offset, 0);
+        assert_eq!(before_collector.next_offset, 0);
+        assert!(before_collector.events.is_empty());
+
+        finished_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        finisher.join().unwrap();
+        let terminal = stream_run(&runtime, "stream_terminal", &record.run_id);
+        assert_eq!(terminal.status, RunStateName::Finished);
+        assert_eq!(terminal.from_offset, 0);
+        assert_eq!(terminal.next_offset, 1);
+        assert!(matches!(
+            terminal.events.as_slice(),
+            [crate::daemon::protocol::BufferedStreamEvent {
+                offset: 0,
+                event: StreamEvent::AssistantDelta { delta_index: 0, .. },
+            }]
+        ));
+    }
+
+    #[test]
+    fn run_cancel_stores_one_idempotent_transition_and_immediate_readback() {
+        let runtime = test_runtime();
+        let record = test_run_record("cancel_idempotent");
+        runtime.reserve_run(record.clone()).unwrap();
+
+        let first = cancel_run(&runtime, "cancel_1", &record.run_id);
+        let first_result: CommandAcceptedResult =
+            serde_json::from_value(first.result.clone().unwrap()).unwrap();
+
+        assert_eq!(first.kind, crate::daemon::protocol::EnvelopeKind::Response);
+        assert_eq!(first_result.run_id, record.run_id);
+        assert_eq!(first_result.status, RunStateName::CancelRequested);
+        assert_eq!(record.status().state, RunStateName::CancelRequested);
+        assert!(record.cancel.load(Ordering::SeqCst));
+
+        let readback = stream_run(&runtime, "stream_1", &record.run_id);
+        assert_eq!(readback.status, RunStateName::CancelRequested);
+        assert_eq!(readback.from_offset, 0);
+        assert_eq!(readback.next_offset, 1);
+        assert!(matches!(
+            readback.events.as_slice(),
+            [crate::daemon::protocol::BufferedStreamEvent {
+                offset: 0,
+                event: StreamEvent::Canceled { run_id },
+            }] if run_id == &record.run_id
+        ));
+
+        let duplicate = cancel_run(&runtime, "cancel_2", &record.run_id);
+        let duplicate_result: CommandAcceptedResult =
+            serde_json::from_value(duplicate.result.clone().unwrap()).unwrap();
+        assert_eq!(
+            duplicate.kind,
+            crate::daemon::protocol::EnvelopeKind::Response
+        );
+        assert_eq!(duplicate_result, first_result);
+
+        let duplicate_readback = stream_run(&runtime, "stream_2", &record.run_id);
+        assert_eq!(duplicate_readback.status, RunStateName::CancelRequested);
+        assert_eq!(duplicate_readback.next_offset, 1);
+        assert_eq!(duplicate_readback.events, readback.events);
+    }
+
+    #[test]
+    fn run_cancel_rejects_every_terminal_status_without_side_effects() {
+        let runtime = test_runtime();
+
+        for terminal in [
+            RunStateName::Finished,
+            RunStateName::Failed,
+            RunStateName::Canceled,
+        ] {
+            let record = test_run_record(terminal.as_str());
+            record.status.lock().unwrap().state = terminal;
+            runtime.reserve_run(record.clone()).unwrap();
+
+            let response = cancel_run(&runtime, "cancel_terminal", &record.run_id);
+
+            assert_eq!(response.kind, crate::daemon::protocol::EnvelopeKind::Error);
+            let error = response.error.unwrap();
+            assert_eq!(error.code, ERROR_NOT_FOUND);
+            assert_eq!(
+                error.message,
+                format!("run is not active: {}", record.run_id)
+            );
+            assert_eq!(record.status().state, terminal);
+            assert!(!record.cancel.load(Ordering::SeqCst));
+            assert!(record.events.lock().unwrap().events.is_empty());
+        }
+    }
+
+    #[test]
+    fn run_cancel_and_finish_linearize_in_both_barrier_schedules() {
+        let cancel_first_runtime = test_runtime();
+        let cancel_first_record = test_run_record("cancel_first");
+        cancel_first_runtime
+            .reserve_run(cancel_first_record.clone())
+            .unwrap();
+        let collector_waiting = Arc::new(Barrier::new(2));
+        let collector_release = Arc::new(Barrier::new(2));
+        let waiting = collector_waiting.clone();
+        let release = collector_release.clone();
+        let event_collector = thread::spawn(move || {
+            waiting.wait();
+            release.wait();
+        });
+        collector_waiting.wait();
+        let finish_started = Arc::new(Barrier::new(2));
+        let started = finish_started.clone();
+        let finisher_runtime = cancel_first_runtime.clone();
+        let finisher_record = cancel_first_record.clone();
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let finisher = thread::spawn(move || {
+            started.wait();
+            let result = finish_run_after_event_collection(
+                &finisher_runtime,
+                &finisher_record,
+                Ok(RunOutcome {
+                    run_id: RunId::new("run_cancel_first").unwrap(),
+                    final_answer: "done".into(),
+                }),
+                event_collector,
+            );
+            finished_sender.send(result).unwrap();
+        });
+        finish_started.wait();
+        assert!(matches!(
+            finished_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        let cancel = cancel_run(
+            &cancel_first_runtime,
+            "cancel_first",
+            &cancel_first_record.run_id,
+        );
+        assert_eq!(cancel.kind, crate::daemon::protocol::EnvelopeKind::Response);
+        assert_eq!(
+            cancel_first_record.status().state,
+            RunStateName::CancelRequested
+        );
+        collector_release.wait();
+        finished_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        finisher.join().unwrap();
+
+        let status = cancel_first_record.status();
+        assert_eq!(status.state, RunStateName::Finished);
+        assert_eq!(status.final_answer.as_deref(), Some("done"));
+        assert_eq!(status.error, None);
+        assert!(cancel_first_record.cancel.load(Ordering::SeqCst));
+        assert_eq!(cancel_first_record.events.lock().unwrap().events.len(), 1);
+
+        let finish_first_runtime = test_runtime();
+        let finish_first_record = test_run_record("finish_first");
+        finish_first_runtime
+            .reserve_run(finish_first_record.clone())
+            .unwrap();
+        let finish_started = Arc::new(Barrier::new(2));
+        let started = finish_started.clone();
+        let finisher_runtime = finish_first_runtime.clone();
+        let finisher_record = finish_first_record.clone();
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let finisher = thread::spawn(move || {
+            started.wait();
+            finisher_runtime.finish_run(&finisher_record, "done".into());
+            finished_sender.send(()).unwrap();
+        });
+        finish_started.wait();
+        finished_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let cancel = cancel_run(
+            &finish_first_runtime,
+            "finish_first",
+            &finish_first_record.run_id,
+        );
+        finisher.join().unwrap();
+        assert_eq!(cancel.kind, crate::daemon::protocol::EnvelopeKind::Error);
+        assert_eq!(cancel.error.unwrap().code, ERROR_NOT_FOUND);
+        let status = finish_first_record.status();
+        assert_eq!(status.state, RunStateName::Finished);
+        assert_eq!(status.final_answer.as_deref(), Some("done"));
+        assert_eq!(status.error, None);
+        assert!(!finish_first_record.cancel.load(Ordering::SeqCst));
+        assert!(finish_first_record.events.lock().unwrap().events.is_empty());
+    }
+
     fn assert_terminal_waits_for_collector(
         case: &'static str,
         outcome: AppResult<RunOutcome>,
@@ -1115,6 +1385,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
+    }
+
+    fn cancel_run(runtime: &DaemonRuntime, request_id: &str, run_id: &str) -> Envelope {
+        handle_line(
+            runtime,
+            &format!(
+                r#"{{"v":1,"id":"{request_id}","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
+            ),
+        )
+    }
+
+    fn stream_run(runtime: &DaemonRuntime, request_id: &str, run_id: &str) -> EventsStreamResult {
+        let response = handle_line(
+            runtime,
+            &format!(
+                r#"{{"v":1,"id":"{request_id}","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":128}}}}"#
+            ),
+        );
+        assert_eq!(
+            response.kind,
+            crate::daemon::protocol::EnvelopeKind::Response
+        );
+        serde_json::from_value(response.result.unwrap()).unwrap()
     }
 
     fn test_runtime() -> DaemonRuntime {

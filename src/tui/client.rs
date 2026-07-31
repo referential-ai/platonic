@@ -92,7 +92,11 @@ fn load_connected_state(
     state.approval = approval;
     let active_session = state.selected_session_id.as_deref().and_then(|session_id| {
         state.sessions.iter().find(|session| {
-            session.session_id == session_id && session.status == RunStateName::Running
+            session.session_id == session_id
+                && matches!(
+                    session.status,
+                    RunStateName::Running | RunStateName::CancelRequested
+                )
         })
     });
     if let Some(session) = active_session {
@@ -144,10 +148,12 @@ impl UiRuntime {
             config_path,
             next_offset: 0,
             poll_in_flight: false,
-            polling: state
-                .active_run
-                .as_ref()
-                .is_some_and(|run| run.status == RunStateName::Running),
+            polling: state.active_run.as_ref().is_some_and(|run| {
+                matches!(
+                    run.status,
+                    RunStateName::Running | RunStateName::CancelRequested
+                )
+            }),
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
             active_since: state.active_run.as_ref().map(|_| Instant::now()),
@@ -156,10 +162,12 @@ impl UiRuntime {
 
     fn sync_from_state(&mut self, state: &TuiState) {
         self.active_run_id = state.active_run.as_ref().map(|run| run.run_id.clone());
-        self.polling = state
-            .active_run
-            .as_ref()
-            .is_some_and(|run| run.status == RunStateName::Running);
+        self.polling = state.active_run.as_ref().is_some_and(|run| {
+            matches!(
+                run.status,
+                RunStateName::Running | RunStateName::CancelRequested
+            )
+        });
         self.next_offset = 0;
         self.poll_in_flight = false;
         self.last_poll = Instant::now();
@@ -602,7 +610,11 @@ pub(super) fn apply_events_result(
     runtime.next_offset = result.next_offset;
     let needs_catch_up =
         result.events.len() == EVENT_LIMIT && result.next_offset > result.from_offset;
-    runtime.polling = result.status == RunStateName::Running || needs_catch_up;
+    let active = matches!(
+        result.status,
+        RunStateName::Running | RunStateName::CancelRequested
+    );
+    runtime.polling = active || needs_catch_up;
     state.stream_warning = None;
     state.active_run = Some(ActiveRunView::new(result.run_id.clone(), result.status));
     for buffered in result.events {
@@ -636,7 +648,7 @@ pub(super) fn apply_events_result(
     }
     if needs_catch_up {
         maybe_poll_events_now(runtime, commands);
-    } else if result.status != RunStateName::Running {
+    } else if !active {
         runtime.active_since = None;
         send_command(
             commands,
@@ -851,6 +863,66 @@ mod tests {
             transcript_targets,
             vec!["session_finished", "session_running"]
         );
+    }
+
+    #[test]
+    fn cancel_requested_remains_active_until_a_terminal_stream_status() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = DaemonConnectionConfig {
+            workspace_root: workspace.path().to_owned(),
+            socket_path: workspace.path().join("agent.sock"),
+        };
+        let mut state = connected_state(&config);
+        state.active_run = Some(ActiveRunView::new(
+            "run_canceling".into(),
+            RunStateName::CancelRequested,
+        ));
+        let mut runtime = UiRuntime::from_state(&state, None);
+        let (commands, command_receiver) = mpsc::channel();
+
+        assert!(runtime.polling);
+        apply_events_result(
+            &mut state,
+            &mut runtime,
+            &commands,
+            EventsStreamResult {
+                run_id: "run_canceling".into(),
+                from_offset: 0,
+                next_offset: 0,
+                status: RunStateName::CancelRequested,
+                events: vec![],
+            },
+        );
+
+        assert!(runtime.polling);
+        assert!(runtime.active_since.is_some());
+        assert_eq!(
+            state.active_run.as_ref().map(|run| run.status),
+            Some(RunStateName::CancelRequested)
+        );
+        assert!(command_receiver.try_recv().is_err());
+
+        apply_events_result(
+            &mut state,
+            &mut runtime,
+            &commands,
+            EventsStreamResult {
+                run_id: "run_canceling".into(),
+                from_offset: 0,
+                next_offset: 0,
+                status: RunStateName::Canceled,
+                events: vec![],
+            },
+        );
+
+        assert!(!runtime.polling);
+        assert!(runtime.active_since.is_none());
+        assert!(matches!(
+            command_receiver.try_recv().unwrap(),
+            ClientCommand::Load {
+                run_id: Some(run_id)
+            } if run_id == "run_canceling"
+        ));
     }
 
     #[test]

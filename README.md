@@ -253,6 +253,9 @@ to the ledger. After a `lagged` response, omitting `from_offset` resumes at the
 current tip; `transcript.read` returns ledger-backed status and final answer.
 The collector drains every queued run event into the contiguous-offset buffer
 before `finished`, `failed`, or `canceled` can be observed.
+An accepted `run.cancel` stores `cancel_requested` before replying. Repeated
+requests return that state without another cancellation event, while terminal
+runs reject cancellation.
 The daemon retains event buffers for the newest 32 terminal runs in completion
 order. Older runs return `not_found` from `events.stream`; `transcript.read` and
 `sessions.list` remain ledger-backed.

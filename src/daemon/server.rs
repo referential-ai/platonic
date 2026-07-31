@@ -1598,6 +1598,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
         ));
         assert_eq!(response.kind, EnvelopeKind::Response);
+        assert_eq!(
+            response.result.as_ref().unwrap()["status"],
+            "cancel_requested"
+        );
         assert!(record.approvals.lock().unwrap().is_empty());
         assert_eq!(record.pending_approval(), None);
         let transcript = server.handle_line(&format!(
@@ -1611,7 +1615,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(stale.kind, EnvelopeKind::Error);
         assert_eq!(stale.error.unwrap().code, ERROR_NOT_FOUND);
         let deadline = Instant::now() + Duration::from_secs(2);
-        while record.status().state == RunStateName::Running {
+        while matches!(
+            record.status().state,
+            RunStateName::Running | RunStateName::CancelRequested
+        ) {
             assert!(
                 Instant::now() < deadline,
                 "canceled approval worker did not exit"
@@ -2489,6 +2496,19 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(result["sessions"][0]["session_id"], "session_1");
         assert_eq!(result["sessions"][0]["run_id"], "run_1");
         assert_eq!(result["sessions"][0]["status"], "running");
+
+        let cancel = server.handle_line(
+            r#"{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"run_id":"run_1"}}"#,
+        );
+        assert_eq!(cancel.kind, EnvelopeKind::Response);
+        assert_eq!(cancel.result.unwrap()["status"], "cancel_requested");
+
+        let response = server
+            .handle_line(r#"{"v":1,"id":"sessions_2","kind":"request","method":"sessions.list"}"#);
+        let result = response.result.unwrap();
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        assert_eq!(result["sessions"][0]["run_id"], "run_1");
+        assert_eq!(result["sessions"][0]["status"], "cancel_requested");
     }
 
     #[test]
