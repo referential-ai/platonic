@@ -799,8 +799,12 @@ fn composer_height(state: &TuiState) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::protocol::{HelloResult, SessionSummary, TranscriptReadResult};
+    use crate::daemon::protocol::{
+        HelloResult, PendingApprovalSnapshot, SessionSummary, TranscriptReadResult,
+    };
+    use platonic_core::EffectClass;
 
+    use super::super::state::approval_from_snapshot;
     use super::super::{ActiveRunView, LiveEventLine};
 
     #[test]
@@ -1391,22 +1395,22 @@ mod tests {
             Vec::new(),
             TranscriptState::None,
         );
-        state.approval = Some(ApprovalModalView {
+        state.approval = Some(approval_from_snapshot(PendingApprovalSnapshot {
             run_id: "run_1".into(),
             tool_call_id: "call_1".into(),
             tool_name: "file.write".into(),
-            effect: "WorkspaceWrite".into(),
-            reason: "file.write requires approval".into(),
-            input_preview: r#"{"path":"scratch.txt"}"#.into(),
+            effect: EffectClass::WorkspaceWrite,
+            reason: Some("file.write requires approval".into()),
+            input_preview: Some(r#"{"path":"scratch.txt"}"#.into()),
             approval_preview: None,
             diff_preview: None,
-        });
+        }));
 
         let output = render_to_text(&state);
 
         assert!(output.contains("Approval"));
         assert!(output.contains("file.write"));
-        assert!(output.contains("WorkspaceWrite"));
+        assert!(output.contains("workspace_write"));
         assert!(output.contains("scratch.txt"));
         assert!(output.contains("g grant"));
         assert!(output.contains("d deny"));

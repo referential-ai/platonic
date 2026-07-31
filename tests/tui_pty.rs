@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use plato_agent::{
-    daemon::protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION},
+    daemon::protocol::{ERROR_LAGGED, Envelope, EnvelopeKind, PROTOCOL_VERSION},
     paths,
 };
 use pty_process::{
@@ -33,6 +33,8 @@ const RESIZED_COLS: u16 = 100;
 const PROOF_TIMEOUT: Duration = Duration::from_secs(15);
 const MARKER: &str = "__PLATO_TUI_PTY_237__";
 const EXPECTED_DRAFT: &str = "ask hello café pasted text";
+const PENDING_RUN_ID: &str = "run_pty_pending";
+const PENDING_CALL_ID: &str = "call_pty_pending";
 
 #[test]
 fn bare_plato_preserves_draft_and_restores_parent_terminal() {
@@ -140,6 +142,87 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
     );
 }
 
+#[test]
+fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+
+    let workspace_id = paths::workspace_id(&workspace).unwrap();
+    let endpoint = runtime
+        .join("plato-agent")
+        .join("workspaces")
+        .join(&workspace_id)
+        .join("agent.sock");
+    let ledger = state.join("fake-agent.db");
+    let fake = FakeDaemon::bind_pending_approval(&endpoint, &workspace, &workspace_id, &ledger);
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        br#"pre=$(stty -g); printf '\n%sPRE:%s\n' "$PTY_MARK" "$pre"; "$PLATO_BIN"; status=$?; post=$(stty -g); printf '\n%sPOST:%s\n%sSTATUS:%s\n' "$PTY_MARK" "$post" "$PTY_MARK" "$status"
+"#,
+    );
+    let before_termios = shell.wait_for_marker("PRE");
+    let approval_screen = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, PENDING_CALL_ID);
+    assert!(approval_screen.contains("Approval"));
+    assert!(approval_screen.contains("file.edit (workspace_write)"));
+    assert!(approval_screen.contains("review the PTY edit"));
+    assert!(approval_screen.contains("-old PTY"));
+    assert!(approval_screen.contains("+new PTY"));
+
+    fake.wait_for_request_count("events.stream", 2);
+    let stream_requests = fake.requests_for("events.stream");
+    assert_eq!(
+        stream_requests[0].params.as_ref().unwrap()["from_offset"],
+        0
+    );
+    assert!(
+        stream_requests[1]
+            .params
+            .as_ref()
+            .unwrap()
+            .get("from_offset")
+            .is_none(),
+        "lag recovery must request the current tip"
+    );
+
+    shell.write(b"d");
+    let decision = fake.wait_for_request("approval.decide");
+    let params = decision.params.as_ref().unwrap();
+    assert_eq!(params["run_id"], PENDING_RUN_ID);
+    assert_eq!(params["tool_call_id"], PENDING_CALL_ID);
+    assert_eq!(params["decision"], "deny");
+    assert_eq!(params["reason"], "denied by plato-tui");
+
+    let decided = shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "approval decision sent for run_pty_pending",
+    );
+    assert!(!decided.contains(PENDING_CALL_ID));
+    shell.write(b"q");
+
+    let after_termios = shell.wait_for_marker("POST");
+    assert_eq!(after_termios, before_termios);
+    assert_eq!(shell.wait_for_marker("STATUS"), "0");
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+
+    let requests = fake.finish();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method.as_deref() == Some("approval.decide"))
+            .count(),
+        1
+    );
+}
+
 struct PtyShell {
     pty: Pty,
     child: Child,
@@ -238,6 +321,27 @@ impl PtyShell {
         }
     }
 
+    fn wait_for_screen_text(&mut self, rows: u16, cols: u16, expected: &str) -> String {
+        let deadline = Instant::now() + PROOF_TIMEOUT;
+        loop {
+            let output = self.output.lock().unwrap().clone();
+            let screen = parsed_screen(&output, rows, cols, None);
+            let contents = screen.contents();
+            if contents.contains(expected) {
+                assert_eq!(screen.size(), (rows, cols));
+                return contents;
+            }
+            self.assert_running(expected);
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {expected:?} on rendered screen\nrendered:\n{}\nraw:\n{}",
+                contents,
+                output_tail(&output)
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn assert_running(&mut self, context: &str) {
         if let Some(status) = self.child.try_wait().unwrap() {
             let output = self.output.lock().unwrap();
@@ -314,6 +418,12 @@ fn output_tail(output: &[u8]) -> String {
     String::from_utf8_lossy(&output[start..]).into_owned()
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FakeScenario {
+    FreshRun,
+    PendingApproval,
+}
+
 struct FakeDaemon {
     requests: Arc<Mutex<Vec<Envelope>>>,
     stop: Sender<()>,
@@ -322,6 +432,37 @@ struct FakeDaemon {
 
 impl FakeDaemon {
     fn bind(endpoint: &Path, workspace: &Path, workspace_id: &str, ledger: &Path) -> Self {
+        Self::bind_scenario(
+            endpoint,
+            workspace,
+            workspace_id,
+            ledger,
+            FakeScenario::FreshRun,
+        )
+    }
+
+    fn bind_pending_approval(
+        endpoint: &Path,
+        workspace: &Path,
+        workspace_id: &str,
+        ledger: &Path,
+    ) -> Self {
+        Self::bind_scenario(
+            endpoint,
+            workspace,
+            workspace_id,
+            ledger,
+            FakeScenario::PendingApproval,
+        )
+    }
+
+    fn bind_scenario(
+        endpoint: &Path,
+        workspace: &Path,
+        workspace_id: &str,
+        ledger: &Path,
+        scenario: FakeScenario,
+    ) -> Self {
         fs::create_dir_all(endpoint.parent().unwrap()).unwrap();
         let listener = UnixListener::bind(endpoint).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -339,6 +480,7 @@ impl FakeDaemon {
                 workspace_root,
                 workspace_id,
                 ledger,
+                scenario,
             )
         });
         Self {
@@ -346,6 +488,38 @@ impl FakeDaemon {
             stop,
             server: Some(server),
         }
+    }
+
+    fn wait_for_request_count(&self, method: &str, count: usize) {
+        let deadline = Instant::now() + PROOF_TIMEOUT;
+        loop {
+            let actual = self
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.method.as_deref() == Some(method))
+                .count();
+            if actual >= count {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fake daemon received {actual} {method} requests, expected {count}; received {:?}",
+                self.request_methods()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn requests_for(&self, method: &str) -> Vec<Envelope> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_deref() == Some(method))
+            .cloned()
+            .collect()
     }
 
     fn wait_for_request(&self, method: &str) -> Envelope {
@@ -404,6 +578,7 @@ fn serve_fake_daemon(
     workspace_root: PathBuf,
     workspace_id: String,
     ledger: PathBuf,
+    scenario: FakeScenario,
 ) -> Result<(), String> {
     loop {
         match stopped.try_recv() {
@@ -411,9 +586,14 @@ fn serve_fake_daemon(
             Err(TryRecvError::Empty) => {}
         }
         match listener.accept() {
-            Ok((stream, _)) => {
-                handle_connection(stream, &requests, &workspace_root, &workspace_id, &ledger)?
-            }
+            Ok((stream, _)) => handle_connection(
+                stream,
+                &requests,
+                &workspace_root,
+                &workspace_id,
+                &ledger,
+                scenario,
+            )?,
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(5));
             }
@@ -428,6 +608,7 @@ fn handle_connection(
     workspace_root: &Path,
     workspace_id: &str,
     ledger: &Path,
+    scenario: FakeScenario,
 ) -> Result<(), String> {
     let reader = stream
         .try_clone()
@@ -448,7 +629,20 @@ fn handle_connection(
         if request.v != PROTOCOL_VERSION || request.kind != EnvelopeKind::Request {
             return Err(format!("invalid daemon envelope: {request:?}"));
         }
-        let response = fake_response(&request, workspace_root, workspace_id, ledger)?;
+        let first_stream_request = request.method.as_deref() == Some("events.stream")
+            && !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.method.as_deref() == Some("events.stream"));
+        let response = fake_response(
+            &request,
+            workspace_root,
+            workspace_id,
+            ledger,
+            scenario,
+            first_stream_request,
+        )?;
         let mut response = serde_json::to_vec(&response)
             .map_err(|error| format!("fake daemon response failed: {error}"))?;
         response.push(b'\n');
@@ -470,11 +664,24 @@ fn fake_response(
     workspace_root: &Path,
     workspace_id: &str,
     ledger: &Path,
+    scenario: FakeScenario,
+    first_stream_request: bool,
 ) -> Result<Envelope, String> {
     let method = request
         .method
         .as_deref()
         .ok_or_else(|| "daemon request omitted method".to_owned())?;
+    if scenario == FakeScenario::PendingApproval
+        && method == "events.stream"
+        && first_stream_request
+    {
+        return Ok(Envelope::error(
+            request.id.clone(),
+            Some(method.into()),
+            ERROR_LAGGED,
+            "offset is no longer buffered",
+        ));
+    }
     let result = match method {
         "hello" => {
             let params = request
@@ -498,11 +705,48 @@ fn fake_response(
                     "run.start",
                     "events.stream",
                     "sessions.list",
-                    "transcript.read"
+                    "transcript.read",
+                    "transcript.read.pending_approval",
+                    "approval.decide"
                 ]
             })
         }
-        "sessions.list" => json!({"sessions": []}),
+        "sessions.list" => match scenario {
+            FakeScenario::FreshRun => json!({"sessions": []}),
+            FakeScenario::PendingApproval => json!({
+                "sessions": [
+                    {
+                        "session_id": "session_pty_pending",
+                        "run_id": PENDING_RUN_ID,
+                        "status": "running",
+                        "latest_question": "review the PTY edit",
+                        "ledger_path": ledger.to_string_lossy()
+                    },
+                    {
+                        "session_id": "session_pty_other",
+                        "run_id": "run_pty_other",
+                        "status": "running",
+                        "latest_question": "other simultaneous run",
+                        "ledger_path": ledger.to_string_lossy()
+                    }
+                ]
+            }),
+        },
+        "transcript.read" if scenario == FakeScenario::PendingApproval => json!({
+            "run_id": PENDING_RUN_ID,
+            "status": "running",
+            "final_answer": null,
+            "transcript": "[turn_pty] user: review the PTY edit\n",
+            "pending_approval": {
+                "run_id": PENDING_RUN_ID,
+                "tool_call_id": PENDING_CALL_ID,
+                "tool_name": "file.edit",
+                "effect": "workspace_write",
+                "reason": "review the PTY edit",
+                "input_preview": "{\"path\":\"pty.txt\"}",
+                "diff_preview": "-old PTY\n+new PTY\n"
+            }
+        }),
         "run.start" => json!({
             "run_id": "run_tui_pty",
             "session_id": "session_tui_pty",
@@ -516,15 +760,24 @@ fn fake_response(
                 .as_ref()
                 .and_then(|params| params.get("from_offset"))
                 .and_then(Value::as_u64)
-                .unwrap_or(0);
+                .unwrap_or(9);
+            let run_id = if scenario == FakeScenario::PendingApproval {
+                PENDING_RUN_ID
+            } else {
+                "run_tui_pty"
+            };
             json!({
-                "run_id": "run_tui_pty",
+                "run_id": run_id,
                 "from_offset": from_offset,
                 "next_offset": from_offset,
                 "status": "running",
                 "events": []
             })
         }
+        "approval.decide" if scenario == FakeScenario::PendingApproval => json!({
+            "run_id": PENDING_RUN_ID,
+            "status": "running"
+        }),
         _ => {
             return Ok(Envelope::error(
                 request.id.clone(),
