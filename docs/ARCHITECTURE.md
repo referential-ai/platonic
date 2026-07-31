@@ -90,7 +90,7 @@ A bounded agent unit (`AgentId`): not a personality blob, but an execution ident
 
 A durable execution instance. A run is event-log-first. Transcripts, metrics, replay, and audit views are derived from events. The run loop lives in `run` as a pure state machine; hosts drive it. `RunCommand` (desired effects) is a separate type from `HarnessEvent` (recorded facts); replay applies events only, so it can never re-emit IO.
 
-`RunReadback` lives in `projection` as a small pure view over a recorded ledger. It validates the ledger by replaying each `RecordedEvent` through `RunState`, then projects chronological context fragments, model failures and messages, whole-batch proposal rejections, tool calls, tool results, policy denials, approval grants and denials, and tool failures. It does not store events, render output, execute tools, call providers, or read clocks.
+`RunReadback` lives in `projection` as a small pure, all-visibility audit view over a recorded ledger. It validates the ledger by replaying each `RecordedEvent` through `RunState`, then projects chronological context fragments, model failures and messages, whole-batch proposal rejections, tool calls, tool results, policy denials, approval grants and denials, and tool failures. Every recorded tool result is retained with its `ResultVisibility` metadata; the view does not filter for a model or user audience. It does not store events, render output, execute tools, call providers, or read clocks.
 
 ### ContextPack
 
@@ -187,7 +187,7 @@ The multi-turn proof extends that contract without adding IO or runtime machiner
 - a successful tool result can conclude one turn and feed a later host-built context/model turn;
 - whole-batch proposal rejection, policy denial, approval denial, and tool failure can also conclude a turn and continue through later host-built context;
 - each turn consumes at most one host-validated tool call, while `model_responded` records all proposals as ledger facts;
-- immediate `turn_id` reuse after a concluded turn is rejected;
+- `turn_id` and host-validated `ToolCallId` reuse anywhere later in the same run is rejected;
 - model `step` sequencing continues across turns;
 - replay over a two-turn ledger still emits zero model calls and zero tool executions.
 - readback projection is derived from replay-validated ledgers and rejects invalid event streams instead of producing partial transcripts.

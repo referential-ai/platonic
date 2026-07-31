@@ -5,7 +5,10 @@ use crate::{
     RunPhase, RunState, ToolCall, ToolCallId, ToolResult, TurnId,
 };
 
-/// Replay-validated readback for one run ledger.
+/// Replay-validated, all-visibility audit view for one run ledger.
+///
+/// Tool results retain their recorded `ResultVisibility` metadata; this projection does not
+/// filter entries for a model or user audience.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunReadback {
     /// Chronological entries useful for replay output.
@@ -892,6 +895,84 @@ mod tests {
             call_id: call_id(),
             actor_id: actor_id(),
         }));
+    }
+
+    #[test]
+    fn replay_rejects_nonadjacent_turn_id_reuse() {
+        let events = vec![
+            start_event(0),
+            rec(1, context(turn_id(), "First turn")),
+            rec(2, model_requested(turn_id(), 0)),
+            rec(3, model_responded(turn_id(), 0, "done", vec![])),
+            rec(4, context(second_turn_id(), "Second turn")),
+            rec(5, model_requested(second_turn_id(), 1)),
+            rec(6, model_responded(second_turn_id(), 1, "done", vec![])),
+            rec(7, context(turn_id(), "Reused first turn")),
+        ];
+
+        assert_eq!(
+            RunReadback::from_events(&events).unwrap_err(),
+            Error::TurnReused {
+                turn_id: "turn_1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn replay_rejects_tool_call_id_reuse_in_a_later_turn() {
+        let events = vec![
+            start_event(0),
+            rec(1, context(turn_id(), "First read")),
+            rec(2, model_requested(turn_id(), 0)),
+            rec(
+                3,
+                model_responded(turn_id(), 0, "I will read it.", vec![proposal()]),
+            ),
+            rec(
+                4,
+                HarnessEvent::ToolCallProposed {
+                    run_id: run_id(),
+                    turn_id: turn_id(),
+                    call: call(),
+                },
+            ),
+            rec(
+                5,
+                HarnessEvent::PolicyEvaluated {
+                    run_id: run_id(),
+                    call_id: call_id(),
+                    decision: PolicyDecision::Deny {
+                        reason: "first call denied".into(),
+                    },
+                },
+            ),
+            rec(6, context(second_turn_id(), "Second read")),
+            rec(7, model_requested(second_turn_id(), 1)),
+            rec(
+                8,
+                model_responded(
+                    second_turn_id(),
+                    1,
+                    "I will read it again.",
+                    vec![proposal()],
+                ),
+            ),
+            rec(
+                9,
+                HarnessEvent::ToolCallProposed {
+                    run_id: run_id(),
+                    turn_id: second_turn_id(),
+                    call: call(),
+                },
+            ),
+        ];
+
+        assert_eq!(
+            RunReadback::from_events(&events).unwrap_err(),
+            Error::ToolCallReused {
+                call_id: "call_1".into()
+            }
+        );
     }
 
     #[test]

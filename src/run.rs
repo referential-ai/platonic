@@ -4,6 +4,7 @@ use crate::{
     ContextPack, Error, HarnessEvent, PolicyDecision, RecordedEvent, RunId, ToolCall, ToolCallId,
     ToolProposal, TurnId,
 };
+use std::collections::BTreeSet;
 
 /// Host command requested by the run state machine.
 #[derive(Clone, Debug, PartialEq)]
@@ -234,7 +235,8 @@ pub struct RunState {
     run_id: Option<RunId>,
     next_seq: u64,
     next_model_step: u32,
-    last_turn_id: Option<TurnId>,
+    used_turn_ids: BTreeSet<TurnId>,
+    used_tool_call_ids: BTreeSet<ToolCallId>,
     pending_compaction_turn_id: Option<TurnId>,
     phase: RunPhase,
 }
@@ -252,7 +254,8 @@ impl RunState {
             run_id: None,
             next_seq: 0,
             next_model_step: 0,
-            last_turn_id: None,
+            used_turn_ids: BTreeSet::new(),
+            used_tool_call_ids: BTreeSet::new(),
             pending_compaction_turn_id: None,
             phase: RunPhase::NotStarted,
         }
@@ -365,6 +368,7 @@ impl RunState {
                 },
             ) => {
                 ensure_compaction_range(*dropped_turn_start, *dropped_turn_end_exclusive)?;
+                ensure_new_turn(&self.used_turn_ids, turn_id)?;
                 self.pending_compaction_turn_id = Some(turn_id.clone());
                 Ok(())
             }
@@ -442,6 +446,8 @@ impl RunState {
             ) => {
                 ensure_turn(turn_id, actual_turn_id)?;
                 ensure_proposed(proposals, call)?;
+                ensure_new_tool_call(&self.used_tool_call_ids, &call.id)?;
+                self.used_tool_call_ids.insert(call.id.clone());
                 self.phase = RunPhase::AwaitingPolicy { call: call.clone() };
                 Ok(())
             }
@@ -549,9 +555,9 @@ impl RunState {
     }
 
     fn start_turn(&mut self, turn_id: &TurnId, context: &ContextPack) -> Result<(), Error> {
-        ensure_new_turn(self.last_turn_id.as_ref(), turn_id)?;
+        ensure_new_turn(&self.used_turn_ids, turn_id)?;
         context.validate_budget()?;
-        self.last_turn_id = Some(turn_id.clone());
+        self.used_turn_ids.insert(turn_id.clone());
         self.phase = RunPhase::ReadyToRequestModel {
             turn_id: turn_id.clone(),
             step: self.next_model_step,
@@ -600,8 +606,8 @@ fn ensure_turn(expected: &TurnId, actual: &TurnId) -> Result<(), Error> {
     })
 }
 
-fn ensure_new_turn(previous: Option<&TurnId>, actual: &TurnId) -> Result<(), Error> {
-    if previous.is_some_and(|previous| previous == actual) {
+fn ensure_new_turn(used_turn_ids: &BTreeSet<TurnId>, actual: &TurnId) -> Result<(), Error> {
+    if used_turn_ids.contains(actual) {
         return Err(Error::TurnReused {
             turn_id: actual.to_string(),
         });
@@ -641,6 +647,18 @@ fn ensure_call(expected: &ToolCallId, actual: &ToolCallId) -> Result<(), Error> 
         expected: expected.to_string(),
         actual: actual.to_string(),
     })
+}
+
+fn ensure_new_tool_call(
+    used_tool_call_ids: &BTreeSet<ToolCallId>,
+    actual: &ToolCallId,
+) -> Result<(), Error> {
+    if used_tool_call_ids.contains(actual) {
+        return Err(Error::ToolCallReused {
+            call_id: actual.to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn ensure_proposed(proposals: &[ToolProposal], call: &ToolCall) -> Result<(), Error> {
@@ -695,6 +713,10 @@ mod tests {
 
     fn call_id() -> ToolCallId {
         ToolCallId::new("call_1").unwrap()
+    }
+
+    fn other_call_id() -> ToolCallId {
+        ToolCallId::new("call_2").unwrap()
     }
 
     fn actor_id() -> ActorId {
@@ -1440,6 +1462,70 @@ mod tests {
     }
 
     #[test]
+    fn distinct_ids_preserve_pending_commands_and_replay_state() {
+        let second_call = ToolCall {
+            id: other_call_id(),
+            ..call(EffectClass::ReadOnly)
+        };
+        let events = vec![
+            start_event(0),
+            context_event(1),
+            model_requested(2),
+            model_responded(3),
+            tool_proposed(4, EffectClass::SecretAccess),
+            deny_policy(5),
+            second_context_event(6),
+            second_model_requested(7),
+            model_responded_with(
+                8,
+                other_turn_id(),
+                1,
+                "I should read the file again.",
+                vec![proposal()],
+            ),
+            rec(
+                9,
+                HarnessEvent::ToolCallProposed {
+                    run_id: run_id(),
+                    turn_id: other_turn_id(),
+                    call: second_call.clone(),
+                },
+            ),
+            rec(
+                10,
+                HarnessEvent::PolicyEvaluated {
+                    run_id: run_id(),
+                    call_id: other_call_id(),
+                    decision: PolicyDecision::Allow,
+                },
+            ),
+        ];
+
+        let mut state = RunState::new();
+        for event in &events[..7] {
+            state.apply(event).unwrap();
+        }
+        assert_eq!(
+            state.pending_command(),
+            Some(RunCommand::RequestModel {
+                turn_id: other_turn_id(),
+                step: 1,
+                context: context_with_content(10, "tool result: read README"),
+            })
+        );
+
+        for event in &events[7..] {
+            state.apply(event).unwrap();
+        }
+        assert_eq!(
+            state.pending_command(),
+            Some(RunCommand::ExecuteTool { call: second_call })
+        );
+        assert_eq!(state.next_seq(), 11);
+        assert_eq!(apply_all(&events), state);
+    }
+
+    #[test]
     fn policy_denial_can_feed_a_second_model_turn_without_tool_execution() {
         let events = vec![
             start_event(0),
@@ -1523,21 +1609,32 @@ mod tests {
     }
 
     #[test]
-    fn concluded_turn_cannot_reuse_turn_id() {
+    fn earlier_turn_id_cannot_be_reused_after_a_distinct_turn() {
         let events = [
             start_event(0),
             context_event(1),
             model_requested(2),
-            model_responded(3),
-            tool_proposed(4, EffectClass::ReadOnly),
-            allow_policy(5),
-            tool_started(6),
-            tool_finished(7),
+            model_responded_with(3, turn_id(), 0, "first turn done", vec![]),
+            second_context_event(4),
+            second_model_requested(5),
+            second_model_answer(6),
         ];
         let mut state = apply_all(&events);
+        let unchanged = state.clone();
+
+        let mut compacted = state.clone();
+        assert_eq!(
+            compacted
+                .apply(&compaction_event(7, turn_id()))
+                .unwrap_err(),
+            Error::TurnReused {
+                turn_id: "turn_1".into()
+            }
+        );
+        assert_eq!(compacted, unchanged);
 
         let err = state
-            .apply(&context_event_for(8, turn_id(), "reuse turn id"))
+            .apply(&context_event_for(7, turn_id(), "reuse turn id"))
             .unwrap_err();
         assert_eq!(
             err,
@@ -1545,6 +1642,48 @@ mod tests {
                 turn_id: "turn_1".into()
             }
         );
+        assert_eq!(state, unchanged);
+    }
+
+    #[test]
+    fn tool_call_id_cannot_be_reused_in_a_later_turn() {
+        let events = [
+            start_event(0),
+            context_event(1),
+            model_requested(2),
+            model_responded(3),
+            tool_proposed(4, EffectClass::SecretAccess),
+            deny_policy(5),
+            second_context_event(6),
+            second_model_requested(7),
+            model_responded_with(
+                8,
+                other_turn_id(),
+                1,
+                "I should read the file again.",
+                vec![proposal()],
+            ),
+        ];
+        let mut state = apply_all(&events);
+        let unchanged = state.clone();
+
+        let err = state
+            .apply(&rec(
+                9,
+                HarnessEvent::ToolCallProposed {
+                    run_id: run_id(),
+                    turn_id: other_turn_id(),
+                    call: call(EffectClass::ReadOnly),
+                },
+            ))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::ToolCallReused {
+                call_id: "call_1".into()
+            }
+        );
+        assert_eq!(state, unchanged);
     }
 
     #[test]
@@ -1943,6 +2082,34 @@ mod tests {
 
         let err = state.apply(&unproposed_tool(4));
         assert_eq!(err, Err(Error::UnproposedToolCall));
+    }
+
+    #[test]
+    fn tool_call_id_mismatches_are_rejected() {
+        let mut state = apply_all(&[
+            start_event(0),
+            context_event(1),
+            model_requested(2),
+            model_responded(3),
+            tool_proposed(4, EffectClass::ReadOnly),
+        ]);
+
+        assert_eq!(
+            state
+                .apply(&rec(
+                    5,
+                    HarnessEvent::PolicyEvaluated {
+                        run_id: run_id(),
+                        call_id: ToolCallId::new("call_2").unwrap(),
+                        decision: PolicyDecision::Allow,
+                    },
+                ))
+                .unwrap_err(),
+            Error::ToolCallMismatch {
+                expected: "call_1".into(),
+                actual: "call_2".into(),
+            }
+        );
     }
 
     #[test]
