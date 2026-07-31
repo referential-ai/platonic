@@ -248,6 +248,8 @@ the path. Do not remove a lock for a live daemon.
 Live assistant deltas are transient `events.stream` events and are not written
 to the ledger. After a `lagged` response, omitting `from_offset` resumes at the
 current tip; `transcript.read` returns ledger-backed status and final answer.
+The collector drains every queued run event into the contiguous-offset buffer
+before `finished`, `failed`, or `canceled` can be observed.
 The daemon retains event buffers for the newest 32 terminal runs in completion
 order. Older runs return `not_found` from `events.stream`; `transcript.read` and
 `sessions.list` remain ledger-backed.

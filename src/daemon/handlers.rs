@@ -1,5 +1,5 @@
 use crate::{
-    AppError, AppResult, ApprovalMode, RunEvent, RunLedger, RunOptions, RunSession,
+    AppError, AppResult, ApprovalMode, RunEvent, RunLedger, RunOptions, RunOutcome, RunSession,
     daemon::{
         protocol::{
             ApprovalDecideParams, ApprovalDecision, ApprovalDecisionName, CommandAcceptedResult,
@@ -37,6 +37,7 @@ use std::{
 const DEFAULT_EVENT_LIMIT: usize = 64;
 const MAX_EVENT_LIMIT: usize = 128;
 const LATEST_QUESTION_MAX_CHARS: usize = 120;
+const EVENT_COLLECTOR_PANIC: &str = "daemon event collector panicked";
 
 pub(super) fn handle_line(runtime: &DaemonRuntime, line: &str) -> Envelope {
     match decode_request(line) {
@@ -318,7 +319,7 @@ fn start_run(
     }
 
     let (event_sender, event_receiver) = mpsc::channel::<RunEvent>();
-    spawn_event_collector(record.clone(), event_receiver);
+    let event_collector = spawn_event_collector(record.clone(), event_receiver);
     let options = RunOptions {
         question,
         config_path: config_path.map(PathBuf::from),
@@ -334,30 +335,50 @@ fn start_run(
     };
 
     if wait.unwrap_or(false) {
-        match run_question(options) {
-            Ok(outcome) => {
-                runtime.finish_run(&record, outcome.final_answer.clone());
-                run_start_response(request_id, method, &record)
-            }
-            Err(error) => {
-                runtime.finish_run_with_error(&record, &error);
-                Envelope::error(
-                    request_id,
-                    Some(method.into()),
-                    ERROR_RUN_FAILED,
-                    error.to_string(),
-                )
-            }
+        match run_to_completion(runtime, &record, options, event_collector) {
+            Ok(_) => run_start_response(request_id, method, &record),
+            Err(error) => Envelope::error(
+                request_id,
+                Some(method.into()),
+                ERROR_RUN_FAILED,
+                error.to_string(),
+            ),
         }
     } else {
         let worker_runtime = runtime.clone();
         let worker_record = record.clone();
-        thread::spawn(move || match run_question(options) {
-            Ok(outcome) => worker_runtime.finish_run(&worker_record, outcome.final_answer),
-            Err(error) => worker_runtime.finish_run_with_error(&worker_record, &error),
+        thread::spawn(move || {
+            let _ = run_to_completion(&worker_runtime, &worker_record, options, event_collector);
         });
         run_start_response(request_id, method, &record)
     }
+}
+
+fn run_to_completion(
+    runtime: &DaemonRuntime,
+    record: &RunRecord,
+    options: RunOptions,
+    event_collector: thread::JoinHandle<()>,
+) -> AppResult<RunOutcome> {
+    let outcome = run_question(options);
+    finish_run_after_event_collection(runtime, record, outcome, event_collector)
+}
+
+fn finish_run_after_event_collection(
+    runtime: &DaemonRuntime,
+    record: &RunRecord,
+    outcome: AppResult<RunOutcome>,
+    event_collector: thread::JoinHandle<()>,
+) -> AppResult<RunOutcome> {
+    let outcome = match event_collector.join() {
+        Ok(()) => outcome,
+        Err(_) => Err(AppError::RunFailed(EVENT_COLLECTOR_PANIC.into())),
+    };
+    match &outcome {
+        Ok(outcome) => runtime.finish_run(record, outcome.final_answer.clone()),
+        Err(error) => runtime.finish_run_with_error(record, error),
+    }
+    outcome
 }
 
 fn handle_shutdown_if_idle(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
@@ -862,15 +883,22 @@ fn handle_with_params<T: serde::de::DeserializeOwned>(
     handler(runtime, request, params)
 }
 
-fn spawn_event_collector(record: Arc<RunRecord>, receiver: mpsc::Receiver<RunEvent>) {
+fn spawn_event_collector(
+    record: Arc<RunRecord>,
+    receiver: mpsc::Receiver<RunEvent>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         for event in receiver {
-            match event {
-                RunEvent::Ledger(recorded) => record.push_recorded_event(recorded),
-                RunEvent::AssistantDelta(delta) => record.push_assistant_delta(delta),
-            }
+            collect_run_event(&record, event);
         }
-    });
+    })
+}
+
+fn collect_run_event(record: &RunRecord, event: RunEvent) {
+    match event {
+        RunEvent::Ledger(recorded) => record.push_recorded_event(recorded),
+        RunEvent::AssistantDelta(delta) => record.push_assistant_delta(delta),
+    }
 }
 
 fn find_run(runtime: &DaemonRuntime, run_id: &str) -> Result<Arc<RunRecord>, String> {
@@ -891,11 +919,231 @@ fn error_response(request_id: Option<String>, method: &'static str, message: Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AssistantDeltaEvent;
     use platonic_core::{
         ActorId, ContextFragment, ContextLane, EffectClass, HarnessEvent, Message, MessageRole,
         RecordedEvent, ResultVisibility, RunId, ToolCall, ToolCallId, ToolName, ToolResult, TurnId,
     };
     use serde_json::json;
+    use std::{sync::Barrier, time::Duration};
+
+    #[test]
+    fn terminal_status_waits_for_collected_events_on_success_failure_and_cancellation() {
+        assert_terminal_waits_for_collector(
+            "success",
+            Ok(RunOutcome {
+                run_id: RunId::new("run_success").unwrap(),
+                final_answer: "done".into(),
+            }),
+            RunStateName::Finished,
+        );
+        assert_terminal_waits_for_collector(
+            "failure",
+            Err(AppError::RunFailed("provider failed".into())),
+            RunStateName::Failed,
+        );
+        assert_terminal_waits_for_collector(
+            "cancellation",
+            Err(AppError::RunCanceled),
+            RunStateName::Canceled,
+        );
+    }
+
+    #[test]
+    fn collector_handle_drains_in_order_without_changing_retention() {
+        let record = test_run_record("retention");
+        let (event_sender, event_receiver) = mpsc::channel();
+        let event_collector = spawn_event_collector(record.clone(), event_receiver);
+        let sent = crate::daemon::runtime::MAX_EVENT_BUFFER as u64 + 2;
+        for delta_index in 0..sent {
+            event_sender
+                .send(test_delta("retention", delta_index))
+                .unwrap();
+        }
+        drop(event_sender);
+
+        event_collector.join().unwrap();
+
+        let buffer = record.events.lock().unwrap();
+        assert_eq!(buffer.first_offset, 2);
+        assert_eq!(buffer.next_offset, sent);
+        assert_eq!(
+            buffer
+                .events
+                .iter()
+                .map(|event| event.offset)
+                .collect::<Vec<_>>(),
+            (2..sent).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn collector_panic_becomes_typed_run_failure() {
+        let runtime = test_runtime();
+        let record = test_run_record("collector_panic");
+        runtime.reserve_run(record.clone()).unwrap();
+        let event_collector = thread::spawn(|| panic!("injected collector panic"));
+
+        let error = finish_run_after_event_collection(
+            &runtime,
+            &record,
+            Ok(RunOutcome {
+                run_id: RunId::new("run_collector_panic").unwrap(),
+                final_answer: "must not publish".into(),
+            }),
+            event_collector,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::RunFailed(ref reason) if reason == EVENT_COLLECTOR_PANIC
+        ));
+        assert_eq!(
+            record.status(),
+            crate::daemon::runtime::RunStatus {
+                state: RunStateName::Failed,
+                final_answer: None,
+                error: Some(format!("run did not finish: {EVENT_COLLECTOR_PANIC}")),
+            }
+        );
+    }
+
+    fn assert_terminal_waits_for_collector(
+        case: &'static str,
+        outcome: AppResult<RunOutcome>,
+        expected_status: RunStateName,
+    ) {
+        let runtime = test_runtime();
+        let record = test_run_record(case);
+        runtime.reserve_run(record.clone()).unwrap();
+        let (event_sender, event_receiver) = mpsc::channel();
+        for delta_index in 0..2 {
+            event_sender.send(test_delta(case, delta_index)).unwrap();
+        }
+        drop(event_sender);
+
+        let collected = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let collector_record = record.clone();
+        let collector_collected = collected.clone();
+        let collector_release = release.clone();
+        let event_collector = thread::spawn(move || {
+            let pending = event_receiver.into_iter().collect::<Vec<_>>();
+            collector_collected.wait();
+            collector_release.wait();
+            for event in pending {
+                collect_run_event(&collector_record, event);
+            }
+        });
+        collected.wait();
+
+        let finish_started = Arc::new(Barrier::new(2));
+        let finisher_started = finish_started.clone();
+        let finisher_runtime = runtime.clone();
+        let finisher_record = record.clone();
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let finisher = thread::spawn(move || {
+            finisher_started.wait();
+            let result = finish_run_after_event_collection(
+                &finisher_runtime,
+                &finisher_record,
+                outcome,
+                event_collector,
+            );
+            finished_sender.send(result).unwrap();
+        });
+        finish_started.wait();
+
+        assert_eq!(record.status().state, RunStateName::Running);
+        let buffer = record.events.lock().unwrap();
+        assert_eq!(buffer.first_offset, 0);
+        assert_eq!(buffer.next_offset, 0);
+        assert!(buffer.events.is_empty());
+        drop(buffer);
+        assert!(
+            matches!(
+                finished_receiver.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "{case} terminal status published before collector release"
+        );
+
+        release.wait();
+        let result = finished_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        finisher.join().unwrap();
+        let status = record.status();
+        assert_eq!(status.state, expected_status);
+        match expected_status {
+            RunStateName::Finished => {
+                assert_eq!(result.unwrap().final_answer, "done");
+                assert_eq!(status.final_answer.as_deref(), Some("done"));
+                assert_eq!(status.error, None);
+            }
+            RunStateName::Failed => {
+                assert!(matches!(
+                    result,
+                    Err(AppError::RunFailed(ref reason)) if reason == "provider failed"
+                ));
+                assert_eq!(status.final_answer, None);
+                assert_eq!(
+                    status.error.as_deref(),
+                    Some("run did not finish: provider failed")
+                );
+            }
+            RunStateName::Canceled => {
+                assert!(matches!(result, Err(AppError::RunCanceled)));
+                assert_eq!(status.final_answer, None);
+                assert_eq!(
+                    status.error.as_deref(),
+                    Some("run did not finish: run canceled")
+                );
+            }
+            unexpected => panic!("unexpected terminal test status: {unexpected}"),
+        }
+
+        let buffer = record.events.lock().unwrap();
+        assert_eq!(buffer.first_offset, 0);
+        assert_eq!(buffer.next_offset, 2);
+        assert_eq!(
+            buffer
+                .events
+                .iter()
+                .map(|event| event.offset)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    fn test_runtime() -> DaemonRuntime {
+        DaemonRuntime::new(crate::daemon::server::DaemonPaths {
+            workspace_root: PathBuf::from("/tmp/workspace"),
+            workspace_id: "workspace-1".into(),
+            socket_path: PathBuf::from("/tmp/agent.sock"),
+            lock_path: PathBuf::from("/tmp/agent.lock"),
+            ledger_path: PathBuf::from("/tmp/agent.db"),
+        })
+    }
+
+    fn test_run_record(case: &str) -> Arc<RunRecord> {
+        Arc::new(RunRecord::new(
+            format!("run_{case}"),
+            format!("session_{case}"),
+            PathBuf::from("/tmp/agent.db"),
+        ))
+    }
+
+    fn test_delta(case: &str, delta_index: u64) -> RunEvent {
+        RunEvent::AssistantDelta(AssistantDeltaEvent {
+            run_id: RunId::new(format!("run_{case}")).unwrap(),
+            turn_id: TurnId::new("turn_1").unwrap(),
+            step: 0,
+            delta_index,
+            text: format!("delta {delta_index}"),
+        })
+    }
 
     #[test]
     fn typed_entries_omit_context_compaction() {
