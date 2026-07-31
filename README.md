@@ -82,7 +82,11 @@ A completion POST rejected with HTTP 429 before any response body or streaming
 delta retries once and records the failed attempt plus repeated request at the
 same turn and step. A finite, nonnegative numeric `Retry-After` of at most 30
 seconds is honored; a missing or invalid value waits one second, and a value
-over 30 seconds is not retried. Other provider failures are not retried.
+over 30 seconds is not retried. Cancellation before the 429 is handled, and
+cancellation during the retry wait prevents the second request event and POST.
+Once the second request boundary is crossed, cancellation does not retract that
+POST and is observed at the existing response boundary. Other provider failures
+are not retried.
 
 `file.read` and `file.list` are auto-allowed. `file.write`, `file.edit`, and
 `shell.exec` require stdin approval and default to no. `shell.exec` runs from

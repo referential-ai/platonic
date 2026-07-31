@@ -547,7 +547,20 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                     reason,
                 },
             )?;
-            std::thread::sleep(delay);
+            let retry_deadline = std::time::Instant::now() + delay;
+            let retry_poll_interval = std::time::Duration::from_millis(100);
+            loop {
+                let now = std::time::Instant::now();
+                if now >= retry_deadline {
+                    break;
+                }
+                let remaining = retry_deadline - now;
+                std::thread::sleep(remaining.min(retry_poll_interval));
+                if remaining > retry_poll_interval {
+                    check_cancel(&mut recorder, &options, &run_id)?;
+                }
+            }
+            check_cancel(&mut recorder, &options, &run_id)?;
             record_event(
                 &mut recorder,
                 &options,
@@ -3455,10 +3468,10 @@ enabled = ["file.read"]
     }
 
     #[test]
-    fn completion_429_retries_identical_request_with_same_step_ledger_evidence_and_replay() {
+    fn completion_429_waits_admitted_delay_then_retries_once_with_exact_evidence() {
         let secret = "rate-limit-secret-body";
         let server = spawn_raw_provider_sequence(vec![
-            rate_limit_response(Some("0"), secret),
+            rate_limit_response(Some("0.2"), secret),
             successful_provider_response("retried answer"),
         ]);
         let dir = tempfile::tempdir().unwrap();
@@ -3466,6 +3479,7 @@ enabled = ["file.read"]
         let ledger_path = dir.path().join("events.jsonl");
         write_retry_test_config(&config_path, &server.base_url, 2_000, 2_000);
 
+        let started = std::time::Instant::now();
         let outcome = run_question(retry_test_options(
             config_path,
             ledger_path.clone(),
@@ -3475,10 +3489,19 @@ enabled = ["file.read"]
             None,
         ))
         .unwrap();
+        let elapsed = started.elapsed();
         let requests = server.handle.join().unwrap();
 
         assert_eq!(outcome.final_answer, "retried answer");
         assert_eq!(requests.len(), 2);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "admitted retry delay was too short: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "uncanceled retry exceeded its proof window: {elapsed:?}"
+        );
         assert_eq!(
             http_request_json(&requests[0]),
             http_request_json(&requests[1])
@@ -3802,48 +3825,231 @@ enabled = ["file.read"]
     }
 
     #[test]
-    fn cancellation_observed_after_first_429_uses_terminal_path_without_retry_evidence() {
+    fn cancellation_before_first_429_is_one_request_without_retry_failure_evidence() {
         let cancel = Arc::new(AtomicBool::new(false));
-        let server_cancel = cancel.clone();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let response = rate_limit_response(Some("0"), "");
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = read_http_request(&mut stream);
-            server_cancel.store(true, Ordering::SeqCst);
-            stream.write_all(response.as_bytes()).unwrap();
-            stream.flush().unwrap();
-            vec![request]
-        });
-        let server = SequenceProvider { base_url, handle };
+        let server = spawn_gated_retry_provider("2");
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("plato.toml");
-        let ledger_path = dir.path().join("events.jsonl");
+        let ledger_path = dir.path().join("events.db");
         write_retry_test_config(&config_path, &server.base_url, 2_000, 2_000);
-
-        let error = run_question(retry_test_options(
+        let options = retry_session_test_options(
             config_path,
             ledger_path.clone(),
             dir.path().to_path_buf(),
-            "run_retry_canceled",
+            "run_cancel_before_429",
+            "session_cancel_before_429",
             None,
-            Some(cancel),
-        ))
-        .unwrap_err();
+            cancel.clone(),
+        );
+        let run_handle = thread::spawn(move || run_question(options));
+
+        assert_eq!(
+            server
+                .request_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            0
+        );
+        cancel.store(true, Ordering::SeqCst);
+        server.response_sender.send(()).unwrap();
+        server.response_sender.send(()).unwrap();
+
+        let error = run_handle.join().unwrap().unwrap_err();
+        server.stop_sender.send(()).unwrap();
         let requests = server.handle.join().unwrap();
 
         assert!(matches!(error, AppError::RunCanceled));
         assert_eq!(requests.len(), 1);
-        let records = crate::ledger::read_records(&ledger_path).unwrap();
-        assert_eq!(
-            model_event_sequence(&records),
-            vec![("requested", "turn_1".into(), 0)]
+        assert_canceled_retry_session(
+            &ledger_path,
+            "run_cancel_before_429",
+            "session_cancel_before_429",
+            vec![("requested", "turn_1".into(), 0)],
         );
-        assert!(records.iter().any(|record| matches!(
-            &record.event,
-            HarnessEvent::RunFailed { reason, .. } if reason == RUN_CANCELED_REASON
-        )));
+    }
+
+    #[test]
+    fn cancellation_during_retry_wait_returns_promptly_without_second_request() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let server = spawn_gated_retry_provider("2");
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        let ledger_path = dir.path().join("events.db");
+        write_retry_test_config(&config_path, &server.base_url, 2_000, 2_000);
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let options = retry_session_test_options(
+            config_path,
+            ledger_path.clone(),
+            dir.path().to_path_buf(),
+            "run_cancel_during_wait",
+            "session_cancel_during_wait",
+            Some(event_sender),
+            cancel.clone(),
+        );
+        let run_handle = thread::spawn(move || run_question(options));
+
+        assert_eq!(
+            server
+                .request_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            0
+        );
+        server.response_sender.send(()).unwrap();
+        server.response_sender.send(()).unwrap();
+        wait_for_model_failed(&event_receiver);
+
+        const CANCEL_OBSERVATION_TARGET: std::time::Duration =
+            std::time::Duration::from_millis(250);
+        const TEST_RUNNER_SCHEDULER_TOLERANCE: std::time::Duration =
+            std::time::Duration::from_millis(750);
+
+        let canceled_at = std::time::Instant::now();
+        cancel.store(true, Ordering::SeqCst);
+        let error = run_handle.join().unwrap().unwrap_err();
+        // The full return also includes terminal SQLite persistence and runner
+        // scheduling after the inline loop's at-most-100 ms cancel poll.
+        let full_return_elapsed = canceled_at.elapsed();
+        server.stop_sender.send(()).unwrap();
+        let requests = server.handle.join().unwrap();
+
+        assert!(matches!(error, AppError::RunCanceled));
+        assert_eq!(requests.len(), 1);
+        assert!(
+            full_return_elapsed <= CANCEL_OBSERVATION_TARGET + TEST_RUNNER_SCHEDULER_TOLERANCE,
+            "retry-wait cancellation full return exceeded the 250 ms observation target plus \
+             750 ms test scheduler tolerance (1 s total, below the 2 s Retry-After): \
+             {full_return_elapsed:?}"
+        );
+        assert_canceled_retry_session(
+            &ledger_path,
+            "run_cancel_during_wait",
+            "session_cancel_during_wait",
+            vec![
+                ("requested", "turn_1".into(), 0),
+                ("failed", "turn_1".into(), 0),
+            ],
+        );
+    }
+
+    #[test]
+    fn cancellation_immediately_before_retry_prevents_second_request() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let server = spawn_gated_retry_provider("0.1");
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        let ledger_path = dir.path().join("events.db");
+        write_retry_test_config(&config_path, &server.base_url, 2_000, 2_000);
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let options = retry_session_test_options(
+            config_path,
+            ledger_path.clone(),
+            dir.path().to_path_buf(),
+            "run_cancel_before_retry",
+            "session_cancel_before_retry",
+            Some(event_sender),
+            cancel.clone(),
+        );
+        let boundary_cancel = cancel.clone();
+        let (boundary_ready_sender, boundary_ready_receiver) = std::sync::mpsc::sync_channel(0);
+        // Arm the event-gated cancel before the request. This single final wait
+        // slice makes the explicit pre-request check the only later observer.
+        let boundary_handle = thread::spawn(move || {
+            boundary_ready_sender.send(()).unwrap();
+            wait_for_model_failed(&event_receiver);
+            boundary_cancel.store(true, Ordering::SeqCst);
+        });
+        boundary_ready_receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let run_handle = thread::spawn(move || run_question(options));
+
+        assert_eq!(
+            server
+                .request_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            0
+        );
+        server.response_sender.send(()).unwrap();
+        server.response_sender.send(()).unwrap();
+
+        boundary_handle.join().unwrap();
+        let error = run_handle.join().unwrap().unwrap_err();
+        server.stop_sender.send(()).unwrap();
+        let requests = server.handle.join().unwrap();
+
+        assert!(matches!(error, AppError::RunCanceled));
+        assert_eq!(requests.len(), 1);
+        assert_canceled_retry_session(
+            &ledger_path,
+            "run_cancel_before_retry",
+            "session_cancel_before_retry",
+            vec![
+                ("requested", "turn_1".into(), 0),
+                ("failed", "turn_1".into(), 0),
+            ],
+        );
+    }
+
+    #[test]
+    fn cancellation_after_second_request_boundary_keeps_second_request_and_cancels() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let server = spawn_gated_retry_provider("0");
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        let ledger_path = dir.path().join("events.db");
+        write_retry_test_config(&config_path, &server.base_url, 2_000, 2_000);
+        let options = retry_session_test_options(
+            config_path,
+            ledger_path.clone(),
+            dir.path().to_path_buf(),
+            "run_cancel_after_second_request",
+            "session_cancel_after_second_request",
+            None,
+            cancel.clone(),
+        );
+        let run_handle = thread::spawn(move || run_question(options));
+
+        assert_eq!(
+            server
+                .request_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            0
+        );
+        server.response_sender.send(()).unwrap();
+        assert_eq!(
+            server
+                .request_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            1
+        );
+        cancel.store(true, Ordering::SeqCst);
+        server.response_sender.send(()).unwrap();
+
+        let error = run_handle.join().unwrap().unwrap_err();
+        server.stop_sender.send(()).unwrap();
+        let requests = server.handle.join().unwrap();
+
+        assert!(matches!(error, AppError::RunCanceled));
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            http_request_json(&requests[0]),
+            http_request_json(&requests[1])
+        );
+        assert_canceled_retry_session(
+            &ledger_path,
+            "run_cancel_after_second_request",
+            "session_cancel_after_second_request",
+            vec![
+                ("requested", "turn_1".into(), 0),
+                ("failed", "turn_1".into(), 0),
+                ("requested", "turn_1".into(), 0),
+                ("responded", "turn_1".into(), 0),
+            ],
+        );
     }
 
     #[test]
@@ -4459,6 +4665,14 @@ enabled = ["file.read"]
         handle: thread::JoinHandle<Vec<String>>,
     }
 
+    struct GatedRetryProvider {
+        base_url: String,
+        request_receiver: std::sync::mpsc::Receiver<usize>,
+        response_sender: std::sync::mpsc::Sender<()>,
+        stop_sender: std::sync::mpsc::Sender<()>,
+        handle: thread::JoinHandle<Vec<String>>,
+    }
+
     fn mutation_tool_response(
         provider_call_id: &str,
         provider_tool_name: &str,
@@ -4662,6 +4876,56 @@ enabled = ["file.write", "file.edit"]
         SequenceProvider { base_url, handle }
     }
 
+    fn spawn_gated_retry_provider(retry_after: &'static str) -> GatedRetryProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let responses = [
+            rate_limit_response(Some(retry_after), ""),
+            successful_provider_response("retried answer"),
+        ];
+        let (request_sender, request_receiver) = std::sync::mpsc::channel();
+        let (response_sender, response_receiver) = std::sync::mpsc::channel();
+        let (stop_sender, stop_receiver) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            loop {
+                if stop_receiver.try_recv().is_ok() {
+                    break;
+                }
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("provider accept failed: {error}"),
+                };
+                let request = read_http_request(&mut stream);
+                let index = requests.len();
+                request_sender.send(index).unwrap();
+                response_receiver
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                let response = responses
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| status_response(500, "Internal Server Error", None, ""));
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        GatedRetryProvider {
+            base_url,
+            request_receiver,
+            response_sender,
+            stop_sender,
+            handle,
+        }
+    }
+
     fn rate_limit_response(retry_after: Option<&str>, body: &str) -> String {
         status_response(429, "Too Many Requests", retry_after, body)
     }
@@ -4748,6 +5012,49 @@ enabled = ["file.read"]
         }
     }
 
+    fn retry_session_test_options(
+        config_path: PathBuf,
+        ledger_path: PathBuf,
+        workspace_root: PathBuf,
+        run_id: &str,
+        session_id: &str,
+        event_sender: Option<Sender<RunEvent>>,
+        cancel: Arc<AtomicBool>,
+    ) -> RunOptions {
+        RunOptions {
+            question: "say hello".into(),
+            config_path: Some(config_path),
+            overrides: RunOverrides::default(),
+            ledger: RunLedger::Sqlite(ledger_path),
+            workspace_root,
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(RunId::new(run_id).unwrap()),
+            session: Some(RunSession::Fresh {
+                session_id: session_id.into(),
+            }),
+            event_sender,
+            stream_to_stderr: false,
+            cancel: Some(cancel),
+        }
+    }
+
+    fn wait_for_model_failed(receiver: &std::sync::mpsc::Receiver<RunEvent>) {
+        loop {
+            let event = receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            if matches!(
+                event,
+                RunEvent::Ledger(RecordedEvent {
+                    event: HarnessEvent::ModelFailed { .. },
+                    ..
+                })
+            ) {
+                return;
+            }
+        }
+    }
+
     fn model_event_sequence(records: &[RecordedEvent]) -> Vec<(&'static str, String, u32)> {
         records
             .iter()
@@ -4764,6 +5071,62 @@ enabled = ["file.read"]
                 _ => None,
             })
             .collect()
+    }
+
+    fn assert_canceled_retry_session(
+        ledger_path: &Path,
+        run_id: &str,
+        session_id: &str,
+        expected_model_events: Vec<(&'static str, String, u32)>,
+    ) {
+        let records = crate::ledger::read_sqlite_records(ledger_path, Some(run_id)).unwrap();
+        assert_eq!(model_event_sequence(&records), expected_model_events);
+        let terminal_reasons = records
+            .iter()
+            .filter_map(|record| match &record.event {
+                HarnessEvent::RunFailed { reason, .. } => Some(reason.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(terminal_reasons, [RUN_CANCELED_REASON]);
+
+        let readback = RunReadback::from_events(&records).unwrap();
+        assert!(matches!(
+            readback.final_phase,
+            RunPhase::Failed { ref reason } if reason == RUN_CANCELED_REASON
+        ));
+
+        let ledger = SqliteLedger::open_readonly(ledger_path).unwrap();
+        let session = ledger.read_session(session_id).unwrap();
+        assert_eq!(session.runs.len(), 1);
+        assert_eq!(session.runs[0].run_id, run_id);
+        assert_eq!(session.runs[0].status.as_str(), "canceled");
+        assert_eq!(session.runs[0].final_answer, None);
+        assert_eq!(session.runs[0].records, records);
+
+        let connection = rusqlite::Connection::open(ledger_path).unwrap();
+        let (status, final_answer, error) = connection
+            .query_row(
+                "SELECT status, final_answer, error FROM session_runs WHERE run_id = ?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(status, "canceled");
+        assert_eq!(final_answer, None);
+        assert_eq!(error.as_deref(), Some(RUN_CANCELED_REASON));
+
+        let replay = crate::replay::replay_sqlite_session(ledger_path, session_id).unwrap();
+        assert!(replay.contains(&format!("session_id: {session_id}")));
+        assert!(replay.contains(&format!("run_id: {run_id}")));
+        assert!(replay.contains("final_phase: Failed"));
+        assert!(replay.contains(RUN_CANCELED_REASON));
     }
 
     fn assert_single_provider_terminal(ledger_path: &Path) {
