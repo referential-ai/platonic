@@ -3352,6 +3352,109 @@ enabled = ["file.read"]
     }
 
     #[test]
+    fn provider_http_bodies_never_reach_errors_live_events_or_ledgers() {
+        for (index, (status, reason)) in [
+            (400, "Bad Request"),
+            (401, "Unauthorized"),
+            (403, "Forbidden"),
+            (429, "Too Many Requests"),
+            (500, "Internal Server Error"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let secret = format!("provider-secret-{status}");
+            let retry_after = (status == 429).then_some("31");
+            let response = status_response(status, reason, retry_after, &secret);
+            let server = spawn_raw_provider_sequence(vec![response.clone(), response]);
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join("plato.toml");
+            write_retry_test_config(&config_path, &server.base_url, 2_000, 2_000);
+
+            let jsonl_path = dir.path().join("events.jsonl");
+            let (jsonl_sender, jsonl_receiver) = std::sync::mpsc::channel();
+            let jsonl_run_id = format!("run_status_jsonl_{index}");
+            let error = run_question(retry_test_options(
+                config_path.clone(),
+                jsonl_path.clone(),
+                dir.path().to_path_buf(),
+                &jsonl_run_id,
+                Some(jsonl_sender),
+                None,
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains(&status.to_string()));
+            assert!(!error.to_string().contains(&secret));
+
+            let live_events = jsonl_receiver.try_iter().collect::<Vec<_>>();
+            let live_debug = format!("{live_events:?}");
+            assert!(live_debug.contains(&status.to_string()));
+            assert!(!live_debug.contains(&secret));
+            let jsonl = std::fs::read_to_string(&jsonl_path).unwrap();
+            assert!(jsonl.contains(&status.to_string()));
+            assert!(!jsonl.contains(&secret));
+            let replay = crate::replay::replay_file(&jsonl_path).unwrap();
+            assert!(replay.contains("final_phase: Failed"));
+            assert!(replay.contains(&status.to_string()));
+            assert!(!replay.contains(&secret));
+
+            let sqlite_path = dir.path().join("events.db");
+            let sqlite_run_id = format!("run_status_sqlite_{index}");
+            let session_id = format!("session_status_{index}");
+            let (sqlite_sender, sqlite_receiver) = std::sync::mpsc::channel();
+            let error = run_question(RunOptions {
+                question: "say hello".into(),
+                config_path: Some(config_path.clone()),
+                overrides: RunOverrides::default(),
+                ledger: RunLedger::Sqlite(sqlite_path.clone()),
+                workspace_root: dir.path().to_path_buf(),
+                approval_mode: ApprovalMode::Deny { actor: "test" },
+                run_id: Some(RunId::new(sqlite_run_id.clone()).unwrap()),
+                session: Some(RunSession::Fresh {
+                    session_id: session_id.clone(),
+                }),
+                event_sender: Some(sqlite_sender),
+                stream_to_stderr: false,
+                cancel: None,
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains(&status.to_string()));
+            assert!(!error.to_string().contains(&secret));
+
+            let live_events = sqlite_receiver.try_iter().collect::<Vec<_>>();
+            let live_debug = format!("{live_events:?}");
+            assert!(live_debug.contains(&status.to_string()));
+            assert!(!live_debug.contains(&secret));
+            let connection = rusqlite::Connection::open(&sqlite_path).unwrap();
+            let event_json = connection
+                .prepare("SELECT event_json FROM ledger_events WHERE run_id = ?1 ORDER BY seq ASC")
+                .unwrap()
+                .query_map([&sqlite_run_id], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(event_json.contains(&status.to_string()));
+            assert!(!event_json.contains(&secret));
+            let session_error = connection
+                .query_row(
+                    "SELECT error FROM session_runs WHERE run_id = ?1",
+                    [&sqlite_run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            assert!(session_error.contains(&status.to_string()));
+            assert!(!session_error.contains(&secret));
+            let replay = crate::replay::replay_sqlite(&sqlite_path, Some(&sqlite_run_id)).unwrap();
+            assert!(replay.contains("final_phase: Failed"));
+            assert!(replay.contains(&status.to_string()));
+            assert!(!replay.contains(&secret));
+
+            assert_eq!(server.handle.join().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
     fn completion_429_retries_identical_request_with_same_step_ledger_evidence_and_replay() {
         let secret = "rate-limit-secret-body";
         let server = spawn_raw_provider_sequence(vec![
@@ -3604,6 +3707,98 @@ enabled = ["file.read"]
             model_event_sequence(&records),
             vec![("requested", "turn_1".into(), 0)]
         );
+    }
+
+    #[test]
+    fn provider_response_limit_failures_are_single_replay_valid_terminals() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+
+        let mut non_stream_body = json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "within"}
+            }]
+        })
+        .to_string();
+        non_stream_body.push_str(&" ".repeat(1024 * 1024 + 1 - non_stream_body.len()));
+        let server =
+            spawn_raw_provider_sequence(vec![ok_response("application/json", &non_stream_body)]);
+        write_retry_test_config(&config_path, &server.base_url, 2_000, 2_000);
+        let ledger_path = dir.path().join("non-stream-limit.jsonl");
+
+        let error = run_question(retry_test_options(
+            config_path.clone(),
+            ledger_path.clone(),
+            dir.path().to_path_buf(),
+            "run_non_stream_limit",
+            None,
+            None,
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("1 MiB non-stream body limit"));
+        assert_eq!(server.handle.join().unwrap().len(), 1);
+        assert_single_provider_terminal(&ledger_path);
+
+        let fragment = "x".repeat(4 * 1024 * 1024 / 8);
+        let mut streaming_body = (0..8)
+            .map(|_| {
+                format!(
+                    "data: {}\n\n",
+                    json!({
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": fragment},
+                            "finish_reason": null
+                        }]
+                    })
+                )
+            })
+            .collect::<String>();
+        streaming_body.push_str(&format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": "z"},
+                    "finish_reason": null
+                }]
+            })
+        ));
+        streaming_body.push_str(concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ));
+        let server =
+            spawn_raw_provider_sequence(vec![ok_response("text/event-stream", &streaming_body)]);
+        write_retry_test_config(&config_path, &server.base_url, 2_000, 2_000);
+        let ledger_path = dir.path().join("stream-limit.jsonl");
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+
+        let error = run_question(retry_test_options(
+            config_path,
+            ledger_path.clone(),
+            dir.path().to_path_buf(),
+            "run_stream_limit",
+            Some(event_sender),
+            None,
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("4 MiB assistant text limit"));
+        assert_eq!(server.handle.join().unwrap().len(), 1);
+        let deltas = event_receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                RunEvent::AssistantDelta(delta) => Some(delta.text),
+                RunEvent::Ledger(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            deltas.iter().map(String::len).sum::<usize>(),
+            4 * 1024 * 1024
+        );
+        assert!(!deltas.iter().any(|delta| delta == "z"));
+        assert_single_provider_terminal(&ledger_path);
     }
 
     #[test]
@@ -4468,11 +4663,15 @@ enabled = ["file.write", "file.edit"]
     }
 
     fn rate_limit_response(retry_after: Option<&str>, body: &str) -> String {
+        status_response(429, "Too Many Requests", retry_after, body)
+    }
+
+    fn status_response(status: u16, reason: &str, retry_after: Option<&str>, body: &str) -> String {
         let retry_after = retry_after
             .map(|value| format!("retry-after: {value}\r\n"))
             .unwrap_or_default();
         format!(
-            "HTTP/1.1 429 Too Many Requests\r\n{retry_after}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status} {reason}\r\n{retry_after}content-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         )
     }
@@ -4485,8 +4684,12 @@ enabled = ["file.write", "file.edit"]
             }]
         })
         .to_string();
+        ok_response("application/json", &body)
+    }
+
+    fn ok_response(content_type: &str, body: &str) -> String {
         format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         )
     }
@@ -4561,6 +4764,24 @@ enabled = ["file.read"]
                 _ => None,
             })
             .collect()
+    }
+
+    fn assert_single_provider_terminal(ledger_path: &Path) {
+        let records = crate::ledger::read_records(ledger_path).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.event, HarnessEvent::RunFailed { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(record.event, HarnessEvent::ModelResponded { .. }))
+        );
+        let replay = crate::replay::replay_file(ledger_path).unwrap();
+        assert!(replay.contains("final_phase: Failed"));
     }
 
     fn spawn_cancelable_streaming_provider(
