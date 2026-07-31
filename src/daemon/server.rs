@@ -89,6 +89,10 @@ impl DaemonPaths {
 #[derive(Debug)]
 pub struct DaemonServer {
     listener: transport::Listener,
+    #[cfg(unix)]
+    socket_device: u64,
+    #[cfg(unix)]
+    socket_inode: u64,
     runtime: DaemonRuntime,
     handlers: Arc<HandlerCapacity>,
     _lock: WorkspaceLock,
@@ -107,6 +111,8 @@ impl DaemonServer {
     }
 
     fn bind_inner(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<Self> {
+        #[cfg(unix)]
+        let reclaim_default_socket = socket_path.is_none();
         let paths = DaemonPaths::resolve(workspace_root, socket_path)?;
         #[cfg(unix)]
         {
@@ -127,19 +133,23 @@ impl DaemonServer {
         let lock = WorkspaceLock::acquire_for_workspace(&paths.workspace_root, &paths.socket_path)?;
         crate::ledger::interrupt_orphaned_default_sqlite_runs(&paths.default_ledger())?;
         #[cfg(unix)]
-        if paths.socket_path.exists() {
-            fs::remove_file(&paths.socket_path)?;
-        }
+        prepare_socket_for_bind(&paths.socket_path, reclaim_default_socket)?;
         let listener = transport::bind(&paths.socket_path)?;
+        #[cfg(unix)]
+        let (socket_device, socket_inode) = bound_socket_identity(&paths.socket_path)?;
         #[cfg(unix)]
         if let Err(error) = restrict_socket(&paths.socket_path) {
             drop(listener);
-            let _ = fs::remove_file(&paths.socket_path);
+            let _ = remove_socket_if_matches(&paths.socket_path, socket_device, socket_inode);
             return Err(error.into());
         }
         let runtime = DaemonRuntime::new(paths);
         Ok(Self {
             listener,
+            #[cfg(unix)]
+            socket_device,
+            #[cfg(unix)]
+            socket_inode,
             runtime,
             handlers: Arc::new(HandlerCapacity::default()),
             _lock: lock,
@@ -231,6 +241,67 @@ where
             eprintln!("daemon connection error: {error}");
         }
     })
+}
+
+#[cfg(unix)]
+fn prepare_socket_for_bind(path: &Path, reclaim_default_socket: bool) -> std::io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let path_in_use = || {
+        Error::new(
+            ErrorKind::AddrInUse,
+            format!("daemon socket path already exists: {}", path.display()),
+        )
+    };
+    if !reclaim_default_socket
+        || !metadata.file_type().is_socket()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+    {
+        return Err(path_in_use());
+    }
+
+    remove_socket_if_matches(path, metadata.dev(), metadata.ino())?;
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(path_in_use()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn bound_socket_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    let metadata = fs::symlink_metadata(path)?;
+    let expected_uid = rustix::process::geteuid().as_raw();
+    if !metadata.file_type().is_socket() || metadata.uid() != expected_uid {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "daemon socket path is not a current-user socket: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(unix)]
+fn remove_socket_if_matches(
+    path: &Path,
+    expected_device: u64,
+    expected_inode: u64,
+) -> std::io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.dev() == expected_device && metadata.ino() == expected_inode {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -407,7 +478,11 @@ fn handle_stream(runtime: DaemonRuntime, stream: transport::Stream) -> AppResult
 impl Drop for DaemonServer {
     fn drop(&mut self) {
         #[cfg(unix)]
-        let _ = fs::remove_file(&self.runtime.paths.socket_path);
+        let _ = remove_socket_if_matches(
+            &self.runtime.paths.socket_path,
+            self.socket_device,
+            self.socket_inode,
+        );
     }
 }
 
@@ -697,8 +772,10 @@ mod tests {
     use std::{
         io::{BufRead, Read},
         net::TcpListener,
-        os::unix::fs::PermissionsExt,
-        os::unix::net::UnixStream,
+        os::unix::{
+            fs::{PermissionsExt, symlink},
+            net::{UnixListener, UnixStream},
+        },
         sync::{Arc, Barrier, mpsc},
         thread,
         time::{Duration, Instant},
@@ -813,6 +890,174 @@ mod tests {
 
     fn mode(path: &Path) -> u32 {
         fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn test_default_socket_path(workspace: &Path) -> PathBuf {
+        crate::paths::with_test_xdg(workspace, || {
+            crate::paths::default_socket_path(workspace).unwrap()
+        })
+    }
+
+    fn socket_identity(path: &Path) -> (u64, u64) {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        (metadata.dev(), metadata.ino())
+    }
+
+    fn assert_addr_in_use(error: AppError) {
+        match error {
+            AppError::Io(error) => assert_eq!(error.kind(), ErrorKind::AddrInUse),
+            error => panic!("expected AddrInUse, got {error}"),
+        }
+    }
+
+    #[test]
+    fn regular_files_survive_failed_default_and_custom_bind_attempts() {
+        for custom_socket in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            let socket_root = tempfile::tempdir().unwrap();
+            let socket_path = if custom_socket {
+                socket_root.path().join("agent.sock")
+            } else {
+                test_default_socket_path(workspace.path())
+            };
+            fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+            fs::write(&socket_path, b"rightful owner").unwrap();
+
+            let error =
+                DaemonServer::bind(workspace.path(), custom_socket.then(|| socket_path.clone()))
+                    .unwrap_err();
+
+            assert_addr_in_use(error);
+            assert_eq!(fs::read(&socket_path).unwrap(), b"rightful owner");
+            assert!(fs::symlink_metadata(&socket_path).unwrap().is_file());
+        }
+    }
+
+    #[test]
+    fn symlinks_survive_failed_default_and_custom_bind_attempts() {
+        for custom_socket in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            let socket_root = tempfile::tempdir().unwrap();
+            let socket_path = if custom_socket {
+                socket_root.path().join("agent.sock")
+            } else {
+                test_default_socket_path(workspace.path())
+            };
+            let target = workspace.path().join("rightful-owner");
+            fs::write(&target, b"rightful owner").unwrap();
+            fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+            symlink(&target, &socket_path).unwrap();
+
+            let error =
+                DaemonServer::bind(workspace.path(), custom_socket.then(|| socket_path.clone()))
+                    .unwrap_err();
+
+            assert_addr_in_use(error);
+            assert_eq!(fs::read_link(&socket_path).unwrap(), target);
+            assert_eq!(fs::read(&target).unwrap(), b"rightful owner");
+        }
+    }
+
+    #[test]
+    fn custom_bind_preserves_a_stale_socket() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_root = tempfile::tempdir().unwrap();
+        let socket_path = socket_root.path().join("agent.sock");
+        let stale_listener = UnixListener::bind(&socket_path).unwrap();
+        let stale_identity = socket_identity(&socket_path);
+        drop(stale_listener);
+
+        let error = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap_err();
+
+        assert_addr_in_use(error);
+        assert_eq!(socket_identity(&socket_path), stale_identity);
+    }
+
+    #[test]
+    fn custom_socket_collision_preserves_the_first_workspace_server() {
+        let first_workspace = tempfile::tempdir().unwrap();
+        let second_workspace = tempfile::tempdir().unwrap();
+        let socket_root = tempfile::tempdir().unwrap();
+        let socket_path = socket_root.path().join("agent.sock");
+        let first_server =
+            DaemonServer::bind(first_workspace.path(), Some(socket_path.clone())).unwrap();
+        let first_identity = socket_identity(&socket_path);
+
+        let error =
+            DaemonServer::bind(second_workspace.path(), Some(socket_path.clone())).unwrap_err();
+
+        assert_addr_in_use(error);
+        assert_eq!(socket_identity(&socket_path), first_identity);
+
+        let first_workspace_id = first_server.paths().workspace_id.clone();
+        let handle = thread::spawn(move || first_server.serve_next().unwrap());
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        let hello = client.hello(first_workspace.path()).unwrap();
+        assert_eq!(hello.workspace_id, first_workspace_id);
+        drop(client);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn default_bind_recovers_a_stale_current_user_socket() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_path = test_default_socket_path(workspace.path());
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        let stale_listener = UnixListener::bind(&socket_path).unwrap();
+        drop(stale_listener);
+
+        let server = DaemonServer::bind(workspace.path(), None).unwrap();
+
+        assert_eq!(server.paths().socket_path, socket_path);
+        assert_eq!(mode(&socket_path), SOCKET_MODE);
+        let handle = thread::spawn(move || server.serve_next().unwrap());
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        client.hello(workspace.path()).unwrap();
+        drop(client);
+        handle.join().unwrap();
+        assert!(matches!(
+            fs::symlink_metadata(&socket_path),
+            Err(error) if error.kind() == ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn drop_preserves_a_replacement_socket() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_root = tempfile::tempdir().unwrap();
+        let socket_path = socket_root.path().join("agent.sock");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let bound_identity = socket_identity(&socket_path);
+        fs::remove_file(&socket_path).unwrap();
+        let replacement = UnixListener::bind(&socket_path).unwrap();
+        let replacement_identity = socket_identity(&socket_path);
+        assert_ne!(replacement_identity, bound_identity);
+
+        drop(server);
+
+        assert_eq!(socket_identity(&socket_path), replacement_identity);
+        let stream = UnixStream::connect(&socket_path).unwrap();
+        drop(stream);
+        drop(replacement);
+    }
+
+    #[test]
+    fn drop_removes_the_unchanged_bound_socket() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_root = tempfile::tempdir().unwrap();
+        let socket_path = socket_root.path().join("agent.sock");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        assert_eq!(
+            (server.socket_device, server.socket_inode),
+            socket_identity(&socket_path)
+        );
+
+        drop(server);
+
+        assert!(matches!(
+            fs::symlink_metadata(&socket_path),
+            Err(error) if error.kind() == ErrorKind::NotFound
+        ));
     }
 
     #[test]
