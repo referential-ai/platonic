@@ -76,7 +76,7 @@ jobs:
         run: >-
           cargo test --locked --test sqlite_cli_lock
           independent_daemon_startups_wait_for_installer_gate_release
-          -- --ignored --exact --nocapture
+          -- --exact --nocapture
 
       - name: Prove pipe and lock ACLs
         run: >-
