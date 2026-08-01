@@ -28,6 +28,9 @@ jobs:
       - name: Install Rust 1.88.0
         run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
 
+      - name: Install Rust 1.85.0
+        run: rustup toolchain install 1.85.0 --profile minimal --component clippy
+
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -39,16 +42,25 @@ jobs:
           echo 'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: Prove plato-protocol on Rust 1.85.0
+        run: |
+          cargo +1.85.0 check --locked -p plato-protocol --all-targets
+          cargo +1.85.0 test --locked -p plato-protocol
+          cargo +1.85.0 clippy --locked -p plato-protocol --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo +1.85.0 doc --locked -p plato-protocol --no-deps
+          cargo +1.85.0 package --locked -p plato-protocol
+          cargo +1.85.0 package --locked --list -p plato-protocol
 
       - name: Run tests
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
       - name: Run clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --workspace --locked --all-targets -- -D warnings
 
       - name: Check documentation
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --locked --no-deps
 
       - name: Check CLI help
-        run: cargo run --locked --bin plato -- --help
+        run: cargo run --locked -p plato-agent --bin plato -- --help

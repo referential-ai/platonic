@@ -2526,6 +2526,7 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "interprocess",
+ "plato-protocol",
  "platonic-core",
  "ratatui",
  "rusqlite",
@@ -2558,6 +2559,16 @@ dependencies = [
  "tempfile",
  "widestring",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "plato-protocol"
+version = "0.1.0"
+dependencies = [
+ "platonic-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

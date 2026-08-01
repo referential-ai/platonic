@@ -1,6 +1,10 @@
 use crate::{
     AppError, AppResult,
-    daemon::{client::DaemonClient, lock::LockMetadata, protocol::ShutdownIfIdleResultName},
+    daemon::{
+        client::DaemonClient,
+        lock::LockMetadata,
+        protocol::{CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE, ShutdownIfIdleResultName},
+    },
     paths,
     windows_security::{self, CurrentUserProcess},
 };
@@ -21,7 +25,6 @@ const MAX_LOCK_BYTES: u64 = 16 * 1024;
 const METADATA_RETRY: Duration = Duration::from_millis(500);
 const METADATA_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
-const SHUTDOWN_CAPABILITY: &str = "daemon.shutdown_if_idle";
 
 struct ValidatedWorkspace {
     lock_path: PathBuf,
@@ -485,10 +488,10 @@ fn inspect_lock(lock_path: &Path) -> AppResult<LiveObservation> {
     if !hello
         .capabilities
         .iter()
-        .any(|capability| capability == SHUTDOWN_CAPABILITY)
+        .any(|capability| capability == CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE)
     {
         return Err(control_error(format!(
-            "daemon {} lacks {SHUTDOWN_CAPABILITY}",
+            "daemon {} lacks {CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE}",
             metadata.workspace_id
         )));
     }

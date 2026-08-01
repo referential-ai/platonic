@@ -1,4 +1,5 @@
-use crate::{AppError, AppResult, daemon::protocol::RunStateName, paths::DefaultSqlitePath};
+use crate::{AppError, AppResult, paths::DefaultSqlitePath};
+use plato_protocol::RunStateName;
 use platonic_core::{HarnessEvent, MessageRole, RecordedEvent, RunId, RunPhase, RunState};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use serde::{Deserialize, Serialize};
