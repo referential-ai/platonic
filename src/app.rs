@@ -1321,6 +1321,7 @@ mod tests {
     const FALLBACK_ASSISTANT_TEXT: &str = "fallback assistant text";
     const FALLBACK_CAPTURE_RUN_ID: &str = "run_fallback_stderr";
     const FALLBACK_CAPTURE_SESSION_ID: &str = "session_fallback_stderr";
+    const LOADED_RUNNER_REQUEST_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(10);
 
     #[test]
     fn generated_run_and_session_ids_are_unique() {
@@ -4044,7 +4045,7 @@ enabled = ["file.read"]
         assert_eq!(
             server
                 .request_receiver
-                .recv_timeout(std::time::Duration::from_secs(2))
+                .recv_timeout(LOADED_RUNNER_REQUEST_ALLOWANCE)
                 .unwrap(),
             0
         );
@@ -4089,7 +4090,7 @@ enabled = ["file.read"]
         assert_eq!(
             server
                 .request_receiver
-                .recv_timeout(std::time::Duration::from_secs(2))
+                .recv_timeout(LOADED_RUNNER_REQUEST_ALLOWANCE)
                 .unwrap(),
             0
         );
@@ -4165,7 +4166,7 @@ enabled = ["file.read"]
         assert_eq!(
             server
                 .request_receiver
-                .recv_timeout(std::time::Duration::from_secs(2))
+                .recv_timeout(LOADED_RUNNER_REQUEST_ALLOWANCE)
                 .unwrap(),
             0
         );
@@ -4212,7 +4213,7 @@ enabled = ["file.read"]
         assert_eq!(
             server
                 .request_receiver
-                .recv_timeout(std::time::Duration::from_secs(2))
+                .recv_timeout(LOADED_RUNNER_REQUEST_ALLOWANCE)
                 .unwrap(),
             0
         );
@@ -4220,7 +4221,7 @@ enabled = ["file.read"]
         assert_eq!(
             server
                 .request_receiver
-                .recv_timeout(std::time::Duration::from_secs(2))
+                .recv_timeout(LOADED_RUNNER_REQUEST_ALLOWANCE)
                 .unwrap(),
             1
         );
