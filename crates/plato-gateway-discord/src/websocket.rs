@@ -12,7 +12,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
+use tungstenite::{Message, WebSocket, connect, error::UrlError, stream::MaybeTlsStream};
 use url::Url;
 
 pub(super) const DISCORD_INTENTS: u64 = (1 << 9) | (1 << 12) | (1 << 15);
@@ -69,11 +69,7 @@ impl DiscordGatewayReceiver {
         };
         let (mut socket, _) = match connect(url.as_str()) {
             Ok(connection) => connection,
-            Err(tungstenite::Error::Url(_)) => {
-                return GatewayControl::Fatal(GatewayError::Discord(
-                    "discord gateway returned an invalid websocket URL".into(),
-                ));
-            }
+            Err(tungstenite::Error::Url(error)) => return connect_url_error_control(error),
             Err(_) => return GatewayControl::Resume,
         };
         if set_read_timeout(&mut socket, self.read_timeout).is_err() {
@@ -239,6 +235,15 @@ enum GatewayControl {
     Reidentify,
     Fatal(GatewayError),
     Stop,
+}
+
+fn connect_url_error_control(error: UrlError) -> GatewayControl {
+    match error {
+        UrlError::UnableToConnect(_) => GatewayControl::Resume,
+        _ => GatewayControl::Fatal(GatewayError::Discord(
+            "discord gateway returned an invalid websocket URL".into(),
+        )),
+    }
 }
 
 struct DiscordSession {
@@ -412,6 +417,29 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    #[test]
+    fn websocket_connect_only_treats_unable_to_connect_as_recoverable() {
+        assert!(matches!(
+            connect_url_error_control(UrlError::UnableToConnect("ws://127.0.0.1:1/".into())),
+            GatewayControl::Resume
+        ));
+
+        for error in [
+            UrlError::TlsFeatureNotEnabled,
+            UrlError::NoHostName,
+            UrlError::UnsupportedUrlScheme,
+            UrlError::EmptyHostName,
+            UrlError::NoPathOrQuery,
+        ] {
+            let GatewayControl::Fatal(GatewayError::Discord(message)) =
+                connect_url_error_control(error)
+            else {
+                panic!("non-connect URL error was not fatal");
+            };
+            assert_eq!(message, "discord gateway returned an invalid websocket URL");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn websocket_admits_only_mapped_messages_and_interactions() {
@@ -438,6 +466,10 @@ mod tests {
             assert_eq!(identify["op"], 2);
             assert_eq!(identify["d"]["token"], "test-token");
             assert_eq!(identify["d"]["intents"], DISCORD_INTENTS);
+            let heartbeat =
+                read_websocket_json(&mut socket).expect("client disconnected before heartbeating");
+            assert_eq!(heartbeat["op"], 1);
+            send_websocket_json(&mut socket, json!({"op": 11, "d": null}));
             send_websocket_json(
                 &mut socket,
                 json!({
@@ -542,7 +574,11 @@ mod tests {
             crate::DiscordGatewayTimings::default(),
         )
         .unwrap();
-        let message = platform.recv_message().unwrap();
+        let message = platform
+            .messages
+            .recv_timeout(TEST_GATEWAY_BOUND)
+            .expect("discord gateway message exceeded the local test bound")
+            .unwrap();
         let interaction_sent_at = sent_at.recv_timeout(Duration::from_secs(2)).unwrap();
 
         assert_eq!(message, discord_message(42, 200, "hello"));
