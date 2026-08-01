@@ -1659,13 +1659,29 @@ enabled = ["{enabled_tool}"]
     }
 
     fn read_provider_request(stream: &mut TcpStream) -> String {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+        let read_timeout = Duration::from_secs(2);
+        stream.set_read_timeout(Some(read_timeout)).unwrap();
+        let read_deadline = Instant::now() + read_timeout;
         let mut bytes = Vec::new();
         let mut buffer = [0_u8; 4096];
+        let mut read_request_bytes = |buffer: &mut [u8]| loop {
+            match stream.read(buffer) {
+                Ok(count) => break count,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && Instant::now() < read_deadline =>
+                {
+                    thread::sleep(
+                        read_deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(1)),
+                    );
+                }
+                Err(error) => panic!("provider request read failed: {error}"),
+            }
+        };
         let header_end = loop {
-            let count = stream.read(&mut buffer).unwrap();
+            let count = read_request_bytes(&mut buffer);
             assert_ne!(count, 0, "provider request ended before headers");
             bytes.extend_from_slice(&buffer[..count]);
             if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -1682,7 +1698,7 @@ enabled = ["{enabled_tool}"]
             })
             .unwrap();
         while bytes.len() < header_end + content_length {
-            let count = stream.read(&mut buffer).unwrap();
+            let count = read_request_bytes(&mut buffer);
             assert_ne!(count, 0, "provider request ended before body");
             bytes.extend_from_slice(&buffer[..count]);
         }

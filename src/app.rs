@@ -5177,10 +5177,29 @@ enabled = ["file.read"]
     }
 
     fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let read_timeout = std::time::Duration::from_secs(2);
+        stream.set_read_timeout(Some(read_timeout)).unwrap();
+        let read_deadline = std::time::Instant::now() + read_timeout;
         let mut bytes = Vec::new();
         let mut buffer = [0_u8; 1024];
+        let mut read_request_bytes = |buffer: &mut [u8]| loop {
+            match stream.read(buffer) {
+                Ok(read) => break read,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < read_deadline =>
+                {
+                    thread::sleep(
+                        read_deadline
+                            .saturating_duration_since(std::time::Instant::now())
+                            .min(std::time::Duration::from_millis(1)),
+                    );
+                }
+                Err(error) => panic!("provider request read failed: {error}"),
+            }
+        };
         let header_end = loop {
-            let read = stream.read(&mut buffer).unwrap();
+            let read = read_request_bytes(&mut buffer);
             assert_ne!(read, 0, "client closed before headers");
             bytes.extend_from_slice(&buffer[..read]);
             if let Some(header_end) = find_header_end(&bytes) {
@@ -5197,7 +5216,7 @@ enabled = ["file.read"]
             })
             .unwrap_or(0);
         while bytes.len() < header_end + content_length {
-            let read = stream.read(&mut buffer).unwrap();
+            let read = read_request_bytes(&mut buffer);
             assert_ne!(read, 0, "client closed before body");
             bytes.extend_from_slice(&buffer[..read]);
         }
