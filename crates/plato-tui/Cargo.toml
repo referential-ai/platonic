@@ -1,0 +1,23 @@
+[package]
+name = "plato-tui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = ["crates-io"]
+description = "Terminal client library for Plato Agent."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/referential-ai/plato-agent"
+documentation = "https://docs.rs/plato-tui"
+readme = "README.md"
+include = ["src/**", "README.md"]
+
+[dependencies]
+crossterm = "0.28.1"
+plato-daemon-client = { version = "0.1.0", path = "../plato-daemon-client" }
+plato-protocol = { version = "0.1.0", path = "../plato-protocol" }
+platonic-core = "0.3.0"
+ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

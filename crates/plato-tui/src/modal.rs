@@ -1,21 +1,31 @@
-use crate::daemon::protocol::{BufferedStreamEvent, StreamEvent};
+use plato_protocol::{BufferedStreamEvent, StreamEvent};
 use platonic_core::HarnessEvent;
 use serde_json::Value;
 
 use super::LiveEventLine;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Approval request content displayed by the terminal client.
 pub struct ApprovalModalView {
+    /// Run awaiting a decision.
     pub run_id: String,
+    /// Tool call awaiting a decision.
     pub tool_call_id: String,
+    /// Requested tool name.
     pub tool_name: String,
+    /// Requested effect class.
     pub effect: String,
+    /// Policy reason for requiring approval.
     pub reason: String,
+    /// Serialized tool input shown to the user.
     pub input_preview: String,
+    /// Optional approval-specific preview.
     pub approval_preview: Option<String>,
+    /// Optional diff preview.
     pub diff_preview: Option<String>,
 }
 
+/// Converts an approval stream event into its modal view.
 pub fn approval_from_event(
     event: &StreamEvent,
     input_preview: Option<String>,
@@ -53,6 +63,7 @@ pub fn approval_from_event(
     })
 }
 
+/// Extracts a tool call identifier and formatted input preview.
 pub fn tool_input_preview_from_event(event: &StreamEvent) -> Option<(String, String)> {
     let StreamEvent::Ledger { record } = event else {
         return None;
@@ -66,6 +77,7 @@ pub fn tool_input_preview_from_event(event: &StreamEvent) -> Option<(String, Str
     Some((call_id, truncate_preview(preview, 1200)))
 }
 
+/// Converts a buffered daemon event into one live transcript row.
 pub fn live_event_line(buffered: &BufferedStreamEvent) -> LiveEventLine {
     let offset = Some(buffered.offset);
     let run_id = match &buffered.event {
@@ -103,6 +115,7 @@ pub fn live_event_line(buffered: &BufferedStreamEvent) -> LiveEventLine {
     line
 }
 
+/// Extracts the requested model from a stream event.
 pub fn model_from_event(event: &StreamEvent) -> Option<String> {
     let StreamEvent::Ledger { record } = event else {
         return None;

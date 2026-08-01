@@ -887,14 +887,13 @@ name = "plato-agent"
 version = "0.1.0"
 dependencies = [
  "clap",
- "crossterm",
  "ctrlc",
  "interprocess",
  "plato-daemon-client",
  "plato-protocol",
+ "plato-tui",
  "platonic-core",
  "pty-process",
- "ratatui",
  "rusqlite",
  "rustix 1.1.4",
  "serde",
@@ -938,6 +937,19 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "plato-tui"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "plato-daemon-client",
+ "plato-protocol",
+ "platonic-core",
+ "ratatui",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

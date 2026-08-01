@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/plato-daemon-client", "crates/plato-protocol"]
+members = [
+  "crates/plato-daemon-client",
+  "crates/plato-protocol",
+  "crates/plato-tui",
+]
 exclude = ["desktop/src-tauri"]
 resolver = "3"
 
@@ -26,6 +30,7 @@ path = "src/bin/plato-agentd.rs"
 [[bin]]
 name = "plato-tui"
 path = "src/bin/plato-tui.rs"
+doc = false
 
 [[bin]]
 name = "plato-gateway-discord"
@@ -33,11 +38,10 @@ path = "src/bin/plato-gateway-discord.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.28.1"
 plato-daemon-client = { version = "0.1.0", path = "crates/plato-daemon-client" }
 plato-protocol = { version = "0.1.0", path = "crates/plato-protocol" }
+plato-tui = { version = "0.1.0", path = "crates/plato-tui" }
 platonic-core = "0.3.0"
-ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 rustix = { version = "1", features = ["event", "fs", "net", "process", "time"] }
 serde = { version = "1", features = ["derive"] }

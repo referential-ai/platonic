@@ -1,12 +1,12 @@
-use crate::{
-    AppError, AppResult,
-    daemon::client::{DaemonClient, DaemonConnectionConfig},
-    daemon::protocol::{
-        CommandAcceptedResult, ERROR_LAGGED, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
-        ERROR_WORKSPACE_MISMATCH, EventsStreamResult, IssuePrepResult, IssuePrepStartResult,
-        RunStartResult, RunStateName, StreamEvent,
-    },
-    tui::{ActiveRunView, ApprovalModalView, TranscriptState, TranscriptView, TuiState},
+use crate::{ActiveRunView, ApprovalModalView, TranscriptState, TranscriptView, TuiState};
+use plato_daemon_client::{
+    ClientError, ClientResult,
+    client::{DaemonClient, DaemonConnectionConfig},
+};
+use plato_protocol::{
+    CommandAcceptedResult, ERROR_LAGGED, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
+    ERROR_WORKSPACE_MISMATCH, EventsStreamResult, IssuePrepResult, IssuePrepStartResult,
+    RunStartResult, RunStateName, StreamEvent,
 };
 use std::{
     collections::HashMap,
@@ -39,7 +39,7 @@ fn load_connected_state(
     config: &DaemonConnectionConfig,
     run_id: Option<&str>,
     session_id: Option<&str>,
-) -> AppResult<TuiState> {
+) -> ClientResult<TuiState> {
     let mut client = connect_daemon(config, DAEMON_CLIENT_TIMEOUT)?;
     let hello = client.hello(&config.workspace_root)?;
     let sessions = client.sessions_list()?;
@@ -106,7 +106,7 @@ fn load_connected_state(
 }
 
 fn loaded_transcript_state(
-    transcript: crate::daemon::protocol::TranscriptReadResult,
+    transcript: plato_protocol::TranscriptReadResult,
 ) -> (TranscriptState, Option<ApprovalModalView>) {
     let approval = transcript
         .pending_approval
@@ -225,7 +225,7 @@ pub(super) enum ClientEvent {
     RunCanceled(CommandAcceptedResult),
     Failed {
         operation: ClientOperation,
-        error: crate::AppError,
+        error: ClientError,
     },
 }
 
@@ -280,7 +280,7 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             question,
             config_path,
         } => with_client(config, |client| {
-            Ok(client.run_start(question, config_path, false)?)
+            client.run_start(question, config_path, false)
         })
         .map_or_else(
             failed_event(ClientOperation::RunStart),
@@ -291,7 +291,7 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             session_id,
             config_path,
         } => with_client(config, |client| {
-            Ok(client.message_append_to_session(message, Some(session_id), config_path, false)?)
+            client.message_append_to_session(message, Some(session_id), config_path, false)
         })
         .map_or_else(
             failed_event(ClientOperation::MessageAppend),
@@ -302,7 +302,7 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
                 let mut client = connect_daemon(config, DAEMON_CLIENT_TIMEOUT)?;
                 client.hello(&config.workspace_root)?;
                 client.clear_request_timeout()?;
-                Ok(client.issue_prep_start(input, config_path)?)
+                client.issue_prep_start(input, config_path)
             })();
             result.map_or_else(
                 failed_event(ClientOperation::IssuePrepStart),
@@ -313,7 +313,7 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             run_id,
             from_offset,
         } => with_client(config, |client| {
-            Ok(client.events_stream(&run_id, from_offset, EVENT_LIMIT)?)
+            client.events_stream(&run_id, from_offset, EVENT_LIMIT)
         })
         .map_or_else(
             failed_event(ClientOperation::EventsStream),
@@ -323,7 +323,7 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             run_id,
             tool_call_id,
         } => with_client(config, |client| {
-            Ok(client.approval_grant(&run_id, &tool_call_id)?)
+            client.approval_grant(&run_id, &tool_call_id)
         })
         .map_or_else(
             failed_event(ClientOperation::ApprovalDecide),
@@ -334,14 +334,14 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             tool_call_id,
             reason,
         } => with_client(config, |client| {
-            Ok(client.approval_deny(&run_id, &tool_call_id, reason)?)
+            client.approval_deny(&run_id, &tool_call_id, reason)
         })
         .map_or_else(
             failed_event(ClientOperation::ApprovalDecide),
             ClientEvent::ApprovalDecided,
         ),
         ClientCommand::RunCancel { run_id } => {
-            with_client(config, |client| Ok(client.run_cancel(&run_id)?)).map_or_else(
+            with_client(config, |client| client.run_cancel(&run_id)).map_or_else(
                 failed_event(ClientOperation::RunCancel),
                 ClientEvent::RunCanceled,
             )
@@ -351,8 +351,8 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
 
 fn with_client<T>(
     config: &DaemonConnectionConfig,
-    run: impl FnOnce(&mut DaemonClient) -> AppResult<T>,
-) -> AppResult<T> {
+    run: impl FnOnce(&mut DaemonClient) -> ClientResult<T>,
+) -> ClientResult<T> {
     let mut client = connect_daemon(config, DAEMON_CLIENT_TIMEOUT)?;
     client.hello(&config.workspace_root)?;
     run(&mut client)
@@ -361,14 +361,11 @@ fn with_client<T>(
 pub(super) fn connect_daemon(
     config: &DaemonConnectionConfig,
     timeout: Duration,
-) -> AppResult<DaemonClient> {
-    Ok(DaemonClient::connect_with_timeout(
-        &config.socket_path,
-        timeout,
-    )?)
+) -> ClientResult<DaemonClient> {
+    DaemonClient::connect_with_timeout(&config.socket_path, timeout)
 }
 
-fn failed_event(operation: ClientOperation) -> impl FnOnce(crate::AppError) -> ClientEvent {
+fn failed_event(operation: ClientOperation) -> impl FnOnce(ClientError) -> ClientEvent {
     move |error| ClientEvent::Failed { operation, error }
 }
 
@@ -391,13 +388,10 @@ pub(super) fn drain_client_events(
                 state.issue_prep_started_at = None;
                 match result.outcome {
                     IssuePrepResult::Candidate { markdown } => {
+                        push_live_event(state, crate::LiveEventLine::assistant(None, markdown));
                         push_live_event(
                             state,
-                            crate::tui::LiveEventLine::assistant(None, markdown),
-                        );
-                        push_live_event(
-                            state,
-                            crate::tui::LiveEventLine::status(
+                            crate::LiveEventLine::status(
                                 None,
                                 format!("issue-prep artifacts: {}", result.run_dir),
                             ),
@@ -413,7 +407,7 @@ pub(super) fn drain_client_events(
                         };
                         push_live_event(
                             state,
-                            crate::tui::LiveEventLine::warning(
+                            crate::LiveEventLine::warning(
                                 None,
                                 format!(
                                     "issue prep blocked at {stage}{reason_text}\nartifacts: {}",
@@ -446,7 +440,7 @@ pub(super) fn drain_client_events(
                 state.active_run = Some(ActiveRunView::new(result.run_id.clone(), result.status));
                 push_live_event(
                     state,
-                    crate::tui::LiveEventLine::status(
+                    crate::LiveEventLine::status(
                         None,
                         format!("cancel requested: {}", result.run_id),
                     )
@@ -458,11 +452,11 @@ pub(super) fn drain_client_events(
                 let connection_error = is_connection_error(&error);
                 let lagged = matches!(
                     &error,
-                    AppError::DaemonResponse(error) if error.code == ERROR_LAGGED
+                    ClientError::DaemonResponse(error) if error.code == ERROR_LAGGED
                 );
                 let overloaded = matches!(
                     &error,
-                    AppError::DaemonResponse(error) if error.code == ERROR_OVERLOAD
+                    ClientError::DaemonResponse(error) if error.code == ERROR_OVERLOAD
                 );
                 let message = error.to_string();
                 if operation == ClientOperation::EventsStream && lagged {
@@ -475,7 +469,7 @@ pub(super) fn drain_client_events(
                 } else {
                     if connection_error {
                         runtime.polling = false;
-                        state.connection = crate::tui::ConnectionState::Disconnected {
+                        state.connection = crate::ConnectionState::Disconnected {
                             error: message.clone(),
                         };
                     }
@@ -487,10 +481,7 @@ pub(super) fn drain_client_events(
                         }
                         ClientOperation::IssuePrepStart => {
                             state.issue_prep_started_at = None;
-                            push_live_event(
-                                state,
-                                crate::tui::LiveEventLine::warning(None, failure),
-                            );
+                            push_live_event(state, crate::LiveEventLine::warning(None, failure));
                             if !connection_error {
                                 start_next_queued(commands, state, runtime);
                             }
@@ -596,7 +587,7 @@ pub(super) fn apply_run_response(
     state.bind_latest_user_to_run(&run_id);
     push_live_event(
         state,
-        crate::tui::LiveEventLine::status(None, format!("{message}: {run_id}"))
+        crate::LiveEventLine::status(None, format!("{message}: {run_id}"))
             .with_run_id(run_id.clone()),
     );
     state.reset_scroll();
@@ -628,10 +619,10 @@ pub(super) fn apply_events_result(
     state.active_run = Some(ActiveRunView::new(result.run_id.clone(), result.status));
     for buffered in result.events {
         let event = &buffered.event;
-        if let Some(model) = crate::tui::model_from_event(event) {
+        if let Some(model) = crate::model_from_event(event) {
             state.active_model = Some(model);
         }
-        if let Some((call_id, input_preview)) = crate::tui::tool_input_preview_from_event(event) {
+        if let Some((call_id, input_preview)) = crate::tool_input_preview_from_event(event) {
             runtime
                 .tool_inputs
                 .insert(call_id.clone(), input_preview.clone());
@@ -641,7 +632,7 @@ pub(super) fn apply_events_result(
                 approval.input_preview = input_preview;
             }
         }
-        if let Some(approval) = crate::tui::approval_from_event(
+        if let Some(approval) = crate::approval_from_event(
             event,
             match event {
                 StreamEvent::ApprovalRequested { tool_call_id, .. } => {
@@ -652,7 +643,7 @@ pub(super) fn apply_events_result(
         ) {
             state.approval = Some(approval);
         }
-        let line = crate::tui::live_event_line(&buffered);
+        let line = crate::live_event_line(&buffered);
         let line = if line.run_id.is_some() {
             line
         } else {
@@ -712,10 +703,10 @@ fn poll_events_from(
     }
 }
 
-pub(super) fn is_connection_error(error: &AppError) -> bool {
+pub(super) fn is_connection_error(error: &ClientError) -> bool {
     match error {
-        AppError::Io(_) | AppError::DaemonLockHeld { .. } | AppError::DaemonProtocol(_) => true,
-        AppError::DaemonResponse(error) => matches!(
+        ClientError::Io(_) | ClientError::DaemonProtocol(_) => true,
+        ClientError::DaemonResponse(error) => matches!(
             error.code.as_str(),
             ERROR_UNSUPPORTED_VERSION | ERROR_WORKSPACE_MISMATCH
         ),
@@ -726,15 +717,11 @@ pub(super) fn is_connection_error(error: &AppError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        daemon::{
-            protocol::{
-                ERROR_ISSUE_PREP_FAILED, Envelope, EnvelopeKind, HelloResult, PROTOCOL_VERSION,
-                ProtocolError,
-            },
-            transport,
-        },
-        tui::{ConnectionState, TranscriptState, render_snapshot},
+    use crate::{ConnectionState, TranscriptState, render_snapshot};
+    use plato_daemon_client::transport;
+    use plato_protocol::{
+        ERROR_ISSUE_PREP_FAILED, Envelope, EnvelopeKind, HelloResult, PROTOCOL_VERSION,
+        ProtocolError,
     };
     use serde_json::json;
     use std::{
@@ -984,7 +971,7 @@ mod tests {
                 &commands,
                 ClientEvent::Failed {
                     operation,
-                    error: AppError::DaemonResponse(ProtocolError {
+                    error: ClientError::DaemonResponse(ProtocolError {
                         code: "test_failure".into(),
                         message: "expected failure".into(),
                     }),
@@ -1292,7 +1279,8 @@ mod tests {
             config.socket_path.to_string_lossy().into_owned(),
             HelloResult {
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
-                workspace_id: crate::paths::workspace_id(&config.workspace_root).unwrap(),
+                workspace_id: plato_daemon_client::paths::workspace_id(&config.workspace_root)
+                    .unwrap(),
                 ledger_path: "/work/agent.db".into(),
                 capabilities: vec!["hello".into(), "issue-prep.start".into()],
             },
@@ -1381,7 +1369,8 @@ mod tests {
             let config =
                 DaemonConnectionConfig::resolve(workspace.path(), Some(endpoint.path.clone()))
                     .unwrap();
-            let workspace_id = crate::paths::workspace_id(&config.workspace_root).unwrap();
+            let workspace_id =
+                plato_daemon_client::paths::workspace_id(&config.workspace_root).unwrap();
             let replies = VecDeque::from(replies(&workspace_id));
             let requests = Arc::new(Mutex::new(Vec::new()));
             let server_requests = Arc::clone(&requests);
@@ -1453,7 +1442,8 @@ mod tests {
             let config =
                 DaemonConnectionConfig::resolve(workspace.path(), Some(endpoint.path.clone()))
                     .unwrap();
-            let workspace_id = crate::paths::workspace_id(&config.workspace_root).unwrap();
+            let workspace_id =
+                plato_daemon_client::paths::workspace_id(&config.workspace_root).unwrap();
             let (request_seen_sender, request_seen) = mpsc::channel();
             let (release, release_receiver) = mpsc::channel();
             let server = thread::spawn(move || {

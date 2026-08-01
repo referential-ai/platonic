@@ -11,10 +11,11 @@ use super::{
     ApprovalModalView, ConnectionState, LiveEventKind, TranscriptState, TuiState,
     state::DisplayMode,
 };
-use crate::daemon::protocol::{RunStateName, TypedRun, TypedTranscriptEntry};
-use crate::tui::commands::{SLASH_COMMANDS, matching_slash_commands};
+use crate::commands::{SLASH_COMMANDS, matching_slash_commands};
+use plato_protocol::{RunStateName, TypedRun, TypedTranscriptEntry};
 use std::time::Duration;
 
+/// Renders the current client state into a terminal frame.
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     let [history, composer, status] = vertical(frame.area(), state);
     render_history(frame, history, state);
@@ -31,6 +32,7 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     }
 }
 
+/// Renders client state into a plain-text test snapshot of the requested size.
 pub fn render_snapshot(state: &TuiState, width: u16, height: u16) -> std::io::Result<String> {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend)?;
@@ -560,17 +562,16 @@ fn conversation_live_event_lines(
             }
             LiveEventKind::Tool | LiveEventKind::Status | LiveEventKind::Warning => continue,
         };
-        if let Some(run_id) = event.run_id.as_deref() {
-            if let Some(index) =
+        if let Some(run_id) = event.run_id.as_deref()
+            && let Some(index) =
                 committed
                     .iter()
                     .position(|(committed_run_id, committed_kind, text)| {
                         committed_run_id == run_id && *committed_kind == kind && text == &event.text
                     })
-            {
-                committed.remove(index);
-                continue;
-            }
+        {
+            committed.remove(index);
+            continue;
         }
         push_message_rows(&mut lines, kind, &event.text);
     }
@@ -1105,7 +1106,7 @@ fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
 fn session_picker_row(
     state: &TuiState,
-    session: &crate::daemon::protocol::SessionSummary,
+    session: &plato_protocol::SessionSummary,
     focused: bool,
 ) -> Line<'static> {
     let focus = if focused { ">" } else { " " };
@@ -1247,7 +1248,7 @@ fn composer_height(state: &TuiState) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::protocol::{
+    use plato_protocol::{
         HelloResult, PendingApprovalSnapshot, SessionSummary, TranscriptReadResult, TypedRun,
         TypedTranscript, TypedTranscriptEntry,
     };
