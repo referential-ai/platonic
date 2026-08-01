@@ -1,5 +1,7 @@
 #![allow(unsafe_code)]
 
+//! Current-user Windows installer and daemon-startup exclusion gate.
+
 use crate::windows_security;
 use interprocess::os::windows::security_descriptor::AsSecurityDescriptorExt;
 use std::{
@@ -21,15 +23,18 @@ const INSTALLER_GATE_PREFIX: &str = r"Global\plato-agent-installer";
 const DAEMON_STARTUP_WAIT_MS: u32 = 5_000;
 
 #[derive(Debug)]
+/// Owned current-user installer startup gate.
 pub struct InstallerStartupGate {
     handle: OwnedHandle,
 }
 
 impl InstallerStartupGate {
+    /// Acquires the gate immediately for installer or desktop startup.
     pub fn acquire() -> io::Result<Self> {
         Self::acquire_with_wait(0)
     }
 
+    /// Waits up to the existing daemon-startup bound to acquire the gate.
     pub fn acquire_for_daemon_startup() -> io::Result<Self> {
         Self::acquire_with_wait(DAEMON_STARTUP_WAIT_MS)
     }

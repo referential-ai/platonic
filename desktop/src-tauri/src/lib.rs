@@ -124,8 +124,8 @@ impl DesktopError {
         }
     }
 
-    fn daemon(context: &str, error: AppError) -> Self {
-        match error {
+    fn daemon(context: &str, error: impl Into<AppError>) -> Self {
+        match error.into() {
             AppError::DaemonResponse(error) => Self::new(error.code, error.message),
             AppError::DaemonProtocol(message) => {
                 Self::new("incompatible_daemon", format!("{context}: {message}"))

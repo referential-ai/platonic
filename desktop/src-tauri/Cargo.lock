@@ -2526,6 +2526,7 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "interprocess",
+ "plato-daemon-client",
  "plato-protocol",
  "platonic-core",
  "ratatui",
@@ -2540,6 +2541,21 @@ dependencies = [
  "tungstenite",
  "ureq",
  "url",
+ "widestring",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "plato-daemon-client"
+version = "0.1.0"
+dependencies = [
+ "interprocess",
+ "plato-protocol",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
  "widestring",
  "windows-sys 0.61.2",
 ]

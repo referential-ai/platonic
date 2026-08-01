@@ -1,5 +1,9 @@
 use crate::{AppError, AppResult};
-use sha2::{Digest, Sha256};
+#[cfg(windows)]
+pub(crate) use plato_daemon_client::paths::runtime_home;
+#[cfg(unix)]
+pub(crate) use plato_daemon_client::paths::runtime_home_and_fallback;
+pub use plato_daemon_client::paths::{default_lock_path, default_socket_path, workspace_id};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,93 +35,6 @@ pub fn default_sqlite(workspace_root: &Path) -> AppResult<DefaultSqlitePath> {
 }
 
 #[cfg(unix)]
-pub fn default_socket_path(workspace_root: &Path) -> AppResult<PathBuf> {
-    Ok(runtime_home()?
-        .join("plato-agent")
-        .join("workspaces")
-        .join(workspace_id(workspace_root)?)
-        .join("agent.sock"))
-}
-
-#[cfg(windows)]
-pub fn default_socket_path(workspace_root: &Path) -> AppResult<PathBuf> {
-    Ok(PathBuf::from(format!(
-        r"\\.\pipe\plato-agent-{}",
-        workspace_id(workspace_root)?
-    )))
-}
-
-pub fn default_lock_path(workspace_root: &Path) -> AppResult<PathBuf> {
-    Ok(runtime_home()?
-        .join("plato-agent")
-        .join("workspaces")
-        .join(workspace_id(workspace_root)?)
-        .join("agent.lock"))
-}
-
-pub fn workspace_id(workspace_root: &Path) -> AppResult<String> {
-    let canonical = workspace_root.canonicalize()?;
-    Ok(workspace_id_from_canonical_path(&canonical))
-}
-
-fn workspace_id_from_canonical_path(path: &Path) -> String {
-    let basename = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("workspace");
-    let slug = slug(basename);
-    #[cfg(windows)]
-    let slug: String = slug.chars().take(64).collect();
-    format!("{slug}-{}", hash16(path))
-}
-
-fn slug(value: &str) -> String {
-    let mut output = String::new();
-    let mut last_was_dash = false;
-    for character in value.chars().flat_map(char::to_lowercase) {
-        if character.is_ascii_alphanumeric() {
-            output.push(character);
-            last_was_dash = false;
-        } else if !last_was_dash && !output.is_empty() {
-            output.push('-');
-            last_was_dash = true;
-        }
-    }
-    while output.ends_with('-') {
-        output.pop();
-    }
-    if output.is_empty() {
-        "workspace".into()
-    } else {
-        output
-    }
-}
-
-fn hash16(path: &Path) -> String {
-    let digest = Sha256::digest(path_bytes(path));
-    digest[..8]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-#[cfg(unix)]
-fn path_bytes(path: &Path) -> &[u8] {
-    use std::os::unix::ffi::OsStrExt;
-    path.as_os_str().as_bytes()
-}
-
-#[cfg(windows)]
-fn path_bytes(path: &Path) -> Vec<u8> {
-    use std::os::windows::ffi::OsStrExt;
-
-    path.as_os_str()
-        .encode_wide()
-        .flat_map(u16::to_le_bytes)
-        .collect()
-}
-
-#[cfg(unix)]
 fn state_home() -> AppResult<PathBuf> {
     if let Some(value) = std::env::var_os("XDG_STATE_HOME")
         && !value.is_empty()
@@ -132,30 +49,6 @@ fn state_home() -> AppResult<PathBuf> {
 #[cfg(windows)]
 fn state_home() -> AppResult<PathBuf> {
     local_app_data("default --db path")
-}
-
-#[cfg(unix)]
-pub(crate) fn runtime_home() -> AppResult<PathBuf> {
-    Ok(runtime_home_and_fallback().0)
-}
-
-#[cfg(unix)]
-pub(crate) fn runtime_home_and_fallback() -> (PathBuf, bool) {
-    match std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
-        Some(value) => (PathBuf::from(value), false),
-        None => (
-            std::env::temp_dir().join(format!(
-                "plato-agent-{}",
-                rustix::process::geteuid().as_raw()
-            )),
-            true,
-        ),
-    }
-}
-
-#[cfg(windows)]
-pub(crate) fn runtime_home() -> AppResult<PathBuf> {
-    local_app_data("default daemon runtime path")
 }
 
 #[cfg(windows)]
@@ -190,14 +83,6 @@ pub(crate) fn with_test_xdg<T>(root: &Path, run: impl FnOnce() -> T) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn workspace_id_uses_slug_and_hash16() {
-        let id = workspace_id_from_canonical_path(Path::new("/tmp/Platonic Workspace"));
-
-        assert!(id.starts_with("platonic-workspace-"));
-        assert_eq!(id.rsplit_once('-').unwrap().1.len(), 16);
-    }
 
     #[test]
     fn default_sqlite_path_uses_workspace_directory() {

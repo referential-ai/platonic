@@ -1976,7 +1976,8 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let error = client.events_stream("run_1", Some(0), 16).unwrap_err();
         assert!(matches!(
             error,
-            AppError::DaemonResponse(ProtocolError { code, .. }) if code == ERROR_LAGGED
+            crate::daemon::client::ClientError::DaemonResponse(ProtocolError { code, .. })
+                if code == ERROR_LAGGED
         ));
 
         let tail = client.events_stream("run_1", None, 16).unwrap();
@@ -2116,7 +2117,8 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             .unwrap_err();
         assert!(matches!(
             error,
-            AppError::DaemonResponse(ProtocolError { code, .. }) if code == ERROR_LAGGED
+            crate::daemon::client::ClientError::DaemonResponse(ProtocolError { code, .. })
+                if code == ERROR_LAGGED
         ));
         drop(client);
 
@@ -2144,7 +2146,8 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             .unwrap_err();
         assert!(matches!(
             stale,
-            AppError::DaemonResponse(ProtocolError { code, .. }) if code == ERROR_NOT_FOUND
+            crate::daemon::client::ClientError::DaemonResponse(ProtocolError { code, .. })
+                if code == ERROR_NOT_FOUND
         ));
         assert_eq!(
             client

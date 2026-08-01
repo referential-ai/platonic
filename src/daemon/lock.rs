@@ -1,5 +1,5 @@
 use crate::{AppError, AppResult, paths};
-use serde::{Deserialize, Serialize};
+pub use plato_daemon_client::lock::{LOCK_VERSION, LockMetadata};
 #[cfg(unix)]
 use std::io::{Error, Read};
 #[cfg(unix)]
@@ -10,46 +10,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const LOCK_VERSION: u32 = 1;
 #[cfg(unix)]
 const LOCK_FILE_MODE: u32 = 0o600;
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LockMetadata {
-    pub v: u32,
-    pub pid: u32,
-    pub executable: Option<String>,
-    pub workspace_root: String,
-    pub workspace_id: String,
-    pub socket_path: String,
-}
-
-impl LockMetadata {
-    pub fn for_workspace(workspace_root: &Path, socket_path: &Path) -> AppResult<Self> {
-        Ok(Self {
-            v: LOCK_VERSION,
-            pid: std::process::id(),
-            executable: std::env::current_exe()
-                .ok()
-                .map(|path| path.to_string_lossy().into_owned()),
-            workspace_root: workspace_root
-                .canonicalize()?
-                .to_string_lossy()
-                .into_owned(),
-            workspace_id: paths::workspace_id(workspace_root)?,
-            socket_path: socket_path.to_string_lossy().into_owned(),
-        })
-    }
-
-    fn summary(&self) -> String {
-        let executable = self.executable.as_deref().unwrap_or("unknown executable");
-        format!(
-            "pid={}, executable={}, workspace_id={}, socket_path={}",
-            self.pid, executable, self.workspace_id, self.socket_path
-        )
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LockConflict {
@@ -61,7 +23,7 @@ pub struct LockConflict {
 impl LockConflict {
     pub fn owner_summary(&self) -> String {
         if let Some(metadata) = &self.metadata {
-            metadata.summary()
+            metadata.owner_summary()
         } else if let Some(error) = &self.metadata_error {
             format!("metadata unreadable: {error}")
         } else {

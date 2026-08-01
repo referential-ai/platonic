@@ -58,7 +58,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Run Windows tests
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
       - name: Prove installer startup gate
         run: >-
@@ -70,6 +70,12 @@ jobs:
         run: >-
           cargo test --locked --test windows_daemon
           installer_gate_is_isolated_per_current_user
+          -- --ignored --exact --nocapture
+
+      - name: Prove independent daemon installer-gate release
+        run: >-
+          cargo test --locked --test sqlite_cli_lock
+          independent_daemon_startups_wait_for_installer_gate_release
           -- --ignored --exact --nocapture
 
       - name: Prove pipe and lock ACLs
@@ -97,7 +103,7 @@ jobs:
           -- --ignored --exact --nocapture
 
       - name: Run Windows clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --workspace --locked --all-targets -- -D warnings
 
       - name: Remove ACL proof user
         if: always()

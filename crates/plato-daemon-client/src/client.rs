@@ -1,17 +1,16 @@
+//! Synchronous daemon request client with bounded connection and request calls.
+
+pub use crate::{ClientError, ClientResult};
 use crate::{
-    AppError, AppResult,
-    daemon::{
-        protocol::{
-            ApprovalDecideParams, ApprovalDecision, CommandAcceptedResult, Envelope, EnvelopeKind,
-            EventsStreamParams, EventsStreamResult, HelloParams, HelloResult, IssuePrepStartParams,
-            IssuePrepStartResult, MessageAppendParams, PROTOCOL_VERSION, RunCancelParams,
-            RunStartParams, RunStartResult, SessionSummary, SessionsListResult,
-            ShutdownIfIdleResult, TranscriptReadParams, TranscriptReadResult,
-        },
-        transport::{self, Stream},
-    },
-    model::RunOverrides,
     paths,
+    transport::{self, Stream},
+};
+use plato_protocol::{
+    ApprovalDecideParams, ApprovalDecision, CommandAcceptedResult, Envelope, EnvelopeKind,
+    EventsStreamParams, EventsStreamResult, HelloParams, HelloResult, IssuePrepStartParams,
+    IssuePrepStartResult, MessageAppendParams, PROTOCOL_VERSION, RunCancelParams, RunOverrides,
+    RunStartParams, RunStartResult, SessionSummary, SessionsListResult, ShutdownIfIdleResult,
+    TranscriptReadParams, TranscriptReadResult,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -21,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Synchronous client for one `plato-agentd` connection.
 pub struct DaemonClient {
     reader: BufReader<Stream>,
     writer: Stream,
@@ -32,23 +32,27 @@ pub struct DaemonClient {
 #[cfg(windows)]
 const CONTROL_RESPONSE_LIMIT: u64 = 64 * 1024;
 impl DaemonClient {
-    pub fn connect(socket_path: &Path) -> AppResult<Self> {
+    /// Connects to a daemon endpoint using the platform's ordinary connect bound.
+    pub fn connect(socket_path: &Path) -> ClientResult<Self> {
         let writer = transport::connect(socket_path)?;
         Self::from_stream(writer, None, None)
     }
 
-    pub fn connect_with_timeout(socket_path: &Path, timeout: Duration) -> AppResult<Self> {
+    /// Connects to a daemon endpoint within `timeout` and applies that bound to requests.
+    pub fn connect_with_timeout(socket_path: &Path, timeout: Duration) -> ClientResult<Self> {
         let writer = transport::connect_with_timeout(socket_path, timeout)?;
         Self::from_stream(writer, None, Some(timeout))
     }
 
     #[cfg(unix)]
-    pub fn set_timeout(&mut self, timeout: Duration) -> AppResult<()> {
+    /// Replaces the per-request timeout used by this client.
+    pub fn set_timeout(&mut self, timeout: Duration) -> ClientResult<()> {
         self.request_timeout = Some(timeout);
         Ok(())
     }
 
-    pub(crate) fn clear_request_timeout(&mut self) -> AppResult<()> {
+    /// Clears the per-request timeout and returns the stream to blocking I/O.
+    pub fn clear_request_timeout(&mut self) -> ClientResult<()> {
         transport::clear_deadline(self.reader.get_mut())?;
         transport::clear_deadline(&mut self.writer)?;
         self.request_timeout = None;
@@ -56,7 +60,8 @@ impl DaemonClient {
     }
 
     #[cfg(windows)]
-    pub fn connect_expected_server(socket_path: &Path, expected_pid: u32) -> AppResult<Self> {
+    /// Connects to the named-pipe server identified by lock metadata.
+    pub fn connect_expected_server(socket_path: &Path, expected_pid: u32) -> ClientResult<Self> {
         let writer = transport::connect_expected_server(socket_path, expected_pid)?;
         Self::from_stream(writer, Some(CONTROL_RESPONSE_LIMIT), None)
     }
@@ -65,7 +70,7 @@ impl DaemonClient {
         writer: Stream,
         response_limit: Option<u64>,
         request_timeout: Option<Duration>,
-    ) -> AppResult<Self> {
+    ) -> ClientResult<Self> {
         let reader = BufReader::new(transport::try_clone(&writer)?);
         Ok(Self {
             reader,
@@ -76,7 +81,8 @@ impl DaemonClient {
         })
     }
 
-    pub fn hello(&mut self, workspace_root: &Path) -> AppResult<HelloResult> {
+    /// Performs the daemon handshake for `workspace_root`.
+    pub fn hello(&mut self, workspace_root: &Path) -> ClientResult<HelloResult> {
         let workspace_root = workspace_root.canonicalize()?;
         let workspace_id = paths::workspace_id(&workspace_root)?;
         self.request(
@@ -88,16 +94,19 @@ impl DaemonClient {
         )
     }
 
-    pub fn sessions_list(&mut self) -> AppResult<Vec<SessionSummary>> {
+    /// Lists daemon sessions for the connected workspace.
+    pub fn sessions_list(&mut self) -> ClientResult<Vec<SessionSummary>> {
         let result: SessionsListResult = self.request_without_params("sessions.list")?;
         Ok(result.sessions)
     }
 
-    pub fn shutdown_if_idle(&mut self) -> AppResult<ShutdownIfIdleResult> {
+    /// Requests daemon shutdown when no run or approval is active.
+    pub fn shutdown_if_idle(&mut self) -> ClientResult<ShutdownIfIdleResult> {
         self.request_without_params("daemon.shutdown_if_idle")
     }
 
-    pub fn transcript_read(&mut self, run_id: &str) -> AppResult<TranscriptReadResult> {
+    /// Reads the ledger-backed transcript containing `run_id`.
+    pub fn transcript_read(&mut self, run_id: &str) -> ClientResult<TranscriptReadResult> {
         self.request(
             "transcript.read",
             TranscriptReadParams {
@@ -107,7 +116,11 @@ impl DaemonClient {
         )
     }
 
-    pub fn transcript_read_session(&mut self, session_id: &str) -> AppResult<TranscriptReadResult> {
+    /// Reads the latest ledger-backed transcript for `session_id`.
+    pub fn transcript_read_session(
+        &mut self,
+        session_id: &str,
+    ) -> ClientResult<TranscriptReadResult> {
         self.request(
             "transcript.read",
             TranscriptReadParams {
@@ -117,22 +130,24 @@ impl DaemonClient {
         )
     }
 
+    /// Starts a new daemon run with default model overrides.
     pub fn run_start(
         &mut self,
         question: String,
         config_path: Option<String>,
         wait: bool,
-    ) -> AppResult<RunStartResult> {
+    ) -> ClientResult<RunStartResult> {
         self.run_start_with_overrides(question, config_path, RunOverrides::default(), wait)
     }
 
+    /// Starts a new daemon run with explicit model overrides.
     pub fn run_start_with_overrides(
         &mut self,
         question: String,
         config_path: Option<String>,
         overrides: RunOverrides,
         wait: bool,
-    ) -> AppResult<RunStartResult> {
+    ) -> ClientResult<RunStartResult> {
         self.request(
             "run.start",
             RunStartParams {
@@ -144,22 +159,24 @@ impl DaemonClient {
         )
     }
 
+    /// Appends a message to the daemon's latest workspace session.
     pub fn message_append(
         &mut self,
         message: String,
         config_path: Option<String>,
         wait: bool,
-    ) -> AppResult<RunStartResult> {
+    ) -> ClientResult<RunStartResult> {
         self.message_append_to_session(message, None, config_path, wait)
     }
 
+    /// Appends a message to an optional session with default model overrides.
     pub fn message_append_to_session(
         &mut self,
         message: String,
         session_id: Option<String>,
         config_path: Option<String>,
         wait: bool,
-    ) -> AppResult<RunStartResult> {
+    ) -> ClientResult<RunStartResult> {
         self.message_append_to_session_with_overrides(
             message,
             session_id,
@@ -169,6 +186,7 @@ impl DaemonClient {
         )
     }
 
+    /// Appends a message to an optional session with explicit model overrides.
     pub fn message_append_to_session_with_overrides(
         &mut self,
         message: String,
@@ -176,7 +194,7 @@ impl DaemonClient {
         config_path: Option<String>,
         overrides: RunOverrides,
         wait: bool,
-    ) -> AppResult<RunStartResult> {
+    ) -> ClientResult<RunStartResult> {
         self.request(
             "message.append",
             MessageAppendParams {
@@ -189,23 +207,25 @@ impl DaemonClient {
         )
     }
 
+    /// Runs the daemon's synchronous issue-preparation command.
     pub fn issue_prep_start(
         &mut self,
         input: String,
         config_path: Option<String>,
-    ) -> AppResult<IssuePrepStartResult> {
+    ) -> ClientResult<IssuePrepStartResult> {
         self.request(
             "issue-prep.start",
             IssuePrepStartParams { input, config_path },
         )
     }
 
+    /// Reads one buffered event page for `run_id`.
     pub fn events_stream(
         &mut self,
         run_id: &str,
         from_offset: Option<u64>,
         limit: usize,
-    ) -> AppResult<EventsStreamResult> {
+    ) -> ClientResult<EventsStreamResult> {
         self.request(
             "events.stream",
             EventsStreamParams {
@@ -216,11 +236,12 @@ impl DaemonClient {
         )
     }
 
+    /// Grants a pending daemon approval request.
     pub fn approval_grant(
         &mut self,
         run_id: &str,
         tool_call_id: &str,
-    ) -> AppResult<CommandAcceptedResult> {
+    ) -> ClientResult<CommandAcceptedResult> {
         self.request(
             "approval.decide",
             ApprovalDecideParams {
@@ -232,12 +253,13 @@ impl DaemonClient {
         )
     }
 
+    /// Denies a pending daemon approval request with a reason.
     pub fn approval_deny(
         &mut self,
         run_id: &str,
         tool_call_id: &str,
         reason: String,
-    ) -> AppResult<CommandAcceptedResult> {
+    ) -> ClientResult<CommandAcceptedResult> {
         self.request(
             "approval.decide",
             ApprovalDecideParams {
@@ -249,7 +271,8 @@ impl DaemonClient {
         )
     }
 
-    pub fn run_cancel(&mut self, run_id: &str) -> AppResult<CommandAcceptedResult> {
+    /// Requests cancellation for an active daemon run.
+    pub fn run_cancel(&mut self, run_id: &str) -> ClientResult<CommandAcceptedResult> {
         self.request(
             "run.cancel",
             RunCancelParams {
@@ -258,14 +281,14 @@ impl DaemonClient {
         )
     }
 
-    fn request_without_params<T>(&mut self, method: &str) -> AppResult<T>
+    fn request_without_params<T>(&mut self, method: &str) -> ClientResult<T>
     where
         T: DeserializeOwned,
     {
         self.request_value(method, None)
     }
 
-    fn request<T, P>(&mut self, method: &str, params: P) -> AppResult<T>
+    fn request<T, P>(&mut self, method: &str, params: P) -> ClientResult<T>
     where
         T: DeserializeOwned,
         P: Serialize,
@@ -273,7 +296,7 @@ impl DaemonClient {
         self.request_value(method, Some(serde_json::to_value(params)?))
     }
 
-    fn request_value<T>(&mut self, method: &str, params: Option<Value>) -> AppResult<T>
+    fn request_value<T>(&mut self, method: &str, params: Option<Value>) -> ClientResult<T>
     where
         T: DeserializeOwned,
     {
@@ -323,7 +346,7 @@ impl DaemonClient {
         id: String,
         bytes_read: usize,
         line: Vec<u8>,
-    ) -> AppResult<T>
+    ) -> ClientResult<T>
     where
         T: DeserializeOwned,
     {
@@ -336,13 +359,13 @@ impl DaemonClient {
         }
         let response = serde_json::from_slice::<Envelope>(&line)?;
         if response.v != PROTOCOL_VERSION {
-            return Err(AppError::DaemonProtocol(format!(
+            return Err(ClientError::DaemonProtocol(format!(
                 "unsupported response protocol version: {}",
                 response.v
             )));
         }
         if response.id.as_deref() != Some(&id) {
-            return Err(AppError::DaemonProtocol(format!(
+            return Err(ClientError::DaemonProtocol(format!(
                 "response id mismatch: expected {id}, got {:?}",
                 response.id
             )));
@@ -350,17 +373,17 @@ impl DaemonClient {
         match response.kind {
             EnvelopeKind::Response => {
                 let result = response.result.ok_or_else(|| {
-                    AppError::DaemonProtocol(format!("{method} response missing result"))
+                    ClientError::DaemonProtocol(format!("{method} response missing result"))
                 })?;
                 Ok(serde_json::from_value(result)?)
             }
             EnvelopeKind::Error => {
                 let error = response.error.ok_or_else(|| {
-                    AppError::DaemonProtocol(format!("{method} error missing payload"))
+                    ClientError::DaemonProtocol(format!("{method} error missing payload"))
                 })?;
-                Err(AppError::DaemonResponse(error))
+                Err(ClientError::DaemonResponse(error))
             }
-            other => Err(AppError::DaemonProtocol(format!(
+            other => Err(ClientError::DaemonProtocol(format!(
                 "{method} returned unexpected envelope kind {other:?}"
             ))),
         }
@@ -371,11 +394,11 @@ impl DaemonClient {
         method: &str,
         limit: u64,
         line: &mut Vec<u8>,
-    ) -> AppResult<usize> {
+    ) -> ClientResult<usize> {
         let mut reader = std::io::Read::take(reader, limit + 1);
         let bytes_read = reader.read_until(b'\n', line)?;
         if bytes_read as u64 > limit {
-            return Err(AppError::DaemonProtocol(format!(
+            return Err(ClientError::DaemonProtocol(format!(
                 "{method} response exceeds {limit} bytes"
             )));
         }
@@ -387,7 +410,7 @@ impl DaemonClient {
         method: &str,
         mut request: &[u8],
         deadline: Instant,
-    ) -> AppResult<()> {
+    ) -> ClientResult<()> {
         while !request.is_empty() {
             Self::ensure_deadline(method, deadline)?;
             transport::set_deadline(&mut self.writer, deadline)?;
@@ -416,7 +439,7 @@ impl DaemonClient {
         limit: Option<u64>,
         deadline: Instant,
         line: &mut Vec<u8>,
-    ) -> AppResult<usize> {
+    ) -> ClientResult<usize> {
         loop {
             Self::ensure_deadline(method, deadline)?;
             transport::set_deadline(self.reader.get_mut(), deadline)?;
@@ -437,7 +460,7 @@ impl DaemonClient {
             line.extend_from_slice(&available[..retained]);
             self.reader.consume(consumed);
             if limit.is_some_and(|limit| line.len() as u64 > limit) {
-                return Err(AppError::DaemonProtocol(format!(
+                return Err(ClientError::DaemonProtocol(format!(
                     "{method} response exceeds {} bytes",
                     limit.expect("checked as present")
                 )));
@@ -448,7 +471,7 @@ impl DaemonClient {
         }
     }
 
-    fn ensure_deadline(method: &str, deadline: Instant) -> AppResult<()> {
+    fn ensure_deadline(method: &str, deadline: Instant) -> ClientResult<()> {
         if Instant::now() >= deadline {
             Err(Self::request_timeout(method).into())
         } else {
@@ -456,7 +479,7 @@ impl DaemonClient {
         }
     }
 
-    fn deadline_io<T>(method: &str, result: std::io::Result<T>) -> AppResult<T> {
+    fn deadline_io<T>(method: &str, result: std::io::Result<T>) -> ClientResult<T> {
         result.map_err(|error| {
             if matches!(
                 error.kind(),
@@ -483,14 +506,18 @@ impl DaemonClient {
     }
 }
 
+/// Canonical workspace and endpoint used to establish daemon connections.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonConnectionConfig {
+    /// Canonical workspace root supplied during `hello`.
     pub workspace_root: PathBuf,
+    /// Explicit or discovered local daemon endpoint.
     pub socket_path: PathBuf,
 }
 
 impl DaemonConnectionConfig {
-    pub fn resolve(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<Self> {
+    /// Resolves a canonical workspace root and optional endpoint override.
+    pub fn resolve(workspace_root: &Path, socket_path: Option<PathBuf>) -> ClientResult<Self> {
         let workspace_root = workspace_root.canonicalize()?;
         let socket_path = socket_path.unwrap_or(paths::default_socket_path(&workspace_root)?);
         Ok(Self {
@@ -503,7 +530,8 @@ impl DaemonConnectionConfig {
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
-    use crate::daemon::{protocol::Envelope, transport};
+    use crate::transport;
+    use plato_protocol::Envelope;
     use serde_json::json;
     use std::{
         io::{BufRead, BufReader, Write},
@@ -665,9 +693,9 @@ mod timeout_tests {
         writer.flush().unwrap();
     }
 
-    fn assert_timed_out(error: AppError) {
+    fn assert_timed_out(error: ClientError) {
         match error {
-            AppError::Io(error) => {
+            ClientError::Io(error) => {
                 assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}")
             }
             error => panic!("expected I/O timeout, got {error}"),
@@ -707,9 +735,7 @@ mod timeout_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::daemon::protocol::{
-        ProtocolError, RunStateName, SessionSummary, ShutdownIfIdleResultName,
-    };
+    use plato_protocol::{ProtocolError, RunStateName, SessionSummary, ShutdownIfIdleResultName};
     use serde_json::json;
     use std::{
         io::{BufRead, BufReader, Write},
@@ -854,7 +880,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            AppError::DaemonResponse(ProtocolError { code, message })
+            ClientError::DaemonResponse(ProtocolError { code, message })
                 if code == "not_found" && message == "missing"
         ));
     }
@@ -877,7 +903,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            AppError::Io(error)
+            ClientError::Io(error)
                 if error.kind() == std::io::ErrorKind::UnexpectedEof
                     && error.to_string() == "daemon connection closed before response"
         ));
@@ -909,7 +935,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            AppError::DaemonProtocol(message)
+            ClientError::DaemonProtocol(message)
                 if message == "unsupported response protocol version: 2"
         ));
     }
@@ -1040,7 +1066,7 @@ mod tests {
             result,
             IssuePrepStartResult {
                 run_dir: "/work/.plato/issue-prep/run_1".into(),
-                outcome: crate::daemon::protocol::IssuePrepResult::Candidate {
+                outcome: plato_protocol::IssuePrepResult::Candidate {
                     markdown: "# Prepared issue".into()
                 }
             }

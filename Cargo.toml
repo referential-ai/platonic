@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/plato-protocol"]
+members = ["crates/plato-daemon-client", "crates/plato-protocol"]
 exclude = ["desktop/src-tauri"]
 resolver = "3"
 
@@ -34,6 +34,7 @@ path = "src/bin/plato-gateway-discord.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28.1"
+plato-daemon-client = { version = "0.1.0", path = "crates/plato-daemon-client" }
 plato-protocol = { version = "0.1.0", path = "crates/plato-protocol" }
 platonic-core = "0.3.0"
 ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
