@@ -37,6 +37,13 @@ fn historical_installer_gate_path_shares_the_extracted_owner() {
 
 #[test]
 fn root_error_conversion_preserves_variants_and_display() {
+    let config: AppError = ClientError::Config("missing runtime".into()).into();
+    assert!(matches!(
+        config,
+        AppError::Config(ref message) if message == "missing runtime"
+    ));
+    assert_eq!(config.to_string(), "config error: missing runtime");
+
     let protocol: AppError = ClientError::DaemonProtocol("bad response".into()).into();
     assert!(matches!(
         protocol,
@@ -76,4 +83,12 @@ fn root_error_conversion_preserves_variants_and_display() {
         AppError::Io(ref error) if error.kind() == std::io::ErrorKind::TimedOut
     ));
     assert_eq!(io.to_string(), "io error: request timed out");
+
+    let json_error = serde_json::from_str::<serde_json::Value>("!").unwrap_err();
+    let json: AppError = ClientError::Json(json_error).into();
+    assert!(matches!(json, AppError::Json(_)));
+    assert_eq!(
+        json.to_string(),
+        "json error: expected value at line 1 column 1"
+    );
 }
