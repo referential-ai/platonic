@@ -9,15 +9,15 @@ use std::{
     },
 };
 
-use ort::{
-    session::{Session, builder::GraphOptimizationLevel},
-    value::Tensor,
-};
+use ort::{session::Session, value::Tensor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{PcmSink, SpeechSynthesizer};
-use crate::{AudioFormat, PcmChunk, SampleFormat, Sentence, SynthError};
+use super::{
+    PcmSink, SpeechSynthesizer,
+    runtime::{OrtRuntime, SessionLoadError},
+};
+use crate::{AudioFormat, InferenceBackend, PcmChunk, SampleFormat, Sentence, SynthError};
 
 /// Immutable Hugging Face repository used for the admitted Kokoro model.
 pub const KOKORO_MODEL_SOURCE: &str = "onnx-community/Kokoro-82M-v1.0-ONNX";
@@ -34,25 +34,12 @@ pub const KOKORO_VOICE_SHA256: &str =
     "4435255c9744f3f31659e0d714ab7689bf65d9e77ec1cce060f083912614f0b9";
 /// Exact model output sample rate in hertz.
 pub const KOKORO_SAMPLE_RATE: u32 = 24_000;
-/// Pinned Rust wrapper and ONNX Runtime line.
-pub const ORT_RUNTIME_VERSION: &str = "ort 2.0.0-rc.13 / ONNX Runtime 1.28";
-
 const MODEL_FILENAME: &str = "model.onnx";
 const TOKENIZER_FILENAME: &str = "tokenizer.json";
 const VOICE_FILENAME: &str = "af_sky.bin";
 const VOICE_WIDTH: usize = 256;
 const MAX_SENTENCE_BYTES: usize = 16 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 2 * 1024;
-
-/// Resident inference provider selected during engine construction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InferenceBackend {
-    /// ONNX Runtime CUDA execution provider, device zero.
-    Cuda,
-    /// ONNX Runtime CPU execution provider.
-    Cpu,
-}
 
 /// Explicit paths and bounded settings for a pinned Kokoro engine.
 #[derive(Clone, Debug, PartialEq)]
@@ -141,6 +128,8 @@ pub struct KokoroProvenance {
     pub ort_runtime: String,
     /// Loaded ONNX Runtime build identity.
     pub ort_build_info: String,
+    /// Shared process-local runtime owner used to construct this session.
+    pub ort_runtime_owner: u64,
     /// Exact espeak-ng version output.
     pub phonemizer_version: String,
     /// Resident inference provider.
@@ -201,6 +190,15 @@ pub struct KokoroSynthesizer {
 impl KokoroSynthesizer {
     /// Verifies all artifacts, starts the phonemizer, and loads one resident session.
     pub fn load(config: KokoroConfig) -> Result<Self, SynthError> {
+        let runtime = OrtRuntime::acquire()?;
+        Self::load_with_runtime(config, runtime)
+    }
+
+    /// Loads one resident session through an explicitly shared ONNX runtime owner.
+    pub fn load_with_runtime(
+        config: KokoroConfig,
+        runtime: OrtRuntime,
+    ) -> Result<Self, SynthError> {
         let model = read_verified("model", &config.model_path, KOKORO_MODEL_SHA256)?;
         drop(model);
         let tokenizer_bytes =
@@ -209,7 +207,12 @@ impl KokoroSynthesizer {
         let tokenizer = parse_tokenizer(&config.tokenizer_path, &tokenizer_bytes)?;
         let (voice, voice_rows) = parse_voice(&config.voice_path, &voice_bytes)?;
         let phonemizer = EspeakPhonemizer::start(config.phonemizer_program, config.language)?;
-        let (session, backend, fallback_reason) = load_resident_session(&config.model_path)?;
+        let resident = runtime
+            .load_session(&config.model_path)
+            .map_err(map_session_error)?;
+        let session = resident.session;
+        let backend = resident.backend;
+        let fallback_reason = resident.fallback_reason;
 
         let provenance = KokoroProvenance {
             model_source: KOKORO_MODEL_SOURCE.to_owned(),
@@ -217,8 +220,9 @@ impl KokoroSynthesizer {
             model_sha256: KOKORO_MODEL_SHA256.to_owned(),
             tokenizer_sha256: KOKORO_TOKENIZER_SHA256.to_owned(),
             voice_sha256: KOKORO_VOICE_SHA256.to_owned(),
-            ort_runtime: ORT_RUNTIME_VERSION.to_owned(),
+            ort_runtime: super::ORT_RUNTIME_VERSION.to_owned(),
             ort_build_info: bounded(ort::info()),
+            ort_runtime_owner: runtime.owner_id(),
             phonemizer_version: phonemizer.version.clone(),
             backend,
             fallback_reason,
@@ -567,50 +571,13 @@ fn read_verified(
     Ok(bytes)
 }
 
-fn cpu_session(path: &Path) -> Result<Session, String> {
-    let builder = Session::builder().map_err(|error| bounded(&error.to_string()))?;
-    let mut builder = builder
-        .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(|error| bounded(&error.to_string()))?;
-    builder
-        .commit_from_file(path)
-        .map_err(|error| bounded(&error.to_string()))
-}
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn load_resident_session(
-    path: &Path,
-) -> Result<(Session, InferenceBackend, Option<String>), SynthError> {
-    let cuda = (|| {
-        let builder = Session::builder().map_err(|error| bounded(&error.to_string()))?;
-        let builder = builder
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|error| bounded(&error.to_string()))?;
-        let mut builder = builder
-            .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
-            .map_err(|error| bounded(&error.to_string()))?;
-        builder
-            .commit_from_file(path)
-            .map_err(|error| bounded(&error.to_string()))
-    })();
-    match cuda {
-        Ok(session) => Ok((session, InferenceBackend::Cuda, None)),
-        Err(cuda) => cpu_session(path)
-            .map(|session| (session, InferenceBackend::Cpu, Some(cuda.clone())))
-            .map_err(|cpu| SynthError::ModelLoadFallback { cuda, cpu }),
+fn map_session_error(error: SessionLoadError) -> SynthError {
+    match error {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        SessionLoadError::Fallback { cuda, cpu } => SynthError::ModelLoadFallback { cuda, cpu },
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        SessionLoadError::Backend { backend, reason } => SynthError::ModelLoad { backend, reason },
     }
-}
-
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-fn load_resident_session(
-    path: &Path,
-) -> Result<(Session, InferenceBackend, Option<String>), SynthError> {
-    cpu_session(path)
-        .map(|session| (session, InferenceBackend::Cpu, None))
-        .map_err(|reason| SynthError::ModelLoad {
-            backend: InferenceBackend::Cpu,
-            reason,
-        })
 }
 
 fn bounded(value: &str) -> String {

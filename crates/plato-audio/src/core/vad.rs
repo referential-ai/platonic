@@ -1,8 +1,17 @@
 use serde::Serialize;
 
+#[cfg(test)]
 use crate::CaptureError;
+use crate::VadError;
 
-/// Whisper input rate and the fixed threshold-VAD clock.
+mod neural;
+
+pub use neural::{
+    NeuralVadEvent, NeuralVadState, SILERO_HANGOVER_FRAMES, SILERO_MINIMUM_SPEECH_FRAMES,
+    SILERO_ONSET_FRAMES, SILERO_SPEECH_THRESHOLD, SILERO_WINDOW_SAMPLES,
+};
+
+/// Whisper input rate and the shared endpoint sample clock.
 pub const CAPTURE_SAMPLE_RATE: u32 = 16_000;
 /// Samples in each literal 10 ms RMS window.
 pub const VAD_WINDOW_SAMPLES: usize = 160;
@@ -14,13 +23,26 @@ pub const VAD_ONSET_WINDOWS: u16 = 3;
 pub const VAD_MINIMUM_SPEECH_WINDOWS: u16 = 20;
 /// Consecutive quiet windows required to close an utterance.
 pub const VAD_HANGOVER_WINDOWS: u16 = 25;
-/// Fixed utterance memory bound. AU3 exposes no tuning surface.
+/// Fixed utterance memory bound shared by threshold fixtures and neural endpointing.
 pub const MAX_UTTERANCE_MS: u64 = 30_000;
 
+#[cfg(test)]
 const MAX_UTTERANCE_SAMPLES: usize =
     (CAPTURE_SAMPLE_RATE as usize * MAX_UTTERANCE_MS as usize) / 1_000;
 
-/// Exact sample boundaries produced by threshold endpointing.
+/// One warm frame-level voice activity inference engine.
+pub trait VoiceActivityDetector: Send {
+    /// Returns the fixed number of 16 kHz mono samples accepted per inference.
+    fn frame_samples(&self) -> usize;
+
+    /// Clears recurrent utterance state without reloading the model session.
+    fn reset(&mut self);
+
+    /// Returns a speech probability for one exact-size normalized frame.
+    fn speech_probability(&mut self, samples: &[f32]) -> Result<f32, VadError>;
+}
+
+/// Exact sample boundaries produced by an endpoint detector.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct VadEndpoint {
     /// First sample of the onset candidate, in the worker's 16 kHz clock.
@@ -59,11 +81,13 @@ impl VoiceSegment {
     }
 }
 
+#[cfg(test)]
 pub(crate) enum VadEvent {
     Segment(VoiceSegment),
     RejectedTransient(VadEndpoint),
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum VadState {
     #[default]
@@ -80,6 +104,7 @@ enum VadState {
     },
 }
 
+#[cfg(test)]
 pub(crate) struct ThresholdVad {
     state: VadState,
     window: [f32; VAD_WINDOW_SAMPLES],
@@ -88,6 +113,7 @@ pub(crate) struct ThresholdVad {
     processed_samples: u64,
 }
 
+#[cfg(test)]
 impl ThresholdVad {
     pub(crate) fn new() -> Self {
         Self {
@@ -219,6 +245,7 @@ impl ThresholdVad {
     }
 }
 
+#[cfg(test)]
 fn rms(samples: &[f32]) -> f32 {
     let mean_square = samples
         .iter()

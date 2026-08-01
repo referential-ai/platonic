@@ -135,15 +135,16 @@ Message History, plus Send Messages in Threads when threads are used.
 
 ## 5. Local voice proof (developer MVP)
 
-AU2 voice-out and AU3 explicit voice-in are exposed through focused examples,
+AU2 voice-out and AU4 explicit voice-in are exposed through focused examples,
 not a general CLI or ambient listener. Install espeak-ng, CUDA, and the native
-cpal backend headers, then place the pinned Kokoro and large-v3-turbo artifacts
-described in
+cpal backend headers, then place the pinned Kokoro, Silero v6.2.1, and
+large-v3-turbo artifacts described in
 [`../crates/plato-audio/README.md`](../crates/plato-audio/README.md) outside the
 repository.
 
 ```bash
 export PLATO_AUDIO_KOKORO_DIR="$HOME/.cache/plato-audio/kokoro-82m-v1.0-onnx-1939ad2a8e416c0acfeecc08a694d14ef25f2231"
+export PLATO_AUDIO_SILERO_MODEL="$HOME/.cache/plato-audio/silero-vad-7e30209a3e901f9842f81b225f3e93d8199902b1/silero_vad.onnx"
 export PLATO_AUDIO_WHISPER_MODEL="$HOME/.cache/plato-audio/ggml-large-v3-turbo-6034871ec87c84e342efab769d4c5c06cd126db3.bin"
 
 # Credential-free real run_question delta narration through the live speaker:
@@ -153,9 +154,36 @@ PLATO_AUDIO_FIXTURE_KEY=local-proof \
 # One excluded warmup, 20 TTFA trials, and four-sentence gap/overlap proof:
 cargo run --release --locked -p plato-audio --example kokoro_device_proof
 
-# Public non-human corpus: exact endpoint/text, no noise hallucination, 20 warm trials:
+# Public non-human corpus: AU3 threshold versus Silero confusion/endpoints:
+cargo test --release --locked -p plato-audio \
+  silero_strictly_reduces_au3_false_cuts_without_missing_speech -- --ignored --nocapture
+
+# Twenty warm RTX 4090 trials: live partial p95 <=200 ms, final p95 <=120 ms:
+ffmpeg -hide_banner -loglevel error -y -stream_loop 23 \
+  -i crates/plato-audio/fixtures/au4/speech-plus-noise.wav \
+  -f s16le -acodec pcm_s16le -ac 1 -ar 16000 \
+  /tmp/plato-329-au4-cpal-24x.raw
+(
+  module_id=$(pactl load-module module-null-sink \
+    sink_name=plato_au4_timing rate=48000 channels=2)
+  pacat --playback --raw --device=plato_au4_timing --rate=16000 \
+    --channels=1 --format=s16le </tmp/plato-329-au4-cpal-24x.raw &
+  feeder_pid=$!
+  trap 'kill "$feeder_pid" 2>/dev/null || true; wait "$feeder_pid" 2>/dev/null || true; pactl unload-module "$module_id"' EXIT
+  PULSE_SOURCE=plato_au4_timing.monitor \
+  PLATO_AUDIO_PULSE_MODULE_ID="$module_id" \
+  PLATO_AUDIO_PULSE_FEEDER_PID="$feeder_pid" \
+  PLATO_AUDIO_RECORDED_FIXTURE_RAW=/tmp/plato-329-au4-cpal-24x.raw \
+    cargo test --release --locked --features whisper-cuda \
+    twenty_warm_rtx4090_live_partial_and_final_trials_meet_au4_bounds -- --ignored --nocapture
+)
+
+# Exact 24.859-second transcript plus 20 warm bounded final-window decodes:
 cargo test --release --locked -p plato-audio --features whisper-cuda \
-  recorded_corpus_has_exact_endpoint_transcript_and_warm_latency -- --ignored --nocapture
+  long_utterance_final_is_bounded_and_preserves_exact_stable_text -- --ignored
+cargo test --release --locked -p plato-audio --features whisper-cuda \
+  twenty_long_utterance_finals_are_bounded_and_preserve_exact_stable_text \
+  -- --ignored --nocapture
 
 # Inspect input IDs without changing the host default audio policy:
 cargo run --locked --example narrated_run -- --list-input-devices
@@ -163,19 +191,31 @@ cargo run --locked --example narrated_run -- --list-input-devices
 # One microphone question -> one existing run -> spoken AU2 answer:
 PLATO_AUDIO_FIXTURE_KEY=local-proof \
   cargo run --release --locked --features whisper-cuda --example narrated_run -- \
-  --fixture --whisper-model "$PLATO_AUDIO_WHISPER_MODEL" --input-device CPAL_ID
+  --fixture --whisper-model "$PLATO_AUDIO_WHISPER_MODEL" \
+  --silero-model "$PLATO_AUDIO_SILERO_MODEL" --input-device CPAL_ID
 ```
 
 The model engine, native-rate resampling plan, and output stream open before
 timing. Both examples fail closed on artifact checksum, phonemizer, backend,
 device, PCM, worker, callback, sentence-order, gap, overlap, or teardown errors.
-AU3 opens one persistent input stream and one worker, normalizes/resamples on
-the worker, and runs fixed threshold endpointing before the resident CUDA
-recognizer. Ring overflow, device loss, worker panic, and recognition failures
-are typed terminal outcomes. The microphone form retains no raw audio; proof
-JSON contains only the final transcript, bounded metrics, and provenance.
-Model files and provider credentials are never written into the repository or
-proof JSON.
+AU4 opens one persistent input stream and one worker, normalizes/resamples on
+the worker, and runs a warm Silero session through the ONNX Runtime owner shared
+with Kokoro. The resident CUDA recognizer re-decodes only a bounded five-second
+pending window, commits only timestamp-bounded byte-stable prefixes outside a
+one-second overlap, and finalizes only the retained tail. Its non-final text
+replaces one live stderr line; only the single final transcript enters the
+existing run path. Ring overflow, device loss, worker panic, VAD failure, and
+recognition failure are typed terminal outcomes.
+
+The deterministic timing command selects a named PipeWire/Pulse null-sink
+monitor through the real production cpal/callback/rtrb/normalization path. The
+spoken payload is the recorded CC0 WAV, not a physical microphone or live human
+voice. Its partial clock starts at cpal callback entry and therefore includes
+ring wait and worker normalization; it does not claim analog, driver, device,
+or virtual-source pacing latency before that callback. The interactive
+microphone form retains no raw audio. Proof JSON contains transcripts, bounded
+metrics, and provenance. Model files and provider credentials are never written
+into the repository or proof JSON.
 
 ## 6. Run the test suite (no API key needed)
 

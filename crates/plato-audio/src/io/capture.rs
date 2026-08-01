@@ -1,8 +1,11 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
 
 use serde::Serialize;
 
-use crate::{AudioFormat, DeviceBufferSize, DeviceError, Transcript, VadEndpoint};
+use crate::{AudioFormat, CaptureSample, DeviceBufferSize, DeviceError, Transcript, VadEndpoint};
 
 mod device;
 mod worker;
@@ -11,6 +14,12 @@ pub use device::capture_devices;
 pub use worker::CaptureWorker;
 #[cfg(all(test, feature = "whisper-cuda"))]
 pub(crate) use worker::recognize_segment;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TimedCaptureSample {
+    pub(super) sample: CaptureSample,
+    pub(super) available_at: Instant,
+}
 
 const DEFAULT_CAPACITY_SAMPLES: usize = 192_000;
 const DEFAULT_PREFERRED_BUFFER_FRAMES: u32 = 256;
@@ -144,10 +153,47 @@ pub struct CaptureMetrics {
     pub rejected_transients: u64,
     /// Final transcripts returned to explicit capture requests.
     pub transcripts: u64,
+    /// Nonempty changed partial hypotheses delivered before finalization.
+    pub partial_updates: u64,
     /// Aggregate worker-side normalization and resampling time.
     pub normalization_resampling_us: u64,
     /// Bounded callback overflow accounting.
     pub overflow: CaptureOverflow,
+}
+
+/// One ephemeral rolling hypothesis and its visible-presentation timing input.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CapturePartial {
+    /// Typed non-final recognizer hypothesis.
+    pub transcript: Transcript,
+    /// Earliest drained input-callback entry through capture-worker delivery.
+    pub audio_available_to_partial_us: u64,
+    /// Earliest drained input-callback entry through root presentation, when rendered live.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_available_to_visible_us: Option<u64>,
+    #[serde(skip)]
+    available_at: Instant,
+}
+
+impl CapturePartial {
+    /// Records worker delivery while retaining a process-local availability clock.
+    pub fn new(transcript: Transcript, audio_available_to_partial_us: u64) -> Self {
+        let delivered_at = Instant::now();
+        let available_at = delivered_at
+            .checked_sub(Duration::from_micros(audio_available_to_partial_us))
+            .unwrap_or(delivered_at);
+        Self {
+            transcript,
+            audio_available_to_partial_us,
+            audio_available_to_visible_us: None,
+            available_at,
+        }
+    }
+
+    /// Measures availability through the caller's just-completed observation.
+    pub fn observed_latency_us(&self) -> u64 {
+        u64::try_from(self.available_at.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
 }
 
 /// One explicit VAD-closed recognition outcome.
@@ -157,10 +203,17 @@ pub struct CaptureReport {
     pub sequence: u64,
     /// The only committed recognizer outcome for this request.
     pub transcript: Transcript,
-    /// Exact fixed-threshold VAD boundaries on the 16 kHz worker clock.
+    /// Ordered ephemeral partials delivered before this final transcript.
+    pub partials: Vec<CapturePartial>,
+    /// Exact Silero VAD boundaries on the 16 kHz worker clock.
     pub endpoint: VadEndpoint,
-    /// VAD close through final transcript construction.
+    /// Closing VAD evaluation entry through final transcript construction.
+    ///
+    /// This conservative upper bound starts immediately before the `vad.push` call that emits
+    /// the endpoint, so it includes VAD evaluation and any earlier events in that result batch.
     pub vad_close_to_final_us: u64,
+    #[serde(skip)]
+    vad_evaluation_started_at: Instant,
     /// Worker-side normalization and resampling time for the request.
     pub normalization_resampling_us: u64,
     /// Complete native frames consumed for the request.
@@ -169,6 +222,13 @@ pub struct CaptureReport {
     pub output_frames: u64,
     /// Callback overflow snapshot when the transcript completed.
     pub overflow: CaptureOverflow,
+}
+
+impl CaptureReport {
+    /// Measures closing VAD evaluation entry through the caller's just-completed observation.
+    pub fn observed_final_latency_us(&self) -> u64 {
+        u64::try_from(self.vad_evaluation_started_at.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
 }
 
 /// Deterministic ownership proof returned after capture teardown.
@@ -194,6 +254,7 @@ struct CaptureCounters {
     output_frames: AtomicU64,
     rejected_transients: AtomicU64,
     transcripts: AtomicU64,
+    partial_updates: AtomicU64,
     normalization_resampling_us: AtomicU64,
 }
 
@@ -208,4 +269,26 @@ impl CaptureCounters {
 
 fn bounded(value: &str) -> String {
     value.chars().take(MAX_DIAGNOSTIC_CHARS).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_serialization_separates_worker_delivery_from_optional_visibility() {
+        let mut partial = CapturePartial::new(
+            Transcript::new("rolling words", false, 320).unwrap(),
+            12_000,
+        );
+        assert!(partial.observed_latency_us() >= 12_000);
+        let delivered = serde_json::to_value(&partial).unwrap();
+        assert_eq!(delivered["audio_available_to_partial_us"], 12_000);
+        assert!(delivered.get("audio_available_to_visible_us").is_none());
+        assert!(delivered.get("available_at").is_none());
+
+        partial.audio_available_to_visible_us = Some(13_000);
+        let visible = serde_json::to_value(partial).unwrap();
+        assert_eq!(visible["audio_available_to_visible_us"], 13_000);
+    }
 }

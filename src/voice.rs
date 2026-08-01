@@ -1,6 +1,7 @@
 //! Root-owned composition from app run events to the audio IO leaf.
 
 use std::{
+    io::{self, Write},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -10,11 +11,13 @@ use std::{
 };
 
 use plato_audio::{
-    CaptureConfig, CaptureDeviceInfo, CaptureError, CaptureMetrics, CaptureReport, CaptureWorker,
-    CaptureWorkerShutdown, KokoroConfig, KokoroMetrics, KokoroMetricsReader, KokoroProvenance,
-    KokoroSynthesizer, PlaybackConfig, PlaybackDeviceInfo, PlaybackMetrics, PlaybackReport,
-    Sentence, SentenceCutter, SttError, SynthError, SynthWorker, SynthWorkerError,
-    SynthWorkerShutdown, SynthWorkerStartError, Transcript, WhisperConfig, WhisperMetrics,
+    CaptureConfig, CaptureDeviceInfo, CaptureError, CaptureMetrics, CapturePartial, CaptureReport,
+    CaptureWorker, CaptureWorkerShutdown, KokoroConfig, KokoroMetrics, KokoroMetricsReader,
+    KokoroProvenance, KokoroSynthesizer, OrtRuntime, OrtRuntimeError, OrtRuntimeMetrics,
+    OrtRuntimeMetricsReader, PlaybackConfig, PlaybackDeviceInfo, PlaybackMetrics, PlaybackReport,
+    Sentence, SentenceCutter, SileroConfig, SileroMetrics, SileroMetricsReader, SileroProvenance,
+    SileroVad, SttError, SynthError, SynthWorker, SynthWorkerError, SynthWorkerShutdown,
+    SynthWorkerStartError, Transcript, VadError, WhisperConfig, WhisperMetrics,
     WhisperMetricsReader, WhisperProvenance, WhisperRecognizer,
 };
 use platonic_core::{HarnessEvent, RunId, TurnId};
@@ -26,6 +29,9 @@ use crate::{AppError, AssistantDeltaEvent, RunEvent, RunOptions, RunOutcome};
 /// Root composition failures while interpreting existing run events.
 #[derive(Debug, Error)]
 pub enum VoiceError {
+    /// Shared process-global ONNX Runtime acquisition failed.
+    #[error(transparent)]
+    Runtime(#[from] OrtRuntimeError),
     /// Assistant deltas and their durable response boundary disagreed.
     #[error("assistant narration event contract failed: {reason}")]
     EventContract {
@@ -44,9 +50,15 @@ pub enum VoiceError {
     /// Resident Whisper setup failed.
     #[error(transparent)]
     Recognition(#[from] SttError),
+    /// Resident Silero setup or inference failed.
+    #[error(transparent)]
+    Vad(#[from] VadError),
     /// Persistent input, endpointing, or recognition failed.
     #[error(transparent)]
     Capture(#[from] CaptureError),
+    /// Live root transcript presentation failed before a run began.
+    #[error("cannot present live voice transcript: {0}")]
+    Presentation(#[source] io::Error),
     /// This session was opened without the explicit capture path.
     #[error("voice session has no capture worker")]
     CaptureUnavailable,
@@ -119,47 +131,63 @@ pub struct VoiceSessionShutdown {
     pub synthesis: SynthWorkerShutdown,
 }
 
-/// Warm Kokoro engine and persistent cpal stream reused across narrated runs.
+/// Root-owned warm voice engines and persistent cpal streams reused across runs.
 pub struct VoiceSession {
+    ort_runtime: OrtRuntime,
+    ort_metrics: OrtRuntimeMetricsReader,
     provenance: KokoroProvenance,
     kokoro_metrics: KokoroMetricsReader,
     worker: Option<SynthWorker>,
     whisper_provenance: Option<WhisperProvenance>,
     whisper_metrics: Option<WhisperMetricsReader>,
+    silero_provenance: Option<SileroProvenance>,
+    silero_metrics: Option<SileroMetricsReader>,
     capture: Option<CaptureWorker>,
 }
 
 impl VoiceSession {
     /// Loads the pinned model and opens the output device before any app run.
     pub fn open(kokoro: KokoroConfig, playback: PlaybackConfig) -> Result<Self, VoiceError> {
-        let synthesizer = KokoroSynthesizer::load(kokoro)?;
+        let ort_runtime = OrtRuntime::acquire()?;
+        let ort_metrics = ort_runtime.metrics_reader();
+        let synthesizer = KokoroSynthesizer::load_with_runtime(kokoro, ort_runtime.clone())?;
         let provenance = synthesizer.provenance().clone();
         let kokoro_metrics = synthesizer.metrics_reader();
         let worker = SynthWorker::spawn(synthesizer, playback)?;
         Ok(Self {
+            ort_runtime,
+            ort_metrics,
             provenance,
             kokoro_metrics,
             worker: Some(worker),
             whisper_provenance: None,
             whisper_metrics: None,
+            silero_provenance: None,
+            silero_metrics: None,
             capture: None,
         })
     }
 
-    /// Opens AU2 output plus one resident CUDA recognizer and persistent input stream.
+    /// Opens AU2 output plus resident Whisper/Silero input through one shared ONNX owner.
     pub fn open_with_capture(
         kokoro: KokoroConfig,
         playback: PlaybackConfig,
         whisper: WhisperConfig,
+        silero: SileroConfig,
         capture_config: CaptureConfig,
     ) -> Result<Self, VoiceError> {
         let mut session = Self::open(kokoro, playback)?;
         let recognizer = WhisperRecognizer::load(whisper)?;
         let whisper_provenance = recognizer.provenance().clone();
         let whisper_metrics = recognizer.metrics_reader();
-        let capture = CaptureWorker::open(capture_config, recognizer)?;
+        let detector = SileroVad::load_with_runtime(silero, session.ort_runtime.clone())?;
+        let silero_provenance = detector.provenance().clone();
+        let silero_metrics = detector.metrics_reader();
+        let capture = CaptureWorker::open(capture_config, detector, recognizer)?;
         session.whisper_provenance = Some(whisper_provenance);
         session.whisper_metrics = Some(whisper_metrics);
+        session.silero_provenance = Some(silero_provenance);
+        session.silero_metrics = Some(silero_metrics);
         session.capture = Some(capture);
         Ok(session)
     }
@@ -182,6 +210,16 @@ impl VoiceSession {
         self.whisper_provenance.as_ref()
     }
 
+    /// Returns resident Silero artifact and shared-runtime identity when enabled.
+    pub fn vad_provenance(&self) -> Option<&SileroProvenance> {
+        self.silero_provenance.as_ref()
+    }
+
+    /// Reads the one-environment ONNX session residency counters.
+    pub fn ort_runtime_metrics(&self) -> OrtRuntimeMetrics {
+        self.ort_metrics.snapshot()
+    }
+
     /// Returns the live input device and negotiated native format when enabled.
     pub fn capture_device_info(&self) -> Option<&CaptureDeviceInfo> {
         self.capture.as_ref().map(CaptureWorker::device_info)
@@ -192,6 +230,13 @@ impl VoiceSession {
         self.whisper_metrics
             .as_ref()
             .map(WhisperMetricsReader::snapshot)
+    }
+
+    /// Reads resident Silero session and recurrent-state counters when enabled.
+    pub fn vad_metrics(&self) -> Option<SileroMetrics> {
+        self.silero_metrics
+            .as_ref()
+            .map(SileroMetricsReader::snapshot)
     }
 
     /// Reads persistent input, VAD, conversion, and overflow counters when enabled.
@@ -211,7 +256,7 @@ impl VoiceSession {
         Ok(VoiceSessionShutdown { capture, synthesis })
     }
 
-    /// Captures one final question, then reuses the existing run and AU2 answer path.
+    /// Presents replaceable partials, commits one final question, then starts one run.
     pub fn capture_question(
         &mut self,
         options: RunOptions,
@@ -220,12 +265,55 @@ impl VoiceSession {
         if options.event_sender.is_some() {
             return Err(VoiceRunError::EventSenderAlreadySet);
         }
+        let display_live = options.stream_to_stderr;
+        let mut input = ActiveVoiceInput::default();
+        let mut input_error = None;
+        let mut presentation_error = None;
+        let mut visible_partial_us = Vec::new();
+        let stderr = io::stderr();
+        let mut presentation = display_live.then(|| TerminalVoiceInput::new(stderr.lock()));
         let capture = self
             .capture
             .as_ref()
             .ok_or(VoiceError::CaptureUnavailable)?
-            .capture(timeout)
+            .capture_with_partials(timeout, |partial| {
+                if input_error.is_none()
+                    && let Err(error) = input.replace_partial(partial)
+                {
+                    input_error = Some(error);
+                }
+                if let Some(presentation) = presentation.as_mut()
+                    && presentation_error.is_none()
+                {
+                    match presentation.replace(partial) {
+                        Ok(()) => visible_partial_us.push(partial.observed_latency_us()),
+                        Err(error) => presentation_error = Some(error),
+                    }
+                }
+            })
             .map_err(VoiceError::from)?;
+        if let Some(error) = input_error {
+            return Err(error.into());
+        }
+        input.finalize(&capture.transcript)?;
+        if let Some(error) = presentation_error {
+            return Err(VoiceError::Presentation(error).into());
+        }
+        if display_live && visible_partial_us.len() != capture.partials.len() {
+            return Err(
+                contract_error("live presentation did not observe every capture partial").into(),
+            );
+        }
+        let mut capture = capture;
+        for (partial, visible_us) in capture.partials.iter_mut().zip(visible_partial_us) {
+            partial.audio_available_to_visible_us = Some(visible_us);
+        }
+        if let Some(presentation) = presentation.as_mut() {
+            presentation
+                .commit(&capture.transcript)
+                .map_err(VoiceError::Presentation)?;
+        }
+        drop(presentation);
         let options = options_for_transcript(options, &capture.transcript)?;
         let narrated = self.run_question(options)?;
         Ok(CapturedRunOutcome { capture, narrated })
@@ -321,6 +409,82 @@ impl VoiceSession {
             })
         })
     }
+}
+
+#[derive(Default)]
+struct ActiveVoiceInput {
+    partial: Option<Transcript>,
+    finalized: bool,
+}
+
+impl ActiveVoiceInput {
+    fn replace_partial(&mut self, partial: &CapturePartial) -> Result<(), VoiceError> {
+        if partial.transcript.is_final {
+            return Err(contract_error(
+                "voice input partial callback received a final transcript",
+            ));
+        }
+        if self.finalized {
+            return Err(contract_error(
+                "voice input partial arrived after finalization",
+            ));
+        }
+        self.partial = Some(partial.transcript.clone());
+        Ok(())
+    }
+
+    fn finalize(&mut self, transcript: &Transcript) -> Result<(), VoiceError> {
+        if !transcript.is_final {
+            return Err(contract_error(
+                "voice input finalization received a non-final transcript",
+            ));
+        }
+        if self.finalized {
+            return Err(contract_error("voice input finalized more than once"));
+        }
+        self.finalized = true;
+        Ok(())
+    }
+}
+
+struct TerminalVoiceInput<W> {
+    writer: W,
+}
+
+impl<W: Write> TerminalVoiceInput<W> {
+    fn new(writer: W) -> Self {
+        Self { writer }
+    }
+
+    fn replace(&mut self, partial: &CapturePartial) -> io::Result<()> {
+        write!(
+            self.writer,
+            "\r\x1b[2KYou: {}",
+            single_line(&partial.transcript.text)
+        )?;
+        self.writer.flush()
+    }
+
+    fn commit(&mut self, transcript: &Transcript) -> io::Result<()> {
+        writeln!(
+            self.writer,
+            "\r\x1b[2KYou: {}",
+            single_line(&transcript.text)
+        )?;
+        self.writer.flush()
+    }
+}
+
+fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn options_for_transcript(
@@ -476,6 +640,9 @@ fn contract_error(reason: impl Into<String>) -> VoiceError {
     }
 }
 
+#[cfg(all(test, feature = "whisper-cuda"))]
+mod timing_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,5 +768,49 @@ mod tests {
             options_for_transcript(run_options("typed placeholder"), &rolling),
             Err(VoiceError::EventContract { .. })
         ));
+    }
+
+    #[test]
+    fn rolling_voice_input_replaces_state_and_commits_exactly_one_final() {
+        let mut input = ActiveVoiceInput::default();
+        let first = CapturePartial::new(Transcript::new("what is", false, 320).unwrap(), 40_000);
+        let revised = CapturePartial::new(
+            Transcript::new("what is the capital", false, 480).unwrap(),
+            45_000,
+        );
+        input.replace_partial(&first).unwrap();
+        input.replace_partial(&revised).unwrap();
+        assert_eq!(
+            input.partial.as_ref().map(|partial| partial.text.as_str()),
+            Some("what is the capital")
+        );
+
+        let final_transcript =
+            Transcript::new("What is the capital of France?", true, 1_500).unwrap();
+        input.finalize(&final_transcript).unwrap();
+        assert!(input.finalize(&final_transcript).is_err());
+        assert!(input.replace_partial(&revised).is_err());
+    }
+
+    #[test]
+    fn terminal_partials_clear_and_replace_one_active_line() {
+        let mut output = Vec::new();
+        let first = CapturePartial::new(Transcript::new("what is", false, 320).unwrap(), 10);
+        let revised = CapturePartial::new(
+            Transcript::new("what\nis the capital", false, 480).unwrap(),
+            11,
+        );
+        let final_transcript =
+            Transcript::new("What is the capital of France?", true, 1_500).unwrap();
+        {
+            let mut presentation = TerminalVoiceInput::new(&mut output);
+            presentation.replace(&first).unwrap();
+            presentation.replace(&revised).unwrap();
+            presentation.commit(&final_transcript).unwrap();
+        }
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\r\x1b[2KYou: what is\r\x1b[2KYou: what is the capital\r\x1b[2KYou: What is the capital of France?\n"
+        );
     }
 }

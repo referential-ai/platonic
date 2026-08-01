@@ -1,0 +1,22 @@
+{
+  "schema": "plato_audio.au4_long_utterance.v1",
+  "license": "CC0-1.0",
+  "human_recording": false,
+  "format": {
+    "codec": "pcm_s16le",
+    "sample_rate": 16000,
+    "channels": 1,
+    "samples": 397752,
+    "duration_ms": 24859
+  },
+  "fixture": {
+    "path": "long-utterance.wav",
+    "source": "eSpeak NG 1.52.0 en-us at 165 words/minute; FFmpeg n8.1.2 16 kHz mono resample and 250 ms leading/trailing silence",
+    "source_text": "What is the capital of France? Which city is the capital of Germany? Name the capital of Italy. Tell me the capital of Spain. What is the capital of Portugal? Which city is the capital of Belgium? Name the capital of Austria. Tell me the capital of Greece. What is the capital of Ireland? Which city is the capital of Denmark? Name the capital of Sweden. Tell me the capital of Norway.",
+    "sha256": "71129abe7edb62301ab3c7bd035d999cb1b43d0ab4d92665e387555f3b5ec1d0"
+  },
+  "whisper": {
+    "expected_transcript": "What is the capital of France? Which city is the capital of of Germany. Name the capital of Italy. Tell me the capital of Spain. What is the capital of Portugal? which city is the capital of Belgium. the capital of Austria. Tell me the capital of Greece. What is the capital of Ireland? which city is the capital of Denmark. Name the capital of Sweden. Tell me the capital of Norway.",
+    "expected_transcript_sha256": "fd2d0cd4c36d2bc3ea7dad2b5e82eac2504d7accc05ec4d0d162dae0bdd2077a"
+  }
+}

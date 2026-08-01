@@ -24,6 +24,15 @@ use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
 };
 
+#[cfg(any(feature = "whisper-cuda", test))]
+mod window;
+
+#[cfg(feature = "whisper-cuda")]
+use window::{
+    DecodedSegment, DecodedWindow, MAX_END_PADDING_SAMPLES, clamp_end_padding, stable_prefix,
+    timestamp_samples, validate_decode_window, validate_decoded_window,
+};
+
 #[cfg(feature = "whisper-cuda")]
 use crate::SampleFormat;
 use crate::{AudioFormat, InferenceBackend, PcmFrame, SttError};
@@ -37,9 +46,19 @@ pub const WHISPER_MODEL_SHA256: &str =
     "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69";
 /// Exact Rust wrapper used to embed whisper.cpp.
 pub const WHISPER_RS_RUNTIME_VERSION: &str = "whisper-rs 0.16.0";
+/// Maximum PCM retained in each rolling partial re-decode.
+pub const WHISPER_PARTIAL_WINDOW_MS: u64 = 5_000;
+/// Exact PCM cadence between eligible rolling partial re-decodes.
+pub const WHISPER_PARTIAL_CADENCE_MS: u64 = 160;
+/// Minimum active speech span before the first partial re-decode.
+pub const WHISPER_PARTIAL_MINIMUM_MS: u64 = 320;
+/// Tail retained after a stable segment boundary to protect revision context.
+pub const WHISPER_STABLE_OVERLAP_MS: u64 = 1_000;
 
 #[cfg(feature = "whisper-cuda")]
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
+#[cfg(feature = "whisper-cuda")]
+const WHISPER_SEGMENT_MAX_CHARS: i32 = 32;
 #[cfg(feature = "whisper-cuda")]
 const MAX_DIAGNOSTIC_CHARS: usize = 2_048;
 #[cfg(feature = "whisper-cuda")]
@@ -78,6 +97,9 @@ pub trait SpeechRecognizer: Send {
 
     /// Accepts one normalized PCM frame and may return rolling transcripts.
     fn accept(&mut self, frame: &PcmFrame) -> Result<Vec<Transcript>, SttError>;
+
+    /// Discards an unfinished utterance without reconstructing resident model state.
+    fn reset(&mut self);
 
     /// Closes the current VAD endpoint and returns one committed transcript.
     fn finalize(&mut self) -> Result<Transcript, SttError>;
@@ -124,6 +146,18 @@ pub struct WhisperProvenance {
     pub cuda_device: u32,
     /// Bounded in-process runtime evidence for the selected backend.
     pub backend_evidence: String,
+    /// Fixed rolling partial window bound.
+    pub partial_window_ms: u64,
+    /// Fixed rolling partial re-decode cadence.
+    pub partial_cadence_ms: u64,
+    /// Fixed maximum decode window used by endpoint finalization.
+    pub final_window_ms: u64,
+    /// Uncommitted tail retained behind every stable segment commit.
+    pub stable_overlap_ms: u64,
+    /// Character bound used to expose stable word-aligned segment boundaries.
+    pub segment_max_chars: u32,
+    /// Maximum terminal timestamp padding normalized before segment validation.
+    pub timestamp_end_padding_samples: usize,
 }
 
 /// Observable resident-recognizer reuse counters.
@@ -133,12 +167,27 @@ pub struct WhisperMetrics {
     pub model_loads: u64,
     /// Successful final utterance decodes.
     pub finalizations: u64,
+    /// Successful bounded rolling decode calls.
+    pub partial_decodes: u64,
+    /// Nonempty changed partial hypotheses returned to capture.
+    pub partial_updates: u64,
+    /// Stable prefixes committed before their PCM leaves the rolling window.
+    pub window_commits: u64,
+    /// Largest PCM window passed to whisper.cpp by any decode.
+    pub maximum_decode_samples: u64,
+    /// PCM samples passed to the most recent endpoint-final decode.
+    pub last_final_window_samples: u64,
 }
 
 #[derive(Default)]
 struct WhisperMetricCounters {
     model_loads: AtomicU64,
     finalizations: AtomicU64,
+    partial_decodes: AtomicU64,
+    partial_updates: AtomicU64,
+    window_commits: AtomicU64,
+    maximum_decode_samples: AtomicU64,
+    last_final_window_samples: AtomicU64,
 }
 
 /// Cloneable read-only access to resident recognizer counters.
@@ -153,6 +202,14 @@ impl WhisperMetricsReader {
         WhisperMetrics {
             model_loads: self.counters.model_loads.load(Ordering::Relaxed),
             finalizations: self.counters.finalizations.load(Ordering::Relaxed),
+            partial_decodes: self.counters.partial_decodes.load(Ordering::Relaxed),
+            partial_updates: self.counters.partial_updates.load(Ordering::Relaxed),
+            window_commits: self.counters.window_commits.load(Ordering::Relaxed),
+            maximum_decode_samples: self.counters.maximum_decode_samples.load(Ordering::Relaxed),
+            last_final_window_samples: self
+                .counters
+                .last_final_window_samples
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -251,6 +308,12 @@ pub struct WhisperRecognizer {
     #[cfg(feature = "whisper-cuda")]
     state: WhisperState,
     samples: Vec<f32>,
+    total_samples: u64,
+    committed_text: String,
+    #[cfg(feature = "whisper-cuda")]
+    previous_window: Option<DecodedWindow>,
+    samples_since_partial: usize,
+    last_partial: String,
     input_format: AudioFormat,
     provenance: WhisperProvenance,
     metrics: Arc<WhisperMetricCounters>,
@@ -309,6 +372,12 @@ impl WhisperRecognizer {
             Ok(Self {
                 state,
                 samples: Vec::new(),
+                total_samples: 0,
+                committed_text: String::new(),
+                #[cfg(feature = "whisper-cuda")]
+                previous_window: None,
+                samples_since_partial: 0,
+                last_partial: String::new(),
                 input_format: AudioFormat::new(WHISPER_SAMPLE_RATE, 1, SampleFormat::F32)
                     .expect("literal Whisper format is valid"),
                 provenance: WhisperProvenance {
@@ -321,6 +390,12 @@ impl WhisperRecognizer {
                     backend: InferenceBackend::Cuda,
                     cuda_device: admission.device,
                     backend_evidence: admission.evidence,
+                    partial_window_ms: WHISPER_PARTIAL_WINDOW_MS,
+                    partial_cadence_ms: WHISPER_PARTIAL_CADENCE_MS,
+                    final_window_ms: WHISPER_PARTIAL_WINDOW_MS,
+                    stable_overlap_ms: WHISPER_STABLE_OVERLAP_MS,
+                    segment_max_chars: WHISPER_SEGMENT_MAX_CHARS as u32,
+                    timestamp_end_padding_samples: MAX_END_PADDING_SAMPLES,
                 },
                 metrics,
             })
@@ -356,8 +431,66 @@ impl SpeechRecognizer for WhisperRecognizer {
             .samples()
             .as_f32()
             .expect("Whisper format contract is f32")[0];
+
+        #[cfg(feature = "whisper-cuda")]
+        {
+            let maximum = milliseconds_to_samples(WHISPER_PARTIAL_WINDOW_MS);
+            if self.samples.len() > maximum {
+                return Err(SttError::Contract {
+                    reason: format!("pending Whisper PCM exceeded its {maximum}-sample hard cap"),
+                });
+            }
+            if self.samples.len() == maximum {
+                self.rollover_at_capacity()?;
+            }
+        }
+
         self.samples.push(sample);
-        Ok(Vec::new())
+        self.total_samples = self.total_samples.saturating_add(1);
+        self.samples_since_partial = self.samples_since_partial.saturating_add(1);
+
+        #[cfg(not(feature = "whisper-cuda"))]
+        {
+            Ok(Vec::new())
+        }
+
+        #[cfg(feature = "whisper-cuda")]
+        {
+            let minimum_samples = milliseconds_to_samples(WHISPER_PARTIAL_MINIMUM_MS);
+            let cadence_samples = milliseconds_to_samples(WHISPER_PARTIAL_CADENCE_MS);
+            if self.samples.len() < minimum_samples || self.samples_since_partial < cadence_samples
+            {
+                return Ok(Vec::new());
+            }
+            self.samples_since_partial = 0;
+            let decoded = self.decode_pending()?;
+            self.metrics.partial_decodes.fetch_add(1, Ordering::Relaxed);
+            let text = self.accept_decoded_window(decoded, false)?;
+            if text.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            let span_ms = samples_to_milliseconds_u64(self.total_samples);
+            let transcript = Transcript::new(text, false, span_ms)?;
+            if transcript.text == self.last_partial {
+                return Ok(Vec::new());
+            }
+            self.last_partial.clear();
+            self.last_partial.push_str(&transcript.text);
+            self.metrics.partial_updates.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![transcript])
+        }
+    }
+
+    fn reset(&mut self) {
+        self.samples.clear();
+        self.total_samples = 0;
+        self.committed_text.clear();
+        #[cfg(feature = "whisper-cuda")]
+        {
+            self.previous_window = None;
+        }
+        self.samples_since_partial = 0;
+        self.last_partial.clear();
     }
 
     fn finalize(&mut self) -> Result<Transcript, SttError> {
@@ -370,51 +503,168 @@ impl SpeechRecognizer for WhisperRecognizer {
 
         #[cfg(feature = "whisper-cuda")]
         {
-            if self.samples.is_empty() {
+            if self.total_samples == 0 {
                 return Err(SttError::NoAudio);
             }
-            let mut audio = std::mem::take(&mut self.samples);
-            let span_ms =
-                (audio.len() as u64).saturating_mul(1_000) / u64::from(WHISPER_SAMPLE_RATE);
-            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-            params.set_language(Some("en"));
-            params.set_translate(false);
-            params.set_no_context(true);
-            params.set_single_segment(false);
-            params.set_print_special(false);
-            params.set_print_progress(false);
-            params.set_print_realtime(false);
-            params.set_print_timestamps(false);
-            params.set_no_timestamps(true);
-
-            let inference = self
-                .state
-                .full(params, &audio)
-                .map_err(|error| SttError::Inference {
-                    reason: bounded(&error.to_string()),
-                });
-            if let Err(error) = inference {
-                audio.clear();
-                self.samples = audio;
-                return Err(error);
-            }
-            let text = self
-                .state
-                .as_iter()
-                .try_fold(String::new(), |mut text, segment| {
-                    let segment = segment.to_str().map_err(|error| SttError::Inference {
-                        reason: bounded(&error.to_string()),
-                    })?;
-                    text.push_str(segment);
-                    Ok::<_, SttError>(text)
-                });
-            audio.clear();
-            self.samples = audio;
+            let audio = std::mem::take(&mut self.samples);
+            let final_window_samples = u64::try_from(audio.len()).unwrap_or(u64::MAX);
+            self.metrics
+                .last_final_window_samples
+                .store(final_window_samples, Ordering::Relaxed);
+            let span_ms = samples_to_milliseconds_u64(self.total_samples);
+            let decoded = if audio.is_empty() {
+                Ok(DecodedWindow::default())
+            } else {
+                self.decode_window(&audio)
+            };
+            let text = decoded.map(|decoded| {
+                let mut text = std::mem::take(&mut self.committed_text);
+                text.push_str(&decoded.text());
+                text
+            });
+            self.total_samples = 0;
+            self.previous_window = None;
+            self.samples_since_partial = 0;
+            self.last_partial.clear();
             let transcript = Transcript::new(text?, true, span_ms)?;
             self.metrics.finalizations.fetch_add(1, Ordering::Relaxed);
             Ok(transcript)
         }
     }
+}
+
+#[cfg(feature = "whisper-cuda")]
+impl WhisperRecognizer {
+    fn rollover_at_capacity(&mut self) -> Result<(), SttError> {
+        let maximum = milliseconds_to_samples(WHISPER_PARTIAL_WINDOW_MS);
+        debug_assert_eq!(self.samples.len(), maximum);
+        let decoded = self.decode_pending()?;
+        self.metrics.partial_decodes.fetch_add(1, Ordering::Relaxed);
+        self.accept_decoded_window(decoded, true)?;
+        self.samples_since_partial = 0;
+        Ok(())
+    }
+
+    fn decode_pending(&mut self) -> Result<DecodedWindow, SttError> {
+        let audio = self.samples.clone();
+        self.decode_window(&audio)
+    }
+
+    fn decode_window(&mut self, audio: &[f32]) -> Result<DecodedWindow, SttError> {
+        let maximum = milliseconds_to_samples(WHISPER_PARTIAL_WINDOW_MS);
+        validate_decode_window(audio.len(), maximum)
+            .map_err(|reason| SttError::Contract { reason })?;
+        self.metrics.maximum_decode_samples.fetch_max(
+            u64::try_from(audio.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_language(Some("en"));
+        params.set_translate(false);
+        params.set_no_context(true);
+        params.set_single_segment(false);
+        params.set_print_special(false);
+        params.set_print_progress(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+        params.set_no_timestamps(false);
+        params.set_token_timestamps(true);
+        params.set_max_len(WHISPER_SEGMENT_MAX_CHARS);
+        params.set_split_on_word(true);
+        self.state
+            .full(params, audio)
+            .map_err(|error| SttError::Inference {
+                reason: bounded(&error.to_string()),
+            })?;
+        let segments = self
+            .state
+            .as_iter()
+            .map(|segment| {
+                let text = segment.to_str().map_err(|error| SttError::Inference {
+                    reason: bounded(&error.to_string()),
+                })?;
+                Ok(DecodedSegment {
+                    text: text.to_owned(),
+                    start_sample: timestamp_samples(segment.start_timestamp())
+                        .map_err(|reason| SttError::Contract { reason })?,
+                    end_sample: clamp_end_padding(
+                        timestamp_samples(segment.end_timestamp())
+                            .map_err(|reason| SttError::Contract { reason })?,
+                        audio.len(),
+                    )
+                    .map_err(|reason| SttError::Contract { reason })?,
+                })
+            })
+            .collect::<Result<_, SttError>>()?;
+        let decoded = DecodedWindow { segments };
+        validate_decoded_window(&decoded, audio.len())
+            .map_err(|reason| SttError::Contract { reason })?;
+        Ok(decoded)
+    }
+
+    fn accept_decoded_window(
+        &mut self,
+        current: DecodedWindow,
+        require_commit: bool,
+    ) -> Result<String, SttError> {
+        let mut complete_text = self.committed_text.clone();
+        complete_text.push_str(&current.text());
+        let selection = self
+            .previous_window
+            .as_ref()
+            .map(|previous| {
+                stable_prefix(
+                    previous,
+                    &current,
+                    self.samples.len(),
+                    milliseconds_to_samples(WHISPER_STABLE_OVERLAP_MS),
+                )
+            })
+            .transpose();
+        let prefix = match selection {
+            Ok(prefix) => prefix.flatten(),
+            Err(reason) if require_commit => return Err(SttError::Contract { reason }),
+            Err(_) => None,
+        };
+        match prefix {
+            Some(prefix) => {
+                self.committed_text.push_str(&prefix.text);
+                self.samples.drain(..prefix.drain_samples);
+                self.previous_window = None;
+                self.metrics.window_commits.fetch_add(1, Ordering::Relaxed);
+            }
+            None if require_commit => {
+                return Err(SttError::Contract {
+                    reason: format!(
+                        "pending Whisper PCM reached {} samples without a stable segment boundary \
+                         (previous segments: {}, current segments: {})",
+                        self.samples.len(),
+                        self.previous_window
+                            .as_ref()
+                            .map_or(0, |window| window.segments.len()),
+                        current.segments.len(),
+                    ),
+                });
+            }
+            None => self.previous_window = Some(current),
+        }
+        Ok(complete_text)
+    }
+}
+
+#[cfg(feature = "whisper-cuda")]
+fn milliseconds_to_samples(milliseconds: u64) -> usize {
+    usize::try_from(
+        u64::from(WHISPER_SAMPLE_RATE)
+            .saturating_mul(milliseconds)
+            .div_ceil(1_000),
+    )
+    .unwrap_or(usize::MAX)
+}
+
+#[cfg(feature = "whisper-cuda")]
+fn samples_to_milliseconds_u64(samples: u64) -> u64 {
+    samples.saturating_mul(1_000) / u64::from(WHISPER_SAMPLE_RATE)
 }
 
 #[cfg(feature = "whisper-cuda")]
