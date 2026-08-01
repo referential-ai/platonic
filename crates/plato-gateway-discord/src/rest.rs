@@ -1,4 +1,4 @@
-use crate::{AppError, AppResult};
+use crate::{GatewayError, GatewayResult};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::Cell,
@@ -7,7 +7,6 @@ use std::{
 };
 
 pub(super) const DISCORD_MESSAGE_LIMIT: usize = 2_000;
-pub(super) const PRESENTATION_TIMEOUT: Duration = Duration::from_millis(1_500);
 const PRODUCT_MESSAGE_RETRY_LIMIT: Duration = Duration::from_secs(30);
 const TERMINAL_REACTION_WAIT_LIMIT: Duration = Duration::from_secs(2);
 
@@ -20,13 +19,29 @@ pub(super) struct DiscordRestClient {
 }
 
 impl DiscordRestClient {
+    #[cfg(test)]
     pub(super) fn new(api_base: &str, token: String) -> Self {
+        let timings = crate::DiscordGatewayTimings::default();
+        Self::with_timeouts(
+            api_base,
+            token,
+            timings.discord_http_timeout,
+            timings.presentation_timeout,
+        )
+    }
+
+    pub(super) fn with_timeouts(
+        api_base: &str,
+        token: String,
+        discord_http_timeout: Duration,
+        presentation_timeout: Duration,
+    ) -> Self {
         Self {
             agent: ureq::AgentBuilder::new()
-                .timeout(Duration::from_secs(35))
+                .timeout(discord_http_timeout)
                 .build(),
             presentation_agent: ureq::AgentBuilder::new()
-                .timeout(PRESENTATION_TIMEOUT)
+                .timeout(presentation_timeout)
                 .build(),
             api_base: api_base.trim_end_matches('/').into(),
             token,
@@ -34,7 +49,7 @@ impl DiscordRestClient {
         }
     }
 
-    pub(super) fn application_id(&self) -> AppResult<u64> {
+    pub(super) fn application_id(&self) -> GatewayResult<u64> {
         let response = self
             .request(
                 self.agent
@@ -43,30 +58,30 @@ impl DiscordRestClient {
             .call()
             .map_err(|error| discord_http_error("application lookup", error))?;
         let response: DiscordApplication = response.into_json().map_err(|_| {
-            AppError::Provider("discord application lookup returned invalid JSON".into())
+            GatewayError::Discord("discord application lookup returned invalid JSON".into())
         })?;
         response.id.parse().map_err(|_| {
-            AppError::Provider("discord application lookup returned an invalid id".into())
+            GatewayError::Discord("discord application lookup returned an invalid id".into())
         })
     }
 
-    pub(super) fn gateway_url(&self) -> AppResult<String> {
+    pub(super) fn gateway_url(&self) -> GatewayResult<String> {
         let response = self
             .request(self.agent.get(&format!("{}/gateway/bot", self.api_base)))
             .call()
             .map_err(|error| discord_http_error("gateway discovery", error))?;
         let response: GatewayBotResponse = response.into_json().map_err(|_| {
-            AppError::Provider("discord gateway discovery returned invalid JSON".into())
+            GatewayError::Discord("discord gateway discovery returned invalid JSON".into())
         })?;
         if response.url.is_empty() {
-            return Err(AppError::Provider(
+            return Err(GatewayError::Discord(
                 "discord gateway discovery returned an empty URL".into(),
             ));
         }
         Ok(response.url)
     }
 
-    pub(super) fn send_message(&self, channel_id: u64, text: &str) -> AppResult<()> {
+    pub(super) fn send_message(&self, channel_id: u64, text: &str) -> GatewayResult<()> {
         for content in discord_chunks(text) {
             let mut retry_available = true;
             loop {
@@ -99,7 +114,7 @@ impl DiscordRestClient {
         Ok(())
     }
 
-    pub(super) fn trigger_typing(&self, channel_id: u64) -> AppResult<()> {
+    pub(super) fn trigger_typing(&self, channel_id: u64) -> GatewayResult<()> {
         if !self.presentation_allowed("typing") {
             return Ok(());
         }
@@ -121,10 +136,10 @@ impl DiscordRestClient {
         message_id: u64,
         emoji: &str,
         action: ReactionAction,
-    ) -> AppResult<()> {
+    ) -> GatewayResult<()> {
         match self.reaction_attempt(channel_id, message_id, emoji, action)? {
             PresentationAttempt::Sent | PresentationAttempt::Gated => Ok(()),
-            PresentationAttempt::RateLimited(_) => Err(AppError::Provider(
+            PresentationAttempt::RateLimited(_) => Err(GatewayError::Discord(
                 "discord reaction returned HTTP 429".into(),
             )),
         }
@@ -135,12 +150,12 @@ impl DiscordRestClient {
         channel_id: u64,
         message_id: u64,
         emoji: &str,
-    ) -> AppResult<()> {
+    ) -> GatewayResult<()> {
         match self.reaction_attempt(channel_id, message_id, emoji, ReactionAction::Add)? {
             PresentationAttempt::Sent | PresentationAttempt::Gated => Ok(()),
             PresentationAttempt::RateLimited(rate_limit) => {
                 let Some(wait) = terminal_reaction_wait(rate_limit) else {
-                    return Err(AppError::Provider(
+                    return Err(GatewayError::Discord(
                         "discord terminal reaction returned HTTP 429".into(),
                     ));
                 };
@@ -148,7 +163,7 @@ impl DiscordRestClient {
                 thread::sleep(wait);
                 match self.reaction_attempt(channel_id, message_id, emoji, ReactionAction::Add)? {
                     PresentationAttempt::Sent | PresentationAttempt::Gated => Ok(()),
-                    PresentationAttempt::RateLimited(_) => Err(AppError::Provider(
+                    PresentationAttempt::RateLimited(_) => Err(GatewayError::Discord(
                         "discord terminal reaction returned HTTP 429".into(),
                     )),
                 }
@@ -162,7 +177,7 @@ impl DiscordRestClient {
         message_id: u64,
         emoji: &str,
         action: ReactionAction,
-    ) -> AppResult<PresentationAttempt> {
+    ) -> GatewayResult<PresentationAttempt> {
         if !self.presentation_allowed("reaction") {
             return Ok(PresentationAttempt::Gated);
         }
@@ -195,11 +210,11 @@ impl DiscordRestClient {
         allowed
     }
 
-    fn require_product_allowed(&self) -> AppResult<()> {
+    fn require_product_allowed(&self) -> GatewayResult<()> {
         if self.rate_limits.get().product_allowed(Instant::now()) {
             Ok(())
         } else {
-            Err(AppError::Provider(
+            Err(GatewayError::Discord(
                 "discord REST is globally rate limited".into(),
             ))
         }
@@ -232,7 +247,9 @@ impl DiscordRestClient {
                     self.rate_limits.set(limits);
                 }
                 DiscordRestError {
-                    app_error: AppError::Provider(format!("discord {operation} returned HTTP 429")),
+                    app_error: GatewayError::Discord(format!(
+                        "discord {operation} returned HTTP 429"
+                    )),
                     rate_limit: retry_after.map(|retry_after| DiscordRateLimit {
                         retry_after,
                         global,
@@ -284,7 +301,7 @@ enum RestClass {
 }
 
 struct DiscordRestError {
-    app_error: AppError,
+    app_error: GatewayError,
     rate_limit: Option<DiscordRateLimit>,
 }
 
@@ -338,13 +355,13 @@ impl DiscordRateLimits {
     }
 }
 
-pub(super) fn discord_http_error(operation: &str, error: ureq::Error) -> AppError {
+pub(super) fn discord_http_error(operation: &str, error: ureq::Error) -> GatewayError {
     match error {
         ureq::Error::Status(status, _) => {
-            AppError::Provider(format!("discord {operation} returned HTTP {status}"))
+            GatewayError::Discord(format!("discord {operation} returned HTTP {status}"))
         }
         ureq::Error::Transport(_) => {
-            AppError::Provider(format!("discord {operation} transport failed"))
+            GatewayError::Discord(format!("discord {operation} transport failed"))
         }
     }
 }
@@ -388,7 +405,7 @@ pub(super) struct AllowedMentions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discord_gateway::{
+    use crate::{
         daemon_bridge::{EYES_EMOJI, SUCCESS_EMOJI},
         test_support::*,
     };

@@ -1,4 +1,5 @@
 use plato_daemon_client::ClientError;
+use plato_gateway_discord::GatewayError;
 use plato_protocol::ProtocolError;
 use std::path::PathBuf;
 
@@ -120,5 +121,62 @@ impl From<ClientError> for AppError {
             ClientError::Io(error) => Self::Io(error),
             ClientError::Json(error) => Self::Json(error),
         }
+    }
+}
+
+impl From<GatewayError> for AppError {
+    fn from(error: GatewayError) -> Self {
+        match error {
+            GatewayError::Discord(message) => Self::Provider(message),
+            GatewayError::RunFailed(message) => Self::RunFailed(message),
+            GatewayError::DaemonProtocol(message) => Self::DaemonProtocol(message),
+            GatewayError::EmptyModelName => {
+                Self::Core(platonic_core::Error::EmptyIdentifier("ModelName"))
+            }
+            GatewayError::Client(error) => error.into(),
+            GatewayError::Io(error) => Self::Io(error),
+            GatewayError::Json(error) => Self::Json(error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_errors_preserve_root_variants_and_display() {
+        let cases = [
+            (
+                GatewayError::Discord("discord failed".into()),
+                "provider error: discord failed",
+            ),
+            (
+                GatewayError::RunFailed("missing answer".into()),
+                "run did not finish: missing answer",
+            ),
+            (
+                GatewayError::DaemonProtocol("bad response".into()),
+                "daemon protocol error: bad response",
+            ),
+            (
+                GatewayError::EmptyModelName,
+                "core error: ModelName cannot be empty",
+            ),
+        ];
+
+        for (gateway, expected) in cases {
+            let root = AppError::from(gateway);
+            assert_eq!(root.to_string(), expected);
+        }
+
+        assert!(matches!(
+            AppError::from(GatewayError::Discord("failed".into())),
+            AppError::Provider(message) if message == "failed"
+        ));
+        assert!(matches!(
+            AppError::from(GatewayError::EmptyModelName),
+            AppError::Core(platonic_core::Error::EmptyIdentifier("ModelName"))
+        ));
     }
 }

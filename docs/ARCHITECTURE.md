@@ -28,7 +28,9 @@ Default to a clear module with a narrow surface.
 Promote to a Cargo feature only when a real build wants exclusion.
 Promote to a crate only on a trigger: second consumer, independent process/deployable, or compile/dependency isolation.
 `sqlite` as a feature is a later discussion candidate only; the current SQLite path stays concrete.
-Connectors and gateways are future crate/process candidates when real ingress adapters exist; provider adapters come next.
+The Discord runtime is the `plato-gateway-discord` leaf crate; root retains
+configuration admission, startup composition, and the installed compatibility
+binary. Other connectors remain unadmitted.
 The store becomes a crate only with out-of-crate consumers; scheduler, cron, and memory are daemon-era modules/features if they ever become real.
 Crate-per-function upfront is rejected.
 
