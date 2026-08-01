@@ -9,17 +9,23 @@ use cpal::{
     SupportedStreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
+use rtrb::{Producer, RingBuffer};
 use serde::Serialize;
 
-use crate::{AudioFormat, DeviceError, PcmChunk, SampleFormat, core::playback::CallbackBuffer};
+use crate::{
+    AudioFormat, DeviceError, PcmChunk, SampleFormat,
+    core::playback::{CallbackDrain, PlaybackTimeline},
+};
 
 /// Exact cpal runtime crate version used by the playback implementation.
 pub const CPAL_RUNTIME_VERSION: &str = "cpal 0.18.1";
+/// Exact wait-free PCM ring implementation used by the callback edge.
+pub const RTRB_RUNTIME_VERSION: &str = "rtrb 0.3.4";
 
 const DEFAULT_CAPACITY_FRAMES: usize = 24_000 * 120;
 const DEFAULT_PREFERRED_BUFFER_FRAMES: u32 = 256;
-const PLAYBACK_TIMEOUT_SLACK: Duration = Duration::from_secs(5);
-const POLL_INTERVAL: Duration = Duration::from_millis(1);
+const RING_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+const RING_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const AUDIBLE_EPSILON: f32 = 1.0e-6;
 
 /// Buffer request selected from cpal's advertised device range.
@@ -56,11 +62,12 @@ impl Default for PlaybackConfig {
 }
 
 impl PlaybackConfig {
-    /// Constructs a configuration with a nonzero mono-frame capacity.
+    /// Constructs a configuration with a nonzero mono-frame ring capacity.
     pub fn new(capacity_frames: usize, preferred_buffer_frames: u32) -> Result<Self, DeviceError> {
         if capacity_frames == 0 || preferred_buffer_frames == 0 {
-            return Err(DeviceError::DeviceQuery {
-                reason: "playback capacity and preferred buffer size must be nonzero".to_owned(),
+            return Err(DeviceError::InvalidPlaybackConfig {
+                capacity_frames,
+                preferred_buffer_frames,
             });
         }
         Ok(Self {
@@ -69,7 +76,7 @@ impl PlaybackConfig {
         })
     }
 
-    /// Returns the maximum mono sentence frames held by the callback buffer.
+    /// Returns the exact mono f32 sample capacity of the PCM ring.
     pub fn capacity_frames(self) -> usize {
         self.capacity_frames
     }
@@ -91,43 +98,90 @@ pub struct PlaybackDeviceInfo {
     pub device: String,
     /// Actual device stream format.
     pub format: AudioFormat,
+    /// Mono f32 format accepted by the callback ring.
+    pub ring_format: AudioFormat,
     /// Requested device buffer mode and advertised range.
     pub buffer_size: DeviceBufferSize,
 }
 
-/// Observable persistent-device reuse counters.
+/// Explicit silence emitted while an accepted sentence lacked ring PCM.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct PlaybackUnderrun {
+    /// Callback invocations that emitted at least one underrun frame.
+    pub callbacks: u64,
+    /// Device frames filled with silence during those callbacks.
+    pub frames: u64,
+}
+
+/// Observable persistent-device and bounded-ring counters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct PlaybackMetrics {
     /// Successful stream constructions. This remains one for a reused device.
     pub stream_opens: u64,
-    /// Completely drained sentence chunks.
+    /// Completely drained sentence regions.
     pub chunks_played: u64,
+    /// Output callback invocations since stream construction.
+    pub callback_count: u64,
+    /// Exact fixed PCM ring capacity.
+    pub ring_capacity_frames: usize,
+    /// Highest accepted-but-not-finished job count observed by the owner.
+    pub max_accepted_unfinished: usize,
+    /// Aggregate underrun silence while jobs were accepted.
+    pub underrun: PlaybackUnderrun,
 }
 
-/// Timing observed for one serial sentence playback.
+/// Callback and synthesis timing for one sentence region.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct PlaybackReport {
-    /// Sentence-acceptance to first non-silent callback frame in microseconds.
+    /// Worker-global sentence sequence.
+    pub sequence: u64,
+    /// Sentence acceptance timestamp relative to stream construction.
+    pub accepted_ns: u64,
+    /// Synth worker start timestamp relative to stream construction.
+    pub synth_started_ns: u64,
+    /// Synth plus resampling completion timestamp.
+    pub synth_finished_ns: u64,
+    /// First sentence PCM frame copied by the callback.
+    pub first_pcm_ns: u64,
+    /// First non-silent sentence PCM frame copied by the callback.
+    pub first_non_silent_ns: u64,
+    /// Exclusive end timestamp of the final sentence PCM frame.
+    pub pcm_end_ns: u64,
+    /// Sentence-acceptance to first non-silent callback frame.
     pub accepted_to_first_non_silent_us: u64,
-    /// Actual frames supplied in the callback that emitted the first audible sample.
+    /// Worker synthesis plus resampling duration.
+    pub synthesis_us: u64,
+    /// Silence after the previous sentence PCM region, if one exists.
+    pub gap_before_us: Option<u64>,
+    /// Device frames in the first callback touching this sentence.
     pub first_callback_frames: usize,
-    /// Callback invocations while this sentence was active.
+    /// Callback invocations from first touch through final PCM.
     pub callback_count: u64,
-    /// Complete mono PCM frames drained.
-    pub frames_played: usize,
+    /// Complete source PCM frames before resampling.
+    pub source_frames: usize,
+    /// Complete mono device-rate frames drained from rtrb.
+    pub device_frames: usize,
+    /// Typed silence emitted while this sentence was accepted but unavailable.
+    pub underrun: PlaybackUnderrun,
 }
 
-/// One persistent cpal output stream that drains synthesized sentences serially.
-pub struct PersistentPlayback {
-    callback: Arc<CallbackBuffer>,
+/// One persistent cpal output stream whose callback owns the rtrb consumer.
+pub(crate) struct PersistentPlayback {
+    timeline: Arc<PlaybackTimeline>,
     device_info: PlaybackDeviceInfo,
-    metrics: PlaybackMetrics,
-    _stream: Stream,
+    ring_capacity_frames: usize,
+    stream: Option<Stream>,
+}
+
+pub(crate) struct PlaybackProducer {
+    producer: Producer<f32>,
+    timeline: Arc<PlaybackTimeline>,
+    ring_format: AudioFormat,
+    produced_samples: u64,
 }
 
 impl PersistentPlayback {
-    /// Opens and starts the default output device exactly once.
-    pub fn open(config: PlaybackConfig) -> Result<Self, DeviceError> {
+    pub(crate) fn open(config: PlaybackConfig) -> Result<(Self, PlaybackProducer), DeviceError> {
         let host = cpal::default_host();
         let backend = host.id().name().to_owned();
         let device = host
@@ -140,53 +194,67 @@ impl PersistentPlayback {
             })?
             .to_string();
         let device_name = device.to_string();
-        let supported = device
-            .supported_output_configs()
+        let default = device
+            .default_output_config()
             .map_err(|error| DeviceError::DeviceQuery {
                 reason: error.to_string(),
-            })?
-            .collect::<Vec<_>>();
-        let selected =
-            choose_supported_config(&supported).ok_or(DeviceError::UnsupportedSampleRate {
-                sample_rate: super::KOKORO_SAMPLE_RATE,
             })?;
+        let selected = if supported_sample_format(default.sample_format()) {
+            default
+        } else {
+            let supported = device
+                .supported_output_configs()
+                .map_err(|error| DeviceError::DeviceQuery {
+                    reason: error.to_string(),
+                })?
+                .collect::<Vec<_>>();
+            choose_supported_config(&supported).ok_or(DeviceError::UnsupportedOutputFormat)?
+        };
         let (buffer_size, requested_buffer) =
             select_buffer_size(selected.buffer_size(), config.preferred_buffer_frames);
         let mut stream_config: StreamConfig = selected.into();
         stream_config.buffer_size = requested_buffer;
-        let channels = usize::from(stream_config.channels);
-        let callback = Arc::new(CallbackBuffer::new(config.capacity_frames));
-        let stream = build_stream(
-            &device,
-            stream_config,
-            selected.sample_format(),
-            Arc::clone(&callback),
-            channels,
-        )?;
-        stream.play().map_err(|error| DeviceError::StreamStart {
-            reason: error.to_string(),
-        })?;
-        let format = AudioFormat::new(
+        let device_format = AudioFormat::new(
             selected.sample_rate(),
             selected.channels(),
             sample_format(selected.sample_format()),
         )?;
-
-        Ok(Self {
-            callback,
+        let ring_format = AudioFormat::new(device_format.sample_rate(), 1, SampleFormat::F32)?;
+        let timeline = Arc::new(PlaybackTimeline::new());
+        let (producer, consumer) = RingBuffer::new(config.capacity_frames);
+        let drain =
+            CallbackDrain::new(consumer, Arc::clone(&timeline), device_format.sample_rate());
+        let stream = build_stream(
+            &device,
+            stream_config,
+            selected.sample_format(),
+            drain,
+            Arc::clone(&timeline),
+            usize::from(device_format.channels()),
+        )?;
+        stream.play().map_err(|error| DeviceError::StreamStart {
+            reason: error.to_string(),
+        })?;
+        let playback = Self {
+            timeline: Arc::clone(&timeline),
             device_info: PlaybackDeviceInfo {
                 backend,
                 device_id,
                 device: device_name,
-                format,
+                format: device_format,
+                ring_format,
                 buffer_size,
             },
-            metrics: PlaybackMetrics {
-                stream_opens: 1,
-                chunks_played: 0,
-            },
-            _stream: stream,
-        })
+            ring_capacity_frames: config.capacity_frames,
+            stream: Some(stream),
+        };
+        let producer = PlaybackProducer {
+            producer,
+            timeline,
+            ring_format,
+            produced_samples: 0,
+        };
+        Ok((playback, producer))
     }
 
     /// Returns the exact live stream identity.
@@ -194,66 +262,140 @@ impl PersistentPlayback {
         &self.device_info
     }
 
-    /// Returns counters proving stream reuse.
-    pub fn metrics(&self) -> PlaybackMetrics {
-        self.metrics
+    pub(crate) fn timeline(&self) -> &Arc<PlaybackTimeline> {
+        &self.timeline
     }
 
-    /// Plays one complete 24 kHz mono f32 chunk and waits for its final frame.
-    ///
-    /// `accepted_at` is the sentence-acceptance boundary and may precede
-    /// synthesis. The report measures from that instant to the first audible
-    /// device callback frame.
-    pub fn play_blocking(
+    pub(crate) fn metrics(&self, max_accepted_unfinished: usize) -> PlaybackMetrics {
+        PlaybackMetrics {
+            stream_opens: 1,
+            chunks_played: self.timeline.finished_sentences(),
+            callback_count: self.timeline.callback_count(),
+            ring_capacity_frames: self.ring_capacity_frames,
+            max_accepted_unfinished,
+            underrun: PlaybackUnderrun {
+                callbacks: self.timeline.underrun_callbacks(),
+                frames: self.timeline.underrun_frames(),
+            },
+        }
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.timeline.mark_shutdown();
+        drop(self.stream.take());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pair(
+        device_format: AudioFormat,
+        ring_capacity_frames: usize,
+    ) -> (Self, PlaybackProducer, CallbackDrain) {
+        let ring_format =
+            AudioFormat::new(device_format.sample_rate(), 1, SampleFormat::F32).unwrap();
+        let timeline = Arc::new(PlaybackTimeline::new());
+        let (producer, consumer) = RingBuffer::new(ring_capacity_frames);
+        let callback =
+            CallbackDrain::new(consumer, Arc::clone(&timeline), device_format.sample_rate());
+        (
+            Self {
+                timeline: Arc::clone(&timeline),
+                device_info: PlaybackDeviceInfo {
+                    backend: "test".to_owned(),
+                    device_id: "test:output".to_owned(),
+                    device: "Synthetic output".to_owned(),
+                    format: device_format,
+                    ring_format,
+                    buffer_size: DeviceBufferSize::Fixed {
+                        requested_frames: 4,
+                        supported_min_frames: 1,
+                        supported_max_frames: 64,
+                    },
+                },
+                ring_capacity_frames,
+                stream: None,
+            },
+            PlaybackProducer {
+                producer,
+                timeline,
+                ring_format,
+                produced_samples: 0,
+            },
+            callback,
+        )
+    }
+}
+
+impl Drop for PersistentPlayback {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl PlaybackProducer {
+    #[cfg(test)]
+    pub(crate) fn ring_format(&self) -> AudioFormat {
+        self.ring_format
+    }
+
+    pub(crate) fn write_sentence(
         &mut self,
+        sequence: u64,
+        source_frames: usize,
         chunk: &PcmChunk,
-        accepted_at: Instant,
-    ) -> Result<PlaybackReport, DeviceError> {
-        let expected = AudioFormat::new(super::KOKORO_SAMPLE_RATE, 1, SampleFormat::F32)?;
-        if chunk.format() != expected {
+    ) -> Result<(), DeviceError> {
+        if chunk.format() != self.ring_format {
             return Err(DeviceError::FormatMismatch {
-                expected,
+                expected: self.ring_format,
                 actual: chunk.format(),
             });
         }
-        let samples = chunk.samples().as_f32().expect("validated f32 chunk");
-        if !samples.iter().any(|sample| sample.abs() > AUDIBLE_EPSILON) {
+        let samples = chunk.samples().as_f32().expect("ring contract is f32");
+        if samples.is_empty() || !samples.iter().any(|sample| sample.abs() > AUDIBLE_EPSILON) {
             return Err(DeviceError::SilentChunk);
         }
-        let accepted_ns = self.callback.timestamp(accepted_at);
-        self.callback.load(samples, accepted_ns)?;
-        let timeout = chunk.duration().saturating_add(PLAYBACK_TIMEOUT_SLACK);
-        let deadline = Instant::now() + timeout;
-        while !self.callback.is_idle() {
-            if self.callback.stream_failed() {
-                return Err(DeviceError::StreamFailed);
-            }
-            if Instant::now() >= deadline {
+        self.timeline
+            .publish_pcm(
+                sequence,
+                self.produced_samples,
+                source_frames,
+                samples.len(),
+            )
+            .map_err(|_| DeviceError::CallbackContract)?;
+
+        let mut remaining = samples;
+        let mut stall_deadline = Instant::now() + RING_STALL_TIMEOUT;
+        while !remaining.is_empty() {
+            self.check_health()?;
+            let (pushed_samples, remainder) = self.producer.push_partial_slice(remaining);
+            remaining = remainder;
+            let pushed = pushed_samples.len();
+            self.produced_samples = self
+                .produced_samples
+                .saturating_add(u64::try_from(pushed).unwrap_or(u64::MAX));
+            if pushed > 0 {
+                stall_deadline = Instant::now() + RING_STALL_TIMEOUT;
+            } else if Instant::now() >= stall_deadline {
                 return Err(DeviceError::PlaybackTimeout {
-                    milliseconds: timeout.as_millis(),
+                    milliseconds: RING_STALL_TIMEOUT.as_millis(),
                 });
+            } else {
+                thread::sleep(RING_POLL_INTERVAL);
             }
-            thread::sleep(POLL_INTERVAL);
         }
-        if self.callback.stream_failed() {
+        Ok(())
+    }
+
+    fn check_health(&self) -> Result<(), DeviceError> {
+        if self.timeline.stream_failed() {
             return Err(DeviceError::StreamFailed);
         }
-        let observation = self.callback.observation();
-        let first_non_silent_ns = observation
-            .first_non_silent_ns
-            .ok_or(DeviceError::SilentChunk)?;
-        let first_callback_frames = observation
-            .first_callback_frames
-            .ok_or(DeviceError::SilentChunk)?;
-        self.metrics.chunks_played += 1;
-        Ok(PlaybackReport {
-            accepted_to_first_non_silent_us: first_non_silent_ns
-                .saturating_sub(observation.accepted_ns)
-                / 1_000,
-            first_callback_frames,
-            callback_count: observation.callback_count,
-            frames_played: chunk.frame_count(),
-        })
+        if self.timeline.callback_contract_failed() {
+            return Err(DeviceError::CallbackContract);
+        }
+        if self.timeline.is_shutdown() {
+            return Err(DeviceError::PlaybackClosed);
+        }
+        Ok(())
     }
 }
 
@@ -270,7 +412,8 @@ fn choose_supported_config(
         supported
             .iter()
             .filter(|range| range.sample_format() == sample_format)
-            .filter_map(|range| range.try_with_sample_rate(super::KOKORO_SAMPLE_RATE))
+            .cloned()
+            .map(cpal::SupportedStreamConfigRange::with_max_sample_rate)
             .min_by_key(SupportedStreamConfig::channels)
     })
 }
@@ -299,55 +442,64 @@ fn build_stream(
     device: &cpal::Device,
     config: StreamConfig,
     sample_format: CpalSampleFormat,
-    callback: Arc<CallbackBuffer>,
+    drain: CallbackDrain,
+    timeline: Arc<PlaybackTimeline>,
     channels: usize,
 ) -> Result<Stream, DeviceError> {
     match sample_format {
         CpalSampleFormat::F32 => build_typed_stream(
             device,
             config,
-            callback,
+            drain,
+            timeline,
             channels,
-            CallbackBuffer::write_f32,
+            CallbackDrain::write_f32,
         ),
         CpalSampleFormat::I16 => build_typed_stream(
             device,
             config,
-            callback,
+            drain,
+            timeline,
             channels,
-            CallbackBuffer::write_i16,
+            CallbackDrain::write_i16,
         ),
         CpalSampleFormat::U16 => build_typed_stream(
             device,
             config,
-            callback,
+            drain,
+            timeline,
             channels,
-            CallbackBuffer::write_u16,
+            CallbackDrain::write_u16,
         ),
-        _ => Err(DeviceError::StreamBuild {
-            reason: format!("unsupported selected cpal sample format {sample_format}"),
-        }),
+        _ => Err(DeviceError::UnsupportedOutputFormat),
     }
 }
 
 fn build_typed_stream<T: cpal::SizedSample + 'static>(
     device: &cpal::Device,
     config: StreamConfig,
-    callback: Arc<CallbackBuffer>,
+    mut drain: CallbackDrain,
+    timeline: Arc<PlaybackTimeline>,
     channels: usize,
-    write: fn(&CallbackBuffer, &mut [T], usize),
+    write: fn(&mut CallbackDrain, &mut [T], usize),
 ) -> Result<Stream, DeviceError> {
-    let error_state = Arc::clone(&callback);
     device
         .build_output_stream(
             config,
-            move |output: &mut [T], _| write(&callback, output, channels),
-            move |_| error_state.mark_stream_failed(),
+            move |output: &mut [T], _| write(&mut drain, output, channels),
+            move |_| timeline.mark_stream_failed(),
             None,
         )
         .map_err(|error| DeviceError::StreamBuild {
             reason: error.to_string(),
         })
+}
+
+fn supported_sample_format(sample_format: CpalSampleFormat) -> bool {
+    matches!(
+        sample_format,
+        CpalSampleFormat::F32 | CpalSampleFormat::I16 | CpalSampleFormat::U16
+    )
 }
 
 fn sample_format(sample_format: CpalSampleFormat) -> SampleFormat {
@@ -364,7 +516,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn selection_prefers_f32_and_fewer_channels_at_model_rate() {
+    fn fallback_selection_prefers_f32_and_fewer_channels() {
         let supported = [
             cpal::SupportedStreamConfigRange::new(
                 2,
@@ -391,19 +543,7 @@ mod tests {
         let selected = choose_supported_config(&supported).unwrap();
         assert_eq!(selected.sample_format(), CpalSampleFormat::F32);
         assert_eq!(selected.channels(), 2);
-        assert_eq!(selected.sample_rate(), super::super::KOKORO_SAMPLE_RATE);
-    }
-
-    #[test]
-    fn selection_rejects_ranges_without_model_rate() {
-        let supported = [cpal::SupportedStreamConfigRange::new(
-            2,
-            44_100,
-            48_000,
-            SupportedBufferSize::Unknown,
-            CpalSampleFormat::F32,
-        )];
-        assert!(choose_supported_config(&supported).is_none());
+        assert_eq!(selected.sample_rate(), 48_000);
     }
 
     #[test]
@@ -433,7 +573,28 @@ mod tests {
 
     #[test]
     fn playback_config_rejects_zero_bounds_without_a_device() {
-        assert!(PlaybackConfig::new(0, 256).is_err());
-        assert!(PlaybackConfig::new(1024, 0).is_err());
+        assert!(matches!(
+            PlaybackConfig::new(0, 256),
+            Err(DeviceError::InvalidPlaybackConfig {
+                capacity_frames: 0,
+                preferred_buffer_frames: 256
+            })
+        ));
+        assert!(matches!(
+            PlaybackConfig::new(1024, 0),
+            Err(DeviceError::InvalidPlaybackConfig {
+                capacity_frames: 1024,
+                preferred_buffer_frames: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn synthetic_pair_has_exact_bounded_ring_and_native_format() {
+        let format = AudioFormat::new(48_000, 2, SampleFormat::I16).unwrap();
+        let (playback, producer, _callback) = PersistentPlayback::test_pair(format, 17);
+        assert_eq!(playback.device_info().format, format);
+        assert_eq!(producer.ring_format().sample_rate(), 48_000);
+        assert_eq!(playback.metrics(0).ring_capacity_frames, 17);
     }
 }

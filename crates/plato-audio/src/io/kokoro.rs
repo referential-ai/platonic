@@ -3,7 +3,10 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 use ort::{
@@ -158,6 +161,30 @@ pub struct KokoroMetrics {
     pub syntheses: u64,
 }
 
+#[derive(Default)]
+struct KokoroMetricCounters {
+    session_loads: AtomicU64,
+    phonemizer_invocations: AtomicU64,
+    syntheses: AtomicU64,
+}
+
+/// Cloneable read-only access to counters owned by the synth worker's engine.
+#[derive(Clone)]
+pub struct KokoroMetricsReader {
+    counters: Arc<KokoroMetricCounters>,
+}
+
+impl KokoroMetricsReader {
+    /// Reads one internally consistent-enough monotonic metrics snapshot.
+    pub fn snapshot(&self) -> KokoroMetrics {
+        KokoroMetrics {
+            session_loads: self.counters.session_loads.load(Ordering::Relaxed),
+            phonemizer_invocations: self.counters.phonemizer_invocations.load(Ordering::Relaxed),
+            syntheses: self.counters.syntheses.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Warm Kokoro-82M inference state backed by one resident ONNX session.
 pub struct KokoroSynthesizer {
     session: Session,
@@ -168,7 +195,7 @@ pub struct KokoroSynthesizer {
     phonemizer: EspeakPhonemizer,
     speed: f32,
     provenance: KokoroProvenance,
-    metrics: KokoroMetrics,
+    metrics: Arc<KokoroMetricCounters>,
 }
 
 impl KokoroSynthesizer {
@@ -197,6 +224,8 @@ impl KokoroSynthesizer {
             fallback_reason,
         };
 
+        let metrics = Arc::new(KokoroMetricCounters::default());
+        metrics.session_loads.store(1, Ordering::Relaxed);
         Ok(Self {
             session,
             backend,
@@ -206,10 +235,7 @@ impl KokoroSynthesizer {
             phonemizer,
             speed: config.speed,
             provenance,
-            metrics: KokoroMetrics {
-                session_loads: 1,
-                ..KokoroMetrics::default()
-            },
+            metrics,
         })
     }
 
@@ -220,11 +246,20 @@ impl KokoroSynthesizer {
 
     /// Returns counters proving resident session reuse.
     pub fn metrics(&self) -> KokoroMetrics {
-        self.metrics
+        self.metrics_reader().snapshot()
+    }
+
+    /// Returns a read-only counter handle that remains valid after worker ownership transfer.
+    pub fn metrics_reader(&self) -> KokoroMetricsReader {
+        KokoroMetricsReader {
+            counters: Arc::clone(&self.metrics),
+        }
     }
 
     fn token_ids(&mut self, sentence: &Sentence) -> Result<Vec<i64>, SynthError> {
-        self.metrics.phonemizer_invocations += 1;
+        self.metrics
+            .phonemizer_invocations
+            .fetch_add(1, Ordering::Relaxed);
         let phonemes = self.phonemizer.phonemize(sentence)?;
         tokenize(&self.tokenizer, &phonemes, self.voice_rows)
     }
@@ -287,7 +322,7 @@ impl SpeechSynthesizer for KokoroSynthesizer {
             return Err(SynthError::Canceled);
         }
         sink.push(chunk)?;
-        self.metrics.syntheses += 1;
+        self.metrics.syntheses.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }

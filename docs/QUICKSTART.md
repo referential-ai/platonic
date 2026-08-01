@@ -135,9 +135,11 @@ Message History, plus Send Messages in Threads when threads are used.
 
 ## 5. Local voice-out proof (developer MVP)
 
-AU1 exposes voice-out through focused examples rather than a general CLI or
-configuration surface. Install espeak-ng and the native cpal backend headers,
-then place the pinned Kokoro artifacts described in
+AU2 exposes bounded prefetched voice-out through focused examples rather than a
+general CLI or configuration surface. It uses one synth thread, a fixed
+four-sentence window, one persistent cpal stream, an rtrb PCM edge, and one
+rubato source/device plan. Install espeak-ng and the native cpal backend
+headers, then place the pinned Kokoro artifacts described in
 [`../crates/plato-audio/README.md`](../crates/plato-audio/README.md) outside the
 repository.
 
@@ -148,14 +150,15 @@ export PLATO_AUDIO_KOKORO_DIR="$HOME/.cache/plato-audio/kokoro-82m-v1.0-onnx-193
 PLATO_AUDIO_FIXTURE_KEY=local-proof \
   cargo run --release --locked --example narrated_run -- --fixture
 
-# One excluded warmup plus 20 actual-device warm TTFA trials (CUDA required):
+# One excluded warmup, 20 TTFA trials, and four-sentence gap/overlap proof:
 cargo run --release --locked -p plato-audio --example kokoro_device_proof
 ```
 
-The model engine and output stream open before the run. Both examples fail
-closed on artifact checksum, phonemizer, backend, device, PCM, callback, or
-sentence-sequence errors. Model files and provider credentials are never
-written into the repository or proof JSON.
+The model engine, native-rate resampling plan, and output stream open before
+timing. Both examples fail closed on artifact checksum, phonemizer, backend,
+device, PCM, worker, callback, sentence-order, gap, overlap, or teardown errors.
+Model files and provider credentials are never written into the repository or
+proof JSON.
 
 ## 6. Run the test suite (no API key needed)
 

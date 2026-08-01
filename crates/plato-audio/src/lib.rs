@@ -11,12 +11,18 @@ mod core;
 mod error;
 mod io;
 
-pub use core::{AudioFormat, PcmChunk, PcmData, PcmFrame, SampleFormat, Sentence, SentenceCutter};
-pub use error::{DeviceError, PcmError, PcmSinkError, SentenceError, SynthError};
+pub use core::{
+    AudioFormat, PcmChunk, PcmData, PcmFrame, RUBATO_RUNTIME_VERSION, ResampleReport,
+    ResamplingPlan, SENTENCE_PREFETCH_CAPACITY, SampleFormat, Sentence, SentenceCutter,
+    SentenceQueueError,
+};
+pub use error::{DeviceError, PcmError, PcmSinkError, ResampleError, SentenceError, SynthError};
 pub use io::{
     CPAL_RUNTIME_VERSION, DeviceBufferSize, InferenceBackend, KOKORO_MODEL_REVISION,
     KOKORO_MODEL_SHA256, KOKORO_MODEL_SOURCE, KOKORO_SAMPLE_RATE, KOKORO_TOKENIZER_SHA256,
-    KOKORO_VOICE_SHA256, KokoroConfig, KokoroMetrics, KokoroProvenance, KokoroSynthesizer,
-    ORT_RUNTIME_VERSION, PcmSink, PersistentPlayback, PlaybackConfig, PlaybackDeviceInfo,
-    PlaybackMetrics, PlaybackReport, SpeechSynthesizer,
+    KOKORO_VOICE_SHA256, KokoroConfig, KokoroMetrics, KokoroMetricsReader, KokoroProvenance,
+    KokoroSynthesizer, ORT_RUNTIME_VERSION, PcmSink, PlaybackConfig, PlaybackDeviceInfo,
+    PlaybackMetrics, PlaybackReport, PlaybackUnderrun, RTRB_RUNTIME_VERSION, SentenceAdmission,
+    SpeechSynthesizer, SynthWorker, SynthWorkerError, SynthWorkerFailure, SynthWorkerShutdown,
+    SynthWorkerStartError, SynthesizedSentenceReport,
 };

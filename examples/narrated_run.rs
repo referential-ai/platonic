@@ -16,15 +16,17 @@ const DEFAULT_QUESTION: &str =
     "Reply with exactly two complete sentences about a warm local voice. Do not use tools.";
 
 #[derive(Serialize)]
-struct ProofOutput<'a> {
+struct ProofOutput {
     schema: &'static str,
     run_id: String,
     final_answer: String,
     ledger: String,
     provider: &'static str,
-    model: &'a plato_audio::KokoroProvenance,
-    output: &'a plato_audio::PlaybackDeviceInfo,
+    model: plato_audio::KokoroProvenance,
+    output: plato_audio::PlaybackDeviceInfo,
     narration: plato_agent::NarrationReport,
+    shutdown: plato_audio::SynthWorkerShutdown,
+    synthesis_overlapped_playback: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -74,8 +76,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
+    let synthesis_overlapped_playback = outcome.narration.sentences.windows(2).all(|pair| {
+        pair[1].playback.synth_started_ns < pair[0].playback.pcm_end_ns
+            && pair[1].playback.synth_finished_ns > pair[0].playback.first_pcm_ns
+    });
+    if !synthesis_overlapped_playback {
+        return Err("narrated fixture did not overlap synthesis N+1 with playback N".into());
+    }
+    if outcome
+        .narration
+        .sentences
+        .iter()
+        .skip(1)
+        .any(|report| report.playback.gap_before_us.is_none_or(|gap| gap > 20_000))
+    {
+        return Err("narrated fixture exceeded the 20 ms inter-sentence gap bound".into());
+    }
+    let model = voice.provenance().clone();
+    let output = voice.device_info().clone();
+    let shutdown = voice.shutdown()?;
     let proof = ProofOutput {
-        schema: "plato_agent.narrated_run.v1",
+        schema: "plato_agent.narrated_run.v2",
         run_id: outcome.run.run_id.to_string(),
         final_answer: outcome.run.final_answer,
         ledger: ledger.display().to_string(),
@@ -84,9 +105,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         } else {
             "configured-provider"
         },
-        model: voice.provenance(),
-        output: voice.device_info(),
+        model,
+        output,
         narration: outcome.narration,
+        shutdown,
+        synthesis_overlapped_playback,
     };
     println!("{}", serde_json::to_string_pretty(&proof)?);
     Ok(())

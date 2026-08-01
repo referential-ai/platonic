@@ -1,36 +1,85 @@
-use std::{error::Error, path::PathBuf, process::Command, sync::atomic::AtomicBool, time::Instant};
+use std::{
+    error::Error,
+    path::PathBuf,
+    process::Command,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use plato_audio::{
     AudioFormat, CPAL_RUNTIME_VERSION, InferenceBackend, KokoroConfig, KokoroMetrics,
-    KokoroProvenance, KokoroSynthesizer, PcmChunk, PersistentPlayback, PlaybackConfig,
-    PlaybackDeviceInfo, PlaybackMetrics, PlaybackReport, Sentence, SpeechSynthesizer,
+    KokoroProvenance, KokoroSynthesizer, PlaybackConfig, PlaybackDeviceInfo, PlaybackMetrics,
+    PlaybackReport, PlaybackUnderrun, RTRB_RUNTIME_VERSION, RUBATO_RUNTIME_VERSION,
+    SENTENCE_PREFETCH_CAPACITY, Sentence, SynthWorker, SynthWorkerShutdown,
 };
 use serde::Serialize;
 
 const TRIALS: usize = 20;
-const MAX_P95_US: u64 = 500_000;
+const MAX_TTFA_P95_US: u64 = 350_000;
+const MAX_GAP_US: u64 = 20_000;
 const DEFAULT_SENTENCE: &str = "Plato speaks this complete warm sentence.";
-const TIMING_BOUNDARY: &str = "Instant immediately before warm synthesize(sentence) returns through the first non-silent sample copied by the persistent cpal output callback";
+const TIMING_BOUNDARY: &str = "sentence accepted into the fixed four-job window through the first non-silent sample copied by the persistent cpal output callback; model load and stream open excluded";
+const MULTI_SENTENCE_CORPUS: [&str; SENTENCE_PREFETCH_CAPACITY] = [
+    "Prefetch keeps this first sentence playing for the listener.",
+    "The second sentence synthesizes while the first one is still audible.",
+    "A third sentence follows through the same persistent device stream.",
+    "The final sentence proves exact order and a clean bounded drain.",
+];
 
 #[derive(Serialize)]
 struct ProofReport {
     schema: &'static str,
-    trial_count: usize,
-    sentence: String,
     timing_boundary: &'static str,
+    ttfa: LatencyMetric,
+    multi_sentence: MultiSentenceMetric,
+    model_format: AudioFormat,
+    provenance: KokoroProvenance,
+    cpal_runtime: &'static str,
+    rtrb_runtime: &'static str,
+    rubato_runtime: &'static str,
+    output: PlaybackDeviceInfo,
+    observed_device_period_us: Vec<u64>,
+    accelerator: AcceleratorInfo,
+    kokoro_metrics: KokoroMetrics,
+    shutdown: SynthWorkerShutdown,
+    warmup_excluded: bool,
+}
+
+#[derive(Serialize)]
+struct LatencyMetric {
+    trial_count: usize,
     threshold_us: u64,
     p50_us: u64,
     p95_us: u64,
     max_us: u64,
     trials: Vec<PlaybackReport>,
-    model_format: AudioFormat,
-    provenance: KokoroProvenance,
-    cpal_runtime: &'static str,
-    output: PlaybackDeviceInfo,
-    accelerator: AcceleratorInfo,
-    kokoro_metrics: KokoroMetrics,
-    playback_metrics: PlaybackMetrics,
-    warmup_excluded: bool,
+}
+
+#[derive(Serialize)]
+struct MultiSentenceMetric {
+    capacity: usize,
+    corpus: Vec<String>,
+    callback_sample_timestamps: Vec<PlaybackReport>,
+    gaps_us: Vec<u64>,
+    p50_us: u64,
+    p95_us: u64,
+    max_us: u64,
+    threshold_us: u64,
+    overlaps: Vec<OverlapProof>,
+    every_boundary_within_threshold: bool,
+    demonstrated_synthesis_playback_overlap: bool,
+    underrun: PlaybackUnderrun,
+    metrics_before_shutdown: PlaybackMetrics,
+}
+
+#[derive(Serialize)]
+struct OverlapProof {
+    playing_sequence: u64,
+    following_sequence: u64,
+    playing_first_pcm_ns: u64,
+    playing_pcm_end_ns: u64,
+    following_synth_started_ns: u64,
+    following_synth_finished_ns: u64,
+    overlap_us: u64,
 }
 
 #[derive(Serialize)]
@@ -45,9 +94,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     };
     let sentence = Sentence::new(sentence)?;
-    let cancel = AtomicBool::new(false);
-
-    let mut synthesizer = KokoroSynthesizer::load(KokoroConfig::from_model_dir(model_dir))?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let synthesizer = KokoroSynthesizer::load(KokoroConfig::from_model_dir(model_dir))?;
     if synthesizer.provenance().backend != InferenceBackend::Cuda {
         return Err(format!(
             "device proof requires the admitted CUDA backend; CPU fallback was selected: {}",
@@ -59,79 +107,197 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    let mut playback = PersistentPlayback::open(PlaybackConfig::default())?;
+    let provenance = synthesizer.provenance().clone();
+    let model_format = plato_audio::SpeechSynthesizer::output_format(&synthesizer);
+    let metrics_reader = synthesizer.metrics_reader();
+    let worker = SynthWorker::spawn(synthesizer, PlaybackConfig::default())?;
+    let output = worker.device_info().clone();
     let accelerator = accelerator_info()?;
 
-    let warmup_accepted = Instant::now();
-    let warmup = synthesize_one(&mut synthesizer, &sentence, &cancel)?;
-    playback.play_blocking(&warmup, warmup_accepted)?;
+    let warmup_admission = worker.accept(sentence.clone(), Arc::clone(&cancel))?;
+    let mut warmup = warmup_admission.completed;
+    warmup.extend(worker.wait_until_idle()?);
+    if warmup.len() != 1 {
+        return Err(format!("warmup returned {} reports; expected one", warmup.len()).into());
+    }
 
     let mut trials = Vec::with_capacity(TRIALS);
     for _ in 0..TRIALS {
-        let accepted_at = Instant::now();
-        let chunk = synthesize_one(&mut synthesizer, &sentence, &cancel)?;
-        trials.push(playback.play_blocking(&chunk, accepted_at)?);
+        let admission = worker.accept(sentence.clone(), Arc::clone(&cancel))?;
+        let mut report = admission.completed;
+        report.extend(worker.wait_until_idle()?);
+        if report.len() != 1 {
+            return Err(
+                format!("TTFA trial returned {} reports; expected one", report.len()).into(),
+            );
+        }
+        trials.push(report.pop().expect("one report was checked").playback);
     }
-
-    let mut latencies = trials
+    let ttfa_values = trials
         .iter()
         .map(|trial| trial.accepted_to_first_non_silent_us)
         .collect::<Vec<_>>();
-    latencies.sort_unstable();
-    let kokoro_metrics = synthesizer.metrics();
-    let playback_metrics = playback.metrics();
-    if kokoro_metrics.session_loads != 1 || kokoro_metrics.syntheses != (TRIALS + 1) as u64 {
-        return Err(format!("warm model reuse assertion failed: {kokoro_metrics:?}").into());
-    }
-    if playback_metrics.stream_opens != 1 || playback_metrics.chunks_played != (TRIALS + 1) as u64 {
-        return Err(
-            format!("persistent device reuse assertion failed: {playback_metrics:?}").into(),
-        );
-    }
+    let ttfa = metric(ttfa_values, MAX_TTFA_P95_US, trials);
 
-    let p50_us = percentile(&latencies, 50);
-    let p95_us = percentile(&latencies, 95);
-    let max_us = *latencies.last().expect("twenty trials are present");
-    let report = ProofReport {
-        schema: "plato_audio.kokoro_device_ttfa.v1",
-        trial_count: TRIALS,
-        sentence: sentence.into_string(),
-        timing_boundary: TIMING_BOUNDARY,
-        threshold_us: MAX_P95_US,
-        p50_us,
-        p95_us,
-        max_us,
-        trials,
-        model_format: synthesizer.output_format(),
-        provenance: synthesizer.provenance().clone(),
-        cpal_runtime: CPAL_RUNTIME_VERSION,
-        output: playback.device_info().clone(),
-        accelerator,
-        kokoro_metrics,
-        playback_metrics,
-        warmup_excluded: true,
-    };
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    if p95_us > MAX_P95_US {
+    let mut multi_reports = Vec::with_capacity(SENTENCE_PREFETCH_CAPACITY);
+    for text in MULTI_SENTENCE_CORPUS {
+        let admission = worker.try_accept(Sentence::new(text)?, Arc::clone(&cancel))?;
+        multi_reports.extend(admission.completed);
+    }
+    multi_reports.extend(worker.wait_until_idle()?);
+    let corpus = multi_reports
+        .iter()
+        .map(|report| report.sentence.clone())
+        .collect::<Vec<_>>();
+    if corpus != MULTI_SENTENCE_CORPUS {
         return Err(format!(
-            "warm TTFA p95 was {p95_us} us, above the admitted {MAX_P95_US} us limit"
+            "multi-sentence order mismatch: expected {MULTI_SENTENCE_CORPUS:?}, got {corpus:?}"
         )
         .into());
     }
+    let callback_sample_timestamps = multi_reports
+        .iter()
+        .map(|report| report.playback)
+        .collect::<Vec<_>>();
+    let gaps_us = callback_sample_timestamps
+        .iter()
+        .skip(1)
+        .map(|report| {
+            report
+                .gap_before_us
+                .expect("adjacent sentence has a prior boundary")
+        })
+        .collect::<Vec<_>>();
+    let overlaps = callback_sample_timestamps
+        .windows(2)
+        .map(|pair| {
+            let overlap_start = pair[0].first_pcm_ns.max(pair[1].synth_started_ns);
+            let overlap_end = pair[0].pcm_end_ns.min(pair[1].synth_finished_ns);
+            OverlapProof {
+                playing_sequence: pair[0].sequence,
+                following_sequence: pair[1].sequence,
+                playing_first_pcm_ns: pair[0].first_pcm_ns,
+                playing_pcm_end_ns: pair[0].pcm_end_ns,
+                following_synth_started_ns: pair[1].synth_started_ns,
+                following_synth_finished_ns: pair[1].synth_finished_ns,
+                overlap_us: overlap_end.saturating_sub(overlap_start) / 1_000,
+            }
+        })
+        .collect::<Vec<_>>();
+    let every_boundary_within_threshold = gaps_us.iter().all(|gap| *gap <= MAX_GAP_US);
+    let demonstrated_synthesis_playback_overlap = overlaps.iter().any(|proof| proof.overlap_us > 0);
+    let multi_sentence_underrun =
+        callback_sample_timestamps
+            .iter()
+            .fold(PlaybackUnderrun::default(), |mut total, report| {
+                total.callbacks = total.callbacks.saturating_add(report.underrun.callbacks);
+                total.frames = total.frames.saturating_add(report.underrun.frames);
+                total
+            });
+    let mut sorted_gaps = gaps_us.clone();
+    sorted_gaps.sort_unstable();
+    let multi_sentence = MultiSentenceMetric {
+        capacity: SENTENCE_PREFETCH_CAPACITY,
+        corpus,
+        callback_sample_timestamps,
+        gaps_us,
+        p50_us: percentile(&sorted_gaps, 50),
+        p95_us: percentile(&sorted_gaps, 95),
+        max_us: *sorted_gaps.last().expect("four sentences have three gaps"),
+        threshold_us: MAX_GAP_US,
+        overlaps,
+        every_boundary_within_threshold,
+        demonstrated_synthesis_playback_overlap,
+        underrun: multi_sentence_underrun,
+        metrics_before_shutdown: worker.playback_metrics(),
+    };
+    let observed_device_period_us = ttfa
+        .trials
+        .iter()
+        .chain(multi_sentence.callback_sample_timestamps.iter())
+        .map(|report| {
+            u64::try_from(report.first_callback_frames)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(1_000_000)
+                / u64::from(output.format.sample_rate())
+        })
+        .fold(Vec::new(), |mut periods, period| {
+            if !periods.contains(&period) {
+                periods.push(period);
+            }
+            periods
+        });
+    let kokoro_metrics = metrics_reader.snapshot();
+    let shutdown = worker.shutdown()?;
+
+    if kokoro_metrics.session_loads != 1
+        || kokoro_metrics.syntheses != (1 + TRIALS + SENTENCE_PREFETCH_CAPACITY) as u64
+    {
+        return Err(format!("warm model reuse assertion failed: {kokoro_metrics:?}").into());
+    }
+    if shutdown.playback.stream_opens != 1
+        || shutdown.playback.chunks_played != (1 + TRIALS + SENTENCE_PREFETCH_CAPACITY) as u64
+        || shutdown.playback.max_accepted_unfinished != SENTENCE_PREFETCH_CAPACITY
+        || shutdown.synth_worker_threads != 1
+        || shutdown.resampling_plan_builds != 1
+        || !shutdown.worker_joined
+        || !shutdown.playback_closed
+    {
+        return Err(format!(
+            "persistent bounded playback assertion failed: {:?}",
+            shutdown.playback
+        )
+        .into());
+    }
+    if ttfa.p95_us > MAX_TTFA_P95_US {
+        return Err(format!(
+            "warm TTFA p95 was {} us, above the admitted {} us limit",
+            ttfa.p95_us, MAX_TTFA_P95_US
+        )
+        .into());
+    }
+    if !multi_sentence.every_boundary_within_threshold {
+        return Err(format!(
+            "inter-sentence gaps {:?} exceeded the admitted {} us limit",
+            multi_sentence.gaps_us, MAX_GAP_US
+        )
+        .into());
+    }
+    if !multi_sentence.demonstrated_synthesis_playback_overlap {
+        return Err("no synthesis N+1 interval overlapped playback N".into());
+    }
+
+    let report = ProofReport {
+        schema: "plato_audio.audio_prefetch_device.v2",
+        timing_boundary: TIMING_BOUNDARY,
+        ttfa,
+        multi_sentence,
+        model_format,
+        provenance,
+        cpal_runtime: CPAL_RUNTIME_VERSION,
+        rtrb_runtime: RTRB_RUNTIME_VERSION,
+        rubato_runtime: RUBATO_RUNTIME_VERSION,
+        output,
+        observed_device_period_us,
+        accelerator,
+        kokoro_metrics,
+        shutdown,
+        warmup_excluded: true,
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
-fn synthesize_one(
-    synthesizer: &mut KokoroSynthesizer,
-    sentence: &Sentence,
-    cancel: &AtomicBool,
-) -> Result<PcmChunk, Box<dyn Error>> {
-    let mut chunks = Vec::new();
-    synthesizer.synthesize(sentence, &mut chunks, cancel)?;
-    if chunks.len() != 1 {
-        return Err(format!("Kokoro emitted {} chunks; expected one", chunks.len()).into());
+fn metric(mut values: Vec<u64>, threshold_us: u64, trials: Vec<PlaybackReport>) -> LatencyMetric {
+    values.sort_unstable();
+    LatencyMetric {
+        trial_count: values.len(),
+        threshold_us,
+        p50_us: percentile(&values, 50),
+        p95_us: percentile(&values, 95),
+        max_us: *values.last().expect("twenty trials are present"),
+        trials,
     }
-    Ok(chunks.pop().expect("one chunk was checked"))
 }
 
 fn arguments() -> Result<Option<(PathBuf, String)>, Box<dyn Error>> {
@@ -154,8 +320,9 @@ fn arguments() -> Result<Option<(PathBuf, String)>, Box<dyn Error>> {
                 println!(
                     "Usage: kokoro_device_proof --model-dir PATH [--sentence TEXT]\n\
                      \n\
-                     PLATO_AUDIO_KOKORO_DIR may provide PATH. The proof performs one excluded\n\
-                     warmup followed by 20 serial synth/playback TTFA trials and requires CUDA."
+                     PLATO_AUDIO_KOKORO_DIR may provide PATH. The proof excludes one warmup,\n\
+                     measures 20 warm TTFA trials, then proves four-sentence gap and overlap\n\
+                     behavior through one persistent device stream. CUDA is required."
                 );
                 return Ok(None);
             }
