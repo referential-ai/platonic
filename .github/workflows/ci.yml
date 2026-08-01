@@ -68,6 +68,21 @@ jobs:
             grep -F 'no matching package named `plato-protocol` found' "$package_log"
           fi
 
+      - name: Prove plato-tui on Rust 1.88.0
+        run: |
+          cargo check --locked -p plato-tui --all-targets
+          cargo test --locked -p plato-tui
+          cargo clippy --locked -p plato-tui --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked -p plato-tui --no-deps
+          cargo package --locked --list -p plato-tui
+          package_log=$(mktemp)
+          if cargo package --locked --no-verify -p plato-tui >"$package_log" 2>&1; then
+            cat "$package_log"
+          else
+            cat "$package_log"
+            grep -F 'no matching package named `plato-daemon-client` found' "$package_log"
+          fi
+
       - name: Run tests
         run: cargo test --workspace --locked
 

@@ -1,9 +1,4 @@
-use crate::{
-    AppResult,
-    daemon::client::DaemonConnectionConfig,
-    daemon::protocol::RunStateName,
-    tui::{TranscriptState, TuiState, render, render_snapshot},
-};
+use crate::{TranscriptState, TuiState, render, render_snapshot};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -12,6 +7,8 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use plato_daemon_client::{ClientResult, client::DaemonConnectionConfig};
+use plato_protocol::RunStateName;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     io::{self, Stdout},
@@ -32,15 +29,22 @@ use super::{
 const SCROLL_PAGE_LINES: usize = 10;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Options for connecting and starting the terminal client.
 pub struct TuiOptions {
+    /// Workspace root served by the daemon.
     pub workspace: PathBuf,
+    /// Optional explicit daemon endpoint.
     pub socket: Option<PathBuf>,
+    /// Optional run to select on startup.
     pub run: Option<String>,
+    /// Optional config path forwarded with new run requests.
     pub config: Option<PathBuf>,
+    /// Whether to render one frame and exit without entering raw mode.
     pub snapshot: bool,
 }
 
 impl TuiOptions {
+    /// Creates options for a workspace using the default daemon endpoint.
     pub fn new(workspace: PathBuf) -> Self {
         Self {
             workspace,
@@ -52,7 +56,8 @@ impl TuiOptions {
     }
 }
 
-pub fn run_tui(options: TuiOptions) -> AppResult<()> {
+/// Connects to the workspace daemon and runs the terminal client.
+pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
     let config = DaemonConnectionConfig::resolve(&options.workspace, options.socket)?;
     let mut state = load_state(&config, options.run.as_deref());
     if options.snapshot {
@@ -301,7 +306,7 @@ fn reconnect(commands: &Sender<ClientCommand>, state: &mut TuiState, run_id: Opt
 fn is_disconnected(state: &TuiState) -> bool {
     matches!(
         state.connection,
-        crate::tui::ConnectionState::Disconnected { .. }
+        crate::ConnectionState::Disconnected { .. }
     )
 }
 
@@ -612,7 +617,7 @@ fn submit_composer(
         state.status_message = Some("queued for next turn".into());
         return true;
     }
-    push_live_event(state, crate::tui::LiveEventLine::user(message.clone()));
+    push_live_event(state, crate::LiveEventLine::user(message.clone()));
     let command = submit_message_command(message, state.selected_session_id.clone(), config_path);
     state.status_message = Some("submitted to daemon".into());
     send_command(commands, command, state);
@@ -740,7 +745,7 @@ fn start_issue_prep(
     state.status_message = Some("issue prep running".into());
     push_live_event(
         state,
-        crate::tui::LiveEventLine::user(format!("/issue-prep {input}")),
+        crate::LiveEventLine::user(format!("/issue-prep {input}")),
     );
     if commands
         .send(ClientCommand::IssuePrepStart {
@@ -767,7 +772,7 @@ pub(super) fn start_next_queued(
         return;
     }
     let message = state.queued_messages.remove(0);
-    push_live_event(state, crate::tui::LiveEventLine::user(message.clone()));
+    push_live_event(state, crate::LiveEventLine::user(message.clone()));
     let command = submit_message_command(
         message,
         state.selected_session_id.clone(),
@@ -815,8 +820,8 @@ fn update_elapsed(state: &mut TuiState, runtime: &UiRuntime) {
         .map(|started| started.elapsed().as_secs());
 }
 
-pub(super) fn push_live_event(state: &mut TuiState, mut line: crate::tui::LiveEventLine) {
-    use crate::tui::LiveEventKind;
+pub(super) fn push_live_event(state: &mut TuiState, mut line: crate::LiveEventLine) {
+    use crate::LiveEventKind;
 
     state.invalidate_live_event_rows();
     if line.kind == LiveEventKind::AssistantDelta {
@@ -849,7 +854,7 @@ struct TerminalSession {
 }
 
 impl TerminalSession {
-    fn enter() -> AppResult<Self> {
+    fn enter() -> ClientResult<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
@@ -857,7 +862,7 @@ impl TerminalSession {
         Ok(Self { terminal })
     }
 
-    fn draw(&mut self, state: &TuiState) -> AppResult<()> {
+    fn draw(&mut self, state: &TuiState) -> ClientResult<()> {
         self.terminal.draw(|frame| render(frame, state))?;
         Ok(())
     }
@@ -885,15 +890,12 @@ mod tests {
     use super::super::client::{DAEMON_CLIENT_TIMEOUT, connect_daemon};
     use super::super::state::DisplayMode;
     use super::*;
-    use crate::{
-        AppError,
-        daemon::protocol::{
-            BufferedStreamEvent, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
-            ERROR_WORKSPACE_MISMATCH, EventsStreamResult, HelloResult, IssuePrepResult,
-            IssuePrepStartResult, ProtocolError, RunStartResult, SessionSummary,
-            TranscriptReadResult,
-        },
-        tui::TranscriptState,
+    use crate::TranscriptState;
+    use plato_daemon_client::ClientError;
+    use plato_protocol::{
+        BufferedStreamEvent, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION, ERROR_WORKSPACE_MISMATCH,
+        EventsStreamResult, HelloResult, IssuePrepResult, IssuePrepStartResult, ProtocolError,
+        RunStartResult, SessionSummary, TranscriptReadResult,
     };
     use serde_json::json;
     #[cfg(unix)]
@@ -950,7 +952,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            crate::daemon::client::ClientError::Io(error)
+            ClientError::Io(error)
                 if error.kind() == io::ErrorKind::TimedOut
         ));
         assert!(elapsed < Duration::from_secs(1), "request took {elapsed:?}");
@@ -1110,7 +1112,7 @@ mod tests {
             "run_1",
             "[turn_1] user: question\n[turn_1] assistant: answer\n",
         ));
-        state.live_events = vec![crate::tui::LiveEventLine::status(Some(7), "run finished")];
+        state.live_events = vec![crate::LiveEventLine::status(Some(7), "run finished")];
         state.scroll_history_up(20);
         let transcript = state.transcript.clone();
         let live_events = state.live_events.clone();
@@ -1310,7 +1312,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
         state.replace_transcript(loaded_transcript("run_1", "[turn_1] user: hello\n"));
-        state.live_events = vec![crate::tui::LiveEventLine::assistant(Some(1), "hello")];
+        state.live_events = vec![crate::LiveEventLine::assistant(Some(1), "hello")];
         state.stream_warning = Some("lagged".into());
         state.scroll_offset = 10;
         state.composer = "/clear".into();
@@ -1362,7 +1364,7 @@ mod tests {
         assert_eq!(state.status_message.as_deref(), Some("already connected"));
         assert!(receiver.try_recv().is_err());
 
-        state.connection = crate::tui::ConnectionState::Disconnected {
+        state.connection = crate::ConnectionState::Disconnected {
             error: "connection closed".into(),
         };
         state.composer = "/reconnect".into();
@@ -1575,7 +1577,7 @@ mod tests {
         let mut state = test_state();
         state.selected_session_id = Some("session_1".into());
         state.replace_transcript(loaded_transcript("run_1", "[turn_1] user: old\n"));
-        state.live_events = vec![crate::tui::LiveEventLine::assistant(None, "old")];
+        state.live_events = vec![crate::LiveEventLine::assistant(None, "old")];
         state.composer = "/new".into();
         state.composer_cursor = state.composer.len();
         let runtime = UiRuntime::from_state(&state, None);
@@ -1919,7 +1921,7 @@ mod tests {
     fn r_reconnects_from_disconnected_state() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.connection = crate::tui::ConnectionState::Disconnected {
+        state.connection = crate::ConnectionState::Disconnected {
             error: "connection closed".into(),
         };
         let runtime = UiRuntime::from_state(&state, None);
@@ -1983,17 +1985,14 @@ mod tests {
             "run_1",
             "[turn_1] assistant: cached answer\n",
         ));
-        push_live_event(
-            &mut state,
-            crate::tui::LiveEventLine::user("cached question"),
-        );
+        push_live_event(&mut state, crate::LiveEventLine::user("cached question"));
         render_snapshot(&state, 100, 24).unwrap();
         let transcript_rows_ptr = cached_transcript_rows_ptr(&state);
         assert_cached_rows(&state, true, true);
 
         push_live_event(
             &mut state,
-            crate::tui::LiveEventLine::tool(Some(1), "new tool event"),
+            crate::LiveEventLine::tool(Some(1), "new tool event"),
         );
 
         assert_eq!(cached_transcript_rows_ptr(&state), transcript_rows_ptr);
@@ -2050,10 +2049,7 @@ mod tests {
         );
 
         assert_eq!(state.live_events.len(), 1);
-        assert_eq!(
-            state.live_events[0].kind,
-            crate::tui::LiveEventKind::Assistant
-        );
+        assert_eq!(state.live_events[0].kind, crate::LiveEventKind::Assistant);
         assert_eq!(state.live_events[0].text.len(), 500);
         assert!(state.stream_warning.is_none());
         assert!(receiver.try_recv().is_err());
@@ -2160,7 +2156,7 @@ mod tests {
     fn run_response_selects_returned_session_for_continuation() {
         let mut state = test_state();
         let mut runtime = UiRuntime::from_state(&state, None);
-        push_live_event(&mut state, crate::tui::LiveEventLine::user("question"));
+        push_live_event(&mut state, crate::LiveEventLine::user("question"));
 
         apply_run_response(
             &mut state,
@@ -2191,12 +2187,12 @@ mod tests {
         let mut state = test_state();
         push_live_event(
             &mut state,
-            crate::tui::LiveEventLine::assistant(Some(1), "first").with_run_id("run_1"),
+            crate::LiveEventLine::assistant(Some(1), "first").with_run_id("run_1"),
         );
 
         push_live_event(
             &mut state,
-            crate::tui::LiveEventLine::assistant_delta(Some(2), "second").with_run_id("run_2"),
+            crate::LiveEventLine::assistant_delta(Some(2), "second").with_run_id("run_2"),
         );
 
         assert_eq!(state.live_events.len(), 2);
@@ -2346,10 +2342,10 @@ mod tests {
             Some("issue ready; artifacts: /tmp/workspace/.plato/issue-prep/run_1")
         );
         assert!(state.live_events.iter().any(|event| {
-            event.kind == crate::tui::LiveEventKind::Assistant && event.text == "# Prepared issue"
+            event.kind == crate::LiveEventKind::Assistant && event.text == "# Prepared issue"
         }));
         assert!(state.live_events.iter().any(|event| {
-            event.kind == crate::tui::LiveEventKind::Status
+            event.kind == crate::LiveEventKind::Status
                 && event.text.contains(".plato/issue-prep/run_1")
         }));
         assert!(command_receiver.try_recv().is_err());
@@ -2365,7 +2361,7 @@ mod tests {
         event_sender
             .send(ClientEvent::Failed {
                 operation: ClientOperation::IssuePrepStart,
-                error: crate::AppError::DaemonResponse(ProtocolError {
+                error: ClientError::DaemonResponse(ProtocolError {
                     code: "issue_prep_failed".into(),
                     message: "provider failed".into(),
                 }),
@@ -2382,8 +2378,7 @@ mod tests {
             )
         );
         assert!(state.live_events.iter().any(|event| {
-            event.kind == crate::tui::LiveEventKind::Warning
-                && event.text.contains("provider failed")
+            event.kind == crate::LiveEventKind::Warning && event.text.contains("provider failed")
         }));
         assert!(command_receiver.try_recv().is_err());
     }
@@ -2416,7 +2411,7 @@ mod tests {
             )
         );
         assert!(state.live_events.iter().any(|event| {
-            event.kind == crate::tui::LiveEventKind::Warning
+            event.kind == crate::LiveEventKind::Warning
                 && event.text.contains("acceptance is not testable")
                 && event.text.contains(".plato/issue-prep/run_2")
         }));
@@ -2428,7 +2423,7 @@ mod tests {
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
         let mut state = test_state();
-        state.active_run = Some(crate::tui::ActiveRunView {
+        state.active_run = Some(crate::ActiveRunView {
             run_id: "run_1".into(),
             status: RunStateName::Running,
         });
@@ -2445,7 +2440,7 @@ mod tests {
         event_sender
             .send(ClientEvent::Failed {
                 operation: ClientOperation::EventsStream,
-                error: crate::AppError::DaemonResponse(ProtocolError {
+                error: ClientError::DaemonResponse(ProtocolError {
                     code: "lagged".into(),
                     message: "offset is no longer buffered".into(),
                 }),
@@ -2476,7 +2471,7 @@ mod tests {
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
         let mut state = test_state();
-        state.active_run = Some(crate::tui::ActiveRunView {
+        state.active_run = Some(crate::ActiveRunView {
             run_id: "run_1".into(),
             status: RunStateName::Running,
         });
@@ -2493,7 +2488,7 @@ mod tests {
         event_sender
             .send(ClientEvent::Failed {
                 operation: ClientOperation::EventsStream,
-                error: crate::AppError::Io(std::io::Error::new(
+                error: ClientError::Io(std::io::Error::new(
                     std::io::ErrorKind::ConnectionRefused,
                     "Connection refused",
                 )),
@@ -2511,33 +2506,32 @@ mod tests {
 
     #[test]
     fn connection_error_classification_uses_typed_errors() {
-        assert!(is_connection_error(&AppError::DaemonLockHeld {
-            path: PathBuf::from("/tmp/agent.lock"),
-            owner: "pid 1".into(),
-        }));
-        assert!(is_connection_error(&AppError::DaemonProtocol(
+        assert!(is_connection_error(&ClientError::DaemonProtocol(
             "response id mismatch".into()
         )));
-        assert!(is_connection_error(&AppError::Io(std::io::Error::other(
-            "socket failed"
-        ))));
-        assert!(is_connection_error(&AppError::DaemonResponse(
+        assert!(is_connection_error(&ClientError::Io(
+            std::io::Error::other("socket failed")
+        )));
+        assert!(is_connection_error(&ClientError::DaemonResponse(
             ProtocolError {
                 code: ERROR_UNSUPPORTED_VERSION.into(),
                 message: "unsupported".into(),
             }
         )));
-        assert!(is_connection_error(&AppError::DaemonResponse(
+        assert!(is_connection_error(&ClientError::DaemonResponse(
             ProtocolError {
                 code: ERROR_WORKSPACE_MISMATCH.into(),
                 message: "wrong workspace".into(),
             }
         )));
-        assert!(!is_connection_error(&AppError::DaemonResponse(
+        assert!(!is_connection_error(&ClientError::DaemonResponse(
             ProtocolError {
                 code: ERROR_OVERLOAD.into(),
                 message: "busy".into(),
             }
+        )));
+        assert!(!is_connection_error(&ClientError::Config(
+            "missing runtime".into()
         )));
     }
 
@@ -2604,7 +2598,7 @@ mod tests {
     fn approval_decisions_send_daemon_commands() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.approval = Some(crate::tui::ApprovalModalView {
+        state.approval = Some(crate::ApprovalModalView {
             run_id: "run_1".into(),
             tool_call_id: "call_1".into(),
             tool_name: "file.write".into(),
@@ -2635,7 +2629,7 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
 
-        state.approval = Some(crate::tui::ApprovalModalView {
+        state.approval = Some(crate::ApprovalModalView {
             run_id: "run_2".into(),
             tool_call_id: "call_2".into(),
             tool_name: "file.write".into(),
@@ -2683,7 +2677,7 @@ mod tests {
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
         let mut state = test_state();
-        let approval = crate::tui::ApprovalModalView {
+        let approval = crate::ApprovalModalView {
             run_id: "run_retry".into(),
             tool_call_id: "call_retry".into(),
             tool_name: "file.write".into(),
@@ -2694,7 +2688,7 @@ mod tests {
             diff_preview: None,
         };
         state.approval = Some(approval.clone());
-        state.active_run = Some(crate::tui::ActiveRunView {
+        state.active_run = Some(crate::ActiveRunView {
             run_id: approval.run_id.clone(),
             status: RunStateName::Running,
         });
@@ -2739,7 +2733,7 @@ mod tests {
         event_sender
             .send(ClientEvent::Failed {
                 operation: ClientOperation::ApprovalDecide,
-                error: crate::AppError::DaemonResponse(ProtocolError {
+                error: ClientError::DaemonResponse(ProtocolError {
                     code: "temporarily_unavailable".into(),
                     message: "try the same decision again".into(),
                 }),
@@ -2768,7 +2762,7 @@ mod tests {
 
         event_sender
             .send(ClientEvent::ApprovalDecided(
-                crate::daemon::protocol::CommandAcceptedResult {
+                plato_protocol::CommandAcceptedResult {
                     run_id: "run_retry".into(),
                     status: RunStateName::Running,
                 },
@@ -2782,7 +2776,7 @@ mod tests {
     fn first_cancel_requests_daemon_and_second_cancel_quits() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.active_run = Some(crate::tui::ActiveRunView {
+        state.active_run = Some(crate::ActiveRunView {
             run_id: "run_1".into(),
             status: RunStateName::Running,
         });
@@ -2834,7 +2828,7 @@ mod tests {
             "matching run",
         )];
         state.selected_session_id = Some("session_1".into());
-        state.active_run = Some(crate::tui::ActiveRunView {
+        state.active_run = Some(crate::ActiveRunView {
             run_id: "run_1".into(),
             status: RunStateName::Running,
         });
@@ -2844,7 +2838,7 @@ mod tests {
         ));
         push_live_event(
             &mut state,
-            crate::tui::LiveEventLine::status(Some(1), "live status"),
+            crate::LiveEventLine::status(Some(1), "live status"),
         );
         state.stream_warning = Some("matching warning".into());
         state.active_model = Some("matching-model".into());
@@ -2859,7 +2853,7 @@ mod tests {
         let mut loaded = test_state();
         loaded.sessions = state.sessions.clone();
         loaded.selected_session_id = Some("session_1".into());
-        loaded.active_run = Some(crate::tui::ActiveRunView {
+        loaded.active_run = Some(crate::ActiveRunView {
             run_id: "run_1".into(),
             status: RunStateName::Running,
         });
@@ -2909,10 +2903,7 @@ mod tests {
             let previous_session = state.selected_session_id.clone().unwrap();
             let previous_run = state.active_run.as_ref().unwrap().run_id.clone();
             let old_marker = format!("old-live-{previous_session}");
-            state.live_events = vec![crate::tui::LiveEventLine::assistant(
-                Some(7),
-                old_marker.clone(),
-            )];
+            state.live_events = vec![crate::LiveEventLine::assistant(Some(7), old_marker.clone())];
             state.stream_warning = Some(format!("old-warning-{previous_session}"));
             state.active_model = Some(format!("old-model-{previous_session}"));
             state.active_run_elapsed_secs = Some(91);
@@ -2948,10 +2939,7 @@ mod tests {
     #[test]
     fn reload_without_selected_identity_clears_live_state() {
         let mut state = test_state();
-        state.live_events = vec![crate::tui::LiveEventLine::status(
-            None,
-            "unowned live state",
-        )];
+        state.live_events = vec![crate::LiveEventLine::status(None, "unowned live state")];
         state.stream_warning = Some("unowned warning".into());
         state.active_model = Some("unowned-model".into());
         state.active_run_elapsed_secs = Some(12);
@@ -2992,7 +2980,7 @@ mod tests {
             transcript,
         )];
         state.selected_session_id = Some(session_id.into());
-        state.active_run = Some(crate::tui::ActiveRunView {
+        state.active_run = Some(crate::ActiveRunView {
             run_id: run_id.into(),
             status: RunStateName::Running,
         });
@@ -3000,8 +2988,8 @@ mod tests {
         state
     }
 
-    fn test_approval(run_id: &str, tool_call_id: &str) -> crate::tui::ApprovalModalView {
-        crate::tui::ApprovalModalView {
+    fn test_approval(run_id: &str, tool_call_id: &str) -> crate::ApprovalModalView {
+        crate::ApprovalModalView {
             run_id: run_id.into(),
             tool_call_id: tool_call_id.into(),
             tool_name: "file.write".into(),

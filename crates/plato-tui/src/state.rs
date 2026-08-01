@@ -1,4 +1,4 @@
-use crate::daemon::protocol::{
+use plato_protocol::{
     HelloResult, PendingApprovalSnapshot, RunStateName, SessionSummary, TranscriptReadResult,
     TypedTranscript,
 };
@@ -19,39 +19,66 @@ pub(super) enum DisplayMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Complete render and interaction state for the terminal client.
 pub struct TuiState {
+    /// Canonical workspace root displayed by the client.
     pub workspace_root: String,
+    /// Daemon endpoint displayed by the client.
     pub socket_path: String,
+    /// Current daemon connection state.
     pub connection: ConnectionState,
+    /// Sessions returned by the daemon, newest first.
     pub sessions: Vec<SessionSummary>,
+    /// Session selected for display and continuation.
     pub selected_session_id: Option<String>,
+    /// Selected transcript state.
     pub transcript: TranscriptState,
+    /// Run currently active in the selected session.
     pub active_run: Option<ActiveRunView>,
+    /// Transient events received since transcript readback.
     pub live_events: Vec<LiveEventLine>,
     pub(super) history_rows: HistoryRowsCache,
+    /// Scroll offset retained for compatibility with the active display mode.
     pub scroll_offset: usize,
     pub(super) display_mode: DisplayMode,
     pub(super) conversation_scroll_offset: usize,
     pub(super) audit_scroll_offset: usize,
+    /// Model reported for the active run.
     pub active_model: Option<String>,
+    /// Elapsed active-run time, in seconds.
     pub active_run_elapsed_secs: Option<u64>,
+    /// Composer text.
     pub composer: String,
+    /// Composer cursor byte offset.
     pub composer_cursor: usize,
+    /// Composer kill/yank buffer.
     pub composer_kill_buffer: String,
+    /// Open slash-command popup state.
     pub slash_popup: Option<SlashPopupView>,
+    /// Open session-picker state.
     pub session_picker: Option<SessionPickerView>,
+    /// Messages queued behind the active operation.
     pub queued_messages: Vec<String>,
+    /// Start time of an active issue-preparation request.
     pub issue_prep_started_at: Option<Instant>,
+    /// Submitted composer history.
     pub input_history: Vec<String>,
+    /// Selected composer-history index.
     pub history_index: Option<usize>,
+    /// Current status-row message.
     pub status_message: Option<String>,
+    /// Current event-stream warning.
     pub stream_warning: Option<String>,
+    /// Approval request currently awaiting a decision.
     pub approval: Option<ApprovalModalView>,
+    /// Whether the help overlay is open.
     pub help_visible: bool,
+    /// Whether cancellation has already been requested.
     pub cancel_requested: bool,
 }
 
 impl TuiState {
+    /// Creates state from a successful daemon hello and session readback.
     pub fn connected(
         workspace_root: String,
         socket_path: String,
@@ -75,6 +102,7 @@ impl TuiState {
         state
     }
 
+    /// Creates disconnected state with its rendered connection error.
     pub fn disconnected(workspace_root: String, socket_path: String, error: String) -> Self {
         Self::new(
             workspace_root,
@@ -617,12 +645,16 @@ pub struct SlashPopupView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Filter and focus state for the session picker.
 pub struct SessionPickerView {
+    /// Case-insensitive session-question filter.
     pub filter: String,
+    /// Focused index within the filtered results.
     pub selected: usize,
 }
 
 impl SessionPickerView {
+    /// Returns sessions whose latest question contains the current filter.
     pub fn matching_sessions<'a>(&self, sessions: &'a [SessionSummary]) -> Vec<&'a SessionSummary> {
         let filter = self.filter.to_lowercase();
         sessions
@@ -633,22 +665,34 @@ impl SessionPickerView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Current connection state shown by the terminal client.
 pub enum ConnectionState {
+    /// The daemon hello completed successfully.
     Connected {
+        /// Workspace identifier reported by the daemon.
         workspace_id: String,
+        /// Daemon version reported by hello.
         daemon_version: String,
+        /// Ledger path reported by hello.
         ledger_path: String,
     },
+    /// The daemon is unavailable or incompatible.
     Disconnected {
+        /// Rendered connection failure.
         error: String,
     },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Transcript readback selected for display.
 pub struct TranscriptView {
+    /// Run represented by the readback.
     pub run_id: String,
+    /// Run lifecycle status.
     pub status: RunStateName,
+    /// Legacy plain-text transcript.
     pub content: String,
+    /// Typed transcript projection when advertised by the daemon.
     pub typed: Option<TypedTranscript>,
 }
 
@@ -688,33 +732,52 @@ pub(super) fn approval_from_snapshot(snapshot: PendingApprovalSnapshot) -> Appro
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Availability state for the selected transcript.
 pub enum TranscriptState {
+    /// No transcript is selected.
     None,
+    /// Transcript readback loaded successfully.
     Loaded(TranscriptView),
-    Unavailable { run_id: String, error: String },
+    /// Transcript readback failed.
+    Unavailable {
+        /// Run or session identifier requested from the daemon.
+        run_id: String,
+        /// Rendered readback failure.
+        error: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Active run shown in the selected session.
 pub struct ActiveRunView {
+    /// Active run identifier.
     pub run_id: String,
+    /// Current run lifecycle status.
     pub status: RunStateName,
 }
 
 impl ActiveRunView {
+    /// Creates an active-run view.
     pub fn new(run_id: String, status: RunStateName) -> Self {
         Self { run_id, status }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// One transient event row in the live transcript.
 pub struct LiveEventLine {
+    /// Run that owns the row, when known.
     pub run_id: Option<String>,
+    /// Stream offset that produced the row, when known.
     pub offset: Option<u64>,
+    /// Semantic row kind.
     pub kind: LiveEventKind,
+    /// Text rendered for the row.
     pub text: String,
 }
 
 impl LiveEventLine {
+    /// Creates a user-message row.
     pub fn user(text: impl Into<String>) -> Self {
         Self {
             run_id: None,
@@ -724,6 +787,7 @@ impl LiveEventLine {
         }
     }
 
+    /// Creates a complete assistant-message row.
     pub fn assistant(offset: Option<u64>, text: impl Into<String>) -> Self {
         Self {
             run_id: None,
@@ -733,6 +797,7 @@ impl LiveEventLine {
         }
     }
 
+    /// Creates a streaming assistant-delta row.
     pub fn assistant_delta(offset: Option<u64>, text: impl Into<String>) -> Self {
         Self {
             run_id: None,
@@ -742,6 +807,7 @@ impl LiveEventLine {
         }
     }
 
+    /// Creates a tool-event row.
     pub fn tool(offset: Option<u64>, text: impl Into<String>) -> Self {
         Self {
             run_id: None,
@@ -751,6 +817,7 @@ impl LiveEventLine {
         }
     }
 
+    /// Creates a status row.
     pub fn status(offset: Option<u64>, text: impl Into<String>) -> Self {
         Self {
             run_id: None,
@@ -760,6 +827,7 @@ impl LiveEventLine {
         }
     }
 
+    /// Creates a warning row.
     pub fn warning(offset: Option<u64>, text: impl Into<String>) -> Self {
         Self {
             run_id: None,
@@ -776,12 +844,19 @@ impl LiveEventLine {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Semantic kind of a live event row.
 pub enum LiveEventKind {
+    /// User message.
     User,
+    /// Complete assistant message.
     Assistant,
+    /// Streaming assistant delta.
     AssistantDelta,
+    /// Tool activity.
     Tool,
+    /// Run or client status.
     Status,
+    /// Recoverable warning or failure.
     Warning,
 }
 
