@@ -345,6 +345,9 @@ fresh budget for hello and every normal read or mutation.
 
 ## Desktop (Development)
 
+The Plato Agent root and desktop packages require Rust 1.88. Platonic Core
+remains on Rust 1.85.
+
 The desktop shell renders full typed session history, streams the selected run,
 and supports new or continued messages, approval decisions, and cancel.
 Provider credentials remain with the daemon. Linux development attaches to a

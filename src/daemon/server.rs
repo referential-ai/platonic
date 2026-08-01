@@ -1479,8 +1479,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         for attempt in 0..100 {
             writeln!(
                 stream,
-                r#"{{"v":1,"id":"events_{attempt}","kind":"request","method":"events.stream","params":{{"run_id":"{}","from_offset":0,"limit":32}}}}"#,
-                run_id
+                r#"{{"v":1,"id":"events_{attempt}","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":32}}}}"#
             )
             .unwrap();
             let response = read_envelope(&mut reader);
@@ -1500,8 +1499,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         writeln!(
             stream,
-            r#"{{"v":1,"id":"transcript_pending","kind":"request","method":"transcript.read","params":{{"run_id":"{}"}}}}"#,
-            run_id
+            r#"{{"v":1,"id":"transcript_pending","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
         )
         .unwrap();
         let response = read_envelope(&mut reader);
@@ -1520,8 +1518,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         writeln!(
             stream,
-            r#"{{"v":1,"id":"grant_1","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"grant"}}}}"#,
-            run_id
+            r#"{{"v":1,"id":"grant_1","kind":"request","method":"approval.decide","params":{{"run_id":"{run_id}","tool_call_id":"call_1","decision":"grant"}}}}"#
         )
         .unwrap();
         let response = read_envelope(&mut reader);
@@ -1530,8 +1527,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         writeln!(
             stream,
-            r#"{{"v":1,"id":"transcript_resolved","kind":"request","method":"transcript.read","params":{{"run_id":"{}"}}}}"#,
-            run_id
+            r#"{{"v":1,"id":"transcript_resolved","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
         )
         .unwrap();
         let response = read_envelope(&mut reader);
@@ -2033,8 +2029,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(evicted.error.unwrap().code, ERROR_NOT_FOUND);
 
         let retained = server.handle_line(&format!(
-            r#"{{"v":1,"id":"events_new","kind":"request","method":"events.stream","params":{{"run_id":"run_{}"}}}}"#,
-            MAX_TERMINAL_RUNS
+            r#"{{"v":1,"id":"events_new","kind":"request","method":"events.stream","params":{{"run_id":"run_{MAX_TERMINAL_RUNS}"}}}}"#
         ));
         assert_eq!(retained.kind, EnvelopeKind::Response);
         let retained = retained.result.unwrap();
@@ -2688,8 +2683,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let mut approval_seen = false;
         for attempt in 0..100 {
             let response = server.handle_line(&format!(
-                r#"{{"v":1,"id":"events_{attempt}","kind":"request","method":"events.stream","params":{{"run_id":"{}","from_offset":0,"limit":32}}}}"#,
-                run_id
+                r#"{{"v":1,"id":"events_{attempt}","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":32}}}}"#
             ));
             assert_eq!(response.kind, EnvelopeKind::Response);
             let events = response.result.unwrap()["events"].clone();
@@ -2702,8 +2696,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert!(approval_seen);
 
         let response = server.handle_line(&format!(
-            r#"{{"v":1,"id":"deny_1","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"deny","reason":"test done"}}}}"#,
-            run_id
+            r#"{{"v":1,"id":"deny_1","kind":"request","method":"approval.decide","params":{{"run_id":"{run_id}","tool_call_id":"call_1","decision":"deny","reason":"test done"}}}}"#
         ));
         assert_eq!(response.kind, EnvelopeKind::Response);
         let _provider_request = provider.handle.join().unwrap();

@@ -19,11 +19,15 @@ jobs:
     runs-on: windows-2025
     env:
       RUST_BACKTRACE: "1"
+      RUSTUP_TOOLCHAIN: 1.88.0
     steps:
       - name: Check out plato-agent
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
+
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -36,9 +40,6 @@ jobs:
           $ErrorActionPreference = "Stop"
           cargo fetch --locked
           "CARGO_NET_OFFLINE=true" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Install Rust components
-        run: rustup component add rustfmt clippy
 
       - name: Create ACL proof user
         shell: pwsh
