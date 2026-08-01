@@ -135,15 +135,16 @@ Message History, plus Send Messages in Threads when threads are used.
 
 ## 5. Local voice proof (developer MVP)
 
-AU2 voice-out and AU3 explicit voice-in are exposed through focused examples,
+AU2 voice-out and AU4 explicit voice-in are exposed through focused examples,
 not a general CLI or ambient listener. Install espeak-ng, CUDA, and the native
-cpal backend headers, then place the pinned Kokoro and large-v3-turbo artifacts
-described in
+cpal backend headers, then place the pinned Kokoro, Silero v6.2.1, and
+large-v3-turbo artifacts described in
 [`../crates/plato-audio/README.md`](../crates/plato-audio/README.md) outside the
 repository.
 
 ```bash
 export PLATO_AUDIO_KOKORO_DIR="$HOME/.cache/plato-audio/kokoro-82m-v1.0-onnx-1939ad2a8e416c0acfeecc08a694d14ef25f2231"
+export PLATO_AUDIO_SILERO_MODEL="$HOME/.cache/plato-audio/silero-vad-7e30209a3e901f9842f81b225f3e93d8199902b1/silero_vad.onnx"
 export PLATO_AUDIO_WHISPER_MODEL="$HOME/.cache/plato-audio/ggml-large-v3-turbo-6034871ec87c84e342efab769d4c5c06cd126db3.bin"
 
 # Credential-free real run_question delta narration through the live speaker:
@@ -153,9 +154,13 @@ PLATO_AUDIO_FIXTURE_KEY=local-proof \
 # One excluded warmup, 20 TTFA trials, and four-sentence gap/overlap proof:
 cargo run --release --locked -p plato-audio --example kokoro_device_proof
 
-# Public non-human corpus: exact endpoint/text, no noise hallucination, 20 warm trials:
-cargo test --release --locked -p plato-audio --features whisper-cuda \
-  recorded_corpus_has_exact_endpoint_transcript_and_warm_latency -- --ignored --nocapture
+# Public non-human corpus: AU3 threshold versus Silero confusion/endpoints:
+cargo test --release --locked -p plato-audio \
+  silero_strictly_reduces_au3_false_cuts_without_missing_speech -- --ignored --nocapture
+
+# Twenty warm RTX 4090 trials: live partial p95 <=200 ms, final p95 <=120 ms:
+cargo test --release --locked --features whisper-cuda \
+  twenty_warm_rtx4090_live_partial_and_final_trials_meet_au4_bounds -- --ignored --nocapture
 
 # Inspect input IDs without changing the host default audio policy:
 cargo run --locked --example narrated_run -- --list-input-devices
@@ -163,19 +168,22 @@ cargo run --locked --example narrated_run -- --list-input-devices
 # One microphone question -> one existing run -> spoken AU2 answer:
 PLATO_AUDIO_FIXTURE_KEY=local-proof \
   cargo run --release --locked --features whisper-cuda --example narrated_run -- \
-  --fixture --whisper-model "$PLATO_AUDIO_WHISPER_MODEL" --input-device CPAL_ID
+  --fixture --whisper-model "$PLATO_AUDIO_WHISPER_MODEL" \
+  --silero-model "$PLATO_AUDIO_SILERO_MODEL" --input-device CPAL_ID
 ```
 
 The model engine, native-rate resampling plan, and output stream open before
 timing. Both examples fail closed on artifact checksum, phonemizer, backend,
 device, PCM, worker, callback, sentence-order, gap, overlap, or teardown errors.
-AU3 opens one persistent input stream and one worker, normalizes/resamples on
-the worker, and runs fixed threshold endpointing before the resident CUDA
-recognizer. Ring overflow, device loss, worker panic, and recognition failures
-are typed terminal outcomes. The microphone form retains no raw audio; proof
-JSON contains only the final transcript, bounded metrics, and provenance.
-Model files and provider credentials are never written into the repository or
-proof JSON.
+AU4 opens one persistent input stream and one worker, normalizes/resamples on
+the worker, and runs a warm Silero session through the ONNX Runtime owner shared
+with Kokoro. The resident CUDA recognizer re-decodes only a bounded five-second
+window. Its non-final text replaces one live stderr line; only the single final
+transcript enters the existing run path. Ring overflow, device loss, worker
+panic, VAD failure, and recognition failure are typed terminal outcomes. The
+microphone form retains no raw audio; proof JSON contains transcripts, bounded
+metrics, and provenance. Model files and provider credentials are never
+written into the repository or proof JSON.
 
 ## 6. Run the test suite (no API key needed)
 

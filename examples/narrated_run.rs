@@ -11,7 +11,7 @@ use std::{
 use plato_agent::{ApprovalMode, RunLedger, RunOptions, RunOverrides, VoiceSession};
 use plato_audio::{
     CaptureConfig, InputDeviceSelection, KokoroConfig, PlaybackConfig, SentenceCutter,
-    WhisperConfig, capture_devices,
+    SileroConfig, WhisperConfig, capture_devices,
 };
 use serde::Serialize;
 
@@ -38,8 +38,11 @@ struct CaptureProof {
     timing_boundary: &'static str,
     report: plato_audio::CaptureReport,
     model: plato_audio::WhisperProvenance,
+    vad: plato_audio::SileroProvenance,
+    ort_runtime: plato_audio::OrtRuntimeMetrics,
     input: plato_audio::CaptureDeviceInfo,
     recognizer_metrics: plato_audio::WhisperMetrics,
+    vad_metrics: plato_audio::SileroMetrics,
     capture_metrics: plato_audio::CaptureMetrics,
     raw_audio_retained: bool,
 }
@@ -57,6 +60,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             KokoroConfig::from_model_dir(arguments.model_dir.clone()),
             PlaybackConfig::default(),
             WhisperConfig::new(model),
+            SileroConfig::new(
+                arguments
+                    .silero_model
+                    .clone()
+                    .expect("validated Silero model accompanies Whisper"),
+            ),
             CaptureConfig::for_device(match arguments.input_device.clone() {
                 Some(device_id) => InputDeviceSelection::Id(device_id),
                 None => InputDeviceSelection::Default,
@@ -93,12 +102,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (run, narration, capture) = if arguments.whisper_model.is_some() {
         let outcome = voice.capture_question(options, arguments.capture_timeout)?;
         let capture = CaptureProof {
-            timing_boundary: "fixed-threshold VAD close through one final Transcript; resident model load excluded",
+            timing_boundary: "Silero VAD close through one final Transcript; warm resident model/session loads excluded",
             report: outcome.capture,
             model: voice
                 .recognizer_provenance()
                 .expect("capture session retains recognizer provenance")
                 .clone(),
+            vad: voice
+                .vad_provenance()
+                .expect("capture session retains Silero provenance")
+                .clone(),
+            ort_runtime: voice.ort_runtime_metrics(),
             input: voice
                 .capture_device_info()
                 .expect("capture session retains input device")
@@ -106,6 +120,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             recognizer_metrics: voice
                 .recognizer_metrics()
                 .expect("capture session retains recognizer metrics"),
+            vad_metrics: voice
+                .vad_metrics()
+                .expect("capture session retains Silero metrics"),
             capture_metrics: voice
                 .capture_metrics()
                 .expect("capture session retains capture metrics"),
@@ -113,14 +130,33 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         if capture.recognizer_metrics.model_loads != 1
             || capture.recognizer_metrics.finalizations != 1
+            || capture.recognizer_metrics.partial_decodes == 0
+            || capture.report.partials.is_empty()
+            || capture
+                .report
+                .partials
+                .iter()
+                .any(|partial| {
+                    !matches!(partial.audio_available_to_visible_us, Some(us) if us <= 200_000)
+                })
+            || capture.report.vad_close_to_final_us > 120_000
+            || capture.vad_metrics.session_loads != 1
+            || capture.vad_metrics.inference_frames == 0
+            || capture.vad_metrics.state_resets != 1
+            || capture.ort_runtime.environment_instances != 1
+            || capture.ort_runtime.session_loads != 2
+            || capture.vad.ort_runtime_owner != voice.provenance().ort_runtime_owner
             || capture.capture_metrics.stream_opens != 1
             || capture.capture_metrics.worker_threads != 1
             || capture.capture_metrics.transcripts != 1
             || capture.capture_metrics.overflow.samples != 0
         {
             return Err(format!(
-                "capture reuse/overflow assertion failed: recognizer={:?}, capture={:?}",
-                capture.recognizer_metrics, capture.capture_metrics
+                "capture reuse/timing assertion failed: recognizer={:?}, vad={:?}, runtime={:?}, capture={:?}",
+                capture.recognizer_metrics,
+                capture.vad_metrics,
+                capture.ort_runtime,
+                capture.capture_metrics
             )
             .into());
         }
@@ -167,7 +203,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output = voice.device_info().clone();
     let shutdown = voice.shutdown()?;
     let proof = ProofOutput {
-        schema: "plato_agent.narrated_run.v3",
+        schema: "plato_agent.narrated_run.v4",
         run_id: run.run_id.to_string(),
         final_answer: run.final_answer,
         ledger: ledger.display().to_string(),
@@ -208,6 +244,7 @@ struct Arguments {
     question: String,
     fixture: bool,
     whisper_model: Option<PathBuf>,
+    silero_model: Option<PathBuf>,
     input_device: Option<String>,
     capture_timeout: Duration,
 }
@@ -221,6 +258,7 @@ impl Arguments {
         let mut question = Vec::new();
         let mut fixture = false;
         let mut whisper_model = None;
+        let mut silero_model = None;
         let mut input_device = None;
         let mut capture_timeout = Duration::from_secs(30);
         let mut arguments = std::env::args().skip(1);
@@ -251,6 +289,11 @@ impl Arguments {
                         arguments.next().ok_or("--whisper-model requires a path")?,
                     ));
                 }
+                "--silero-model" => {
+                    silero_model = Some(PathBuf::from(
+                        arguments.next().ok_or("--silero-model requires a path")?,
+                    ));
+                }
                 "--input-device" => {
                     input_device = Some(
                         arguments
@@ -272,14 +315,16 @@ impl Arguments {
                     println!(
                         "Usage: narrated_run --model-dir PATH [--config PATH] [--events PATH]\n\
                          \x20      [--workspace-root PATH] [--fixture] [QUESTION ...]\n\
-                         \x20      [--whisper-model PATH] [--input-device CPAL_ID]\n\
+                         \x20      [--whisper-model PATH --silero-model PATH]\n\
+                         \x20      [--input-device CPAL_ID]\n\
                          \x20      [--capture-timeout-seconds N]\n\
                          \x20      narrated_run --list-input-devices\n\
                          \n\
                          PLATO_AUDIO_KOKORO_DIR may provide the model directory. With no QUESTION,\n\
                          a fixed two-sentence no-tools prompt is used. --fixture uses a local SSE\n\
                          provider and requires PLATO_AUDIO_FIXTURE_KEY=local-proof. Supplying\n\
-                         --whisper-model arms exactly one explicit microphone question."
+                         PLATO_AUDIO_SILERO_MODEL may provide the pinned VAD artifact. Supplying\n\
+                         --whisper-model and --silero-model arms one explicit microphone question."
                     );
                     return Ok(None);
                 }
@@ -288,6 +333,15 @@ impl Arguments {
         }
         if input_device.is_some() && whisper_model.is_none() {
             return Err("--input-device requires --whisper-model".into());
+        }
+        if whisper_model.is_some() && silero_model.is_none() {
+            silero_model = std::env::var_os("PLATO_AUDIO_SILERO_MODEL").map(PathBuf::from);
+        }
+        if whisper_model.is_some() != silero_model.is_some() {
+            return Err(
+                "--whisper-model and --silero-model (or PLATO_AUDIO_SILERO_MODEL) are required together"
+                    .into(),
+            );
         }
         let model_dir = model_dir.ok_or(
             "provide --model-dir PATH or set PLATO_AUDIO_KOKORO_DIR to the pinned artifact directory",
@@ -304,6 +358,7 @@ impl Arguments {
             },
             fixture,
             whisper_model,
+            silero_model,
             input_device,
             capture_timeout,
         }))

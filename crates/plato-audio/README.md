@@ -1,11 +1,11 @@
 # plato-audio
 
 `plato-audio` is Plato Agent's synchronous local audio IO leaf. It owns typed
-PCM and sentence values, fixed threshold endpointing, the sans-IO sentence
-cutter and prefetch state, resident Kokoro and Whisper engines, and persistent
-cpal input/output streams. It does not depend on a Platonic crate and owns no
-run, ledger, policy, approval, session, daemon, protocol, or
-configuration-registry behavior.
+PCM, sentence, partial-transcript, and final-transcript values; neural endpoint
+state; the sans-IO sentence cutter and prefetch state; resident Kokoro, Silero,
+and Whisper engines; and persistent cpal input/output streams. It does not
+depend on a Platonic crate and owns no run, ledger, policy, approval, session,
+daemon, display protocol, or configuration-registry behavior.
 
 AU2 moves synthesis onto one owned `std::thread`. A fixed four-sentence
 accepted-but-not-finished window feeds one bounded `rtrb` SPSC PCM ring. One
@@ -15,12 +15,18 @@ timing, and emits silence on underrun.
 
 AU3 adds one persistent input callback that only copies native samples into a
 bounded `rtrb` ring and records overflow. One owned worker normalizes and
-resamples complete device frames to 16 kHz mono, applies a literal 10 ms RMS
-threshold (`0.015`) with three-window onset, 200 ms minimum speech, and 250 ms
-hangover, then returns one final transcript for an explicit capture request.
-Overflow is a typed terminal capture result. There is no ambient recognition,
-partial transcript UI, barge-in, AEC, wake word, cloud fallback, or second
-recognizer.
+resamples complete device frames to 16 kHz mono. AU4 replaces its production
+RMS endpoint with one warm Silero v6.2.1 session: 512-sample frames, probability
+threshold `0.5`, four-frame minimum speech, and eight-frame hangover. The AU3
+threshold detector remains test-only as the pinned comparison baseline.
+
+While Silero holds an utterance open, the same worker feeds each gated frame to
+one resident Whisper large-v3-turbo state. Whisper re-decodes only the newest
+five seconds at a fixed 160 ms cadence after 320 ms of speech, suppresses empty
+or unchanged hypotheses, and returns typed `Transcript { is_final: false }`
+updates. Root replaces the active display line and starts no run until the one
+final transcript arrives at the Silero endpoint. There is no ambient
+recognition, barge-in, AEC, wake word, cloud fallback, or second recognizer.
 
 ## Pinned artifacts
 
@@ -64,12 +70,32 @@ The required SHA-256 is
 `1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69`.
 `WhisperRecognizer::load` verifies it before constructing one resident state.
 
+AU4 admits `silero_vad.onnx` from `snakers4/silero-vad` tag `v6.2.1`, immutable
+commit `7e30209a3e901f9842f81b225f3e93d8199902b1` (MIT). Keep it outside the
+repository:
+
+```bash
+silero_revision=7e30209a3e901f9842f81b225f3e93d8199902b1
+silero_dir="$HOME/.cache/plato-audio/silero-vad-$silero_revision"
+mkdir -p "$silero_dir"
+curl -fL "https://raw.githubusercontent.com/snakers4/silero-vad/$silero_revision/src/silero_vad/data/silero_vad.onnx" -o "$silero_dir/silero_vad.onnx"
+sha256sum "$silero_dir/silero_vad.onnx"
+```
+
+The required SHA-256 is
+`1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3`.
+`SileroVad::load_with_runtime` verifies it before constructing one resident
+session.
+
 ## Native runtime
 
 The crate pins `ort 2.0.0-rc.13` (ONNX Runtime 1.28, CUDA 13 build) and
-`cpal 0.18.1`, `rtrb 0.3.4`, and `rubato 4.0.0`. On Linux x86_64 it attempts
-CUDA device zero with registration errors enabled, then constructs a CPU
-session if CUDA cannot load. Other targets construct the CPU session directly.
+`cpal 0.18.1`, `rtrb 0.3.4`, and `rubato 4.0.0`. Root creates one explicit
+`OrtRuntime` owner and passes clones to Kokoro and Silero. Each model constructs
+one warm session through that owner; no frame or utterance constructs a runtime
+or session. On Linux x86_64 each ONNX model attempts CUDA device zero with
+registration errors enabled, then constructs a CPU session if CUDA cannot
+load. Other targets construct CPU sessions directly.
 
 espeak-ng is invoked as a fixed external executable, not linked into this
 dual-licensed crate. The admitted proof host used these signed Arch packages:
@@ -94,12 +120,23 @@ requested, keeping ordinary hosted builds platform-neutral.
 
 ```bash
 export PLATO_AUDIO_KOKORO_DIR="$model_dir"
+export PLATO_AUDIO_SILERO_MODEL="$silero_dir/silero_vad.onnx"
 cargo test --locked -p plato-audio
 cargo run --release --locked -p plato-audio --example kokoro_device_proof
 
+PLATO_AUDIO_SILERO_MODEL="$PLATO_AUDIO_SILERO_MODEL" \
+  cargo test --release --locked -p plato-audio \
+  silero_strictly_reduces_au3_false_cuts_without_missing_speech -- --ignored --nocapture
+
+PLATO_AUDIO_KOKORO_DIR="$PLATO_AUDIO_KOKORO_DIR" \
+PLATO_AUDIO_SILERO_MODEL="$PLATO_AUDIO_SILERO_MODEL" \
+PLATO_AUDIO_WHISPER_MODEL="$whisper_model" \
+  cargo test --release --locked --features whisper-cuda \
+  twenty_warm_rtx4090_live_partial_and_final_trials_meet_au4_bounds -- --ignored --nocapture
+
 PLATO_AUDIO_WHISPER_MODEL="$whisper_model" \
   cargo test --release --locked -p plato-audio --features whisper-cuda \
-  recorded_corpus_has_exact_endpoint_transcript_and_warm_latency -- --ignored --nocapture
+  au3_threshold_corpus_final_and_silence_regression_remains_exact -- --ignored
 
 CUDA_VISIBLE_DEVICES=-1 PLATO_AUDIO_WHISPER_MODEL="$whisper_model" \
   cargo test --locked -p plato-audio --features whisper-cuda \
@@ -111,7 +148,8 @@ PLATO_AUDIO_FIXTURE_KEY=local-proof \
 cargo run --locked --example narrated_run -- --list-input-devices
 PLATO_AUDIO_FIXTURE_KEY=local-proof \
   cargo run --release --locked --features whisper-cuda --example narrated_run -- \
-  --fixture --whisper-model "$whisper_model" --input-device CPAL_ID
+  --fixture --whisper-model "$whisper_model" \
+  --silero-model "$PLATO_AUDIO_SILERO_MODEL" --input-device CPAL_ID
 ```
 
 The device proof opens the model and stream before timing, excludes one warmup,
@@ -129,16 +167,23 @@ assistant-delta event channel with a credential-free loopback SSE provider. It
 checks the spoken sentence sequence against the committed final response and
 does not add assistant deltas to the durable harness ledger.
 
-The tracked `fixtures/au3` corpus is non-human CC0 audio with explicit source,
-license, and checksums. Its CUDA test requires exactly one retained VAD segment
-with no rejected or additional event, then asserts the exact endpoint and
-transcript, no finalization for below-threshold noise, one model load, and 20
-warm VAD-close-to-final trials with p95 at most 300 ms. A separate hidden-device
-test proves that compiled CUDA capability cannot admit whisper.cpp's CPU
-fallback. The captured-run form arms exactly one microphone question, passes
-its final `Transcript` into the same typed `RunOptions.question` path, and
-speaks the answer through AU2. It retains only transcript, metrics, and
-device/model provenance, never raw live audio.
+The tracked `fixtures/au4` corpus is non-human CC0 audio with exact source,
+annotations, and checksums. Its scorer compares the AU3 threshold baseline and
+Silero sample by sample, reports both confusion matrices and endpoint deltas,
+and requires fewer false cuts without more missed speech. Its RTX 4090 proof
+excludes one warmup, runs 20 utterances through the same resident Silero and
+Whisper sessions, and requires partial p95 at most 200 ms plus VAD-close-to-final
+p95 at most 120 ms. The committed proof artifacts are
+`../../docs/proofs/issue-329-vad-corpus.json` and
+`../../docs/proofs/issue-329-whisper-partials.json`.
+
+The AU3 corpus remains an exact final-text and silence regression. A separate
+hidden-device test proves that compiled CUDA capability cannot admit
+whisper.cpp's CPU fallback. The captured-run form arms exactly one microphone
+question, replaces partials on stderr, passes only its final `Transcript` into
+the same typed `RunOptions.question` path, and speaks the answer through AU2.
+It retains transcripts, metrics, and device/model provenance, never raw live
+audio.
 
 ## Package boundary
 

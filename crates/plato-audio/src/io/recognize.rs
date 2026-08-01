@@ -37,6 +37,12 @@ pub const WHISPER_MODEL_SHA256: &str =
     "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69";
 /// Exact Rust wrapper used to embed whisper.cpp.
 pub const WHISPER_RS_RUNTIME_VERSION: &str = "whisper-rs 0.16.0";
+/// Maximum PCM retained in each rolling partial re-decode.
+pub const WHISPER_PARTIAL_WINDOW_MS: u64 = 5_000;
+/// Exact PCM cadence between eligible rolling partial re-decodes.
+pub const WHISPER_PARTIAL_CADENCE_MS: u64 = 160;
+/// Minimum active speech span before the first partial re-decode.
+pub const WHISPER_PARTIAL_MINIMUM_MS: u64 = 320;
 
 #[cfg(feature = "whisper-cuda")]
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
@@ -78,6 +84,9 @@ pub trait SpeechRecognizer: Send {
 
     /// Accepts one normalized PCM frame and may return rolling transcripts.
     fn accept(&mut self, frame: &PcmFrame) -> Result<Vec<Transcript>, SttError>;
+
+    /// Discards an unfinished utterance without reconstructing resident model state.
+    fn reset(&mut self);
 
     /// Closes the current VAD endpoint and returns one committed transcript.
     fn finalize(&mut self) -> Result<Transcript, SttError>;
@@ -124,6 +133,10 @@ pub struct WhisperProvenance {
     pub cuda_device: u32,
     /// Bounded in-process runtime evidence for the selected backend.
     pub backend_evidence: String,
+    /// Fixed rolling partial window bound.
+    pub partial_window_ms: u64,
+    /// Fixed rolling partial re-decode cadence.
+    pub partial_cadence_ms: u64,
 }
 
 /// Observable resident-recognizer reuse counters.
@@ -133,12 +146,18 @@ pub struct WhisperMetrics {
     pub model_loads: u64,
     /// Successful final utterance decodes.
     pub finalizations: u64,
+    /// Successful bounded rolling decode calls.
+    pub partial_decodes: u64,
+    /// Nonempty changed partial hypotheses returned to capture.
+    pub partial_updates: u64,
 }
 
 #[derive(Default)]
 struct WhisperMetricCounters {
     model_loads: AtomicU64,
     finalizations: AtomicU64,
+    partial_decodes: AtomicU64,
+    partial_updates: AtomicU64,
 }
 
 /// Cloneable read-only access to resident recognizer counters.
@@ -153,6 +172,8 @@ impl WhisperMetricsReader {
         WhisperMetrics {
             model_loads: self.counters.model_loads.load(Ordering::Relaxed),
             finalizations: self.counters.finalizations.load(Ordering::Relaxed),
+            partial_decodes: self.counters.partial_decodes.load(Ordering::Relaxed),
+            partial_updates: self.counters.partial_updates.load(Ordering::Relaxed),
         }
     }
 }
@@ -251,6 +272,8 @@ pub struct WhisperRecognizer {
     #[cfg(feature = "whisper-cuda")]
     state: WhisperState,
     samples: Vec<f32>,
+    samples_since_partial: usize,
+    last_partial: String,
     input_format: AudioFormat,
     provenance: WhisperProvenance,
     metrics: Arc<WhisperMetricCounters>,
@@ -309,6 +332,8 @@ impl WhisperRecognizer {
             Ok(Self {
                 state,
                 samples: Vec::new(),
+                samples_since_partial: 0,
+                last_partial: String::new(),
                 input_format: AudioFormat::new(WHISPER_SAMPLE_RATE, 1, SampleFormat::F32)
                     .expect("literal Whisper format is valid"),
                 provenance: WhisperProvenance {
@@ -321,6 +346,8 @@ impl WhisperRecognizer {
                     backend: InferenceBackend::Cuda,
                     cuda_device: admission.device,
                     backend_evidence: admission.evidence,
+                    partial_window_ms: WHISPER_PARTIAL_WINDOW_MS,
+                    partial_cadence_ms: WHISPER_PARTIAL_CADENCE_MS,
                 },
                 metrics,
             })
@@ -357,7 +384,42 @@ impl SpeechRecognizer for WhisperRecognizer {
             .as_f32()
             .expect("Whisper format contract is f32")[0];
         self.samples.push(sample);
-        Ok(Vec::new())
+        self.samples_since_partial = self.samples_since_partial.saturating_add(1);
+
+        #[cfg(not(feature = "whisper-cuda"))]
+        {
+            Ok(Vec::new())
+        }
+
+        #[cfg(feature = "whisper-cuda")]
+        {
+            let minimum_samples = milliseconds_to_samples(WHISPER_PARTIAL_MINIMUM_MS);
+            let cadence_samples = milliseconds_to_samples(WHISPER_PARTIAL_CADENCE_MS);
+            if self.samples.len() < minimum_samples || self.samples_since_partial < cadence_samples
+            {
+                return Ok(Vec::new());
+            }
+            self.samples_since_partial = 0;
+            let window = partial_window(&self.samples).to_vec();
+            let text = self.decode_text(&window)?;
+            self.metrics.partial_decodes.fetch_add(1, Ordering::Relaxed);
+            let text = text.trim();
+            if text.is_empty() || text == self.last_partial {
+                return Ok(Vec::new());
+            }
+            self.last_partial.clear();
+            self.last_partial.push_str(text);
+            let span_ms = samples_to_milliseconds(self.samples.len());
+            let transcript = Transcript::new(text, false, span_ms)?;
+            self.metrics.partial_updates.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![transcript])
+        }
+    }
+
+    fn reset(&mut self) {
+        self.samples.clear();
+        self.samples_since_partial = 0;
+        self.last_partial.clear();
     }
 
     fn finalize(&mut self) -> Result<Transcript, SttError> {
@@ -373,48 +435,67 @@ impl SpeechRecognizer for WhisperRecognizer {
             if self.samples.is_empty() {
                 return Err(SttError::NoAudio);
             }
-            let mut audio = std::mem::take(&mut self.samples);
-            let span_ms =
-                (audio.len() as u64).saturating_mul(1_000) / u64::from(WHISPER_SAMPLE_RATE);
-            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-            params.set_language(Some("en"));
-            params.set_translate(false);
-            params.set_no_context(true);
-            params.set_single_segment(false);
-            params.set_print_special(false);
-            params.set_print_progress(false);
-            params.set_print_realtime(false);
-            params.set_print_timestamps(false);
-            params.set_no_timestamps(true);
-
-            let inference = self
-                .state
-                .full(params, &audio)
-                .map_err(|error| SttError::Inference {
-                    reason: bounded(&error.to_string()),
-                });
-            if let Err(error) = inference {
-                audio.clear();
-                self.samples = audio;
-                return Err(error);
-            }
-            let text = self
-                .state
-                .as_iter()
-                .try_fold(String::new(), |mut text, segment| {
-                    let segment = segment.to_str().map_err(|error| SttError::Inference {
-                        reason: bounded(&error.to_string()),
-                    })?;
-                    text.push_str(segment);
-                    Ok::<_, SttError>(text)
-                });
-            audio.clear();
-            self.samples = audio;
+            let audio = std::mem::take(&mut self.samples);
+            let span_ms = samples_to_milliseconds(audio.len());
+            let text = self.decode_text(&audio);
+            self.samples_since_partial = 0;
+            self.last_partial.clear();
             let transcript = Transcript::new(text?, true, span_ms)?;
             self.metrics.finalizations.fetch_add(1, Ordering::Relaxed);
             Ok(transcript)
         }
     }
+}
+
+#[cfg(feature = "whisper-cuda")]
+impl WhisperRecognizer {
+    fn decode_text(&mut self, audio: &[f32]) -> Result<String, SttError> {
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_language(Some("en"));
+        params.set_translate(false);
+        params.set_no_context(true);
+        params.set_single_segment(false);
+        params.set_print_special(false);
+        params.set_print_progress(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+        params.set_no_timestamps(true);
+        self.state
+            .full(params, audio)
+            .map_err(|error| SttError::Inference {
+                reason: bounded(&error.to_string()),
+            })?;
+        self.state
+            .as_iter()
+            .try_fold(String::new(), |mut text, segment| {
+                let segment = segment.to_str().map_err(|error| SttError::Inference {
+                    reason: bounded(&error.to_string()),
+                })?;
+                text.push_str(segment);
+                Ok::<_, SttError>(text)
+            })
+    }
+}
+
+#[cfg(feature = "whisper-cuda")]
+fn milliseconds_to_samples(milliseconds: u64) -> usize {
+    usize::try_from(
+        u64::from(WHISPER_SAMPLE_RATE)
+            .saturating_mul(milliseconds)
+            .div_ceil(1_000),
+    )
+    .unwrap_or(usize::MAX)
+}
+
+#[cfg(feature = "whisper-cuda")]
+fn samples_to_milliseconds(samples: usize) -> u64 {
+    (samples as u64).saturating_mul(1_000) / u64::from(WHISPER_SAMPLE_RATE)
+}
+
+#[cfg(feature = "whisper-cuda")]
+fn partial_window(samples: &[f32]) -> &[f32] {
+    let maximum = milliseconds_to_samples(WHISPER_PARTIAL_WINDOW_MS);
+    &samples[samples.len().saturating_sub(maximum)..]
 }
 
 #[cfg(feature = "whisper-cuda")]
@@ -562,6 +643,19 @@ mod tests {
         let admission = admit_cuda_backend(&messages.map(str::to_owned)).unwrap();
         assert_eq!(admission.device, 0);
         assert_eq!(admission.evidence, messages.join(" | "));
+    }
+
+    #[cfg(feature = "whisper-cuda")]
+    #[test]
+    fn rolling_partial_window_keeps_only_the_newest_five_seconds() {
+        let maximum = milliseconds_to_samples(WHISPER_PARTIAL_WINDOW_MS);
+        let samples = (0..maximum + 2_560)
+            .map(|sample| sample as f32)
+            .collect::<Vec<_>>();
+        let window = partial_window(&samples);
+        assert_eq!(window.len(), maximum);
+        assert_eq!(window.first(), Some(&2_560.0));
+        assert_eq!(window.last(), samples.last());
     }
 
     #[cfg(feature = "whisper-cuda")]

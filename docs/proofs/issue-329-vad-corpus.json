@@ -1,0 +1,90 @@
+{
+  "schema": "plato_audio.au4_vad_corpus_proof.v1",
+  "admitted_base": "aca8304a768c519f379ff14f8ca1d515dde231a4",
+  "corpus_license": "CC0-1.0",
+  "corpus_checksum_composition": "exact manifest.json bytes followed by exact speech-plus-noise.wav bytes",
+  "corpus_sha256": "b70723e810ea53c39dff05d0bb746eb89e7dbeb76648c555e1330fbffbebe8f4",
+  "manifest_sha256": "228cecd260153155a4c6ec7b8f7a25a519c6c934e4451aad2820465b548d6658",
+  "wav_sha256": "ce0775c71a2bb748234a92a2c446997d17c299a56a04d38cfa43975fa6245ff3",
+  "sample_count": 82944,
+  "annotations": 1,
+  "threshold": {
+    "detector": "au3_threshold",
+    "confusion": {
+      "true_positive_samples": 28320,
+      "true_negative_samples": 47424,
+      "false_positive_samples": 7200,
+      "false_negative_samples": 0
+    },
+    "predicted_endpoints": [
+      {
+        "start_sample": 8000,
+        "speech_end_sample": 15200,
+        "close_sample": 19200
+      },
+      {
+        "start_sample": 32000,
+        "speech_end_sample": 60320,
+        "close_sample": 64320
+      }
+    ],
+    "endpoint_deltas": [
+      {
+        "annotation_start_sample": 32000,
+        "annotation_end_sample": 60320,
+        "predicted_start_delta_samples": 0,
+        "predicted_speech_end_delta_samples": 0,
+        "predicted_close_delta_samples": 4000
+      }
+    ],
+    "false_cuts": 1,
+    "false_cut_rate": 1.0,
+    "missed_speech_segments": 0
+  },
+  "silero": {
+    "detector": "silero_v6_2_1",
+    "confusion": {
+      "true_positive_samples": 28064,
+      "true_negative_samples": 54528,
+      "false_positive_samples": 96,
+      "false_negative_samples": 256
+    },
+    "predicted_endpoints": [
+      {
+        "start_sample": 32256,
+        "speech_end_sample": 60416,
+        "close_sample": 64512
+      }
+    ],
+    "endpoint_deltas": [
+      {
+        "annotation_start_sample": 32000,
+        "annotation_end_sample": 60320,
+        "predicted_start_delta_samples": 256,
+        "predicted_speech_end_delta_samples": 96,
+        "predicted_close_delta_samples": 4192
+      }
+    ],
+    "false_cuts": 0,
+    "false_cut_rate": 0.0,
+    "missed_speech_segments": 0
+  },
+  "silero_provenance": {
+    "model_source": "snakers4/silero-vad",
+    "model_revision": "7e30209a3e901f9842f81b225f3e93d8199902b1",
+    "model_version": "v6.2.1",
+    "model_license": "MIT",
+    "model_sha256": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3",
+    "ort_runtime": "ort 2.0.0-rc.13 / ONNX Runtime 1.28",
+    "ort_build_info": "ORT Build Info: git-branch=rel-1.28.0, git-commit-id=da9b5e3, quick-build=1, build type=Release",
+    "ort_runtime_owner": 1,
+    "backend": "cuda",
+    "frame_samples": 512,
+    "speech_threshold": 0.5
+  },
+  "silero_metrics": {
+    "session_loads": 1,
+    "inference_frames": 162,
+    "state_resets": 1
+  }
+}

@@ -19,16 +19,16 @@ use rtrb::{Consumer, RingBuffer};
 use crate::DeviceBufferSize;
 use crate::{
     AudioFormat, CaptureError, CaptureResampleReport, CaptureSample, DeviceError, PcmData,
-    PcmFrame, SampleFormat, SpeechRecognizer, SttError, Transcript,
+    PcmFrame, SampleFormat, SpeechRecognizer, SttError, Transcript, VoiceActivityDetector,
     core::{
         capture::CaptureNormalizer,
-        vad::{ThresholdVad, VadEvent},
+        vad::{NeuralVadEvent, NeuralVadState},
     },
 };
 
 use super::{
     CaptureConfig, CaptureCounters, CaptureDeviceInfo, CaptureMetrics, CaptureOverflow,
-    CaptureReport, CaptureWorkerShutdown, bounded,
+    CapturePartial, CaptureReport, CaptureWorkerShutdown, bounded,
     device::{
         CallbackWriter, build_stream, sample_format, select_buffer_size, select_device,
         select_input_config,
@@ -37,6 +37,7 @@ use super::{
 
 const MAX_DRAIN_SAMPLES: usize = 8_192;
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const CAPTURE_EVENT_CAPACITY: usize = 8;
 
 /// One persistent input stream and exactly one normalization/VAD/STT worker.
 pub struct CaptureWorker {
@@ -53,13 +54,13 @@ pub struct CaptureWorker {
 
 #[derive(Default)]
 struct WorkerStatus {
-    active_reply: Mutex<Option<SyncSender<Result<CaptureReport, CaptureError>>>>,
+    active_reply: Mutex<Option<SyncSender<CaptureMessage>>>,
     panicked: AtomicBool,
     exited: AtomicBool,
 }
 
 impl WorkerStatus {
-    fn arm(&self, reply: SyncSender<Result<CaptureReport, CaptureError>>) {
+    fn arm(&self, reply: SyncSender<CaptureMessage>) {
         *self
             .active_reply
             .lock()
@@ -81,18 +82,24 @@ impl WorkerStatus {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
         {
-            let _ = reply.try_send(Err(CaptureError::WorkerPanicked));
+            let _ = reply.try_send(CaptureMessage::Complete(Err(CaptureError::WorkerPanicked)));
         }
     }
 }
 
 impl CaptureWorker {
     /// Opens the selected device once and moves the resident recognizer into one worker.
-    pub fn open<R>(config: CaptureConfig, recognizer: R) -> Result<Self, CaptureError>
+    pub fn open<V, R>(
+        config: CaptureConfig,
+        detector: V,
+        recognizer: R,
+    ) -> Result<Self, CaptureError>
     where
+        V: VoiceActivityDetector + 'static,
         R: SpeechRecognizer + 'static,
     {
         validate_recognizer_format(recognizer.input_format())?;
+        validate_detector_frame(detector.frame_samples())?;
         let host = cpal::default_host();
         let backend = host.id().name().to_owned();
         let device = select_device(&host, &config.device)?;
@@ -143,6 +150,7 @@ impl CaptureWorker {
         let (worker, worker_status) = spawn_worker(
             consumer,
             format,
+            Box::new(detector),
             Box::new(recognizer),
             requests,
             Arc::clone(&stream_failed),
@@ -175,6 +183,15 @@ impl CaptureWorker {
 
     /// Arms capture for exactly one VAD-closed final transcript.
     pub fn capture(&self, timeout: Duration) -> Result<CaptureReport, CaptureError> {
+        self.capture_with_partials(timeout, |_| {})
+    }
+
+    /// Delivers typed non-final updates while waiting for one final transcript.
+    pub fn capture_with_partials(
+        &self,
+        timeout: Duration,
+        mut on_partial: impl FnMut(&CapturePartial),
+    ) -> Result<CaptureReport, CaptureError> {
         if self.closed {
             return Err(CaptureError::Closed);
         }
@@ -184,7 +201,7 @@ impl CaptureWorker {
         if self.worker_status.panicked.load(Ordering::Acquire) {
             return Err(CaptureError::WorkerPanicked);
         }
-        let (reply, result) = mpsc::sync_channel(1);
+        let (reply, result) = mpsc::sync_channel(CAPTURE_EVENT_CAPACITY);
         self.commands
             .send(WorkerCommand::Capture { timeout, reply })
             .map_err(|_| {
@@ -194,14 +211,22 @@ impl CaptureWorker {
                     CaptureError::WorkerStopped
                 }
             })?;
-        result
-            .recv_timeout(timeout.saturating_add(Duration::from_secs(1)))
-            .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout => CaptureError::Timeout {
-                    milliseconds: timeout.as_millis(),
-                },
-                mpsc::RecvTimeoutError::Disconnected => CaptureError::WorkerStopped,
-            })?
+        let wait_deadline = Instant::now() + timeout.saturating_add(Duration::from_secs(1));
+        loop {
+            let remaining = wait_deadline.saturating_duration_since(Instant::now());
+            let message = result
+                .recv_timeout(remaining)
+                .map_err(|error| match error {
+                    mpsc::RecvTimeoutError::Timeout => CaptureError::Timeout {
+                        milliseconds: timeout.as_millis(),
+                    },
+                    mpsc::RecvTimeoutError::Disconnected => CaptureError::WorkerStopped,
+                })?;
+            match message {
+                CaptureMessage::Partial(partial) => on_partial(&partial),
+                CaptureMessage::Complete(result) => return result,
+            }
+        }
     }
 
     /// Reads monotonic capture, endpointing, and callback-overflow counters.
@@ -214,6 +239,7 @@ impl CaptureWorker {
             output_frames: self.counters.output_frames.load(Ordering::Relaxed),
             rejected_transients: self.counters.rejected_transients.load(Ordering::Relaxed),
             transcripts: self.counters.transcripts.load(Ordering::Relaxed),
+            partial_updates: self.counters.partial_updates.load(Ordering::Relaxed),
             normalization_resampling_us: self
                 .counters
                 .normalization_resampling_us
@@ -255,15 +281,18 @@ impl CaptureWorker {
     }
 
     #[cfg(test)]
-    fn test_worker<R>(
+    fn test_worker<V, R>(
         format: AudioFormat,
         capacity_samples: usize,
+        detector: V,
         recognizer: R,
     ) -> (Self, CallbackWriter, Arc<AtomicBool>)
     where
+        V: VoiceActivityDetector + 'static,
         R: SpeechRecognizer + 'static,
     {
         validate_recognizer_format(recognizer.input_format()).unwrap();
+        validate_detector_frame(detector.frame_samples()).unwrap();
         let (producer, consumer) = RingBuffer::new(capacity_samples);
         let counters = Arc::new(CaptureCounters::default());
         let stream_failed = Arc::new(AtomicBool::new(false));
@@ -272,6 +301,7 @@ impl CaptureWorker {
         let (worker, worker_status) = spawn_worker(
             consumer,
             format,
+            Box::new(detector),
             Box::new(recognizer),
             requests,
             Arc::clone(&stream_failed),
@@ -312,18 +342,29 @@ impl Drop for CaptureWorker {
 enum WorkerCommand {
     Capture {
         timeout: Duration,
-        reply: SyncSender<Result<CaptureReport, CaptureError>>,
+        reply: SyncSender<CaptureMessage>,
     },
     Shutdown,
+}
+
+enum CaptureMessage {
+    Partial(CapturePartial),
+    Complete(Result<CaptureReport, CaptureError>),
+}
+
+struct CaptureEngines {
+    detector: Box<dyn VoiceActivityDetector>,
+    recognizer: Box<dyn SpeechRecognizer>,
 }
 
 struct ActiveCapture {
     sequence: u64,
     deadline: Instant,
     timeout: Duration,
-    reply: SyncSender<Result<CaptureReport, CaptureError>>,
+    reply: SyncSender<CaptureMessage>,
     normalizer: CaptureNormalizer,
-    vad: ThresholdVad,
+    vad: NeuralVadState,
+    partials: Vec<CapturePartial>,
     normalization_resampling_us: u64,
     input_frames: u64,
     output_frames: u64,
@@ -334,8 +375,9 @@ impl ActiveCapture {
     fn new(
         sequence: u64,
         timeout: Duration,
-        reply: SyncSender<Result<CaptureReport, CaptureError>>,
+        reply: SyncSender<CaptureMessage>,
         normalizer: CaptureNormalizer,
+        vad: NeuralVadState,
         overflow_at_arm: CaptureOverflow,
     ) -> Self {
         Self {
@@ -344,7 +386,8 @@ impl ActiveCapture {
             timeout,
             reply,
             normalizer,
-            vad: ThresholdVad::new(),
+            vad,
+            partials: Vec::new(),
             normalization_resampling_us: 0,
             input_frames: 0,
             output_frames: 0,
@@ -356,6 +399,7 @@ impl ActiveCapture {
 fn spawn_worker(
     consumer: Consumer<CaptureSample>,
     format: AudioFormat,
+    detector: Box<dyn VoiceActivityDetector>,
     recognizer: Box<dyn SpeechRecognizer>,
     commands: Receiver<WorkerCommand>,
     stream_failed: Arc<AtomicBool>,
@@ -364,7 +408,10 @@ fn spawn_worker(
     spawn_worker_with(
         consumer,
         format,
-        recognizer,
+        CaptureEngines {
+            detector,
+            recognizer,
+        },
         commands,
         stream_failed,
         counters,
@@ -379,7 +426,7 @@ fn spawn_worker(
 fn spawn_worker_with<F>(
     consumer: Consumer<CaptureSample>,
     format: AudioFormat,
-    recognizer: Box<dyn SpeechRecognizer>,
+    engines: CaptureEngines,
     commands: Receiver<WorkerCommand>,
     stream_failed: Arc<AtomicBool>,
     counters: Arc<CaptureCounters>,
@@ -395,7 +442,7 @@ where
             run_worker(
                 consumer,
                 format,
-                recognizer,
+                engines,
                 commands,
                 stream_failed,
                 counters,
@@ -420,12 +467,16 @@ fn thread_start_error(error: std::io::Error) -> CaptureError {
 fn run_worker(
     mut consumer: Consumer<CaptureSample>,
     format: AudioFormat,
-    mut recognizer: Box<dyn SpeechRecognizer>,
+    engines: CaptureEngines,
     commands: Receiver<WorkerCommand>,
     stream_failed: Arc<AtomicBool>,
     counters: Arc<CaptureCounters>,
     worker_status: &WorkerStatus,
 ) {
+    let CaptureEngines {
+        mut detector,
+        mut recognizer,
+    } = engines;
     let mut active: Option<ActiveCapture> = None;
     let mut sequence = 0_u64;
     let mut drained = Vec::with_capacity(MAX_DRAIN_SAMPLES);
@@ -434,6 +485,8 @@ fn run_worker(
             Ok(WorkerCommand::Capture { timeout, reply }) if active.is_none() => {
                 let overflow_at_arm = counters.overflow();
                 drain_discard(&mut consumer);
+                detector.reset();
+                recognizer.reset();
                 sequence = sequence.saturating_add(1);
                 worker_status.arm(reply.clone());
                 active = start_capture(
@@ -441,6 +494,7 @@ fn run_worker(
                     timeout,
                     reply,
                     CaptureNormalizer::new(format),
+                    NeuralVadState::new(detector.frame_samples()),
                     overflow_at_arm,
                 );
                 if active.is_none() {
@@ -448,7 +502,7 @@ fn run_worker(
                 }
             }
             Ok(WorkerCommand::Capture { reply, .. }) => {
-                let _ = reply.send(Err(CaptureError::WorkerStopped));
+                let _ = reply.send(CaptureMessage::Complete(Err(CaptureError::WorkerStopped)));
             }
             Ok(WorkerCommand::Shutdown) => {
                 if let Some(capture) = active.take() {
@@ -532,31 +586,60 @@ fn run_worker(
             }
         };
         update_conversion_counters(capture, &counters, report);
-        let events = match capture.vad.push(&samples) {
+        let audio_available = Instant::now();
+        let events = match capture.vad.push(&samples, detector.as_mut()) {
             Ok(events) => events,
             Err(error) => {
                 let capture = active.take().expect("active capture exists");
-                complete_capture(worker_status, capture, Err(error));
+                complete_capture(worker_status, capture, Err(error.into()));
                 continue;
             }
         };
         for event in events {
             match event {
-                VadEvent::RejectedTransient(endpoint) => {
+                NeuralVadEvent::RejectedTransient(endpoint) => {
                     debug_assert!(endpoint.close_sample >= endpoint.speech_end_sample);
                     counters.rejected_transients.fetch_add(1, Ordering::Relaxed);
                 }
-                VadEvent::Segment(segment) => {
+                NeuralVadEvent::SpeechSamples(samples) => {
+                    let Some(capture) = active.as_mut() else {
+                        break;
+                    };
+                    let updates = match recognize_samples(recognizer.as_mut(), &samples) {
+                        Ok(updates) => updates,
+                        Err(error) => {
+                            let capture = active.take().expect("active capture exists");
+                            complete_capture(worker_status, capture, Err(error));
+                            return;
+                        }
+                    };
+                    for transcript in updates {
+                        let partial =
+                            CapturePartial::new(transcript, duration_us(audio_available.elapsed()));
+                        capture.partials.push(partial.clone());
+                        counters.partial_updates.fetch_add(1, Ordering::Relaxed);
+                        if capture
+                            .reply
+                            .send(CaptureMessage::Partial(partial))
+                            .is_err()
+                        {
+                            worker_status.clear();
+                            return;
+                        }
+                    }
+                }
+                NeuralVadEvent::Segment(segment) => {
                     let close = Instant::now();
                     let overflow_at_close = counters.overflow();
                     let capture = active.take().expect("active capture exists");
                     let recognition = overflow_error(capture.overflow_at_arm, overflow_at_close)
-                        .map_or_else(|| recognize_segment(recognizer.as_mut(), &segment), Err);
+                        .map_or_else(|| finalize_segment(recognizer.as_mut(), &segment), Err);
                     let result = recognition.map(|transcript| {
                         counters.transcripts.fetch_add(1, Ordering::Relaxed);
                         CaptureReport {
                             sequence: capture.sequence,
                             transcript,
+                            partials: capture.partials.clone(),
                             endpoint: segment.endpoint(),
                             vad_close_to_final_us: duration_us(close.elapsed()),
                             normalization_resampling_us: capture.normalization_resampling_us,
@@ -583,26 +666,32 @@ fn complete_capture(
     result: Result<CaptureReport, CaptureError>,
 ) {
     worker_status.clear();
-    let _ = capture.reply.send(result);
+    let _ = capture.reply.send(CaptureMessage::Complete(result));
 }
 
 fn start_capture(
     sequence: u64,
     timeout: Duration,
-    reply: SyncSender<Result<CaptureReport, CaptureError>>,
+    reply: SyncSender<CaptureMessage>,
     normalizer: Result<CaptureNormalizer, CaptureError>,
+    vad: Result<NeuralVadState, crate::VadError>,
     overflow_at_arm: CaptureOverflow,
 ) -> Option<ActiveCapture> {
-    match normalizer {
-        Ok(normalizer) => Some(ActiveCapture::new(
+    match (normalizer, vad) {
+        (Ok(normalizer), Ok(vad)) => Some(ActiveCapture::new(
             sequence,
             timeout,
             reply,
             normalizer,
+            vad,
             overflow_at_arm,
         )),
-        Err(error) => {
-            let _ = reply.send(Err(error));
+        (Err(error), _) => {
+            let _ = reply.send(CaptureMessage::Complete(Err(error)));
+            None
+        }
+        (_, Err(error)) => {
+            let _ = reply.send(CaptureMessage::Complete(Err(error.into())));
             None
         }
     }
@@ -630,12 +719,23 @@ fn update_conversion_counters(
     counters.output_frames.fetch_add(output, Ordering::Relaxed);
 }
 
+#[cfg(all(test, feature = "whisper-cuda"))]
 pub(crate) fn recognize_segment(
     recognizer: &mut dyn SpeechRecognizer,
     segment: &crate::VoiceSegment,
 ) -> Result<Transcript, CaptureError> {
+    recognizer.reset();
+    let _ = recognize_samples(recognizer, segment.samples())?;
+    finalize_segment(recognizer, segment)
+}
+
+pub(crate) fn recognize_samples(
+    recognizer: &mut dyn SpeechRecognizer,
+    samples: &[f32],
+) -> Result<Vec<Transcript>, CaptureError> {
     let format = recognizer.input_format();
-    for &sample in segment.samples() {
+    let mut partials = Vec::new();
+    for &sample in samples {
         let frame =
             PcmFrame::new(format, PcmData::F32(Box::new([sample]))).map_err(SttError::from)?;
         for rolling in recognizer.accept(&frame)? {
@@ -645,8 +745,16 @@ pub(crate) fn recognize_segment(
                 }
                 .into());
             }
+            partials.push(rolling);
         }
     }
+    Ok(partials)
+}
+
+pub(crate) fn finalize_segment(
+    recognizer: &mut dyn SpeechRecognizer,
+    segment: &crate::VoiceSegment,
+) -> Result<Transcript, CaptureError> {
     let transcript = recognizer.finalize()?;
     if !transcript.is_final {
         return Err(SttError::Contract {
@@ -673,6 +781,10 @@ fn validate_recognizer_format(actual: AudioFormat) -> Result<(), CaptureError> {
         return Err(SttError::FormatMismatch { expected, actual }.into());
     }
     Ok(())
+}
+
+fn validate_detector_frame(actual: usize) -> Result<(), CaptureError> {
+    NeuralVadState::new(actual).map(|_| ()).map_err(Into::into)
 }
 
 fn whisper_format() -> AudioFormat {

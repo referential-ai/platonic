@@ -4,6 +4,17 @@ use thiserror::Error;
 
 use crate::{AudioFormat, InferenceBackend, SampleFormat};
 
+/// Process-global ONNX Runtime acquisition failures.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum OrtRuntimeError {
+    /// The linked ONNX Runtime could not provide its process environment.
+    #[error("cannot acquire shared ONNX Runtime environment: {reason}")]
+    Environment {
+        /// Bounded ONNX Runtime diagnostic.
+        reason: String,
+    },
+}
+
 /// Validation failures for typed PCM values.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum PcmError {
@@ -179,6 +190,83 @@ pub enum SttError {
     Pcm(#[from] PcmError),
 }
 
+/// Neural voice-activity model, state, and artifact failures.
+#[derive(Debug, Error)]
+pub enum VadError {
+    /// The process-global ONNX Runtime could not be acquired.
+    #[error(transparent)]
+    Runtime(#[from] OrtRuntimeError),
+    /// The model artifact could not be read.
+    #[error("cannot read Silero VAD model at {path}: {source}")]
+    ArtifactRead {
+        /// Requested model path.
+        path: PathBuf,
+        /// Filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The model artifact did not match the admitted digest.
+    #[error("Silero VAD model checksum mismatch at {path}: expected {expected}, got {actual}")]
+    ArtifactChecksum {
+        /// Checked model path.
+        path: PathBuf,
+        /// Pinned SHA-256 digest.
+        expected: &'static str,
+        /// Observed SHA-256 digest.
+        actual: String,
+    },
+    /// Both accelerated and CPU session construction failed.
+    #[error("cannot load Silero VAD with CUDA ({cuda}) or CPU ({cpu})")]
+    ModelLoadFallback {
+        /// CUDA setup or session-load failure.
+        cuda: String,
+        /// CPU session-load failure.
+        cpu: String,
+    },
+    /// The selected backend could not construct a resident session.
+    #[error("cannot load Silero VAD with {backend:?}: {reason}")]
+    ModelLoad {
+        /// Attempted inference backend.
+        backend: InferenceBackend,
+        /// Bounded ONNX Runtime diagnostic.
+        reason: String,
+    },
+    /// A detector did not accept the fixed 16 kHz frame size.
+    #[error("voice activity detector requires {expected} samples, got {actual}")]
+    FrameLength {
+        /// Model frame size.
+        expected: usize,
+        /// Supplied sample count.
+        actual: usize,
+    },
+    /// Warm Silero inference failed.
+    #[error("Silero VAD inference failed on {backend:?}: {reason}")]
+    Inference {
+        /// Resident inference backend.
+        backend: InferenceBackend,
+        /// Bounded ONNX Runtime diagnostic.
+        reason: String,
+    },
+    /// Silero returned malformed recurrent state or probability output.
+    #[error("Silero VAD output contract failed: {reason}")]
+    OutputContract {
+        /// Bounded contract diagnostic.
+        reason: String,
+    },
+    /// A VAD implementation returned a non-finite or out-of-range probability.
+    #[error("voice activity probability must be finite and within 0..=1, got {probability}")]
+    InvalidProbability {
+        /// Invalid model value.
+        probability: f32,
+    },
+    /// A VAD-confirmed utterance exceeded the fixed memory bound.
+    #[error("captured utterance exceeded the fixed {maximum_ms} ms bound")]
+    UtteranceTooLong {
+        /// Literal maximum accepted utterance duration.
+        maximum_ms: u64,
+    },
+}
+
 /// Capture-worker, endpointing, and recognizer outcomes.
 #[derive(Debug, Error)]
 pub enum CaptureError {
@@ -191,6 +279,9 @@ pub enum CaptureError {
     /// Resident speech-recognition failure.
     #[error(transparent)]
     Recognition(#[from] SttError),
+    /// Neural voice activity evaluation or endpoint state failed.
+    #[error(transparent)]
+    Vad(#[from] VadError),
     /// A raw ring sample did not match the negotiated device format.
     #[error("capture sample format changed from {expected:?} to {actual:?}")]
     SampleFormatMismatch {
@@ -244,6 +335,9 @@ pub enum CaptureError {
 /// Warm synthesis setup and inference failures.
 #[derive(Debug, Error)]
 pub enum SynthError {
+    /// The process-global ONNX Runtime could not be acquired.
+    #[error(transparent)]
+    Runtime(#[from] OrtRuntimeError),
     /// A caller supplied an invalid engine setting.
     #[error("invalid Kokoro configuration: {reason}")]
     InvalidConfig {

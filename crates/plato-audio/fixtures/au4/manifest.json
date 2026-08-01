@@ -1,0 +1,33 @@
+{
+  "schema": "plato_audio.au4_corpus.v1",
+  "license": "CC0-1.0",
+  "human_recording": false,
+  "format": {
+    "codec": "pcm_s16le",
+    "sample_rate": 16000,
+    "channels": 1,
+    "samples": 82944
+  },
+  "fixture": {
+    "path": "speech-plus-noise.wav",
+    "source": "AU3 spoken-question.wav plus FFmpeg n8.1.2 deterministic white-noise sources",
+    "source_text": "What is the capital of France?",
+    "sha256": "ce0775c71a2bb748234a92a2c446997d17c299a56a04d38cfa43975fa6245ff3"
+  },
+  "annotations": {
+    "speech": [
+      {
+        "start_sample": 32000,
+        "end_sample": 60320,
+        "text": "What is the capital of France?"
+      }
+    ],
+    "noise": [
+      {
+        "start_sample": 8000,
+        "end_sample": 15200,
+        "kind": "white_noise_burst"
+      }
+    ]
+  }
+}
