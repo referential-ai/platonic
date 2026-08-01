@@ -5,8 +5,9 @@ use plato_daemon_client::{
 };
 use plato_protocol::{
     ApprovalDecisionName, BufferedStreamEvent, CommandAcceptedResult, EventsStreamResult,
-    HelloResult, PendingApprovalSnapshot, RunStartResult, RunStateName, SessionSummary,
-    StreamEvent, TranscriptReadResult, TypedRun, TypedTranscriptEntry,
+    HarnessEvent, HelloResult, PendingApprovalSnapshot, PolicyDecision, RunStartResult,
+    RunStateName, SessionSummary, StreamEvent, TranscriptReadResult, TypedRun,
+    TypedTranscriptEntry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1530,7 +1531,7 @@ fn normalize_event_page(
                 ),
             ));
         }
-        if let Some(event) = buffered_event_into_desktop(buffered)? {
+        if let Some(event) = buffered_event_into_desktop(buffered) {
             events.push(event);
         }
     }
@@ -1559,11 +1560,9 @@ fn validate_stream_run(
     ))
 }
 
-fn buffered_event_into_desktop(
-    buffered: BufferedStreamEvent,
-) -> Result<Option<DesktopEvent>, DesktopError> {
+fn buffered_event_into_desktop(buffered: BufferedStreamEvent) -> Option<DesktopEvent> {
     let offset = buffered.offset;
-    let event = match buffered.event {
+    match buffered.event {
         StreamEvent::AssistantDelta {
             step,
             delta_index,
@@ -1582,142 +1581,82 @@ fn buffered_event_into_desktop(
             })
         }
         StreamEvent::Canceled { .. } => Some(DesktopEvent::CancelRequested { offset }),
-        StreamEvent::Ledger { record } => {
-            let event = serde_json::from_value::<DaemonLedgerEvent>(
-                serde_json::to_value(record.event).expect("ledger event serializes"),
-            )
-            .map_err(|error| {
-                DesktopError::new(
-                    "incompatible_daemon",
-                    format!("Incompatible daemon: malformed ledger event: {error}"),
-                )
-            })?;
-            event.into_desktop(offset)
-        }
+        StreamEvent::Ledger { record } => ledger_event_into_desktop(record.event, offset),
         StreamEvent::Unknown(_) => None,
-    };
-    Ok(event)
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
-enum DaemonLedgerEvent {
-    ModelResponded {
-        step: u32,
-        output: DaemonMessage,
-    },
-    ToolCallProposed {
-        call: DaemonToolCall,
-    },
-    PolicyEvaluated {
-        call_id: String,
-        decision: DaemonPolicyDecision,
-    },
-    ApprovalGranted {
-        call_id: String,
-        actor_id: String,
-    },
-    ApprovalDenied {
-        call_id: String,
-        actor_id: String,
-        reason: String,
-    },
-    ToolFinished {
-        result: DaemonToolResult,
-    },
-    ToolFailed {
-        call_id: String,
-        reason: String,
-    },
-    #[serde(other)]
-    Ignored,
-}
-
-impl DaemonLedgerEvent {
-    fn into_desktop(self, offset: u64) -> Option<DesktopEvent> {
-        match self {
-            Self::ModelResponded { step, output } => Some(DesktopEvent::AssistantCommitted {
-                offset,
-                step,
-                text: output.content,
-            }),
-            Self::ToolCallProposed { call } => Some(DesktopEvent::ToolCall {
-                offset,
-                call_id: call.id,
-                tool: call.tool,
-                input_preview: json_preview(&call.input),
-            }),
-            Self::PolicyEvaluated {
-                call_id,
-                decision: DaemonPolicyDecision::Deny { reason },
-            } => Some(DesktopEvent::PolicyDenied {
-                offset,
-                call_id,
-                reason,
-            }),
-            Self::PolicyEvaluated { .. } => None,
-            Self::ApprovalGranted { call_id, actor_id } => Some(DesktopEvent::Approval {
-                offset,
-                call_id,
-                decision: ApprovalDecisionName::Granted,
-                actor_id,
-                reason: None,
-            }),
-            Self::ApprovalDenied {
-                call_id,
-                actor_id,
-                reason,
-            } => Some(DesktopEvent::Approval {
-                offset,
-                call_id,
-                decision: ApprovalDecisionName::Denied,
-                actor_id,
-                reason: Some(reason),
-            }),
-            Self::ToolFinished { result } => Some(DesktopEvent::ToolResult {
-                offset,
-                call_id: result.call_id,
-                summary: result.summary,
-            }),
-            Self::ToolFailed { call_id, reason } => Some(DesktopEvent::ToolFailed {
-                offset,
-                call_id,
-                error: reason,
-            }),
-            Self::Ignored => None,
-        }
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct DaemonMessage {
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct DaemonToolCall {
-    id: String,
-    tool: String,
-    input: Value,
-}
-
-#[derive(Debug, Deserialize)]
-struct DaemonToolResult {
-    call_id: String,
-    summary: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "decision", rename_all = "snake_case")]
-enum DaemonPolicyDecision {
-    Allow,
-    RequireApproval {
-        #[serde(rename = "reason")]
-        _reason: String,
-    },
-    Deny {
-        reason: String,
-    },
+fn ledger_event_into_desktop(event: HarnessEvent, offset: u64) -> Option<DesktopEvent> {
+    match event {
+        HarnessEvent::ModelResponded { step, output, .. } => {
+            Some(DesktopEvent::AssistantCommitted {
+                offset,
+                step,
+                text: output.content,
+            })
+        }
+        HarnessEvent::ToolCallProposed { call, .. } => Some(DesktopEvent::ToolCall {
+            offset,
+            call_id: call.id.to_string(),
+            tool: call.tool.to_string(),
+            input_preview: json_preview(&call.input),
+        }),
+        HarnessEvent::PolicyEvaluated {
+            call_id,
+            decision: PolicyDecision::Deny { reason },
+            ..
+        } => Some(DesktopEvent::PolicyDenied {
+            offset,
+            call_id: call_id.to_string(),
+            reason,
+        }),
+        HarnessEvent::PolicyEvaluated {
+            decision: PolicyDecision::Allow | PolicyDecision::RequireApproval { .. },
+            ..
+        } => None,
+        HarnessEvent::ApprovalGranted {
+            call_id, actor_id, ..
+        } => Some(DesktopEvent::Approval {
+            offset,
+            call_id: call_id.to_string(),
+            decision: ApprovalDecisionName::Granted,
+            actor_id: actor_id.to_string(),
+            reason: None,
+        }),
+        HarnessEvent::ApprovalDenied {
+            call_id,
+            actor_id,
+            reason,
+            ..
+        } => Some(DesktopEvent::Approval {
+            offset,
+            call_id: call_id.to_string(),
+            decision: ApprovalDecisionName::Denied,
+            actor_id: actor_id.to_string(),
+            reason: Some(reason),
+        }),
+        HarnessEvent::ToolFinished { result, .. } => Some(DesktopEvent::ToolResult {
+            offset,
+            call_id: result.call_id.to_string(),
+            summary: result.summary,
+        }),
+        HarnessEvent::ToolFailed {
+            call_id, reason, ..
+        } => Some(DesktopEvent::ToolFailed {
+            offset,
+            call_id: call_id.to_string(),
+            error: reason,
+        }),
+        HarnessEvent::RunStarted { .. }
+        | HarnessEvent::ContextBuilt { .. }
+        | HarnessEvent::ContextCompacted { .. }
+        | HarnessEvent::ModelRequested { .. }
+        | HarnessEvent::ModelFailed { .. }
+        | HarnessEvent::ToolProposalsRejected { .. }
+        | HarnessEvent::ToolStarted { .. }
+        | HarnessEvent::RunFinished { .. }
+        | HarnessEvent::RunFailed { .. } => None,
+    }
 }
 
 fn json_preview(value: &Value) -> String {
@@ -2796,38 +2735,145 @@ mod tests {
     }
 
     #[test]
-    fn presentation_events_cover_deltas_commits_calls_approvals_and_cancel() {
-        let page = EventsStreamResult {
-            run_id: "run_1".into(),
-            from_offset: 0,
-            next_offset: 10,
-            status: RunStateName::CancelRequested,
-            events: vec![
+    fn presentation_event_fixtures_preserve_every_mapped_and_ignored_variant() {
+        const OFFSET: u64 = 41;
+        let fixtures = vec![
+            (
+                "assistant_delta",
                 buffered_event(
-                    0,
+                    OFFSET,
                     json!({
                         "kind": "assistant_delta",
                         "run_id": "run_1",
                         "turn_id": "turn_1",
-                        "step": 0,
-                        "delta_index": 0,
+                        "step": 2,
+                        "delta_index": 7,
                         "text": "hel"
                     }),
                 ),
+                Some(json!({
+                    "kind": "assistant_delta",
+                    "offset": OFFSET,
+                    "step": 2,
+                    "deltaIndex": 7,
+                    "text": "hel"
+                })),
+            ),
+            (
+                "run_started",
                 ledger_event(
-                    1,
+                    OFFSET,
+                    json!({
+                        "event": "run_started",
+                        "run_id": "run_1",
+                        "agent_id": "agent_1"
+                    }),
+                ),
+                None,
+            ),
+            (
+                "context_built",
+                ledger_event(
+                    OFFSET,
+                    json!({
+                        "event": "context_built",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "context": {
+                            "token_budget": 8,
+                            "fragments": [{
+                                "lane": "current_task",
+                                "source": "user",
+                                "content": "question",
+                                "estimated_tokens": 2
+                            }]
+                        }
+                    }),
+                ),
+                None,
+            ),
+            (
+                "context_compacted",
+                ledger_event(
+                    OFFSET,
+                    json!({
+                        "event": "context_compacted",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "estimated_tokens_before": 12,
+                        "estimated_tokens_after": 8,
+                        "dropped_turn_start": 0,
+                        "dropped_turn_end_exclusive": 1
+                    }),
+                ),
+                None,
+            ),
+            (
+                "model_requested",
+                ledger_event(
+                    OFFSET,
+                    json!({
+                        "event": "model_requested",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 2,
+                        "model": "model_1"
+                    }),
+                ),
+                None,
+            ),
+            (
+                "model_failed",
+                ledger_event(
+                    OFFSET,
+                    json!({
+                        "event": "model_failed",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 2,
+                        "reason": "retryable failure"
+                    }),
+                ),
+                None,
+            ),
+            (
+                "model_responded",
+                ledger_event(
+                    OFFSET,
                     json!({
                         "event": "model_responded",
                         "run_id": "run_1",
                         "turn_id": "turn_1",
-                        "step": 0,
+                        "step": 2,
                         "output": {"role": "assistant", "content": "hello"},
                         "proposed_calls": [],
-                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                        "usage": {"input_tokens": 3, "output_tokens": 1}
                     }),
                 ),
+                Some(json!({
+                    "kind": "assistant_committed",
+                    "offset": OFFSET,
+                    "step": 2,
+                    "text": "hello"
+                })),
+            ),
+            (
+                "tool_proposals_rejected",
                 ledger_event(
-                    2,
+                    OFFSET,
+                    json!({
+                        "event": "tool_proposals_rejected",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "reason": "invalid proposal"
+                    }),
+                ),
+                None,
+            ),
+            (
+                "tool_call_proposed",
+                ledger_event(
+                    OFFSET,
                     json!({
                         "event": "tool_call_proposed",
                         "run_id": "run_1",
@@ -2840,17 +2886,65 @@ mod tests {
                         }
                     }),
                 ),
+                Some(json!({
+                    "kind": "tool_call",
+                    "offset": OFFSET,
+                    "callId": "call_1",
+                    "tool": "file.read",
+                    "inputPreview": r#"{"path":"README.md"}"#
+                })),
+            ),
+            (
+                "policy_allow",
                 ledger_event(
-                    3,
+                    OFFSET,
+                    json!({
+                        "event": "policy_evaluated",
+                        "run_id": "run_1",
+                        "call_id": "call_1",
+                        "decision": {"decision": "allow"}
+                    }),
+                ),
+                None,
+            ),
+            (
+                "policy_require_approval",
+                ledger_event(
+                    OFFSET,
                     json!({
                         "event": "policy_evaluated",
                         "run_id": "run_1",
                         "call_id": "call_2",
-                        "decision": {"decision": "deny", "reason": "no"}
+                        "decision": {
+                            "decision": "require_approval",
+                            "reason": "operator confirmation required"
+                        }
                     }),
                 ),
+                None,
+            ),
+            (
+                "policy_deny",
                 ledger_event(
-                    4,
+                    OFFSET,
+                    json!({
+                        "event": "policy_evaluated",
+                        "run_id": "run_1",
+                        "call_id": "call_3",
+                        "decision": {"decision": "deny", "reason": "not permitted"}
+                    }),
+                ),
+                Some(json!({
+                    "kind": "policy_denied",
+                    "offset": OFFSET,
+                    "callId": "call_3",
+                    "reason": "not permitted"
+                })),
+            ),
+            (
+                "approval_granted",
+                ledger_event(
+                    OFFSET,
                     json!({
                         "event": "approval_granted",
                         "run_id": "run_1",
@@ -2858,18 +2952,52 @@ mod tests {
                         "actor_id": "human_1"
                     }),
                 ),
+                Some(json!({
+                    "kind": "approval",
+                    "offset": OFFSET,
+                    "callId": "call_1",
+                    "decision": "granted",
+                    "actorId": "human_1",
+                    "reason": null
+                })),
+            ),
+            (
+                "approval_denied",
                 ledger_event(
-                    5,
+                    OFFSET,
                     json!({
                         "event": "approval_denied",
                         "run_id": "run_1",
                         "call_id": "call_2",
-                        "actor_id": "human_1",
+                        "actor_id": "human_2",
                         "reason": "not now"
                     }),
                 ),
+                Some(json!({
+                    "kind": "approval",
+                    "offset": OFFSET,
+                    "callId": "call_2",
+                    "decision": "denied",
+                    "actorId": "human_2",
+                    "reason": "not now"
+                })),
+            ),
+            (
+                "tool_started",
                 ledger_event(
-                    6,
+                    OFFSET,
+                    json!({
+                        "event": "tool_started",
+                        "run_id": "run_1",
+                        "call_id": "call_1"
+                    }),
+                ),
+                None,
+            ),
+            (
+                "tool_finished",
+                ledger_event(
+                    OFFSET,
                     json!({
                         "event": "tool_finished",
                         "run_id": "run_1",
@@ -2877,22 +3005,57 @@ mod tests {
                             "call_id": "call_1",
                             "summary": "read file",
                             "data": {"secret_raw": true},
-                            "artifacts": [],
+                            "artifacts": ["artifact_1"],
                             "visibility": "both"
                         }
                     }),
                 ),
+                Some(json!({
+                    "kind": "tool_result",
+                    "offset": OFFSET,
+                    "callId": "call_1",
+                    "summary": "read file"
+                })),
+            ),
+            (
+                "tool_failed",
                 ledger_event(
-                    7,
+                    OFFSET,
                     json!({
                         "event": "tool_failed",
                         "run_id": "run_1",
                         "call_id": "call_3",
-                        "reason": "failed"
+                        "reason": "execution failed"
                     }),
                 ),
+                Some(json!({
+                    "kind": "tool_failed",
+                    "offset": OFFSET,
+                    "callId": "call_3",
+                    "error": "execution failed"
+                })),
+            ),
+            (
+                "run_finished",
+                ledger_event(OFFSET, json!({"event": "run_finished", "run_id": "run_1"})),
+                None,
+            ),
+            (
+                "run_failed",
+                ledger_event(
+                    OFFSET,
+                    json!({
+                        "event": "run_failed",
+                        "run_id": "run_1",
+                        "reason": "terminal failure"
+                    }),
+                ),
+                None,
+            ),
+            (
+                "approval_requested",
                 buffered_event(
-                    8,
+                    OFFSET,
                     json!({
                         "kind": "approval_requested",
                         "run_id": "run_1",
@@ -2902,46 +3065,35 @@ mod tests {
                         "reason": "approval needed"
                     }),
                 ),
-                buffered_event(9, json!({"kind": "canceled", "run_id": "run_1"})),
-            ],
-        };
+                Some(json!({
+                    "kind": "approval_requested",
+                    "offset": OFFSET,
+                    "toolCallId": "call_4"
+                })),
+            ),
+            (
+                "canceled",
+                buffered_event(OFFSET, json!({"kind": "canceled", "run_id": "run_1"})),
+                Some(json!({"kind": "cancel_requested", "offset": OFFSET})),
+            ),
+            (
+                "unknown_stream_event",
+                buffered_event(
+                    OFFSET,
+                    json!({
+                        "kind": "future_event",
+                        "run_id": "run_1",
+                        "payload": {"answer": 42}
+                    }),
+                ),
+                None,
+            ),
+        ];
 
-        let page = normalize_event_page("run_1", page).unwrap();
-
-        assert_eq!(page.events.len(), 10);
-        assert!(matches!(
-            page.events[0],
-            DesktopEvent::AssistantDelta {
-                offset: 0,
-                step: 0,
-                delta_index: 0,
-                ..
-            }
-        ));
-        assert!(matches!(
-            page.events[1],
-            DesktopEvent::AssistantCommitted {
-                offset: 1,
-                step: 0,
-                ..
-            }
-        ));
-        assert!(matches!(
-            page.events[3],
-            DesktopEvent::PolicyDenied { ref call_id, .. } if call_id == "call_2"
-        ));
-        assert!(matches!(
-            page.events[8],
-            DesktopEvent::ApprovalRequested { ref tool_call_id, .. }
-                if tool_call_id == "call_4"
-        ));
-        assert!(matches!(
-            page.events[9],
-            DesktopEvent::CancelRequested { offset: 9 }
-        ));
-        let serialized = serde_json::to_string(&page).unwrap();
-        for forbidden in ["secret_raw", "occurred_at_ms", "record", "turn_id"] {
-            assert!(!serialized.contains(forbidden), "found {forbidden}");
+        for (name, before, after) in fixtures {
+            let actual = buffered_event_into_desktop(before)
+                .map(|event| serde_json::to_value(event).unwrap());
+            assert_eq!(actual, after, "fixture {name}");
         }
     }
 
@@ -2967,6 +3119,75 @@ mod tests {
         assert_eq!(page.from_offset, 4);
         assert_eq!(page.next_offset, 5);
         assert!(page.events.is_empty());
+    }
+
+    #[test]
+    fn event_page_boundaries_keep_exact_typed_errors() {
+        let fixtures = vec![
+            (
+                "wrong run",
+                EventsStreamResult {
+                    run_id: "run_other".into(),
+                    from_offset: 4,
+                    next_offset: 4,
+                    status: RunStateName::Running,
+                    events: vec![],
+                },
+                "Incompatible daemon: requested events for run_1, got run_other",
+            ),
+            (
+                "reversed offsets",
+                EventsStreamResult {
+                    run_id: "run_1".into(),
+                    from_offset: 5,
+                    next_offset: 4,
+                    status: RunStateName::Running,
+                    events: vec![],
+                },
+                "Incompatible daemon: events.stream next_offset precedes from_offset",
+            ),
+            (
+                "page length mismatch",
+                EventsStreamResult {
+                    run_id: "run_1".into(),
+                    from_offset: 4,
+                    next_offset: 5,
+                    status: RunStateName::Running,
+                    events: vec![],
+                },
+                "Incompatible daemon: events.stream offsets do not match its page length",
+            ),
+            (
+                "offset overflow",
+                EventsStreamResult {
+                    run_id: "run_1".into(),
+                    from_offset: u64::MAX,
+                    next_offset: u64::MAX,
+                    status: RunStateName::Running,
+                    events: vec![buffered_event(u64::MAX, json!({"kind": "future_event"}))],
+                },
+                "Incompatible daemon: events.stream offsets do not match its page length",
+            ),
+            (
+                "noncontiguous event offset",
+                EventsStreamResult {
+                    run_id: "run_1".into(),
+                    from_offset: 5,
+                    next_offset: 6,
+                    status: RunStateName::Running,
+                    events: vec![buffered_event(6, json!({"kind": "future_event"}))],
+                },
+                "Incompatible daemon: event offset 6 is not expected offset 5",
+            ),
+        ];
+
+        for (name, page, message) in fixtures {
+            assert_eq!(
+                normalize_event_page("run_1", page).unwrap_err(),
+                DesktopError::new("incompatible_daemon", message),
+                "fixture {name}"
+            );
+        }
     }
 
     #[test]
