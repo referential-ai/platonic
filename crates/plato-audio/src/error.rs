@@ -327,6 +327,12 @@ pub enum CaptureError {
     /// The capture result channel closed without a typed terminal outcome.
     #[error("capture worker stopped without a terminal outcome")]
     WorkerStopped,
+    /// Continuous playback-time VAD failed and canceled the shared run.
+    #[error("barge-in detection failed: {reason}")]
+    BargeIn {
+        /// Bounded worker-side normalization, VAD, or overflow diagnostic.
+        reason: String,
+    },
     /// The capture session was explicitly closed.
     #[error("capture session is closed")]
     Closed,

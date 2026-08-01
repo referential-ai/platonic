@@ -12,13 +12,14 @@ mod error;
 mod io;
 
 pub use core::{
-    AudioFormat, CAPTURE_SAMPLE_RATE, CaptureResampleReport, CaptureSample, MAX_UTTERANCE_MS,
-    NeuralVadEvent, NeuralVadState, PcmChunk, PcmData, PcmFrame, RUBATO_RUNTIME_VERSION,
-    ResampleReport, ResamplingPlan, SENTENCE_PREFETCH_CAPACITY, SILERO_HANGOVER_FRAMES,
-    SILERO_MINIMUM_SPEECH_FRAMES, SILERO_ONSET_FRAMES, SILERO_SPEECH_THRESHOLD,
-    SILERO_WINDOW_SAMPLES, SampleFormat, Sentence, SentenceCutter, SentenceQueueError,
-    VAD_HANGOVER_WINDOWS, VAD_MINIMUM_SPEECH_WINDOWS, VAD_ONSET_WINDOWS, VAD_RMS_THRESHOLD,
-    VAD_WINDOW_SAMPLES, VadEndpoint, VoiceActivityDetector, VoiceSegment,
+    AudioFormat, BargeInHandle, BargeInMetrics, CAPTURE_SAMPLE_RATE, CaptureResampleReport,
+    CaptureSample, MAX_UTTERANCE_MS, NeuralVadEvent, NeuralVadState, PcmChunk, PcmData, PcmFrame,
+    RUBATO_RUNTIME_VERSION, ResampleReport, ResamplingPlan, SELF_PLAYBACK_GATE_MS,
+    SENTENCE_PREFETCH_CAPACITY, SILERO_HANGOVER_FRAMES, SILERO_MINIMUM_SPEECH_FRAMES,
+    SILERO_ONSET_FRAMES, SILERO_SPEECH_THRESHOLD, SILERO_WINDOW_SAMPLES, SampleFormat, Sentence,
+    SentenceCutter, SentenceQueueError, SpeechSource, SpokenInterruption, VAD_HANGOVER_WINDOWS,
+    VAD_MINIMUM_SPEECH_WINDOWS, VAD_ONSET_WINDOWS, VAD_RMS_THRESHOLD, VAD_WINDOW_SAMPLES,
+    VadEndpoint, VoiceActivityDetector, VoiceSegment,
 };
 pub use error::{
     CaptureError, DeviceError, OrtRuntimeError, PcmError, PcmSinkError, ResampleError,

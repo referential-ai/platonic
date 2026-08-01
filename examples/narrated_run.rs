@@ -98,6 +98,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         event_sender: None,
         stream_to_stderr: true,
         cancel: None,
+        voice_interruption_context: None,
     };
     let (run, narration, capture) = if arguments.whisper_model.is_some() {
         let outcome = voice.capture_question(options, arguments.capture_timeout)?;

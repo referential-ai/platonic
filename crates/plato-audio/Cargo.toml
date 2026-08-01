@@ -48,3 +48,7 @@ ort = { version = "=2.0.0-rc.13", features = ["cuda"] }
 [[example]]
 name = "kokoro_device_proof"
 path = "examples/kokoro_device_proof.rs"
+
+[[example]]
+name = "barge_in_device_proof"
+path = "examples/barge_in_device_proof.rs"

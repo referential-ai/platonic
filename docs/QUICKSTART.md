@@ -154,6 +154,10 @@ PLATO_AUDIO_FIXTURE_KEY=local-proof \
 # One excluded warmup, 20 TTFA trials, and four-sentence gap/overlap proof:
 cargo run --release --locked -p plato-audio --example kokoro_device_proof
 
+# Twenty-five actual-output barge-in trials; every all-silent callback <=30 ms:
+cargo run --release --locked -p plato-audio --example barge_in_device_proof \
+  > docs/proofs/issue-330-barge-in-device.json
+
 # Public non-human corpus: AU3 threshold versus Silero confusion/endpoints:
 cargo test --release --locked -p plato-audio \
   silero_strictly_reduces_au3_false_cuts_without_missing_speech -- --ignored --nocapture
@@ -207,6 +211,14 @@ replaces one live stderr line; only the single final transcript enters the
 existing run path. Ring overflow, device loss, worker panic, VAD failure, and
 recognition failure are typed terminal outcomes.
 
+During narrated playback, the resident Silero session also evaluates input
+continuously after a fixed 150 ms self-playback gate. Qualified speech uses the
+run's existing cancel atomic, silences the next complete output callback
+quantum, and flushes synthesis/prefetch outside the real-time callback. The next
+run receives exactly one sample-derived spoken prefix and sentence/delta
+position in its recorded `ContextBuilt` current-task context. A generic cancel
+does not create that context, and AU5 does not start another run automatically.
+
 The deterministic timing command selects a named PipeWire/Pulse null-sink
 monitor through the real production cpal/callback/rtrb/normalization path. The
 spoken payload is the recorded CC0 WAV, not a physical microphone or live human
@@ -216,6 +228,12 @@ or virtual-source pacing latency before that callback. The interactive
 microphone form retains no raw audio. Proof JSON contains transcripts, bounded
 metrics, and provenance. Model files and provider credentials are never written
 into the repository or proof JSON.
+
+The separate AU5 output proof also uses the recorded CC0 synthetic WAV, fed
+directly to Silero after the playback gate. Its clock starts when resident
+Silero qualifies speech and ends at the first entirely silent callback on the
+actual output device. It therefore makes no physical-microphone, cpal-input, or
+acoustic-loop latency claim.
 
 ## 6. Run the test suite (no API key needed)
 

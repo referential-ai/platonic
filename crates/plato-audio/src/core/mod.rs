@@ -1,4 +1,5 @@
 pub(crate) mod capture;
+pub(crate) mod latch;
 mod pcm;
 pub(crate) mod playback;
 pub(crate) mod prefetch;
@@ -7,6 +8,9 @@ mod sentence;
 pub(crate) mod vad;
 
 pub use capture::{CaptureResampleReport, CaptureSample};
+pub use latch::{
+    BargeInHandle, BargeInMetrics, SELF_PLAYBACK_GATE_MS, SpeechSource, SpokenInterruption,
+};
 pub use pcm::{AudioFormat, PcmChunk, PcmData, PcmFrame, SampleFormat};
 pub use prefetch::{SENTENCE_PREFETCH_CAPACITY, SentenceQueueError};
 pub use resample::{RUBATO_RUNTIME_VERSION, ResampleReport, ResamplingPlan};

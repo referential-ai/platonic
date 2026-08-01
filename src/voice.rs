@@ -11,16 +11,17 @@ use std::{
 };
 
 use plato_audio::{
-    CaptureConfig, CaptureDeviceInfo, CaptureError, CaptureMetrics, CapturePartial, CaptureReport,
-    CaptureWorker, CaptureWorkerShutdown, KokoroConfig, KokoroMetrics, KokoroMetricsReader,
-    KokoroProvenance, KokoroSynthesizer, OrtRuntime, OrtRuntimeError, OrtRuntimeMetrics,
-    OrtRuntimeMetricsReader, PlaybackConfig, PlaybackDeviceInfo, PlaybackMetrics, PlaybackReport,
-    Sentence, SentenceCutter, SileroConfig, SileroMetrics, SileroMetricsReader, SileroProvenance,
-    SileroVad, SttError, SynthError, SynthWorker, SynthWorkerError, SynthWorkerShutdown,
-    SynthWorkerStartError, Transcript, VadError, WhisperConfig, WhisperMetrics,
-    WhisperMetricsReader, WhisperProvenance, WhisperRecognizer,
+    BargeInMetrics, CaptureConfig, CaptureDeviceInfo, CaptureError, CaptureMetrics, CapturePartial,
+    CaptureReport, CaptureWorker, CaptureWorkerShutdown, KokoroConfig, KokoroMetrics,
+    KokoroMetricsReader, KokoroProvenance, KokoroSynthesizer, OrtRuntime, OrtRuntimeError,
+    OrtRuntimeMetrics, OrtRuntimeMetricsReader, PlaybackConfig, PlaybackDeviceInfo,
+    PlaybackMetrics, PlaybackReport, Sentence, SentenceCutter, SileroConfig, SileroMetrics,
+    SileroMetricsReader, SileroProvenance, SileroVad, SpeechSource, SpokenInterruption, SttError,
+    SynthError, SynthWorker, SynthWorkerError, SynthWorkerShutdown, SynthWorkerStartError,
+    Transcript, VadError, WhisperConfig, WhisperMetrics, WhisperMetricsReader, WhisperProvenance,
+    WhisperRecognizer,
 };
-use platonic_core::{HarnessEvent, RunId, TurnId};
+use platonic_core::{ContextLane, HarnessEvent, RunId, TurnId};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -143,6 +144,8 @@ pub struct VoiceSession {
     silero_provenance: Option<SileroProvenance>,
     silero_metrics: Option<SileroMetricsReader>,
     capture: Option<CaptureWorker>,
+    cancel: Arc<AtomicBool>,
+    pending_interruption: Option<SpokenInterruption>,
 }
 
 impl VoiceSession {
@@ -153,7 +156,8 @@ impl VoiceSession {
         let synthesizer = KokoroSynthesizer::load_with_runtime(kokoro, ort_runtime.clone())?;
         let provenance = synthesizer.provenance().clone();
         let kokoro_metrics = synthesizer.metrics_reader();
-        let worker = SynthWorker::spawn(synthesizer, playback)?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = SynthWorker::spawn(synthesizer, playback, Arc::clone(&cancel))?;
         Ok(Self {
             ort_runtime,
             ort_metrics,
@@ -165,6 +169,8 @@ impl VoiceSession {
             silero_provenance: None,
             silero_metrics: None,
             capture: None,
+            cancel,
+            pending_interruption: None,
         })
     }
 
@@ -183,7 +189,13 @@ impl VoiceSession {
         let detector = SileroVad::load_with_runtime(silero, session.ort_runtime.clone())?;
         let silero_provenance = detector.provenance().clone();
         let silero_metrics = detector.metrics_reader();
-        let capture = CaptureWorker::open(capture_config, detector, recognizer)?;
+        let barge_in = session
+            .worker
+            .as_ref()
+            .expect("open voice session retains its worker")
+            .barge_in_handle();
+        let capture =
+            CaptureWorker::open_with_barge_in(capture_config, detector, recognizer, barge_in)?;
         session.whisper_provenance = Some(whisper_provenance);
         session.whisper_metrics = Some(whisper_metrics);
         session.silero_provenance = Some(silero_provenance);
@@ -242,6 +254,19 @@ impl VoiceSession {
     /// Reads persistent input, VAD, conversion, and overflow counters when enabled.
     pub fn capture_metrics(&self) -> Option<CaptureMetrics> {
         self.capture.as_ref().map(CaptureWorker::metrics)
+    }
+
+    /// Returns the one cancel allocation shared by app, synth, capture, and callback.
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+
+    /// Reads playback-time speech-onset and first-silent-callback evidence.
+    pub fn barge_in_metrics(&self) -> BargeInMetrics {
+        self.worker
+            .as_ref()
+            .expect("open voice session retains its worker")
+            .barge_in_metrics()
     }
 
     /// Closes admission, drains accepted audio, and joins the synth worker.
@@ -327,23 +352,42 @@ impl VoiceSession {
         if options.event_sender.is_some() {
             return Err(VoiceRunError::EventSenderAlreadySet);
         }
-        let cancel = options
-            .cancel
-            .get_or_insert_with(|| Arc::new(AtomicBool::new(false)))
-            .clone();
+        bind_voice_cancel(&mut options, &self.cancel)?;
+        let cancel = Arc::clone(&self.cancel);
+        let interruption_context = self.pending_interruption.as_ref().map(interruption_context);
+        options
+            .voice_interruption_context
+            .clone_from(&interruption_context);
         let (sender, receiver) = mpsc::channel();
         options.event_sender = Some(sender);
         let worker = self.worker.as_ref().ok_or(VoiceError::SessionClosed)?;
+        debug_assert!(worker.uses_cancel(&cancel));
+        worker.begin_run().map_err(VoiceError::from)?;
+        let capture = self.capture.as_ref();
+        let mut next_interruption = None;
+        let mut consumed_interruption_context = false;
 
-        std::thread::scope(|scope| {
+        let result = std::thread::scope(|scope| {
             let run = scope.spawn(move || crate::app::run_question(options));
             let mut stream = AssistantTextStream::default();
             let mut sentences = Vec::new();
             let mut voice_error = None;
+            let mut interruption_fragment_count = 0_usize;
 
             loop {
                 match receiver.recv_timeout(Duration::from_millis(1)) {
                     Ok(event) => {
+                        if let Some(expected) = interruption_context.as_deref() {
+                            interruption_fragment_count = interruption_fragment_count
+                                .saturating_add(interruption_fragment_matches(&event, expected));
+                            if interruption_fragment_count > 1 {
+                                voice_error = Some(contract_error(
+                                    "next run emitted more than one voice interruption context fragment",
+                                ));
+                                cancel.store(true, Ordering::Release);
+                                break;
+                            }
+                        }
                         let accepted = match stream.accept(event) {
                             Ok(accepted) => accepted,
                             Err(error) => {
@@ -352,8 +396,8 @@ impl VoiceSession {
                                 break;
                             }
                         };
-                        for sentence in accepted {
-                            match worker.accept(sentence, Arc::clone(&cancel)) {
+                        for narrated in accepted {
+                            match worker.accept(narrated.sentence, narrated.source) {
                                 Ok(admission) => {
                                     sentences.extend(admission.completed.into_iter().map(
                                         |report| NarratedSentenceReport {
@@ -362,6 +406,7 @@ impl VoiceSession {
                                         },
                                     ));
                                 }
+                                Err(SynthWorkerError::Canceled) => break,
                                 Err(error) => {
                                     voice_error = Some(VoiceError::Worker(error));
                                     cancel.store(true, Ordering::Release);
@@ -380,17 +425,34 @@ impl VoiceSession {
                             cancel.store(true, Ordering::Release);
                             break;
                         }
+                        if let Some(capture) = capture
+                            && let Err(error) = capture.check_health()
+                        {
+                            voice_error = Some(VoiceError::Capture(error));
+                            cancel.store(true, Ordering::Release);
+                            break;
+                        }
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
 
-            let run_result = run.join().map_err(|_| VoiceRunError::RunThreadPanicked)?;
+            let run_result = run.join().map_err(|_| VoiceRunError::RunThreadPanicked);
             let audio_result = worker.wait_until_idle();
+            let capture_health = capture.map(CaptureWorker::check_health).transpose();
+            let finish_result = if audio_result.is_ok() {
+                worker.finish_run().map_err(VoiceError::from)
+            } else {
+                Ok(None)
+            };
+            next_interruption = finish_result?;
+            consumed_interruption_context =
+                interruption_context.is_some() && interruption_fragment_count == 1;
             if let Some(error) = voice_error {
                 return Err(VoiceRunError::Voice(error));
             }
-            let run = run_result?;
+            capture_health.map_err(VoiceError::from)?;
+            let run = run_result??;
             stream.finish()?;
             let reports = audio_result.map_err(|failure| {
                 VoiceRunError::Voice(VoiceError::Worker(SynthWorkerError::Failed(failure)))
@@ -407,7 +469,15 @@ impl VoiceSession {
                     playback_metrics: worker.playback_metrics(),
                 },
             })
-        })
+        });
+
+        if consumed_interruption_context {
+            self.pending_interruption = None;
+        }
+        if let Some(interruption) = next_interruption {
+            self.pending_interruption = Some(interruption);
+        }
+        result
     }
 }
 
@@ -500,6 +570,50 @@ pub(crate) fn options_for_transcript(
     Ok(options)
 }
 
+fn interruption_context(interruption: &SpokenInterruption) -> String {
+    let prefix = serde_json::to_string(&interruption.spoken_prefix)
+        .expect("serializing a Rust string cannot fail");
+    format!(
+        "The user interrupted your spoken reply after {prefix} (assistant sentence index {}, assistant delta index {}).",
+        interruption.sentence_index, interruption.assistant_delta_index
+    )
+}
+
+fn bind_voice_cancel(
+    options: &mut RunOptions,
+    session_cancel: &Arc<AtomicBool>,
+) -> Result<(), VoiceError> {
+    if options
+        .cancel
+        .as_ref()
+        .is_some_and(|cancel| !Arc::ptr_eq(cancel, session_cancel))
+    {
+        return Err(contract_error(
+            "narrated run cancel flag does not match the voice session authority",
+        ));
+    }
+    options.cancel = Some(Arc::clone(session_cancel));
+    Ok(())
+}
+
+fn interruption_fragment_matches(event: &RunEvent, expected: &str) -> usize {
+    let RunEvent::Ledger(record) = event else {
+        return 0;
+    };
+    let HarnessEvent::ContextBuilt { context, .. } = &record.event else {
+        return 0;
+    };
+    context
+        .fragments
+        .iter()
+        .filter(|fragment| {
+            fragment.lane == ContextLane::CurrentTask
+                && fragment.source == "voice.interruption"
+                && fragment.content == expected
+        })
+        .count()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResponseKey {
     run_id: RunId,
@@ -514,14 +628,21 @@ struct PendingResponse {
     cutter: SentenceCutter,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NarratedSentence {
+    sentence: Sentence,
+    source: SpeechSource,
+}
+
 #[derive(Default)]
 struct AssistantTextStream {
     pending: Option<PendingResponse>,
     last_committed: Option<ResponseKey>,
+    next_sentence_index: u64,
 }
 
 impl AssistantTextStream {
-    fn accept(&mut self, event: RunEvent) -> Result<Vec<Sentence>, VoiceError> {
+    fn accept(&mut self, event: RunEvent) -> Result<Vec<NarratedSentence>, VoiceError> {
         match event {
             RunEvent::AssistantDelta(delta) => self.accept_delta(delta),
             RunEvent::Ledger(record) => match record.event {
@@ -544,7 +665,11 @@ impl AssistantTextStream {
         }
     }
 
-    fn accept_delta(&mut self, delta: AssistantDeltaEvent) -> Result<Vec<Sentence>, VoiceError> {
+    fn accept_delta(
+        &mut self,
+        delta: AssistantDeltaEvent,
+    ) -> Result<Vec<NarratedSentence>, VoiceError> {
+        let delta_index = delta.delta_index;
         let key = ResponseKey {
             run_id: delta.run_id,
             turn_id: delta.turn_id,
@@ -581,19 +706,20 @@ impl AssistantTextStream {
         }
         pending.next_delta_index += 1;
         pending.text.push_str(&delta.text);
-        Ok(pending.cutter.push(&delta.text))
+        let sentences = pending.cutter.push(&delta.text);
+        Ok(self.tag_sentences(sentences, delta_index))
     }
 
     fn commit_response(
         &mut self,
         key: ResponseKey,
         committed_text: String,
-    ) -> Result<Vec<Sentence>, VoiceError> {
+    ) -> Result<Vec<NarratedSentence>, VoiceError> {
         if self.last_committed.as_ref() == Some(&key) {
             return Err(contract_error("received a duplicate model response commit"));
         }
         let mut sentences = Vec::new();
-        match self.pending.take() {
+        let assistant_delta_index = match self.pending.take() {
             Some(mut pending) => {
                 if pending.key != key {
                     self.pending = Some(pending);
@@ -611,6 +737,7 @@ impl AssistantTextStream {
                 if let Some(tail) = pending.cutter.finish() {
                     sentences.push(tail);
                 }
+                pending.next_delta_index.saturating_sub(1)
             }
             None => {
                 let mut cutter = SentenceCutter::new();
@@ -618,10 +745,26 @@ impl AssistantTextStream {
                 if let Some(tail) = cutter.finish() {
                     sentences.push(tail);
                 }
+                0
             }
-        }
+        };
         self.last_committed = Some(key);
-        Ok(sentences)
+        Ok(self.tag_sentences(sentences, assistant_delta_index))
+    }
+
+    fn tag_sentences(
+        &mut self,
+        sentences: Vec<Sentence>,
+        assistant_delta_index: u64,
+    ) -> Vec<NarratedSentence> {
+        sentences
+            .into_iter()
+            .map(|sentence| {
+                let source = SpeechSource::new(self.next_sentence_index, assistant_delta_index);
+                self.next_sentence_index = self.next_sentence_index.saturating_add(1);
+                NarratedSentence { sentence, source }
+            })
+            .collect()
     }
 
     fn finish(&self) -> Result<(), VoiceRunError> {
@@ -661,6 +804,7 @@ mod tests {
             event_sender: None,
             stream_to_stderr: false,
             cancel: None,
+            voice_interruption_context: None,
         }
     }
 
@@ -692,8 +836,11 @@ mod tests {
         })
     }
 
-    fn strings(sentences: Vec<Sentence>) -> Vec<String> {
-        sentences.into_iter().map(Sentence::into_string).collect()
+    fn strings(sentences: Vec<NarratedSentence>) -> Vec<String> {
+        sentences
+            .into_iter()
+            .map(|sentence| sentence.sentence.into_string())
+            .collect()
     }
 
     #[test]
@@ -713,6 +860,17 @@ mod tests {
                     "This first sentence is complete. A second sentence is complete! Tail",
                 ))
                 .unwrap(),
+        );
+        assert_eq!(
+            accepted
+                .iter()
+                .map(|sentence| sentence.source)
+                .collect::<Vec<_>>(),
+            [
+                SpeechSource::new(0, 1),
+                SpeechSource::new(1, 2),
+                SpeechSource::new(2, 2),
+            ]
         );
         assert_eq!(
             strings(accepted),
@@ -768,6 +926,35 @@ mod tests {
             options_for_transcript(run_options("typed placeholder"), &rolling),
             Err(VoiceError::EventContract { .. })
         ));
+    }
+
+    #[test]
+    fn pre_canceled_same_arc_binding_preserves_generic_cancel_without_voice_context() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut options = run_options("already canceled");
+        options.cancel = Some(Arc::clone(&cancel));
+
+        bind_voice_cancel(&mut options, &cancel).unwrap();
+
+        let bound = options.cancel.as_ref().unwrap();
+        assert!(Arc::ptr_eq(bound, &cancel));
+        assert!(bound.load(Ordering::Acquire));
+        assert!(options.voice_interruption_context.is_none());
+    }
+
+    #[test]
+    fn spoken_interruption_maps_exact_sample_latch_coordinates_into_context() {
+        let interruption = SpokenInterruption {
+            played_samples: 7_424,
+            sentence_index: 2,
+            assistant_delta_index: 5,
+            spoken_prefix: "quoted \"prefix\"".to_owned(),
+        };
+
+        assert_eq!(
+            interruption_context(&interruption),
+            "The user interrupted your spoken reply after \"quoted \\\"prefix\\\"\" (assistant sentence index 2, assistant delta index 5)."
+        );
     }
 
     #[test]

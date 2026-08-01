@@ -118,6 +118,14 @@ impl PrefetchWindow {
         self.closed = true;
     }
 
+    pub(crate) fn interrupt(&mut self) -> Vec<u64> {
+        self.jobs.drain(..).map(|job| job.sequence).collect()
+    }
+
+    pub(crate) fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.jobs.len()
     }
@@ -196,5 +204,17 @@ mod tests {
         assert_eq!(window.front(), Some((first, SentenceJobStage::Failed)));
         assert_eq!(window.len(), 2);
         assert_eq!(window.try_accept(), Err(SentenceQueueError::Closed));
+    }
+
+    #[test]
+    fn interruption_discards_every_stage_without_reusing_sequences() {
+        let mut window = PrefetchWindow::new();
+        let first = window.try_accept().unwrap();
+        let second = window.try_accept().unwrap();
+        assert_eq!(window.next_accepted(), Some(first));
+        assert_eq!(window.interrupt(), [first, second]);
+        assert!(window.is_empty());
+        assert_eq!(window.next_sequence(), 2);
+        assert_eq!(window.try_accept().unwrap(), 2);
     }
 }
