@@ -1,4 +1,4 @@
-use crate::daemon::protocol::ProtocolError;
+use plato_protocol::ProtocolError;
 use std::path::PathBuf;
 
 pub type AppResult<T> = Result<T, AppError>;

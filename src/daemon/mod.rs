@@ -8,7 +8,7 @@ mod handlers;
 #[cfg(windows)]
 pub mod installer_gate;
 pub mod lock;
-pub mod protocol;
+pub use plato_protocol as protocol;
 mod runtime;
 pub mod server;
 pub(crate) mod transport;
