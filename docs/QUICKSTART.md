@@ -133,7 +133,31 @@ typing indicator while active, then ✅ or ❌; canceled and interrupted runs
 remove 👀 without a terminal reaction. The bot needs Add Reactions and Read
 Message History, plus Send Messages in Threads when threads are used.
 
-## 5. Run the test suite (no API key needed)
+## 5. Local voice-out proof (developer MVP)
+
+AU1 exposes voice-out through focused examples rather than a general CLI or
+configuration surface. Install espeak-ng and the native cpal backend headers,
+then place the pinned Kokoro artifacts described in
+[`../crates/plato-audio/README.md`](../crates/plato-audio/README.md) outside the
+repository.
+
+```bash
+export PLATO_AUDIO_KOKORO_DIR="$HOME/.cache/plato-audio/kokoro-82m-v1.0-onnx-1939ad2a8e416c0acfeecc08a694d14ef25f2231"
+
+# Credential-free real run_question delta narration through the live speaker:
+PLATO_AUDIO_FIXTURE_KEY=local-proof \
+  cargo run --release --locked --example narrated_run -- --fixture
+
+# One excluded warmup plus 20 actual-device warm TTFA trials (CUDA required):
+cargo run --release --locked -p plato-audio --example kokoro_device_proof
+```
+
+The model engine and output stream open before the run. Both examples fail
+closed on artifact checksum, phonemizer, backend, device, PCM, callback, or
+sentence-sequence errors. Model files and provider credentials are never
+written into the repository or proof JSON.
+
+## 6. Run the test suite (no API key needed)
 
 ```bash
 cargo test --locked
@@ -141,7 +165,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 | Symptom | Fix |
 | --- | --- |

@@ -13,6 +13,7 @@ pub mod replay;
 pub mod tool_catalog;
 pub mod tools;
 pub mod tui;
+pub mod voice;
 
 pub use tools::github::issues as issue_prep;
 
@@ -27,3 +28,7 @@ pub use error::{AppError, AppResult};
 pub use issue_prep::{IssuePrepOptions, IssuePrepOutcome, run_issue_prep};
 pub use model::{ReasoningEffort, RunOverrides};
 pub use replay::{replay_default_sqlite, replay_file, replay_sqlite, replay_sqlite_session};
+pub use voice::{
+    NarratedRunOutcome, NarratedSentenceReport, NarrationReport, VoiceError, VoiceRunError,
+    VoiceSession,
+};

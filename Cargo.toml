@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/plato-audio",
   "crates/plato-daemon-client",
   "crates/plato-protocol",
   "crates/plato-tui",
@@ -38,6 +39,7 @@ path = "src/bin/plato-gateway-discord.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+plato-audio = { version = "0.1.0", path = "crates/plato-audio" }
 plato-daemon-client = { version = "0.1.0", path = "crates/plato-daemon-client" }
 plato-protocol = { version = "0.1.0", path = "crates/plato-protocol" }
 plato-tui = { version = "0.1.0", path = "crates/plato-tui" }

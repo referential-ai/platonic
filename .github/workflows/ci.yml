@@ -36,10 +36,31 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Install Linux audio build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev
+
       - name: Fetch locked Rust dependencies
         run: |
           cargo fetch --locked
-          echo 'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
+          ort_cache_dir="$RUNNER_TEMP/plato-ort-cache"
+          ort_prime_target="$RUNNER_TEMP/plato-ort-prime-target"
+          test ! -e "$ort_cache_dir"
+          test ! -e "$ort_prime_target"
+          mkdir -p "$ort_cache_dir" "$ort_prime_target"
+          ORT_CACHE_DIR="$ort_cache_dir" \
+            CARGO_TARGET_DIR="$ort_prime_target" \
+            cargo check --locked -p ort-sys
+          mapfile -t ort_lib_dirs < <(
+            find "$ort_cache_dir/dfbin" -type f -name 'libonnxruntime.a' \
+              -printf '%h\n' | LC_ALL=C sort -u
+          )
+          test "${#ort_lib_dirs[@]}" -eq 1
+          printf '%s\n' \
+            "ORT_CACHE_DIR=$ort_cache_dir" \
+            "ORT_LIB_PATH=${ort_lib_dirs[0]}" \
+            'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -82,6 +103,15 @@ jobs:
             cat "$package_log"
             grep -F 'no matching package named `plato-daemon-client` found' "$package_log"
           fi
+
+      - name: Prove plato-audio on Rust 1.88.0
+        run: |
+          cargo check --locked -p plato-audio --all-targets
+          cargo test --locked -p plato-audio
+          cargo clippy --locked -p plato-audio --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked -p plato-audio --no-deps
+          cargo package --locked -p plato-audio
+          cargo package --locked --list -p plato-audio
 
       - name: Run tests
         run: cargo test --workspace --locked
