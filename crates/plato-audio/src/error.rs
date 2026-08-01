@@ -64,6 +64,44 @@ pub enum PcmSinkError {
     },
 }
 
+/// Construction and processing failures for a fixed sample-rate plan.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ResampleError {
+    /// AU2 accepts mono f32 synthesis PCM only.
+    #[error("resampling requires mono f32 source PCM, got {actual:?}")]
+    UnsupportedSource {
+        /// Supplied synthesis format.
+        actual: AudioFormat,
+    },
+    /// A chunk did not match the pair used to build the plan.
+    #[error("resampling plan requires {expected:?}, got {actual:?}")]
+    FormatMismatch {
+        /// Source format captured when the plan was built.
+        expected: AudioFormat,
+        /// Supplied chunk format.
+        actual: AudioFormat,
+    },
+    /// Rubato rejected the fixed source/device rate pair.
+    #[error("cannot build resampling plan from {source_format:?} to {device_format:?}: {reason}")]
+    PlanConstruction {
+        /// Synthesis format.
+        source_format: AudioFormat,
+        /// Live output-device format.
+        device_format: AudioFormat,
+        /// Bounded rubato diagnostic.
+        reason: String,
+    },
+    /// Rubato rejected validated source PCM while using the resident plan.
+    #[error("resampling failed: {reason}")]
+    Processing {
+        /// Bounded adapter or rubato diagnostic.
+        reason: String,
+    },
+    /// Resampled output violated the typed PCM contract.
+    #[error(transparent)]
+    Pcm(#[from] PcmError),
+}
+
 /// Warm synthesis setup and inference failures.
 #[derive(Debug, Error)]
 pub enum SynthError {
@@ -189,9 +227,19 @@ pub enum SynthError {
     },
 }
 
-/// Output-device setup and serial playback failures.
-#[derive(Debug, Error)]
+/// Output-device setup and persistent playback failures.
+#[derive(Clone, Debug, Error)]
 pub enum DeviceError {
+    /// Persistent playback was configured with a zero capacity or period.
+    #[error(
+        "playback ring capacity ({capacity_frames}) and preferred buffer frames ({preferred_buffer_frames}) must be nonzero"
+    )]
+    InvalidPlaybackConfig {
+        /// Requested mono f32 ring capacity.
+        capacity_frames: usize,
+        /// Requested callback period before device-range clamping.
+        preferred_buffer_frames: u32,
+    },
     /// The host has no default output device.
     #[error("no default output device is available")]
     NoOutputDevice,
@@ -201,12 +249,9 @@ pub enum DeviceError {
         /// cpal diagnostic.
         reason: String,
     },
-    /// No cpal configuration can play the model's sample rate.
-    #[error("output device does not support {sample_rate} Hz in f32, i16, or u16")]
-    UnsupportedSampleRate {
-        /// Required model sample rate.
-        sample_rate: u32,
-    },
+    /// The live device's native sample representation is unsupported.
+    #[error("output device offers no f32, i16, or u16 stream format")]
+    UnsupportedOutputFormat,
     /// The persistent output stream could not be built.
     #[error("cannot build persistent output stream: {reason}")]
     StreamBuild {
@@ -222,7 +267,13 @@ pub enum DeviceError {
     /// The device invalidated the live stream.
     #[error("persistent output stream failed")]
     StreamFailed,
-    /// A chunk does not match the serial playback input contract.
+    /// The callback observed PCM without matching published sentence metadata.
+    #[error("persistent output callback observed an invalid PCM boundary")]
+    CallbackContract,
+    /// The stream owner closed playback while the producer still had PCM.
+    #[error("persistent output stream is closed")]
+    PlaybackClosed,
+    /// A chunk does not match the playback input contract.
     #[error("playback requires {expected:?}, got {actual:?}")]
     FormatMismatch {
         /// Required model PCM format.
@@ -230,17 +281,6 @@ pub enum DeviceError {
         /// Supplied chunk format.
         actual: AudioFormat,
     },
-    /// The fixed callback buffer cannot hold the synthesized sentence.
-    #[error("PCM chunk has {frames} frames; persistent buffer capacity is {capacity}")]
-    ChunkTooLarge {
-        /// Submitted mono frames.
-        frames: usize,
-        /// Preallocated mono-frame capacity.
-        capacity: usize,
-    },
-    /// Serial playback was asked to load while a prior chunk remained active.
-    #[error("persistent playback is still draining the prior chunk")]
-    PlaybackBusy,
     /// The callback did not drain a submitted chunk within its bounded deadline.
     #[error("persistent playback timed out after {milliseconds} ms")]
     PlaybackTimeout {

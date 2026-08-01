@@ -1,14 +1,17 @@
 # plato-audio
 
 `plato-audio` is Plato Agent's synchronous local audio IO leaf. It owns typed
-PCM and sentence values, the sans-IO sentence cutter, one resident Kokoro-82M
-ONNX engine, and one persistent cpal output stream. It does not depend on a
+PCM and sentence values, the sans-IO sentence cutter and prefetch state, one
+resident Kokoro-82M ONNX engine, and one persistent cpal output stream. It does not depend on a
 Platonic crate and owns no run, ledger, policy, approval, session, daemon,
 protocol, or configuration-registry behavior.
 
-AU1 is intentionally serial: a complete sentence is synthesized before its
-PCM is played. Worker separation, overlap, prefetch, resampling, capture, STT,
-VAD, barge-in, and voice policy belong to later admitted phases.
+AU2 moves synthesis onto one owned `std::thread`. A fixed four-sentence
+accepted-but-not-finished window feeds one bounded `rtrb` SPSC PCM ring. One
+`rubato` plan converts Kokoro's 24 kHz mono f32 output to the live device rate
+before the callback; the callback only drains, converts samples, records atomic
+timing, and emits silence on underrun. Capture, STT, VAD, barge-in, voice
+ledger/policy, queue configuration, and additional workers remain out of scope.
 
 ## Pinned artifacts
 
@@ -41,9 +44,9 @@ session. Downloaded model files are never packaged or committed.
 ## Native runtime
 
 The crate pins `ort 2.0.0-rc.13` (ONNX Runtime 1.28, CUDA 13 build) and
-`cpal 0.18.1`. On Linux x86_64 it attempts CUDA device zero with registration
-errors enabled, then constructs a CPU session if CUDA cannot load. Other
-targets construct the CPU session directly.
+`cpal 0.18.1`, `rtrb 0.3.4`, and `rubato 4.0.0`. On Linux x86_64 it attempts
+CUDA device zero with registration errors enabled, then constructs a CPU
+session if CUDA cannot load. Other targets construct the CPU session directly.
 
 espeak-ng is invoked as a fixed external executable, not linked into this
 dual-licensed crate. The admitted proof host used these signed Arch packages:
@@ -69,13 +72,15 @@ PLATO_AUDIO_FIXTURE_KEY=local-proof \
   cargo run --release --locked --example narrated_run -- --fixture
 ```
 
-The device proof performs one excluded warmup followed by exactly 20 serial
-trials. Its timing boundary begins immediately before warm sentence synthesis
-and ends when the persistent cpal callback copies the first non-silent sample.
-It emits bounded JSON containing every trial, nearest-rank p50/p95/max, runtime
-and artifact identity, accelerator, output format, observed callback period,
-and reuse counters. It exits unsuccessfully unless CUDA is active and p95 is at
-most 500 ms.
+The device proof opens the model and stream before timing, excludes one warmup,
+then runs exactly 20 warm sentence-acceptance trials. It also admits a fixed
+four-sentence corpus at once and reports callback/sample timestamps, every
+inter-sentence gap, device period, underruns, exact order, and synthesis/playback
+overlap. It exits unsuccessfully unless CUDA is active, TTFA p95 is at most
+350 ms, every gap is at most 20 ms, a measured synthesis N+1 interval overlaps
+playback N, the maximum unfinished count is four, and shutdown joins the single
+worker and closes the stream. Later sentences may finish synthesis even earlier
+as the prefetch fills.
 
 The narrated-run fixture uses the real root `run_question` driver and existing
 assistant-delta event channel with a credential-free loopback SSE provider. It
@@ -87,7 +92,7 @@ does not add assistant deltas to the durable harness ledger.
 The direct dependency graph is deliberately one-way:
 
 ```text
-plato-agent -> plato-audio -> cpal
+plato-agent -> plato-audio -> cpal / rtrb / rubato
                            -> ort
                            -> serde / serde_json / sha2 / thiserror
 ```

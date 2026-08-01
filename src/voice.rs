@@ -6,13 +6,13 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    time::Instant,
+    time::Duration,
 };
 
 use plato_audio::{
-    DeviceError, KokoroConfig, KokoroMetrics, KokoroProvenance, KokoroSynthesizer, PcmChunk,
-    PersistentPlayback, PlaybackConfig, PlaybackDeviceInfo, PlaybackMetrics, PlaybackReport,
-    Sentence, SentenceCutter, SpeechSynthesizer, SynthError,
+    KokoroConfig, KokoroMetrics, KokoroMetricsReader, KokoroProvenance, KokoroSynthesizer,
+    PlaybackConfig, PlaybackDeviceInfo, PlaybackMetrics, PlaybackReport, Sentence, SentenceCutter,
+    SynthError, SynthWorker, SynthWorkerError, SynthWorkerShutdown, SynthWorkerStartError,
 };
 use platonic_core::{HarnessEvent, RunId, TurnId};
 use serde::Serialize;
@@ -32,15 +32,15 @@ pub enum VoiceError {
     /// Warm model synthesis failed.
     #[error(transparent)]
     Synthesis(#[from] SynthError),
-    /// Persistent device playback failed.
+    /// The persistent stream, resampling plan, or synth thread could not start.
     #[error(transparent)]
-    Playback(#[from] DeviceError),
-    /// Kokoro violated its admitted one-chunk-per-sentence contract.
-    #[error("Kokoro emitted {count} PCM chunks for one sentence; expected exactly one")]
-    UnexpectedPcmChunks {
-        /// Number of chunks emitted before playback.
-        count: usize,
-    },
+    WorkerStart(#[from] SynthWorkerStartError),
+    /// Sentence admission or the running worker failed.
+    #[error(transparent)]
+    Worker(#[from] SynthWorkerError),
+    /// The voice session was explicitly shut down.
+    #[error("voice session is closed")]
+    SessionClosed,
 }
 
 /// Failures from the app run or its root-owned narration composition.
@@ -72,7 +72,7 @@ pub struct NarratedSentenceReport {
 /// Bounded proof of sentence order and warm resource reuse for one app run.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct NarrationReport {
-    /// Sentences in their exact serial synthesis and playback order.
+    /// Sentences in exact accepted and callback playback order.
     pub sentences: Vec<NarratedSentenceReport>,
     /// Resident model reuse counters after the run.
     pub kokoro_metrics: KokoroMetrics,
@@ -91,29 +91,45 @@ pub struct NarratedRunOutcome {
 
 /// Warm Kokoro engine and persistent cpal stream reused across narrated runs.
 pub struct VoiceSession {
-    synthesizer: KokoroSynthesizer,
-    playback: PersistentPlayback,
+    provenance: KokoroProvenance,
+    kokoro_metrics: KokoroMetricsReader,
+    worker: Option<SynthWorker>,
 }
 
 impl VoiceSession {
     /// Loads the pinned model and opens the output device before any app run.
     pub fn open(kokoro: KokoroConfig, playback: PlaybackConfig) -> Result<Self, VoiceError> {
         let synthesizer = KokoroSynthesizer::load(kokoro)?;
-        let playback = PersistentPlayback::open(playback)?;
+        let provenance = synthesizer.provenance().clone();
+        let kokoro_metrics = synthesizer.metrics_reader();
+        let worker = SynthWorker::spawn(synthesizer, playback)?;
         Ok(Self {
-            synthesizer,
-            playback,
+            provenance,
+            kokoro_metrics,
+            worker: Some(worker),
         })
     }
 
     /// Returns exact model and runtime provenance captured at warm load.
     pub fn provenance(&self) -> &KokoroProvenance {
-        self.synthesizer.provenance()
+        &self.provenance
     }
 
     /// Returns the live host, output device, format, and buffer request.
     pub fn device_info(&self) -> &PlaybackDeviceInfo {
-        self.playback.device_info()
+        self.worker
+            .as_ref()
+            .expect("open voice session retains its worker")
+            .device_info()
+    }
+
+    /// Closes admission, drains accepted audio, and joins the synth worker.
+    pub fn shutdown(mut self) -> Result<SynthWorkerShutdown, VoiceError> {
+        self.worker
+            .take()
+            .ok_or(VoiceError::SessionClosed)?
+            .shutdown()
+            .map_err(|failure| VoiceError::Worker(SynthWorkerError::Failed(failure)))
     }
 
     /// Drives the existing synchronous app run while narrating its event stream.
@@ -130,6 +146,7 @@ impl VoiceSession {
             .clone();
         let (sender, receiver) = mpsc::channel();
         options.event_sender = Some(sender);
+        let worker = self.worker.as_ref().ok_or(VoiceError::SessionClosed)?;
 
         std::thread::scope(|scope| {
             let run = scope.spawn(move || crate::app::run_question(options));
@@ -137,65 +154,72 @@ impl VoiceSession {
             let mut sentences = Vec::new();
             let mut voice_error = None;
 
-            for event in receiver {
-                let accepted = match stream.accept(event) {
-                    Ok(accepted) => accepted,
-                    Err(error) => {
-                        voice_error = Some(error);
-                        cancel.store(true, Ordering::Release);
-                        break;
+            loop {
+                match receiver.recv_timeout(Duration::from_millis(1)) {
+                    Ok(event) => {
+                        let accepted = match stream.accept(event) {
+                            Ok(accepted) => accepted,
+                            Err(error) => {
+                                voice_error = Some(error);
+                                cancel.store(true, Ordering::Release);
+                                break;
+                            }
+                        };
+                        for sentence in accepted {
+                            match worker.accept(sentence, Arc::clone(&cancel)) {
+                                Ok(admission) => {
+                                    sentences.extend(admission.completed.into_iter().map(
+                                        |report| NarratedSentenceReport {
+                                            sentence: report.sentence,
+                                            playback: report.playback,
+                                        },
+                                    ));
+                                }
+                                Err(error) => {
+                                    voice_error = Some(VoiceError::Worker(error));
+                                    cancel.store(true, Ordering::Release);
+                                    break;
+                                }
+                            }
+                        }
+                        if voice_error.is_some() {
+                            break;
+                        }
                     }
-                };
-                for sentence in accepted {
-                    match self.narrate_sentence(sentence, &cancel) {
-                        Ok(report) => sentences.push(report),
-                        Err(error) => {
-                            voice_error = Some(error);
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Err(failure) = worker.check_health() {
+                            voice_error =
+                                Some(VoiceError::Worker(SynthWorkerError::Failed(failure)));
                             cancel.store(true, Ordering::Release);
                             break;
                         }
                     }
-                }
-                if voice_error.is_some() {
-                    break;
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
 
             let run_result = run.join().map_err(|_| VoiceRunError::RunThreadPanicked)?;
+            let audio_result = worker.wait_until_idle();
             if let Some(error) = voice_error {
                 return Err(VoiceRunError::Voice(error));
             }
             let run = run_result?;
             stream.finish()?;
+            let reports = audio_result.map_err(|failure| {
+                VoiceRunError::Voice(VoiceError::Worker(SynthWorkerError::Failed(failure)))
+            })?;
+            sentences.extend(reports.into_iter().map(|report| NarratedSentenceReport {
+                sentence: report.sentence,
+                playback: report.playback,
+            }));
             Ok(NarratedRunOutcome {
                 run,
                 narration: NarrationReport {
                     sentences,
-                    kokoro_metrics: self.synthesizer.metrics(),
-                    playback_metrics: self.playback.metrics(),
+                    kokoro_metrics: self.kokoro_metrics.snapshot(),
+                    playback_metrics: worker.playback_metrics(),
                 },
             })
-        })
-    }
-
-    fn narrate_sentence(
-        &mut self,
-        sentence: Sentence,
-        cancel: &AtomicBool,
-    ) -> Result<NarratedSentenceReport, VoiceError> {
-        let accepted_at = Instant::now();
-        let mut chunks: Vec<PcmChunk> = Vec::new();
-        self.synthesizer
-            .synthesize(&sentence, &mut chunks, cancel)?;
-        if chunks.len() != 1 {
-            return Err(VoiceError::UnexpectedPcmChunks {
-                count: chunks.len(),
-            });
-        }
-        let playback = self.playback.play_blocking(&chunks[0], accepted_at)?;
-        Ok(NarratedSentenceReport {
-            sentence: sentence.into_string(),
-            playback,
         })
     }
 }
@@ -378,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn fragmented_deltas_produce_one_exact_serial_sentence_sequence() {
+    fn fragmented_deltas_produce_one_exact_sentence_sequence() {
         let mut stream = AssistantTextStream::default();
         let mut accepted = Vec::new();
         accepted.extend(stream.accept(delta(0, "This first sentence ")).unwrap());

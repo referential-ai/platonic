@@ -1,0 +1,404 @@
+{
+  "schema": "plato_audio.audio_prefetch_device.v2",
+  "admitted_base": "9eb00b3c5c3892d3c22907f95534b5859130a93e",
+  "timing_boundary": "sentence accepted into the fixed four-job window through the first non-silent sample copied by the persistent cpal output callback; model load and stream open excluded",
+  "ttfa": {
+    "trial_count": 20,
+    "threshold_us": 350000,
+    "p50_us": 52907,
+    "p95_us": 63647,
+    "max_us": 63856,
+    "trials": [
+      {
+        "accepted_to_first_non_silent_us": 63856,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 11,
+          "frames": 2816
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 63647,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 11,
+          "frames": 2816
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 52563,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 9,
+          "frames": 2304
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 58177,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 10,
+          "frames": 2560
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 57994,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 10,
+          "frames": 2560
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 63259,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 11,
+          "frames": 2816
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 46904,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 8,
+          "frames": 2048
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 52527,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 9,
+          "frames": 2304
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 57985,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 10,
+          "frames": 2560
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 52907,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 9,
+          "frames": 2304
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 48019,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 8,
+          "frames": 2048
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 52296,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 9,
+          "frames": 2304
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 53022,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 9,
+          "frames": 2304
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 63165,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 11,
+          "frames": 2816
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 52605,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 9,
+          "frames": 2304
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 52654,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 9,
+          "frames": 2304
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 52653,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 9,
+          "frames": 2304
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 52711,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 9,
+          "frames": 2304
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 58470,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 10,
+          "frames": 2560
+        }
+      },
+      {
+        "accepted_to_first_non_silent_us": 57639,
+        "first_callback_frames": 256,
+        "underrun": {
+          "callbacks": 10,
+          "frames": 2560
+        }
+      }
+    ]
+  },
+  "multi_sentence": {
+    "capacity": 4,
+    "corpus": [
+      "Prefetch keeps this first sentence playing for the listener.",
+      "The second sentence synthesizes while the first one is still audible.",
+      "A third sentence follows through the same persistent device stream.",
+      "The final sentence proves exact order and a clean bounded drain."
+    ],
+    "callback_sample_timestamps": [
+      {
+        "sequence": 21,
+        "accepted_ns": 68078617706,
+        "synth_started_ns": 68078621352,
+        "synth_finished_ns": 68169137596,
+        "first_pcm_ns": 68173687362,
+        "first_non_silent_ns": 68173687362,
+        "pcm_end_ns": 71848772897,
+        "accepted_to_first_non_silent_us": 95069,
+        "synthesis_us": 90516,
+        "gap_before_us": null,
+        "first_callback_frames": 256,
+        "callback_count": 707,
+        "source_frames": 88200,
+        "device_frames": 176400,
+        "underrun": {
+          "callbacks": 17,
+          "frames": 4352
+        }
+      },
+      {
+        "sequence": 22,
+        "accepted_ns": 68078619562,
+        "synth_started_ns": 68169172584,
+        "synth_finished_ns": 68274346000,
+        "first_pcm_ns": 71848772897,
+        "first_non_silent_ns": 71848772897,
+        "pcm_end_ns": 76498716914,
+        "accepted_to_first_non_silent_us": 3770153,
+        "synthesis_us": 105173,
+        "gap_before_us": 0,
+        "first_callback_frames": 256,
+        "callback_count": 872,
+        "source_frames": 111600,
+        "device_frames": 223200,
+        "underrun": {
+          "callbacks": 0,
+          "frames": 0
+        }
+      },
+      {
+        "sequence": 23,
+        "accepted_ns": 68078620059,
+        "synth_started_ns": 68274531240,
+        "synth_finished_ns": 68376138233,
+        "first_pcm_ns": 76498716914,
+        "first_non_silent_ns": 76498716914,
+        "pcm_end_ns": 80898830392,
+        "accepted_to_first_non_silent_us": 8420096,
+        "synthesis_us": 101606,
+        "gap_before_us": 0,
+        "first_callback_frames": 256,
+        "callback_count": 826,
+        "source_frames": 105600,
+        "device_frames": 211200,
+        "underrun": {
+          "callbacks": 0,
+          "frames": 0
+        }
+      },
+      {
+        "sequence": 24,
+        "accepted_ns": 68078620592,
+        "synth_started_ns": 68376333108,
+        "synth_finished_ns": 68475208913,
+        "first_pcm_ns": 80898830392,
+        "first_non_silent_ns": 80898830392,
+        "pcm_end_ns": 85599084151,
+        "accepted_to_first_non_silent_us": 12820209,
+        "synthesis_us": 98875,
+        "gap_before_us": 0,
+        "first_callback_frames": 256,
+        "callback_count": 883,
+        "source_frames": 112800,
+        "device_frames": 225600,
+        "underrun": {
+          "callbacks": 0,
+          "frames": 0
+        }
+      }
+    ],
+    "gaps_us": [
+      0,
+      0,
+      0
+    ],
+    "p50_us": 0,
+    "p95_us": 0,
+    "max_us": 0,
+    "threshold_us": 20000,
+    "overlaps": [
+      {
+        "playing_sequence": 21,
+        "following_sequence": 22,
+        "playing_first_pcm_ns": 68173687362,
+        "playing_pcm_end_ns": 71848772897,
+        "following_synth_started_ns": 68169172584,
+        "following_synth_finished_ns": 68274346000,
+        "overlap_us": 100658
+      },
+      {
+        "playing_sequence": 22,
+        "following_sequence": 23,
+        "playing_first_pcm_ns": 71848772897,
+        "playing_pcm_end_ns": 76498716914,
+        "following_synth_started_ns": 68274531240,
+        "following_synth_finished_ns": 68376138233,
+        "overlap_us": 0
+      },
+      {
+        "playing_sequence": 23,
+        "following_sequence": 24,
+        "playing_first_pcm_ns": 76498716914,
+        "playing_pcm_end_ns": 80898830392,
+        "following_synth_started_ns": 68376333108,
+        "following_synth_finished_ns": 68475208913,
+        "overlap_us": 0
+      }
+    ],
+    "every_boundary_within_threshold": true,
+    "demonstrated_synthesis_playback_overlap": true,
+    "underrun": {
+      "callbacks": 17,
+      "frames": 4352
+    },
+    "metrics_before_shutdown": {
+      "stream_opens": 1,
+      "chunks_played": 25,
+      "callback_count": 16042,
+      "ring_capacity_frames": 2880000,
+      "max_accepted_unfinished": 4,
+      "underrun": {
+        "callbacks": 258,
+        "frames": 66048
+      }
+    }
+  },
+  "model_format": {
+    "sample_rate": 24000,
+    "channels": 1,
+    "sample": "f32"
+  },
+  "provenance": {
+    "model_source": "onnx-community/Kokoro-82M-v1.0-ONNX",
+    "model_revision": "1939ad2a8e416c0acfeecc08a694d14ef25f2231",
+    "model_sha256": "8fbea51ea711f2af382e88c833d9e288c6dc82ce5e98421ea61c058ce21a34cb",
+    "tokenizer_sha256": "77a02c8e164413299b4b4c403b14f8e0e1c1b727db4d46a09d6327b861060a34",
+    "voice_sha256": "4435255c9744f3f31659e0d714ab7689bf65d9e77ec1cce060f083912614f0b9",
+    "ort_runtime": "ort 2.0.0-rc.13 / ONNX Runtime 1.28",
+    "ort_build_info": "ORT Build Info: git-branch=rel-1.28.0, git-commit-id=da9b5e3, quick-build=1, build type=Release",
+    "phonemizer_version": "eSpeak NG text-to-speech: 1.52.0  Data at: /usr/share/espeak-ng-data",
+    "backend": "cuda"
+  },
+  "native_runtime_packages": {
+    "cuda": "13.3.1-1",
+    "cudnn": "9.25.0.15-1",
+    "espeak_ng": "1.52.0-1",
+    "pipewire": "1:1.6.8-1"
+  },
+  "cpal_runtime": "cpal 0.18.1",
+  "rtrb_runtime": "rtrb 0.3.4",
+  "rubato_runtime": "rubato 4.0.0",
+  "output": {
+    "backend": "ALSA",
+    "device_id": "alsa:default",
+    "device": "Default Audio Device",
+    "format": {
+      "sample_rate": 48000,
+      "channels": 2,
+      "sample": "f32"
+    },
+    "ring_format": {
+      "sample_rate": 48000,
+      "channels": 1,
+      "sample": "f32"
+    },
+    "buffer_size": {
+      "mode": "fixed",
+      "requested_frames": 256,
+      "supported_min_frames": 16,
+      "supported_max_frames": 262144
+    }
+  },
+  "host_audio_route": {
+    "server": "PulseAudio (on PipeWire 1.6.8)",
+    "default_sink": "alsa_output.pci-0000_01_00.1.hdmi-stereo",
+    "description": "AD102 High Definition Audio Controller Digital Stereo (HDMI)",
+    "sink_format": "s32le 2ch 48000Hz"
+  },
+  "observed_device_period_us": [
+    5333
+  ],
+  "accelerator": {
+    "name": "NVIDIA GeForce RTX 4090",
+    "driver_version": "610.43.03",
+    "memory_mib": 24564
+  },
+  "kokoro_metrics": {
+    "session_loads": 1,
+    "phonemizer_invocations": 25,
+    "syntheses": 25
+  },
+  "shutdown": {
+    "worker_joined": true,
+    "playback_closed": true,
+    "synth_worker_threads": 1,
+    "resampling_plan_builds": 1,
+    "completed_sentences": 25,
+    "playback": {
+      "stream_opens": 1,
+      "chunks_played": 25,
+      "callback_count": 16046,
+      "ring_capacity_frames": 2880000,
+      "max_accepted_unfinished": 4,
+      "underrun": {
+        "callbacks": 258,
+        "frames": 66048
+      }
+    }
+  },
+  "warmup_excluded": true
+}
