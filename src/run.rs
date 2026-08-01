@@ -177,6 +177,7 @@ pub enum RunPhase {
 ///             content: "I will write the file.".into(),
 ///         },
 ///         proposed_calls: vec![proposal],
+///         served_model: None,
 ///         usage: Some(ModelUsage { input_tokens: 3, output_tokens: 5 }),
 ///     },
 ///     HarnessEvent::ToolCallProposed {

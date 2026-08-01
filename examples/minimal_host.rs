@@ -60,6 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 content: "I will write the file.".into(),
             },
             proposed_calls: vec![proposal],
+            served_model: None,
             usage: Some(ModelUsage {
                 input_tokens: 6,
                 output_tokens: 6,

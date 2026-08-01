@@ -294,18 +294,22 @@ fn harness_event() -> BoxedStrategy<HarnessEvent> {
             any::<u16>(),
             message(),
             prop::collection::vec(tool_proposal(), 0..=3),
+            prop::option::of(model_name()),
             model_usage(),
         )
-            .prop_map(|(run_id, turn_id, step, output, proposed_calls, usage)| {
-                HarnessEvent::ModelResponded {
-                    run_id,
-                    turn_id,
-                    step: u32::from(step),
-                    output,
-                    proposed_calls,
-                    usage,
-                }
-            },),
+            .prop_map(
+                |(run_id, turn_id, step, output, proposed_calls, served_model, usage)| {
+                    HarnessEvent::ModelResponded {
+                        run_id,
+                        turn_id,
+                        step: u32::from(step),
+                        output,
+                        proposed_calls,
+                        served_model,
+                        usage,
+                    }
+                },
+            ),
         (run_id(), turn_id(), bounded_text()).prop_map(|(run_id, turn_id, reason)| {
             HarnessEvent::ToolProposalsRejected {
                 run_id,
