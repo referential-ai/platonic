@@ -1,3 +1,4 @@
+use plato_daemon_client::ClientError;
 use plato_protocol::ProtocolError;
 use std::path::PathBuf;
 
@@ -107,4 +108,17 @@ pub enum AppError {
 
     #[error("core error: {0}")]
     Core(#[from] platonic_core::Error),
+}
+
+impl From<ClientError> for AppError {
+    fn from(error: ClientError) -> Self {
+        match error {
+            ClientError::Config(message) => Self::Config(message),
+            ClientError::DaemonProtocol(message) => Self::DaemonProtocol(message),
+            ClientError::DaemonResponse(error) => Self::DaemonResponse(error),
+            ClientError::DaemonControl(message) => Self::DaemonControl(message),
+            ClientError::Io(error) => Self::Io(error),
+            ClientError::Json(error) => Self::Json(error),
+        }
+    }
 }

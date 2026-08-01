@@ -280,7 +280,7 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             question,
             config_path,
         } => with_client(config, |client| {
-            client.run_start(question, config_path, false)
+            Ok(client.run_start(question, config_path, false)?)
         })
         .map_or_else(
             failed_event(ClientOperation::RunStart),
@@ -291,7 +291,7 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             session_id,
             config_path,
         } => with_client(config, |client| {
-            client.message_append_to_session(message, Some(session_id), config_path, false)
+            Ok(client.message_append_to_session(message, Some(session_id), config_path, false)?)
         })
         .map_or_else(
             failed_event(ClientOperation::MessageAppend),
@@ -302,7 +302,7 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
                 let mut client = connect_daemon(config, DAEMON_CLIENT_TIMEOUT)?;
                 client.hello(&config.workspace_root)?;
                 client.clear_request_timeout()?;
-                client.issue_prep_start(input, config_path)
+                Ok(client.issue_prep_start(input, config_path)?)
             })();
             result.map_or_else(
                 failed_event(ClientOperation::IssuePrepStart),
@@ -313,7 +313,7 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             run_id,
             from_offset,
         } => with_client(config, |client| {
-            client.events_stream(&run_id, from_offset, EVENT_LIMIT)
+            Ok(client.events_stream(&run_id, from_offset, EVENT_LIMIT)?)
         })
         .map_or_else(
             failed_event(ClientOperation::EventsStream),
@@ -323,7 +323,7 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             run_id,
             tool_call_id,
         } => with_client(config, |client| {
-            client.approval_grant(&run_id, &tool_call_id)
+            Ok(client.approval_grant(&run_id, &tool_call_id)?)
         })
         .map_or_else(
             failed_event(ClientOperation::ApprovalDecide),
@@ -334,14 +334,14 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             tool_call_id,
             reason,
         } => with_client(config, |client| {
-            client.approval_deny(&run_id, &tool_call_id, reason)
+            Ok(client.approval_deny(&run_id, &tool_call_id, reason)?)
         })
         .map_or_else(
             failed_event(ClientOperation::ApprovalDecide),
             ClientEvent::ApprovalDecided,
         ),
         ClientCommand::RunCancel { run_id } => {
-            with_client(config, |client| client.run_cancel(&run_id)).map_or_else(
+            with_client(config, |client| Ok(client.run_cancel(&run_id)?)).map_or_else(
                 failed_event(ClientOperation::RunCancel),
                 ClientEvent::RunCanceled,
             )
@@ -362,7 +362,10 @@ pub(super) fn connect_daemon(
     config: &DaemonConnectionConfig,
     timeout: Duration,
 ) -> AppResult<DaemonClient> {
-    DaemonClient::connect_with_timeout(&config.socket_path, timeout)
+    Ok(DaemonClient::connect_with_timeout(
+        &config.socket_path,
+        timeout,
+    )?)
 }
 
 fn failed_event(operation: ClientOperation) -> impl FnOnce(crate::AppError) -> ClientEvent {

@@ -1,8 +1,8 @@
 use crate::{
     AppError, AppResult,
     daemon::{
-        client::DaemonClient,
-        lock::LockMetadata,
+        client::{ClientError, DaemonClient},
+        lock::{LOCK_VERSION, LockMetadata},
         protocol::{CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE, ShutdownIfIdleResultName},
     },
     paths,
@@ -19,7 +19,6 @@ use std::{
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
-const LOCK_VERSION: u32 = 1;
 const LOCK_FILE_NAME: &str = "agent.lock";
 const MAX_LOCK_BYTES: u64 = 16 * 1024;
 const METADATA_RETRY: Duration = Duration::from_millis(500);
@@ -760,7 +759,7 @@ fn control_errors(context: &str, errors: Vec<String>) -> AppError {
 }
 
 fn control_error(message: impl Into<String>) -> AppError {
-    AppError::DaemonControl(message.into())
+    ClientError::DaemonControl(message.into()).into()
 }
 
 #[cfg(test)]

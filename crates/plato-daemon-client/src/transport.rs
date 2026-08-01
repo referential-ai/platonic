@@ -1,16 +1,24 @@
+//! Cross-platform synchronous local IPC primitives.
+
 #[cfg(windows)]
 use std::io::{Read as _, Write as _};
 use std::{io, path::Path, time::Duration};
 
+/// Platform listener used by the daemon server.
 #[cfg(unix)]
-pub(crate) use std::os::unix::net::{UnixListener as Listener, UnixStream as Stream};
+pub use std::os::unix::net::UnixListener as Listener;
+/// Platform stream used by daemon clients and servers.
+#[cfg(unix)]
+pub use std::os::unix::net::UnixStream as Stream;
 
+/// Platform listener used by the daemon server.
 #[cfg(windows)]
-pub(crate) use interprocess::local_socket::Listener;
+pub use interprocess::local_socket::Listener;
 
+/// Platform stream used by daemon clients and servers.
 #[cfg(windows)]
 #[derive(Debug)]
-pub(crate) struct Stream {
+pub struct Stream {
     inner: WindowsStream,
     deadline: Option<std::time::Instant>,
 }
@@ -29,12 +37,14 @@ const CONTROL_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 const ACCEPT_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 
 #[cfg(unix)]
-pub(crate) fn bind(endpoint: &Path) -> io::Result<Listener> {
+/// Binds a listener at `endpoint`.
+pub fn bind(endpoint: &Path) -> io::Result<Listener> {
     Listener::bind(endpoint)
 }
 
 #[cfg(windows)]
-pub(crate) fn bind(endpoint: &Path) -> io::Result<Listener> {
+/// Binds a current-user-only named-pipe listener at `endpoint`.
+pub fn bind(endpoint: &Path) -> io::Result<Listener> {
     use interprocess::{
         local_socket::{GenericFilePath, ListenerOptions, prelude::*},
         os::windows::local_socket::ListenerOptionsExt,
@@ -48,15 +58,14 @@ pub(crate) fn bind(endpoint: &Path) -> io::Result<Listener> {
 }
 
 #[cfg(unix)]
-pub(crate) fn connect(endpoint: &Path) -> io::Result<Stream> {
+/// Connects to `endpoint` using the platform's ordinary connect behavior.
+pub fn connect(endpoint: &Path) -> io::Result<Stream> {
     Stream::connect(endpoint)
 }
 
 #[cfg(unix)]
-pub(crate) fn connect_with_timeout(
-    endpoint: &Path,
-    timeout: std::time::Duration,
-) -> io::Result<Stream> {
+/// Connects to `endpoint` within `timeout`.
+pub fn connect_with_timeout(endpoint: &Path, timeout: std::time::Duration) -> io::Result<Stream> {
     use rustix::{
         event::{PollFd, PollFlags, Timespec, poll},
         fs::{OFlags, fcntl_getfl, fcntl_setfl},
@@ -129,7 +138,8 @@ fn connect_timeout() -> io::Error {
 }
 
 #[cfg(unix)]
-pub(crate) fn set_deadline(stream: &mut Stream, deadline: std::time::Instant) -> io::Result<()> {
+/// Applies one absolute read/write deadline to `stream`.
+pub fn set_deadline(stream: &mut Stream, deadline: std::time::Instant) -> io::Result<()> {
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
     if remaining.is_zero() {
         return Err(request_io_timeout());
@@ -139,13 +149,15 @@ pub(crate) fn set_deadline(stream: &mut Stream, deadline: std::time::Instant) ->
 }
 
 #[cfg(unix)]
-pub(crate) fn clear_deadline(stream: &mut Stream) -> io::Result<()> {
+/// Clears read/write deadlines from `stream`.
+pub fn clear_deadline(stream: &mut Stream) -> io::Result<()> {
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)
 }
 
 #[cfg(windows)]
-pub(crate) fn connect(endpoint: &Path) -> io::Result<Stream> {
+/// Connects to a current-user named-pipe server.
+pub fn connect(endpoint: &Path) -> io::Result<Stream> {
     Ok(Stream {
         inner: WindowsStream::Client(crate::windows_security::connect_current_user_pipe(
             endpoint,
@@ -155,10 +167,8 @@ pub(crate) fn connect(endpoint: &Path) -> io::Result<Stream> {
 }
 
 #[cfg(windows)]
-pub(crate) fn connect_with_timeout(
-    endpoint: &Path,
-    timeout: std::time::Duration,
-) -> io::Result<Stream> {
+/// Connects to a current-user named-pipe server within `timeout`.
+pub fn connect_with_timeout(endpoint: &Path, timeout: std::time::Duration) -> io::Result<Stream> {
     Ok(Stream {
         inner: WindowsStream::Client(
             crate::windows_security::connect_current_user_pipe_with_timeout(endpoint, timeout)?,
@@ -168,7 +178,8 @@ pub(crate) fn connect_with_timeout(
 }
 
 #[cfg(windows)]
-pub(crate) fn connect_expected_server(endpoint: &Path, expected_pid: u32) -> io::Result<Stream> {
+/// Connects to the current-user named-pipe server with `expected_pid`.
+pub fn connect_expected_server(endpoint: &Path, expected_pid: u32) -> io::Result<Stream> {
     Ok(Stream {
         inner: WindowsStream::Client(crate::windows_security::connect_current_user_pipe_for_pid(
             endpoint,
@@ -179,13 +190,15 @@ pub(crate) fn connect_expected_server(endpoint: &Path, expected_pid: u32) -> io:
 }
 
 #[cfg(windows)]
-pub(crate) fn set_deadline(stream: &mut Stream, deadline: std::time::Instant) -> io::Result<()> {
+/// Applies one absolute I/O deadline to `stream`.
+pub fn set_deadline(stream: &mut Stream, deadline: std::time::Instant) -> io::Result<()> {
     stream.deadline = Some(deadline);
     Ok(())
 }
 
 #[cfg(windows)]
-pub(crate) fn clear_deadline(stream: &mut Stream) -> io::Result<()> {
+/// Clears the client-pipe deadline and restores blocking pipe mode.
+pub fn clear_deadline(stream: &mut Stream) -> io::Result<()> {
     if let WindowsStream::Client(pipe) = &stream.inner {
         crate::windows_security::set_pipe_wait(pipe)?;
     }
@@ -194,12 +207,14 @@ pub(crate) fn clear_deadline(stream: &mut Stream) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-pub(crate) fn accept(listener: &Listener) -> io::Result<Stream> {
+/// Accepts one stream from `listener`.
+pub fn accept(listener: &Listener) -> io::Result<Stream> {
     listener.accept().map(|(stream, _)| stream)
 }
 
 #[cfg(windows)]
-pub(crate) fn accept(listener: &Listener) -> io::Result<Stream> {
+/// Accepts one named-pipe stream from `listener`.
+pub fn accept(listener: &Listener) -> io::Result<Stream> {
     use interprocess::local_socket::prelude::*;
 
     listener.accept().map(|stream| Stream {
@@ -208,7 +223,8 @@ pub(crate) fn accept(listener: &Listener) -> io::Result<Stream> {
     })
 }
 
-pub(crate) fn accept_retry_delay(error: &io::Error) -> Option<Duration> {
+/// Returns the existing bounded retry delay for a transient accept failure.
+pub fn accept_retry_delay(error: &io::Error) -> Option<Duration> {
     match error.kind() {
         io::ErrorKind::Interrupted => Some(Duration::ZERO),
         io::ErrorKind::WouldBlock | io::ErrorKind::ConnectionAborted => Some(ACCEPT_RETRY_BACKOFF),
@@ -257,19 +273,22 @@ fn is_platform_retryable_accept_error(error: &io::Error) -> bool {
 }
 
 #[cfg(unix)]
-pub(crate) fn try_clone(stream: &Stream) -> io::Result<Stream> {
+/// Clones a stream handle for independent buffered reading and writing.
+pub fn try_clone(stream: &Stream) -> io::Result<Stream> {
     stream.try_clone()
 }
 
 #[cfg(windows)]
-pub(crate) fn reset_deadline(stream: &mut Stream) {
+/// Refreshes the fixed control-client deadline when one is active.
+pub fn reset_deadline(stream: &mut Stream) {
     if stream.deadline.is_some() {
         stream.deadline = Some(std::time::Instant::now() + CONTROL_IO_TIMEOUT);
     }
 }
 
 #[cfg(windows)]
-pub(crate) fn try_clone(stream: &Stream) -> io::Result<Stream> {
+/// Clones a stream handle for independent buffered reading and writing.
+pub fn try_clone(stream: &Stream) -> io::Result<Stream> {
     let inner = match &stream.inner {
         WindowsStream::Client(stream) => WindowsStream::Client(stream.try_clone()?),
         WindowsStream::Server(stream) => {
@@ -282,7 +301,8 @@ pub(crate) fn try_clone(stream: &Stream) -> io::Result<Stream> {
     })
 }
 
-pub(crate) fn wake(endpoint: &Path) {
+/// Wakes a blocking daemon accept call by making a best-effort connection.
+pub fn wake(endpoint: &Path) {
     let _ = connect(endpoint);
 }
 
@@ -301,7 +321,10 @@ impl io::Read for &Stream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match &self.inner {
             WindowsStream::Client(stream) => read_client(stream, self.deadline, buffer),
-            WindowsStream::Server(stream) => (&*stream).read(buffer),
+            WindowsStream::Server(stream) => {
+                let mut server = stream;
+                server.read(buffer)
+            }
         }
     }
 }

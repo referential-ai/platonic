@@ -446,12 +446,27 @@ pub(super) fn spawn_stalled_rest(delay: Duration) -> FakeRest {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> HttpRequest {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
+    let read_timeout = Duration::from_secs(2);
+    stream.set_read_timeout(Some(read_timeout)).unwrap();
+    let read_deadline = Instant::now() + read_timeout;
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request_line = String::new();
-    reader.read_line(&mut request_line).unwrap();
+    loop {
+        match reader.read_line(&mut request_line) {
+            Ok(_) => break,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && Instant::now() < read_deadline =>
+            {
+                thread::sleep(
+                    read_deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(1)),
+                );
+            }
+            Err(error) => panic!("discord REST request line read failed: {error}"),
+        }
+    }
     let mut request_parts = request_line.split_whitespace();
     let method = request_parts.next().unwrap().to_owned();
     let path = request_parts.next().unwrap().to_owned();
@@ -459,7 +474,22 @@ fn read_http_request(stream: &mut TcpStream) -> HttpRequest {
     let mut authorization = String::new();
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
+        loop {
+            match reader.read_line(&mut line) {
+                Ok(_) => break,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < read_deadline =>
+                {
+                    thread::sleep(
+                        read_deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(1)),
+                    );
+                }
+                Err(error) => panic!("discord REST header read failed: {error}"),
+            }
+        }
         if line == "\r\n" {
             break;
         }
@@ -471,7 +501,24 @@ fn read_http_request(stream: &mut TcpStream) -> HttpRequest {
         }
     }
     let mut body = vec![0; content_length];
-    reader.read_exact(&mut body).unwrap();
+    let mut body_read = 0;
+    while body_read < body.len() {
+        match reader.read(&mut body[body_read..]) {
+            Ok(0) => panic!("discord REST request ended before body"),
+            Ok(count) => body_read += count,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && Instant::now() < read_deadline =>
+            {
+                thread::sleep(
+                    read_deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(1)),
+                );
+            }
+            Err(error) => panic!("discord REST body read failed: {error}"),
+        }
+    }
     HttpRequest {
         method,
         path,

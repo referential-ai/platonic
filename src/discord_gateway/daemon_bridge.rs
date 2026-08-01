@@ -99,7 +99,10 @@ impl DiscordGateway {
         let mut approvals = ApprovalNotifications::default();
         let mut canceling = false;
         loop {
-            match daemon.events_stream(run_id, next_offset, EVENT_PAGE_LIMIT) {
+            match daemon
+                .events_stream(run_id, next_offset, EVENT_PAGE_LIMIT)
+                .map_err(AppError::from)
+            {
                 Ok(events) => {
                     next_offset = Some(events.next_offset);
                     let needs_catch_up = events.events.len() == EVENT_PAGE_LIMIT
@@ -209,11 +212,11 @@ impl DiscordGateway {
         daemon: &mut DaemonClient,
         run_id: &str,
     ) -> AppResult<TranscriptReadResult> {
-        match daemon.transcript_read(run_id) {
+        match daemon.transcript_read(run_id).map_err(AppError::from) {
             Ok(transcript) => Ok(transcript),
             Err(error) if reconnectable(&error) => {
                 *daemon = self.reconnect_daemon()?;
-                daemon.transcript_read(run_id)
+                Ok(daemon.transcript_read(run_id)?)
             }
             Err(error) => Err(error),
         }

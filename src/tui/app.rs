@@ -950,7 +950,8 @@ mod tests {
 
         assert!(matches!(
             error,
-            AppError::Io(error) if error.kind() == io::ErrorKind::TimedOut
+            crate::daemon::client::ClientError::Io(error)
+                if error.kind() == io::ErrorKind::TimedOut
         ));
         assert!(elapsed < Duration::from_secs(1), "request took {elapsed:?}");
         assert_eq!(DAEMON_CLIENT_TIMEOUT, Duration::from_secs(3));
