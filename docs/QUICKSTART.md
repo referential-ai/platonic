@@ -133,18 +133,18 @@ typing indicator while active, then ✅ or ❌; canceled and interrupted runs
 remove 👀 without a terminal reaction. The bot needs Add Reactions and Read
 Message History, plus Send Messages in Threads when threads are used.
 
-## 5. Local voice-out proof (developer MVP)
+## 5. Local voice proof (developer MVP)
 
-AU2 exposes bounded prefetched voice-out through focused examples rather than a
-general CLI or configuration surface. It uses one synth thread, a fixed
-four-sentence window, one persistent cpal stream, an rtrb PCM edge, and one
-rubato source/device plan. Install espeak-ng and the native cpal backend
-headers, then place the pinned Kokoro artifacts described in
+AU2 voice-out and AU3 explicit voice-in are exposed through focused examples,
+not a general CLI or ambient listener. Install espeak-ng, CUDA, and the native
+cpal backend headers, then place the pinned Kokoro and large-v3-turbo artifacts
+described in
 [`../crates/plato-audio/README.md`](../crates/plato-audio/README.md) outside the
 repository.
 
 ```bash
 export PLATO_AUDIO_KOKORO_DIR="$HOME/.cache/plato-audio/kokoro-82m-v1.0-onnx-1939ad2a8e416c0acfeecc08a694d14ef25f2231"
+export PLATO_AUDIO_WHISPER_MODEL="$HOME/.cache/plato-audio/ggml-large-v3-turbo-6034871ec87c84e342efab769d4c5c06cd126db3.bin"
 
 # Credential-free real run_question delta narration through the live speaker:
 PLATO_AUDIO_FIXTURE_KEY=local-proof \
@@ -152,11 +152,28 @@ PLATO_AUDIO_FIXTURE_KEY=local-proof \
 
 # One excluded warmup, 20 TTFA trials, and four-sentence gap/overlap proof:
 cargo run --release --locked -p plato-audio --example kokoro_device_proof
+
+# Public non-human corpus: exact endpoint/text, no noise hallucination, 20 warm trials:
+cargo test --release --locked -p plato-audio --features whisper-cuda \
+  recorded_corpus_has_exact_endpoint_transcript_and_warm_latency -- --ignored --nocapture
+
+# Inspect input IDs without changing the host default audio policy:
+cargo run --locked --example narrated_run -- --list-input-devices
+
+# One microphone question -> one existing run -> spoken AU2 answer:
+PLATO_AUDIO_FIXTURE_KEY=local-proof \
+  cargo run --release --locked --features whisper-cuda --example narrated_run -- \
+  --fixture --whisper-model "$PLATO_AUDIO_WHISPER_MODEL" --input-device CPAL_ID
 ```
 
 The model engine, native-rate resampling plan, and output stream open before
 timing. Both examples fail closed on artifact checksum, phonemizer, backend,
 device, PCM, worker, callback, sentence-order, gap, overlap, or teardown errors.
+AU3 opens one persistent input stream and one worker, normalizes/resamples on
+the worker, and runs fixed threshold endpointing before the resident CUDA
+recognizer. Ring overflow, device loss, worker panic, and recognition failures
+are typed terminal outcomes. The microphone form retains no raw audio; proof
+JSON contains only the final transcript, bounded metrics, and provenance.
 Model files and provider credentials are never written into the repository or
 proof JSON.
 

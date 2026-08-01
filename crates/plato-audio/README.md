@@ -1,17 +1,26 @@
 # plato-audio
 
 `plato-audio` is Plato Agent's synchronous local audio IO leaf. It owns typed
-PCM and sentence values, the sans-IO sentence cutter and prefetch state, one
-resident Kokoro-82M ONNX engine, and one persistent cpal output stream. It does not depend on a
-Platonic crate and owns no run, ledger, policy, approval, session, daemon,
-protocol, or configuration-registry behavior.
+PCM and sentence values, fixed threshold endpointing, the sans-IO sentence
+cutter and prefetch state, resident Kokoro and Whisper engines, and persistent
+cpal input/output streams. It does not depend on a Platonic crate and owns no
+run, ledger, policy, approval, session, daemon, protocol, or
+configuration-registry behavior.
 
 AU2 moves synthesis onto one owned `std::thread`. A fixed four-sentence
 accepted-but-not-finished window feeds one bounded `rtrb` SPSC PCM ring. One
 `rubato` plan converts Kokoro's 24 kHz mono f32 output to the live device rate
 before the callback; the callback only drains, converts samples, records atomic
-timing, and emits silence on underrun. Capture, STT, VAD, barge-in, voice
-ledger/policy, queue configuration, and additional workers remain out of scope.
+timing, and emits silence on underrun.
+
+AU3 adds one persistent input callback that only copies native samples into a
+bounded `rtrb` ring and records overflow. One owned worker normalizes and
+resamples complete device frames to 16 kHz mono, applies a literal 10 ms RMS
+threshold (`0.015`) with three-window onset, 200 ms minimum speech, and 250 ms
+hangover, then returns one final transcript for an explicit capture request.
+Overflow is a typed terminal capture result. There is no ambient recognition,
+partial transcript UI, barge-in, AEC, wake word, cloud fallback, or second
+recognizer.
 
 ## Pinned artifacts
 
@@ -41,6 +50,20 @@ Expected SHA-256 values:
 `KokoroSynthesizer::load` verifies all three digests before constructing the
 session. Downloaded model files are never packaged or committed.
 
+AU3 admits `ggml-large-v3-turbo.bin` from `ggerganov/whisper.cpp` commit
+`6034871ec87c84e342efab769d4c5c06cd126db3`. Keep it outside the repository:
+
+```bash
+whisper_revision=6034871ec87c84e342efab769d4c5c06cd126db3
+whisper_model="$HOME/.cache/plato-audio/ggml-large-v3-turbo-$whisper_revision.bin"
+curl -fL "https://huggingface.co/ggerganov/whisper.cpp/resolve/$whisper_revision/ggml-large-v3-turbo.bin?download=true" -o "$whisper_model"
+sha256sum "$whisper_model"
+```
+
+The required SHA-256 is
+`1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69`.
+`WhisperRecognizer::load` verifies it before constructing one resident state.
+
 ## Native runtime
 
 The crate pins `ort 2.0.0-rc.13` (ONNX Runtime 1.28, CUDA 13 build) and
@@ -59,7 +82,13 @@ espeak-ng 1.52.0-1              GPL-3.0-or-later external executable
 
 Linux compilation also requires ALSA development headers. For example,
 install `libasound2-dev` on Ubuntu. The hardware proof deliberately requires
-CUDA; the library itself retains the typed CPU fallback.
+CUDA; the Kokoro path retains its typed CPU fallback.
+
+Whisper uses pinned `whisper-rs 0.16.0` and is compiled only by the explicit
+`whisper-cuda` feature. That feature requires CUDA device zero and flash
+attention; it returns a typed error rather than falling back to CPU. Default
+builds retain the public types and fail closed if the CUDA recognizer is
+requested, keeping ordinary hosted builds platform-neutral.
 
 ## Proof commands
 
@@ -68,8 +97,21 @@ export PLATO_AUDIO_KOKORO_DIR="$model_dir"
 cargo test --locked -p plato-audio
 cargo run --release --locked -p plato-audio --example kokoro_device_proof
 
+PLATO_AUDIO_WHISPER_MODEL="$whisper_model" \
+  cargo test --release --locked -p plato-audio --features whisper-cuda \
+  recorded_corpus_has_exact_endpoint_transcript_and_warm_latency -- --ignored --nocapture
+
+CUDA_VISIBLE_DEVICES=-1 PLATO_AUDIO_WHISPER_MODEL="$whisper_model" \
+  cargo test --locked -p plato-audio --features whisper-cuda \
+  runtime_without_visible_cuda_device_fails_closed -- --ignored
+
 PLATO_AUDIO_FIXTURE_KEY=local-proof \
   cargo run --release --locked --example narrated_run -- --fixture
+
+cargo run --locked --example narrated_run -- --list-input-devices
+PLATO_AUDIO_FIXTURE_KEY=local-proof \
+  cargo run --release --locked --features whisper-cuda --example narrated_run -- \
+  --fixture --whisper-model "$whisper_model" --input-device CPAL_ID
 ```
 
 The device proof opens the model and stream before timing, excludes one warmup,
@@ -87,6 +129,17 @@ assistant-delta event channel with a credential-free loopback SSE provider. It
 checks the spoken sentence sequence against the committed final response and
 does not add assistant deltas to the durable harness ledger.
 
+The tracked `fixtures/au3` corpus is non-human CC0 audio with explicit source,
+license, and checksums. Its CUDA test requires exactly one retained VAD segment
+with no rejected or additional event, then asserts the exact endpoint and
+transcript, no finalization for below-threshold noise, one model load, and 20
+warm VAD-close-to-final trials with p95 at most 300 ms. A separate hidden-device
+test proves that compiled CUDA capability cannot admit whisper.cpp's CPU
+fallback. The captured-run form arms exactly one microphone question, passes
+its final `Transcript` into the same typed `RunOptions.question` path, and
+speaks the answer through AU2. It retains only transcript, metrics, and
+device/model provenance, never raw live audio.
+
 ## Package boundary
 
 The direct dependency graph is deliberately one-way:
@@ -94,6 +147,7 @@ The direct dependency graph is deliberately one-way:
 ```text
 plato-agent -> plato-audio -> cpal / rtrb / rubato
                            -> ort
+                           -> whisper-rs (only with whisper-cuda)
                            -> serde / serde_json / sha2 / thiserror
 ```
 

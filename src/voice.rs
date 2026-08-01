@@ -10,9 +10,12 @@ use std::{
 };
 
 use plato_audio::{
-    KokoroConfig, KokoroMetrics, KokoroMetricsReader, KokoroProvenance, KokoroSynthesizer,
-    PlaybackConfig, PlaybackDeviceInfo, PlaybackMetrics, PlaybackReport, Sentence, SentenceCutter,
-    SynthError, SynthWorker, SynthWorkerError, SynthWorkerShutdown, SynthWorkerStartError,
+    CaptureConfig, CaptureDeviceInfo, CaptureError, CaptureMetrics, CaptureReport, CaptureWorker,
+    CaptureWorkerShutdown, KokoroConfig, KokoroMetrics, KokoroMetricsReader, KokoroProvenance,
+    KokoroSynthesizer, PlaybackConfig, PlaybackDeviceInfo, PlaybackMetrics, PlaybackReport,
+    Sentence, SentenceCutter, SttError, SynthError, SynthWorker, SynthWorkerError,
+    SynthWorkerShutdown, SynthWorkerStartError, Transcript, WhisperConfig, WhisperMetrics,
+    WhisperMetricsReader, WhisperProvenance, WhisperRecognizer,
 };
 use platonic_core::{HarnessEvent, RunId, TurnId};
 use serde::Serialize;
@@ -38,6 +41,15 @@ pub enum VoiceError {
     /// Sentence admission or the running worker failed.
     #[error(transparent)]
     Worker(#[from] SynthWorkerError),
+    /// Resident Whisper setup failed.
+    #[error(transparent)]
+    Recognition(#[from] SttError),
+    /// Persistent input, endpointing, or recognition failed.
+    #[error(transparent)]
+    Capture(#[from] CaptureError),
+    /// This session was opened without the explicit capture path.
+    #[error("voice session has no capture worker")]
+    CaptureUnavailable,
     /// The voice session was explicitly shut down.
     #[error("voice session is closed")]
     SessionClosed,
@@ -89,11 +101,32 @@ pub struct NarratedRunOutcome {
     pub narration: NarrationReport,
 }
 
+/// One final voice question paired with the existing narrated run outcome.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedRunOutcome {
+    /// Input device, endpoint, transcript, and latency observation.
+    pub capture: CaptureReport,
+    /// Unmodified existing run result and AU2 spoken-answer observation.
+    pub narrated: NarratedRunOutcome,
+}
+
+/// Joined input and output ownership for a root voice session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct VoiceSessionShutdown {
+    /// Present only when the session was opened with explicit input capture.
+    pub capture: Option<CaptureWorkerShutdown>,
+    /// AU2 synthesis worker and persistent playback teardown.
+    pub synthesis: SynthWorkerShutdown,
+}
+
 /// Warm Kokoro engine and persistent cpal stream reused across narrated runs.
 pub struct VoiceSession {
     provenance: KokoroProvenance,
     kokoro_metrics: KokoroMetricsReader,
     worker: Option<SynthWorker>,
+    whisper_provenance: Option<WhisperProvenance>,
+    whisper_metrics: Option<WhisperMetricsReader>,
+    capture: Option<CaptureWorker>,
 }
 
 impl VoiceSession {
@@ -107,7 +140,28 @@ impl VoiceSession {
             provenance,
             kokoro_metrics,
             worker: Some(worker),
+            whisper_provenance: None,
+            whisper_metrics: None,
+            capture: None,
         })
+    }
+
+    /// Opens AU2 output plus one resident CUDA recognizer and persistent input stream.
+    pub fn open_with_capture(
+        kokoro: KokoroConfig,
+        playback: PlaybackConfig,
+        whisper: WhisperConfig,
+        capture_config: CaptureConfig,
+    ) -> Result<Self, VoiceError> {
+        let mut session = Self::open(kokoro, playback)?;
+        let recognizer = WhisperRecognizer::load(whisper)?;
+        let whisper_provenance = recognizer.provenance().clone();
+        let whisper_metrics = recognizer.metrics_reader();
+        let capture = CaptureWorker::open(capture_config, recognizer)?;
+        session.whisper_provenance = Some(whisper_provenance);
+        session.whisper_metrics = Some(whisper_metrics);
+        session.capture = Some(capture);
+        Ok(session)
     }
 
     /// Returns exact model and runtime provenance captured at warm load.
@@ -123,13 +177,58 @@ impl VoiceSession {
             .device_info()
     }
 
+    /// Returns resident Whisper artifact and CUDA runtime identity when enabled.
+    pub fn recognizer_provenance(&self) -> Option<&WhisperProvenance> {
+        self.whisper_provenance.as_ref()
+    }
+
+    /// Returns the live input device and negotiated native format when enabled.
+    pub fn capture_device_info(&self) -> Option<&CaptureDeviceInfo> {
+        self.capture.as_ref().map(CaptureWorker::device_info)
+    }
+
+    /// Reads resident recognizer reuse counters when capture is enabled.
+    pub fn recognizer_metrics(&self) -> Option<WhisperMetrics> {
+        self.whisper_metrics
+            .as_ref()
+            .map(WhisperMetricsReader::snapshot)
+    }
+
+    /// Reads persistent input, VAD, conversion, and overflow counters when enabled.
+    pub fn capture_metrics(&self) -> Option<CaptureMetrics> {
+        self.capture.as_ref().map(CaptureWorker::metrics)
+    }
+
     /// Closes admission, drains accepted audio, and joins the synth worker.
-    pub fn shutdown(mut self) -> Result<SynthWorkerShutdown, VoiceError> {
-        self.worker
+    pub fn shutdown(mut self) -> Result<VoiceSessionShutdown, VoiceError> {
+        let capture = self.capture.take().map(CaptureWorker::shutdown);
+        let synthesis = self
+            .worker
             .take()
             .ok_or(VoiceError::SessionClosed)?
             .shutdown()
-            .map_err(|failure| VoiceError::Worker(SynthWorkerError::Failed(failure)))
+            .map_err(|failure| VoiceError::Worker(SynthWorkerError::Failed(failure)))?;
+        Ok(VoiceSessionShutdown { capture, synthesis })
+    }
+
+    /// Captures one final question, then reuses the existing run and AU2 answer path.
+    pub fn capture_question(
+        &mut self,
+        options: RunOptions,
+        timeout: Duration,
+    ) -> Result<CapturedRunOutcome, VoiceRunError> {
+        if options.event_sender.is_some() {
+            return Err(VoiceRunError::EventSenderAlreadySet);
+        }
+        let capture = self
+            .capture
+            .as_ref()
+            .ok_or(VoiceError::CaptureUnavailable)?
+            .capture(timeout)
+            .map_err(VoiceError::from)?;
+        let options = options_for_transcript(options, &capture.transcript)?;
+        let narrated = self.run_question(options)?;
+        Ok(CapturedRunOutcome { capture, narrated })
     }
 
     /// Drives the existing synchronous app run while narrating its event stream.
@@ -222,6 +321,19 @@ impl VoiceSession {
             })
         })
     }
+}
+
+pub(crate) fn options_for_transcript(
+    mut options: RunOptions,
+    transcript: &Transcript,
+) -> Result<RunOptions, VoiceError> {
+    if !transcript.is_final {
+        return Err(contract_error(
+            "voice input bridge requires one final transcript",
+        ));
+    }
+    options.question.clone_from(&transcript.text);
+    Ok(options)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -369,6 +481,22 @@ mod tests {
     use super::*;
     use platonic_core::{Message, MessageRole, RecordedEvent};
 
+    fn run_options(question: &str) -> RunOptions {
+        RunOptions {
+            question: question.to_owned(),
+            config_path: None,
+            overrides: crate::RunOverrides::default(),
+            ledger: crate::RunLedger::Jsonl(std::path::PathBuf::from("unused.jsonl")),
+            workspace_root: std::path::PathBuf::from("."),
+            approval_mode: crate::ApprovalMode::Deny { actor: "test" },
+            run_id: None,
+            session: None,
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: None,
+        }
+    }
+
     fn delta(index: u64, text: &str) -> RunEvent {
         RunEvent::AssistantDelta(AssistantDeltaEvent {
             run_id: RunId::new("run_1").unwrap(),
@@ -459,5 +587,19 @@ mod tests {
         let mut stream = AssistantTextStream::default();
         stream.accept(delta(0, "pending")).unwrap();
         assert!(stream.finish().is_err());
+    }
+
+    #[test]
+    fn only_a_final_transcript_can_replace_the_typed_question() {
+        let transcript = Transcript::new("spoken question", true, 500).unwrap();
+        let options =
+            options_for_transcript(run_options("typed placeholder"), &transcript).unwrap();
+        assert_eq!(options.question, "spoken question");
+
+        let rolling = Transcript::new("unfinished", false, 250).unwrap();
+        assert!(matches!(
+            options_for_transcript(run_options("typed placeholder"), &rolling),
+            Err(VoiceError::EventContract { .. })
+        ));
     }
 }

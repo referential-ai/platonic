@@ -1,0 +1,25 @@
+{
+  "schema": "plato_audio.au3_corpus.v1",
+  "license": "CC0-1.0",
+  "human_recording": false,
+  "format": {
+    "codec": "pcm_s16le",
+    "sample_rate": 16000,
+    "channels": 1
+  },
+  "fixtures": [
+    {
+      "path": "spoken-question.wav",
+      "source": "eSpeak NG 1.52.0 en-us at 150 words/minute; FFmpeg n8.1.2 resample and silence padding",
+      "source_text": "What is the capital of France?",
+      "expected_transcript": "What is the capital of France?",
+      "sha256": "5020c50762851fb3182a7f9690adb3882e4cc2083b5610edb505f046c15b3dbc"
+    },
+    {
+      "path": "steady-noise.wav",
+      "source": "FFmpeg n8.1.2 anoisesrc white amplitude=0.003 seed=328 duration=3",
+      "expected_transcript": null,
+      "sha256": "3edf82ef3f40c9aa88174c5cf1e5ae15a5e88ce4bdf11d9cec6278747f13e6c3"
+    }
+  ]
+}

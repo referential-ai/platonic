@@ -102,6 +102,145 @@ pub enum ResampleError {
     Pcm(#[from] PcmError),
 }
 
+/// Warm speech-recognition setup and inference failures.
+#[derive(Debug, Error)]
+pub enum SttError {
+    /// The model artifact could not be read.
+    #[error("cannot read Whisper model at {path}: {source}")]
+    ArtifactRead {
+        /// Requested model path.
+        path: PathBuf,
+        /// Filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The model artifact did not match the admitted large-v3-turbo digest.
+    #[error("Whisper model checksum mismatch at {path}: expected {expected}, got {actual}")]
+    ArtifactChecksum {
+        /// Checked model path.
+        path: PathBuf,
+        /// Pinned SHA-256 digest.
+        expected: &'static str,
+        /// Observed SHA-256 digest.
+        actual: String,
+    },
+    /// This build cannot construct the admitted CUDA recognizer.
+    #[error("Whisper CUDA support is unavailable in this build for {platform}")]
+    CudaUnavailable {
+        /// Compile-time target identity.
+        platform: &'static str,
+    },
+    /// A CUDA-capable build did not select the required runtime device/backend.
+    #[error("Whisper CUDA runtime backend is unavailable: {reason}")]
+    CudaBackendUnavailable {
+        /// Bounded backend-selection evidence.
+        reason: String,
+    },
+    /// whisper.cpp could not load the verified model on CUDA.
+    #[error("cannot load resident Whisper CUDA model: {reason}")]
+    ModelLoad {
+        /// Bounded whisper.cpp diagnostic.
+        reason: String,
+    },
+    /// whisper.cpp could not create the one resident decode state.
+    #[error("cannot create resident Whisper decode state: {reason}")]
+    StateCreation {
+        /// Bounded whisper.cpp diagnostic.
+        reason: String,
+    },
+    /// An input frame did not match 16 kHz mono f32.
+    #[error("speech recognition requires {expected:?}, got {actual:?}")]
+    FormatMismatch {
+        /// Required Whisper PCM format.
+        expected: AudioFormat,
+        /// Supplied PCM format.
+        actual: AudioFormat,
+    },
+    /// The recognizer was finalized without accepted PCM.
+    #[error("cannot finalize speech recognition without PCM")]
+    NoAudio,
+    /// Warm whisper.cpp inference failed.
+    #[error("Whisper inference failed: {reason}")]
+    Inference {
+        /// Bounded whisper.cpp diagnostic.
+        reason: String,
+    },
+    /// Whisper returned no usable text for a VAD-confirmed segment.
+    #[error("Whisper returned an empty final transcript")]
+    EmptyTranscript,
+    /// A recognizer implementation violated the rolling/final transcript contract.
+    #[error("speech recognizer contract failed: {reason}")]
+    Contract {
+        /// Bounded contract diagnostic.
+        reason: String,
+    },
+    /// The supplied PCM value itself is invalid.
+    #[error(transparent)]
+    Pcm(#[from] PcmError),
+}
+
+/// Capture-worker, endpointing, and recognizer outcomes.
+#[derive(Debug, Error)]
+pub enum CaptureError {
+    /// Input-device construction or runtime failure.
+    #[error(transparent)]
+    Device(#[from] DeviceError),
+    /// Worker-side normalization or resampling failure.
+    #[error(transparent)]
+    Resample(#[from] ResampleError),
+    /// Resident speech-recognition failure.
+    #[error(transparent)]
+    Recognition(#[from] SttError),
+    /// A raw ring sample did not match the negotiated device format.
+    #[error("capture sample format changed from {expected:?} to {actual:?}")]
+    SampleFormatMismatch {
+        /// Native representation fixed when the stream opened.
+        expected: SampleFormat,
+        /// Representation observed by the worker.
+        actual: SampleFormat,
+    },
+    /// A native floating-point input sample was NaN or infinite.
+    #[error("capture input contained a non-finite f32 sample")]
+    NonFiniteInput,
+    /// The callback ring filled while an explicit capture request was armed.
+    #[error(
+        "capture ring overflowed in {callbacks} callback(s), dropping {dropped_samples} native samples"
+    )]
+    RingOverflow {
+        /// Callback invocations that overflowed during this request.
+        callbacks: u64,
+        /// Native interleaved samples dropped during this request.
+        dropped_samples: u64,
+    },
+    /// A VAD-confirmed utterance exceeded the fixed memory bound.
+    #[error("captured utterance exceeded the fixed {maximum_ms} ms bound")]
+    UtteranceTooLong {
+        /// Literal maximum accepted utterance duration.
+        maximum_ms: u64,
+    },
+    /// The caller's bounded wait elapsed without a final transcript.
+    #[error("capture timed out after {milliseconds} ms without a final transcript")]
+    Timeout {
+        /// Caller-selected wait bound.
+        milliseconds: u128,
+    },
+    /// The owned capture worker panicked.
+    #[error("capture worker panicked")]
+    WorkerPanicked,
+    /// The operating system rejected construction of the sole capture worker.
+    #[error("cannot start capture worker thread: {reason}")]
+    WorkerThreadStart {
+        /// Bounded operating-system thread diagnostic.
+        reason: String,
+    },
+    /// The capture result channel closed without a typed terminal outcome.
+    #[error("capture worker stopped without a terminal outcome")]
+    WorkerStopped,
+    /// The capture session was explicitly closed.
+    #[error("capture session is closed")]
+    Closed,
+}
+
 /// Warm synthesis setup and inference failures.
 #[derive(Debug, Error)]
 pub enum SynthError {
@@ -240,22 +379,66 @@ pub enum DeviceError {
         /// Requested callback period before device-range clamping.
         preferred_buffer_frames: u32,
     },
+    /// Persistent capture was configured with a zero capacity or period.
+    #[error(
+        "capture ring capacity ({capacity_samples}) and preferred buffer frames ({preferred_buffer_frames}) must be nonzero"
+    )]
+    InvalidCaptureConfig {
+        /// Requested raw-sample ring capacity.
+        capacity_samples: usize,
+        /// Requested callback period before device-range clamping.
+        preferred_buffer_frames: u32,
+    },
+    /// The raw capture ring cannot hold one complete native frame.
+    #[error(
+        "capture ring capacity ({capacity_samples} samples) is smaller than one {channels}-channel frame"
+    )]
+    CaptureRingTooSmall {
+        /// Fixed ring capacity.
+        capacity_samples: usize,
+        /// Negotiated native input channels.
+        channels: u16,
+    },
     /// The host has no default output device.
     #[error("no default output device is available")]
     NoOutputDevice,
+    /// The host has no default input device.
+    #[error("no default input device is available")]
+    NoInputDevice,
+    /// An explicitly selected input device is not present.
+    #[error("input device is not available: {device_id}")]
+    InputDeviceNotFound {
+        /// Backend-qualified cpal device identifier.
+        device_id: String,
+    },
     /// Device capabilities could not be queried.
     #[error("cannot query output device capabilities: {reason}")]
     DeviceQuery {
         /// cpal diagnostic.
         reason: String,
     },
+    /// Input-device capabilities could not be queried.
+    #[error("cannot query input device capabilities: {reason}")]
+    InputDeviceQuery {
+        /// Bounded cpal diagnostic.
+        reason: String,
+    },
     /// The live device's native sample representation is unsupported.
     #[error("output device offers no f32, i16, or u16 stream format")]
     UnsupportedOutputFormat,
+    /// The live input device has no supported native representation.
+    #[error("input device offers no f32, i16, or u16 stream format")]
+    UnsupportedInputFormat,
     /// The persistent output stream could not be built.
     #[error("cannot build persistent output stream: {reason}")]
     StreamBuild {
         /// cpal diagnostic.
+        reason: String,
+    },
+    /// The persistent input stream could not be built.
+    #[error("cannot build persistent input stream: {reason}")]
+    InputStreamBuild {
+        /// Bounded cpal diagnostic.
         reason: String,
     },
     /// The persistent output stream could not be started.
@@ -264,9 +447,18 @@ pub enum DeviceError {
         /// cpal diagnostic.
         reason: String,
     },
+    /// The persistent input stream could not be started.
+    #[error("cannot start persistent input stream: {reason}")]
+    InputStreamStart {
+        /// Bounded cpal diagnostic.
+        reason: String,
+    },
     /// The device invalidated the live stream.
     #[error("persistent output stream failed")]
     StreamFailed,
+    /// The input device invalidated the live stream.
+    #[error("persistent input stream failed")]
+    InputStreamFailed,
     /// The callback observed PCM without matching published sentence metadata.
     #[error("persistent output callback observed an invalid PCM boundary")]
     CallbackContract,

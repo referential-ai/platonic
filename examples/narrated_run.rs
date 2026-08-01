@@ -9,7 +9,10 @@ use std::{
 };
 
 use plato_agent::{ApprovalMode, RunLedger, RunOptions, RunOverrides, VoiceSession};
-use plato_audio::{KokoroConfig, PlaybackConfig, SentenceCutter};
+use plato_audio::{
+    CaptureConfig, InputDeviceSelection, KokoroConfig, PlaybackConfig, SentenceCutter,
+    WhisperConfig, capture_devices,
+};
 use serde::Serialize;
 
 const DEFAULT_QUESTION: &str =
@@ -25,18 +28,45 @@ struct ProofOutput {
     model: plato_audio::KokoroProvenance,
     output: plato_audio::PlaybackDeviceInfo,
     narration: plato_agent::NarrationReport,
-    shutdown: plato_audio::SynthWorkerShutdown,
+    capture: Option<CaptureProof>,
+    shutdown: plato_agent::VoiceSessionShutdown,
     synthesis_overlapped_playback: bool,
 }
 
+#[derive(Serialize)]
+struct CaptureProof {
+    timing_boundary: &'static str,
+    report: plato_audio::CaptureReport,
+    model: plato_audio::WhisperProvenance,
+    input: plato_audio::CaptureDeviceInfo,
+    recognizer_metrics: plato_audio::WhisperMetrics,
+    capture_metrics: plato_audio::CaptureMetrics,
+    raw_audio_retained: bool,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    if std::env::args().any(|argument| argument == "--list-input-devices") {
+        println!("{}", serde_json::to_string_pretty(&capture_devices()?)?);
+        return Ok(());
+    }
     let Some(arguments) = Arguments::read()? else {
         return Ok(());
     };
-    let mut voice = VoiceSession::open(
-        KokoroConfig::from_model_dir(arguments.model_dir),
-        PlaybackConfig::default(),
-    )?;
+    let mut voice = match arguments.whisper_model.clone() {
+        Some(model) => VoiceSession::open_with_capture(
+            KokoroConfig::from_model_dir(arguments.model_dir.clone()),
+            PlaybackConfig::default(),
+            WhisperConfig::new(model),
+            CaptureConfig::for_device(match arguments.input_device.clone() {
+                Some(device_id) => InputDeviceSelection::Id(device_id),
+                None => InputDeviceSelection::Default,
+            }),
+        )?,
+        None => VoiceSession::open(
+            KokoroConfig::from_model_dir(arguments.model_dir.clone()),
+            PlaybackConfig::default(),
+        )?,
+    };
     let ledger = arguments.events.unwrap_or_else(|| {
         std::env::temp_dir().join(format!("plato-narrated-run-{}.jsonl", std::process::id()))
     });
@@ -45,7 +75,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .as_ref()
         .map(|fixture| fixture.config_path.clone())
         .or(arguments.config);
-    let outcome = voice.run_question(RunOptions {
+    let options = RunOptions {
         question: arguments.question,
         config_path,
         overrides: RunOverrides::default(),
@@ -59,13 +89,55 @@ fn main() -> Result<(), Box<dyn Error>> {
         event_sender: None,
         stream_to_stderr: true,
         cancel: None,
-    })?;
+    };
+    let (run, narration, capture) = if arguments.whisper_model.is_some() {
+        let outcome = voice.capture_question(options, arguments.capture_timeout)?;
+        let capture = CaptureProof {
+            timing_boundary: "fixed-threshold VAD close through one final Transcript; resident model load excluded",
+            report: outcome.capture,
+            model: voice
+                .recognizer_provenance()
+                .expect("capture session retains recognizer provenance")
+                .clone(),
+            input: voice
+                .capture_device_info()
+                .expect("capture session retains input device")
+                .clone(),
+            recognizer_metrics: voice
+                .recognizer_metrics()
+                .expect("capture session retains recognizer metrics"),
+            capture_metrics: voice
+                .capture_metrics()
+                .expect("capture session retains capture metrics"),
+            raw_audio_retained: false,
+        };
+        if capture.recognizer_metrics.model_loads != 1
+            || capture.recognizer_metrics.finalizations != 1
+            || capture.capture_metrics.stream_opens != 1
+            || capture.capture_metrics.worker_threads != 1
+            || capture.capture_metrics.transcripts != 1
+            || capture.capture_metrics.overflow.samples != 0
+        {
+            return Err(format!(
+                "capture reuse/overflow assertion failed: recognizer={:?}, capture={:?}",
+                capture.recognizer_metrics, capture.capture_metrics
+            )
+            .into());
+        }
+        (
+            outcome.narrated.run,
+            outcome.narrated.narration,
+            Some(capture),
+        )
+    } else {
+        let outcome = voice.run_question(options)?;
+        (outcome.run, outcome.narration, None)
+    };
     if let Some(fixture) = fixture {
         fixture.finish()?;
     }
-    let expected = cut_sentences(&outcome.run.final_answer);
-    let narrated = outcome
-        .narration
+    let expected = cut_sentences(&run.final_answer);
+    let narrated = narration
         .sentences
         .iter()
         .map(|report| report.sentence.clone())
@@ -76,15 +148,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    let synthesis_overlapped_playback = outcome.narration.sentences.windows(2).all(|pair| {
+    let synthesis_overlapped_playback = narration.sentences.windows(2).all(|pair| {
         pair[1].playback.synth_started_ns < pair[0].playback.pcm_end_ns
             && pair[1].playback.synth_finished_ns > pair[0].playback.first_pcm_ns
     });
     if !synthesis_overlapped_playback {
         return Err("narrated fixture did not overlap synthesis N+1 with playback N".into());
     }
-    if outcome
-        .narration
+    if narration
         .sentences
         .iter()
         .skip(1)
@@ -96,9 +167,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output = voice.device_info().clone();
     let shutdown = voice.shutdown()?;
     let proof = ProofOutput {
-        schema: "plato_agent.narrated_run.v2",
-        run_id: outcome.run.run_id.to_string(),
-        final_answer: outcome.run.final_answer,
+        schema: "plato_agent.narrated_run.v3",
+        run_id: run.run_id.to_string(),
+        final_answer: run.final_answer,
         ledger: ledger.display().to_string(),
         provider: if arguments.fixture {
             "credential-free-loopback-fixture"
@@ -107,7 +178,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
         model,
         output,
-        narration: outcome.narration,
+        narration,
+        capture,
         shutdown,
         synthesis_overlapped_playback,
     };
@@ -135,6 +207,9 @@ struct Arguments {
     workspace_root: PathBuf,
     question: String,
     fixture: bool,
+    whisper_model: Option<PathBuf>,
+    input_device: Option<String>,
+    capture_timeout: Duration,
 }
 
 impl Arguments {
@@ -145,6 +220,9 @@ impl Arguments {
         let mut workspace_root = std::env::current_dir()?;
         let mut question = Vec::new();
         let mut fixture = false;
+        let mut whisper_model = None;
+        let mut input_device = None;
+        let mut capture_timeout = Duration::from_secs(30);
         let mut arguments = std::env::args().skip(1);
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -168,19 +246,48 @@ impl Arguments {
                         PathBuf::from(arguments.next().ok_or("--workspace-root requires a path")?);
                 }
                 "--fixture" => fixture = true,
+                "--whisper-model" => {
+                    whisper_model = Some(PathBuf::from(
+                        arguments.next().ok_or("--whisper-model requires a path")?,
+                    ));
+                }
+                "--input-device" => {
+                    input_device = Some(
+                        arguments
+                            .next()
+                            .ok_or("--input-device requires a cpal device ID")?,
+                    );
+                }
+                "--capture-timeout-seconds" => {
+                    let seconds = arguments
+                        .next()
+                        .ok_or("--capture-timeout-seconds requires an integer")?
+                        .parse::<u64>()?;
+                    if seconds == 0 {
+                        return Err("--capture-timeout-seconds must be greater than zero".into());
+                    }
+                    capture_timeout = Duration::from_secs(seconds);
+                }
                 "-h" | "--help" => {
                     println!(
                         "Usage: narrated_run --model-dir PATH [--config PATH] [--events PATH]\n\
                          \x20      [--workspace-root PATH] [--fixture] [QUESTION ...]\n\
+                         \x20      [--whisper-model PATH] [--input-device CPAL_ID]\n\
+                         \x20      [--capture-timeout-seconds N]\n\
+                         \x20      narrated_run --list-input-devices\n\
                          \n\
                          PLATO_AUDIO_KOKORO_DIR may provide the model directory. With no QUESTION,\n\
                          a fixed two-sentence no-tools prompt is used. --fixture uses a local SSE\n\
-                         provider and requires PLATO_AUDIO_FIXTURE_KEY=local-proof."
+                         provider and requires PLATO_AUDIO_FIXTURE_KEY=local-proof. Supplying\n\
+                         --whisper-model arms exactly one explicit microphone question."
                     );
                     return Ok(None);
                 }
                 value => question.push(value.to_owned()),
             }
+        }
+        if input_device.is_some() && whisper_model.is_none() {
+            return Err("--input-device requires --whisper-model".into());
         }
         let model_dir = model_dir.ok_or(
             "provide --model-dir PATH or set PLATO_AUDIO_KOKORO_DIR to the pinned artifact directory",
@@ -196,6 +303,9 @@ impl Arguments {
                 question.join(" ")
             },
             fixture,
+            whisper_model,
+            input_device,
+            capture_timeout,
         }))
     }
 }
