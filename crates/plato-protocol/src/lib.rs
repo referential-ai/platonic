@@ -7,6 +7,7 @@
 #![warn(missing_docs)]
 
 use platonic_core::{EffectClass, RecordedEvent};
+pub use platonic_core::{HarnessEvent, PolicyDecision};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use serde_json::Value;
 use std::fmt;
