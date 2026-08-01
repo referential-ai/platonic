@@ -90,7 +90,7 @@ A bounded agent unit (`AgentId`): not a personality blob, but an execution ident
 
 A durable execution instance. A run is event-log-first. Transcripts, metrics, replay, and audit views are derived from events. The run loop lives in `run` as a pure state machine; hosts drive it. `RunCommand` (desired effects) is a separate type from `HarnessEvent` (recorded facts); replay applies events only, so it can never re-emit IO. An accepted `ContextCompacted` preserves the surrounding stable `RunPhase` while `pending_compaction_turn()` exposes the additional constraint that the matching `ContextBuilt` or a terminal failure must follow; no host command is pending between those events.
 
-`RunReadback` lives in `projection` as a small pure, all-visibility audit view over a recorded ledger. It validates the ledger by replaying each `RecordedEvent` through `RunState`, then projects chronological context fragments, model failures and messages, whole-batch proposal rejections, tool calls, tool results, policy denials, approval grants and denials, and tool failures. Every recorded tool result is retained with its `ResultVisibility` metadata; the view does not filter for a model or user audience. It does not store events, render output, execute tools, call providers, or read clocks.
+`RunReadback` lives in `projection` as a small pure, all-visibility audit view over a recorded ledger. It validates the ledger by replaying each `RecordedEvent` through `RunState`, then projects chronological context fragments, model failures and messages with their optional provider-reported served-model identity, whole-batch proposal rejections, tool calls, tool results, policy denials, approval grants and denials, and tool failures. Every recorded tool result is retained with its `ResultVisibility` metadata; the view does not filter for a model or user audience. It does not store events, render output, execute tools, call providers, or read clocks.
 
 ### ContextPack
 
@@ -153,6 +153,8 @@ The durable ledger. Initial events include:
 Events are recorded wrapped in `RecordedEvent { seq, occurred_at_ms, event }`; hosts supply both fields — core never reads clocks. `seq` is per-run and contiguous from 0; the run machine rejects gaps and regressions. Store append is idempotent on `(run_id, seq)`; ordering across runs is a store concern. Correlation: tool events carry `call_id`; model request/response pairs carry a per-run `step` counter. Ledger variants are never cargo-feature-gated: one schema, always readable.
 
 `model_responded.usage` keeps its 0.1 object shape when known, including reported zero counts, and is `null` when usage is unknown.
+
+`model_responded.served_model` retains the validated provider-reported model identity when one is available. Unknown served identity is canonically omitted; pre-field 0.3.0 events decode it as `None` and re-encode without gaining a field. This response fact never affects run transitions, policy, fallback, or routing, and the host-selected request alias remains separately recorded on `model_requested.model`.
 
 `context_compacted` records a non-empty prior-turn range and must be followed by `context_built` for the same turn, or by `run_failed`. It emits no command and leaves the public run phase unchanged.
 

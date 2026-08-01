@@ -99,6 +99,14 @@ pub enum HarnessEvent {
         output: Message,
         /// Unvalidated model proposals; an empty list concludes the turn.
         proposed_calls: Vec<ToolProposal>,
+        /// Provider-reported model that served the response, when available.
+        ///
+        /// This is an auditable response fact. The host-selected request model
+        /// remains recorded separately on [`HarnessEvent::ModelRequested`].
+        /// Unknown values are omitted so pre-field 0.3.0 records round-trip
+        /// without gaining a field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_model: Option<ModelName>,
         /// Provider-reported token usage, or `None` when usage is unknown.
         ///
         /// Reported zero counts remain known usage rather than `None`.
@@ -248,6 +256,7 @@ mod tests {
         r#"{"event":"run_started","run_id":"run_1","agent_id":"agent_1"}"#;
     const REJECTED_UNKNOWN_FIELD_HARNESS_EVENT_JSON: &str =
         r#"{"event":"run_started","run_id":"run_1","agent_id":"agent_1","future_field":true}"#;
+    const PRE_FIELD_V0_3_0_MODEL_RESPONDED_JSON: &str = r#"{"seq":7,"occurred_at_ms":1700000000000,"event":{"event":"model_responded","run_id":"run_1","turn_id":"turn_1","step":1,"output":{"role":"assistant","content":"Done."},"proposed_calls":[],"usage":{"input_tokens":12,"output_tokens":4}}}"#;
 
     #[test]
     fn harness_event_json_schema_is_fail_closed_and_v0_2_0_compatible() {
@@ -331,6 +340,7 @@ mod tests {
                     tool: tool.clone(),
                     input: json!({ "path": "README.md" }),
                 }],
+                served_model: Some(ModelName::new("provider/model_1-2026-07-31").unwrap()),
                 usage: Some(ModelUsage {
                     input_tokens: 12,
                     output_tokens: 4,
@@ -488,6 +498,7 @@ mod tests {
                                 "input": { "path": "README.md" }
                             }
                         ],
+                        "served_model": "provider/model_1-2026-07-31",
                         "usage": {
                             "input_tokens": 12,
                             "output_tokens": 4
@@ -712,6 +723,7 @@ mod tests {
                         content: "Done.".into(),
                     },
                     proposed_calls: vec![],
+                    served_model: None,
                     usage,
                 },
             };
@@ -724,5 +736,133 @@ mod tests {
                 "failed to encode {name} usage fixture"
             );
         }
+    }
+
+    #[test]
+    fn served_model_json_fixtures_are_bidirectional_and_v0_3_0_compatible() {
+        let fixtures = [
+            (
+                "known",
+                json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "model_responded",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 1,
+                        "output": {
+                            "role": "assistant",
+                            "content": "Done."
+                        },
+                        "proposed_calls": [],
+                        "served_model": "openai/gpt-5.2-2026-07-31",
+                        "usage": null
+                    }
+                }),
+                Some(ModelName::new("openai/gpt-5.2-2026-07-31").unwrap()),
+            ),
+            (
+                "unknown",
+                json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "model_responded",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 1,
+                        "output": {
+                            "role": "assistant",
+                            "content": "Done."
+                        },
+                        "proposed_calls": [],
+                        "usage": null
+                    }
+                }),
+                None,
+            ),
+        ];
+
+        for (name, fixture, served_model) in fixtures {
+            let expected = RecordedEvent {
+                seq: 7,
+                occurred_at_ms: 1_700_000_000_000,
+                event: HarnessEvent::ModelResponded {
+                    run_id: RunId::new("run_1").unwrap(),
+                    turn_id: TurnId::new("turn_1").unwrap(),
+                    step: 1,
+                    output: Message {
+                        role: MessageRole::Assistant,
+                        content: "Done.".into(),
+                    },
+                    proposed_calls: vec![],
+                    served_model,
+                    usage: None,
+                },
+            };
+            let decoded: RecordedEvent = serde_json::from_value(fixture.clone()).unwrap();
+
+            assert_eq!(decoded, expected, "failed to decode {name} fixture");
+            assert_eq!(
+                serde_json::to_value(&expected).unwrap(),
+                fixture,
+                "failed to encode {name} fixture"
+            );
+        }
+
+        let pre_field_fixture =
+            serde_json::from_str::<serde_json::Value>(PRE_FIELD_V0_3_0_MODEL_RESPONDED_JSON)
+                .unwrap();
+        let decoded: RecordedEvent = serde_json::from_value(pre_field_fixture.clone()).unwrap();
+        let expected = RecordedEvent {
+            seq: 7,
+            occurred_at_ms: 1_700_000_000_000,
+            event: HarnessEvent::ModelResponded {
+                run_id: RunId::new("run_1").unwrap(),
+                turn_id: TurnId::new("turn_1").unwrap(),
+                step: 1,
+                output: Message {
+                    role: MessageRole::Assistant,
+                    content: "Done.".into(),
+                },
+                proposed_calls: vec![],
+                served_model: None,
+                usage: Some(ModelUsage {
+                    input_tokens: 12,
+                    output_tokens: 4,
+                }),
+            },
+        };
+
+        assert_eq!(decoded, expected);
+        assert_eq!(serde_json::to_value(expected).unwrap(), pre_field_fixture);
+    }
+
+    #[test]
+    fn served_model_reuses_model_name_validation() {
+        let mut fixture = json!({
+            "seq": 7,
+            "occurred_at_ms": 1_700_000_000_000_u64,
+            "event": {
+                "event": "model_responded",
+                "run_id": "run_1",
+                "turn_id": "turn_1",
+                "step": 1,
+                "output": {
+                    "role": "assistant",
+                    "content": "Done."
+                },
+                "proposed_calls": [],
+                "served_model": " ",
+                "usage": null
+            }
+        });
+        let error = serde_json::from_value::<RecordedEvent>(fixture.clone()).unwrap_err();
+
+        assert!(error.to_string().contains("ModelName cannot be empty"));
+
+        fixture["event"]["served_model"] = json!(7);
+        assert!(serde_json::from_value::<RecordedEvent>(fixture).is_err());
     }
 }

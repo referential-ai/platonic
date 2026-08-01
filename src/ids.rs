@@ -57,7 +57,10 @@ id_type!(
     "Identifier for a durable artifact emitted by a run."
 );
 id_type!(ToolName, "Stable registered tool name.");
-id_type!(ModelName, "Stable model identifier as selected by policy.");
+id_type!(
+    ModelName,
+    "Stable model identifier selected for a request or reported for a response."
+);
 id_type!(ActorId, "Identifier for a human or host approval actor.");
 
 #[cfg(test)]

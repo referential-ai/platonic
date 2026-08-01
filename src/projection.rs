@@ -1,8 +1,8 @@
 //! Pure readback projections derived from recorded run events.
 
 use crate::{
-    ActorId, ContextFragment, Error, HarnessEvent, Message, PolicyDecision, RecordedEvent,
-    RunPhase, RunState, ToolCall, ToolCallId, ToolResult, TurnId,
+    ActorId, ContextFragment, Error, HarnessEvent, Message, ModelName, PolicyDecision,
+    RecordedEvent, RunPhase, RunState, ToolCall, ToolCallId, ToolResult, TurnId,
 };
 
 /// Replay-validated, all-visibility audit view for one run ledger.
@@ -67,6 +67,8 @@ pub enum ReadbackEntry {
         turn_id: TurnId,
         /// Normalized model-authored message.
         message: Message,
+        /// Provider-reported model that served the response, when available.
+        served_model: Option<ModelName>,
     },
     /// Model request failed without terminating the run.
     ModelFailed {
@@ -157,11 +159,15 @@ fn collect_entry(event: &HarnessEvent, entries: &mut Vec<ReadbackEntry>) {
             }));
         }
         HarnessEvent::ModelResponded {
-            turn_id, output, ..
+            turn_id,
+            output,
+            served_model,
+            ..
         } => {
             entries.push(ReadbackEntry::ModelMessage {
                 turn_id: turn_id.clone(),
                 message: output.clone(),
+                served_model: served_model.clone(),
             });
         }
         HarnessEvent::ModelFailed {
@@ -333,6 +339,16 @@ mod tests {
         content: &str,
         proposed_calls: Vec<ToolProposal>,
     ) -> HarnessEvent {
+        model_responded_with_served_model(turn_id, step, content, proposed_calls, None)
+    }
+
+    fn model_responded_with_served_model(
+        turn_id: TurnId,
+        step: u32,
+        content: &str,
+        proposed_calls: Vec<ToolProposal>,
+        served_model: Option<ModelName>,
+    ) -> HarnessEvent {
         HarnessEvent::ModelResponded {
             run_id: run_id(),
             turn_id,
@@ -342,6 +358,7 @@ mod tests {
                 content: content.into(),
             },
             proposed_calls,
+            served_model,
             usage: usage(),
         }
     }
@@ -432,18 +449,35 @@ mod tests {
                         role: MessageRole::Assistant,
                         content: "done".into(),
                     },
+                    served_model: None,
                 },
             ]
         );
     }
 
     #[test]
-    fn one_turn_ledger_projects_context_message_and_final_state() {
+    fn pre_field_v0_3_0_response_replays_as_unknown_served_model() {
+        let pre_field_response = serde_json::from_value(json!({
+            "event": "model_responded",
+            "run_id": "run_1",
+            "turn_id": "turn_1",
+            "step": 0,
+            "output": {
+                "role": "assistant",
+                "content": "It is a README."
+            },
+            "proposed_calls": [],
+            "usage": {
+                "input_tokens": 20,
+                "output_tokens": 8
+            }
+        }))
+        .unwrap();
         let events = vec![
             start_event(0),
             rec(1, context(turn_id(), "What is in README?")),
             rec(2, model_requested(turn_id(), 0)),
-            rec(3, model_responded(turn_id(), 0, "It is a README.", vec![])),
+            rec(3, pre_field_response),
             rec(4, HarnessEvent::RunFinished { run_id: run_id() }),
         ];
 
@@ -469,8 +503,57 @@ mod tests {
                         role: MessageRole::Assistant,
                         content: "It is a README.".into(),
                     },
+                    served_model: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn request_alias_and_served_model_remain_distinct_and_visible() {
+        let request_alias = ModelName::new("~openai/gpt-latest").unwrap();
+        let served_model = ModelName::new("openai/gpt-5.2-2026-07-31").unwrap();
+        let events = vec![
+            start_event(0),
+            rec(1, context(turn_id(), "Answer the question")),
+            rec(
+                2,
+                HarnessEvent::ModelRequested {
+                    run_id: run_id(),
+                    turn_id: turn_id(),
+                    step: 0,
+                    model: request_alias.clone(),
+                },
+            ),
+            rec(
+                3,
+                model_responded_with_served_model(
+                    turn_id(),
+                    0,
+                    "Done.",
+                    vec![],
+                    Some(served_model.clone()),
+                ),
+            ),
+            rec(4, HarnessEvent::RunFinished { run_id: run_id() }),
+        ];
+
+        assert!(matches!(
+            &events[2].event,
+            HarnessEvent::ModelRequested { model, .. } if model == &request_alias
+        ));
+
+        let readback = RunReadback::from_events(&events).unwrap();
+        assert_eq!(
+            readback.entries.last().cloned(),
+            Some(ReadbackEntry::ModelMessage {
+                turn_id: turn_id(),
+                message: Message {
+                    role: MessageRole::Assistant,
+                    content: "Done.".into(),
+                },
+                served_model: Some(served_model),
+            })
         );
     }
 
@@ -513,6 +596,7 @@ mod tests {
                         role: MessageRole::Assistant,
                         content: "It is a README.".into(),
                     },
+                    served_model: None,
                 },
             ]
         );
@@ -589,6 +673,7 @@ mod tests {
                         role: MessageRole::Assistant,
                         content: "I will read it.".into(),
                     },
+                    served_model: None,
                 },
                 ReadbackEntry::ToolCall {
                     turn_id: turn_id(),
@@ -610,6 +695,7 @@ mod tests {
                         role: MessageRole::Assistant,
                         content: "README was read.".into(),
                     },
+                    served_model: None,
                 },
             ]
         );
@@ -667,6 +753,7 @@ mod tests {
                         role: MessageRole::Assistant,
                         content: "I will read it.".into(),
                     },
+                    served_model: None,
                 },
                 ReadbackEntry::ToolProposalsRejected {
                     turn_id: turn_id(),
@@ -687,6 +774,7 @@ mod tests {
                         role: MessageRole::Assistant,
                         content: "Understood.".into(),
                     },
+                    served_model: None,
                 },
             ]
         );

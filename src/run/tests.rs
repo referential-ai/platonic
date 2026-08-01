@@ -223,6 +223,17 @@ fn model_responded_with(
     output: &str,
     proposed_calls: Vec<ToolProposal>,
 ) -> RecordedEvent {
+    model_responded_with_served_model(seq, turn_id, step, output, proposed_calls, None)
+}
+
+fn model_responded_with_served_model(
+    seq: u64,
+    turn_id: TurnId,
+    step: u32,
+    output: &str,
+    proposed_calls: Vec<ToolProposal>,
+    served_model: Option<ModelName>,
+) -> RecordedEvent {
     rec(
         seq,
         HarnessEvent::ModelResponded {
@@ -234,6 +245,7 @@ fn model_responded_with(
                 content: output.into(),
             },
             proposed_calls,
+            served_model,
             usage: usage(),
         },
     )
@@ -707,6 +719,40 @@ fn model_failure_reemits_identical_request_and_step_advances_only_on_response() 
         .apply(&rec(9, HarnessEvent::RunFinished { run_id: run_id() }))
         .unwrap();
     assert_eq!(state.phase(), &RunPhase::Finished);
+}
+
+#[test]
+fn served_model_does_not_change_run_state_or_pending_commands() {
+    let awaiting = apply_all(&[start_event(0), context_event(1), model_requested(2)]);
+
+    for proposed_calls in [vec![], vec![proposal()]] {
+        let mut unknown = awaiting.clone();
+        unknown
+            .apply(&model_responded_with_served_model(
+                3,
+                turn_id(),
+                0,
+                "done",
+                proposed_calls.clone(),
+                None,
+            ))
+            .unwrap();
+
+        let mut known = awaiting.clone();
+        known
+            .apply(&model_responded_with_served_model(
+                3,
+                turn_id(),
+                0,
+                "done",
+                proposed_calls,
+                Some(ModelName::new("provider/model-2026-07-31").unwrap()),
+            ))
+            .unwrap();
+
+        assert_eq!(known, unknown);
+        assert_eq!(known.pending_command(), unknown.pending_command());
+    }
 }
 
 #[test]
