@@ -159,8 +159,31 @@ cargo test --release --locked -p plato-audio \
   silero_strictly_reduces_au3_false_cuts_without_missing_speech -- --ignored --nocapture
 
 # Twenty warm RTX 4090 trials: live partial p95 <=200 ms, final p95 <=120 ms:
-cargo test --release --locked --features whisper-cuda \
-  twenty_warm_rtx4090_live_partial_and_final_trials_meet_au4_bounds -- --ignored --nocapture
+ffmpeg -hide_banner -loglevel error -y -stream_loop 23 \
+  -i crates/plato-audio/fixtures/au4/speech-plus-noise.wav \
+  -f s16le -acodec pcm_s16le -ac 1 -ar 16000 \
+  /tmp/plato-329-au4-cpal-24x.raw
+(
+  module_id=$(pactl load-module module-null-sink \
+    sink_name=plato_au4_timing rate=48000 channels=2)
+  pacat --playback --raw --device=plato_au4_timing --rate=16000 \
+    --channels=1 --format=s16le </tmp/plato-329-au4-cpal-24x.raw &
+  feeder_pid=$!
+  trap 'kill "$feeder_pid" 2>/dev/null || true; wait "$feeder_pid" 2>/dev/null || true; pactl unload-module "$module_id"' EXIT
+  PULSE_SOURCE=plato_au4_timing.monitor \
+  PLATO_AUDIO_PULSE_MODULE_ID="$module_id" \
+  PLATO_AUDIO_PULSE_FEEDER_PID="$feeder_pid" \
+  PLATO_AUDIO_RECORDED_FIXTURE_RAW=/tmp/plato-329-au4-cpal-24x.raw \
+    cargo test --release --locked --features whisper-cuda \
+    twenty_warm_rtx4090_live_partial_and_final_trials_meet_au4_bounds -- --ignored --nocapture
+)
+
+# Exact 24.859-second transcript plus 20 warm bounded final-window decodes:
+cargo test --release --locked -p plato-audio --features whisper-cuda \
+  long_utterance_final_is_bounded_and_preserves_exact_stable_text -- --ignored
+cargo test --release --locked -p plato-audio --features whisper-cuda \
+  twenty_long_utterance_finals_are_bounded_and_preserve_exact_stable_text \
+  -- --ignored --nocapture
 
 # Inspect input IDs without changing the host default audio policy:
 cargo run --locked --example narrated_run -- --list-input-devices
@@ -178,12 +201,21 @@ device, PCM, worker, callback, sentence-order, gap, overlap, or teardown errors.
 AU4 opens one persistent input stream and one worker, normalizes/resamples on
 the worker, and runs a warm Silero session through the ONNX Runtime owner shared
 with Kokoro. The resident CUDA recognizer re-decodes only a bounded five-second
-window. Its non-final text replaces one live stderr line; only the single final
-transcript enters the existing run path. Ring overflow, device loss, worker
-panic, VAD failure, and recognition failure are typed terminal outcomes. The
-microphone form retains no raw audio; proof JSON contains transcripts, bounded
-metrics, and provenance. Model files and provider credentials are never
-written into the repository or proof JSON.
+pending window, commits only timestamp-bounded byte-stable prefixes outside a
+one-second overlap, and finalizes only the retained tail. Its non-final text
+replaces one live stderr line; only the single final transcript enters the
+existing run path. Ring overflow, device loss, worker panic, VAD failure, and
+recognition failure are typed terminal outcomes.
+
+The deterministic timing command selects a named PipeWire/Pulse null-sink
+monitor through the real production cpal/callback/rtrb/normalization path. The
+spoken payload is the recorded CC0 WAV, not a physical microphone or live human
+voice. Its partial clock starts at cpal callback entry and therefore includes
+ring wait and worker normalization; it does not claim analog, driver, device,
+or virtual-source pacing latency before that callback. The interactive
+microphone form retains no raw audio. Proof JSON contains transcripts, bounded
+metrics, and provenance. Model files and provider credentials are never written
+into the repository or proof JSON.
 
 ## 6. Run the test suite (no API key needed)
 

@@ -21,12 +21,18 @@ threshold `0.5`, four-frame minimum speech, and eight-frame hangover. The AU3
 threshold detector remains test-only as the pinned comparison baseline.
 
 While Silero holds an utterance open, the same worker feeds each gated frame to
-one resident Whisper large-v3-turbo state. Whisper re-decodes only the newest
-five seconds at a fixed 160 ms cadence after 320 ms of speech, suppresses empty
-or unchanged hypotheses, and returns typed `Transcript { is_final: false }`
-updates. Root replaces the active display line and starts no run until the one
-final transcript arrives at the Silero endpoint. There is no ambient
-recognition, barge-in, AEC, wake word, cloud fallback, or second recognizer.
+one resident Whisper large-v3-turbo state. Whisper re-decodes at a fixed 160 ms
+cadence after 320 ms of speech. It commits only byte-stable leading model text
+at validated timestamp boundaries outside a fixed one-second overlap, retains
+at most five seconds of pending PCM, and forces rollover before sample 80,001.
+If no stable boundary exists at that cap, recognition fails closed. Endpoint
+finalization decodes only the pending window and concatenates its exact text
+with the stable prefix; total span remains the full accepted PCM duration.
+Empty or unchanged hypotheses are suppressed and all rolling updates remain
+typed `Transcript { is_final: false }` values. Root replaces the active display
+line and starts no run until the one final transcript arrives at the Silero
+endpoint. There is no ambient recognition, barge-in, AEC, wake word, cloud
+fallback, or second recognizer.
 
 ## Pinned artifacts
 
@@ -128,15 +134,40 @@ PLATO_AUDIO_SILERO_MODEL="$PLATO_AUDIO_SILERO_MODEL" \
   cargo test --release --locked -p plato-audio \
   silero_strictly_reduces_au3_false_cuts_without_missing_speech -- --ignored --nocapture
 
-PLATO_AUDIO_KOKORO_DIR="$PLATO_AUDIO_KOKORO_DIR" \
-PLATO_AUDIO_SILERO_MODEL="$PLATO_AUDIO_SILERO_MODEL" \
-PLATO_AUDIO_WHISPER_MODEL="$whisper_model" \
-  cargo test --release --locked --features whisper-cuda \
-  twenty_warm_rtx4090_live_partial_and_final_trials_meet_au4_bounds -- --ignored --nocapture
+ffmpeg -hide_banner -loglevel error -y -stream_loop 23 \
+  -i crates/plato-audio/fixtures/au4/speech-plus-noise.wav \
+  -f s16le -acodec pcm_s16le -ac 1 -ar 16000 \
+  /tmp/plato-329-au4-cpal-24x.raw
+(
+  module_id=$(pactl load-module module-null-sink \
+    sink_name=plato_au4_timing rate=48000 channels=2)
+  pacat --playback --raw --device=plato_au4_timing --rate=16000 \
+    --channels=1 --format=s16le </tmp/plato-329-au4-cpal-24x.raw &
+  feeder_pid=$!
+  trap 'kill "$feeder_pid" 2>/dev/null || true; wait "$feeder_pid" 2>/dev/null || true; pactl unload-module "$module_id"' EXIT
+  PULSE_SOURCE=plato_au4_timing.monitor \
+  PLATO_AUDIO_PULSE_MODULE_ID="$module_id" \
+  PLATO_AUDIO_PULSE_FEEDER_PID="$feeder_pid" \
+  PLATO_AUDIO_RECORDED_FIXTURE_RAW=/tmp/plato-329-au4-cpal-24x.raw \
+  PLATO_AUDIO_KOKORO_DIR="$PLATO_AUDIO_KOKORO_DIR" \
+  PLATO_AUDIO_SILERO_MODEL="$PLATO_AUDIO_SILERO_MODEL" \
+  PLATO_AUDIO_WHISPER_MODEL="$whisper_model" \
+    cargo test --release --locked --features whisper-cuda \
+    twenty_warm_rtx4090_live_partial_and_final_trials_meet_au4_bounds -- --ignored --nocapture
+)
 
 PLATO_AUDIO_WHISPER_MODEL="$whisper_model" \
   cargo test --release --locked -p plato-audio --features whisper-cuda \
   au3_threshold_corpus_final_and_silence_regression_remains_exact -- --ignored
+
+PLATO_AUDIO_WHISPER_MODEL="$whisper_model" \
+  cargo test --release --locked -p plato-audio --features whisper-cuda \
+  long_utterance_final_is_bounded_and_preserves_exact_stable_text -- --ignored
+
+PLATO_AUDIO_WHISPER_MODEL="$whisper_model" \
+  cargo test --release --locked -p plato-audio --features whisper-cuda \
+  twenty_long_utterance_finals_are_bounded_and_preserve_exact_stable_text \
+  -- --ignored --nocapture
 
 CUDA_VISIBLE_DEVICES=-1 PLATO_AUDIO_WHISPER_MODEL="$whisper_model" \
   cargo test --locked -p plato-audio --features whisper-cuda \
@@ -171,11 +202,20 @@ The tracked `fixtures/au4` corpus is non-human CC0 audio with exact source,
 annotations, and checksums. Its scorer compares the AU3 threshold baseline and
 Silero sample by sample, reports both confusion matrices and endpoint deltas,
 and requires fewer false cuts without more missed speech. Its RTX 4090 proof
+paces repeated recorded WAV bytes into a named PipeWire/Pulse null-sink monitor
+and opens that virtual source through the production cpal capture worker. It
 excludes one warmup, runs 20 utterances through the same resident Silero and
-Whisper sessions, and requires partial p95 at most 200 ms plus VAD-close-to-final
-p95 at most 120 ms. The committed proof artifacts are
+Whisper sessions, and requires callback-entry-to-visible-partial p95 at most
+200 ms plus closing-VAD-evaluation-entry-to-visible-final p95 at most 120 ms.
+Those boundaries include rtrb, worker normalization, inference, channel
+delivery, and real root stderr TTY writes, but not audio time before cpal
+callback entry. This is recorded virtual input, not a physical-microphone or
+live-human-speech claim. The separate 24.859-second fixture proves 20 warm
+final-window decodes stay bounded while preserving the exact committed
+transcript. The committed proof artifacts are
 `../../docs/proofs/issue-329-vad-corpus.json` and
-`../../docs/proofs/issue-329-whisper-partials.json`.
+`../../docs/proofs/issue-329-whisper-partials.json`, plus
+`../../docs/proofs/issue-329-whisper-long-final.json`.
 
 The AU3 corpus remains an exact final-text and silence regression. A separate
 hidden-device test proves that compiled CUDA capability cannot admit

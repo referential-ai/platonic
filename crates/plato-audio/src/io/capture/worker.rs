@@ -18,8 +18,8 @@ use rtrb::{Consumer, RingBuffer};
 #[cfg(test)]
 use crate::DeviceBufferSize;
 use crate::{
-    AudioFormat, CaptureError, CaptureResampleReport, CaptureSample, DeviceError, PcmData,
-    PcmFrame, SampleFormat, SpeechRecognizer, SttError, Transcript, VoiceActivityDetector,
+    AudioFormat, CaptureError, CaptureResampleReport, DeviceError, PcmData, PcmFrame, SampleFormat,
+    SpeechRecognizer, SttError, Transcript, VoiceActivityDetector,
     core::{
         capture::CaptureNormalizer,
         vad::{NeuralVadEvent, NeuralVadState},
@@ -28,7 +28,7 @@ use crate::{
 
 use super::{
     CaptureConfig, CaptureCounters, CaptureDeviceInfo, CaptureMetrics, CaptureOverflow,
-    CapturePartial, CaptureReport, CaptureWorkerShutdown, bounded,
+    CapturePartial, CaptureReport, CaptureWorkerShutdown, TimedCaptureSample, bounded,
     device::{
         CallbackWriter, build_stream, sample_format, select_buffer_size, select_device,
         select_input_config,
@@ -397,7 +397,7 @@ impl ActiveCapture {
 }
 
 fn spawn_worker(
-    consumer: Consumer<CaptureSample>,
+    consumer: Consumer<TimedCaptureSample>,
     format: AudioFormat,
     detector: Box<dyn VoiceActivityDetector>,
     recognizer: Box<dyn SpeechRecognizer>,
@@ -424,7 +424,7 @@ fn spawn_worker(
 }
 
 fn spawn_worker_with<F>(
-    consumer: Consumer<CaptureSample>,
+    consumer: Consumer<TimedCaptureSample>,
     format: AudioFormat,
     engines: CaptureEngines,
     commands: Receiver<WorkerCommand>,
@@ -465,7 +465,7 @@ fn thread_start_error(error: std::io::Error) -> CaptureError {
 }
 
 fn run_worker(
-    mut consumer: Consumer<CaptureSample>,
+    mut consumer: Consumer<TimedCaptureSample>,
     format: AudioFormat,
     engines: CaptureEngines,
     commands: Receiver<WorkerCommand>,
@@ -480,6 +480,7 @@ fn run_worker(
     let mut active: Option<ActiveCapture> = None;
     let mut sequence = 0_u64;
     let mut drained = Vec::with_capacity(MAX_DRAIN_SAMPLES);
+    let mut native_samples = Vec::with_capacity(MAX_DRAIN_SAMPLES);
     loop {
         match commands.try_recv() {
             Ok(WorkerCommand::Capture { timeout, reply }) if active.is_none() => {
@@ -568,8 +569,14 @@ fn run_worker(
         let Some(capture) = active.as_mut() else {
             continue;
         };
+        let audio_available = drained
+            .first()
+            .expect("nonempty drain has one callback timestamp")
+            .available_at;
+        native_samples.clear();
+        native_samples.extend(drained.iter().map(|sample| sample.sample));
         let started = Instant::now();
-        let normalized = capture.normalizer.push(&drained);
+        let normalized = capture.normalizer.push(&native_samples);
         let elapsed_us = duration_us(started.elapsed());
         capture.normalization_resampling_us = capture
             .normalization_resampling_us
@@ -586,7 +593,7 @@ fn run_worker(
             }
         };
         update_conversion_counters(capture, &counters, report);
-        let audio_available = Instant::now();
+        let vad_evaluation_started_at = Instant::now();
         let events = match capture.vad.push(&samples, detector.as_mut()) {
             Ok(events) => events,
             Err(error) => {
@@ -629,7 +636,6 @@ fn run_worker(
                     }
                 }
                 NeuralVadEvent::Segment(segment) => {
-                    let close = Instant::now();
                     let overflow_at_close = counters.overflow();
                     let capture = active.take().expect("active capture exists");
                     let recognition = overflow_error(capture.overflow_at_arm, overflow_at_close)
@@ -641,7 +647,8 @@ fn run_worker(
                             transcript,
                             partials: capture.partials.clone(),
                             endpoint: segment.endpoint(),
-                            vad_close_to_final_us: duration_us(close.elapsed()),
+                            vad_close_to_final_us: duration_us(vad_evaluation_started_at.elapsed()),
+                            vad_evaluation_started_at,
                             normalization_resampling_us: capture.normalization_resampling_us,
                             input_frames: capture.input_frames,
                             output_frames: capture.output_frames,
@@ -791,7 +798,7 @@ fn whisper_format() -> AudioFormat {
     AudioFormat::new(16_000, 1, SampleFormat::F32).expect("literal worker format is valid")
 }
 
-fn drain_discard(consumer: &mut Consumer<CaptureSample>) {
+fn drain_discard(consumer: &mut Consumer<TimedCaptureSample>) {
     while consumer.pop().is_ok() {}
 }
 

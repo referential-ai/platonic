@@ -573,6 +573,7 @@ fn read_verified(
 
 fn map_session_error(error: SessionLoadError) -> SynthError {
     match error {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         SessionLoadError::Fallback { cuda, cpu } => SynthError::ModelLoadFallback { cuda, cpu },
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         SessionLoadError::Backend { backend, reason } => SynthError::ModelLoad { backend, reason },

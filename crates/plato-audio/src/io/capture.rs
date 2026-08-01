@@ -5,7 +5,7 @@ use std::{
 
 use serde::Serialize;
 
-use crate::{AudioFormat, DeviceBufferSize, DeviceError, Transcript, VadEndpoint};
+use crate::{AudioFormat, CaptureSample, DeviceBufferSize, DeviceError, Transcript, VadEndpoint};
 
 mod device;
 mod worker;
@@ -14,6 +14,12 @@ pub use device::capture_devices;
 pub use worker::CaptureWorker;
 #[cfg(all(test, feature = "whisper-cuda"))]
 pub(crate) use worker::recognize_segment;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TimedCaptureSample {
+    pub(super) sample: CaptureSample,
+    pub(super) available_at: Instant,
+}
 
 const DEFAULT_CAPACITY_SAMPLES: usize = 192_000;
 const DEFAULT_PREFERRED_BUFFER_FRAMES: u32 = 256;
@@ -160,9 +166,9 @@ pub struct CaptureMetrics {
 pub struct CapturePartial {
     /// Typed non-final recognizer hypothesis.
     pub transcript: Transcript,
-    /// Audio-frame availability through capture-worker delivery.
+    /// Earliest drained input-callback entry through capture-worker delivery.
     pub audio_available_to_partial_us: u64,
-    /// Audio-frame availability through root presentation, when rendered live.
+    /// Earliest drained input-callback entry through root presentation, when rendered live.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_available_to_visible_us: Option<u64>,
     #[serde(skip)]
@@ -201,8 +207,13 @@ pub struct CaptureReport {
     pub partials: Vec<CapturePartial>,
     /// Exact Silero VAD boundaries on the 16 kHz worker clock.
     pub endpoint: VadEndpoint,
-    /// VAD close through final transcript construction.
+    /// Closing VAD evaluation entry through final transcript construction.
+    ///
+    /// This conservative upper bound starts immediately before the `vad.push` call that emits
+    /// the endpoint, so it includes VAD evaluation and any earlier events in that result batch.
     pub vad_close_to_final_us: u64,
+    #[serde(skip)]
+    vad_evaluation_started_at: Instant,
     /// Worker-side normalization and resampling time for the request.
     pub normalization_resampling_us: u64,
     /// Complete native frames consumed for the request.
@@ -211,6 +222,13 @@ pub struct CaptureReport {
     pub output_frames: u64,
     /// Callback overflow snapshot when the transcript completed.
     pub overflow: CaptureOverflow,
+}
+
+impl CaptureReport {
+    /// Measures closing VAD evaluation entry through the caller's just-completed observation.
+    pub fn observed_final_latency_us(&self) -> u64 {
+        u64::try_from(self.vad_evaluation_started_at.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
 }
 
 /// Deterministic ownership proof returned after capture teardown.

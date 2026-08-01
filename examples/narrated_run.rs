@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (run, narration, capture) = if arguments.whisper_model.is_some() {
         let outcome = voice.capture_question(options, arguments.capture_timeout)?;
         let capture = CaptureProof {
-            timing_boundary: "Silero VAD close through one final Transcript; warm resident model/session loads excluded",
+            timing_boundary: "closing CaptureWorker vad.push evaluation entry through one final Transcript construction; warm resident model/session loads excluded",
             report: outcome.capture,
             model: voice
                 .recognizer_provenance()

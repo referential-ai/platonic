@@ -27,8 +27,8 @@ pub use playback::{
 pub use recognize::{
     SpeechRecognizer, Transcript, WHISPER_MODEL_REVISION, WHISPER_MODEL_SHA256,
     WHISPER_MODEL_SOURCE, WHISPER_PARTIAL_CADENCE_MS, WHISPER_PARTIAL_MINIMUM_MS,
-    WHISPER_PARTIAL_WINDOW_MS, WHISPER_RS_RUNTIME_VERSION, WhisperConfig, WhisperMetrics,
-    WhisperMetricsReader, WhisperProvenance, WhisperRecognizer,
+    WHISPER_PARTIAL_WINDOW_MS, WHISPER_RS_RUNTIME_VERSION, WHISPER_STABLE_OVERLAP_MS,
+    WhisperConfig, WhisperMetrics, WhisperMetricsReader, WhisperProvenance, WhisperRecognizer,
 };
 pub use runtime::{
     InferenceBackend, ORT_RUNTIME_VERSION, OrtRuntime, OrtRuntimeMetrics, OrtRuntimeMetricsReader,

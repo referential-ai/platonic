@@ -270,6 +270,7 @@ impl VoiceActivityDetector for SileroVad {
 
 fn map_session_error(error: SessionLoadError) -> VadError {
     match error {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         SessionLoadError::Fallback { cuda, cpu } => VadError::ModelLoadFallback { cuda, cpu },
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         SessionLoadError::Backend { backend, reason } => VadError::ModelLoad { backend, reason },

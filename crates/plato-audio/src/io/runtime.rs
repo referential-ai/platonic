@@ -192,10 +192,8 @@ pub(crate) struct ResidentSession {
 }
 
 pub(crate) enum SessionLoadError {
-    Fallback {
-        cuda: String,
-        cpu: String,
-    },
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    Fallback { cuda: String, cpu: String },
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     Backend {
         backend: InferenceBackend,

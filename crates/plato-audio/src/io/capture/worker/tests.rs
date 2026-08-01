@@ -2,8 +2,8 @@ use super::*;
 use std::sync::atomic::AtomicUsize;
 
 use crate::{
-    InferenceBackend, InputDeviceSelection, SILERO_HANGOVER_FRAMES, SILERO_MINIMUM_SPEECH_FRAMES,
-    SILERO_WINDOW_SAMPLES, VadError,
+    CaptureSample, InferenceBackend, InputDeviceSelection, SILERO_HANGOVER_FRAMES,
+    SILERO_MINIMUM_SPEECH_FRAMES, SILERO_WINDOW_SAMPLES, VadError,
 };
 
 struct FakeVad;
@@ -52,6 +52,12 @@ struct PanickingRecognizer {
     samples: usize,
 }
 
+struct DelayedPartialRecognizer {
+    samples: usize,
+    delay_at_sample: usize,
+    delay: Duration,
+}
+
 struct DropRecognizer {
     dropped: Arc<AtomicUsize>,
 }
@@ -95,6 +101,35 @@ impl SpeechRecognizer for PanickingRecognizer {
     fn finalize(&mut self) -> Result<Transcript, SttError> {
         assert!(self.samples > 0);
         panic!("synthetic recognizer panic")
+    }
+}
+
+impl SpeechRecognizer for DelayedPartialRecognizer {
+    fn input_format(&self) -> AudioFormat {
+        whisper_format()
+    }
+
+    fn accept(&mut self, _frame: &PcmFrame) -> Result<Vec<Transcript>, SttError> {
+        self.samples += 1;
+        if self.samples != self.delay_at_sample {
+            return Ok(Vec::new());
+        }
+        thread::sleep(self.delay);
+        Ok(vec![Transcript::new(
+            "delayed partial",
+            false,
+            self.samples as u64 * 1_000 / 16_000,
+        )?])
+    }
+
+    fn reset(&mut self) {
+        self.samples = 0;
+    }
+
+    fn finalize(&mut self) -> Result<Transcript, SttError> {
+        let span_ms = self.samples as u64 * 1_000 / 16_000;
+        self.samples = 0;
+        Transcript::new("delayed final", true, span_ms)
     }
 }
 
@@ -290,6 +325,46 @@ fn one_explicit_capture_returns_one_final_endpoint() {
     let shutdown = worker.shutdown();
     assert!(shutdown.worker_joined);
     assert!(shutdown.input_closed);
+}
+
+#[test]
+fn callback_and_vad_entry_clocks_include_worker_and_close_frame_partial_work() {
+    const DELAY: Duration = Duration::from_millis(30);
+    const MINIMUM_OBSERVED_US: u64 = 25_000;
+    let input = utterance();
+
+    let (partial_worker, partial_callback, _) = CaptureWorker::test_worker(
+        format(16_000, 1, SampleFormat::F32),
+        16_384,
+        FakeVad,
+        DelayedPartialRecognizer {
+            samples: 0,
+            delay_at_sample: 2_048,
+            delay: DELAY,
+        },
+    );
+    let partial_feeder = feed_after_arm(partial_callback, input.clone());
+    let partial_report = partial_worker.capture(Duration::from_secs(2)).unwrap();
+    partial_feeder.join().unwrap();
+    assert!(partial_report.partials[0].audio_available_to_partial_us >= MINIMUM_OBSERVED_US);
+    assert!(partial_worker.shutdown().worker_joined);
+
+    let (close_worker, close_callback, _) = CaptureWorker::test_worker(
+        format(16_000, 1, SampleFormat::F32),
+        16_384,
+        FakeVad,
+        DelayedPartialRecognizer {
+            samples: 0,
+            delay_at_sample: input.len(),
+            delay: DELAY,
+        },
+    );
+    let close_feeder = feed_after_arm(close_callback, input);
+    let close_report = close_worker.capture(Duration::from_secs(2)).unwrap();
+    close_feeder.join().unwrap();
+    assert_eq!(close_report.partials.len(), 1);
+    assert!(close_report.vad_close_to_final_us >= MINIMUM_OBSERVED_US);
+    assert!(close_worker.shutdown().worker_joined);
 }
 
 #[test]

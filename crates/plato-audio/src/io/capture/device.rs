@@ -2,6 +2,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Instant;
 
 use cpal::{
     BufferSize, SampleFormat as CpalSampleFormat, Stream, StreamConfig, SupportedBufferSize,
@@ -12,7 +13,9 @@ use rtrb::Producer;
 
 use crate::{CaptureSample, DeviceBufferSize, DeviceError, SampleFormat};
 
-use super::{CaptureCounters, CaptureDeviceDescriptor, InputDeviceSelection, bounded};
+use super::{
+    CaptureCounters, CaptureDeviceDescriptor, InputDeviceSelection, TimedCaptureSample, bounded,
+};
 
 /// Lists real cpal input devices without selecting one or changing host policy.
 pub fn capture_devices() -> Result<Vec<CaptureDeviceDescriptor>, DeviceError> {
@@ -44,14 +47,14 @@ pub fn capture_devices() -> Result<Vec<CaptureDeviceDescriptor>, DeviceError> {
 }
 
 pub(super) struct CallbackWriter {
-    producer: Producer<CaptureSample>,
+    producer: Producer<TimedCaptureSample>,
     channels: usize,
     counters: Arc<CaptureCounters>,
 }
 
 impl CallbackWriter {
     pub(super) fn new(
-        producer: Producer<CaptureSample>,
+        producer: Producer<TimedCaptureSample>,
         channels: u16,
         counters: Arc<CaptureCounters>,
     ) -> Self {
@@ -63,6 +66,7 @@ impl CallbackWriter {
     }
 
     pub(super) fn write<T: Copy>(&mut self, input: &[T], wrap: fn(T) -> CaptureSample) {
+        let available_at = Instant::now();
         let mut dropped = 0_u64;
         for frame in input.chunks_exact(self.channels) {
             if self.producer.slots() < self.channels {
@@ -71,7 +75,10 @@ impl CallbackWriter {
             }
             for &sample in frame {
                 self.producer
-                    .push(wrap(sample))
+                    .push(TimedCaptureSample {
+                        sample: wrap(sample),
+                        available_at,
+                    })
                     .expect("complete-frame capacity was checked");
             }
         }
@@ -244,11 +251,32 @@ mod tests {
         let counters = Arc::new(CaptureCounters::default());
         let (producer, mut consumer) = RingBuffer::new(4);
         let mut callback = CallbackWriter::new(producer, 2, Arc::clone(&counters));
+        let before = Instant::now();
         callback.write(&[1_i16, 2, 3, 4, 5, 6], CaptureSample::I16);
-        assert_eq!(consumer.pop(), Ok(CaptureSample::I16(1)));
-        assert_eq!(consumer.pop(), Ok(CaptureSample::I16(2)));
-        assert_eq!(consumer.pop(), Ok(CaptureSample::I16(3)));
-        assert_eq!(consumer.pop(), Ok(CaptureSample::I16(4)));
+        let after = Instant::now();
+        let copied = (0..4).map(|_| consumer.pop().unwrap()).collect::<Vec<_>>();
+        assert_eq!(
+            copied
+                .iter()
+                .map(|sample| sample.sample)
+                .collect::<Vec<_>>(),
+            [
+                CaptureSample::I16(1),
+                CaptureSample::I16(2),
+                CaptureSample::I16(3),
+                CaptureSample::I16(4),
+            ]
+        );
+        assert!(
+            copied
+                .iter()
+                .all(|sample| sample.available_at >= before && sample.available_at <= after)
+        );
+        assert!(
+            copied
+                .iter()
+                .all(|sample| sample.available_at == copied[0].available_at)
+        );
         assert!(consumer.pop().is_err());
         assert_eq!(
             counters.overflow(),

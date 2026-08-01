@@ -39,6 +39,6 @@ pub use io::{
     SynthWorkerShutdown, SynthWorkerStartError, SynthesizedSentenceReport, Transcript,
     WHISPER_MODEL_REVISION, WHISPER_MODEL_SHA256, WHISPER_MODEL_SOURCE, WHISPER_PARTIAL_CADENCE_MS,
     WHISPER_PARTIAL_MINIMUM_MS, WHISPER_PARTIAL_WINDOW_MS, WHISPER_RS_RUNTIME_VERSION,
-    WhisperConfig, WhisperMetrics, WhisperMetricsReader, WhisperProvenance, WhisperRecognizer,
-    capture_devices,
+    WHISPER_STABLE_OVERLAP_MS, WhisperConfig, WhisperMetrics, WhisperMetricsReader,
+    WhisperProvenance, WhisperRecognizer, capture_devices,
 };
