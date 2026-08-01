@@ -1,3 +1,5 @@
+pub mod github;
+
 use crate::tool_catalog::{FILE_EDIT, FILE_LIST, FILE_READ, FILE_WRITE, SHELL_EXEC};
 use crate::{AppError, AppResult};
 use platonic_core::{ResultVisibility, ToolResult};
