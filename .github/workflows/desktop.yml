@@ -110,13 +110,30 @@ jobs:
         run: |
           cargo fetch --manifest-path ../Cargo.toml --locked
           cargo fetch --manifest-path src-tauri/Cargo.toml --locked
-          echo 'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
+          ort_cache_dir="$RUNNER_TEMP/plato-ort-cache"
+          ort_prime_target="$RUNNER_TEMP/plato-ort-prime-target"
+          test ! -e "$ort_cache_dir"
+          test ! -e "$ort_prime_target"
+          mkdir -p "$ort_cache_dir" "$ort_prime_target"
+          ORT_CACHE_DIR="$ort_cache_dir" \
+            CARGO_TARGET_DIR="$ort_prime_target" \
+            cargo check --manifest-path ../Cargo.toml --locked -p ort-sys
+          mapfile -t ort_lib_dirs < <(
+            find "$ort_cache_dir/dfbin" -type f -name 'libonnxruntime.a' \
+              -printf '%h\n' | LC_ALL=C sort -u
+          )
+          test "${#ort_lib_dirs[@]}" -eq 1
+          printf '%s\n' \
+            "ORT_CACHE_DIR=$ort_cache_dir" \
+            "ORT_LIB_PATH=${ort_lib_dirs[0]}" \
+            'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
 
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libayatana-appindicator3-dev \
+            libasound2-dev \
             librsvg2-dev \
             libssl-dev \
             libwebkit2gtk-4.1-dev \
@@ -229,8 +246,32 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo fetch --locked
           cargo fetch --manifest-path desktop/src-tauri/Cargo.toml --locked
+          $ortCacheDir = Join-Path $env:RUNNER_TEMP "plato-ort-cache"
+          $ortPrimeTarget = Join-Path $env:RUNNER_TEMP "plato-ort-prime-target"
+          if ((Test-Path $ortCacheDir) -or (Test-Path $ortPrimeTarget)) {
+            throw "ORT prime cache and target must start empty"
+          }
+          New-Item -ItemType Directory -Path $ortCacheDir, $ortPrimeTarget | Out-Null
+          $normalTargetDir = $env:CARGO_TARGET_DIR
+          $env:ORT_CACHE_DIR = $ortCacheDir
+          $env:CARGO_TARGET_DIR = $ortPrimeTarget
+          cargo check --locked -p ort-sys
+          $env:CARGO_TARGET_DIR = $normalTargetDir
+          $ortLibDirs = @(
+            Get-ChildItem -Path (Join-Path $ortCacheDir "dfbin") -Recurse -File -Filter "onnxruntime.lib" |
+              ForEach-Object { $_.Directory.FullName } |
+              Sort-Object -Unique
+          )
+          if ($ortLibDirs.Count -ne 1) {
+            throw "expected exactly one ONNX Runtime library directory; found $($ortLibDirs.Count)"
+          }
+          "ORT_CACHE_DIR=$ortCacheDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_LIB_PATH=$($ortLibDirs[0])" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=-l dxguid -l DXCORE -l DXGI -l D3D12 -l DirectML" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
           "CARGO_NET_OFFLINE=true" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Build sidecars
@@ -288,8 +329,32 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo fetch --manifest-path ../Cargo.toml --locked
           cargo fetch --manifest-path src-tauri/Cargo.toml --locked
+          $ortCacheDir = Join-Path $env:RUNNER_TEMP "plato-ort-cache"
+          $ortPrimeTarget = Join-Path $env:RUNNER_TEMP "plato-ort-prime-target"
+          if ((Test-Path $ortCacheDir) -or (Test-Path $ortPrimeTarget)) {
+            throw "ORT prime cache and target must start empty"
+          }
+          New-Item -ItemType Directory -Path $ortCacheDir, $ortPrimeTarget | Out-Null
+          $normalTargetDir = $env:CARGO_TARGET_DIR
+          $env:ORT_CACHE_DIR = $ortCacheDir
+          $env:CARGO_TARGET_DIR = $ortPrimeTarget
+          cargo check --manifest-path ../Cargo.toml --locked -p ort-sys
+          $env:CARGO_TARGET_DIR = $normalTargetDir
+          $ortLibDirs = @(
+            Get-ChildItem -Path (Join-Path $ortCacheDir "dfbin") -Recurse -File -Filter "onnxruntime.lib" |
+              ForEach-Object { $_.Directory.FullName } |
+              Sort-Object -Unique
+          )
+          if ($ortLibDirs.Count -ne 1) {
+            throw "expected exactly one ONNX Runtime library directory; found $($ortLibDirs.Count)"
+          }
+          "ORT_CACHE_DIR=$ortCacheDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_LIB_PATH=$($ortLibDirs[0])" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=-l dxguid -l DXCORE -l DXGI -l D3D12 -l DirectML" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
           "CARGO_NET_OFFLINE=true" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Set up Node.js

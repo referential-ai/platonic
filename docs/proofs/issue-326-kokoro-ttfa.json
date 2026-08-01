@@ -1,0 +1,81 @@
+{
+  "schema": "plato_audio.kokoro_device_ttfa.v1",
+  "original_admitted_base": "29e6775bb188acf6185013432e6648ecfac0525e",
+  "trial_count": 20,
+  "sentence": "Plato speaks this complete warm sentence.",
+  "timing_boundary": "Instant immediately before warm synthesize(sentence) returns through the first non-silent sample copied by the persistent cpal output callback",
+  "threshold_us": 500000,
+  "p50_us": 52920,
+  "p95_us": 63502,
+  "max_us": 74416,
+  "trials": [
+    {"accepted_to_first_non_silent_us": 52792, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 53052, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 63502, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 63411, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 53248, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 52725, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 52357, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 63144, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 52250, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 52709, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 53394, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 53133, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 53106, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 52666, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 52757, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 53299, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 52313, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 52920, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 52311, "first_callback_frames": 256},
+    {"accepted_to_first_non_silent_us": 74416, "first_callback_frames": 256}
+  ],
+  "model_format": {"sample_rate": 24000, "channels": 1, "sample": "f32"},
+  "provenance": {
+    "model_source": "onnx-community/Kokoro-82M-v1.0-ONNX",
+    "model_revision": "1939ad2a8e416c0acfeecc08a694d14ef25f2231",
+    "model_sha256": "8fbea51ea711f2af382e88c833d9e288c6dc82ce5e98421ea61c058ce21a34cb",
+    "tokenizer_sha256": "77a02c8e164413299b4b4c403b14f8e0e1c1b727db4d46a09d6327b861060a34",
+    "voice_sha256": "4435255c9744f3f31659e0d714ab7689bf65d9e77ec1cce060f083912614f0b9",
+    "ort_runtime": "ort 2.0.0-rc.13 / ONNX Runtime 1.28",
+    "ort_build_info": "ORT Build Info: git-branch=rel-1.28.0, git-commit-id=da9b5e3, quick-build=1, build type=Release",
+    "phonemizer_version": "eSpeak NG text-to-speech: 1.52.0  Data at: /usr/share/espeak-ng-data",
+    "backend": "cuda"
+  },
+  "native_runtime_packages": {
+    "cuda": "13.3.1-1",
+    "cudnn": "9.25.0.15-1",
+    "espeak_ng": "1.52.0-1"
+  },
+  "cpal_runtime": "cpal 0.18.1",
+  "output": {
+    "backend": "ALSA",
+    "device_id": "alsa:default",
+    "device": "Default Audio Device",
+    "format": {"sample_rate": 24000, "channels": 1, "sample": "f32"},
+    "buffer_size": {
+      "mode": "fixed",
+      "requested_frames": 256,
+      "supported_min_frames": 32,
+      "supported_max_frames": 524288
+    }
+  },
+  "host_audio_route": {
+    "server": "PulseAudio (on PipeWire 1.6.8)",
+    "default_sink": "alsa_output.pci-0000_01_00.1.hdmi-stereo",
+    "description": "AD102 High Definition Audio Controller Digital Stereo (HDMI)",
+    "sink_format": "s32le 2ch 48000Hz"
+  },
+  "accelerator": {
+    "name": "NVIDIA GeForce RTX 4090",
+    "driver_version": "610.43.03",
+    "memory_mib": 24564
+  },
+  "kokoro_metrics": {
+    "session_loads": 1,
+    "phonemizer_invocations": 21,
+    "syntheses": 21
+  },
+  "playback_metrics": {"stream_opens": 1, "chunks_played": 21},
+  "warmup_excluded": true
+}

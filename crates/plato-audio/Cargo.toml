@@ -1,0 +1,27 @@
+[package]
+name = "plato-audio"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = ["crates-io"]
+description = "Typed local audio primitives and voice output for Plato Agent."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/referential-ai/plato-agent"
+documentation = "https://docs.rs/plato-audio"
+readme = "README.md"
+include = ["src/**", "examples/**", "README.md", "LICENSE-APACHE", "LICENSE-MIT"]
+
+[dependencies]
+cpal = "=0.18.1"
+ort = "=2.0.0-rc.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+ort = { version = "=2.0.0-rc.13", features = ["cuda"] }
+
+[[example]]
+name = "kokoro_device_proof"
+path = "examples/kokoro_device_proof.rs"
