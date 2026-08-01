@@ -88,7 +88,7 @@ A bounded agent unit (`AgentId`): not a personality blob, but an execution ident
 
 ### Run
 
-A durable execution instance. A run is event-log-first. Transcripts, metrics, replay, and audit views are derived from events. The run loop lives in `run` as a pure state machine; hosts drive it. `RunCommand` (desired effects) is a separate type from `HarnessEvent` (recorded facts); replay applies events only, so it can never re-emit IO.
+A durable execution instance. A run is event-log-first. Transcripts, metrics, replay, and audit views are derived from events. The run loop lives in `run` as a pure state machine; hosts drive it. `RunCommand` (desired effects) is a separate type from `HarnessEvent` (recorded facts); replay applies events only, so it can never re-emit IO. An accepted `ContextCompacted` preserves the surrounding stable `RunPhase` while `pending_compaction_turn()` exposes the additional constraint that the matching `ContextBuilt` or a terminal failure must follow; no host command is pending between those events.
 
 `RunReadback` lives in `projection` as a small pure, all-visibility audit view over a recorded ledger. It validates the ledger by replaying each `RecordedEvent` through `RunState`, then projects chronological context fragments, model failures and messages, whole-batch proposal rejections, tool calls, tool results, policy denials, approval grants and denials, and tool failures. Every recorded tool result is retained with its `ResultVisibility` metadata; the view does not filter for a model or user audience. It does not store events, render output, execute tools, call providers, or read clocks.
 
