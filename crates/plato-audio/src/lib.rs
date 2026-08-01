@@ -1,4 +1,4 @@
-//! Typed local audio primitives, warm Kokoro synthesis, and persistent playback.
+//! Typed local audio primitives with persistent capture and playback.
 //!
 //! This crate is an IO leaf. It deliberately has no dependency on any Platonic
 //! crate and assigns no run, session, policy, approval, ledger, or protocol
@@ -12,17 +12,27 @@ mod error;
 mod io;
 
 pub use core::{
-    AudioFormat, PcmChunk, PcmData, PcmFrame, RUBATO_RUNTIME_VERSION, ResampleReport,
-    ResamplingPlan, SENTENCE_PREFETCH_CAPACITY, SampleFormat, Sentence, SentenceCutter,
-    SentenceQueueError,
+    AudioFormat, CAPTURE_SAMPLE_RATE, CaptureResampleReport, CaptureSample, MAX_UTTERANCE_MS,
+    PcmChunk, PcmData, PcmFrame, RUBATO_RUNTIME_VERSION, ResampleReport, ResamplingPlan,
+    SENTENCE_PREFETCH_CAPACITY, SampleFormat, Sentence, SentenceCutter, SentenceQueueError,
+    VAD_HANGOVER_WINDOWS, VAD_MINIMUM_SPEECH_WINDOWS, VAD_ONSET_WINDOWS, VAD_RMS_THRESHOLD,
+    VAD_WINDOW_SAMPLES, VadEndpoint, VoiceSegment,
 };
-pub use error::{DeviceError, PcmError, PcmSinkError, ResampleError, SentenceError, SynthError};
+pub use error::{
+    CaptureError, DeviceError, PcmError, PcmSinkError, ResampleError, SentenceError, SttError,
+    SynthError,
+};
 pub use io::{
-    CPAL_RUNTIME_VERSION, DeviceBufferSize, InferenceBackend, KOKORO_MODEL_REVISION,
+    CPAL_RUNTIME_VERSION, CaptureConfig, CaptureDeviceDescriptor, CaptureDeviceInfo,
+    CaptureMetrics, CaptureOverflow, CaptureReport, CaptureWorker, CaptureWorkerShutdown,
+    DeviceBufferSize, InferenceBackend, InputDeviceSelection, KOKORO_MODEL_REVISION,
     KOKORO_MODEL_SHA256, KOKORO_MODEL_SOURCE, KOKORO_SAMPLE_RATE, KOKORO_TOKENIZER_SHA256,
     KOKORO_VOICE_SHA256, KokoroConfig, KokoroMetrics, KokoroMetricsReader, KokoroProvenance,
     KokoroSynthesizer, ORT_RUNTIME_VERSION, PcmSink, PlaybackConfig, PlaybackDeviceInfo,
     PlaybackMetrics, PlaybackReport, PlaybackUnderrun, RTRB_RUNTIME_VERSION, SentenceAdmission,
-    SpeechSynthesizer, SynthWorker, SynthWorkerError, SynthWorkerFailure, SynthWorkerShutdown,
-    SynthWorkerStartError, SynthesizedSentenceReport,
+    SpeechRecognizer, SpeechSynthesizer, SynthWorker, SynthWorkerError, SynthWorkerFailure,
+    SynthWorkerShutdown, SynthWorkerStartError, SynthesizedSentenceReport, Transcript,
+    WHISPER_MODEL_REVISION, WHISPER_MODEL_SHA256, WHISPER_MODEL_SOURCE, WHISPER_RS_RUNTIME_VERSION,
+    WhisperConfig, WhisperMetrics, WhisperMetricsReader, WhisperProvenance, WhisperRecognizer,
+    capture_devices,
 };

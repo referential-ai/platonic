@@ -21,6 +21,10 @@ repository = "https://github.com/referential-ai/plato-agent"
 documentation = "https://docs.rs/plato-agent"
 readme = "README.md"
 
+[features]
+default = []
+whisper-cuda = ["plato-audio/whisper-cuda"]
+
 [[bin]]
 name = "plato"
 path = "src/bin/plato.rs"
