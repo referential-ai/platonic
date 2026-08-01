@@ -110,11 +110,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let provenance = synthesizer.provenance().clone();
     let model_format = plato_audio::SpeechSynthesizer::output_format(&synthesizer);
     let metrics_reader = synthesizer.metrics_reader();
-    let worker = SynthWorker::spawn(synthesizer, PlaybackConfig::default())?;
+    let worker = SynthWorker::spawn(synthesizer, PlaybackConfig::default(), Arc::clone(&cancel))?;
+    worker.begin_run()?;
     let output = worker.device_info().clone();
     let accelerator = accelerator_info()?;
 
-    let warmup_admission = worker.accept(sentence.clone(), Arc::clone(&cancel))?;
+    let mut source_index = 0_u64;
+    let warmup_admission = worker.accept(
+        sentence.clone(),
+        plato_audio::SpeechSource::new(source_index, source_index),
+    )?;
+    source_index += 1;
     let mut warmup = warmup_admission.completed;
     warmup.extend(worker.wait_until_idle()?);
     if warmup.len() != 1 {
@@ -123,7 +129,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut trials = Vec::with_capacity(TRIALS);
     for _ in 0..TRIALS {
-        let admission = worker.accept(sentence.clone(), Arc::clone(&cancel))?;
+        let admission = worker.accept(
+            sentence.clone(),
+            plato_audio::SpeechSource::new(source_index, source_index),
+        )?;
+        source_index += 1;
         let mut report = admission.completed;
         report.extend(worker.wait_until_idle()?);
         if report.len() != 1 {
@@ -141,7 +151,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut multi_reports = Vec::with_capacity(SENTENCE_PREFETCH_CAPACITY);
     for text in MULTI_SENTENCE_CORPUS {
-        let admission = worker.try_accept(Sentence::new(text)?, Arc::clone(&cancel))?;
+        let admission = worker.try_accept(
+            Sentence::new(text)?,
+            plato_audio::SpeechSource::new(source_index, source_index),
+        )?;
+        source_index += 1;
         multi_reports.extend(admission.completed);
     }
     multi_reports.extend(worker.wait_until_idle()?);

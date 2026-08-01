@@ -47,6 +47,8 @@ pub struct RunOptions {
     pub event_sender: Option<Sender<RunEvent>>,
     pub stream_to_stderr: bool,
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Root-owned, one-turn voice interruption note; ordinary runs leave this absent.
+    pub voice_interruption_context: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -355,8 +357,19 @@ fn open_final_component_no_follow(_path: &Path) -> io::Result<File> {
 }
 
 fn provider_system_context(platonic_memory: Option<&str>) -> String {
+    provider_system_context_with_interruption(platonic_memory, None)
+}
+
+fn provider_system_context_with_interruption(
+    platonic_memory: Option<&str>,
+    voice_interruption: Option<&str>,
+) -> String {
     let mut context = system_prompt().to_string();
     if let Some(content) = platonic_memory {
+        context.push_str(PLATONIC_MEMORY_SEPARATOR);
+        context.push_str(content);
+    }
+    if let Some(content) = voice_interruption {
         context.push_str(PLATONIC_MEMORY_SEPARATOR);
         context.push_str(content);
     }
@@ -382,6 +395,10 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
 
     let platonic_memory = load_platonic_memory(&options.workspace_root)?;
     let system_context = provider_system_context(platonic_memory.as_deref());
+    let first_system_context = provider_system_context_with_interruption(
+        platonic_memory.as_deref(),
+        options.voice_interruption_context.as_deref(),
+    );
     let mut config = Config::load(&options.workspace_root, options.config_path.as_deref())?;
     if let Some(model) = &options.overrides.model {
         config.provider.model = model.clone();
@@ -409,7 +426,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 &options.question,
                 &config,
                 &tools,
-                &system_context,
+                &first_system_context,
             )?;
             (recorder, Some(hydration))
         }
@@ -421,7 +438,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 &options.question,
                 &config,
                 &tools,
-                &system_context,
+                &first_system_context,
             )?;
             (recorder, Some(hydration))
         }
@@ -453,18 +470,28 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
 
     for turn_index in 0..config.limits.max_turns {
         let turn_id = TurnId::new(format!("turn_{}", turn_index + 1))?;
+        let voice_interruption = if turn_index == 0 {
+            options.voice_interruption_context.as_deref()
+        } else {
+            None
+        };
         let request = ModelRequest {
             model: config.provider.model.clone(),
-            system: system_context.clone(),
+            system: if turn_index == 0 {
+                first_system_context.clone()
+            } else {
+                system_context.clone()
+            },
             max_output_tokens: config.limits.max_output_tokens,
             reasoning_effort: options.overrides.reasoning_effort,
             messages: messages.clone(),
             tools: tools.clone(),
         };
-        let context = context_pack(
+        let context = context_pack_with_interruption(
             &request,
             config.limits.token_budget,
             platonic_memory.as_deref(),
+            voice_interruption,
         )?;
         check_cancel(&mut recorder, &options, &run_id)?;
         if turn_index == 0
@@ -1169,15 +1196,25 @@ fn evaluate_policy(enabled_tools: &[String], call: &ToolCall) -> PolicyDecision 
     }
 }
 
+#[cfg(test)]
 fn context_pack(
     request: &ModelRequest,
     token_budget: u32,
     platonic_memory: Option<&str>,
 ) -> AppResult<ContextPack> {
+    context_pack_with_interruption(request, token_budget, platonic_memory, None)
+}
+
+fn context_pack_with_interruption(
+    request: &ModelRequest,
+    token_budget: u32,
+    platonic_memory: Option<&str>,
+    voice_interruption: Option<&str>,
+) -> AppResult<ContextPack> {
     let messages = serde_json::to_string(&request.messages)?;
     let tools = serde_json::to_string(&request.tools)?;
     let mut system_contract = system_prompt().to_string();
-    if platonic_memory.is_some() {
+    if platonic_memory.is_some() || voice_interruption.is_some() {
         system_contract.push_str(PLATONIC_MEMORY_SEPARATOR);
     }
     // Keep the fragment sum equal to the estimate of the concatenated provider system text.
@@ -1186,15 +1223,31 @@ fn context_pack(
     let mut fragments = vec![ContextFragment {
         lane: ContextLane::SystemContract,
         source: "system_prompt".into(),
-        content: system_contract,
+        content: system_contract.clone(),
         estimated_tokens: system_contract_tokens,
     }];
+    let mut accounted_system_tokens = system_contract_tokens;
     if let Some(content) = platonic_memory {
+        let through_memory = if voice_interruption.is_some() {
+            format!("{system_contract}{content}{PLATONIC_MEMORY_SEPARATOR}")
+        } else {
+            request.system.clone()
+        };
+        let through_memory_tokens = estimate_tokens(&through_memory);
         fragments.push(ContextFragment {
             lane: ContextLane::RetrievedContext,
             source: PLATONIC_MEMORY_FILENAME.into(),
             content: content.into(),
-            estimated_tokens: system_context_tokens.saturating_sub(system_contract_tokens),
+            estimated_tokens: through_memory_tokens.saturating_sub(accounted_system_tokens),
+        });
+        accounted_system_tokens = through_memory_tokens;
+    }
+    if let Some(content) = voice_interruption {
+        fragments.push(ContextFragment {
+            lane: ContextLane::CurrentTask,
+            source: "voice.interruption".into(),
+            content: content.into(),
+            estimated_tokens: system_context_tokens.saturating_sub(accounted_system_tokens),
         });
     }
     fragments.extend([
@@ -1301,6 +1354,7 @@ mod tests {
             event_sender: None,
             stream_to_stderr: false,
             cancel: None,
+            voice_interruption_context: None,
         };
 
         let typed = run_question(options("spoken parity question", typed_ledger.clone())).unwrap();
@@ -1338,6 +1392,82 @@ mod tests {
             http_request_json(&requests[0])["messages"],
             http_request_json(&requests[1])["messages"]
         );
+    }
+
+    #[test]
+    fn voice_interruption_is_exactly_one_next_turn_context_fragment_and_replays() {
+        let interruption = "The user interrupted your spoken reply after \"one two\" (assistant sentence index 3, assistant delta index 8).";
+        let provider = spawn_provider_sequence(vec![
+            json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "provider_read",
+                            "type": "function",
+                            "function": {
+                                "name": "file_read",
+                                "arguments": "{\"path\":\"payload.txt\"}"
+                            }
+                        }]
+                    }
+                }]
+            }),
+            provider_stop_response(),
+        ]);
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("payload.txt"), "payload").unwrap();
+        let config_path = workspace.path().join("plato.toml");
+        write_memory_test_config(&config_path, &provider.base_url, 2, 4_000);
+        let ledger_path = workspace.path().join("events.jsonl");
+        let mut options = memory_test_options(
+            workspace.path(),
+            &config_path,
+            &ledger_path,
+            "run_voice_interruption_context",
+        );
+        options.voice_interruption_context = Some(interruption.to_owned());
+
+        let outcome = run_question(options).unwrap();
+        assert_eq!(outcome.final_answer, "done");
+        let requests = provider.handle.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        let first_request = http_request_json(&requests[0]);
+        let second_request = http_request_json(&requests[1]);
+        assert_eq!(
+            provider_system_from_request(&first_request)
+                .matches(interruption)
+                .count(),
+            1
+        );
+        assert!(!provider_system_from_request(&second_request).contains(interruption));
+
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        let contexts = records
+            .iter()
+            .filter_map(|record| match &record.event {
+                HarnessEvent::ContextBuilt { context, .. } => Some(context),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(contexts.len(), 2);
+        let fragments = contexts
+            .iter()
+            .flat_map(|context| &context.fragments)
+            .filter(|fragment| fragment.source == "voice.interruption")
+            .collect::<Vec<_>>();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].lane, ContextLane::CurrentTask);
+        assert_eq!(fragments[0].content, interruption);
+        assert!(
+            contexts[1]
+                .fragments
+                .iter()
+                .all(|fragment| fragment.source != "voice.interruption")
+        );
+        let readback = RunReadback::from_events(&records).unwrap();
+        assert!(matches!(readback.final_phase, RunPhase::Finished));
     }
 
     #[test]
@@ -1715,6 +1845,7 @@ base_url = "http://{}"
                     event_sender: None,
                     stream_to_stderr: false,
                     cancel: None,
+                    voice_interruption_context: None,
                 })
                 .unwrap_err()
             },
@@ -1862,6 +1993,7 @@ base_url = "http://{}"
             event_sender: None,
             stream_to_stderr: false,
             cancel: None,
+            voice_interruption_context: None,
         })
         .unwrap_err();
 
@@ -2676,6 +2808,7 @@ enabled = ["file.write"]
             event_sender: None,
             stream_to_stderr: false,
             cancel: None,
+            voice_interruption_context: None,
         })
         .unwrap();
         let requests = provider.handle.join().unwrap();
@@ -2837,6 +2970,7 @@ enabled = ["file.write"]
             event_sender: None,
             stream_to_stderr: false,
             cancel: None,
+            voice_interruption_context: None,
         })
         .unwrap();
         let requests = provider.handle.join().unwrap();
@@ -2999,6 +3133,7 @@ enabled = ["file.read"]
             event_sender: Some(event_sender),
             stream_to_stderr: false,
             cancel: None,
+            voice_interruption_context: None,
         })
         .unwrap();
         let requests = provider.handle.join().unwrap();
@@ -3106,6 +3241,7 @@ enabled = ["file.write"]
             event_sender: None,
             stream_to_stderr: false,
             cancel: None,
+            voice_interruption_context: None,
         })
         .unwrap_err();
         provider.handle.join().unwrap();
@@ -3199,6 +3335,7 @@ enabled = ["file.read"]
             event_sender: None,
             stream_to_stderr: false,
             cancel: None,
+            voice_interruption_context: None,
         })
         .unwrap();
         let requests = provider.handle.join().unwrap();
@@ -3269,6 +3406,7 @@ enabled = ["file.read"]
             event_sender: None,
             stream_to_stderr: false,
             cancel: None,
+            voice_interruption_context: None,
         })
         .unwrap();
         provider.handle.join().unwrap();
@@ -3337,6 +3475,7 @@ enabled = ["file.read"]
             event_sender: Some(event_sender),
             stream_to_stderr: false,
             cancel: None,
+            voice_interruption_context: None,
         })
         .unwrap();
         let provider_request = server.handle.join().unwrap().remove(0);
@@ -3487,6 +3626,7 @@ enabled = ["file.read"]
                 event_sender: Some(sqlite_sender),
                 stream_to_stderr: false,
                 cancel: None,
+                voice_interruption_context: None,
             })
             .unwrap_err();
             assert!(error.to_string().contains(&status.to_string()));
@@ -4316,6 +4456,7 @@ enabled = ["file.read"]
             event_sender: None,
             stream_to_stderr,
             cancel: None,
+            voice_interruption_context: None,
         })
         .unwrap();
 
@@ -4394,6 +4535,7 @@ enabled = ["file.read"]
             event_sender: None,
             stream_to_stderr: false,
             cancel: Some(Arc::new(AtomicBool::new(true))),
+            voice_interruption_context: None,
         };
         record_event(
             &mut recorder,
@@ -4476,6 +4618,7 @@ enabled = ["file.read"]
                 event_sender: Some(event_sender),
                 stream_to_stderr: false,
                 cancel: Some(run_cancel),
+                voice_interruption_context: None,
             })
         });
 
@@ -4598,6 +4741,7 @@ enabled = ["file.read"]
             event_sender: None,
             stream_to_stderr: false,
             cancel: None,
+            voice_interruption_context: None,
         }
     }
 
@@ -4619,6 +4763,7 @@ enabled = ["file.read"]
             event_sender: None,
             stream_to_stderr: false,
             cancel: None,
+            voice_interruption_context: None,
         }
     }
 
@@ -4710,6 +4855,7 @@ enabled = ["file.read"]
             event_sender: None,
             stream_to_stderr: false,
             cancel: None,
+            voice_interruption_context: None,
         }
     }
 
@@ -4809,6 +4955,7 @@ enabled = ["file.write", "file.edit"]
             event_sender: None,
             stream_to_stderr: false,
             cancel: None,
+            voice_interruption_context: None,
         }
     }
 
@@ -5067,6 +5214,7 @@ enabled = ["file.read"]
             event_sender,
             stream_to_stderr: false,
             cancel,
+            voice_interruption_context: None,
         }
     }
 
@@ -5093,6 +5241,7 @@ enabled = ["file.read"]
             event_sender,
             stream_to_stderr: false,
             cancel: Some(cancel),
+            voice_interruption_context: None,
         }
     }
 

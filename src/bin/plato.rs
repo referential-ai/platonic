@@ -297,6 +297,7 @@ fn run_prompt(
         event_sender: None,
         stream_to_stderr: true,
         cancel: None,
+        voice_interruption_context: None,
     })?;
     write_run_success_output(&mut io::stdout(), &mut io::stderr(), &outcome, &ledger)
 }

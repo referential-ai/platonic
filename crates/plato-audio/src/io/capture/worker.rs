@@ -18,8 +18,8 @@ use rtrb::{Consumer, RingBuffer};
 #[cfg(test)]
 use crate::DeviceBufferSize;
 use crate::{
-    AudioFormat, CaptureError, CaptureResampleReport, DeviceError, PcmData, PcmFrame, SampleFormat,
-    SpeechRecognizer, SttError, Transcript, VoiceActivityDetector,
+    AudioFormat, BargeInHandle, CaptureError, CaptureResampleReport, DeviceError, PcmData,
+    PcmFrame, SampleFormat, SpeechRecognizer, SttError, Transcript, VoiceActivityDetector,
     core::{
         capture::CaptureNormalizer,
         vad::{NeuralVadEvent, NeuralVadState},
@@ -55,6 +55,7 @@ pub struct CaptureWorker {
 #[derive(Default)]
 struct WorkerStatus {
     active_reply: Mutex<Option<SyncSender<CaptureMessage>>>,
+    barge_failure: Mutex<Option<String>>,
     panicked: AtomicBool,
     exited: AtomicBool,
 }
@@ -85,6 +86,20 @@ impl WorkerStatus {
             let _ = reply.try_send(CaptureMessage::Complete(Err(CaptureError::WorkerPanicked)));
         }
     }
+
+    fn mark_barge_failure(&self, reason: String) {
+        self.barge_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_or_insert(reason);
+    }
+
+    fn barge_failure(&self) -> Option<String> {
+        self.barge_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 impl CaptureWorker {
@@ -93,6 +108,33 @@ impl CaptureWorker {
         config: CaptureConfig,
         detector: V,
         recognizer: R,
+    ) -> Result<Self, CaptureError>
+    where
+        V: VoiceActivityDetector + 'static,
+        R: SpeechRecognizer + 'static,
+    {
+        Self::open_inner(config, detector, recognizer, None)
+    }
+
+    /// Opens continuous playback-time VAD bound to one existing cancel authority.
+    pub fn open_with_barge_in<V, R>(
+        config: CaptureConfig,
+        detector: V,
+        recognizer: R,
+        barge_in: BargeInHandle,
+    ) -> Result<Self, CaptureError>
+    where
+        V: VoiceActivityDetector + 'static,
+        R: SpeechRecognizer + 'static,
+    {
+        Self::open_inner(config, detector, recognizer, Some(barge_in))
+    }
+
+    fn open_inner<V, R>(
+        config: CaptureConfig,
+        detector: V,
+        recognizer: R,
+        barge_in: Option<BargeInHandle>,
     ) -> Result<Self, CaptureError>
     where
         V: VoiceActivityDetector + 'static,
@@ -148,13 +190,16 @@ impl CaptureWorker {
             })?;
         let (commands, requests) = mpsc::sync_channel(1);
         let (worker, worker_status) = spawn_worker(
-            consumer,
-            format,
+            CaptureWorkerRuntime {
+                consumer,
+                format,
+                commands: requests,
+                stream_failed: Arc::clone(&stream_failed),
+                counters: Arc::clone(&counters),
+                barge_in,
+            },
             Box::new(detector),
             Box::new(recognizer),
-            requests,
-            Arc::clone(&stream_failed),
-            Arc::clone(&counters),
         )?;
         Ok(Self {
             stream: Some(stream),
@@ -195,12 +240,7 @@ impl CaptureWorker {
         if self.closed {
             return Err(CaptureError::Closed);
         }
-        if self.stream_failed.load(Ordering::Acquire) {
-            return Err(DeviceError::InputStreamFailed.into());
-        }
-        if self.worker_status.panicked.load(Ordering::Acquire) {
-            return Err(CaptureError::WorkerPanicked);
-        }
+        self.check_health()?;
         let (reply, result) = mpsc::sync_channel(CAPTURE_EVENT_CAPACITY);
         self.commands
             .send(WorkerCommand::Capture { timeout, reply })
@@ -248,6 +288,23 @@ impl CaptureWorker {
         }
     }
 
+    /// Returns a typed persistent-stream or continuous-VAD failure.
+    pub fn check_health(&self) -> Result<(), CaptureError> {
+        if self.stream_failed.load(Ordering::Acquire) {
+            return Err(DeviceError::InputStreamFailed.into());
+        }
+        if self.worker_status.panicked.load(Ordering::Acquire) {
+            return Err(CaptureError::WorkerPanicked);
+        }
+        if let Some(reason) = self.worker_status.barge_failure() {
+            return Err(CaptureError::BargeIn { reason });
+        }
+        if self.worker_status.exited.load(Ordering::Acquire) && !self.closed {
+            return Err(CaptureError::WorkerStopped);
+        }
+        Ok(())
+    }
+
     /// Stops the worker, drops the persistent input stream, and joins ownership.
     pub fn shutdown(mut self) -> CaptureWorkerShutdown {
         self.close()
@@ -291,6 +348,42 @@ impl CaptureWorker {
         V: VoiceActivityDetector + 'static,
         R: SpeechRecognizer + 'static,
     {
+        Self::test_worker_inner(format, capacity_samples, detector, recognizer, None)
+    }
+
+    #[cfg(test)]
+    fn test_worker_with_barge_in<V, R>(
+        format: AudioFormat,
+        capacity_samples: usize,
+        detector: V,
+        recognizer: R,
+        barge_in: BargeInHandle,
+    ) -> (Self, CallbackWriter, Arc<AtomicBool>)
+    where
+        V: VoiceActivityDetector + 'static,
+        R: SpeechRecognizer + 'static,
+    {
+        Self::test_worker_inner(
+            format,
+            capacity_samples,
+            detector,
+            recognizer,
+            Some(barge_in),
+        )
+    }
+
+    #[cfg(test)]
+    fn test_worker_inner<V, R>(
+        format: AudioFormat,
+        capacity_samples: usize,
+        detector: V,
+        recognizer: R,
+        barge_in: Option<BargeInHandle>,
+    ) -> (Self, CallbackWriter, Arc<AtomicBool>)
+    where
+        V: VoiceActivityDetector + 'static,
+        R: SpeechRecognizer + 'static,
+    {
         validate_recognizer_format(recognizer.input_format()).unwrap();
         validate_detector_frame(detector.frame_samples()).unwrap();
         let (producer, consumer) = RingBuffer::new(capacity_samples);
@@ -299,13 +392,16 @@ impl CaptureWorker {
         let callback = CallbackWriter::new(producer, format.channels(), Arc::clone(&counters));
         let (commands, requests) = mpsc::sync_channel(1);
         let (worker, worker_status) = spawn_worker(
-            consumer,
-            format,
+            CaptureWorkerRuntime {
+                consumer,
+                format,
+                commands: requests,
+                stream_failed: Arc::clone(&stream_failed),
+                counters: Arc::clone(&counters),
+                barge_in,
+            },
             Box::new(detector),
             Box::new(recognizer),
-            requests,
-            Arc::clone(&stream_failed),
-            Arc::clone(&counters),
         )
         .unwrap();
         (
@@ -357,6 +453,15 @@ struct CaptureEngines {
     recognizer: Box<dyn SpeechRecognizer>,
 }
 
+struct CaptureWorkerRuntime {
+    consumer: Consumer<TimedCaptureSample>,
+    format: AudioFormat,
+    commands: Receiver<WorkerCommand>,
+    stream_failed: Arc<AtomicBool>,
+    counters: Arc<CaptureCounters>,
+    barge_in: Option<BargeInHandle>,
+}
+
 struct ActiveCapture {
     sequence: u64,
     deadline: Instant,
@@ -369,6 +474,13 @@ struct ActiveCapture {
     input_frames: u64,
     output_frames: u64,
     overflow_at_arm: CaptureOverflow,
+}
+
+struct ActiveBargeIn {
+    generation: u64,
+    normalizer: CaptureNormalizer,
+    vad: NeuralVadState,
+    overflow_at_gate: CaptureOverflow,
 }
 
 impl ActiveCapture {
@@ -397,24 +509,16 @@ impl ActiveCapture {
 }
 
 fn spawn_worker(
-    consumer: Consumer<TimedCaptureSample>,
-    format: AudioFormat,
+    runtime: CaptureWorkerRuntime,
     detector: Box<dyn VoiceActivityDetector>,
     recognizer: Box<dyn SpeechRecognizer>,
-    commands: Receiver<WorkerCommand>,
-    stream_failed: Arc<AtomicBool>,
-    counters: Arc<CaptureCounters>,
 ) -> Result<(JoinHandle<()>, Arc<WorkerStatus>), CaptureError> {
     spawn_worker_with(
-        consumer,
-        format,
+        runtime,
         CaptureEngines {
             detector,
             recognizer,
         },
-        commands,
-        stream_failed,
-        counters,
         |task| {
             thread::Builder::new()
                 .name("plato-audio-capture".to_owned())
@@ -424,12 +528,8 @@ fn spawn_worker(
 }
 
 fn spawn_worker_with<F>(
-    consumer: Consumer<TimedCaptureSample>,
-    format: AudioFormat,
+    runtime: CaptureWorkerRuntime,
     engines: CaptureEngines,
-    commands: Receiver<WorkerCommand>,
-    stream_failed: Arc<AtomicBool>,
-    counters: Arc<CaptureCounters>,
     spawn: F,
 ) -> Result<(JoinHandle<()>, Arc<WorkerStatus>), CaptureError>
 where
@@ -439,15 +539,7 @@ where
     let thread_status = Arc::clone(&worker_status);
     let task = Box::new(move || {
         let result = catch_unwind(AssertUnwindSafe(|| {
-            run_worker(
-                consumer,
-                format,
-                engines,
-                commands,
-                stream_failed,
-                counters,
-                thread_status.as_ref(),
-            );
+            run_worker(runtime, engines, thread_status.as_ref());
         }));
         if result.is_err() {
             thread_status.mark_panicked();
@@ -465,25 +557,31 @@ fn thread_start_error(error: std::io::Error) -> CaptureError {
 }
 
 fn run_worker(
-    mut consumer: Consumer<TimedCaptureSample>,
-    format: AudioFormat,
+    runtime: CaptureWorkerRuntime,
     engines: CaptureEngines,
-    commands: Receiver<WorkerCommand>,
-    stream_failed: Arc<AtomicBool>,
-    counters: Arc<CaptureCounters>,
     worker_status: &WorkerStatus,
 ) {
+    let CaptureWorkerRuntime {
+        mut consumer,
+        format,
+        commands,
+        stream_failed,
+        counters,
+        barge_in,
+    } = runtime;
     let CaptureEngines {
         mut detector,
         mut recognizer,
     } = engines;
     let mut active: Option<ActiveCapture> = None;
+    let mut active_barge_in: Option<ActiveBargeIn> = None;
     let mut sequence = 0_u64;
     let mut drained = Vec::with_capacity(MAX_DRAIN_SAMPLES);
     let mut native_samples = Vec::with_capacity(MAX_DRAIN_SAMPLES);
     loop {
         match commands.try_recv() {
             Ok(WorkerCommand::Capture { timeout, reply }) if active.is_none() => {
+                active_barge_in = None;
                 let overflow_at_arm = counters.overflow();
                 drain_discard(&mut consumer);
                 detector.reset();
@@ -567,6 +665,84 @@ fn run_worker(
             continue;
         }
         let Some(capture) = active.as_mut() else {
+            let Some(handle) = barge_in.as_ref() else {
+                continue;
+            };
+            if !handle.is_active() || handle.cancel_requested() || !handle.playback_active() {
+                active_barge_in = None;
+                continue;
+            }
+            if !handle.gate_open() {
+                active_barge_in = None;
+                continue;
+            }
+
+            let generation = handle.generation();
+            if active_barge_in
+                .as_ref()
+                .is_none_or(|monitor| monitor.generation != generation)
+            {
+                detector.reset();
+                let normalizer = match CaptureNormalizer::new(format) {
+                    Ok(normalizer) => normalizer,
+                    Err(error) => {
+                        fail_barge_in(worker_status, handle, error);
+                        return;
+                    }
+                };
+                let vad = match NeuralVadState::new(detector.frame_samples()) {
+                    Ok(vad) => vad,
+                    Err(error) => {
+                        fail_barge_in(worker_status, handle, error);
+                        return;
+                    }
+                };
+                active_barge_in = Some(ActiveBargeIn {
+                    generation,
+                    normalizer,
+                    vad,
+                    overflow_at_gate: counters.overflow(),
+                });
+                // The gate can open during a native callback. Start on the next
+                // drained batch so pre-gate self-playback never enters Silero.
+                continue;
+            }
+
+            let monitor = active_barge_in
+                .as_mut()
+                .expect("barge-in monitor initialized for this generation");
+            if let Some(error) = overflow_error(monitor.overflow_at_gate, counters.overflow()) {
+                fail_barge_in(worker_status, handle, error);
+                return;
+            }
+            native_samples.clear();
+            native_samples.extend(drained.iter().map(|sample| sample.sample));
+            let started = Instant::now();
+            let (samples, report) = match monitor.normalizer.push(&native_samples) {
+                Ok(result) => result,
+                Err(error) => {
+                    fail_barge_in(worker_status, handle, error);
+                    return;
+                }
+            };
+            let elapsed_us = duration_us(started.elapsed());
+            counters
+                .normalization_resampling_us
+                .fetch_add(elapsed_us, Ordering::Relaxed);
+            update_global_conversion_counters(&counters, report);
+            let events = match monitor.vad.push(&samples, detector.as_mut()) {
+                Ok(events) => events,
+                Err(error) => {
+                    fail_barge_in(worker_status, handle, error);
+                    return;
+                }
+            };
+            if events
+                .iter()
+                .any(|event| matches!(event, NeuralVadEvent::SpeechOnset { .. }))
+            {
+                let _ = handle.trigger_speech_onset();
+            }
             continue;
         };
         let audio_available = drained
@@ -604,6 +780,7 @@ fn run_worker(
         };
         for event in events {
             match event {
+                NeuralVadEvent::SpeechOnset { .. } => {}
                 NeuralVadEvent::RejectedTransient(endpoint) => {
                     debug_assert!(endpoint.close_sample >= endpoint.speech_end_sample);
                     counters.rejected_transients.fetch_add(1, Ordering::Relaxed);
@@ -667,6 +844,15 @@ fn run_worker(
     }
 }
 
+fn fail_barge_in(
+    worker_status: &WorkerStatus,
+    handle: &BargeInHandle,
+    error: impl std::fmt::Display,
+) {
+    worker_status.mark_barge_failure(bounded(&error.to_string()));
+    handle.cancel_for_failure();
+}
+
 fn complete_capture(
     worker_status: &WorkerStatus,
     capture: ActiveCapture,
@@ -724,6 +910,17 @@ fn update_conversion_counters(
     capture.output_frames = capture.output_frames.saturating_add(output);
     counters.input_frames.fetch_add(input, Ordering::Relaxed);
     counters.output_frames.fetch_add(output, Ordering::Relaxed);
+}
+
+fn update_global_conversion_counters(counters: &CaptureCounters, report: CaptureResampleReport) {
+    counters.input_frames.fetch_add(
+        u64::try_from(report.input_frames).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    counters.output_frames.fetch_add(
+        u64::try_from(report.output_frames).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
 }
 
 #[cfg(all(test, feature = "whisper-cuda"))]

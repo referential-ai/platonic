@@ -31,8 +31,19 @@ with the stable prefix; total span remains the full accepted PCM duration.
 Empty or unchanged hypotheses are suppressed and all rolling updates remain
 typed `Transcript { is_final: false }` values. Root replaces the active display
 line and starts no run until the one final transcript arrives at the Silero
-endpoint. There is no ambient recognition, barge-in, AEC, wake word, cloud
-fallback, or second recognizer.
+endpoint.
+
+AU5 keeps that same resident Silero state running while narrated PCM is active.
+It discards input through a fixed 150 ms self-playback gate, then a qualified
+speech onset sets the run's existing `Arc<AtomicBool>`. The output callback
+checks that atomic at callback entry and fills the complete quantum with silence;
+the synthesis worker, never the callback, replaces the PCM ring and clears the
+four-sentence prefetch window. A sans-IO latch maps actual emitted samples back
+to one normalized spoken prefix and assistant sentence/delta position. Root
+adds that latch once as `voice.interruption` in the next run's `ContextBuilt`
+current-task lane. Generic cancellation uses the same path without fabricating
+an interruption latch. There is no AEC, wake word, cloud fallback, second
+recognizer, autonomous follow-up run, or post-playback ambient recognition.
 
 ## Pinned artifacts
 
@@ -131,6 +142,10 @@ cargo test --locked -p plato-audio
 cargo run --release --locked -p plato-audio --example kokoro_device_proof
 
 PLATO_AUDIO_SILERO_MODEL="$PLATO_AUDIO_SILERO_MODEL" \
+  cargo run --release --locked -p plato-audio --example barge_in_device_proof \
+  > docs/proofs/issue-330-barge-in-device.json
+
+PLATO_AUDIO_SILERO_MODEL="$PLATO_AUDIO_SILERO_MODEL" \
   cargo test --release --locked -p plato-audio \
   silero_strictly_reduces_au3_false_cuts_without_missing_speech -- --ignored --nocapture
 
@@ -192,6 +207,15 @@ overlap. It exits unsuccessfully unless CUDA is active, TTFA p95 is at most
 playback N, the maximum unfinished count is four, and shutdown joins the single
 worker and closes the stream. Later sentences may finish synthesis even earlier
 as the prefetch fills.
+
+The AU5 device proof runs 25 Silero decisions against one actual persistent
+output stream and exits unsuccessfully unless every decision-to-first-all-silent
+callback interval is at most 30 ms. It records p50/p95/max latency, callback
+quantum, gate state, sentence and PCM queue depths, flush counts, backend, and
+device format. Its CC0 synthetic speech-plus-noise WAV is fed directly to the
+resident Silero state after the gate; this proves the output callback boundary,
+not physical-microphone, live-speech, cpal-input, or acoustic-loop latency. The
+committed report is `../../docs/proofs/issue-330-barge-in-device.json`.
 
 The narrated-run fixture uses the real root `run_question` driver and existing
 assistant-delta event channel with a credential-free loopback SSE provider. It

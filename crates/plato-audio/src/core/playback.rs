@@ -6,7 +6,7 @@ use std::{
 
 use rtrb::Consumer;
 
-use super::prefetch::SENTENCE_PREFETCH_CAPACITY;
+use super::{BargeInHandle, prefetch::SENTENCE_PREFETCH_CAPACITY};
 
 const VACANT: u8 = 0;
 const ACCEPTED: u8 = 1;
@@ -15,6 +15,7 @@ const BUFFERED: u8 = 3;
 const PLAYING: u8 = 4;
 const FINISHED: u8 = 5;
 const FAILED: u8 = 6;
+const CANCELED: u8 = 7;
 const UNSET: u64 = u64::MAX;
 const AUDIBLE_EPSILON: f32 = 1.0e-6;
 
@@ -64,7 +65,7 @@ impl PlaybackSlot {
     fn reset(&self, sequence: u64, accepted_ns: u64) -> Result<(), ()> {
         if !matches!(
             self.state.load(Ordering::Acquire),
-            VACANT | FINISHED | FAILED
+            VACANT | FINISHED | FAILED | CANCELED
         ) {
             return Err(());
         }
@@ -110,6 +111,8 @@ pub(crate) struct PlaybackTimeline {
     origin: Instant,
     slots: [PlaybackSlot; SENTENCE_PREFETCH_CAPACITY],
     callback_count: AtomicU64,
+    played_samples: AtomicU64,
+    consumer_generation: AtomicU64,
     finished_sentences: AtomicU64,
     underrun_callbacks: AtomicU64,
     underrun_frames: AtomicU64,
@@ -140,6 +143,8 @@ impl PlaybackTimeline {
             origin: Instant::now(),
             slots: array::from_fn(|_| PlaybackSlot::new()),
             callback_count: AtomicU64::new(0),
+            played_samples: AtomicU64::new(0),
+            consumer_generation: AtomicU64::new(0),
             finished_sentences: AtomicU64::new(0),
             underrun_callbacks: AtomicU64::new(0),
             underrun_frames: AtomicU64::new(0),
@@ -208,6 +213,12 @@ impl PlaybackTimeline {
         }
     }
 
+    pub(crate) fn mark_canceled(&self, sequence: u64) {
+        if let Ok(slot) = self.checked_slot(sequence) {
+            slot.state.store(CANCELED, Ordering::Release);
+        }
+    }
+
     pub(crate) fn is_finished(&self, sequence: u64) -> bool {
         self.checked_slot(sequence)
             .is_ok_and(|slot| slot.state.load(Ordering::Acquire) == FINISHED)
@@ -262,6 +273,14 @@ impl PlaybackTimeline {
         self.callback_count.load(Ordering::Acquire)
     }
 
+    pub(crate) fn played_samples(&self) -> u64 {
+        self.played_samples.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn consumer_generation(&self) -> u64 {
+        self.consumer_generation.load(Ordering::Acquire)
+    }
+
     pub(crate) fn finished_sentences(&self) -> u64 {
         self.finished_sentences.load(Ordering::Acquire)
     }
@@ -293,10 +312,18 @@ impl PlaybackTimeline {
     }
 }
 
+pub(crate) struct PlaybackConsumerReplacement {
+    pub(crate) generation: u64,
+    pub(crate) consumer: Consumer<f32>,
+    pub(crate) next_sequence: u64,
+}
+
 /// Callback-owned rtrb consumer and sample cursor.
 pub(crate) struct CallbackDrain {
     consumer: Consumer<f32>,
+    replacements: Consumer<PlaybackConsumerReplacement>,
     timeline: std::sync::Arc<PlaybackTimeline>,
+    barge_in: BargeInHandle,
     sample_rate: u32,
     next_sequence: u64,
     consumed_samples: u64,
@@ -305,12 +332,16 @@ pub(crate) struct CallbackDrain {
 impl CallbackDrain {
     pub(crate) fn new(
         consumer: Consumer<f32>,
+        replacements: Consumer<PlaybackConsumerReplacement>,
         timeline: std::sync::Arc<PlaybackTimeline>,
+        barge_in: BargeInHandle,
         sample_rate: u32,
     ) -> Self {
         Self {
             consumer,
+            replacements,
             timeline,
+            barge_in,
             sample_rate,
             next_sequence: 0,
             consumed_samples: 0,
@@ -346,9 +377,15 @@ impl CallbackDrain {
         }
         let callback_frames = output.len() / channels;
         let callback_index = self.timeline.callback_count.fetch_add(1, Ordering::Relaxed);
+        self.apply_replacement();
+        if self.barge_in.cancel_requested() {
+            self.barge_in.record_silent_callback(callback_frames);
+            return;
+        }
         let callback_ns = duration_ns(self.timeline.origin.elapsed());
         let frame_ns = 1_000_000_000_u64 / u64::from(self.sample_rate);
         let mut underrun_sequences = [UNSET; SENTENCE_PREFETCH_CAPACITY];
+        let mut played_frames = 0_usize;
 
         for (frame_index, frame) in output.chunks_exact_mut(channels).enumerate() {
             let frame_timestamp = callback_ns.saturating_add(
@@ -381,6 +418,9 @@ impl CallbackDrain {
                         slot.first_pcm_ns.store(frame_timestamp, Ordering::Release);
                         slot.state.store(PLAYING, Ordering::Release);
                     }
+                    if played_frames == 0 {
+                        self.barge_in.record_playback_started();
+                    }
                     if sample.abs() > AUDIBLE_EPSILON {
                         let _ = slot.first_non_silent_ns.compare_exchange(
                             UNSET,
@@ -391,6 +431,7 @@ impl CallbackDrain {
                     }
                     frame.fill(convert(sample));
                     self.consumed_samples = self.consumed_samples.saturating_add(1);
+                    played_frames = played_frames.saturating_add(1);
                     if self.consumed_samples == end {
                         slot.pcm_end_ns
                             .store(frame_timestamp.saturating_add(frame_ns), Ordering::Release);
@@ -425,6 +466,25 @@ impl CallbackDrain {
                 }
             }
         }
+        if played_frames > 0 {
+            self.timeline.played_samples.fetch_add(
+                u64::try_from(played_frames).unwrap_or(u64::MAX),
+                Ordering::AcqRel,
+            );
+            self.barge_in.record_played_frames(played_frames);
+        }
+    }
+
+    fn apply_replacement(&mut self) {
+        let Ok(replacement) = self.replacements.pop() else {
+            return;
+        };
+        let old = std::mem::replace(&mut self.consumer, replacement.consumer);
+        self.next_sequence = replacement.next_sequence;
+        drop(old);
+        self.timeline
+            .consumer_generation
+            .store(replacement.generation, Ordering::Release);
     }
 }
 
@@ -434,11 +494,30 @@ fn duration_ns(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, atomic::AtomicBool};
 
     use rtrb::RingBuffer;
 
     use super::*;
+
+    fn drain(
+        consumer: Consumer<f32>,
+        timeline: Arc<PlaybackTimeline>,
+        sample_rate: u32,
+        cancel: Arc<AtomicBool>,
+    ) -> CallbackDrain {
+        let (_replacement_producer, replacement_consumer) = RingBuffer::new(1);
+        let barge_in = BargeInHandle::new(cancel);
+        barge_in.configure_output(sample_rate).unwrap();
+        barge_in.begin_run();
+        CallbackDrain::new(
+            consumer,
+            replacement_consumer,
+            timeline,
+            barge_in,
+            sample_rate,
+        )
+    }
 
     #[test]
     fn callback_concatenates_sentence_pcm_in_exact_order() {
@@ -457,7 +536,12 @@ mod tests {
             .push_entire_slice(&[0.25, -0.5, 0.75, 1.0, -1.0])
             .unwrap();
 
-        let mut callback = CallbackDrain::new(consumer, Arc::clone(&timeline), 48_000);
+        let mut callback = drain(
+            consumer,
+            Arc::clone(&timeline),
+            48_000,
+            Arc::new(AtomicBool::new(false)),
+        );
         let mut output = [9.0_f32; 12];
         callback.write_f32(&mut output, 2);
         assert_eq!(
@@ -479,7 +563,12 @@ mod tests {
         let timeline = Arc::new(PlaybackTimeline::new());
         let (_producer, consumer) = RingBuffer::new(4);
         timeline.accept(0, Instant::now()).unwrap();
-        let mut callback = CallbackDrain::new(consumer, Arc::clone(&timeline), 48_000);
+        let mut callback = drain(
+            consumer,
+            Arc::clone(&timeline),
+            48_000,
+            Arc::new(AtomicBool::new(false)),
+        );
         let mut output = [1.0_f32; 6];
         callback.write_f32(&mut output, 2);
         assert_eq!(output, [0.0; 6]);
@@ -498,7 +587,12 @@ mod tests {
         timeline.finish_synthesis(0).unwrap();
         timeline.publish_pcm(0, 0, 3, 3).unwrap();
         producer.push_entire_slice(&[-1.0, 0.0, 1.0]).unwrap();
-        let mut callback = CallbackDrain::new(consumer, Arc::clone(&timeline), 24_000);
+        let mut callback = drain(
+            consumer,
+            Arc::clone(&timeline),
+            24_000,
+            Arc::new(AtomicBool::new(false)),
+        );
         let mut signed = [0_i16; 3];
         callback.write_i16(&mut signed, 1);
         assert_eq!(signed, [-32_767, 0, 32_767]);
@@ -510,7 +604,7 @@ mod tests {
         timeline.finish_synthesis(0).unwrap();
         timeline.publish_pcm(0, 0, 3, 3).unwrap();
         producer.push_entire_slice(&[-1.0, 0.0, 1.0]).unwrap();
-        let mut callback = CallbackDrain::new(consumer, timeline, 24_000);
+        let mut callback = drain(consumer, timeline, 24_000, Arc::new(AtomicBool::new(false)));
         let mut unsigned = [0_u16; 3];
         callback.write_u16(&mut unsigned, 1);
         assert_eq!(unsigned, [0, 32_768, 65_535]);
@@ -525,5 +619,94 @@ mod tests {
         assert!(!timeline.is_shutdown());
         timeline.mark_shutdown();
         assert!(timeline.is_shutdown());
+    }
+
+    #[test]
+    fn callback_cancel_check_silences_the_entire_next_quantum_without_consuming_pcm() {
+        let timeline = Arc::new(PlaybackTimeline::new());
+        let (mut producer, consumer) = RingBuffer::new(8);
+        timeline.accept(0, Instant::now()).unwrap();
+        timeline.begin_synthesis(0).unwrap();
+        timeline.finish_synthesis(0).unwrap();
+        timeline.publish_pcm(0, 0, 8, 8).unwrap();
+        producer.push_entire_slice(&[0.5; 8]).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut callback = drain(consumer, Arc::clone(&timeline), 48_000, Arc::clone(&cancel));
+
+        let mut first = [1.0_f32; 4];
+        callback.write_f32(&mut first, 1);
+        assert_eq!(first, [0.5; 4]);
+        cancel.store(true, Ordering::Release);
+        let mut stopped = [1.0_f32; 4];
+        callback.write_f32(&mut stopped, 1);
+        assert_eq!(stopped, [0.0; 4]);
+        assert_eq!(callback.consumed_samples, 4);
+        assert_eq!(timeline.played_samples(), 4);
+    }
+
+    #[test]
+    fn cancel_during_callback_bounds_pcm_to_the_current_quantum() {
+        let timeline = Arc::new(PlaybackTimeline::new());
+        let (mut producer, consumer) = RingBuffer::new(8);
+        timeline.accept(0, Instant::now()).unwrap();
+        timeline.begin_synthesis(0).unwrap();
+        timeline.finish_synthesis(0).unwrap();
+        timeline.publish_pcm(0, 0, 8, 8).unwrap();
+        producer.push_entire_slice(&[0.5; 8]).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut callback = drain(consumer, Arc::clone(&timeline), 48_000, Arc::clone(&cancel));
+
+        let canceled_mid_quantum = AtomicBool::new(false);
+        let mut current = [1.0_f32; 4];
+        callback.write(&mut current, 1, 0.0, |sample| {
+            if canceled_mid_quantum
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                cancel.store(true, Ordering::Release);
+            }
+            sample
+        });
+        assert_eq!(current, [0.5; 4]);
+
+        let mut next = [1.0_f32; 4];
+        callback.write_f32(&mut next, 1);
+        assert_eq!(next, [0.0; 4]);
+        assert_eq!(callback.consumed_samples, 4);
+        assert_eq!(timeline.played_samples(), 4);
+        assert!(!timeline.callback_contract_failed());
+    }
+
+    #[test]
+    fn consumer_replacement_never_rewinds_an_in_flight_callback_cursor() {
+        let timeline = Arc::new(PlaybackTimeline::new());
+        let (_producer, consumer) = RingBuffer::new(8);
+        let (mut replacements, replacement_consumer) = RingBuffer::new(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let barge_in = BargeInHandle::new(cancel);
+        barge_in.configure_output(48_000).unwrap();
+        barge_in.begin_run();
+        let mut callback = CallbackDrain::new(
+            consumer,
+            replacement_consumer,
+            Arc::clone(&timeline),
+            barge_in,
+            48_000,
+        );
+        callback.consumed_samples = 256;
+        let (_next_producer, next_consumer) = RingBuffer::new(8);
+        replacements
+            .push(PlaybackConsumerReplacement {
+                generation: 1,
+                consumer: next_consumer,
+                next_sequence: 4,
+            })
+            .unwrap();
+
+        callback.apply_replacement();
+
+        assert_eq!(callback.consumed_samples, 256);
+        assert_eq!(callback.next_sequence, 4);
+        assert_eq!(timeline.consumer_generation(), 1);
     }
 }

@@ -264,17 +264,20 @@ fn worker_thread_start_failure_is_typed_and_bounded() {
     let (commands, requests) = mpsc::sync_channel(1);
     drop(commands);
     let result = spawn_worker_with(
-        consumer,
-        format(16_000, 1, SampleFormat::F32),
+        CaptureWorkerRuntime {
+            consumer,
+            format: format(16_000, 1, SampleFormat::F32),
+            commands: requests,
+            stream_failed: Arc::new(AtomicBool::new(false)),
+            counters: Arc::new(CaptureCounters::default()),
+            barge_in: None,
+        },
         CaptureEngines {
             detector: Box::new(FakeVad),
             recognizer: Box::new(DropRecognizer {
                 dropped: Arc::clone(&dropped),
             }),
         },
-        requests,
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(CaptureCounters::default()),
         |_task| Err(std::io::Error::other("synthetic thread refusal")),
     );
     let error = match result {
@@ -471,6 +474,91 @@ fn recognizer_and_device_failures_are_typed() {
         worker.capture(Duration::from_secs(1)),
         Err(CaptureError::Device(DeviceError::InputStreamFailed))
     ));
+}
+
+#[test]
+fn continuous_vad_ignores_pre_gate_audio_then_sets_the_shared_cancel() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let barge_in = BargeInHandle::new(Arc::clone(&cancel));
+    barge_in.configure_output(16_000).unwrap();
+    barge_in.begin_run();
+    barge_in.record_playback_started();
+    barge_in.record_queued_frames(8_192);
+    let (recognizer, finalizations) = fake_recognizer(false);
+    let (worker, mut callback, _) = CaptureWorker::test_worker_with_barge_in(
+        format(16_000, 1, SampleFormat::F32),
+        16_384,
+        FakeVad,
+        recognizer,
+        barge_in.clone(),
+    );
+
+    callback.write(
+        &vec![0.05; usize::from(SILERO_MINIMUM_SPEECH_FRAMES) * SILERO_WINDOW_SAMPLES],
+        CaptureSample::F32,
+    );
+    thread::sleep(Duration::from_millis(20));
+    assert!(!cancel.load(Ordering::Acquire));
+
+    barge_in.record_played_frames(2_400);
+    callback.write(&vec![0.0; SILERO_WINDOW_SAMPLES], CaptureSample::F32);
+    thread::sleep(Duration::from_millis(20));
+    callback.write(
+        &vec![0.05; usize::from(SILERO_MINIMUM_SPEECH_FRAMES) * SILERO_WINDOW_SAMPLES],
+        CaptureSample::F32,
+    );
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !cancel.load(Ordering::Acquire) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    assert!(cancel.load(Ordering::Acquire));
+    let metrics = barge_in.metrics();
+    assert!(metrics.gate_open_at_decision);
+    assert_eq!(metrics.played_frames_at_decision, 2_400);
+    assert_eq!(finalizations.load(Ordering::Relaxed), 0);
+    worker.check_health().unwrap();
+    assert!(worker.shutdown().worker_joined);
+}
+
+#[test]
+fn continuous_vad_failure_is_typed_and_cancels_the_same_run() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let barge_in = BargeInHandle::new(Arc::clone(&cancel));
+    barge_in.configure_output(16_000).unwrap();
+    barge_in.begin_run();
+    barge_in.record_playback_started();
+    barge_in.record_queued_frames(8_192);
+    barge_in.record_played_frames(2_400);
+    let (recognizer, finalizations) = fake_recognizer(false);
+    let (worker, mut callback, _) = CaptureWorker::test_worker_with_barge_in(
+        format(16_000, 1, SampleFormat::F32),
+        16_384,
+        FailingVad,
+        recognizer,
+        barge_in,
+    );
+
+    callback.write(&vec![0.0; SILERO_WINDOW_SAMPLES], CaptureSample::F32);
+    thread::sleep(Duration::from_millis(20));
+    callback.write(&vec![0.05; SILERO_WINDOW_SAMPLES], CaptureSample::F32);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let error = loop {
+        match worker.check_health() {
+            Err(error) => break error,
+            Ok(()) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+            Ok(()) => panic!("continuous VAD failure did not reach root health"),
+        }
+    };
+
+    assert!(matches!(
+        error,
+        CaptureError::BargeIn { reason }
+            if reason.contains("synthetic neural failure")
+    ));
+    assert!(cancel.load(Ordering::Acquire));
+    assert_eq!(finalizations.load(Ordering::Relaxed), 0);
+    assert!(worker.shutdown().worker_joined);
 }
 
 #[test]

@@ -1,5 +1,8 @@
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -9,12 +12,12 @@ use cpal::{
     SupportedStreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use rtrb::{Producer, RingBuffer};
+use rtrb::{Producer, PushError, RingBuffer};
 use serde::Serialize;
 
 use crate::{
-    AudioFormat, DeviceError, PcmChunk, SampleFormat,
-    core::playback::{CallbackDrain, PlaybackTimeline},
+    AudioFormat, BargeInHandle, DeviceError, PcmChunk, SampleFormat,
+    core::playback::{CallbackDrain, PlaybackConsumerReplacement, PlaybackTimeline},
 };
 
 /// Exact cpal runtime crate version used by the playback implementation.
@@ -175,13 +178,31 @@ pub(crate) struct PersistentPlayback {
 
 pub(crate) struct PlaybackProducer {
     producer: Producer<f32>,
+    replacements: Producer<PlaybackConsumerReplacement>,
     timeline: Arc<PlaybackTimeline>,
+    barge_in: BargeInHandle,
     ring_format: AudioFormat,
+    ring_capacity_frames: usize,
     produced_samples: u64,
+    replacement_generation: u64,
+}
+
+pub(crate) struct PreparedSentence<'a> {
+    pub(crate) start_sample: u64,
+    pub(crate) end_sample: u64,
+    samples: &'a [f32],
+}
+
+pub(crate) enum PlaybackWriteError {
+    Canceled,
+    Device(DeviceError),
 }
 
 impl PersistentPlayback {
-    pub(crate) fn open(config: PlaybackConfig) -> Result<(Self, PlaybackProducer), DeviceError> {
+    pub(crate) fn open(
+        config: PlaybackConfig,
+        barge_in: BargeInHandle,
+    ) -> Result<(Self, PlaybackProducer), DeviceError> {
         let host = cpal::default_host();
         let backend = host.id().name().to_owned();
         let device = host
@@ -220,10 +241,19 @@ impl PersistentPlayback {
             sample_format(selected.sample_format()),
         )?;
         let ring_format = AudioFormat::new(device_format.sample_rate(), 1, SampleFormat::F32)?;
+        barge_in
+            .configure_output(device_format.sample_rate())
+            .map_err(|_| DeviceError::CallbackContract)?;
         let timeline = Arc::new(PlaybackTimeline::new());
         let (producer, consumer) = RingBuffer::new(config.capacity_frames);
-        let drain =
-            CallbackDrain::new(consumer, Arc::clone(&timeline), device_format.sample_rate());
+        let (replacement_producer, replacement_consumer) = RingBuffer::new(1);
+        let drain = CallbackDrain::new(
+            consumer,
+            replacement_consumer,
+            Arc::clone(&timeline),
+            barge_in.clone(),
+            device_format.sample_rate(),
+        );
         let stream = build_stream(
             &device,
             stream_config,
@@ -250,9 +280,13 @@ impl PersistentPlayback {
         };
         let producer = PlaybackProducer {
             producer,
+            replacements: replacement_producer,
             timeline,
+            barge_in,
             ring_format,
+            ring_capacity_frames: config.capacity_frames,
             produced_samples: 0,
+            replacement_generation: 0,
         };
         Ok((playback, producer))
     }
@@ -289,13 +323,23 @@ impl PersistentPlayback {
     pub(crate) fn test_pair(
         device_format: AudioFormat,
         ring_capacity_frames: usize,
+        barge_in: BargeInHandle,
     ) -> (Self, PlaybackProducer, CallbackDrain) {
         let ring_format =
             AudioFormat::new(device_format.sample_rate(), 1, SampleFormat::F32).unwrap();
         let timeline = Arc::new(PlaybackTimeline::new());
         let (producer, consumer) = RingBuffer::new(ring_capacity_frames);
-        let callback =
-            CallbackDrain::new(consumer, Arc::clone(&timeline), device_format.sample_rate());
+        let (replacement_producer, replacement_consumer) = RingBuffer::new(1);
+        barge_in
+            .configure_output(device_format.sample_rate())
+            .unwrap();
+        let callback = CallbackDrain::new(
+            consumer,
+            replacement_consumer,
+            Arc::clone(&timeline),
+            barge_in.clone(),
+            device_format.sample_rate(),
+        );
         (
             Self {
                 timeline: Arc::clone(&timeline),
@@ -316,9 +360,13 @@ impl PersistentPlayback {
             },
             PlaybackProducer {
                 producer,
+                replacements: replacement_producer,
                 timeline,
+                barge_in,
                 ring_format,
+                ring_capacity_frames,
                 produced_samples: 0,
+                replacement_generation: 0,
             },
             callback,
         )
@@ -337,12 +385,12 @@ impl PlaybackProducer {
         self.ring_format
     }
 
-    pub(crate) fn write_sentence(
-        &mut self,
+    pub(crate) fn prepare_sentence<'a>(
+        &self,
         sequence: u64,
         source_frames: usize,
-        chunk: &PcmChunk,
-    ) -> Result<(), DeviceError> {
+        chunk: &'a PcmChunk,
+    ) -> Result<PreparedSentence<'a>, DeviceError> {
         if chunk.format() != self.ring_format {
             return Err(DeviceError::FormatMismatch {
                 expected: self.ring_format,
@@ -361,28 +409,101 @@ impl PlaybackProducer {
                 samples.len(),
             )
             .map_err(|_| DeviceError::CallbackContract)?;
+        Ok(PreparedSentence {
+            start_sample: self.produced_samples,
+            end_sample: self
+                .produced_samples
+                .saturating_add(u64::try_from(samples.len()).unwrap_or(u64::MAX)),
+            samples,
+        })
+    }
 
-        let mut remaining = samples;
+    pub(crate) fn write_prepared(
+        &mut self,
+        prepared: PreparedSentence<'_>,
+        cancel: &AtomicBool,
+    ) -> Result<(), PlaybackWriteError> {
+        let mut remaining = prepared.samples;
         let mut stall_deadline = Instant::now() + RING_STALL_TIMEOUT;
         while !remaining.is_empty() {
-            self.check_health()?;
-            let (pushed_samples, remainder) = self.producer.push_partial_slice(remaining);
-            remaining = remainder;
-            let pushed = pushed_samples.len();
+            if cancel.load(Ordering::Acquire) {
+                return Err(PlaybackWriteError::Canceled);
+            }
+            self.check_health().map_err(PlaybackWriteError::Device)?;
+            let pushed = self.producer.slots().min(remaining.len());
+            if pushed > 0 {
+                self.barge_in.record_queued_frames(pushed);
+                let (pushed_samples, remainder) =
+                    self.producer.push_partial_slice(&remaining[..pushed]);
+                debug_assert_eq!(pushed_samples.len(), pushed);
+                debug_assert!(remainder.is_empty());
+                remaining = &remaining[pushed..];
+            }
             self.produced_samples = self
                 .produced_samples
                 .saturating_add(u64::try_from(pushed).unwrap_or(u64::MAX));
             if pushed > 0 {
                 stall_deadline = Instant::now() + RING_STALL_TIMEOUT;
             } else if Instant::now() >= stall_deadline {
-                return Err(DeviceError::PlaybackTimeout {
+                return Err(PlaybackWriteError::Device(DeviceError::PlaybackTimeout {
                     milliseconds: RING_STALL_TIMEOUT.as_millis(),
-                });
+                }));
             } else {
                 thread::sleep(RING_POLL_INTERVAL);
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn flush(&mut self, next_sequence: u64) -> Result<usize, DeviceError> {
+        self.replacement_generation = self.replacement_generation.saturating_add(1);
+        let generation = self.replacement_generation;
+        let (replacement_producer, replacement_consumer) =
+            RingBuffer::new(self.ring_capacity_frames);
+        let retired_producer = std::mem::replace(&mut self.producer, replacement_producer);
+        let mut replacement = PlaybackConsumerReplacement {
+            generation,
+            consumer: replacement_consumer,
+            next_sequence,
+        };
+        let deadline = Instant::now() + RING_STALL_TIMEOUT;
+        loop {
+            match self.replacements.push(replacement) {
+                Ok(()) => break,
+                Err(PushError::Full(returned)) => replacement = returned,
+            }
+            self.check_health()?;
+            if Instant::now() >= deadline {
+                return Err(DeviceError::PlaybackTimeout {
+                    milliseconds: RING_STALL_TIMEOUT.as_millis(),
+                });
+            }
+            thread::sleep(RING_POLL_INTERVAL);
+        }
+        while self.timeline.consumer_generation() != generation {
+            self.check_health()?;
+            if Instant::now() >= deadline {
+                return Err(DeviceError::PlaybackTimeout {
+                    milliseconds: RING_STALL_TIMEOUT.as_millis(),
+                });
+            }
+            thread::sleep(RING_POLL_INTERVAL);
+        }
+        if self.barge_in.playback_started() {
+            while !self.barge_in.silent_callback_observed() {
+                self.check_health()?;
+                if Instant::now() >= deadline {
+                    return Err(DeviceError::PlaybackTimeout {
+                        milliseconds: RING_STALL_TIMEOUT.as_millis(),
+                    });
+                }
+                thread::sleep(RING_POLL_INTERVAL);
+            }
+        }
+        drop(retired_producer);
+        let sample_cursor = self.timeline.played_samples();
+        self.produced_samples = sample_cursor;
+        Ok(self.barge_in.flush_pcm_queue())
     }
 
     fn check_health(&self) -> Result<(), DeviceError> {
@@ -592,7 +713,9 @@ mod tests {
     #[test]
     fn synthetic_pair_has_exact_bounded_ring_and_native_format() {
         let format = AudioFormat::new(48_000, 2, SampleFormat::I16).unwrap();
-        let (playback, producer, _callback) = PersistentPlayback::test_pair(format, 17);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let barge_in = BargeInHandle::new(cancel);
+        let (playback, producer, _callback) = PersistentPlayback::test_pair(format, 17, barge_in);
         assert_eq!(playback.device_info().format, format);
         assert_eq!(producer.ring_format().sample_rate(), 48_000);
         assert_eq!(playback.metrics(0).ring_capacity_frames, 17);

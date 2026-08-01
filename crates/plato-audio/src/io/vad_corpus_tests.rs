@@ -229,7 +229,9 @@ fn silero_endpoints(samples: &[f32], detector: &mut dyn VoiceActivityDetector) -
         .into_iter()
         .filter_map(|event| match event {
             NeuralVadEvent::Segment(segment) => Some(segment.endpoint()),
-            NeuralVadEvent::SpeechSamples(_) | NeuralVadEvent::RejectedTransient(_) => None,
+            NeuralVadEvent::SpeechOnset { .. }
+            | NeuralVadEvent::SpeechSamples(_)
+            | NeuralVadEvent::RejectedTransient(_) => None,
         })
         .collect()
 }

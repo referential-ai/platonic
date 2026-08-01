@@ -18,6 +18,13 @@ const MAX_UTTERANCE_SAMPLES: usize =
 
 /// Typed streaming and terminal events from the pure Silero endpoint state.
 pub enum NeuralVadEvent {
+    /// Minimum-speech-qualified onset decision before any recognition work.
+    SpeechOnset {
+        /// First sample of the retained onset candidate.
+        start_sample: u64,
+        /// Exclusive sample position of the frame that qualified speech.
+        decision_sample: u64,
+    },
     /// Newly gated PCM that must reach rolling recognition exactly once.
     SpeechSamples(Box<[f32]>),
     /// One minimum-speech-qualified utterance closed by the fixed hangover.
@@ -156,7 +163,7 @@ impl NeuralVadState {
                 self.append_frame()?;
                 let voiced_frames = voiced_frames.saturating_add(1);
                 let now_announced = announced || voiced_frames >= SILERO_MINIMUM_SPEECH_FRAMES;
-                self.emit_progress(announced, now_announced, events);
+                self.emit_progress(start_sample, end, announced, now_announced, events);
                 self.state = EndpointState::Speech {
                     start_sample,
                     voiced_frames,
@@ -210,11 +217,17 @@ impl NeuralVadState {
 
     fn emit_progress(
         &self,
+        start_sample: u64,
+        decision_sample: u64,
         was_announced: bool,
         now_announced: bool,
         events: &mut Vec<NeuralVadEvent>,
     ) {
         if !was_announced && now_announced {
+            events.push(NeuralVadEvent::SpeechOnset {
+                start_sample,
+                decision_sample,
+            });
             events.push(NeuralVadEvent::SpeechSamples(
                 self.segment.clone().into_boxed_slice(),
             ));
@@ -281,7 +294,9 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 NeuralVadEvent::SpeechSamples(samples) => Some(samples.len()),
-                _ => None,
+                NeuralVadEvent::SpeechOnset { .. }
+                | NeuralVadEvent::Segment(_)
+                | NeuralVadEvent::RejectedTransient(_) => None,
             })
             .sum::<usize>();
         assert_eq!(
@@ -293,7 +308,9 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 NeuralVadEvent::Segment(segment) => Some(segment),
-                _ => None,
+                NeuralVadEvent::SpeechOnset { .. }
+                | NeuralVadEvent::SpeechSamples(_)
+                | NeuralVadEvent::RejectedTransient(_) => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(segments.len(), 1);
@@ -301,6 +318,13 @@ mod tests {
         assert_eq!(segments[0].endpoint().start_sample, 0);
         assert_eq!(segments[0].endpoint().speech_end_sample, 2_048);
         assert_eq!(segments[0].endpoint().close_sample, 6_144);
+        assert!(matches!(
+            events.first(),
+            Some(NeuralVadEvent::SpeechOnset {
+                start_sample: 0,
+                decision_sample: 2_048,
+            })
+        ));
     }
 
     #[test]

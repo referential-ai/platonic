@@ -319,6 +319,7 @@ fn start_run(
         event_sender: Some(event_sender),
         stream_to_stderr: false,
         cancel: Some(record.cancel.clone()),
+        voice_interruption_context: None,
     };
 
     if wait.unwrap_or(false) {
