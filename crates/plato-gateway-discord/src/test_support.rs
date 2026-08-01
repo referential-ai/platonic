@@ -12,12 +12,11 @@ use super::{
     rest::DiscordRestClient,
     websocket::{DISCORD_INTENTS, DiscordGatewayReceiver, DiscordMessage},
 };
+use crate::{DiscordGatewayTimings, GatewayResult};
+use plato_daemon_client::client::DaemonConnectionConfig;
+use plato_protocol::{BufferedStreamEvent, RunOverrides};
 #[cfg(unix)]
-use crate::daemon::protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION, RunStateName};
-use crate::{
-    AppResult, config::DiscordGatewayConfig, daemon::client::DaemonConnectionConfig,
-    model::RunOverrides,
-};
+use plato_protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION, RunStateName};
 use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -41,17 +40,11 @@ use tungstenite::{
     protocol::{CloseFrame, frame::coding::CloseCode},
 };
 
-pub(super) fn buffered_event(
-    offset: u64,
-    event: Value,
-) -> crate::daemon::protocol::BufferedStreamEvent {
+pub(super) fn buffered_event(offset: u64, event: Value) -> BufferedStreamEvent {
     serde_json::from_value(json!({"offset": offset, "event": event})).unwrap()
 }
 
-pub(super) fn ledger_event(
-    offset: u64,
-    event: Value,
-) -> crate::daemon::protocol::BufferedStreamEvent {
+pub(super) fn ledger_event(offset: u64, event: Value) -> BufferedStreamEvent {
     buffered_event(
         offset,
         json!({
@@ -73,37 +66,6 @@ pub(super) fn buffered_event_json(offset: u64, event: Value) -> Value {
 #[cfg(unix)]
 pub(super) fn ledger_event_json(offset: u64, event: Value) -> Value {
     serde_json::to_value(ledger_event(offset, event)).unwrap()
-}
-
-#[cfg(unix)]
-pub(super) fn without_provider_credentials<T>(run: impl FnOnce() -> T) -> T {
-    temp_env::with_vars(
-        [
-            ("DISCORD_BOT_TOKEN", Some("test-token")),
-            ("OPENAI_API_KEY", None),
-            ("OPENROUTER_API_KEY", None),
-        ],
-        run,
-    )
-}
-
-#[cfg(unix)]
-pub(super) fn write_direct_gateway_config(workspace: &tempfile::TempDir) -> PathBuf {
-    let config_path = workspace.path().join("gateway.toml");
-    std::fs::write(workspace.path().join("mapped.toml"), "").unwrap();
-    std::fs::write(
-        &config_path,
-        r#"
-[gateway.discord]
-api_key_env = "DISCORD_BOT_TOKEN"
-owner_user_ids = [42]
-
-[gateway.discord.channel_configs]
-"200" = "mapped.toml"
-"#,
-    )
-    .unwrap();
-    config_path
 }
 
 #[cfg(unix)]
@@ -130,14 +92,6 @@ pub(super) fn spawn_preflight_daemon(
         );
         hello
     })
-}
-
-pub(super) fn discord_config() -> DiscordGatewayConfig {
-    DiscordGatewayConfig {
-        api_key_env: "DISCORD_BOT_TOKEN".into(),
-        owner_user_ids: vec![42],
-        channel_configs: std::collections::HashMap::from([(200, PathBuf::from("mapped.toml"))]),
-    }
 }
 
 pub(super) fn discord_message(author_id: u64, channel_id: u64, content: &str) -> DiscordMessage {
@@ -200,6 +154,8 @@ pub(super) fn test_command_handler(
         allowed_channel_ids: std::collections::HashSet::from([200]),
         base_model: "base-model".into(),
         overrides: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        daemon_client_timeout: DiscordGatewayTimings::default().daemon_client_timeout,
+        presentation_timeout: DiscordGatewayTimings::default().presentation_timeout,
     }
 }
 
@@ -258,13 +214,18 @@ pub(super) fn test_gateway_with_overrides(
     overrides: Arc<Mutex<std::collections::HashMap<u64, RunOverrides>>>,
 ) -> DiscordGateway {
     let daemon = DaemonConnectionConfig::resolve(workspace.path(), Some(socket_path)).unwrap();
-    let mut gateway = DiscordGateway::new(
+    let timings = DiscordGatewayTimings::default();
+    let mut gateway = DiscordGateway {
         platform,
         daemon,
-        std::collections::HashMap::from([(200, "mapped.toml".into())]),
-        discord_config(),
+        channel_config_paths: std::collections::HashMap::from([(200, "mapped.toml".into())]),
+        owner_user_ids: std::collections::HashSet::from([42]),
+        sessions: std::collections::HashMap::new(),
         overrides,
-    );
+        daemon_client_timeout: timings.daemon_client_timeout,
+        event_poll_delay: timings.event_poll_delay,
+        reconnect_delay: timings.daemon_reconnect_delay,
+    };
     gateway.event_poll_delay = Duration::ZERO;
     gateway.reconnect_delay = Duration::from_millis(5);
     gateway
@@ -603,7 +564,7 @@ pub(super) fn spawn_test_gateway_receiver(
     websocket_url: &str,
 ) -> (
     Arc<AtomicBool>,
-    Receiver<AppResult<DiscordMessage>>,
+    Receiver<GatewayResult<DiscordMessage>>,
     thread::JoinHandle<()>,
 ) {
     let (sender, messages) = mpsc::channel();
@@ -612,6 +573,7 @@ pub(super) fn spawn_test_gateway_receiver(
         token: "test-token".into(),
         initial_url: websocket_url.into(),
         read_timeout: TEST_GATEWAY_READ_TIMEOUT,
+        hello_timeout: DiscordGatewayTimings::default().gateway_hello_timeout,
         reconnect_delay: Duration::from_millis(1),
         commands: DiscordCommandHandler {
             api_base: "http://127.0.0.1".into(),
@@ -624,6 +586,8 @@ pub(super) fn spawn_test_gateway_receiver(
             allowed_channel_ids: std::collections::HashSet::from([200]),
             base_model: "base-model".into(),
             overrides: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            daemon_client_timeout: DiscordGatewayTimings::default().daemon_client_timeout,
+            presentation_timeout: DiscordGatewayTimings::default().presentation_timeout,
         },
     };
     let worker_stop = Arc::clone(&stop);
@@ -633,7 +597,7 @@ pub(super) fn spawn_test_gateway_receiver(
 
 pub(super) fn finish_recoverable_gateway_receiver(
     stop: Arc<AtomicBool>,
-    messages: Receiver<AppResult<DiscordMessage>>,
+    messages: Receiver<GatewayResult<DiscordMessage>>,
     worker: thread::JoinHandle<()>,
 ) {
     stop.store(true, Ordering::Relaxed);

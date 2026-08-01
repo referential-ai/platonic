@@ -1,15 +1,13 @@
 use super::{DiscordGateway, DiscordPlatform, rest::DISCORD_MESSAGE_LIMIT};
-use crate::{
-    AppError, AppResult,
-    daemon::{
-        client::{DaemonClient, DaemonConnectionConfig},
-        protocol::{
-            BufferedStreamEvent, HelloResult, RunStateName, StreamEvent, TranscriptReadResult,
-        },
-    },
+use crate::{GatewayError, GatewayResult};
+use plato_daemon_client::{
+    ClientError,
+    client::{DaemonClient, DaemonConnectionConfig},
     paths,
 };
-use platonic_core::HarnessEvent;
+use plato_protocol::{
+    BufferedStreamEvent, HarnessEvent, HelloResult, RunStateName, StreamEvent, TranscriptReadResult,
+};
 use std::{
     collections::HashMap,
     path::Path,
@@ -17,7 +15,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(super) const DAEMON_CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
 pub(super) const EVENT_PAGE_LIMIT: usize = 64;
 const APPROVAL_FIELD_LIMIT: usize = 80;
 pub(super) const RUN_FAILED_MESSAGE: &str = "Run failed. Inspect it locally with: plato replay";
@@ -39,7 +36,7 @@ impl DiscordGateway {
     pub(super) fn handle_message(
         &mut self,
         message: super::websocket::DiscordMessage,
-    ) -> AppResult<()> {
+    ) -> GatewayResult<()> {
         let mut presentation = MessagePresentation::new(message.channel_id, message.id);
         presentation.add_eyes(&self.platform);
         let result = self.handle_allowed_message(message, &mut presentation);
@@ -53,17 +50,17 @@ impl DiscordGateway {
         &mut self,
         message: super::websocket::DiscordMessage,
         presentation: &mut MessagePresentation,
-    ) -> AppResult<()> {
+    ) -> GatewayResult<()> {
         let channel_id = message.channel_id;
         let overrides = self
             .overrides
             .lock()
-            .map_err(|_| AppError::Provider("discord run settings lock poisoned".into()))?
+            .map_err(|_| GatewayError::Discord("discord run settings lock poisoned".into()))?
             .get(&channel_id)
             .cloned()
             .unwrap_or_default();
         let config_path = self.channel_config_paths.get(&channel_id).cloned();
-        let mut daemon = self.connect_daemon(DAEMON_CLIENT_TIMEOUT)?;
+        let mut daemon = self.connect_daemon(self.daemon_client_timeout)?;
         let run = match self.sessions.get(&channel_id).cloned() {
             Some(session_id) => daemon.message_append_to_session_with_overrides(
                 message.content,
@@ -94,14 +91,14 @@ impl DiscordGateway {
         channel_id: u64,
         run_id: &str,
         presentation: &mut MessagePresentation,
-    ) -> AppResult<TranscriptReadResult> {
+    ) -> GatewayResult<TranscriptReadResult> {
         let mut next_offset = Some(0);
         let mut approvals = ApprovalNotifications::default();
         let mut canceling = false;
         loop {
             match daemon
                 .events_stream(run_id, next_offset, EVENT_PAGE_LIMIT)
-                .map_err(AppError::from)
+                .map_err(GatewayError::from)
             {
                 Ok(events) => {
                     next_offset = Some(events.next_offset);
@@ -153,7 +150,9 @@ impl DiscordGateway {
                         }
                     }
                 }
-                Err(AppError::DaemonResponse(error)) if error.code == "lagged" => {
+                Err(GatewayError::Client(ClientError::DaemonResponse(error)))
+                    if error.code == "lagged" =>
+                {
                     next_offset = None;
                     approvals.clear();
                     canceling = false;
@@ -187,20 +186,20 @@ impl DiscordGateway {
         }
     }
 
-    fn reconnect_daemon(&self) -> AppResult<DaemonClient> {
+    fn reconnect_daemon(&self) -> GatewayResult<DaemonClient> {
         for _ in 0..RECONNECT_ATTEMPTS {
-            match self.connect_daemon(DAEMON_CLIENT_TIMEOUT) {
+            match self.connect_daemon(self.daemon_client_timeout) {
                 Ok(client) => return Ok(client),
                 Err(error) if reconnectable(&error) => thread::sleep(self.reconnect_delay),
                 Err(error) => return Err(error),
             }
         }
-        Err(AppError::DaemonProtocol(
+        Err(GatewayError::DaemonProtocol(
             "daemon unavailable during gateway recovery".into(),
         ))
     }
 
-    fn connect_daemon(&self, timeout: Duration) -> AppResult<DaemonClient> {
+    fn connect_daemon(&self, timeout: Duration) -> GatewayResult<DaemonClient> {
         let mut client = DaemonClient::connect_with_timeout(&self.daemon.socket_path, timeout)?;
         let hello = client.hello(&self.daemon.workspace_root)?;
         require_gateway_daemon_contract(&self.daemon.workspace_root, &hello)?;
@@ -211,8 +210,8 @@ impl DiscordGateway {
         &self,
         daemon: &mut DaemonClient,
         run_id: &str,
-    ) -> AppResult<TranscriptReadResult> {
-        match daemon.transcript_read(run_id).map_err(AppError::from) {
+    ) -> GatewayResult<TranscriptReadResult> {
+        match daemon.transcript_read(run_id).map_err(GatewayError::from) {
             Ok(transcript) => Ok(transcript),
             Err(error) if reconnectable(&error) => {
                 *daemon = self.reconnect_daemon()?;
@@ -223,14 +222,15 @@ impl DiscordGateway {
     }
 }
 
-pub(super) fn report_response_delivery_failure(error: &AppError) {
+pub(super) fn report_response_delivery_failure(error: &GatewayError) {
     eprintln!("discord response delivery failed; gateway continues: {error}");
 }
 
+/// Verifies daemon identity and every capability required by the gateway.
 pub fn preflight_discord_gateway_daemon(
     config: &DaemonConnectionConfig,
     timeout: Duration,
-) -> AppResult<()> {
+) -> GatewayResult<()> {
     let mut client = DaemonClient::connect_with_timeout(&config.socket_path, timeout)?;
     let hello = client.hello(&config.workspace_root)?;
     require_gateway_daemon_contract(&config.workspace_root, &hello)
@@ -239,10 +239,10 @@ pub fn preflight_discord_gateway_daemon(
 pub(super) fn require_gateway_daemon_contract(
     workspace_root: &Path,
     hello: &HelloResult,
-) -> AppResult<()> {
+) -> GatewayResult<()> {
     let expected_workspace_id = paths::workspace_id(workspace_root)?;
     if hello.workspace_id != expected_workspace_id {
-        return Err(AppError::DaemonProtocol(format!(
+        return Err(GatewayError::DaemonProtocol(format!(
             "hello workspace_id mismatch: expected {expected_workspace_id}, got {}",
             hello.workspace_id
         )));
@@ -253,17 +253,17 @@ pub(super) fn require_gateway_daemon_contract(
             .iter()
             .any(|actual| actual == **capability)
     }) {
-        return Err(AppError::DaemonProtocol(format!(
+        return Err(GatewayError::DaemonProtocol(format!(
             "daemon does not advertise required capability {capability}"
         )));
     }
     Ok(())
 }
 
-fn terminal_message(transcript: TranscriptReadResult) -> AppResult<Option<String>> {
+fn terminal_message(transcript: TranscriptReadResult) -> GatewayResult<Option<String>> {
     match transcript.status {
         RunStateName::Finished => transcript.final_answer.map(Some).ok_or_else(|| {
-            AppError::RunFailed(format!(
+            GatewayError::RunFailed(format!(
                 "run {} ended with status {} without a final answer",
                 transcript.run_id, transcript.status
             ))
@@ -271,7 +271,7 @@ fn terminal_message(transcript: TranscriptReadResult) -> AppResult<Option<String
         RunStateName::Failed => Ok(Some(RUN_FAILED_MESSAGE.into())),
         RunStateName::Canceled | RunStateName::Interrupted => Ok(None),
         RunStateName::Running | RunStateName::CancelRequested => {
-            Err(AppError::DaemonProtocol(format!(
+            Err(GatewayError::DaemonProtocol(format!(
                 "run {} read back with nonterminal status {}",
                 transcript.run_id, transcript.status
             )))
@@ -417,13 +417,18 @@ fn truncate_chars(value: &str, limit: usize) -> String {
     truncated
 }
 
-fn reconnectable(error: &AppError) -> bool {
+fn reconnectable(error: &GatewayError) -> bool {
     matches!(
         error,
-        AppError::Io(_) | AppError::Json(_) | AppError::DaemonProtocol(_)
+        GatewayError::Io(_)
+            | GatewayError::Json(_)
+            | GatewayError::DaemonProtocol(_)
+            | GatewayError::Client(
+                ClientError::Io(_) | ClientError::Json(_) | ClientError::DaemonProtocol(_)
+            )
     ) || matches!(
         error,
-        AppError::DaemonResponse(error) if error.code == "not_found"
+        GatewayError::Client(ClientError::DaemonResponse(error)) if error.code == "not_found"
     )
 }
 
@@ -503,7 +508,7 @@ impl MessagePresentation {
         self.ignore(platform.remove_reaction(self.channel_id, self.message_id, EYES_EMOJI));
     }
 
-    fn ignore(&self, result: AppResult<()>) {
+    fn ignore(&self, result: GatewayResult<()>) {
         if let Err(error) = result {
             eprintln!("discord presentation effect failed: {error}");
         }
@@ -513,10 +518,10 @@ impl MessagePresentation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::protocol::TranscriptReadResult;
-    use crate::discord_gateway::test_support::*;
+    use crate::test_support::*;
+    use plato_protocol::TranscriptReadResult;
     #[cfg(unix)]
-    use crate::model::{ReasoningEffort, RunOverrides};
+    use plato_protocol::{ReasoningEffort, RunOverrides};
     #[cfg(unix)]
     use serde_json::Value;
     use serde_json::json;
@@ -553,10 +558,14 @@ mod tests {
 
         assert!(matches!(
             error,
-            AppError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut
+            GatewayError::Client(ClientError::Io(error))
+                if error.kind() == std::io::ErrorKind::TimedOut
         ));
         assert!(elapsed < Duration::from_secs(1), "request took {elapsed:?}");
-        assert_eq!(DAEMON_CLIENT_TIMEOUT, Duration::from_secs(3));
+        assert_eq!(
+            crate::DiscordGatewayTimings::default().daemon_client_timeout,
+            Duration::from_secs(3)
+        );
     }
 
     #[cfg(unix)]
@@ -1133,7 +1142,7 @@ mod tests {
 
         let error = gateway.poll_once().unwrap_err();
 
-        assert!(matches!(error, AppError::Io(_)));
+        assert!(matches!(error, GatewayError::Client(ClientError::Io(_))));
         let requests = rest.handle.join().unwrap();
         assert_reaction(&requests[0], "PUT", EYES_EMOJI);
         assert_reaction(&requests[1], "DELETE", EYES_EMOJI);

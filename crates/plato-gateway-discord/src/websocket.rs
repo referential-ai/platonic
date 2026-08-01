@@ -1,5 +1,5 @@
 use super::commands::{DiscordCommandHandler, InteractionCreateEvent, parse_snowflake};
-use crate::{AppError, AppResult};
+use crate::{GatewayError, GatewayResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -12,11 +12,10 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
+use tungstenite::{Message, WebSocket, connect, error::UrlError, stream::MaybeTlsStream};
 use url::Url;
 
 pub(super) const DISCORD_INTENTS: u64 = (1 << 9) | (1 << 12) | (1 << 15);
-const GATEWAY_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DiscordMessage {
@@ -30,12 +29,13 @@ pub(super) struct DiscordGatewayReceiver {
     pub(super) token: String,
     pub(super) initial_url: String,
     pub(super) read_timeout: Duration,
+    pub(super) hello_timeout: Duration,
     pub(super) reconnect_delay: Duration,
     pub(super) commands: DiscordCommandHandler,
 }
 
 impl DiscordGatewayReceiver {
-    pub(super) fn run(self, sender: Sender<AppResult<DiscordMessage>>, stop: Arc<AtomicBool>) {
+    pub(super) fn run(self, sender: Sender<GatewayResult<DiscordMessage>>, stop: Arc<AtomicBool>) {
         let mut session = None;
         while !stop.load(Ordering::Relaxed) {
             match self.run_connection(&sender, &stop, &mut session) {
@@ -55,7 +55,7 @@ impl DiscordGatewayReceiver {
 
     fn run_connection(
         &self,
-        sender: &Sender<AppResult<DiscordMessage>>,
+        sender: &Sender<GatewayResult<DiscordMessage>>,
         stop: &AtomicBool,
         session: &mut Option<DiscordSession>,
     ) -> GatewayControl {
@@ -69,17 +69,13 @@ impl DiscordGatewayReceiver {
         };
         let (mut socket, _) = match connect(url.as_str()) {
             Ok(connection) => connection,
-            Err(tungstenite::Error::Url(_)) => {
-                return GatewayControl::Fatal(AppError::Provider(
-                    "discord gateway returned an invalid websocket URL".into(),
-                ));
-            }
+            Err(tungstenite::Error::Url(error)) => return connect_url_error_control(error),
             Err(_) => return GatewayControl::Resume,
         };
         if set_read_timeout(&mut socket, self.read_timeout).is_err() {
             return GatewayControl::Resume;
         }
-        let heartbeat_interval = match wait_for_hello(&mut socket, stop, GATEWAY_HELLO_TIMEOUT) {
+        let heartbeat_interval = match wait_for_hello(&mut socket, stop, self.hello_timeout) {
             Ok(interval) => interval,
             Err(control) => return control,
         };
@@ -237,8 +233,17 @@ impl DiscordGatewayReceiver {
 enum GatewayControl {
     Resume,
     Reidentify,
-    Fatal(AppError),
+    Fatal(GatewayError),
     Stop,
+}
+
+fn connect_url_error_control(error: UrlError) -> GatewayControl {
+    match error {
+        UrlError::UnableToConnect(_) => GatewayControl::Resume,
+        _ => GatewayControl::Fatal(GatewayError::Discord(
+            "discord gateway returned an invalid websocket URL".into(),
+        )),
+    }
 }
 
 struct DiscordSession {
@@ -270,9 +275,9 @@ struct MessageCreateEvent {
     content: String,
 }
 
-fn gateway_url(base_url: &str) -> AppResult<String> {
+fn gateway_url(base_url: &str) -> GatewayResult<String> {
     let mut url = Url::parse(base_url).map_err(|_| {
-        AppError::Provider("discord gateway returned an invalid websocket URL".into())
+        GatewayError::Discord("discord gateway returned an invalid websocket URL".into())
     })?;
     url.query_pairs_mut()
         .clear()
@@ -347,16 +352,19 @@ fn send_gateway_payload(
 
 fn close_control(code: Option<u16>) -> GatewayControl {
     match code {
-        Some(4004 | 4010 | 4011 | 4012 | 4013 | 4014) => GatewayControl::Fatal(AppError::Provider(
-            format!("discord gateway closed with fatal code {}", code.unwrap()),
-        )),
+        Some(4004 | 4010 | 4011 | 4012 | 4013 | 4014) => {
+            GatewayControl::Fatal(GatewayError::Discord(format!(
+                "discord gateway closed with fatal code {}",
+                code.unwrap()
+            )))
+        }
         Some(4007 | 4009) => GatewayControl::Reidentify,
         _ => GatewayControl::Resume,
     }
 }
 
 fn invalid_gateway_payload() -> GatewayControl {
-    GatewayControl::Fatal(AppError::Provider(
+    GatewayControl::Fatal(GatewayError::Discord(
         "discord gateway returned an invalid payload".into(),
     ))
 }
@@ -389,33 +397,48 @@ fn set_read_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discord_gateway::test_support::*;
+    use crate::test_support::*;
     #[cfg(unix)]
     use crate::{
-        daemon::client::DaemonConnectionConfig,
-        discord_gateway::{
-            DiscordPlatform,
-            commands::{
-                DISCORD_APPLICATION_COMMAND, DISCORD_CHAT_INPUT_COMMAND,
-                DISCORD_DEFERRED_CHANNEL_MESSAGE, DISCORD_EPHEMERAL_FLAG, DISCORD_MODEL_COMMAND,
-                DISCORD_MODEL_DESCRIPTION, DISCORD_MODEL_OPTION, DISCORD_REASONING_COMMAND,
-                DISCORD_REASONING_DESCRIPTION, DISCORD_REASONING_OPTION, DISCORD_STATUS_COMMAND,
-                DISCORD_STATUS_DESCRIPTION, DISCORD_STRING_OPTION, reasoning_choices,
-            },
+        DiscordPlatform,
+        commands::{
+            DISCORD_APPLICATION_COMMAND, DISCORD_CHAT_INPUT_COMMAND,
+            DISCORD_DEFERRED_CHANNEL_MESSAGE, DISCORD_EPHEMERAL_FLAG, DISCORD_MODEL_COMMAND,
+            DISCORD_MODEL_DESCRIPTION, DISCORD_MODEL_OPTION, DISCORD_REASONING_COMMAND,
+            DISCORD_REASONING_DESCRIPTION, DISCORD_REASONING_OPTION, DISCORD_STATUS_COMMAND,
+            DISCORD_STATUS_DESCRIPTION, DISCORD_STRING_OPTION, reasoning_choices,
         },
     };
     use serde_json::json;
-    #[cfg(unix)]
-    use std::{
-        collections::{HashMap, HashSet},
-        sync::{Arc, Mutex},
-    };
     use std::{
         net::TcpListener,
         sync::mpsc,
         thread,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn websocket_connect_only_treats_unable_to_connect_as_recoverable() {
+        assert!(matches!(
+            connect_url_error_control(UrlError::UnableToConnect("ws://127.0.0.1:1/".into())),
+            GatewayControl::Resume
+        ));
+
+        for error in [
+            UrlError::TlsFeatureNotEnabled,
+            UrlError::NoHostName,
+            UrlError::UnsupportedUrlScheme,
+            UrlError::EmptyHostName,
+            UrlError::NoPathOrQuery,
+        ] {
+            let GatewayControl::Fatal(GatewayError::Discord(message)) =
+                connect_url_error_control(error)
+            else {
+                panic!("non-connect URL error was not fatal");
+            };
+            assert_eq!(message, "discord gateway returned an invalid websocket URL");
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -443,6 +466,10 @@ mod tests {
             assert_eq!(identify["op"], 2);
             assert_eq!(identify["d"]["token"], "test-token");
             assert_eq!(identify["d"]["intents"], DISCORD_INTENTS);
+            let heartbeat =
+                read_websocket_json(&mut socket).expect("client disconnected before heartbeating");
+            assert_eq!(heartbeat["op"], 1);
+            send_websocket_json(&mut socket, json!({"op": 11, "d": null}));
             send_websocket_json(
                 &mut socket,
                 json!({
@@ -539,17 +566,19 @@ mod tests {
             panic!("discord gateway did not send a heartbeat");
         });
 
+        let commands = test_command_handler(&rest.base_url, &workspace, socket_path);
         let platform = DiscordPlatform::connect(
             &rest.base_url,
             "test-token".into(),
-            DaemonConnectionConfig::resolve(workspace.path(), Some(socket_path)).unwrap(),
-            vec![42],
-            HashSet::from([200]),
-            "base-model".into(),
-            Arc::new(Mutex::new(HashMap::new())),
+            commands,
+            crate::DiscordGatewayTimings::default(),
         )
         .unwrap();
-        let message = platform.recv_message().unwrap();
+        let message = platform
+            .messages
+            .recv_timeout(TEST_GATEWAY_BOUND)
+            .expect("discord gateway message exceeded the local test bound")
+            .unwrap();
         let interaction_sent_at = sent_at.recv_timeout(Duration::from_secs(2)).unwrap();
 
         assert_eq!(message, discord_message(42, 200, "hello"));

@@ -104,6 +104,21 @@ jobs:
             grep -F 'no matching package named `plato-daemon-client` found' "$package_log"
           fi
 
+      - name: Prove plato-gateway-discord on Rust 1.88.0
+        run: |
+          cargo check --locked -p plato-gateway-discord --all-targets
+          cargo test --locked -p plato-gateway-discord
+          cargo clippy --locked -p plato-gateway-discord --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked -p plato-gateway-discord --no-deps
+          cargo package --locked --list -p plato-gateway-discord
+          package_log=$(mktemp)
+          if cargo package --locked --no-verify -p plato-gateway-discord >"$package_log" 2>&1; then
+            cat "$package_log"
+          else
+            cat "$package_log"
+            grep -F 'no matching package named `plato-daemon-client` found' "$package_log"
+          fi
+
       - name: Prove plato-audio on Rust 1.88.0
         run: |
           cargo check --locked -p plato-audio --all-targets

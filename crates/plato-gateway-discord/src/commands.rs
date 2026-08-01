@@ -1,18 +1,10 @@
 use super::{
-    daemon_bridge::{DAEMON_CLIENT_TIMEOUT, require_gateway_daemon_contract},
-    rest::{
-        AllowedMentions, CreateMessage, DiscordRestClient, PRESENTATION_TIMEOUT, discord_http_error,
-    },
+    daemon_bridge::require_gateway_daemon_contract,
+    rest::{AllowedMentions, CreateMessage, DiscordRestClient, discord_http_error},
 };
-use crate::{
-    AppError, AppResult,
-    daemon::{
-        client::{DaemonClient, DaemonConnectionConfig},
-        protocol::RunStateName,
-    },
-    model::{ReasoningEffort, RunOverrides},
-};
-use platonic_core::ModelName;
+use crate::{GatewayError, GatewayResult};
+use plato_daemon_client::client::{DaemonClient, DaemonConnectionConfig};
+use plato_protocol::{ReasoningEffort, RunOverrides, RunStateName};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -39,7 +31,7 @@ pub(super) const DISCORD_DEFERRED_CHANNEL_MESSAGE: u8 = 5;
 pub(super) const DISCORD_EPHEMERAL_FLAG: u64 = 64;
 
 impl DiscordRestClient {
-    pub(super) fn replace_application_commands(&self, application_id: u64) -> AppResult<()> {
+    pub(super) fn replace_application_commands(&self, application_id: u64) -> GatewayResult<()> {
         let commands = [
             DiscordApplicationCommand {
                 kind: DISCORD_CHAT_INPUT_COMMAND,
@@ -80,7 +72,7 @@ impl DiscordRestClient {
             .send_json(commands)
             .map_err(|error| discord_http_error("command synchronization", error))?;
         let registered: Vec<RegisteredApplicationCommand> = response.into_json().map_err(|_| {
-            AppError::Provider("discord command synchronization returned invalid JSON".into())
+            GatewayError::Discord("discord command synchronization returned invalid JSON".into())
         })?;
         let expected = [
             DISCORD_STATUS_COMMAND,
@@ -94,7 +86,7 @@ impl DiscordRestClient {
                 })
             })
         {
-            return Err(AppError::Provider(
+            return Err(GatewayError::Discord(
                 "discord command synchronization returned an unexpected registry".into(),
             ));
         }
@@ -111,6 +103,8 @@ pub(super) struct DiscordCommandHandler {
     pub(super) allowed_channel_ids: HashSet<u64>,
     pub(super) base_model: String,
     pub(super) overrides: Arc<Mutex<HashMap<u64, RunOverrides>>>,
+    pub(super) daemon_client_timeout: std::time::Duration,
+    pub(super) presentation_timeout: std::time::Duration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -121,7 +115,7 @@ enum DiscordCommand {
 }
 
 impl DiscordCommandHandler {
-    pub(super) fn handle(&self, interaction: InteractionCreateEvent) -> AppResult<()> {
+    pub(super) fn handle(&self, interaction: InteractionCreateEvent) -> GatewayResult<()> {
         if interaction.kind != DISCORD_APPLICATION_COMMAND {
             return Ok(());
         }
@@ -131,7 +125,7 @@ impl DiscordCommandHandler {
         }
         let application_id = parse_snowflake(&interaction.application_id)?;
         if application_id != self.application_id {
-            return Err(AppError::Provider(
+            return Err(GatewayError::Discord(
                 "discord interaction used an unexpected application id".into(),
             ));
         }
@@ -142,12 +136,14 @@ impl DiscordCommandHandler {
             .or(interaction.user.as_ref())
             .map(|user| parse_snowflake(&user.id))
             .transpose()?
-            .ok_or_else(|| AppError::Provider("discord interaction omitted its author".into()))?;
+            .ok_or_else(|| {
+                GatewayError::Discord("discord interaction omitted its author".into())
+            })?;
         if !self.owner_user_ids.contains(&author_id) {
             return Ok(());
         }
         let Some(data) = interaction.data.as_ref() else {
-            return Err(AppError::Provider(
+            return Err(GatewayError::Discord(
                 "discord interaction omitted command data".into(),
             ));
         };
@@ -159,7 +155,7 @@ impl DiscordCommandHandler {
         };
         let interaction_id = parse_snowflake(&interaction.id)?;
         if interaction.token.is_empty() {
-            return Err(AppError::Provider(
+            return Err(GatewayError::Discord(
                 "discord interaction omitted its token".into(),
             ));
         }
@@ -182,9 +178,9 @@ impl DiscordCommandHandler {
         interaction_token: &str,
         channel_id: u64,
         command: DiscordCommand,
-    ) -> AppResult<()> {
+    ) -> GatewayResult<()> {
         let agent = ureq::AgentBuilder::new()
-            .timeout(PRESENTATION_TIMEOUT)
+            .timeout(self.presentation_timeout)
             .build();
         agent
             .post(&format!(
@@ -217,7 +213,7 @@ impl DiscordCommandHandler {
         Ok(())
     }
 
-    fn status_content(&self, channel_id: u64) -> AppResult<String> {
+    fn status_content(&self, channel_id: u64) -> GatewayResult<String> {
         let (model, reasoning) = self.effective_settings(channel_id)?;
         match self.daemon_status() {
             Ok((version, sessions, active_runs)) => Ok(format!(
@@ -229,7 +225,7 @@ impl DiscordCommandHandler {
         }
     }
 
-    fn model_content(&self, channel_id: u64, value: Option<String>) -> AppResult<String> {
+    fn model_content(&self, channel_id: u64, value: Option<String>) -> GatewayResult<String> {
         if let Some(value) = value {
             let value = value.trim();
             if value.eq_ignore_ascii_case(DISCORD_DEFAULT_SETTING) {
@@ -240,7 +236,10 @@ impl DiscordCommandHandler {
                         "Model names must be one non-whitespace value of at most {DISCORD_MODEL_LIMIT} bytes."
                     ));
                 }
-                let model = ModelName::new(value)?.to_string();
+                if value.is_empty() {
+                    return Err(GatewayError::EmptyModelName);
+                }
+                let model = value.to_string();
                 self.update_overrides(channel_id, |overrides| overrides.model = Some(model))?;
             }
         }
@@ -250,7 +249,7 @@ impl DiscordCommandHandler {
         ))
     }
 
-    fn reasoning_content(&self, channel_id: u64, value: Option<String>) -> AppResult<String> {
+    fn reasoning_content(&self, channel_id: u64, value: Option<String>) -> GatewayResult<String> {
         if let Some(value) = value {
             if value.eq_ignore_ascii_case(DISCORD_DEFAULT_SETTING) {
                 self.update_overrides(channel_id, |overrides| {
@@ -279,11 +278,11 @@ impl DiscordCommandHandler {
         &self,
         channel_id: u64,
         update: impl FnOnce(&mut RunOverrides),
-    ) -> AppResult<()> {
+    ) -> GatewayResult<()> {
         let mut settings = self
             .overrides
             .lock()
-            .map_err(|_| AppError::Provider("discord run settings lock poisoned".into()))?;
+            .map_err(|_| GatewayError::Discord("discord run settings lock poisoned".into()))?;
         let overrides = settings.entry(channel_id).or_default();
         update(overrides);
         if overrides.is_empty() {
@@ -292,11 +291,11 @@ impl DiscordCommandHandler {
         Ok(())
     }
 
-    fn effective_settings(&self, channel_id: u64) -> AppResult<(String, String)> {
+    fn effective_settings(&self, channel_id: u64) -> GatewayResult<(String, String)> {
         let settings = self
             .overrides
             .lock()
-            .map_err(|_| AppError::Provider("discord run settings lock poisoned".into()))?;
+            .map_err(|_| GatewayError::Discord("discord run settings lock poisoned".into()))?;
         let overrides = settings.get(&channel_id);
         let model = overrides
             .and_then(|overrides| overrides.model.clone())
@@ -307,9 +306,11 @@ impl DiscordCommandHandler {
         Ok((model, reasoning))
     }
 
-    fn daemon_status(&self) -> AppResult<(String, usize, usize)> {
-        let mut daemon =
-            DaemonClient::connect_with_timeout(&self.daemon.socket_path, DAEMON_CLIENT_TIMEOUT)?;
+    fn daemon_status(&self) -> GatewayResult<(String, usize, usize)> {
+        let mut daemon = DaemonClient::connect_with_timeout(
+            &self.daemon.socket_path,
+            self.daemon_client_timeout,
+        )?;
         let hello = daemon.hello(&self.daemon.workspace_root)?;
         require_gateway_daemon_contract(&self.daemon.workspace_root, &hello)?;
         let sessions = daemon.sessions_list()?;
@@ -326,11 +327,11 @@ impl DiscordCommandHandler {
     }
 }
 
-fn discord_command(data: &InteractionData) -> AppResult<Option<DiscordCommand>> {
+fn discord_command(data: &InteractionData) -> GatewayResult<Option<DiscordCommand>> {
     match data.name.as_str() {
         DISCORD_STATUS_COMMAND => {
             if !data.options.is_empty() {
-                return Err(AppError::Provider(
+                return Err(GatewayError::Discord(
                     "discord status interaction included unexpected options".into(),
                 ));
             }
@@ -344,18 +345,18 @@ fn discord_command(data: &InteractionData) -> AppResult<Option<DiscordCommand>> 
     }
 }
 
-fn optional_string_option(data: &InteractionData, expected: &str) -> AppResult<Option<String>> {
+fn optional_string_option(data: &InteractionData, expected: &str) -> GatewayResult<Option<String>> {
     if data.options.is_empty() {
         return Ok(None);
     }
     if data.options.len() != 1 {
-        return Err(AppError::Provider(
+        return Err(GatewayError::Discord(
             "discord command interaction included unexpected options".into(),
         ));
     }
     let option = &data.options[0];
     if option.kind != DISCORD_STRING_OPTION || option.name != expected {
-        return Err(AppError::Provider(
+        return Err(GatewayError::Discord(
             "discord command interaction included an unexpected option".into(),
         ));
     }
@@ -363,7 +364,7 @@ fn optional_string_option(data: &InteractionData, expected: &str) -> AppResult<O
         .value
         .as_str()
         .map(|value| Some(value.to_string()))
-        .ok_or_else(|| AppError::Provider("discord command option was not a string".into()))
+        .ok_or_else(|| GatewayError::Discord("discord command option was not a string".into()))
 }
 
 #[derive(Serialize)]
@@ -469,16 +470,16 @@ pub(super) struct DiscordAuthor {
     pub(super) bot: Option<bool>,
 }
 
-pub(super) fn parse_snowflake(value: &str) -> AppResult<u64> {
+pub(super) fn parse_snowflake(value: &str) -> GatewayResult<u64> {
     value
         .parse()
-        .map_err(|_| AppError::Provider("discord gateway returned an invalid snowflake".into()))
+        .map_err(|_| GatewayError::Discord("discord gateway returned an invalid snowflake".into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discord_gateway::test_support::*;
+    use crate::test_support::*;
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
 
@@ -660,6 +661,13 @@ mod tests {
                 .reasoning_content(200, Some("turbo".into()))
                 .unwrap()
                 .starts_with("Reasoning effort must be")
+        );
+        assert_eq!(
+            handler
+                .model_content(200, Some(" \t".into()))
+                .unwrap_err()
+                .to_string(),
+            "core error: ModelName cannot be empty"
         );
         assert!(handler.overrides.lock().unwrap().is_empty());
     }
