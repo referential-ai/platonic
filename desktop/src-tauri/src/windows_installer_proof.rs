@@ -1,9 +1,7 @@
 #![allow(unsafe_code)]
 
-use plato_agent::{
-    daemon::{client::DaemonClient, installer_gate::InstallerStartupGate, protocol::RunStateName},
-    paths,
-};
+use plato_daemon_client::{client::DaemonClient, installer_gate::InstallerStartupGate, paths};
+use plato_protocol::RunStateName;
 use serde_json::json;
 use std::{
     env, fs,
