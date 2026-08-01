@@ -5,6 +5,9 @@ on:
     tags:
       - plato-desktop-v*
 
+env:
+  RUSTUP_TOOLCHAIN: 1.88.0
+
 jobs:
   build:
     name: Build Linux AppImage
@@ -23,6 +26,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal
 
       - name: Require the release tag to match the desktop version and main
         run: |

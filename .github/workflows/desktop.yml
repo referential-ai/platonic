@@ -14,7 +14,28 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  RUSTUP_TOOLCHAIN: 1.88.0
+
 jobs:
+  rustsec:
+    name: Desktop RustSec
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out plato-agent
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.0
+
+      - name: Audit desktop Rust dependencies
+        run: cargo audit --file desktop/src-tauri/Cargo.lock
+
   web:
     name: Web
     runs-on: ubuntu-24.04
@@ -74,6 +95,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -104,9 +128,6 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: desktop/package-lock.json
-
-      - name: Install Rust components
-        run: rustup component add rustfmt clippy
 
       - name: Install web dependencies
         run: npm ci
@@ -193,6 +214,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -208,9 +232,6 @@ jobs:
           cargo fetch --locked
           cargo fetch --manifest-path desktop/src-tauri/Cargo.toml --locked
           "CARGO_NET_OFFLINE=true" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Install Rust components
-        run: rustup component add rustfmt clippy
 
       - name: Build sidecars
         run: cargo build --locked --bin plato-agentd --bin plato
@@ -251,6 +272,9 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
+
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
