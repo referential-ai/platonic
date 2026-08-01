@@ -5,7 +5,6 @@ pub mod config;
 pub mod daemon;
 pub mod discord_gateway;
 pub mod error;
-pub mod issue_prep;
 pub mod ledger;
 pub mod model;
 pub mod paths;
@@ -14,6 +13,8 @@ pub mod replay;
 pub mod tool_catalog;
 pub mod tools;
 pub mod tui;
+
+pub use tools::github::issues as issue_prep;
 
 #[cfg(windows)]
 mod windows_security;
