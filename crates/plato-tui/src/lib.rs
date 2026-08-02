@@ -10,6 +10,7 @@
 mod app;
 mod client;
 mod commands;
+mod markdown;
 mod modal;
 mod render;
 mod state;

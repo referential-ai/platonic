@@ -9,6 +9,7 @@ use std::{fmt, sync::RwLock, time::Instant};
 use super::{
     ApprovalModalView,
     commands::{SlashCommandSpec, has_slash_command_prefix, matching_slash_commands},
+    markdown::{MarkdownRenderer, SyntaxTheme},
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -620,16 +621,38 @@ fn nth_char_boundary(value: &str, start: usize, end: usize, column: usize) -> us
         .unwrap_or(end)
 }
 
-type CachedLiveEventRows = (
-    Vec<LiveEventLine>,
-    Vec<(String, LiveEventKind, String)>,
-    Vec<Line<'static>>,
-);
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct TranscriptRowsKey {
+    pub(super) source: TranscriptView,
+    pub(super) width: u16,
+    pub(super) display_mode: DisplayMode,
+    pub(super) syntax_theme: SyntaxTheme,
+}
+
+pub(super) struct CachedTranscriptRows {
+    pub(super) key: TranscriptRowsKey,
+    pub(super) rows: Vec<Line<'static>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct LiveEventRowsKey {
+    pub(super) source: Vec<LiveEventLine>,
+    pub(super) committed: Vec<(String, LiveEventKind, String)>,
+    pub(super) width: u16,
+    pub(super) display_mode: DisplayMode,
+    pub(super) syntax_theme: SyntaxTheme,
+}
+
+pub(super) struct CachedLiveEventRows {
+    pub(super) key: LiveEventRowsKey,
+    pub(super) rows: Vec<Line<'static>>,
+}
 
 #[derive(Default)]
 pub(super) struct HistoryRowsCache {
-    pub(super) transcript: RwLock<Option<(TranscriptView, Vec<Line<'static>>)>>,
+    pub(super) transcript: RwLock<Option<CachedTranscriptRows>>,
     pub(super) live_events: RwLock<Option<CachedLiveEventRows>>,
+    pub(super) markdown: MarkdownRenderer,
 }
 
 // These rows are derived from public source fields and are not semantic TUI state.

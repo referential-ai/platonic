@@ -540,6 +540,9 @@ It renders a conversation-first transcript with distinct `You` and `Plato`
 messages, at most one subtle trace summary per run, one status row, a composer,
 session picker, and approval modal. Press `v` from an empty composer to toggle
 the complete ordered audit view without reloading the session.
+Assistant messages render headings, emphasis, lists, quotes, inline code,
+fenced code, and unified diffs in conversation view. User messages remain
+literal, while audit view retains the exact stored transcript source.
 
 ```bash
 cargo run --bin plato

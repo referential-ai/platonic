@@ -3139,7 +3139,7 @@ mod tests {
             .unwrap()
             .as_ref()
             .unwrap()
-            .1
+            .rows
             .as_ptr()
     }
 
@@ -3151,7 +3151,7 @@ mod tests {
             .unwrap()
             .as_ref()
             .unwrap()
-            .2
+            .rows
             .as_ptr()
     }
 
