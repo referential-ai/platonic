@@ -1487,6 +1487,7 @@ mod tests {
                     content: "hi".into(),
                 },
                 proposed_calls: vec![],
+                served_model: None,
                 usage: None,
             },
         ];

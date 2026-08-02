@@ -6,7 +6,7 @@ use crate::{
     },
     tool_catalog::{ToolSpec, internal_name_for_provider, provider_name_for_internal},
 };
-use platonic_core::ModelUsage;
+use platonic_core::{ModelName, ModelUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -38,6 +38,9 @@ const TOOL_ARGUMENT_LIMIT_ERROR: &str =
     "provider response exceeded the 1 MiB per-call tool arguments limit";
 const TOOL_ARGUMENTS_LIMIT_ERROR: &str =
     "provider response exceeded the 4 MiB aggregate tool arguments limit";
+const CONFLICTING_SERVED_MODEL_ERROR: &str =
+    "provider stream returned conflicting served model values";
+const STREAM_ERROR_EVENT_ERROR: &str = "provider stream returned an error event";
 
 pub struct OpenAiCompatibleClient {
     api_key: String,
@@ -267,12 +270,14 @@ struct ChatFunctionCall {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
+    model: Option<ModelName>,
     choices: Vec<ChatChoice>,
     usage: Option<ChatUsage>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionChunk {
+    model: Option<ModelName>,
     #[serde(default)]
     choices: Vec<ChatChunkChoice>,
     usage: Option<ChatUsage>,
@@ -388,6 +393,7 @@ struct StreamingAssembler {
     tool_calls: BTreeMap<usize, StreamingToolCall>,
     tool_arguments_bytes: usize,
     finish_reason: Option<ChatFinishReason>,
+    served_model: Option<ModelName>,
     usage: Option<ChatUsage>,
 }
 
@@ -404,6 +410,15 @@ impl StreamingAssembler {
         chunk: ChatCompletionChunk,
         on_delta: &mut impl FnMut(&str) -> AppResult<()>,
     ) -> AppResult<()> {
+        if let Some(served_model) = chunk.model {
+            match &self.served_model {
+                Some(first) if first != &served_model => {
+                    return Err(AppError::Provider(CONFLICTING_SERVED_MODEL_ERROR.into()));
+                }
+                Some(_) => {}
+                None => self.served_model = Some(served_model),
+            }
+        }
         if let Some(usage) = chunk.usage {
             self.usage = Some(usage);
         }
@@ -499,7 +514,12 @@ impl StreamingAssembler {
         let finish_reason = self.finish_reason.ok_or_else(|| {
             AppError::Provider("provider stream ended without finish_reason".into())
         })?;
-        Ok(model_response(content, finish_reason, self.usage))
+        Ok(model_response(
+            content,
+            finish_reason,
+            self.served_model,
+            self.usage,
+        ))
     }
 }
 
@@ -591,10 +611,8 @@ fn process_stream_data(
     let value: Value = serde_json::from_str(data).map_err(|error| {
         AppError::Provider(format!("provider returned invalid SSE JSON: {error}"))
     })?;
-    if let Some(error) = value.get("error") {
-        return Err(AppError::Provider(format!(
-            "provider stream error: {error}"
-        )));
+    if value.get("error").is_some() {
+        return Err(AppError::Provider(STREAM_ERROR_EVENT_ERROR.into()));
     }
     let chunk = serde_json::from_value::<ChatCompletionChunk>(value).map_err(|error| {
         AppError::Provider(format!("provider returned invalid SSE chunk: {error}"))
@@ -718,11 +736,13 @@ fn usage_from(usage: Option<ChatUsage>) -> Option<ModelUsage> {
 fn model_response(
     content: Vec<ModelBlock>,
     finish_reason: ChatFinishReason,
+    served_model: Option<ModelName>,
     usage: Option<ChatUsage>,
 ) -> ModelResponse {
     ModelResponse {
         content,
         stop: stop_from_finish(finish_reason),
+        served_model,
         usage: usage_from(usage),
     }
 }
@@ -780,7 +800,12 @@ impl ChatCompletionResponse {
                 call.function.arguments,
             )?);
         }
-        Ok(model_response(content, choice.finish_reason, self.usage))
+        Ok(model_response(
+            content,
+            choice.finish_reason,
+            self.model,
+            self.usage,
+        ))
     }
 }
 
@@ -810,6 +835,7 @@ mod tests {
     #[test]
     fn maps_openai_tool_calls_to_internal_tool_names() {
         let response: ChatCompletionResponse = serde_json::from_value(json!({
+            "model": "provider/test-model-2026-08-01",
             "choices": [{
                 "finish_reason": "tool_calls",
                 "message": {
@@ -835,6 +861,10 @@ mod tests {
 
         assert_eq!(response.stop, ModelStop::ToolUse);
         assert_eq!(
+            response.served_model,
+            Some(ModelName::new("provider/test-model-2026-08-01").unwrap())
+        );
+        assert_eq!(
             response.tool_uses(),
             vec![(
                 "call_1".into(),
@@ -842,6 +872,43 @@ mod tests {
                 json!({"path": "README.md"})
             )]
         );
+    }
+
+    #[test]
+    fn non_streaming_served_model_is_validated_and_omission_stays_unknown() {
+        let response: ChatCompletionResponse = serde_json::from_value(json!({
+            "model": "provider/concrete-model-2026-08-01",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "done"}
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            response.into_model_response().unwrap().served_model,
+            Some(ModelName::new("provider/concrete-model-2026-08-01").unwrap())
+        );
+
+        let omitted: ChatCompletionResponse = serde_json::from_value(json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "done"}
+            }]
+        }))
+        .unwrap();
+        assert_eq!(omitted.into_model_response().unwrap().served_model, None);
+
+        for malformed in [json!(""), json!(" "), json!(7)] {
+            let error = serde_json::from_value::<ChatCompletionResponse>(json!({
+                "model": malformed,
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": "done"}
+                }]
+            }))
+            .unwrap_err();
+            assert!(!error.to_string().contains("done"));
+        }
     }
 
     #[test]
@@ -1379,8 +1446,8 @@ mod tests {
     fn streaming_text_assembles_final_response_and_emits_deltas() {
         let raw = concat!(
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"model\":\"provider/concrete-model-2026-08-01\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"model\":\"provider/concrete-model-2026-08-01\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2}}\n\n",
             "data: [DONE]\n\n",
         );
@@ -1396,12 +1463,56 @@ mod tests {
         assert_eq!(response.text(), "Hello");
         assert_eq!(response.stop, ModelStop::EndTurn);
         assert_eq!(
+            response.served_model,
+            Some(ModelName::new("provider/concrete-model-2026-08-01").unwrap())
+        );
+        assert_eq!(
             response.usage,
             Some(ModelUsage {
                 input_tokens: 4,
                 output_tokens: 2,
             })
         );
+    }
+
+    #[test]
+    fn streaming_conflicting_served_models_fail_before_later_delta_or_success() {
+        let raw = concat!(
+            "data: {\"model\":\"provider/model-a\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"first\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"model\":\"provider/model-b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"second\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut deltas = Vec::new();
+
+        let error = parse_chat_completion_stream(Cursor::new(raw), &mut |delta| {
+            deltas.push(delta.to_owned());
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(deltas, ["first"]);
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == CONFLICTING_SERVED_MODEL_ERROR
+        ));
+    }
+
+    #[test]
+    fn streaming_error_event_body_is_not_exposed() {
+        let secret = "provider-secret-error-body";
+        let raw = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"error": {"message": secret}})
+        );
+
+        let error = parse_chat_completion_stream(Cursor::new(raw), &mut |_| Ok(())).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!("provider error: {STREAM_ERROR_EVENT_ERROR}")
+        );
+        assert!(!error.to_string().contains(secret));
     }
 
     #[test]
@@ -1423,6 +1534,7 @@ mod tests {
             let response = parse_chat_completion_stream(Cursor::new(raw), &mut |_| Ok(())).unwrap();
 
             assert_eq!(response.usage, expected, "fixture: {fixture}");
+            assert_eq!(response.served_model, None, "fixture: {fixture}");
         }
     }
 
@@ -1481,6 +1593,8 @@ mod tests {
         let cases = [
             b"data: not-json\n\n".to_vec(),
             b"data: {\"choices\":\"wrong shape\"}\n\n".to_vec(),
+            b"data: {\"model\":\" \",\"choices\":[]}\n\n".to_vec(),
+            b"data: {\"model\":7,\"choices\":[]}\n\n".to_vec(),
             b"data: {\"choices\":[\n\n".to_vec(),
             b"data: \xff\n\n".to_vec(),
             huge_event,
@@ -1851,6 +1965,7 @@ mod tests {
         assembler
             .apply_chunk(
                 ChatCompletionChunk {
+                    model: None,
                     choices: vec![ChatChunkChoice {
                         index: 0,
                         delta: ChatDelta {
@@ -1902,6 +2017,7 @@ mod tests {
         let error = assembler
             .apply_chunk(
                 ChatCompletionChunk {
+                    model: None,
                     choices: vec![ChatChunkChoice {
                         index: 0,
                         delta: ChatDelta {
@@ -1926,6 +2042,7 @@ mod tests {
             assembler
                 .apply_chunk(
                     ChatCompletionChunk {
+                        model: None,
                         choices: vec![ChatChunkChoice {
                             index: 0,
                             delta: ChatDelta {
@@ -2052,6 +2169,7 @@ mod tests {
         tool_calls: Vec<ChatToolCall>,
     ) -> ChatCompletionResponse {
         ChatCompletionResponse {
+            model: None,
             choices: vec![ChatChoice {
                 finish_reason: if tool_calls.is_empty() {
                     ChatFinishReason::Stop
@@ -2099,6 +2217,7 @@ mod tests {
         arguments: Option<String>,
     ) -> ChatCompletionChunk {
         ChatCompletionChunk {
+            model: None,
             choices: vec![ChatChunkChoice {
                 index: 0,
                 delta: ChatDelta {

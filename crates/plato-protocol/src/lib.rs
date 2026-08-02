@@ -782,6 +782,23 @@ pub struct TypedTranscript {
     pub runs: Vec<TypedRun>,
 }
 
+/// Latest requested-or-responded model identity state for one durable run.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum ModelIdentityStatus {
+    /// The host-selected model has been requested and no later response is recorded.
+    Requested {
+        /// Host-selected model or alias sent to the provider.
+        model: String,
+    },
+    /// A model response is durable, with optional provider-reported identity.
+    Responded {
+        /// Provider-reported served model, or unknown when omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_model: Option<String>,
+    },
+}
+
 /// Structured transcript entries for one run.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TypedRun {
@@ -791,6 +808,9 @@ pub struct TypedRun {
     pub session_index: u64,
     /// Run state.
     pub status: RunStateName,
+    /// Latest model identity state reconstructed from the durable ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_status: Option<ModelIdentityStatus>,
     /// Ordered transcript entries.
     pub entries: Vec<TypedTranscriptEntry>,
 }
@@ -1219,6 +1239,7 @@ mod tests {
                     run_id: "run_1".into(),
                     session_index: 0,
                     status: RunStateName::Finished,
+                    model_status: None,
                     entries: vec![
                         TypedTranscriptEntry::User {
                             text: "do work".into(),
@@ -1341,6 +1362,51 @@ mod tests {
         .expect("current clients decode typed-less daemon responses");
         assert_eq!(current_client.typed, None);
         assert_eq!(current_client.pending_approval, None);
+    }
+
+    #[test]
+    fn model_identity_status_keeps_exact_known_unknown_and_requested_wire_shapes() {
+        let fixtures = [
+            (
+                ModelIdentityStatus::Requested {
+                    model: "~openai/gpt-latest".into(),
+                },
+                json!({
+                    "state": "requested",
+                    "model": "~openai/gpt-latest"
+                }),
+            ),
+            (
+                ModelIdentityStatus::Responded {
+                    served_model: Some("openai/gpt-5.2-2026-08-01".into()),
+                },
+                json!({
+                    "state": "responded",
+                    "served_model": "openai/gpt-5.2-2026-08-01"
+                }),
+            ),
+            (
+                ModelIdentityStatus::Responded { served_model: None },
+                json!({"state": "responded"}),
+            ),
+        ];
+
+        for (status, wire) in fixtures {
+            assert_eq!(serde_json::to_value(&status).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<ModelIdentityStatus>(wire).unwrap(),
+                status
+            );
+        }
+
+        let legacy_run: TypedRun = serde_json::from_value(json!({
+            "run_id": "run_1",
+            "session_index": 0,
+            "status": "finished",
+            "entries": []
+        }))
+        .unwrap();
+        assert_eq!(legacy_run.model_status, None);
     }
 
     #[test]

@@ -28,6 +28,7 @@ const API_KEY_ENV: &str = "PLATO_SEMANTIC_CONFORMANCE_TEST_KEY";
 const DENIAL_REASON: &str = "approval denied by stdin";
 const FIXTURE_INITIAL: &str = "fixture baseline\n";
 const FIXTURE_WRITTEN: &str = "fixture changed\n";
+const SERVED_MODEL: &str = "provider/test-model-2026-08-01";
 const PROOF_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const REQUESTS_PER_LEG: usize = 2;
@@ -276,6 +277,8 @@ fn run_scenario(scenario: Scenario) {
         scenario.expected_usage_known(),
         "{scenario:?} daemon usage-known state"
     );
+    assert_eq!(served_models(&direct.records), vec![SERVED_MODEL; 2]);
+    assert_eq!(served_models(&daemon.records), vec![SERVED_MODEL; 2]);
     assert_approval_transport(scenario, &direct.records, &daemon.records);
     assert_policy_and_effect(scenario, &direct.records);
     assert_policy_and_effect(scenario, &daemon.records);
@@ -448,6 +451,19 @@ fn usage_known(records: &[RecordedEvent]) -> Vec<bool> {
         .iter()
         .filter_map(|record| match &record.event {
             HarnessEvent::ModelResponded { usage, .. } => Some(usage.is_some()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn served_models(records: &[RecordedEvent]) -> Vec<&str> {
+    records
+        .iter()
+        .filter_map(|record| match &record.event {
+            HarnessEvent::ModelResponded {
+                served_model: Some(model),
+                ..
+            } => Some(model.as_str()),
             _ => None,
         })
         .collect()
@@ -996,13 +1012,15 @@ impl ProviderReply {
 
 fn event_stream(events: [Value; 2], usage: UsageFixture) -> String {
     let mut body = String::new();
-    for event in events {
+    for mut event in events {
+        event["model"] = json!(SERVED_MODEL);
         body.push_str(&format!("data: {event}\n\n"));
     }
     if let UsageFixture::Known(prompt_tokens, completion_tokens) = usage {
         body.push_str(&format!(
             "data: {}\n\n",
             json!({
+                "model": SERVED_MODEL,
                 "choices": [],
                 "usage": {
                     "prompt_tokens": prompt_tokens,
@@ -1181,6 +1199,7 @@ fn sample_evidence(approval: SampleApproval) -> RunEvidence {
                 tool: tool.clone(),
                 input: input.clone(),
             }],
+            served_model: Some(ModelName::new(SERVED_MODEL).unwrap()),
             usage: Some(ModelUsage {
                 input_tokens: 10,
                 output_tokens: 2,
@@ -1256,6 +1275,7 @@ fn sample_evidence(approval: SampleApproval) -> RunEvidence {
                 content: "done".into(),
             },
             proposed_calls: vec![],
+            served_model: Some(ModelName::new(SERVED_MODEL).unwrap()),
             usage: Some(ModelUsage {
                 input_tokens: 20,
                 output_tokens: 4,

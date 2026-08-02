@@ -632,6 +632,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                     content: response.text(),
                 },
                 proposed_calls: proposals.clone(),
+                served_model: response.served_model.clone(),
                 usage: response.usage.clone(),
             },
         )?;
@@ -1307,7 +1308,7 @@ fn generated_id(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use platonic_core::{EffectClass, RunPhase, RunReadback};
+    use platonic_core::{EffectClass, ReadbackEntry, RunPhase, RunReadback};
     use serde_json::json;
     use std::{
         io::{Read, Write},
@@ -3383,7 +3384,7 @@ enabled = ["file.read"]
     }
 
     #[test]
-    fn omitted_provider_usage_is_recorded_as_unknown_in_raw_jsonl() {
+    fn omitted_provider_usage_and_served_model_are_unknown_in_raw_jsonl() {
         let provider = spawn_provider_sequence(vec![json!({
             "choices": [{
                 "finish_reason": "stop",
@@ -3416,7 +3417,11 @@ enabled = ["file.read"]
         let records = crate::ledger::read_records(&ledger_path).unwrap();
         assert!(records.iter().any(|record| matches!(
             &record.event,
-            HarnessEvent::ModelResponded { usage: None, .. }
+            HarnessEvent::ModelResponded {
+                served_model: None,
+                usage: None,
+                ..
+            }
         )));
         let raw_response = std::fs::read_to_string(&ledger_path)
             .unwrap()
@@ -3425,14 +3430,101 @@ enabled = ["file.read"]
             .find(|line| line["record"]["event"]["event"] == "model_responded")
             .unwrap();
         assert!(raw_response["record"]["event"]["usage"].is_null());
+        assert!(raw_response["record"]["event"]["served_model"].is_null());
+    }
+
+    #[test]
+    fn direct_served_model_persists_and_replays_identically_in_jsonl_and_sqlite() {
+        const RUN_ID: &str = "run_served_model_persistence";
+        const REQUESTED_MODEL: &str = "~openai/gpt-latest";
+        const SERVED_MODEL: &str = "openai/gpt-5.2-2026-08-01";
+
+        let response = json!({
+            "model": SERVED_MODEL,
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "served answer"}
+            }]
+        });
+        let provider = spawn_provider_sequence(vec![response.clone(), response]);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        write_served_model_test_config(&config_path, &provider.base_url, REQUESTED_MODEL);
+        let jsonl_path = dir.path().join("events.jsonl");
+        let sqlite_path = dir.path().join("events.db");
+
+        for ledger in [
+            RunLedger::Jsonl(jsonl_path.clone()),
+            RunLedger::Sqlite(sqlite_path.clone()),
+        ] {
+            let outcome = run_question(over_budget_options(
+                &config_path,
+                ledger,
+                dir.path().to_path_buf(),
+                RUN_ID,
+            ))
+            .unwrap();
+            assert_eq!(outcome.final_answer, "served answer");
+        }
+        assert_eq!(provider.handle.join().unwrap().len(), 2);
+
+        let jsonl_records = crate::ledger::read_records(&jsonl_path).unwrap();
+        let sqlite_records =
+            crate::ledger::read_sqlite_records(&sqlite_path, Some(RUN_ID)).unwrap();
+        for records in [&jsonl_records, &sqlite_records] {
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| matches!(record.event, HarnessEvent::ModelResponded { .. }))
+                    .count(),
+                1
+            );
+            assert!(records.iter().any(|record| matches!(
+                &record.event,
+                HarnessEvent::ModelRequested { model, .. }
+                    if model.as_str() == REQUESTED_MODEL
+            )));
+            assert!(records.iter().any(|record| matches!(
+                &record.event,
+                HarnessEvent::ModelResponded {
+                    served_model: Some(model),
+                    ..
+                } if model.as_str() == SERVED_MODEL
+            )));
+            let readback = RunReadback::from_events(records).unwrap();
+            assert!(readback.entries.iter().any(|entry| matches!(
+                entry,
+                ReadbackEntry::ModelMessage {
+                    served_model: Some(model),
+                    ..
+                } if model.as_str() == SERVED_MODEL
+            )));
+        }
+
+        let jsonl = std::fs::read_to_string(&jsonl_path).unwrap();
+        assert!(jsonl.contains(&format!(r#""served_model":"{SERVED_MODEL}""#)));
+        let sqlite_json = rusqlite::Connection::open(&sqlite_path)
+            .unwrap()
+            .query_row(
+                "SELECT event_json FROM ledger_events WHERE run_id = ?1 AND event_json LIKE '%model_responded%'",
+                [RUN_ID],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let sqlite_response: Value = serde_json::from_str(&sqlite_json).unwrap();
+        assert_eq!(sqlite_response["served_model"], SERVED_MODEL);
+        assert_eq!(
+            crate::replay::replay_file(&jsonl_path).unwrap(),
+            crate::replay::replay_sqlite(&sqlite_path, Some(RUN_ID)).unwrap()
+        );
     }
 
     #[test]
     fn assistant_deltas_are_live_only_not_jsonl_ledger() {
         let server = spawn_streaming_provider_sequence(vec![concat!(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"model\":\"provider/test-model-2026-08-01\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"model\":\"provider/test-model-2026-08-01\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"model\":\"provider/test-model-2026-08-01\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n",
             "data: [DONE]\n\n",
         )]);
@@ -3517,6 +3609,13 @@ enabled = ["file.read"]
             .expect("model response should record usage");
         assert_eq!(usage.input_tokens, 7);
         assert_eq!(usage.output_tokens, 3);
+        assert!(records.iter().any(|record| matches!(
+            &record.event,
+            HarnessEvent::ModelResponded {
+                served_model: Some(model),
+                ..
+            } if model.as_str() == "provider/test-model-2026-08-01"
+        )));
 
         let replay = crate::replay::replay_file(&ledger_path).unwrap();
         assert_eq!(
@@ -3716,6 +3815,13 @@ enabled = ["file.read"]
                 ("responded", "turn_1".into(), 0),
             ]
         );
+        assert!(records.iter().any(|record| matches!(
+            &record.event,
+            HarnessEvent::ModelResponded {
+                served_model: Some(model),
+                ..
+            } if model.as_str() == "provider/test-model-2026-08-01"
+        )));
         assert_eq!(
             records
                 .iter()
@@ -3929,6 +4035,97 @@ enabled = ["file.read"]
             model_event_sequence(&records),
             vec![("requested", "turn_1".into(), 0)]
         );
+    }
+
+    #[test]
+    fn streaming_identity_conflicts_and_error_bodies_fail_without_success_or_secret_leakage() {
+        let conflict_secret = "provider/secret-conflicting-model";
+        let error_secret = "provider-secret-stream-error-body";
+        let cases = [
+            (
+                "conflict",
+                format!(
+                    "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    json!({
+                        "model": "provider/model-a",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": "partial"},
+                            "finish_reason": null
+                        }]
+                    }),
+                    json!({
+                        "model": conflict_secret,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": "hidden"},
+                            "finish_reason": "stop"
+                        }]
+                    })
+                ),
+                conflict_secret,
+                "provider stream returned conflicting served model values",
+            ),
+            (
+                "error-event",
+                format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    json!({"error": {"message": error_secret}})
+                ),
+                error_secret,
+                "provider stream returned an error event",
+            ),
+        ];
+
+        for (index, (name, body, secret, expected_error)) in cases.into_iter().enumerate() {
+            let server = spawn_raw_provider_sequence(vec![ok_response("text/event-stream", &body)]);
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join("plato.toml");
+            let ledger_path = dir.path().join("events.jsonl");
+            write_retry_test_config(&config_path, &server.base_url, 2_000, 2_000);
+            let (event_sender, event_receiver) = std::sync::mpsc::channel();
+
+            let error = run_question(retry_test_options(
+                config_path,
+                ledger_path.clone(),
+                dir.path().to_path_buf(),
+                &format!("run_stream_identity_failure_{index}"),
+                Some(event_sender),
+                None,
+            ))
+            .unwrap_err();
+            assert_eq!(server.handle.join().unwrap().len(), 1);
+            assert!(
+                error.to_string().contains(expected_error),
+                "{name}: {error}"
+            );
+            assert!(!error.to_string().contains(secret));
+
+            let live = format!("{:?}", event_receiver.try_iter().collect::<Vec<_>>());
+            assert!(live.contains(expected_error));
+            assert!(!live.contains(secret));
+            let records = crate::ledger::read_records(&ledger_path).unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| matches!(record.event, HarnessEvent::ModelResponded { .. }))
+                    .count(),
+                0
+            );
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| matches!(record.event, HarnessEvent::RunFailed { .. }))
+                    .count(),
+                1
+            );
+            let raw = std::fs::read_to_string(&ledger_path).unwrap();
+            assert!(raw.contains(expected_error));
+            assert!(!raw.contains(secret));
+            let replay = crate::replay::replay_file(&ledger_path).unwrap();
+            assert!(replay.contains(expected_error));
+            assert!(!replay.contains(secret));
+        }
     }
 
     #[test]
@@ -4699,6 +4896,7 @@ enabled = ["file.read"]
                         content: turn.final_answer.clone(),
                     },
                     proposed_calls: vec![],
+                    served_model: None,
                     usage: None,
                 },
             ];
@@ -4807,6 +5005,31 @@ timeout_ms = 5000
 
 [limits]
 token_budget = {token_budget}
+max_output_tokens = 32
+max_turns = 1
+
+[tools]
+enabled = ["file.read"]
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_served_model_test_config(path: &Path, base_url: &str, model: &str) {
+        std::fs::write(
+            path,
+            format!(
+                r#"
+[provider]
+kind = "open_ai"
+model = "{model}"
+api_key_env = "PATH"
+base_url = "{base_url}"
+timeout_ms = 5000
+
+[limits]
+token_budget = 4000
 max_output_tokens = 32
 max_turns = 1
 
@@ -5148,6 +5371,7 @@ enabled = ["file.write", "file.edit"]
 
     fn successful_provider_response(text: &str) -> String {
         let body = json!({
+            "model": "provider/test-model-2026-08-01",
             "choices": [{
                 "finish_reason": "stop",
                 "message": {"content": text}

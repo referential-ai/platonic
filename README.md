@@ -559,6 +559,9 @@ Live rows, model status, warnings, and approvals remain bound to that selected
 session and run across reloads. A pending approval is restored from daemon
 readback. An accepted grant or deny immediately resolves its conversation trace
 to approval, while a failed decision remains available to retry.
+While a provider response is pending, the status row labels the selected model
+or alias. After the response is durable, it labels the provider-reported served
+model, or `served unknown` when the provider omits that identity.
 
 ```bash
 cargo run --bin plato-agentd -- --workspace "$PWD"

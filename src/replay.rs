@@ -80,7 +80,9 @@ pub fn format_readback(readback: &RunReadback) -> String {
                     fragment.lane, fragment.source, fragment.content
                 ));
             }
-            ReadbackEntry::ModelMessage { turn_id, message } => {
+            ReadbackEntry::ModelMessage {
+                turn_id, message, ..
+            } => {
                 let role = match message.role {
                     MessageRole::System => "system",
                     MessageRole::User => "user",
@@ -726,6 +728,7 @@ mod tests {
                     content: format!("voice answer {turn}"),
                 },
                 proposed_calls: vec![],
+                served_model: None,
                 usage: Some(ModelUsage {
                     input_tokens: 4,
                     output_tokens: 3,
@@ -792,6 +795,7 @@ mod tests {
                         tool: ToolName::new("shell.exec").unwrap(),
                         input: json!({"command": "cargo test"}),
                     }],
+                    served_model: None,
                     usage: Some(ModelUsage {
                         input_tokens: 0,
                         output_tokens: 0,
@@ -821,6 +825,7 @@ mod tests {
         assert!(matches!(
             &records[3].event,
             HarnessEvent::ModelResponded {
+                served_model: None,
                 usage: Some(ModelUsage {
                     input_tokens: 8,
                     output_tokens: 3,

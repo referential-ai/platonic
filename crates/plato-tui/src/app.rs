@@ -907,8 +907,8 @@ mod tests {
     use plato_daemon_client::ClientError;
     use plato_protocol::{
         BufferedStreamEvent, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION, ERROR_WORKSPACE_MISMATCH,
-        EventsStreamResult, HelloResult, IssuePrepResult, IssuePrepStartResult, ProtocolError,
-        RunStartResult, SessionSummary, TranscriptReadResult,
+        EventsStreamResult, HelloResult, IssuePrepResult, IssuePrepStartResult,
+        ModelIdentityStatus, ProtocolError, RunStartResult, SessionSummary, TranscriptReadResult,
     };
     use serde_json::json;
     #[cfg(unix)]
@@ -2180,7 +2180,69 @@ mod tests {
             },
         );
 
-        assert_eq!(state.active_model.as_deref(), Some("openrouter/auto"));
+        assert_eq!(
+            state.active_model,
+            Some(ModelIdentityStatus::Requested {
+                model: "openrouter/auto".into()
+            })
+        );
+    }
+
+    #[test]
+    fn model_responded_events_update_status_to_known_or_unknown_served_identity() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut state = test_state();
+        let mut runtime = UiRuntime {
+            active_run_id: Some("run_1".into()),
+            config_path: None,
+            next_offset: 0,
+            poll_in_flight: true,
+            polling: true,
+            last_poll: Instant::now(),
+            tool_inputs: HashMap::new(),
+            active_since: Some(Instant::now()),
+        };
+
+        for (offset, served_model, expected) in [
+            (
+                0,
+                json!("openai/gpt-5.2-2026-08-01"),
+                Some("openai/gpt-5.2-2026-08-01".into()),
+            ),
+            (1, json!(null), None),
+        ] {
+            apply_events_result(
+                &mut state,
+                &mut runtime,
+                &sender,
+                EventsStreamResult {
+                    run_id: "run_1".into(),
+                    from_offset: offset,
+                    next_offset: offset + 1,
+                    status: RunStateName::Running,
+                    events: vec![ledger_event(
+                        offset,
+                        json!({
+                            "event": "model_responded",
+                            "run_id": "run_1",
+                            "turn_id": "turn_1",
+                            "step": 0,
+                            "output": {"role": "assistant", "content": "done"},
+                            "proposed_calls": [],
+                            "served_model": served_model,
+                            "usage": null
+                        }),
+                    )],
+                },
+            );
+
+            assert_eq!(
+                state.active_model,
+                Some(ModelIdentityStatus::Responded {
+                    served_model: expected
+                })
+            );
+        }
     }
 
     #[test]
@@ -2887,7 +2949,9 @@ mod tests {
             crate::LiveEventLine::status(Some(1), "live status"),
         );
         state.stream_warning = Some("matching warning".into());
-        state.active_model = Some("matching-model".into());
+        state.active_model = Some(ModelIdentityStatus::Requested {
+            model: "matching-model".into(),
+        });
         state.active_run_elapsed_secs = Some(17);
         state.toggle_display_mode();
         state.scroll_history_up(10);
@@ -2912,7 +2976,12 @@ mod tests {
         assert_cached_rows(&state, false, true);
         assert_eq!(cached_live_event_rows_ptr(&state), live_event_rows_ptr);
         assert_eq!(state.stream_warning.as_deref(), Some("matching warning"));
-        assert_eq!(state.active_model.as_deref(), Some("matching-model"));
+        assert_eq!(
+            state.active_model,
+            Some(ModelIdentityStatus::Requested {
+                model: "matching-model".into()
+            })
+        );
         assert_eq!(state.active_run_elapsed_secs, Some(17));
         assert_eq!(state.display_mode, DisplayMode::Audit);
         assert_eq!(state.scroll_offset, 10);
@@ -2951,7 +3020,9 @@ mod tests {
             let old_marker = format!("old-live-{previous_session}");
             state.live_events = vec![crate::LiveEventLine::assistant(Some(7), old_marker.clone())];
             state.stream_warning = Some(format!("old-warning-{previous_session}"));
-            state.active_model = Some(format!("old-model-{previous_session}"));
+            state.active_model = Some(ModelIdentityStatus::Requested {
+                model: format!("old-model-{previous_session}"),
+            });
             state.active_run_elapsed_secs = Some(91);
             state.approval = Some(test_approval(&previous_run, "old-call"));
             state.scroll_history_up(10);
@@ -2987,7 +3058,9 @@ mod tests {
         let mut state = test_state();
         state.live_events = vec![crate::LiveEventLine::status(None, "unowned live state")];
         state.stream_warning = Some("unowned warning".into());
-        state.active_model = Some("unowned-model".into());
+        state.active_model = Some(ModelIdentityStatus::Requested {
+            model: "unowned-model".into(),
+        });
         state.active_run_elapsed_secs = Some(12);
         state.approval = Some(test_approval("unowned-run", "unowned-call"));
         render_snapshot(&state, 100, 24).unwrap();

@@ -1,6 +1,6 @@
 use crate::tool_catalog::ToolSpec;
 pub use plato_protocol::{ReasoningEffort, RunOverrides};
-use platonic_core::ModelUsage;
+use platonic_core::{ModelName, ModelUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -63,6 +63,8 @@ pub enum ModelStop {
 pub struct ModelResponse {
     pub content: Vec<ModelBlock>,
     pub stop: ModelStop,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<ModelName>,
     pub usage: Option<ModelUsage>,
 }
 

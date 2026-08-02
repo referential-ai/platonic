@@ -50,7 +50,7 @@ plato-daemon-client = { version = "0.1.0", path = "crates/plato-daemon-client" }
 plato-gateway-discord = { version = "0.1.0", path = "crates/plato-gateway-discord" }
 plato-protocol = { version = "0.1.0", path = "crates/plato-protocol" }
 plato-tui = { version = "0.1.0", path = "crates/plato-tui" }
-platonic-core = "0.3.0"
+platonic-core = "0.3.1"
 rusqlite = { version = "0.39", features = ["bundled"] }
 rustix = { version = "1", features = ["event", "fs", "net", "process", "time"] }
 serde = { version = "1", features = ["derive"] }

@@ -12,7 +12,7 @@ use super::{
     state::DisplayMode,
 };
 use crate::commands::{SLASH_COMMANDS, matching_slash_commands};
-use plato_protocol::{RunStateName, TypedRun, TypedTranscriptEntry};
+use plato_protocol::{ModelIdentityStatus, RunStateName, TypedRun, TypedTranscriptEntry};
 use std::time::Duration;
 
 /// Renders the current client state into a terminal frame.
@@ -807,7 +807,7 @@ fn status_line(state: &TuiState, width: u16) -> Line<'static> {
                 .unwrap_or_else(|| "0s".into()),
         )
     };
-    let model = state.active_model.as_deref().unwrap_or("model pending");
+    let model = model_status_label(state.active_model.as_ref());
     let connection = match &state.connection {
         ConnectionState::Connected { .. } => "online",
         ConnectionState::Disconnected { .. } => "offline",
@@ -824,7 +824,7 @@ fn status_line(state: &TuiState, width: u16) -> Line<'static> {
     let full = format!(
         "{connection} {identity} | {run_status} {elapsed} | {model} | queued {queued} | {mode}"
     );
-    let medium = format!("{connection} {identity} | {run_status} | q {queued} | {mode}");
+    let medium = format!("{connection} | {run_status} | {model} | q {queued} | {mode}");
     let short_connection = if connection == "online" { "on" } else { "off" };
     let short_mode = if state.display_mode == DisplayMode::Conversation {
         "chat"
@@ -832,14 +832,26 @@ fn status_line(state: &TuiState, width: u16) -> Line<'static> {
         "audit"
     };
     let short = format!("{short_connection} | {run_status} | {model} | q{queued} | {short_mode}");
-    let text = [full, medium, short]
+    let compact = format!("{short_connection} | {run_status} | {model}");
+    let text = [full, medium, short, compact]
         .into_iter()
         .find(|candidate| candidate.chars().count() <= usize::from(width))
-        .unwrap_or_else(|| format!("{short_connection} {run_status} q{queued} {short_mode}"));
+        .unwrap_or(model);
     Line::from(Span::styled(
         bounded_status_text(text, width),
         Style::default().fg(Color::DarkGray),
     ))
+}
+
+fn model_status_label(status: Option<&ModelIdentityStatus>) -> String {
+    match status {
+        Some(ModelIdentityStatus::Requested { model }) => format!("selected {model}"),
+        Some(ModelIdentityStatus::Responded {
+            served_model: Some(model),
+        }) => format!("served {model}"),
+        Some(ModelIdentityStatus::Responded { served_model: None }) => "served unknown".into(),
+        None => "model pending".into(),
+    }
 }
 
 fn daemon_identity_label(identity: &str) -> String {
@@ -1357,13 +1369,36 @@ mod tests {
     }
 
     #[test]
+    fn model_status_labels_distinguish_selected_known_served_and_unknown_served() {
+        assert_eq!(
+            model_status_label(Some(&ModelIdentityStatus::Requested {
+                model: "~openai/gpt-latest".into(),
+            })),
+            "selected ~openai/gpt-latest"
+        );
+        assert_eq!(
+            model_status_label(Some(&ModelIdentityStatus::Responded {
+                served_model: Some("openai/gpt-5.2-2026-08-01".into()),
+            })),
+            "served openai/gpt-5.2-2026-08-01"
+        );
+        assert_eq!(
+            model_status_label(Some(&ModelIdentityStatus::Responded { served_model: None })),
+            "served unknown"
+        );
+        assert_eq!(model_status_label(None), "model pending");
+    }
+
+    #[test]
     fn status_chrome_stays_one_bounded_row() {
         let mut state = conversation_fixture();
         state.active_run = Some(ActiveRunView {
             run_id: "run_hidden_identifier".into(),
             status: RunStateName::Running,
         });
-        state.active_model = Some("model-with-a-very-long-display-name".into());
+        state.active_model = Some(ModelIdentityStatus::Requested {
+            model: "model-with-a-very-long-display-name".into(),
+        });
         state.queued_messages = vec!["one".into(), "two".into()];
 
         for width in [0, 8, 24, 48, 96] {
@@ -1434,11 +1469,11 @@ mod tests {
         let narrow_conversation = focused_snapshot(&state, 48, 24);
         assert_eq!(
             normal_conversation,
-            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow widths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | ready 0s | openrouter/auto | queued 0 | conversation"
+            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow widths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | ready 0s | selected openrouter/auto | queued 0 | conversation"
         );
         assert_eq!(
             narrow_conversation,
-            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow\nwidths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n> | Try \"read README.md and summarize it\"\non | ready | openrouter/auto | q0 | chat"
+            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow\nwidths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n> | Try \"read README.md and summarize it\"\non | ready | selected openrouter/auto"
         );
         for snapshot in [&normal_conversation, &narrow_conversation] {
             assert_eq!(snapshot.lines().filter(|line| *line == "You").count(), 2);
@@ -1461,11 +1496,11 @@ mod tests {
         let narrow_audit = focused_snapshot(&state, 48, 24);
         assert_eq!(
             normal_audit,
-            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise summary.\nassistant\ntool      call_alpha file.read {\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at narrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission denied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | ready 0s | openrouter/auto | queued 0 | audit"
+            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise summary.\nassistant\ntool      call_alpha file.read {\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at narrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission denied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | ready 0s | selected openrouter/auto | queued 0 | audit"
         );
         assert_eq!(
             narrow_audit,
-            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise\nsummary.\nassistant\ntool      call_alpha file.read\n{\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at\nnarrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission\ndenied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\non | ready | openrouter/auto | q0 | audit"
+            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise\nsummary.\nassistant\ntool      call_alpha file.read\n{\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at\nnarrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission\ndenied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\non | ready | selected openrouter/auto"
         );
         for snapshot in [&normal_audit, &narrow_audit] {
             assert!(snapshot.contains("run_alpha_full_identifier"));
@@ -1868,7 +1903,9 @@ mod tests {
             Vec::new(),
             TranscriptState::None,
         );
-        state.active_model = Some("openrouter/auto".into());
+        state.active_model = Some(ModelIdentityStatus::Requested {
+            model: "openrouter/auto".into(),
+        });
         state.active_run_elapsed_secs = Some(65);
         state.live_events = vec![
             LiveEventLine::user("read README"),
@@ -1879,7 +1916,7 @@ mod tests {
         let output = render_to_text(&state);
 
         assert!(output.contains("1m05s"));
-        assert!(output.contains("openrouter/auto"));
+        assert!(output.contains("selected openrouter/auto"));
         assert!(output.contains("You"));
         assert!(output.contains("read README"));
         assert!(output.contains("Trace"));
@@ -1915,6 +1952,7 @@ mod tests {
                 run_id: "run_1".into(),
                 session_index: 0,
                 status: RunStateName::Running,
+                model_status: None,
                 entries: Vec::new(),
             };
             assert_eq!(
@@ -1949,6 +1987,7 @@ mod tests {
                 run_id: "run_1".into(),
                 session_index: 0,
                 status: RunStateName::Running,
+                model_status: None,
                 entries: vec![TypedTranscriptEntry::Approval {
                     call_id: "call_1".into(),
                     decision,
@@ -2399,6 +2438,7 @@ mod tests {
                                 run_id: "run_alpha_full_identifier".into(),
                                 session_index: 0,
                                 status: RunStateName::Finished,
+                                model_status: None,
                                 entries: vec![
                                     TypedTranscriptEntry::User {
                                         text: "First question asks for a concise summary.".into(),
@@ -2424,6 +2464,7 @@ mod tests {
                                 run_id: "run_beta_full_identifier".into(),
                                 session_index: 1,
                                 status: RunStateName::Failed,
+                                model_status: None,
                                 entries: vec![
                                     TypedTranscriptEntry::User {
                                         text: "Second question remains readable at narrow widths."
@@ -2445,7 +2486,9 @@ mod tests {
                 .into(),
             ),
         );
-        state.active_model = Some("openrouter/auto".into());
+        state.active_model = Some(ModelIdentityStatus::Requested {
+            model: "openrouter/auto".into(),
+        });
         state.live_events = vec![
             LiveEventLine::assistant(Some(41), "Second answer stays readable.")
                 .with_run_id("run_beta_full_identifier"),
@@ -2477,6 +2520,7 @@ mod tests {
                             run_id: "run_approval".into(),
                             session_index: 0,
                             status: RunStateName::Running,
+                            model_status: None,
                             entries: vec![TypedTranscriptEntry::User {
                                 text: "Review the proposed edit.".into(),
                             }],
