@@ -818,6 +818,21 @@ mod tests {
         },
     };
 
+    const MOCK_PROVIDER_READINESS_ALLOWANCE: Duration = Duration::from_secs(10);
+    #[cfg(not(windows))]
+    const NATIVE_WINDOWS_FIXTURE_TRIALS: usize = 1;
+    #[cfg(windows)]
+    const NATIVE_WINDOWS_FIXTURE_TRIALS: usize = 50;
+
+    fn run_native_windows_fixture_trials(name: &str, fixture: fn()) {
+        for trial in 1..=NATIVE_WINDOWS_FIXTURE_TRIALS {
+            if let Err(payload) = std::panic::catch_unwind(fixture) {
+                eprintln!("{name} failed on trial {trial}/{NATIVE_WINDOWS_FIXTURE_TRIALS}");
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+
     #[test]
     fn sqlite_success_hint_goes_to_stderr_without_changing_stdout() {
         let outcome = RunOutcome {
@@ -1254,6 +1269,13 @@ mod tests {
 
     #[test]
     fn delegated_prompt_bridges_stdin_grant_and_denial() {
+        run_native_windows_fixture_trials(
+            "delegated_prompt_bridges_stdin_grant_and_denial",
+            delegated_prompt_bridges_stdin_grant_and_denial_fixture,
+        );
+    }
+
+    fn delegated_prompt_bridges_stdin_grant_and_denial_fixture() {
         for (stdin, final_answer, file_exists) in
             [("y\n", "granted", true), ("\n", "denied", false)]
         {
@@ -1590,7 +1612,9 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(0);
             let handle = thread::spawn(move || {
+                ready_sender.send(()).unwrap();
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let mut requests = Vec::new();
                 for body in responses {
@@ -1619,6 +1643,9 @@ mod tests {
                 }
                 requests
             });
+            ready_receiver
+                .recv_timeout(MOCK_PROVIDER_READINESS_ALLOWANCE)
+                .unwrap();
             Self { base_url, handle }
         }
 

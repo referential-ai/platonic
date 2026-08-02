@@ -1322,7 +1322,21 @@ mod tests {
     const FALLBACK_ASSISTANT_TEXT: &str = "fallback assistant text";
     const FALLBACK_CAPTURE_RUN_ID: &str = "run_fallback_stderr";
     const FALLBACK_CAPTURE_SESSION_ID: &str = "session_fallback_stderr";
+    const LOADED_RUNNER_EVENT_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(10);
     const LOADED_RUNNER_REQUEST_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(10);
+    #[cfg(not(windows))]
+    const NATIVE_WINDOWS_FIXTURE_TRIALS: usize = 1;
+    #[cfg(windows)]
+    const NATIVE_WINDOWS_FIXTURE_TRIALS: usize = 50;
+
+    fn run_native_windows_fixture_trials(name: &str, fixture: fn()) {
+        for trial in 1..=NATIVE_WINDOWS_FIXTURE_TRIALS {
+            if let Err(payload) = std::panic::catch_unwind(fixture) {
+                eprintln!("{name} failed on trial {trial}/{NATIVE_WINDOWS_FIXTURE_TRIALS}");
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
 
     #[test]
     fn generated_run_and_session_ids_are_unique() {
@@ -4330,6 +4344,13 @@ enabled = ["file.read"]
 
     #[test]
     fn cancellation_immediately_before_retry_prevents_second_request() {
+        run_native_windows_fixture_trials(
+            "cancellation_immediately_before_retry_prevents_second_request",
+            cancellation_immediately_before_retry_prevents_second_request_fixture,
+        );
+    }
+
+    fn cancellation_immediately_before_retry_prevents_second_request_fixture() {
         let cancel = Arc::new(AtomicBool::new(false));
         let server = spawn_gated_retry_provider("0.1");
         let dir = tempfile::tempdir().unwrap();
@@ -4348,11 +4369,15 @@ enabled = ["file.read"]
         );
         let boundary_cancel = cancel.clone();
         let (boundary_ready_sender, boundary_ready_receiver) = std::sync::mpsc::sync_channel(0);
+        let (event_deadline_sender, event_deadline_receiver) = std::sync::mpsc::sync_channel(0);
         // Arm the event-gated cancel before the request. This single final wait
         // slice makes the explicit pre-request check the only later observer.
         let boundary_handle = thread::spawn(move || {
             boundary_ready_sender.send(()).unwrap();
-            wait_for_model_failed(&event_receiver);
+            let event_deadline = event_deadline_receiver
+                .recv_timeout(LOADED_RUNNER_REQUEST_ALLOWANCE + LOADED_RUNNER_EVENT_ALLOWANCE)
+                .unwrap();
+            wait_for_model_failed_until(&event_receiver, event_deadline);
             boundary_cancel.store(true, Ordering::SeqCst);
         });
         boundary_ready_receiver
@@ -4367,6 +4392,11 @@ enabled = ["file.read"]
                 .unwrap(),
             0
         );
+        let loaded_runner_event_deadline =
+            std::time::Instant::now() + LOADED_RUNNER_EVENT_ALLOWANCE;
+        event_deadline_sender
+            .send(loaded_runner_event_deadline)
+            .unwrap();
         server.response_sender.send(()).unwrap();
         server.response_sender.send(()).unwrap();
 
@@ -5474,6 +5504,26 @@ enabled = ["file.read"]
         loop {
             let event = receiver
                 .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            if matches!(
+                event,
+                RunEvent::Ledger(RecordedEvent {
+                    event: HarnessEvent::ModelFailed { .. },
+                    ..
+                })
+            ) {
+                return;
+            }
+        }
+    }
+
+    fn wait_for_model_failed_until(
+        receiver: &std::sync::mpsc::Receiver<RunEvent>,
+        deadline: std::time::Instant,
+    ) {
+        loop {
+            let event = receiver
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
                 .unwrap();
             if matches!(
                 event,
