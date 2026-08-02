@@ -819,6 +819,7 @@ mod tests {
     };
 
     const MOCK_PROVIDER_READINESS_ALLOWANCE: Duration = Duration::from_secs(10);
+    const LOADED_RUNNER_REQUEST_OBSERVATION_ALLOWANCE: Duration = Duration::from_secs(10);
     #[cfg(not(windows))]
     const NATIVE_WINDOWS_FIXTURE_TRIALS: usize = 1;
     #[cfg(windows)]
@@ -1148,6 +1149,13 @@ mod tests {
 
     #[test]
     fn serving_daemon_handles_fresh_and_latest_continuation() {
+        run_native_windows_fixture_trials(
+            "serving_daemon_handles_fresh_and_latest_continuation",
+            serving_daemon_handles_fresh_and_latest_continuation_fixture,
+        );
+    }
+
+    fn serving_daemon_handles_fresh_and_latest_continuation_fixture() {
         let workspace = tempfile::tempdir().unwrap();
         with_test_xdg(workspace.path(), || {
             let provider = FakeProvider::start(vec![
@@ -1208,6 +1216,13 @@ mod tests {
 
     #[test]
     fn delegated_prompt_tolerates_context_compaction_ledger_event() {
+        run_native_windows_fixture_trials(
+            "delegated_prompt_tolerates_context_compaction_ledger_event",
+            delegated_prompt_tolerates_context_compaction_ledger_event_fixture,
+        );
+    }
+
+    fn delegated_prompt_tolerates_context_compaction_ledger_event_fixture() {
         let workspace = tempfile::tempdir().unwrap();
         with_test_xdg(workspace.path(), || {
             let old_answer = "old answer ".repeat(800);
@@ -1324,6 +1339,13 @@ mod tests {
 
     #[test]
     fn delegated_prompt_returns_terminal_daemon_failure() {
+        run_native_windows_fixture_trials(
+            "delegated_prompt_returns_terminal_daemon_failure",
+            delegated_prompt_returns_terminal_daemon_failure_fixture,
+        );
+    }
+
+    fn delegated_prompt_returns_terminal_daemon_failure_fixture() {
         let workspace = tempfile::tempdir().unwrap();
         with_test_xdg(workspace.path(), || {
             let provider = FakeProvider::start(vec!["data: not-json\n\n".into()]);
@@ -1615,7 +1637,7 @@ mod tests {
             let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(0);
             let handle = thread::spawn(move || {
                 ready_sender.send(()).unwrap();
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + LOADED_RUNNER_REQUEST_OBSERVATION_ALLOWANCE;
                 let mut requests = Vec::new();
                 for body in responses {
                     let mut stream = loop {
