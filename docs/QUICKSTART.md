@@ -27,7 +27,7 @@ max_output_tokens = 1024
 max_turns = 8
 
 [tools]
-enabled = ["file.read", "file.list", "file.write", "file.edit", "shell.exec"]
+enabled = ["file.read", "file.list", "file.write", "file.edit", "shell.exec", "web.fetch"]
 ```
 
 ## 1. First run (60-second smoke test)
@@ -60,6 +60,9 @@ Reads and listings never prompt. Workspace writes prompt unless `--yolo`.
 Yolo does not approve network tools or `shell.exec`. `shell.exec` always
 prompts and runs with a scrubbed environment that does not inherit provider
 credentials.
+`web.fetch` always prompts with its normalized public origin and validated
+addresses, revalidates immediately before each pinned connection, and returns
+only bounded UTF-8 text from the approved origin.
 Nothing escapes the workspace: `../`, absolute paths, and symlinks out are refused.
 
 ## 3. Durable runs (SQLite)
