@@ -2197,9 +2197,9 @@ mod tests {
 
         let equal_before_render = state.clone();
         let first = render_to_text(&state);
-        assert_eq!(format!("{state:?}"), format!("{equal_before_render:?}"));
+        assert_eq!(state, equal_before_render);
         let cloned = state.clone();
-        assert_eq!(format!("{cloned:?}"), format!("{state:?}"));
+        assert_eq!(cloned, state);
         assert!(cloned.history_rows.transcript.read().unwrap().is_none());
         assert!(cloned.history_rows.live_events.read().unwrap().is_none());
         assert_eq!(render_to_text(&cloned), first);

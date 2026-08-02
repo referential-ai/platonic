@@ -87,6 +87,80 @@ pub struct TuiState {
     pub cancel_requested: bool,
 }
 
+impl PartialEq for TuiState {
+    fn eq(&self, other: &Self) -> bool {
+        self.workspace_root == other.workspace_root
+            && self.socket_path == other.socket_path
+            && self.connection == other.connection
+            && self.sessions == other.sessions
+            && self.selected_session_id == other.selected_session_id
+            && self.transcript == other.transcript
+            && self.active_run == other.active_run
+            && self.live_events == other.live_events
+            && self.history_rows == other.history_rows
+            && self.scroll_offset == other.scroll_offset
+            && self.display_mode == other.display_mode
+            && self.conversation_scroll_offset == other.conversation_scroll_offset
+            && self.audit_scroll_offset == other.audit_scroll_offset
+            && self.active_model == other.active_model
+            && self.active_run_elapsed_secs == other.active_run_elapsed_secs
+            && self.working_elapsed_millis == other.working_elapsed_millis
+            && composer_eq(&self.composer, &other.composer)
+            && self.slash_popup == other.slash_popup
+            && self.session_picker == other.session_picker
+            && self.queued_messages == other.queued_messages
+            && self.issue_prep_started_at == other.issue_prep_started_at
+            && self.issue_prep_elapsed_secs == other.issue_prep_elapsed_secs
+            && self.motion_mode == other.motion_mode
+            && self.input_history == other.input_history
+            && self.history_index == other.history_index
+            && self.status_message == other.status_message
+            && self.stream_warning == other.stream_warning
+            && self.approval == other.approval
+            && self.help_visible == other.help_visible
+            && self.status_modal == other.status_modal
+            && self.cancel_requested == other.cancel_requested
+    }
+}
+
+impl Eq for TuiState {}
+
+fn composer_eq(left: &TextArea<'static>, right: &TextArea<'static>) -> bool {
+    if left.tab_length() != right.tab_length()
+        || left.hard_tab_indent() != right.hard_tab_indent()
+        || left.max_histories() != right.max_histories()
+        || !composer_surface_eq(left, right)
+    {
+        return false;
+    }
+
+    let (mut left_undo, mut right_undo) = (left.clone(), right.clone());
+    loop {
+        match (left_undo.undo(), right_undo.undo()) {
+            (false, false) => break,
+            (true, true) if composer_surface_eq(&left_undo, &right_undo) => {}
+            _ => return false,
+        }
+    }
+
+    let (mut left_redo, mut right_redo) = (left.clone(), right.clone());
+    loop {
+        match (left_redo.redo(), right_redo.redo()) {
+            (false, false) => break,
+            (true, true) if composer_surface_eq(&left_redo, &right_redo) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn composer_surface_eq(left: &TextArea<'static>, right: &TextArea<'static>) -> bool {
+    left.lines() == right.lines()
+        && left.cursor() == right.cursor()
+        && left.selection_range() == right.selection_range()
+        && left.yank_text() == right.yank_text()
+}
+
 impl TuiState {
     /// Creates state from a successful daemon hello and session readback.
     pub fn connected(
@@ -776,6 +850,55 @@ pub enum LiveEventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_equality_tracks_observable_composer_state_and_edit_history() {
+        let mut state = TuiState::disconnected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            "offline".into(),
+        );
+        state.set_composer_text("alpha beta");
+        state.composer.move_cursor(CursorMove::WordBack);
+        state.composer.start_selection();
+        state.composer.move_cursor(CursorMove::End);
+        state.composer.set_yank_text("saved");
+
+        assert_eq!(state, state.clone());
+
+        let mut different_text = state.clone();
+        different_text.composer.insert_char('!');
+        assert_ne!(state, different_text);
+
+        let mut different_cursor = state.clone();
+        different_cursor.composer.cancel_selection();
+        different_cursor.composer.move_cursor(CursorMove::Back);
+        assert_ne!(state, different_cursor);
+
+        let mut different_selection = state.clone();
+        different_selection.composer.cancel_selection();
+        assert_ne!(state, different_selection);
+
+        let mut different_yank = state.clone();
+        different_yank.composer.set_yank_text("other");
+        assert_ne!(state, different_yank);
+
+        let mut different_history = state.clone();
+        different_history.composer.cancel_selection();
+        different_history.composer.insert_char('!');
+        assert!(different_history.composer.undo());
+        let mut same_surface = state.clone();
+        same_surface.composer.cancel_selection();
+        assert_eq!(
+            different_history.composer.lines(),
+            same_surface.composer.lines()
+        );
+        assert_eq!(
+            different_history.composer.cursor(),
+            same_surface.composer.cursor()
+        );
+        assert_ne!(different_history, same_surface);
+    }
 
     #[test]
     fn connected_state_restores_known_and_unknown_served_model_status() {

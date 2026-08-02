@@ -1541,10 +1541,10 @@ mod tests {
             &runtime,
             &sender,
         ));
-        assert_eq!(format!("{state:?}"), format!("{unchanged:?}"));
+        assert_eq!(state, unchanged);
         assert!(receiver.try_recv().is_err());
         state.handle_paste_text("must not reach the composer");
-        assert_eq!(format!("{state:?}"), format!("{unchanged:?}"));
+        assert_eq!(state, unchanged);
 
         let mut expected = state.clone();
         expected.status_modal = None;
@@ -1554,7 +1554,7 @@ mod tests {
             &runtime,
             &sender,
         ));
-        assert_eq!(format!("{state:?}"), format!("{expected:?}"));
+        assert_eq!(state, expected);
         assert!(receiver.try_recv().is_err());
 
         state.insert_composer_text("/status");
