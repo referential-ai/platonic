@@ -715,6 +715,12 @@ pub struct SessionSummary {
     pub status: RunStateName,
     /// Latest user question, possibly presentation-truncated by the daemon.
     pub latest_question: String,
+    /// Exact first user question in the session.
+    #[serde(default)]
+    pub first_question: String,
+    /// Session update time from the ledger, in Unix milliseconds.
+    #[serde(default)]
+    pub updated_at_ms: u64,
     /// Ledger containing the session.
     pub ledger_path: String,
 }
@@ -1046,6 +1052,37 @@ mod tests {
             serde_json::to_string(&response).unwrap(),
             RUN_FAILED_RESPONSE
         );
+    }
+
+    #[test]
+    fn session_summary_keeps_exact_wire_fields_and_legacy_defaults() {
+        const SUMMARY: &str = r#"{"session_id":"session_1","run_id":"run_2","status":"finished","latest_question":"approved, go ahead","first_question":"review the release","updated_at_ms":123456,"ledger_path":"/tmp/agent.db"}"#;
+        let summary = SessionSummary {
+            session_id: "session_1".into(),
+            run_id: "run_2".into(),
+            status: RunStateName::Finished,
+            latest_question: "approved, go ahead".into(),
+            first_question: "review the release".into(),
+            updated_at_ms: 123_456,
+            ledger_path: "/tmp/agent.db".into(),
+        };
+
+        assert_eq!(serde_json::to_string(&summary).unwrap(), SUMMARY);
+        assert_eq!(
+            serde_json::from_str::<SessionSummary>(SUMMARY).unwrap(),
+            summary
+        );
+
+        let legacy: SessionSummary = serde_json::from_value(json!({
+            "session_id": "session_legacy",
+            "run_id": "run_legacy",
+            "status": "finished",
+            "latest_question": "legacy question",
+            "ledger_path": "/tmp/legacy.db"
+        }))
+        .unwrap();
+        assert!(legacy.first_question.is_empty());
+        assert_eq!(legacy.updated_at_ms, 0);
     }
 
     #[test]

@@ -669,13 +669,28 @@ pub struct SessionPickerView {
 }
 
 impl SessionPickerView {
-    /// Returns sessions whose latest question contains the current filter.
+    /// Returns sessions whose visible first-question label or recovery ID matches the filter.
     pub fn matching_sessions<'a>(&self, sessions: &'a [SessionSummary]) -> Vec<&'a SessionSummary> {
         let filter = self.filter.to_lowercase();
         sessions
             .iter()
-            .filter(|session| session.latest_question.to_lowercase().contains(&filter))
+            .filter(|session| {
+                session_question_label(session)
+                    .to_lowercase()
+                    .contains(&filter)
+                    || session.session_id.to_lowercase().contains(&filter)
+            })
             .collect()
+    }
+}
+
+pub(super) fn session_question_label(session: &SessionSummary) -> &str {
+    if !session.first_question.trim().is_empty() {
+        &session.first_question
+    } else if !session.latest_question.trim().is_empty() {
+        &session.latest_question
+    } else {
+        "(no question)"
     }
 }
 
@@ -984,6 +999,35 @@ mod tests {
     }
 
     #[test]
+    fn session_picker_filters_first_question_with_legacy_and_id_recovery_fallbacks() {
+        let sessions = vec![
+            session_with_questions("session_first", "Plan the release", "approved, go ahead"),
+            session_with_questions("session_legacy", "", "Legacy latest question"),
+        ];
+        let mut picker = SessionPickerView {
+            filter: "release".into(),
+            selected: 0,
+        };
+
+        assert_eq!(
+            session_ids(picker.matching_sessions(&sessions)),
+            vec!["session_first"]
+        );
+        picker.filter = "approved".into();
+        assert!(picker.matching_sessions(&sessions).is_empty());
+        picker.filter = "legacy latest".into();
+        assert_eq!(
+            session_ids(picker.matching_sessions(&sessions)),
+            vec!["session_legacy"]
+        );
+        picker.filter = "SESSION_FIRST".into();
+        assert_eq!(
+            session_ids(picker.matching_sessions(&sessions)),
+            vec!["session_first"]
+        );
+    }
+
+    #[test]
     fn pending_approval_snapshot_maps_exact_modal_fields() {
         let modal = approval_from_snapshot(PendingApprovalSnapshot {
             run_id: "run_selected".into(),
@@ -1010,11 +1054,21 @@ mod tests {
     }
 
     fn session(session_id: &str, latest_question: &str) -> SessionSummary {
+        session_with_questions(session_id, latest_question, latest_question)
+    }
+
+    fn session_with_questions(
+        session_id: &str,
+        first_question: &str,
+        latest_question: &str,
+    ) -> SessionSummary {
         SessionSummary {
             session_id: session_id.into(),
             run_id: format!("run_{session_id}"),
             status: RunStateName::Finished,
             latest_question: latest_question.into(),
+            first_question: first_question.into(),
+            updated_at_ms: 1,
             ledger_path: "/tmp/agent.db".into(),
         }
     }

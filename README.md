@@ -552,7 +552,9 @@ Assistant text appears live through daemon `events.stream`; replay remains
 based on final ledger messages.
 Session picker statuses are `running`, `finished`, `failed`, `canceled`, or
 `interrupted`; `interrupted` means a daemon restart closed a previously running
-session so it can be resumed.
+session so it can be resumed. Picker rows show that status, a compact relative
+age, and a bounded preview of the session's first question. Raw session IDs stay
+hidden in normal rows while remaining available for exact resume and recovery.
 On attach, the TUI selects the latest session by default; submitted messages
 continue that session until `/new` clears the selection.
 Live rows, model status, warnings, and approvals remain bound to that selected
@@ -578,10 +580,10 @@ Keys:
   active run.
 - `v` (with an empty composer): toggle conversation and audit views. A `v`
   typed into a nonempty composer remains input.
-- `/sessions`: open the session picker. Type to filter latest questions (`q` is
-  text); `Backspace` edits; `Up`/`Down` and `Ctrl-P`/`Ctrl-N` wrap through
-  matches; `Enter` resumes the focused match; `Esc` closes. With no matches,
-  `Enter` keeps the picker open.
+- `/sessions`: open the session picker. Type to filter first-question labels or
+  an exact session ID for recovery (`q` is text); `Backspace` edits; `Up`/`Down`
+  and `Ctrl-P`/`Ctrl-N` wrap through matches; `Enter` resumes the focused match;
+  `Esc` closes. With no matches, `Enter` keeps the picker open.
 - `/new`: clear the selected session so the next submitted message starts fresh.
 - `/issue-prep <rough issue>`: prepare and review an implementation issue.
   It is unavailable while another run or issue-prep command is active, and the

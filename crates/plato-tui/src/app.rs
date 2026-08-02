@@ -3180,6 +3180,8 @@ mod tests {
             run_id: run_id.into(),
             status,
             latest_question: latest_question.into(),
+            first_question: latest_question.into(),
+            updated_at_ms: 1,
             ledger_path: "/tmp/agent.db".into(),
         }
     }

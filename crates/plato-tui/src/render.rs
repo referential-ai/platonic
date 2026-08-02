@@ -9,14 +9,22 @@ use ratatui::{
 
 use super::{
     ApprovalModalView, ConnectionState, LiveEventKind, TranscriptState, TuiState,
-    state::DisplayMode,
+    state::{DisplayMode, session_question_label},
 };
 use crate::commands::{SLASH_COMMANDS, matching_slash_commands};
 use plato_protocol::{ModelIdentityStatus, RunStateName, TypedRun, TypedTranscriptEntry};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const SESSION_STATUS_WIDTH: usize = 16;
+const SESSION_AGE_WIDTH: usize = 5;
+const SESSION_QUESTION_MAX_CHARS: usize = 72;
 
 /// Renders the current client state into a terminal frame.
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
+    render_at(frame, state, unix_now_ms());
+}
+
+fn render_at(frame: &mut Frame<'_>, state: &TuiState, now_ms: u64) {
     let [history, composer, status] = vertical(frame.area(), state);
     render_history(frame, history, state);
     render_composer(frame, composer, state);
@@ -25,7 +33,7 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
         render_help_modal(frame, frame.area());
     }
     if state.session_picker.is_some() {
-        render_session_picker(frame, frame.area(), state);
+        render_session_picker(frame, frame.area(), state, now_ms);
     }
     if let Some(approval) = &state.approval {
         render_approval_modal(frame, frame.area(), approval);
@@ -34,9 +42,18 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
 
 /// Renders client state into a plain-text test snapshot of the requested size.
 pub fn render_snapshot(state: &TuiState, width: u16, height: u16) -> std::io::Result<String> {
+    render_snapshot_at(state, width, height, unix_now_ms())
+}
+
+fn render_snapshot_at(
+    state: &TuiState,
+    width: u16,
+    height: u16,
+    now_ms: u64,
+) -> std::io::Result<String> {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend)?;
-    terminal.draw(|frame| render(frame, state))?;
+    terminal.draw(|frame| render_at(frame, state, now_ms))?;
     let buffer = terminal.backend().buffer();
     let area = buffer.area;
     let mut output = String::new();
@@ -1136,8 +1153,9 @@ fn render_help_modal(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState, now_ms: u64) {
     let area = centered_rect(78, 64, area);
+    let row_width = area.width.saturating_sub(2);
     let picker = state
         .session_picker
         .as_ref()
@@ -1158,11 +1176,9 @@ fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     } else if sessions.is_empty() {
         lines.push(Line::from("No matching sessions"));
     } else {
-        lines.extend(
-            sessions.iter().enumerate().map(|(index, session)| {
-                session_picker_row(state, session, index == picker.selected)
-            }),
-        );
+        lines.extend(sessions.iter().enumerate().map(|(index, session)| {
+            session_picker_row(state, session, index == picker.selected, now_ms, row_width)
+        }));
     }
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -1177,6 +1193,8 @@ fn session_picker_row(
     state: &TuiState,
     session: &plato_protocol::SessionSummary,
     focused: bool,
+    now_ms: u64,
+    row_width: u16,
 ) -> Line<'static> {
     let focus = if focused { ">" } else { " " };
     let current = if state.selected_session_id.as_deref() == Some(session.session_id.as_str()) {
@@ -1191,20 +1209,61 @@ fn session_picker_row(
     } else {
         Style::default()
     };
+    let age = relative_age(session.updated_at_ms, now_ms);
+    let prefix_width = 3 + SESSION_STATUS_WIDTH + 1 + SESSION_AGE_WIDTH + 1;
+    let question_width = usize::from(row_width)
+        .saturating_sub(prefix_width)
+        .min(SESSION_QUESTION_MAX_CHARS);
+    let question = bounded_question_preview(session_question_label(session), question_width);
     Line::from(vec![
         Span::styled(format!("{focus}{current} "), style),
         Span::styled(
-            format!("{:<11}", session.status),
+            format!("{:<SESSION_STATUS_WIDTH$}", session.status),
             status_style(&session.status),
         ),
         Span::raw(" "),
         Span::styled(
-            short_id(&session.session_id),
+            format!("{age:>SESSION_AGE_WIDTH$}"),
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw(" "),
-        Span::raw(session.latest_question.clone()),
+        Span::raw(question),
     ])
+}
+
+fn relative_age(updated_at_ms: u64, now_ms: u64) -> String {
+    if updated_at_ms == 0 {
+        return "--".into();
+    }
+    let elapsed_ms = now_ms.saturating_sub(updated_at_ms);
+    if elapsed_ms < 60_000 {
+        format!("{}s", elapsed_ms / 1_000)
+    } else if elapsed_ms < 3_600_000 {
+        format!("{}m", elapsed_ms / 60_000)
+    } else if elapsed_ms < 86_400_000 {
+        format!("{}h", elapsed_ms / 3_600_000)
+    } else {
+        let days = elapsed_ms / 86_400_000;
+        if days > 999 {
+            "999d+".into()
+        } else {
+            format!("{days}d")
+        }
+    }
+}
+
+fn bounded_question_preview(question: &str, max_chars: usize) -> String {
+    let line = question.lines().next().unwrap_or_default();
+    if line.chars().count() <= max_chars {
+        return line.to_owned();
+    }
+    if max_chars <= 3 {
+        return line.chars().take(max_chars).collect();
+    }
+    format!(
+        "{}...",
+        line.chars().take(max_chars - 3).collect::<String>()
+    )
 }
 
 fn status_style(status: &RunStateName) -> Style {
@@ -1216,8 +1275,11 @@ fn status_style(status: &RunStateName) -> Style {
     }
 }
 
-fn short_id(id: &str) -> String {
-    id.chars().take(18).collect()
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 fn render_approval_modal(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalModalView) {
@@ -1431,6 +1493,8 @@ mod tests {
                 run_id: "run_1".into(),
                 status: RunStateName::Finished,
                 latest_question: "read README".into(),
+                first_question: "read README".into(),
+                updated_at_ms: 1,
                 ledger_path: "/tmp/agent.db".into(),
             }],
             TranscriptState::Loaded(
@@ -1710,6 +1774,8 @@ mod tests {
                 run_id: "run_1".into(),
                 status: RunStateName::Failed,
                 latest_question: "read README".into(),
+                first_question: "read README".into(),
+                updated_at_ms: 1,
                 ledger_path: "/tmp/agent.db".into(),
             }],
             TranscriptState::Unavailable {
@@ -2155,6 +2221,7 @@ mod tests {
 
     #[test]
     fn renders_session_picker_overlay() {
+        const NOW_MS: u64 = 172_800_000;
         let mut state = TuiState::connected(
             "/tmp/work".into(),
             "/tmp/agent.sock".into(),
@@ -2169,7 +2236,9 @@ mod tests {
                     session_id: "session_1".into(),
                     run_id: "run_1".into(),
                     status: RunStateName::Finished,
-                    latest_question: "read README".into(),
+                    latest_question: "approved, go ahead".into(),
+                    first_question: "read README".into(),
+                    updated_at_ms: 172_680_000,
                     ledger_path: "/tmp/agent.db".into(),
                 },
                 SessionSummary {
@@ -2177,6 +2246,8 @@ mod tests {
                     run_id: "run_2".into(),
                     status: RunStateName::Interrupted,
                     latest_question: "continue docs".into(),
+                    first_question: "continue docs".into(),
+                    updated_at_ms: 169_200_000,
                     ledger_path: "/tmp/agent.db".into(),
                 },
             ],
@@ -2188,7 +2259,7 @@ mod tests {
             selected: 1,
         });
 
-        let output = render_to_text(&state);
+        let output = render_to_text_at(&state, NOW_MS);
 
         assert!(output.contains("Sessions"));
         assert!(output.contains("Type to filter"));
@@ -2196,8 +2267,12 @@ mod tests {
         assert!(output.contains("Enter resume"));
         assert!(output.contains("Filter: |"));
         assert!(output.contains("read README"));
+        assert!(output.contains("2m read README"));
         assert!(output.contains("interrupted"));
-        assert!(output.contains("continue docs"));
+        assert!(output.contains("1h continue docs"));
+        assert!(!output.contains("approved, go ahead"));
+        assert!(!output.contains("session_1"));
+        assert!(!output.contains("session_2"));
     }
 
     #[test]
@@ -2217,6 +2292,8 @@ mod tests {
                     run_id: "run_1".into(),
                     status: RunStateName::Finished,
                     latest_question: "prepare release notes".into(),
+                    first_question: "prepare release notes".into(),
+                    updated_at_ms: 1,
                     ledger_path: "/tmp/agent.db".into(),
                 },
                 SessionSummary {
@@ -2224,6 +2301,8 @@ mod tests {
                     run_id: "run_2".into(),
                     status: RunStateName::Interrupted,
                     latest_question: "continue docs".into(),
+                    first_question: "continue docs".into(),
+                    updated_at_ms: 1,
                     ledger_path: "/tmp/agent.db".into(),
                 },
             ],
@@ -2234,7 +2313,7 @@ mod tests {
             selected: 0,
         });
 
-        let output = render_to_text(&state);
+        let output = render_to_text_at(&state, 172_800_000);
 
         assert!(output.contains("Filter: CONT|"));
         assert!(output.contains("continue docs"));
@@ -2242,12 +2321,91 @@ mod tests {
         assert!(!output.contains("No matching sessions"));
 
         state.session_picker.as_mut().unwrap().filter = "missing".into();
-        let output = render_to_text(&state);
+        let output = render_to_text_at(&state, 172_800_000);
 
         assert!(output.contains("Filter: missing|"));
         assert!(output.contains("No matching sessions"));
         assert!(!output.contains("prepare release notes"));
         assert!(!output.contains("continue docs"));
+    }
+
+    #[test]
+    fn session_picker_relative_age_uses_deterministic_unit_boundaries() {
+        const NOW_MS: u64 = 1_000_000_000;
+        for (elapsed_ms, expected) in [
+            (0, "0s"),
+            (999, "0s"),
+            (1_000, "1s"),
+            (59_999, "59s"),
+            (60_000, "1m"),
+            (3_599_999, "59m"),
+            (3_600_000, "1h"),
+            (86_399_999, "23h"),
+            (86_400_000, "1d"),
+        ] {
+            assert_eq!(relative_age(NOW_MS - elapsed_ms, NOW_MS), expected);
+        }
+        assert_eq!(relative_age(NOW_MS + 1, NOW_MS), "0s");
+        assert_eq!(relative_age(0, NOW_MS), "--");
+    }
+
+    #[test]
+    fn session_picker_row_bounds_first_question_and_keeps_legacy_fallback() {
+        let session = SessionSummary {
+            session_id: "session_full_raw_identifier".into(),
+            run_id: "run_full_raw_identifier".into(),
+            status: RunStateName::Finished,
+            latest_question: "approved, go ahead".into(),
+            first_question:
+                "This first question is deliberately much longer than the picker row can display"
+                    .into(),
+            updated_at_ms: 99_000,
+            ledger_path: "/tmp/agent.db".into(),
+        };
+
+        let row = session_picker_row(
+            &TuiState::disconnected("w".into(), "s".into(), "e".into()),
+            &session,
+            true,
+            100_000,
+            48,
+        );
+        let rendered = row.to_string();
+
+        assert!(row.width() <= 48);
+        assert!(rendered.ends_with("..."));
+        assert!(!rendered.contains("session_full_raw_identifier"));
+        assert!(!rendered.contains("approved, go ahead"));
+
+        let legacy = SessionSummary {
+            first_question: String::new(),
+            latest_question: "legacy latest question".into(),
+            updated_at_ms: 0,
+            ..session
+        };
+        let rendered = session_picker_row(
+            &TuiState::disconnected("w".into(), "s".into(), "e".into()),
+            &legacy,
+            false,
+            100_000,
+            80,
+        )
+        .to_string();
+        assert!(rendered.contains("-- legacy latest question"));
+
+        let empty = SessionSummary {
+            latest_question: String::new(),
+            ..legacy
+        };
+        let rendered = session_picker_row(
+            &TuiState::disconnected("w".into(), "s".into(), "e".into()),
+            &empty,
+            false,
+            100_000,
+            80,
+        )
+        .to_string();
+        assert!(rendered.contains("-- (no question)"));
     }
 
     #[test]
@@ -2577,5 +2735,9 @@ mod tests {
 
     fn render_to_text(state: &TuiState) -> String {
         render_snapshot(state, 100, 24).unwrap()
+    }
+
+    fn render_to_text_at(state: &TuiState, now_ms: u64) -> String {
+        render_snapshot_at(state, 100, 24, now_ms).unwrap()
     }
 }
