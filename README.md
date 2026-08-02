@@ -552,7 +552,8 @@ the complete ordered audit view without reloading the session.
 Assistant messages render headings, emphasis, lists, quotes, inline code,
 fenced code, and unified diffs in conversation view. User messages remain
 literal, while audit view retains the exact stored transcript source.
-The composer uses the terminal cursor without adding a caret glyph to its text.
+The multiline composer uses the terminal cursor without adding a caret glyph to
+its text. Bracketed paste inserts literal text as one undoable edit.
 A nonempty `NO_COLOR` suppresses colors while retaining emphasis and layout.
 
 ```bash
@@ -595,6 +596,12 @@ Keys:
 
 - `Enter`: submit the composer to the daemon. A session can have only one
   active run.
+- `Tab`: queue the composer while a run is active.
+- `Shift-Enter`, `Alt-Enter`, `Ctrl-J`, or `Ctrl-M`: insert a newline.
+- `Shift` plus an arrow, `Home`, or `End`: select text; typing replaces the
+  selection. `Alt-B`/`Alt-F` and `Ctrl-Left`/`Ctrl-Right` move by word.
+- `Ctrl-Z` / `Ctrl-R`: undo / redo composer edits. `Ctrl-K`, `Ctrl-U`,
+  `Ctrl-W`, and `Ctrl-Y` retain the existing kill/yank bindings.
 - `v` (with an empty composer): toggle conversation and audit views. A `v`
   typed into a nonempty composer remains input.
 - `/sessions`: open the session picker. Type to filter first-question labels or

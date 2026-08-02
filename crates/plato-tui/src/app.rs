@@ -19,6 +19,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+use tui_textarea::CursorMove;
 
 use super::{
     client::{
@@ -321,36 +322,24 @@ fn handle_key_press(
 
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('a') => {
-                state.move_composer_line_start();
-                return true;
-            }
-            KeyCode::Char('b') => {
-                state.move_composer_left();
-                return true;
-            }
-            KeyCode::Char('e') => {
-                state.move_composer_line_end();
-                return true;
-            }
-            KeyCode::Char('f') => {
-                state.move_composer_right();
-                return true;
-            }
-            KeyCode::Char('k') => {
-                state.delete_composer_to_line_end();
+            KeyCode::Char('a' | 'b' | 'e' | 'f' | 'k' | 'w' | 'y') => {
+                state.handle_composer_key(key);
                 return true;
             }
             KeyCode::Char('u') => {
-                state.kill_composer_to_start();
+                state.delete_composer_to_start();
                 return true;
             }
-            KeyCode::Char('w') => {
-                state.delete_previous_word();
+            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                state.redo_composer();
                 return true;
             }
-            KeyCode::Char('y') => {
-                state.yank_composer_kill_buffer();
+            KeyCode::Char('z') => {
+                state.undo_composer();
+                return true;
+            }
+            KeyCode::Char('r') => {
+                state.redo_composer();
                 return true;
             }
             KeyCode::Char('p') => {
@@ -377,15 +366,15 @@ fn handle_key_press(
             request_cancel(commands, state)
         }
         KeyCode::Esc => handle_exit_request(state),
-        KeyCode::Char('?') if state.composer.is_empty() => {
+        KeyCode::Char('?') if state.composer_is_empty() => {
             state.help_visible = true;
             true
         }
-        KeyCode::Char('v') if state.composer.is_empty() && key.modifiers == KeyModifiers::NONE => {
+        KeyCode::Char('v') if state.composer_is_empty() && key.modifiers == KeyModifiers::NONE => {
             state.toggle_display_mode();
             true
         }
-        KeyCode::Char('q') if state.composer.is_empty() => handle_exit_request(state),
+        KeyCode::Char('q') if state.composer_is_empty() => handle_exit_request(state),
         KeyCode::Char('r') if is_disconnected(state) => {
             reconnect(commands, state, initial_run_id);
             true
@@ -397,55 +386,66 @@ fn handle_key_press(
             true
         }
         KeyCode::Tab => submit_composer(commands, state, runtime, initial_run_id, config_path),
-        KeyCode::Char('b') if key.modifiers == KeyModifiers::ALT => {
-            state.move_composer_word_left();
-            true
-        }
-        KeyCode::Char('f') if key.modifiers == KeyModifiers::ALT => {
-            state.move_composer_word_right();
+        KeyCode::Char('b' | 'f')
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            state.handle_composer_key(key);
             true
         }
         KeyCode::Backspace => {
-            state.delete_composer_before_cursor();
+            state.handle_composer_key(key);
             true
         }
         KeyCode::Delete => {
-            state.delete_composer_after_cursor();
+            state.handle_composer_key(key);
             true
         }
         KeyCode::Left => {
             if key.modifiers.contains(KeyModifiers::ALT) {
-                state.move_composer_word_left();
+                state.move_composer_cursor(
+                    CursorMove::WordBack,
+                    key.modifiers.contains(KeyModifiers::SHIFT),
+                );
             } else {
-                state.move_composer_left();
+                state.handle_composer_key(key);
             }
             true
         }
         KeyCode::Right => {
             if key.modifiers.contains(KeyModifiers::ALT) {
-                state.move_composer_word_right();
+                state.move_composer_cursor(
+                    CursorMove::WordForward,
+                    key.modifiers.contains(KeyModifiers::SHIFT),
+                );
             } else {
-                state.move_composer_right();
+                state.handle_composer_key(key);
             }
             true
         }
         KeyCode::Home => {
-            state.move_composer_line_start();
+            state.handle_composer_key(key);
             true
         }
         KeyCode::End => {
-            state.move_composer_line_end();
+            state.handle_composer_key(key);
             true
         }
         KeyCode::Up => {
-            if !state.move_composer_up() {
+            if key.modifiers == KeyModifiers::NONE && state.composer.cursor().0 == 0 {
                 state.recall_history_previous();
+            } else {
+                state.handle_composer_key(key);
             }
             true
         }
         KeyCode::Down => {
-            if !state.move_composer_down() {
+            if key.modifiers == KeyModifiers::NONE
+                && state.composer.cursor().0 + 1 == state.composer.lines().len()
+            {
                 state.recall_history_next();
+            } else {
+                state.handle_composer_key(key);
             }
             true
         }
@@ -457,11 +457,11 @@ fn handle_key_press(
             scroll_history_down(state);
             true
         }
-        KeyCode::Char(ch)
+        KeyCode::Char(_)
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
         {
-            state.insert_composer_char(ch);
+            state.handle_composer_key(key);
             true
         }
         _ => true,
@@ -766,7 +766,7 @@ fn submit_composer(
     initial_run_id: Option<String>,
     config_path: Option<String>,
 ) -> bool {
-    let message = state.composer.trim().to_string();
+    let message = state.composer_text().trim().to_string();
     if message.is_empty() {
         return true;
     }
@@ -1274,7 +1274,7 @@ mod tests {
     fn submit_composer_uses_run_start_when_idle() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.composer = "start work".into();
+        state.set_composer_text("start work");
         let runtime = UiRuntime::from_state(&state, None);
 
         assert!(submit_composer(
@@ -1303,7 +1303,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
         state.selected_session_id = Some("session_1".into());
-        state.composer = "continue work".into();
+        state.set_composer_text("continue work");
         let runtime = UiRuntime::from_state(&state, None);
 
         assert!(submit_composer(
@@ -1333,8 +1333,7 @@ mod tests {
     fn submit_composer_queues_follow_up_while_run_is_polling() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.composer = "next turn".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("next turn");
         let runtime = UiRuntime {
             active_run_id: Some("run_1".into()),
             config_path: Some("plato.toml".into()),
@@ -1350,7 +1349,7 @@ mod tests {
 
         assert!(receiver.try_recv().is_err());
         assert!(state.composer.is_empty());
-        assert_eq!(state.composer_cursor, 0);
+        assert_eq!(state.composer.cursor(), (0, 0));
         assert_eq!(state.queued_messages, vec!["next turn"]);
         assert_eq!(state.input_history, vec!["next turn"]);
         assert_eq!(
@@ -1364,8 +1363,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
         state.selected_session_id = Some("session_1".into());
-        state.composer = "next turn".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("next turn");
         let runtime = UiRuntime {
             active_run_id: Some("run_1".into()),
             config_path: Some("plato.toml".into()),
@@ -1466,8 +1464,7 @@ mod tests {
     fn v_in_nonempty_composer_remains_text_input() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.composer = "sa".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("sa");
         let runtime = UiRuntime::from_state(&state, None);
 
         assert!(press_key(
@@ -1477,8 +1474,8 @@ mod tests {
             &sender,
         ));
 
-        assert_eq!(state.composer, "sav");
-        assert_eq!(state.composer_cursor, 3);
+        assert_eq!(state.composer_text(), "sav");
+        assert_eq!(state.composer.cursor(), (0, 3));
         assert_eq!(state.display_mode, DisplayMode::Conversation);
         assert!(receiver.try_recv().is_err());
     }
@@ -1487,8 +1484,7 @@ mod tests {
     fn help_command_opens_help_without_daemon_command() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.composer = "/help".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("/help");
         let runtime = UiRuntime::from_state(&state, None);
 
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
@@ -1545,10 +1541,10 @@ mod tests {
             &runtime,
             &sender,
         ));
-        assert_eq!(state, unchanged);
+        assert_eq!(format!("{state:?}"), format!("{unchanged:?}"));
         assert!(receiver.try_recv().is_err());
         state.handle_paste_text("must not reach the composer");
-        assert_eq!(state, unchanged);
+        assert_eq!(format!("{state:?}"), format!("{unchanged:?}"));
 
         let mut expected = state.clone();
         expected.status_modal = None;
@@ -1558,7 +1554,7 @@ mod tests {
             &runtime,
             &sender,
         ));
-        assert_eq!(state, expected);
+        assert_eq!(format!("{state:?}"), format!("{expected:?}"));
         assert!(receiver.try_recv().is_err());
 
         state.insert_composer_text("/status");
@@ -1591,8 +1587,7 @@ mod tests {
     fn issue_prep_command_sends_typed_daemon_request() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.composer = "/issue-prep make retries bounded and testable".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("/issue-prep make retries bounded and testable");
         let runtime = UiRuntime::from_state(&state, None);
 
         assert!(submit_composer(
@@ -1644,8 +1639,7 @@ mod tests {
     fn issue_prep_command_requires_input() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.composer = "/issue-prep".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("/issue-prep");
         let runtime = UiRuntime::from_state(&state, None);
 
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
@@ -1663,8 +1657,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
         state.issue_prep_started_at = Some(Instant::now());
-        state.composer = "/issue-prep another issue".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("/issue-prep another issue");
         let runtime = UiRuntime::from_state(&state, None);
 
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
@@ -1675,8 +1668,7 @@ mod tests {
         assert!(receiver.try_recv().is_err());
 
         state.issue_prep_started_at = None;
-        state.composer = "/issue-prep another issue".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("/issue-prep another issue");
         let mut runtime = UiRuntime::from_state(&state, None);
         runtime.polling = true;
 
@@ -1693,8 +1685,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
         state.issue_prep_started_at = Some(Instant::now());
-        state.composer = "follow up".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("follow up");
         let runtime = UiRuntime::from_state(&state, None);
 
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
@@ -1715,8 +1706,7 @@ mod tests {
         state.live_events = vec![crate::LiveEventLine::assistant(Some(1), "hello")];
         state.stream_warning = Some("lagged".into());
         state.scroll_offset = 10;
-        state.composer = "/clear".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("/clear");
         let runtime = UiRuntime::from_state(&state, None);
         render_snapshot(&state, 100, 24).unwrap();
         assert_cached_rows(&state, true, true);
@@ -1743,8 +1733,7 @@ mod tests {
     fn quit_command_exits_without_daemon_command() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.composer = "/quit".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("/quit");
         let runtime = UiRuntime::from_state(&state, None);
 
         assert!(!submit_composer(&sender, &mut state, &runtime, None, None));
@@ -1756,8 +1745,7 @@ mod tests {
     fn reconnect_command_only_sends_load_when_offline() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.composer = "/reconnect".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("/reconnect");
         let runtime = UiRuntime::from_state(&state, None);
 
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
@@ -1767,8 +1755,7 @@ mod tests {
         state.connection = crate::ConnectionState::Disconnected {
             error: "connection closed".into(),
         };
-        state.composer = "/reconnect".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("/reconnect");
         assert!(submit_composer(
             &sender,
             &mut state,
@@ -1788,8 +1775,7 @@ mod tests {
     fn unknown_slash_command_does_not_hit_daemon() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.composer = "/wat".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("/wat");
         let runtime = UiRuntime::from_state(&state, None);
 
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
@@ -1811,8 +1797,7 @@ mod tests {
             RunStateName::Finished,
             "first",
         )];
-        state.composer = "/sessions".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("/sessions");
         let runtime = UiRuntime::from_state(&state, None);
 
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
@@ -1978,8 +1963,7 @@ mod tests {
         state.selected_session_id = Some("session_1".into());
         state.replace_transcript(loaded_transcript("run_1", "[turn_1] user: old\n"));
         state.live_events = vec![crate::LiveEventLine::assistant(None, "old")];
-        state.composer = "/new".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("/new");
         let runtime = UiRuntime::from_state(&state, None);
         render_snapshot(&state, 100, 24).unwrap();
         assert_cached_rows(&state, true, true);
@@ -1995,8 +1979,7 @@ mod tests {
         );
         assert!(receiver.try_recv().is_err());
 
-        state.composer = "fresh work".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("fresh work");
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
         match receiver.try_recv().unwrap() {
             ClientCommand::RunStart { question, .. } => assert_eq!(question, "fresh work"),
@@ -2030,7 +2013,7 @@ mod tests {
             &runtime,
             &sender,
         ));
-        assert_eq!(state.composer, "/c");
+        assert_eq!(state.composer_text(), "/c");
         assert_eq!(
             state
                 .slash_popup
@@ -2045,8 +2028,8 @@ mod tests {
             &runtime,
             &sender,
         ));
-        assert_eq!(state.composer, "/clear ");
-        assert_eq!(state.composer_cursor, state.composer.len());
+        assert_eq!(state.composer_text(), "/clear ");
+        assert_eq!(state.composer.cursor(), (0, 7));
         assert!(state.slash_popup.is_none());
         assert!(receiver.try_recv().is_err());
     }
@@ -2126,8 +2109,7 @@ mod tests {
         let mut state = test_state();
         let runtime = UiRuntime::from_state(&state, None);
 
-        state.composer = "a".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("a");
         for key in [
             KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
             KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
@@ -2135,24 +2117,26 @@ mod tests {
             KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
         ] {
             assert!(press_key(key, &mut state, &runtime, &sender));
-            state.composer.push('x');
-            state.composer_cursor = state.composer.len();
+            state.insert_composer_text("x");
         }
 
-        assert_eq!(state.composer, "a\nx\nx\nx\nx");
+        assert_eq!(state.composer_text(), "a\nx\nx\nx\nx");
         assert!(receiver.try_recv().is_err());
     }
 
     #[test]
-    fn paste_normalizes_carriage_returns_and_updates_popup() {
+    fn paste_is_one_literal_multiline_edit_and_updates_popup() {
         let (_sender, _receiver) = mpsc::channel::<ClientCommand>();
         let mut state = test_state();
 
-        state.handle_paste_text("/c\rnext");
+        state.handle_paste_text("/c\r\nnext\t\x1b[A");
 
-        assert_eq!(state.composer, "/c\nnext");
-        assert_eq!(state.composer_cursor, state.composer.len());
+        assert_eq!(state.composer_text(), "/c\nnext\t\x1b[A");
+        assert_eq!(state.composer.cursor(), (1, 8));
         assert!(state.slash_popup.is_none());
+
+        state.undo_composer();
+        assert!(state.composer_is_empty());
     }
 
     #[test]
@@ -2160,8 +2144,8 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
         let runtime = UiRuntime::from_state(&state, None);
-        state.composer = "hello world".into();
-        state.composer_cursor = "hello ".len();
+        state.set_composer_text("hello world");
+        state.composer.move_cursor(CursorMove::Jump(0, 6));
 
         assert!(press_key(
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
@@ -2169,8 +2153,8 @@ mod tests {
             &runtime,
             &sender,
         ));
-        assert_eq!(state.composer, "hello ");
-        assert_eq!(state.composer_kill_buffer, "world");
+        assert_eq!(state.composer_text(), "hello ");
+        assert_eq!(state.composer.yank_text(), "world");
 
         assert!(press_key(
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
@@ -2178,7 +2162,60 @@ mod tests {
             &runtime,
             &sender,
         ));
-        assert_eq!(state.composer, "hello world");
+        assert_eq!(state.composer_text(), "hello world");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn textarea_selection_undo_redo_and_word_motions_edit_the_composer() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, None);
+        state.set_composer_text("alpha beta");
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert_eq!(state.composer.cursor(), (0, 6));
+        for _ in 0..4 {
+            assert!(press_key(
+                KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+                &mut state,
+                &runtime,
+                &sender,
+            ));
+        }
+        assert_eq!(state.composer.selection_range(), Some(((0, 6), (0, 10))));
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert_eq!(state.composer_text(), "alpha B");
+
+        for _ in 0..2 {
+            assert!(press_key(
+                KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+                &mut state,
+                &runtime,
+                &sender,
+            ));
+        }
+        assert_eq!(state.composer_text(), "alpha beta");
+        for _ in 0..2 {
+            assert!(press_key(
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                &mut state,
+                &runtime,
+                &sender,
+            ));
+        }
+        assert_eq!(state.composer_text(), "alpha B");
         assert!(receiver.try_recv().is_err());
     }
 
@@ -2199,8 +2236,11 @@ mod tests {
             ));
         }
 
-        assert_eq!(state.composer, "read write current target/current");
-        assert_eq!(state.composer_cursor, state.composer.len());
+        assert_eq!(state.composer_text(), "read write current target/current");
+        assert_eq!(
+            state.composer.cursor(),
+            (0, state.composer.lines()[0].chars().count())
+        );
         assert!(receiver.try_recv().is_err());
     }
 
@@ -2237,8 +2277,8 @@ mod tests {
             None,
         ));
 
-        assert_eq!(state.composer, "hello");
-        assert_eq!(state.composer_cursor, 4);
+        assert_eq!(state.composer_text(), "hello");
+        assert_eq!(state.composer.cursor(), (0, 4));
 
         assert!(handle_key_press(
             KeyEvent::new(KeyCode::End, KeyModifiers::empty()),
@@ -2267,7 +2307,7 @@ mod tests {
             ));
         }
 
-        assert_eq!(state.composer, "hello\nworld");
+        assert_eq!(state.composer_text(), "hello\nworld");
         assert!(receiver.try_recv().is_err());
     }
 
@@ -2286,7 +2326,7 @@ mod tests {
             None,
             None,
         ));
-        assert_eq!(state.composer, "second");
+        assert_eq!(state.composer_text(), "second");
         assert!(handle_key_press(
             KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
             &mut state,
@@ -2295,7 +2335,7 @@ mod tests {
             None,
             None,
         ));
-        assert_eq!(state.composer, "first");
+        assert_eq!(state.composer_text(), "first");
         assert!(handle_key_press(
             KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
             &mut state,
@@ -2304,7 +2344,7 @@ mod tests {
             None,
             None,
         ));
-        assert_eq!(state.composer, "second");
+        assert_eq!(state.composer_text(), "second");
         assert!(handle_key_press(
             KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
             &mut state,

@@ -659,8 +659,6 @@ pub(super) fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
         ) if current_session == loaded_session && current_run == loaded_run
     );
     loaded.composer = std::mem::take(&mut state.composer);
-    loaded.composer_cursor = state.composer_cursor;
-    loaded.composer_kill_buffer = state.composer_kill_buffer.clone();
     loaded.slash_popup = state.slash_popup.clone();
     loaded.queued_messages = std::mem::take(&mut state.queued_messages);
     loaded.issue_prep_started_at = state.issue_prep_started_at;
