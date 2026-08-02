@@ -2238,6 +2238,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
                         "run_id": "run_2",
                         "session_index": 1,
                         "status": "finished",
+                        "model_status": {"state": "responded"},
                         "entries": [
                             {"kind": "user", "text": "second question"},
                             {"kind": "assistant", "text": "second answer"}
@@ -2274,6 +2275,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
                             "run_id": "run_1",
                             "session_index": 0,
                             "status": "finished",
+                            "model_status": {"state": "responded"},
                             "entries": [
                                 {"kind": "user", "text": "first question"},
                                 {"kind": "assistant", "text": "first answer"}
@@ -2283,6 +2285,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
                             "run_id": "run_2",
                             "session_index": 1,
                             "status": "finished",
+                            "model_status": {"state": "responded"},
                             "entries": [
                                 {"kind": "user", "text": "second question"},
                                 {"kind": "assistant", "text": "second answer"}
@@ -3040,6 +3043,7 @@ enabled = ["{enabled_tool}"]
                     content: answer.into(),
                 },
                 proposed_calls: vec![],
+                served_model: None,
                 usage: Some(ModelUsage {
                     input_tokens: 0,
                     output_tokens: 0,

@@ -8,10 +8,10 @@ use crate::{
             ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED, ERROR_UNSUPPORTED_METHOD,
             ERROR_WORKSPACE_MISMATCH, Envelope, EventsStreamParams, EventsStreamResult,
             HelloParams, HelloResult, IssuePrepResult, IssuePrepStartParams, IssuePrepStartResult,
-            MessageAppendParams, RunCancelParams, RunStartParams, RunStartResult, RunStateName,
-            SessionSummary, SessionsListResult, ShutdownIfIdleResult, ShutdownIfIdleResultName,
-            StreamEvent, TranscriptReadParams, TranscriptReadResult, TypedRun, TypedTranscript,
-            TypedTranscriptEntry, decode_request,
+            MessageAppendParams, ModelIdentityStatus, RunCancelParams, RunStartParams,
+            RunStartResult, RunStateName, SessionSummary, SessionsListResult, ShutdownIfIdleResult,
+            ShutdownIfIdleResultName, StreamEvent, TranscriptReadParams, TranscriptReadResult,
+            TypedRun, TypedTranscript, TypedTranscriptEntry, decode_request,
         },
         runtime::{
             DaemonRuntime, IssuePrepAdmissionError, RunAdmissionError, RunRecord,
@@ -27,7 +27,7 @@ use crate::{
     run_question,
     tools::ApprovalOutcome,
 };
-use platonic_core::{ReadbackEntry, RunReadback};
+use platonic_core::{HarnessEvent, ReadbackEntry, RecordedEvent, RunReadback};
 use std::{
     path::PathBuf,
     sync::{Arc, atomic::Ordering, mpsc},
@@ -784,8 +784,21 @@ fn typed_run(run: &SessionRunRecords, readback_entries: Vec<ReadbackEntry>) -> T
         run_id: run.run_id.clone(),
         session_index: run.session_index,
         status: run.status,
+        model_status: model_status(&run.records),
         entries: typed_entries(&run.question, readback_entries),
     }
+}
+
+fn model_status(records: &[RecordedEvent]) -> Option<ModelIdentityStatus> {
+    records.iter().rev().find_map(|record| match &record.event {
+        HarnessEvent::ModelRequested { model, .. } => Some(ModelIdentityStatus::Requested {
+            model: model.to_string(),
+        }),
+        HarnessEvent::ModelResponded { served_model, .. } => Some(ModelIdentityStatus::Responded {
+            served_model: served_model.as_ref().map(ToString::to_string),
+        }),
+        _ => None,
+    })
 }
 
 fn typed_entries(
@@ -936,7 +949,8 @@ mod tests {
     use crate::AssistantDeltaEvent;
     use platonic_core::{
         ActorId, ContextFragment, ContextLane, EffectClass, HarnessEvent, Message, MessageRole,
-        RecordedEvent, ResultVisibility, RunId, ToolCall, ToolCallId, ToolName, ToolResult, TurnId,
+        ModelName, RecordedEvent, ResultVisibility, RunId, ToolCall, ToolCallId, ToolName,
+        ToolResult, TurnId,
     };
     use serde_json::json;
     use std::{sync::Barrier, time::Duration};
@@ -1448,6 +1462,88 @@ mod tests {
     }
 
     #[test]
+    fn model_status_follows_latest_durable_request_or_response() {
+        let run_id = RunId::new("run_1").unwrap();
+        let turn_id = TurnId::new("turn_1").unwrap();
+        let record = |seq, event| RecordedEvent {
+            seq,
+            occurred_at_ms: seq,
+            event,
+        };
+        let mut records = vec![record(
+            0,
+            HarnessEvent::ModelRequested {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 0,
+                model: ModelName::new("~openai/gpt-latest").unwrap(),
+            },
+        )];
+        assert_eq!(
+            model_status(&records),
+            Some(ModelIdentityStatus::Requested {
+                model: "~openai/gpt-latest".into()
+            })
+        );
+
+        records.push(record(
+            1,
+            HarnessEvent::ModelResponded {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 0,
+                output: Message {
+                    role: MessageRole::Assistant,
+                    content: "tool call".into(),
+                },
+                proposed_calls: vec![],
+                served_model: Some(ModelName::new("openai/gpt-5.2-2026-08-01").unwrap()),
+                usage: None,
+            },
+        ));
+        assert_eq!(
+            model_status(&records),
+            Some(ModelIdentityStatus::Responded {
+                served_model: Some("openai/gpt-5.2-2026-08-01".into())
+            })
+        );
+
+        records.push(record(
+            2,
+            HarnessEvent::ModelRequested {
+                run_id: run_id.clone(),
+                turn_id: TurnId::new("turn_2").unwrap(),
+                step: 1,
+                model: ModelName::new("~openai/gpt-latest").unwrap(),
+            },
+        ));
+        assert!(matches!(
+            model_status(&records),
+            Some(ModelIdentityStatus::Requested { .. })
+        ));
+
+        records.push(record(
+            3,
+            HarnessEvent::ModelResponded {
+                run_id,
+                turn_id: TurnId::new("turn_2").unwrap(),
+                step: 1,
+                output: Message {
+                    role: MessageRole::Assistant,
+                    content: "done".into(),
+                },
+                proposed_calls: vec![],
+                served_model: None,
+                usage: None,
+            },
+        ));
+        assert_eq!(
+            model_status(&records),
+            Some(ModelIdentityStatus::Responded { served_model: None })
+        );
+    }
+
+    #[test]
     fn context_compaction_uses_v1_ledger_stream_envelope() {
         let runtime = DaemonRuntime::new(crate::daemon::server::DaemonPaths {
             workspace_root: PathBuf::from("/tmp/workspace"),
@@ -1534,6 +1630,7 @@ mod tests {
                         role: MessageRole::Assistant,
                         content: "working".into(),
                     },
+                    served_model: None,
                 },
                 ReadbackEntry::ToolCall {
                     turn_id,

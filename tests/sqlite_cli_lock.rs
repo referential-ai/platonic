@@ -980,6 +980,7 @@ fn seed_sqlite_session(path: &Path, session_id: &str, run_id: &str, question: &s
                 content: answer.into(),
             },
             proposed_calls: vec![],
+            served_model: None,
             usage: Some(ModelUsage {
                 input_tokens: 0,
                 output_tokens: 0,

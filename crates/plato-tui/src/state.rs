@@ -1,6 +1,6 @@
 use plato_protocol::{
-    HelloResult, PendingApprovalSnapshot, RunStateName, SessionSummary, TranscriptReadResult,
-    TypedTranscript,
+    HelloResult, ModelIdentityStatus, PendingApprovalSnapshot, RunStateName, SessionSummary,
+    TranscriptReadResult, TypedTranscript,
 };
 use platonic_core::EffectClass;
 use ratatui::text::Line;
@@ -43,8 +43,8 @@ pub struct TuiState {
     pub(super) display_mode: DisplayMode,
     pub(super) conversation_scroll_offset: usize,
     pub(super) audit_scroll_offset: usize,
-    /// Model reported for the active run.
-    pub active_model: Option<String>,
+    /// Latest requested-or-responded model identity state for the selected run.
+    pub active_model: Option<ModelIdentityStatus>,
     /// Elapsed active-run time, in seconds.
     pub active_run_elapsed_secs: Option<u64>,
     /// Composer text.
@@ -98,6 +98,7 @@ impl TuiState {
         );
         state.sessions = sessions;
         state.selected_session_id = selected_session_id;
+        state.active_model = model_status_from_transcript(&transcript);
         state.replace_transcript(transcript);
         state
     }
@@ -525,6 +526,20 @@ impl TuiState {
     }
 }
 
+fn model_status_from_transcript(transcript: &TranscriptState) -> Option<ModelIdentityStatus> {
+    let TranscriptState::Loaded(transcript) = transcript else {
+        return None;
+    };
+    transcript
+        .typed
+        .as_ref()?
+        .runs
+        .iter()
+        .find(|run| run.run_id == transcript.run_id)?
+        .model_status
+        .clone()
+}
+
 fn slash_filter_at_cursor(text: &str, cursor: usize) -> Option<String> {
     if !text.starts_with('/') {
         return None;
@@ -875,6 +890,51 @@ pub enum LiveEventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connected_state_restores_known_and_unknown_served_model_status() {
+        for status in [
+            ModelIdentityStatus::Responded {
+                served_model: Some("openai/gpt-5.2-2026-08-01".into()),
+            },
+            ModelIdentityStatus::Responded { served_model: None },
+        ] {
+            let transcript = TranscriptState::Loaded(
+                TranscriptReadResult {
+                    run_id: "run_1".into(),
+                    status: RunStateName::Finished,
+                    final_answer: Some("done".into()),
+                    transcript: "[turn_1] assistant: done\n".into(),
+                    typed: Some(TypedTranscript {
+                        runs: vec![plato_protocol::TypedRun {
+                            run_id: "run_1".into(),
+                            session_index: 0,
+                            status: RunStateName::Finished,
+                            model_status: Some(status.clone()),
+                            entries: vec![],
+                        }],
+                    }),
+                    pending_approval: None,
+                }
+                .into(),
+            );
+
+            let state = TuiState::connected(
+                "/tmp/workspace".into(),
+                "/tmp/agent.sock".into(),
+                HelloResult {
+                    daemon_version: "0.1.0".into(),
+                    workspace_id: "workspace-1".into(),
+                    ledger_path: "/tmp/agent.db".into(),
+                    capabilities: vec![],
+                },
+                vec![],
+                transcript,
+            );
+
+            assert_eq!(state.active_model, Some(status));
+        }
+    }
 
     #[test]
     fn session_picker_matches_unicode_lowercase_substrings_in_source_order() {

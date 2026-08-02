@@ -1103,6 +1103,7 @@ mod tests {
                     content: text.to_owned(),
                 },
                 proposed_calls: Vec::new(),
+                served_model: None,
                 usage: None,
             },
         })

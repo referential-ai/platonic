@@ -2698,6 +2698,7 @@ mod tests {
             run_id: "run_1".into(),
             session_index: 2,
             status: RunStateName::Finished,
+            model_status: None,
             entries: vec![
                 TypedTranscriptEntry::User {
                     text: "question".into(),
@@ -3649,6 +3650,7 @@ mod tests {
             run_id: run_id.into(),
             session_index: 0,
             status: RunStateName::Finished,
+            model_status: None,
             entries: vec![],
         }
     }

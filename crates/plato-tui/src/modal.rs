@@ -1,4 +1,4 @@
-use plato_protocol::{BufferedStreamEvent, StreamEvent};
+use plato_protocol::{BufferedStreamEvent, ModelIdentityStatus, StreamEvent};
 use platonic_core::HarnessEvent;
 use serde_json::Value;
 
@@ -115,13 +115,18 @@ pub fn live_event_line(buffered: &BufferedStreamEvent) -> LiveEventLine {
     line
 }
 
-/// Extracts the requested model from a stream event.
-pub fn model_from_event(event: &StreamEvent) -> Option<String> {
+/// Extracts the latest model identity state from a stream event.
+pub fn model_from_event(event: &StreamEvent) -> Option<ModelIdentityStatus> {
     let StreamEvent::Ledger { record } = event else {
         return None;
     };
     match &record.event {
-        HarnessEvent::ModelRequested { model, .. } => Some(model.to_string()),
+        HarnessEvent::ModelRequested { model, .. } => Some(ModelIdentityStatus::Requested {
+            model: model.to_string(),
+        }),
+        HarnessEvent::ModelResponded { served_model, .. } => Some(ModelIdentityStatus::Responded {
+            served_model: served_model.as_ref().map(ToString::to_string),
+        }),
         _ => None,
     }
 }
