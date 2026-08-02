@@ -68,16 +68,36 @@ validate_set() {
   fi
   validate_owned_directory "$path"
 
+  local LC_ALL=C
   local -a entries=()
+  local -a unexpected=()
   shopt -s dotglob nullglob
   entries=("$path"/*)
   shopt -u dotglob nullglob
   if ((${#entries[@]} == 0)) && [[ "$allow_missing" == "yes" ]]; then
     return 1
   fi
-  ((${#entries[@]} == ${#INSTALL_BINARIES[@]})) || die "binary set must contain exactly three files: $path"
 
-  local name
+  local entry expected name owned
+  for entry in "${entries[@]}"; do
+    name="${entry##*/}"
+    owned="no"
+    for expected in "${INSTALL_BINARIES[@]}"; do
+      if [[ "$name" == "$expected" ]]; then
+        owned="yes"
+        break
+      fi
+    done
+    [[ "$owned" == "yes" ]] || unexpected+=("$name")
+  done
+  if ((${#unexpected[@]} > 0)); then
+    for name in "${unexpected[@]}"; do
+      printf 'error: unexpected binary-set basename %q in %s; move it outside the managed directory before retrying\n' \
+        "$name" "$path" >&2
+    done
+    exit 1
+  fi
+
   for name in "${INSTALL_BINARIES[@]}"; do
     validate_binary_file "$path/$name"
   done
@@ -389,16 +409,16 @@ for entry in sorted(os.scandir(workspaces), key=lambda item: item.name):
         fail(f"daemon executable identity is missing: {lock_path}")
     start_time, process_executable, process_stat = process_identity(pid)
     metadata_executable = os.path.realpath(executable)
+    candidate = metadata_executable == installed_daemon or process_executable == installed_daemon
+    if not candidate:
+        os.close(descriptor)
+        continue
     if os.path.exists(executable):
         executable_stat = os.stat(executable)
         if (executable_stat.st_dev, executable_stat.st_ino) != (process_stat.st_dev, process_stat.st_ino):
             fail(f"daemon lock executable does not match pid {pid}")
     elif process_executable != metadata_executable:
         fail(f"daemon executable disappeared during validation: {executable}")
-    candidate = metadata_executable == installed_daemon or process_executable == installed_daemon
-    if not candidate:
-        os.close(descriptor)
-        continue
     socket_path = metadata.get("socket_path")
     if not isinstance(socket_path, str) or not os.path.isabs(socket_path):
         fail(f"installed daemon socket path is invalid: {lock_path}")
