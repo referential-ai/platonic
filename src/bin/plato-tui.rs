@@ -29,6 +29,9 @@ struct Cli {
 
     #[arg(long, help = "Render the current TUI state once and exit")]
     snapshot: bool,
+
+    #[arg(long, help = "Use a static working indicator")]
+    reduced_motion: bool,
 }
 
 fn main() {
@@ -46,5 +49,6 @@ fn run() -> plato_agent::AppResult<()> {
         run: cli.run,
         config: cli.config,
         snapshot: cli.snapshot,
+        reduced_motion: cli.reduced_motion,
     })
 }

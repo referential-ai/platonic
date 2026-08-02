@@ -1,5 +1,6 @@
 use crate::{TranscriptState, TuiState, render, render_snapshot};
 use crossterm::{
+    SynchronizedUpdate,
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers,
@@ -11,22 +12,74 @@ use plato_daemon_client::{ClientResult, client::DaemonConnectionConfig};
 use plato_protocol::RunStateName;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
-    io::{self, Stdout},
+    env,
+    io::{self, Stdout, Write},
     path::PathBuf,
-    sync::mpsc::Sender,
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use super::{
     client::{
-        ClientCommand, UiRuntime, drain_client_events, load_state, maybe_poll_events,
-        spawn_client_worker,
+        ClientCommand, ClientEvent, UiRuntime, apply_client_event, load_state,
+        maybe_poll_events_at, spawn_client_worker_to,
     },
     commands::{SlashCommandAction, find_slash_command},
-    state::SessionPickerView,
+    state::{MotionMode, SessionPickerView},
 };
 
 const SCROLL_PAGE_LINES: usize = 10;
+const MIN_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000_u64.div_ceil(120));
+const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
+const REDUCED_MOTION_ENV: &str = "PLATO_REDUCED_MOTION";
+
+pub(super) enum UiEvent {
+    Terminal(io::Result<Event>),
+    Daemon(ClientEvent),
+}
+
+#[derive(Debug, Default)]
+struct FrameScheduler {
+    deadline: Option<Instant>,
+    last_frame: Option<Instant>,
+}
+
+impl FrameScheduler {
+    fn schedule_frame(&mut self) {
+        self.schedule_frame_at(Instant::now(), Duration::ZERO);
+    }
+
+    fn schedule_frame_in(&mut self, delay: Duration) {
+        self.schedule_frame_at(Instant::now(), delay);
+    }
+
+    fn schedule_frame_at(&mut self, now: Instant, delay: Duration) {
+        let requested = now + delay;
+        let clamped = self
+            .last_frame
+            .map(|last| requested.max(last + MIN_FRAME_INTERVAL))
+            .unwrap_or(requested);
+        self.deadline = Some(
+            self.deadline
+                .map(|deadline| deadline.min(clamped))
+                .unwrap_or(clamped),
+        );
+    }
+
+    fn take_due(&mut self, now: Instant) -> bool {
+        if self.deadline.is_none_or(|deadline| deadline > now) {
+            return false;
+        }
+        self.deadline = None;
+        self.last_frame = Some(now);
+        true
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Options for connecting and starting the terminal client.
@@ -41,6 +94,8 @@ pub struct TuiOptions {
     pub config: Option<PathBuf>,
     /// Whether to render one frame and exit without entering raw mode.
     pub snapshot: bool,
+    /// Whether animated working indicators are replaced with a static marker.
+    pub reduced_motion: bool,
 }
 
 impl TuiOptions {
@@ -52,6 +107,7 @@ impl TuiOptions {
             run: None,
             config: None,
             snapshot: false,
+            reduced_motion: false,
         }
     }
 }
@@ -60,6 +116,7 @@ impl TuiOptions {
 pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
     let config = DaemonConnectionConfig::resolve(&options.workspace, options.socket)?;
     let mut state = load_state(&config, options.run.as_deref());
+    state.set_reduced_motion(options.reduced_motion || reduced_motion_from_env());
     if options.snapshot {
         print!("{}", render_snapshot(&state, 100, 24)?);
         return Ok(());
@@ -68,37 +125,132 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
         .config
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
-    let (commands, events) = spawn_client_worker(config.clone());
+    let (event_sender, events) = mpsc::channel();
+    let commands = spawn_client_worker_to(config.clone(), event_sender.clone());
     let mut runtime = UiRuntime::from_state(&state, config_path.clone());
     let mut terminal = TerminalSession::enter()?;
+    let mut terminal_events = TerminalEventReader::spawn(event_sender);
+    let mut frames = FrameScheduler::default();
+    frames.schedule_frame();
 
     loop {
-        drain_client_events(&mut state, &mut runtime, &events, &commands);
-        maybe_poll_events(&mut runtime, &commands);
-        update_elapsed(&mut state, &runtime);
-        terminal.draw(&state)?;
-        if event::poll(Duration::from_millis(50))? {
-            match event::read()? {
-                Event::Key(key)
-                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-                {
-                    if !handle_key_press(
-                        key,
-                        &mut state,
-                        &runtime,
-                        &commands,
-                        options.run.clone(),
-                        config_path.clone(),
-                    ) {
-                        break;
+        let now = Instant::now();
+        maybe_poll_events_at(&mut runtime, &commands, now);
+        update_elapsed_at(&mut state, &mut runtime, now);
+        if frames.take_due(now) {
+            terminal.draw(&state)?;
+            if let Some(delay) = next_animation_frame_in(&state) {
+                frames.schedule_frame_in(delay);
+            }
+        }
+
+        let deadline = earliest_deadline(frames.deadline(), runtime.poll_deadline());
+        let event = receive_ui_event(&events, deadline)?;
+        let Some(event) = event else {
+            continue;
+        };
+        match event {
+            UiEvent::Terminal(event) => {
+                let event = event?;
+                let keep_running = match event {
+                    Event::Key(key)
+                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
+                        handle_key_press(
+                            key,
+                            &mut state,
+                            &runtime,
+                            &commands,
+                            options.run.clone(),
+                            config_path.clone(),
+                        )
                     }
+                    Event::Paste(text) => {
+                        state.handle_paste_text(&text);
+                        true
+                    }
+                    _ => true,
+                };
+                terminal_events.acknowledge(keep_running);
+                if !keep_running {
+                    break;
                 }
-                Event::Paste(text) => state.handle_paste_text(&text),
-                _ => {}
+                frames.schedule_frame();
+            }
+            UiEvent::Daemon(event) => {
+                apply_client_event(&mut state, &mut runtime, event, &commands);
+                frames.schedule_frame();
             }
         }
     }
     Ok(())
+}
+
+fn reduced_motion_from_env() -> bool {
+    env::var(REDUCED_MOTION_ENV)
+        .ok()
+        .is_some_and(|value| reduced_motion_signal(&value))
+}
+
+fn reduced_motion_signal(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
+}
+
+fn earliest_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
+}
+
+fn receive_ui_event(
+    events: &Receiver<UiEvent>,
+    deadline: Option<Instant>,
+) -> ClientResult<Option<UiEvent>> {
+    let event =
+        match deadline {
+            Some(deadline) => {
+                let now = Instant::now();
+                if deadline <= now {
+                    return Ok(None);
+                }
+                match events.recv_timeout(deadline.saturating_duration_since(now)) {
+                    Ok(event) => Some(event),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "TUI event stream stopped",
+                        )
+                        .into());
+                    }
+                }
+            }
+            None => Some(events.recv().map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "TUI event stream stopped")
+            })?),
+        };
+    Ok(event)
+}
+
+fn next_animation_frame_in(state: &TuiState) -> Option<Duration> {
+    let working = state.issue_prep_started_at.is_some()
+        || state.active_run.as_ref().is_some_and(|run| {
+            matches!(
+                run.status,
+                RunStateName::Running | RunStateName::CancelRequested
+            )
+        });
+    if !working || state.approval.is_some() || state.motion_mode == MotionMode::Reduced {
+        return None;
+    }
+    let interval_ms = SPINNER_INTERVAL.as_millis() as u64;
+    let remainder = state.working_elapsed_millis % interval_ms;
+    Some(Duration::from_millis(interval_ms - remainder))
 }
 
 fn handle_key_press(
@@ -136,7 +288,8 @@ fn handle_key_press(
 
     if state.approval.is_some() {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return false,
+            KeyCode::Char('q') => return false,
+            KeyCode::Esc => return request_cancel(commands, state),
             KeyCode::Char('g') => decide_approval(commands, state, ApprovalAction::Grant),
             KeyCode::Char('d') => decide_approval(commands, state, ApprovalAction::Deny),
             _ => {}
@@ -213,6 +366,16 @@ fn handle_key_press(
     }
 
     match key.code {
+        KeyCode::Esc
+            if state.active_run.as_ref().is_some_and(|run| {
+                matches!(
+                    run.status,
+                    RunStateName::Running | RunStateName::CancelRequested
+                )
+            }) =>
+        {
+            request_cancel(commands, state)
+        }
         KeyCode::Esc => handle_exit_request(state),
         KeyCode::Char('?') if state.composer.is_empty() => {
             state.help_visible = true;
@@ -762,6 +925,7 @@ fn start_issue_prep(
     }
 
     state.issue_prep_started_at = Some(Instant::now());
+    state.issue_prep_elapsed_secs = Some(0);
     state.status_message = Some("issue prep running".into());
     push_live_event(
         state,
@@ -775,6 +939,7 @@ fn start_issue_prep(
         .is_err()
     {
         state.issue_prep_started_at = None;
+        state.issue_prep_elapsed_secs = None;
         state.status_message = Some("daemon client worker stopped".into());
     }
 }
@@ -801,7 +966,9 @@ pub(super) fn start_next_queued(
     runtime.polling = true;
     runtime.poll_in_flight = false;
     runtime.active_run_id = None;
-    runtime.active_since = Some(Instant::now());
+    runtime
+        .active_timer
+        .start_at(Instant::now(), Duration::ZERO);
     state.status_message = Some("submitted queued message".into());
     send_command(commands, command, state);
 }
@@ -834,10 +1001,19 @@ pub(super) fn send_command(
     }
 }
 
-fn update_elapsed(state: &mut TuiState, runtime: &UiRuntime) {
-    state.active_run_elapsed_secs = runtime
-        .active_since
-        .map(|started| started.elapsed().as_secs());
+fn update_elapsed_at(state: &mut TuiState, runtime: &mut UiRuntime, now: Instant) {
+    runtime
+        .active_timer
+        .set_paused_at(state.approval.is_some(), now);
+    if let Some(elapsed) = runtime.active_timer.elapsed_at(now) {
+        state.active_run_elapsed_secs = Some(elapsed.as_secs());
+        state.working_elapsed_millis = elapsed.as_millis().try_into().unwrap_or(u64::MAX);
+    }
+    state.issue_prep_elapsed_secs = state.issue_prep_started_at.map(|started| {
+        let elapsed = now.saturating_duration_since(started);
+        state.working_elapsed_millis = elapsed.as_millis().try_into().unwrap_or(u64::MAX);
+        elapsed.as_secs()
+    });
 }
 
 pub(super) fn push_live_event(state: &mut TuiState, mut line: crate::LiveEventLine) {
@@ -882,8 +1058,59 @@ pub(super) fn push_live_event(state: &mut TuiState, mut line: crate::LiveEventLi
     state.reset_scroll();
 }
 
+enum TerminalReaderControl {
+    Continue,
+    Stop,
+}
+
+struct TerminalEventReader {
+    control: Sender<TerminalReaderControl>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl TerminalEventReader {
+    fn spawn(events: Sender<UiEvent>) -> Self {
+        let (control, controls) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            loop {
+                let event = event::read();
+                if events.send(UiEvent::Terminal(event)).is_err() {
+                    break;
+                }
+                match controls.recv() {
+                    Ok(TerminalReaderControl::Continue) => {}
+                    Ok(TerminalReaderControl::Stop) | Err(_) => break,
+                }
+            }
+        });
+        Self {
+            control,
+            worker: Some(worker),
+        }
+    }
+
+    fn acknowledge(&mut self, keep_running: bool) {
+        let control = if keep_running {
+            TerminalReaderControl::Continue
+        } else {
+            TerminalReaderControl::Stop
+        };
+        let _ = self.control.send(control);
+        if !keep_running && let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for TerminalEventReader {
+    fn drop(&mut self) {
+        let _ = self.control.send(TerminalReaderControl::Stop);
+    }
+}
+
 struct TerminalSession {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<CrosstermBackend<Vec<u8>>>,
+    stdout: Stdout,
 }
 
 impl TerminalSession {
@@ -891,33 +1118,40 @@ impl TerminalSession {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-        Ok(Self { terminal })
+        let terminal = Terminal::new(CrosstermBackend::new(Vec::new()))?;
+        Ok(Self { terminal, stdout })
     }
 
     fn draw(&mut self, state: &TuiState) -> ClientResult<()> {
         self.terminal.draw(|frame| render(frame, state))?;
+        let output = std::mem::take(self.terminal.backend_mut().writer_mut());
+        write_synchronized(&mut self.stdout, &output)?;
         Ok(())
     }
+}
+
+fn write_synchronized(output: &mut impl Write, frame: &[u8]) -> io::Result<()> {
+    output.sync_update(|output| output.write_all(frame))?
 }
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(
-            self.terminal.backend_mut(),
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
+        let _ = execute!(self.stdout, DisableBracketedPaste, LeaveAlternateScreen);
+        self.terminal.backend_mut().writer_mut().clear();
         let _ = self.terminal.show_cursor();
+        let output = std::mem::take(self.terminal.backend_mut().writer_mut());
+        let _ = self.stdout.write_all(&output);
+        let _ = self.stdout.flush();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::client::{
-        ACTIVE_POLL_INTERVAL, ClientEvent, ClientOperation, EVENT_LIMIT, apply_events_result,
-        apply_loaded_state, apply_run_response, is_connection_error,
+        ACTIVE_POLL_INTERVAL, ActiveTimer, ClientEvent, ClientOperation, EVENT_LIMIT,
+        apply_events_result, apply_loaded_state, apply_run_response, drain_client_events,
+        is_connection_error, maybe_poll_events,
     };
     #[cfg(unix)]
     use super::super::client::{DAEMON_CLIENT_TIMEOUT, connect_daemon};
@@ -1109,7 +1343,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
-            active_since: Some(Instant::now()),
+            active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
         };
 
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
@@ -1140,7 +1374,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
-            active_since: Some(Instant::now()),
+            active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
         };
 
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
@@ -2120,7 +2354,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
-            active_since: Some(Instant::now()),
+            active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
         };
         let result = EventsStreamResult {
             run_id: "run_1".into(),
@@ -2201,7 +2435,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
-            active_since: Some(Instant::now()),
+            active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
         };
         let events = (0..500)
             .map(|index| {
@@ -2251,7 +2485,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
-            active_since: Some(Instant::now()),
+            active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
         };
         let events = (0..EVENT_LIMIT)
             .map(|index| {
@@ -2308,7 +2542,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
-            active_since: Some(Instant::now()),
+            active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
         };
 
         apply_events_result(
@@ -2353,7 +2587,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
-            active_since: Some(Instant::now()),
+            active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
         };
 
         for (offset, served_model, expected) in [
@@ -2489,7 +2723,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
-            active_since: Some(Instant::now()),
+            active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
         };
         let result = EventsStreamResult {
             run_id: "run_1".into(),
@@ -2536,7 +2770,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
-            active_since: Some(Instant::now()),
+            active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
         };
         let result = EventsStreamResult {
             run_id: "run_1".into(),
@@ -2681,7 +2915,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
-            active_since: Some(Instant::now()),
+            active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
         };
         event_sender
             .send(ClientEvent::Failed {
@@ -2729,7 +2963,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now() - ACTIVE_POLL_INTERVAL,
             tool_inputs: HashMap::new(),
-            active_since: Some(Instant::now()),
+            active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
         };
         event_sender
             .send(ClientEvent::Failed {
@@ -2793,7 +3027,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
-            active_since: Some(Instant::now()),
+            active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
         };
         let result = EventsStreamResult {
             run_id: "run_1".into(),
@@ -3050,6 +3284,128 @@ mod tests {
         }
 
         assert!(!request_cancel(&sender, &mut state));
+    }
+
+    #[test]
+    fn escape_interrupts_an_active_run() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.active_run = Some(crate::ActiveRunView {
+            run_id: "run_escape".into(),
+            status: RunStateName::Running,
+        });
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+
+        assert!(state.cancel_requested);
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientCommand::RunCancel { run_id } if run_id == "run_escape"
+        ));
+    }
+
+    #[test]
+    fn escape_interrupts_an_active_run_while_approval_is_pending() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.active_run = Some(crate::ActiveRunView {
+            run_id: "run_approval_escape".into(),
+            status: RunStateName::Running,
+        });
+        state.approval = Some(test_approval("run_approval_escape", "call_approval_escape"));
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+
+        assert!(state.cancel_requested);
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientCommand::RunCancel { run_id } if run_id == "run_approval_escape"
+        ));
+    }
+
+    #[test]
+    fn frame_scheduler_coalesces_earliest_deadline_and_clamps_to_120_fps() {
+        let base = Instant::now();
+        let mut frames = FrameScheduler::default();
+        frames.schedule_frame_at(base, Duration::from_millis(100));
+        frames.schedule_frame_at(base, Duration::from_millis(40));
+        frames.schedule_frame_at(base, Duration::from_millis(60));
+        assert_eq!(frames.deadline(), Some(base + Duration::from_millis(40)));
+        assert!(!frames.take_due(base + Duration::from_millis(39)));
+        assert!(frames.take_due(base + Duration::from_millis(40)));
+        assert_eq!(frames.deadline(), None);
+
+        frames.schedule_frame_at(base + Duration::from_millis(41), Duration::ZERO);
+        assert_eq!(
+            frames.deadline(),
+            Some(base + Duration::from_millis(40) + MIN_FRAME_INTERVAL)
+        );
+        assert!(MIN_FRAME_INTERVAL * 120 >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn active_timer_freezes_for_approval_and_resumes_without_running_backward() {
+        let base = Instant::now();
+        let mut timer = ActiveTimer::started_at(base, Duration::ZERO);
+        assert_eq!(
+            timer.elapsed_at(base + Duration::from_secs(2)),
+            Some(Duration::from_secs(2))
+        );
+
+        timer.set_paused_at(true, base + Duration::from_secs(2));
+        assert_eq!(
+            timer.elapsed_at(base + Duration::from_secs(7)),
+            Some(Duration::from_secs(2))
+        );
+        timer.set_paused_at(false, base + Duration::from_secs(7));
+        assert_eq!(
+            timer.elapsed_at(base + Duration::from_secs(8)),
+            Some(Duration::from_secs(3))
+        );
+    }
+
+    #[test]
+    fn reduced_motion_signal_and_scheduler_fallback_are_explicit() {
+        for enabled in ["1", "true", "yes", "on", "enabled"] {
+            assert!(reduced_motion_signal(enabled));
+        }
+        for disabled in ["", "0", "false", "no", "off"] {
+            assert!(!reduced_motion_signal(disabled));
+        }
+
+        let mut state = test_state();
+        state.active_run = Some(crate::ActiveRunView {
+            run_id: "run_motion".into(),
+            status: RunStateName::Running,
+        });
+        assert_eq!(next_animation_frame_in(&state), Some(SPINNER_INTERVAL));
+        state.working_elapsed_millis = SPINNER_INTERVAL.as_millis() as u64 - 1;
+        assert_eq!(
+            next_animation_frame_in(&state),
+            Some(Duration::from_millis(1))
+        );
+        state.set_reduced_motion(true);
+        assert_eq!(next_animation_frame_in(&state), None);
+    }
+
+    #[test]
+    fn synchronized_writer_wraps_each_frame_in_mode_2026() {
+        let mut output = Vec::new();
+        write_synchronized(&mut output, b"frame").unwrap();
+
+        assert_eq!(output, b"\x1b[?2026hframe\x1b[?2026l");
     }
 
     #[test]

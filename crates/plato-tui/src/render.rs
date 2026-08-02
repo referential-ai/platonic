@@ -11,7 +11,7 @@ use super::{
     ApprovalModalView, ConnectionState, LiveEventKind, TranscriptState, TuiState,
     markdown::{DEFAULT_SYNTAX_THEME, MarkdownRenderer, SyntaxTheme},
     state::{
-        CachedLiveEventRows, CachedTranscriptRows, DisplayMode, LiveEventRowsKey,
+        CachedLiveEventRows, CachedTranscriptRows, DisplayMode, LiveEventRowsKey, MotionMode,
         TranscriptRowsKey, session_question_label,
     },
 };
@@ -20,11 +20,13 @@ use plato_protocol::{
     DaemonStatusResult, DaemonStatusTokenUsage, ModelIdentityStatus, RunStateName, TypedRun,
     TypedTranscriptEntry,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const SESSION_STATUS_WIDTH: usize = 16;
 const SESSION_AGE_WIDTH: usize = 5;
 const SESSION_QUESTION_MAX_CHARS: usize = 72;
+const WORKING_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+const WORKING_FRAME_MILLIS: u64 = 80;
 
 /// Renders the current client state into a terminal frame.
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
@@ -369,9 +371,9 @@ fn append_audit_live_transcript(
     if let Some(active) = &state.active_run {
         lines.push(status_row(format!("{} {}", active.status, active.run_id)));
     }
-    if let Some((marker, elapsed)) = issue_prep_activity(state) {
+    if let Some(elapsed) = issue_prep_activity(state) {
         lines.push(status_row(format!(
-            "issue prep {marker} {}",
+            "issue prep {}",
             format_elapsed(elapsed)
         )));
     } else if let Some(message) = &state.status_message {
@@ -381,6 +383,7 @@ fn append_audit_live_transcript(
         lines.push(warning_row(format!("stream warning {warning}")));
     }
     append_audit_live_event_rows(lines, state, width, syntax_theme);
+    append_working_row(lines, state);
 }
 
 fn clear_live_event_rows(state: &TuiState) {
@@ -580,6 +583,7 @@ fn append_conversation_activity(
     ) {
         push_trace_row(lines, summary);
     }
+    append_working_row(lines, state);
 }
 
 fn latest_typed_run(transcript: &super::TranscriptView) -> Option<&TypedRun> {
@@ -984,13 +988,51 @@ fn append_queue_preview(lines: &mut Vec<Line<'static>>, state: &TuiState) {
     );
 }
 
+fn append_working_row(lines: &mut Vec<Line<'static>>, state: &TuiState) {
+    let Some((task, elapsed, interruptible)) = working_task(state) else {
+        return;
+    };
+    let marker = match state.motion_mode {
+        MotionMode::Animated => {
+            let index = (state.working_elapsed_millis / WORKING_FRAME_MILLIS) as usize;
+            WORKING_FRAMES[index % WORKING_FRAMES.len()]
+        }
+        MotionMode::Reduced => "•",
+    };
+    let mut spans = vec![
+        Span::styled(format!("{marker} "), Style::default().fg(Color::Yellow)),
+        Span::styled(task, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(format!("  {}", format_elapsed(elapsed))),
+    ];
+    if interruptible {
+        spans.push(Span::styled(
+            "  Esc to interrupt",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    append_spaced_rows(lines, std::iter::once(Line::from(spans)));
+}
+
+fn working_task(state: &TuiState) -> Option<(&'static str, u64, bool)> {
+    if let Some(elapsed) = issue_prep_activity(state) {
+        return Some(("Preparing", elapsed, false));
+    }
+    state.active_run.as_ref().and_then(|run| {
+        matches!(
+            run.status,
+            RunStateName::Running | RunStateName::CancelRequested
+        )
+        .then_some(("Working", state.active_run_elapsed_secs.unwrap_or(0), true))
+    })
+}
+
 fn render_status_line(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(Paragraph::new(status_line(state, area.width)), area);
 }
 
 fn status_line(state: &TuiState, width: u16) -> Line<'static> {
-    let (run_status, elapsed) = if let Some((marker, elapsed)) = issue_prep_activity(state) {
-        (format!("issue prep {marker}"), format_elapsed(elapsed))
+    let (run_status, elapsed) = if let Some(elapsed) = issue_prep_activity(state) {
+        ("issue prep".to_owned(), format_elapsed(elapsed))
     } else {
         (
             state
@@ -1091,18 +1133,9 @@ fn bounded_status_text(mut text: String, width: u16) -> String {
     text
 }
 
-fn issue_prep_activity(state: &TuiState) -> Option<(&'static str, u64)> {
-    let elapsed = state.issue_prep_started_at?.elapsed();
-    Some((activity_marker(elapsed), elapsed.as_secs()))
-}
-
-fn activity_marker(elapsed: Duration) -> &'static str {
-    match (elapsed.as_millis() / 200) % 4 {
-        0 => ".",
-        1 => ":",
-        2 => "*",
-        _ => "+",
-    }
+fn issue_prep_activity(state: &TuiState) -> Option<u64> {
+    state.issue_prep_started_at?;
+    Some(state.issue_prep_elapsed_secs.unwrap_or(0))
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -1284,12 +1317,15 @@ fn composer_with_cursor(state: &TuiState) -> String {
 }
 
 fn format_elapsed(seconds: u64) -> String {
-    let minutes = seconds / 60;
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
     let seconds = seconds % 60;
-    if minutes == 0 {
-        format!("{seconds}s")
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
     } else {
-        format!("{minutes}m{seconds:02}s")
+        format!("{seconds}s")
     }
 }
 
@@ -2186,17 +2222,55 @@ mod tests {
             Vec::new(),
             TranscriptState::None,
         );
-        state.issue_prep_started_at = Some(std::time::Instant::now() - Duration::from_secs(2));
+        state.issue_prep_started_at = Some(std::time::Instant::now());
+        state.issue_prep_elapsed_secs = Some(2);
+        state.working_elapsed_millis = 2_000;
         state.status_message = Some("issue prep running".into());
 
         let output = render_to_text(&state);
 
         assert!(output.contains("issue prep"));
         assert!(output.contains("2s"));
-        assert_eq!(activity_marker(Duration::ZERO), ".");
-        assert_eq!(activity_marker(Duration::from_millis(200)), ":");
-        assert_eq!(activity_marker(Duration::from_millis(400)), "*");
-        assert_eq!(activity_marker(Duration::from_millis(600)), "+");
+        assert!(output.contains("Preparing"));
+    }
+
+    #[test]
+    fn working_row_uses_braille_cadence_and_reduced_motion_fallback() {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            Vec::new(),
+            TranscriptState::None,
+        );
+        state.active_run = Some(ActiveRunView::new(
+            "run_working".into(),
+            RunStateName::Running,
+        ));
+        state.active_run_elapsed_secs = Some(60);
+
+        for (index, frame) in WORKING_FRAMES.iter().enumerate() {
+            state.working_elapsed_millis = index as u64 * WORKING_FRAME_MILLIS;
+            let output = render_to_text(&state);
+            assert!(output.contains(&format!("{frame} Working  1m 00s  Esc to interrupt")));
+        }
+
+        state.set_reduced_motion(true);
+        let output = render_to_text(&state);
+        assert!(output.contains("• Working  1m 00s  Esc to interrupt"));
+        assert!(!WORKING_FRAMES.iter().any(|frame| output.contains(frame)));
+    }
+
+    #[test]
+    fn compact_elapsed_formats_literal_boundary_forms() {
+        assert_eq!(format_elapsed(59), "59s");
+        assert_eq!(format_elapsed(60), "1m 00s");
+        assert_eq!(format_elapsed(7_389), "2h 03m 09s");
     }
 
     #[test]
@@ -2316,7 +2390,7 @@ mod tests {
 
         let output = render_to_text(&state);
 
-        assert!(output.contains("1m05s"));
+        assert!(output.contains("1m 05s"));
         assert!(output.contains("selected openrouter/auto"));
         assert!(output.contains("You"));
         assert!(output.contains("read README"));
@@ -2439,13 +2513,13 @@ mod tests {
         let mut state = approval_trace_fixture();
         assert_eq!(
             focused_snapshot(&state, 96, 24),
-            "You\n  Review the proposed edit.\n\nTrace  approval | running\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | running 0s | model pending | queued 0 | conversation"
+            "You\n  Review the proposed edit.\n\nTrace  approval | running\n\n⣾ Working  0s  Esc to interrupt\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | running 0s | model pending | queued 0 | conversation"
         );
 
         state.toggle_display_mode();
         assert_eq!(
             focused_snapshot(&state, 96, 24),
-            "status    run run_approval\n\nuser      Review the proposed edit.\n\ntranscript\nstatus    running run_approval\nwarning   #4 approval pending file.write (workspace_write)\nstatus    #5 approval granted call_approval\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | running 0s | model pending | queued 0 | audit"
+            "status    run run_approval\n\nuser      Review the proposed edit.\n\ntranscript\nstatus    running run_approval\nwarning   #4 approval pending file.write (workspace_write)\nstatus    #5 approval granted call_approval\n\n⣾ Working  0s  Esc to interrupt\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | running 0s | model pending | queued 0 | audit"
         );
     }
 

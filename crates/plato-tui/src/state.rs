@@ -19,6 +19,13 @@ pub(super) enum DisplayMode {
     Audit,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum MotionMode {
+    #[default]
+    Animated,
+    Reduced,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Complete render and interaction state for the terminal client.
 pub struct TuiState {
@@ -48,6 +55,7 @@ pub struct TuiState {
     pub active_model: Option<ModelIdentityStatus>,
     /// Elapsed active-run time, in seconds.
     pub active_run_elapsed_secs: Option<u64>,
+    pub(super) working_elapsed_millis: u64,
     /// Composer text.
     pub composer: String,
     /// Composer cursor byte offset.
@@ -62,6 +70,8 @@ pub struct TuiState {
     pub queued_messages: Vec<String>,
     /// Start time of an active issue-preparation request.
     pub issue_prep_started_at: Option<Instant>,
+    pub(super) issue_prep_elapsed_secs: Option<u64>,
+    pub(super) motion_mode: MotionMode,
     /// Submitted composer history.
     pub input_history: Vec<String>,
     /// Selected composer-history index.
@@ -132,6 +142,7 @@ impl TuiState {
             audit_scroll_offset: 0,
             active_model: None,
             active_run_elapsed_secs: None,
+            working_elapsed_millis: 0,
             composer: String::new(),
             composer_cursor: 0,
             composer_kill_buffer: String::new(),
@@ -139,6 +150,8 @@ impl TuiState {
             session_picker: None,
             queued_messages: Vec::new(),
             issue_prep_started_at: None,
+            issue_prep_elapsed_secs: None,
+            motion_mode: MotionMode::Animated,
             input_history: Vec::new(),
             history_index: None,
             status_message: None,
@@ -148,6 +161,14 @@ impl TuiState {
             status_modal: None,
             cancel_requested: false,
         }
+    }
+
+    pub(super) fn set_reduced_motion(&mut self, reduced: bool) {
+        self.motion_mode = if reduced {
+            MotionMode::Reduced
+        } else {
+            MotionMode::Animated
+        };
     }
 
     pub(super) fn move_slash_popup_selection(&mut self, delta: isize) {
