@@ -40,6 +40,7 @@ fn compatibility_wrapper_preserves_client_error_display() {
         run: None,
         config: None,
         snapshot: true,
+        reduced_motion: false,
     };
 
     let direct = plato_tui::run_tui(options.clone()).unwrap_err();

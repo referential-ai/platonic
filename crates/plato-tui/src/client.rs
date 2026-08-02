@@ -10,13 +10,16 @@ use plato_protocol::{
 };
 use std::{
     collections::HashMap,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Sender},
     thread,
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use std::sync::mpsc::Receiver;
+
 use super::{
-    app::{push_live_event, send_command, start_next_queued},
+    app::{UiEvent, push_live_event, send_command, start_next_queued},
     state::approval_from_snapshot,
 };
 
@@ -138,11 +141,77 @@ pub(super) struct UiRuntime {
     pub(super) polling: bool,
     pub(super) last_poll: Instant,
     pub(super) tool_inputs: HashMap<String, String>,
-    pub(super) active_since: Option<Instant>,
+    pub(super) active_timer: ActiveTimer,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct ActiveTimer {
+    accumulated: Duration,
+    running_since: Option<Instant>,
+    paused: bool,
+}
+
+impl ActiveTimer {
+    pub(super) fn started_at(now: Instant, elapsed: Duration) -> Self {
+        Self {
+            accumulated: elapsed,
+            running_since: Some(now),
+            paused: false,
+        }
+    }
+
+    fn from_state_at(state: &TuiState, now: Instant) -> Self {
+        let mut timer = Self::default();
+        if state.active_run.is_some() {
+            timer.start_at(
+                now,
+                Duration::from_secs(state.active_run_elapsed_secs.unwrap_or(0)),
+            );
+            timer.set_paused_at(state.approval.is_some(), now);
+        }
+        timer
+    }
+
+    pub(super) fn start_at(&mut self, now: Instant, elapsed: Duration) {
+        *self = Self::started_at(now, elapsed);
+    }
+
+    pub(super) fn stop(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(super) fn set_paused_at(&mut self, paused: bool, now: Instant) {
+        if paused == self.paused || !self.is_active() {
+            return;
+        }
+        if paused {
+            if let Some(started) = self.running_since.take() {
+                self.accumulated += now.saturating_duration_since(started);
+            }
+        } else {
+            self.running_since = Some(now);
+        }
+        self.paused = paused;
+    }
+
+    pub(super) fn elapsed_at(&self, now: Instant) -> Option<Duration> {
+        self.is_active().then(|| {
+            self.accumulated
+                + self
+                    .running_since
+                    .map(|started| now.saturating_duration_since(started))
+                    .unwrap_or_default()
+        })
+    }
+
+    pub(super) fn is_active(&self) -> bool {
+        self.running_since.is_some() || self.paused
+    }
 }
 
 impl UiRuntime {
     pub(super) fn from_state(state: &TuiState, config_path: Option<String>) -> Self {
+        let now = Instant::now();
         Self {
             active_run_id: state.active_run.as_ref().map(|run| run.run_id.clone()),
             config_path,
@@ -154,9 +223,9 @@ impl UiRuntime {
                     RunStateName::Running | RunStateName::CancelRequested
                 )
             }),
-            last_poll: Instant::now(),
+            last_poll: now,
             tool_inputs: HashMap::new(),
-            active_since: state.active_run.as_ref().map(|_| Instant::now()),
+            active_timer: ActiveTimer::from_state_at(state, now),
         }
     }
 
@@ -170,9 +239,15 @@ impl UiRuntime {
         });
         self.next_offset = 0;
         self.poll_in_flight = false;
-        self.last_poll = Instant::now();
+        let now = Instant::now();
+        self.last_poll = now;
         self.tool_inputs.clear();
-        self.active_since = state.active_run.as_ref().map(|_| Instant::now());
+        self.active_timer = ActiveTimer::from_state_at(state, now);
+    }
+
+    pub(super) fn poll_deadline(&self) -> Option<Instant> {
+        (self.polling && !self.poll_in_flight && self.active_run_id.is_some())
+            .then_some(self.last_poll + ACTIVE_POLL_INTERVAL)
     }
 }
 
@@ -263,6 +338,7 @@ impl ClientOperation {
     }
 }
 
+#[cfg(test)]
 pub(super) fn spawn_client_worker(
     config: DaemonConnectionConfig,
 ) -> (Sender<ClientCommand>, Receiver<ClientEvent>) {
@@ -277,6 +353,22 @@ pub(super) fn spawn_client_worker(
         }
     });
     (command_sender, event_receiver)
+}
+
+pub(super) fn spawn_client_worker_to(
+    config: DaemonConnectionConfig,
+    event_sender: Sender<UiEvent>,
+) -> Sender<ClientCommand> {
+    let (command_sender, command_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for command in command_receiver {
+            let event = handle_client_command(&config, command);
+            if event_sender.send(UiEvent::Daemon(event)).is_err() {
+                break;
+            }
+        }
+    });
+    command_sender
 }
 
 fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand) -> ClientEvent {
@@ -399,6 +491,7 @@ fn failed_event(operation: ClientOperation) -> impl FnOnce(ClientError) -> Clien
     move |error| ClientEvent::Failed { operation, error }
 }
 
+#[cfg(test)]
 pub(super) fn drain_client_events(
     state: &mut TuiState,
     runtime: &mut UiRuntime,
@@ -406,142 +499,144 @@ pub(super) fn drain_client_events(
     commands: &Sender<ClientCommand>,
 ) {
     while let Ok(event) = events.try_recv() {
-        match event {
-            ClientEvent::Loaded(loaded) => {
-                apply_loaded_state(state, *loaded);
-                runtime.sync_from_state(state);
-            }
-            ClientEvent::StatusLoaded(status) => {
-                state.status_modal = Some(*status);
-                state.status_message = Some("status opened".into());
-            }
-            ClientEvent::RunStarted(result) => {
-                apply_run_response(state, runtime, result, "run started")
-            }
-            ClientEvent::IssuePrepFinished(result) => {
-                state.issue_prep_started_at = None;
-                match result.outcome {
-                    IssuePrepResult::Candidate { markdown } => {
-                        push_live_event(state, crate::LiveEventLine::assistant(None, markdown));
-                        push_live_event(
-                            state,
-                            crate::LiveEventLine::status(
-                                None,
-                                format!("issue-prep artifacts: {}", result.run_dir),
-                            ),
-                        );
-                        state.status_message =
-                            Some(format!("issue ready; artifacts: {}", result.run_dir));
-                    }
-                    IssuePrepResult::Blocked { stage, reasons } => {
-                        let reason_text = if reasons.is_empty() {
-                            String::new()
-                        } else {
-                            format!(":\n- {}", reasons.join("\n- "))
-                        };
-                        push_live_event(
-                            state,
-                            crate::LiveEventLine::warning(
-                                None,
-                                format!(
-                                    "issue prep blocked at {stage}{reason_text}\nartifacts: {}",
-                                    result.run_dir
-                                ),
-                            ),
-                        );
-                        state.status_message = Some(format!(
-                            "issue prep blocked at {stage}; artifacts: {}",
-                            result.run_dir
-                        ));
-                    }
+        apply_client_event(state, runtime, event, commands);
+    }
+}
+
+pub(super) fn apply_client_event(
+    state: &mut TuiState,
+    runtime: &mut UiRuntime,
+    event: ClientEvent,
+    commands: &Sender<ClientCommand>,
+) {
+    match event {
+        ClientEvent::Loaded(loaded) => {
+            apply_loaded_state(state, *loaded);
+            runtime.sync_from_state(state);
+        }
+        ClientEvent::StatusLoaded(status) => {
+            state.status_modal = Some(*status);
+            state.status_message = Some("status opened".into());
+        }
+        ClientEvent::RunStarted(result) => {
+            apply_run_response(state, runtime, result, "run started")
+        }
+        ClientEvent::IssuePrepFinished(result) => {
+            state.issue_prep_started_at = None;
+            state.issue_prep_elapsed_secs = None;
+            match result.outcome {
+                IssuePrepResult::Candidate { markdown } => {
+                    push_live_event(state, crate::LiveEventLine::assistant(None, markdown));
+                    push_live_event(
+                        state,
+                        crate::LiveEventLine::status(
+                            None,
+                            format!("issue-prep artifacts: {}", result.run_dir),
+                        ),
+                    );
+                    state.status_message =
+                        Some(format!("issue ready; artifacts: {}", result.run_dir));
                 }
-                state.reset_scroll();
-                start_next_queued(commands, state, runtime);
+                IssuePrepResult::Blocked { stage, reasons } => {
+                    let reason_text = if reasons.is_empty() {
+                        String::new()
+                    } else {
+                        format!(":\n- {}", reasons.join("\n- "))
+                    };
+                    push_live_event(
+                        state,
+                        crate::LiveEventLine::warning(
+                            None,
+                            format!(
+                                "issue prep blocked at {stage}{reason_text}\nartifacts: {}",
+                                result.run_dir
+                            ),
+                        ),
+                    );
+                    state.status_message = Some(format!(
+                        "issue prep blocked at {stage}; artifacts: {}",
+                        result.run_dir
+                    ));
+                }
             }
-            ClientEvent::EventsPolled(result) => {
-                apply_events_result(state, runtime, commands, result)
-            }
-            ClientEvent::ApprovalDecided {
-                result,
-                tool_call_id,
-                decision,
-            } => {
-                state.status_message =
-                    Some(format!("approval decision sent for {}", result.run_id));
-                state.approval = None;
-                state.active_run = Some(ActiveRunView::new(result.run_id.clone(), result.status));
-                let decision = match decision {
-                    ApprovalDecisionName::Granted => "granted",
-                    ApprovalDecisionName::Denied => "denied",
-                };
-                push_live_event(
-                    state,
-                    crate::LiveEventLine::approval(
-                        None,
-                        format!("approval {decision} {tool_call_id}"),
-                    )
+            state.reset_scroll();
+            start_next_queued(commands, state, runtime);
+        }
+        ClientEvent::EventsPolled(result) => apply_events_result(state, runtime, commands, result),
+        ClientEvent::ApprovalDecided {
+            result,
+            tool_call_id,
+            decision,
+        } => {
+            state.status_message = Some(format!("approval decision sent for {}", result.run_id));
+            state.approval = None;
+            state.active_run = Some(ActiveRunView::new(result.run_id.clone(), result.status));
+            let decision = match decision {
+                ApprovalDecisionName::Granted => "granted",
+                ApprovalDecisionName::Denied => "denied",
+            };
+            push_live_event(
+                state,
+                crate::LiveEventLine::approval(None, format!("approval {decision} {tool_call_id}"))
                     .with_run_id(result.run_id),
-                );
-            }
-            ClientEvent::RunCanceled(result) => {
-                state.status_message = Some(format!("cancel requested for {}", result.run_id));
-                state.cancel_requested = true;
-                state.approval = None;
-                state.active_run = Some(ActiveRunView::new(result.run_id.clone(), result.status));
-                push_live_event(
-                    state,
-                    crate::LiveEventLine::status(
-                        None,
-                        format!("cancel requested: {}", result.run_id),
-                    )
+            );
+        }
+        ClientEvent::RunCanceled(result) => {
+            state.status_message = Some(format!("cancel requested for {}", result.run_id));
+            state.cancel_requested = true;
+            state.approval = None;
+            state.active_run = Some(ActiveRunView::new(result.run_id.clone(), result.status));
+            push_live_event(
+                state,
+                crate::LiveEventLine::status(None, format!("cancel requested: {}", result.run_id))
                     .with_run_id(result.run_id),
-                );
-            }
-            ClientEvent::Failed { operation, error } => {
-                runtime.poll_in_flight = false;
-                let connection_error = is_connection_error(&error);
-                let lagged = matches!(
-                    &error,
-                    ClientError::DaemonResponse(error) if error.code == ERROR_LAGGED
-                );
-                let overloaded = matches!(
-                    &error,
-                    ClientError::DaemonResponse(error) if error.code == ERROR_OVERLOAD
-                );
-                let message = error.to_string();
-                if operation == ClientOperation::EventsStream && lagged {
-                    state.stream_warning = Some(format!("{message}; resuming at current tip"));
-                    if let Some(run_id) = runtime.active_run_id.clone() {
-                        poll_events_from(runtime, commands, run_id, None);
+            );
+        }
+        ClientEvent::Failed { operation, error } => {
+            runtime.poll_in_flight = false;
+            let connection_error = is_connection_error(&error);
+            let lagged = matches!(
+                &error,
+                ClientError::DaemonResponse(error) if error.code == ERROR_LAGGED
+            );
+            let overloaded = matches!(
+                &error,
+                ClientError::DaemonResponse(error) if error.code == ERROR_OVERLOAD
+            );
+            let message = error.to_string();
+            if operation == ClientOperation::EventsStream && lagged {
+                state.stream_warning = Some(format!("{message}; resuming at current tip"));
+                if let Some(run_id) = runtime.active_run_id.clone() {
+                    poll_events_from(runtime, commands, run_id, None);
+                }
+            } else if operation == ClientOperation::EventsStream && overloaded {
+                state.stream_warning = Some(message);
+            } else {
+                if connection_error {
+                    runtime.polling = false;
+                    state.connection = crate::ConnectionState::Disconnected {
+                        error: message.clone(),
+                    };
+                }
+                let failure = format!("{} failed: {message}", operation.method());
+                state.status_message = Some(failure.clone());
+                match operation {
+                    ClientOperation::RunCancel => {
+                        state.cancel_requested = false;
                     }
-                } else if operation == ClientOperation::EventsStream && overloaded {
-                    state.stream_warning = Some(message);
-                } else {
-                    if connection_error {
-                        runtime.polling = false;
-                        state.connection = crate::ConnectionState::Disconnected {
-                            error: message.clone(),
-                        };
-                    }
-                    let failure = format!("{} failed: {message}", operation.method());
-                    state.status_message = Some(failure.clone());
-                    match operation {
-                        ClientOperation::RunCancel => {
-                            state.cancel_requested = false;
+                    ClientOperation::IssuePrepStart => {
+                        state.issue_prep_started_at = None;
+                        state.issue_prep_elapsed_secs = None;
+                        push_live_event(state, crate::LiveEventLine::warning(None, failure));
+                        if !connection_error {
+                            start_next_queued(commands, state, runtime);
                         }
-                        ClientOperation::IssuePrepStart => {
-                            state.issue_prep_started_at = None;
-                            push_live_event(state, crate::LiveEventLine::warning(None, failure));
-                            if !connection_error {
-                                start_next_queued(commands, state, runtime);
-                            }
-                        }
-                        ClientOperation::RunStart
-                        | ClientOperation::MessageAppend
-                        | ClientOperation::EventsStream
-                        | ClientOperation::ApprovalDecide
-                        | ClientOperation::DaemonStatus => {}
                     }
+                    ClientOperation::RunStart
+                    | ClientOperation::MessageAppend
+                    | ClientOperation::EventsStream
+                    | ClientOperation::ApprovalDecide
+                    | ClientOperation::DaemonStatus => {}
                 }
             }
         }
@@ -569,6 +664,8 @@ pub(super) fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
     loaded.slash_popup = state.slash_popup.clone();
     loaded.queued_messages = std::mem::take(&mut state.queued_messages);
     loaded.issue_prep_started_at = state.issue_prep_started_at;
+    loaded.issue_prep_elapsed_secs = state.issue_prep_elapsed_secs;
+    loaded.motion_mode = state.motion_mode;
     loaded.input_history = std::mem::take(&mut state.input_history);
     loaded.history_index = state.history_index;
     loaded.help_visible = state.help_visible;
@@ -594,6 +691,7 @@ pub(super) fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
         if loaded.active_run_elapsed_secs.is_none() {
             loaded.active_run_elapsed_secs = state.active_run_elapsed_secs;
         }
+        loaded.working_elapsed_millis = state.working_elapsed_millis;
         if loaded.approval.is_none() {
             loaded.approval = state.approval.clone();
         }
@@ -649,7 +747,9 @@ pub(super) fn apply_run_response(
     runtime.polling = status == RunStateName::Running;
     runtime.last_poll = Instant::now() - ACTIVE_POLL_INTERVAL;
     runtime.tool_inputs.clear();
-    runtime.active_since = Some(Instant::now());
+    runtime
+        .active_timer
+        .start_at(Instant::now(), Duration::ZERO);
 }
 
 pub(super) fn apply_events_result(
@@ -706,7 +806,11 @@ pub(super) fn apply_events_result(
     if needs_catch_up {
         maybe_poll_events_now(runtime, commands);
     } else if !active {
-        runtime.active_since = None;
+        state.active_run_elapsed_secs = runtime
+            .active_timer
+            .elapsed_at(Instant::now())
+            .map(|elapsed| elapsed.as_secs());
+        runtime.active_timer.stop();
         send_command(
             commands,
             ClientCommand::Load {
@@ -718,21 +822,38 @@ pub(super) fn apply_events_result(
     }
 }
 
+#[cfg(test)]
 pub(super) fn maybe_poll_events(runtime: &mut UiRuntime, commands: &Sender<ClientCommand>) {
+    maybe_poll_events_at(runtime, commands, Instant::now());
+}
+
+pub(super) fn maybe_poll_events_at(
+    runtime: &mut UiRuntime,
+    commands: &Sender<ClientCommand>,
+    now: Instant,
+) {
     if !runtime.polling || runtime.poll_in_flight {
         return;
     }
-    if runtime.last_poll.elapsed() < ACTIVE_POLL_INTERVAL {
+    if now.saturating_duration_since(runtime.last_poll) < ACTIVE_POLL_INTERVAL {
         return;
     }
-    maybe_poll_events_now(runtime, commands);
+    maybe_poll_events_now_at(runtime, commands, now);
 }
 
 fn maybe_poll_events_now(runtime: &mut UiRuntime, commands: &Sender<ClientCommand>) {
+    maybe_poll_events_now_at(runtime, commands, Instant::now());
+}
+
+fn maybe_poll_events_now_at(
+    runtime: &mut UiRuntime,
+    commands: &Sender<ClientCommand>,
+    now: Instant,
+) {
     let Some(run_id) = runtime.active_run_id.clone() else {
         return;
     };
-    poll_events_from(runtime, commands, run_id, Some(runtime.next_offset));
+    poll_events_from_at(runtime, commands, run_id, Some(runtime.next_offset), now);
 }
 
 fn poll_events_from(
@@ -740,6 +861,16 @@ fn poll_events_from(
     commands: &Sender<ClientCommand>,
     run_id: String,
     from_offset: Option<u64>,
+) {
+    poll_events_from_at(runtime, commands, run_id, from_offset, Instant::now());
+}
+
+fn poll_events_from_at(
+    runtime: &mut UiRuntime,
+    commands: &Sender<ClientCommand>,
+    run_id: String,
+    from_offset: Option<u64>,
+    now: Instant,
 ) {
     if commands
         .send(ClientCommand::PollEvents {
@@ -749,7 +880,7 @@ fn poll_events_from(
         .is_ok()
     {
         runtime.poll_in_flight = true;
-        runtime.last_poll = Instant::now();
+        runtime.last_poll = now;
     } else {
         runtime.polling = false;
     }
@@ -948,7 +1079,7 @@ mod tests {
         );
 
         assert!(runtime.polling);
-        assert!(runtime.active_since.is_some());
+        assert!(runtime.active_timer.is_active());
         assert_eq!(
             state.active_run.as_ref().map(|run| run.status),
             Some(RunStateName::CancelRequested)
@@ -969,7 +1100,7 @@ mod tests {
         );
 
         assert!(!runtime.polling);
-        assert!(runtime.active_since.is_none());
+        assert!(!runtime.active_timer.is_active());
         assert!(matches!(
             command_receiver.try_recv().unwrap(),
             ClientCommand::Load {

@@ -88,7 +88,9 @@ plato
 This attaches to the workspace daemon if one is already running. Otherwise it
 starts the sibling `plato-agentd` detached. Quitting the TUI leaves that daemon
 running. `plato --tui --config plato.toml` is the explicit form when selecting
-a config.
+a config. During a run, one working row shows elapsed active time and the
+interrupt key. Use `plato --reduced-motion` or set `PLATO_REDUCED_MOTION=1` to
+replace its animated braille marker with a static bullet.
 The screen is a chat-first transcript with a bottom status rule and composer.
 
 Manual two-terminal mode still works:
@@ -119,9 +121,10 @@ starts a daemon with its Discord environment. The direct
 | --- | --- |
 | type + Enter | start a run when idle |
 | `g` / `d` | grant / deny in the approval modal |
+| Esc | interrupt an active run; otherwise close or quit |
 | Ctrl-C | first press cancels the active run; second quits the TUI |
 | `r` | reconnect (only when the screen shows daemon unavailable) |
-| `q` / Esc | quit (`q` only with an empty composer, so it is typeable in words) |
+| `q` | quit when the composer is empty |
 | Ctrl-U | clear the composer |
 
 When `plato-gateway-discord` reaches an approval-required tool, Discord gets one

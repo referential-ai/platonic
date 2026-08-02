@@ -66,6 +66,9 @@ struct Cli {
     #[arg(long, global = true, help = "Start the interactive terminal UI")]
     tui: bool,
 
+    #[arg(long, global = true, help = "Use a static TUI working indicator")]
+    reduced_motion: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -370,6 +373,7 @@ fn tui_options_from_cli(cli: &Cli, workspace_root: &Path) -> plato_agent::AppRes
     validate_tui_cli(cli)?;
     let mut options = TuiOptions::new(workspace_root.to_path_buf());
     options.config = cli.config.clone();
+    options.reduced_motion = cli.reduced_motion;
     Ok(options)
 }
 
@@ -1027,6 +1031,17 @@ mod tests {
         assert_eq!(options.socket, None);
         assert_eq!(options.run, None);
         assert!(!options.snapshot);
+        assert!(!options.reduced_motion);
+    }
+
+    #[test]
+    fn tui_reduced_motion_flag_sets_tui_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from(["plato", "--tui", "--reduced-motion"]).unwrap();
+
+        let options = tui_options_from_cli(&cli, dir.path()).unwrap();
+
+        assert!(options.reduced_motion);
     }
 
     #[test]

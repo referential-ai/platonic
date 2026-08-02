@@ -71,6 +71,23 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
         "Try \"read README.md and summarize it\"",
     );
 
+    let idle_output_len = shell.output_len();
+    thread::sleep(Duration::from_secs(5));
+    assert_eq!(
+        shell.output_len(),
+        idle_output_len,
+        "an unchanged idle TUI must not redraw during the five-second observation"
+    );
+    let keypress_at = Instant::now();
+    shell.write(b"?");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Commands");
+    assert!(
+        keypress_at.elapsed() < Duration::from_secs(1),
+        "terminal input did not trigger a prompt redraw"
+    );
+    shell.write(b"\x1b");
+    shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "Commands");
+
     shell.write(b"ask hllo");
     shell.write(b"\x1b[D\x1b[D\x1b[D");
     shell.write(b"e");
@@ -101,6 +118,8 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
         .expect("resized composer row should contain the visible draft and cursor");
     assert_eq!(visible_draft, EXPECTED_DRAFT);
 
+    let daemon_event_at = Instant::now();
+    let daemon_output_at = shell.output_len();
     shell.write(b"\r");
     let run_start = fake.wait_for_request("run.start");
     let question = run_start
@@ -112,6 +131,24 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
     assert_eq!(question, visible_draft);
     assert!(!question.contains("\x1b[200~"));
     assert!(!question.contains("\x1b[201~"));
+
+    let working = shell.wait_for_screen_text_after(
+        RESIZED_ROWS,
+        RESIZED_COLS,
+        daemon_output_at,
+        "Esc to interrupt",
+    );
+    assert!(working.contains("Working"));
+    assert!(
+        daemon_event_at.elapsed() < Duration::from_secs(1),
+        "the daemon run-start event did not trigger a prompt redraw"
+    );
+
+    let stream_resize_at = shell.output_len();
+    shell.resize(28, 90);
+    let streamed = shell.wait_for_screen_text_after(28, 90, stream_resize_at, "Working");
+    assert!(streamed.contains("Esc to interrupt"));
+    assert_synchronized_frames(&shell.output_since(stream_resize_at));
 
     shell.write(b"q");
     let after_termios = shell.wait_for_marker("POST");
@@ -529,6 +566,11 @@ impl PtyShell {
         self.output.lock().unwrap().len()
     }
 
+    fn output_since(&self, offset: usize) -> Vec<u8> {
+        let output = self.output.lock().unwrap();
+        output[offset.min(output.len())..].to_vec()
+    }
+
     fn wait_for_marker(&mut self, name: &str) -> String {
         let deadline = Instant::now() + PROOF_TIMEOUT;
         loop {
@@ -589,6 +631,35 @@ impl PtyShell {
             assert!(
                 Instant::now() < deadline,
                 "timed out waiting for {expected:?} on rendered screen\nrendered:\n{}\nraw:\n{}",
+                contents,
+                output_tail(&output)
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_screen_text_after(
+        &mut self,
+        rows: u16,
+        cols: u16,
+        offset: usize,
+        expected: &str,
+    ) -> String {
+        let deadline = Instant::now() + PROOF_TIMEOUT;
+        loop {
+            let output = self.output_since(offset);
+            let mut parser = vt100::Parser::new(rows, cols, 0);
+            parser.process(&output);
+            let screen = parser.screen();
+            let contents = screen.contents();
+            if contents.contains(expected) {
+                assert_eq!(screen.size(), (rows, cols));
+                return contents;
+            }
+            self.assert_running(expected);
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {expected:?} after output offset {offset}\nrendered:\n{}\nraw:\n{}",
                 contents,
                 output_tail(&output)
             );
@@ -691,6 +762,44 @@ fn marker_value(output: &[u8], name: &str) -> Option<String> {
 fn output_tail(output: &[u8]) -> String {
     let start = output.len().saturating_sub(8_000);
     String::from_utf8_lossy(&output[start..]).into_owned()
+}
+
+fn assert_synchronized_frames(output: &[u8]) {
+    const BEGIN: &[u8] = b"\x1b[?2026h";
+    const END: &[u8] = b"\x1b[?2026l";
+    let begins = output
+        .windows(BEGIN.len())
+        .filter(|bytes| *bytes == BEGIN)
+        .count();
+    let ends = output
+        .windows(END.len())
+        .filter(|bytes| *bytes == END)
+        .count();
+    assert!(
+        begins > 0,
+        "resize plus stream emitted no synchronized frame"
+    );
+    assert_eq!(
+        begins, ends,
+        "resize plus stream left a synchronized frame open"
+    );
+
+    let mut depth = 0_u8;
+    let mut index = 0;
+    while index < output.len() {
+        if output[index..].starts_with(BEGIN) {
+            assert_eq!(depth, 0, "synchronized frames must not nest");
+            depth = 1;
+            index += BEGIN.len();
+        } else if output[index..].starts_with(END) {
+            assert_eq!(depth, 1, "synchronized frame ended without a begin");
+            depth = 0;
+            index += END.len();
+        } else {
+            index += 1;
+        }
+    }
+    assert_eq!(depth, 0, "synchronized frame was not closed");
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
