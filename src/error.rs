@@ -37,6 +37,15 @@ pub enum AppError {
     #[error("ledger conflict for run {run_id} seq {seq}")]
     LedgerConflict { run_id: String, seq: u64 },
 
+    #[error("voice event version mismatch: expected {expected}, actual {actual}")]
+    VoiceEventVersion { expected: u32, actual: u32 },
+
+    #[error("voice ledger conflict for run {run_id} sequence {sequence}")]
+    VoiceLedgerConflict { run_id: String, sequence: u64 },
+
+    #[error("voice event contract failed: {0}")]
+    VoiceEventContract(String),
+
     #[error("sqlite ledger has no runs")]
     NoSqliteRuns,
 

@@ -202,6 +202,21 @@ PLATO_AUDIO_FIXTURE_KEY=local-proof \
 The model engine, native-rate resampling plan, and output stream open before
 timing. Both examples fail closed on artifact checksum, phonemizer, backend,
 device, PCM, worker, callback, sentence-order, gap, overlap, or teardown errors.
+`narrated_run` uses a root SQLite ledger (the `--events` path, or a temporary
+`.db` by default) and returns the exact committed revision-one `VoiceEvent`
+envelopes in its proof JSON. A selected-run `plato replay --db=/path/to/run.db
+--run RUN_ID` appends those canonical `voice_event` lines without writing to the
+database; runs without voice facts retain their prior replay output byte for
+byte.
+
+`VoiceCaptured` stores only the final transcript's SHA-256 and UTF-8 byte
+length, transcript span, native and 16 kHz frame counts, VAD sample boundaries,
+and capture timing. `VoiceSpoken` stores the AU2 sentence-acceptance to first
+non-silent callback TTFA in whole milliseconds plus sentence/interruption
+coordinates; an AU5 latch adds one exact `VoiceInterrupted` prefix and delta
+index. These companion facts are committed atomically beside the core ledger,
+never as `HarnessEvent` variants.
+
 AU4 opens one persistent input stream and one worker, normalizes/resamples on
 the worker, and runs a warm Silero session through the ONNX Runtime owner shared
 with Kokoro. The resident CUDA recognizer re-decodes only a bounded five-second

@@ -1,6 +1,7 @@
 //! Root-owned composition from app run events to the audio IO leaf.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     io::{self, Write},
     sync::{
         Arc,
@@ -25,7 +26,11 @@ use platonic_core::{ContextLane, HarnessEvent, RunId, TurnId};
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::{AppError, AssistantDeltaEvent, RunEvent, RunOptions, RunOutcome};
+use crate::{
+    AppError, AssistantDeltaEvent, RunEvent, RunLedger, RunOptions, RunOutcome,
+    ledger::SqliteLedger,
+    voice_session::{VoiceEvent, VoiceEventEnvelope},
+};
 
 /// Root composition failures while interpreting existing run events.
 #[derive(Debug, Error)]
@@ -66,6 +71,12 @@ pub enum VoiceError {
     /// The voice session was explicitly shut down.
     #[error("voice session is closed")]
     SessionClosed,
+    /// Durable voice facts require the root companion SQLite stream.
+    #[error("narrated runs require a SQLite ledger for durable voice facts")]
+    SqliteRequired,
+    /// The root companion stream could not be committed.
+    #[error("cannot persist voice facts: {0}")]
+    Persistence(#[source] AppError),
 }
 
 /// Failures from the app run or its root-owned narration composition.
@@ -112,6 +123,8 @@ pub struct NarratedRunOutcome {
     pub run: RunOutcome,
     /// Audio-only observation outside the durable harness ledger.
     pub narration: NarrationReport,
+    /// Exact revision-one companion facts committed before this outcome returned.
+    pub voice_events: Vec<VoiceEventEnvelope>,
 }
 
 /// One final voice question paired with the existing narrated run outcome.
@@ -290,6 +303,7 @@ impl VoiceSession {
         if options.event_sender.is_some() {
             return Err(VoiceRunError::EventSenderAlreadySet);
         }
+        require_voice_sqlite(&options.ledger)?;
         let display_live = options.stream_to_stderr;
         let mut input = ActiveVoiceInput::default();
         let mut input_error = None;
@@ -340,18 +354,28 @@ impl VoiceSession {
         }
         drop(presentation);
         let options = options_for_transcript(options, &capture.transcript)?;
-        let narrated = self.run_question(options)?;
+        let narrated = self.run_question_with_capture(options, Some(&capture))?;
         Ok(CapturedRunOutcome { capture, narrated })
     }
 
     /// Drives the existing synchronous app run while narrating its event stream.
     pub fn run_question(
         &mut self,
+        options: RunOptions,
+    ) -> Result<NarratedRunOutcome, VoiceRunError> {
+        self.run_question_with_capture(options, None)
+    }
+
+    fn run_question_with_capture(
+        &mut self,
         mut options: RunOptions,
+        capture_report: Option<&CaptureReport>,
     ) -> Result<NarratedRunOutcome, VoiceRunError> {
         if options.event_sender.is_some() {
             return Err(VoiceRunError::EventSenderAlreadySet);
         }
+        require_voice_sqlite(&options.ledger)?;
+        let voice_ledger = options.ledger.clone();
         bind_voice_cancel(&mut options, &self.cancel)?;
         let cancel = Arc::clone(&self.cancel);
         let interruption_context = self.pending_interruption.as_ref().map(interruption_context);
@@ -366,6 +390,8 @@ impl VoiceSession {
         let capture = self.capture.as_ref();
         let mut next_interruption = None;
         let mut consumed_interruption_context = false;
+        let mut accepted_sources = BTreeMap::new();
+        let mut first_response_key = None;
 
         let result = std::thread::scope(|scope| {
             let run = scope.spawn(move || crate::app::run_question(options));
@@ -397,8 +423,23 @@ impl VoiceSession {
                             }
                         };
                         for narrated in accepted {
-                            match worker.accept(narrated.sentence, narrated.source) {
+                            let source = narrated.source;
+                            let key = narrated.key;
+                            match worker.accept(narrated.sentence, source) {
                                 Ok(admission) => {
+                                    if accepted_sources
+                                        .insert(
+                                            admission.sequence,
+                                            AcceptedNarrationSource { key, source },
+                                        )
+                                        .is_some()
+                                    {
+                                        voice_error = Some(contract_error(
+                                            "synthesis reused a worker sequence within one run",
+                                        ));
+                                        cancel.store(true, Ordering::Release);
+                                        break;
+                                    }
                                     sentences.extend(admission.completed.into_iter().map(
                                         |report| NarratedSentenceReport {
                                             sentence: report.sentence,
@@ -454,6 +495,7 @@ impl VoiceSession {
             capture_health.map_err(VoiceError::from)?;
             let run = run_result??;
             stream.finish()?;
+            first_response_key = stream.first_committed().cloned();
             let reports = audio_result.map_err(|failure| {
                 VoiceRunError::Voice(VoiceError::Worker(SynthWorkerError::Failed(failure)))
             })?;
@@ -468,17 +510,213 @@ impl VoiceSession {
                     kokoro_metrics: self.kokoro_metrics.snapshot(),
                     playback_metrics: worker.playback_metrics(),
                 },
+                voice_events: Vec::new(),
             })
         });
 
         if consumed_interruption_context {
             self.pending_interruption = None;
         }
-        if let Some(interruption) = next_interruption {
-            self.pending_interruption = Some(interruption);
+        if let Some(interruption) = next_interruption.as_ref() {
+            self.pending_interruption = Some(interruption.clone());
         }
-        result
+        let mut outcome = result?;
+        let events = voice_events_for_run(
+            &outcome,
+            capture_report,
+            first_response_key.as_ref(),
+            &accepted_sources,
+            next_interruption.as_ref(),
+            worker,
+        )?;
+        outcome.voice_events = persist_voice_events(&voice_ledger, &events)?;
+        Ok(outcome)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AcceptedNarrationSource {
+    key: ResponseKey,
+    source: SpeechSource,
+}
+
+#[derive(Clone, Debug)]
+struct VoiceTurnEvidence {
+    key: ResponseKey,
+    audible_sequences: BTreeSet<u64>,
+    interruption: Option<SpokenInterruption>,
+}
+
+fn require_voice_sqlite(ledger: &RunLedger) -> Result<(), VoiceError> {
+    match ledger {
+        RunLedger::Sqlite(_) | RunLedger::DefaultSqlite(_) => Ok(()),
+        RunLedger::Jsonl(_) => Err(VoiceError::SqliteRequired),
+    }
+}
+
+fn persist_voice_events(
+    target: &RunLedger,
+    events: &[VoiceEvent],
+) -> Result<Vec<VoiceEventEnvelope>, VoiceError> {
+    let mut ledger = match target {
+        RunLedger::Sqlite(path) => SqliteLedger::open_or_create(path),
+        RunLedger::DefaultSqlite(path) => SqliteLedger::open_or_create_default(path),
+        RunLedger::Jsonl(_) => return Err(VoiceError::SqliteRequired),
+    }
+    .map_err(VoiceError::Persistence)?;
+    ledger
+        .append_voice_events(events)
+        .map_err(VoiceError::Persistence)
+}
+
+fn voice_events_for_run(
+    outcome: &NarratedRunOutcome,
+    capture: Option<&CaptureReport>,
+    first_response_key: Option<&ResponseKey>,
+    accepted: &BTreeMap<u64, AcceptedNarrationSource>,
+    interruption: Option<&SpokenInterruption>,
+    worker: &SynthWorker,
+) -> Result<Vec<VoiceEvent>, VoiceError> {
+    voice_events_for_observations(
+        &outcome.run.run_id,
+        &outcome.narration.sentences,
+        capture,
+        first_response_key,
+        accepted,
+        interruption,
+        |sequence| worker.accepted_to_first_non_silent_us(sequence),
+    )
+}
+
+fn voice_events_for_observations(
+    run_id: &RunId,
+    sentences: &[NarratedSentenceReport],
+    capture: Option<&CaptureReport>,
+    first_response_key: Option<&ResponseKey>,
+    accepted: &BTreeMap<u64, AcceptedNarrationSource>,
+    interruption: Option<&SpokenInterruption>,
+    ttfa_us_for_sequence: impl Fn(u64) -> Option<u64>,
+) -> Result<Vec<VoiceEvent>, VoiceError> {
+    let mut events = Vec::new();
+    if let Some(capture) = capture {
+        if !capture.transcript.is_final {
+            return Err(contract_error(
+                "durable capture mapping received a non-final transcript",
+            ));
+        }
+        let response = first_response_key.ok_or_else(|| {
+            contract_error("captured run completed without a committed response turn")
+        })?;
+        if &response.run_id != run_id {
+            return Err(contract_error(
+                "captured response run ID differed from the completed run",
+            ));
+        }
+        events.push(VoiceEvent::captured(
+            run_id.clone(),
+            response.turn_id.clone(),
+            capture,
+        ));
+    }
+
+    let mut turns = Vec::<VoiceTurnEvidence>::new();
+    for report in sentences {
+        let source = accepted.get(&report.playback.sequence).ok_or_else(|| {
+            contract_error(format!(
+                "completed sentence {} had no root source mapping",
+                report.playback.sequence
+            ))
+        })?;
+        if &source.key.run_id != run_id {
+            return Err(contract_error(
+                "completed narration run ID differed from the app outcome",
+            ));
+        }
+        turn_evidence(&mut turns, &source.key)
+            .audible_sequences
+            .insert(report.playback.sequence);
+    }
+
+    if let Some(interruption) = interruption {
+        let (sequence, source) = accepted
+            .iter()
+            .find(|(_, source)| {
+                source.source.sentence_index == interruption.sentence_index
+                    && source.source.assistant_delta_index == interruption.assistant_delta_index
+            })
+            .ok_or_else(|| {
+                contract_error("AU5 interruption latch had no matching root sentence source")
+            })?;
+        let turn = turn_evidence(&mut turns, &source.key);
+        if turn.interruption.is_some() {
+            return Err(contract_error(
+                "one narrated run produced more than one interruption latch",
+            ));
+        }
+        turn.audible_sequences.insert(*sequence);
+        turn.interruption = Some(interruption.clone());
+    }
+
+    turns.sort_by_key(|turn| turn.audible_sequences.first().copied().unwrap_or(u64::MAX));
+    for turn in turns {
+        if &turn.key.run_id != run_id {
+            return Err(contract_error(
+                "voice turn run ID differed from the app outcome",
+            ));
+        }
+        let first_sequence = turn
+            .audible_sequences
+            .first()
+            .copied()
+            .ok_or_else(|| contract_error("voice turn had no audible sentence"))?;
+        let ttfa_us = sentences
+            .iter()
+            .find(|report| report.playback.sequence == first_sequence)
+            .map(|report| report.playback.accepted_to_first_non_silent_us)
+            .or_else(|| ttfa_us_for_sequence(first_sequence))
+            .ok_or_else(|| {
+                contract_error(format!(
+                    "voice turn first sentence {first_sequence} had no first non-silent timing"
+                ))
+            })?;
+        let sentence_count = u64::try_from(turn.audible_sequences.len())
+            .map_err(|_| contract_error("voice turn sentence count overflowed u64"))?;
+        let interrupted_at = turn
+            .interruption
+            .as_ref()
+            .map(|interruption| interruption.sentence_index);
+        events.push(VoiceEvent::VoiceSpoken {
+            run_id: run_id.clone(),
+            turn_id: turn.key.turn_id.clone(),
+            ttfa_ms: ttfa_us / 1_000,
+            sentence_count,
+            interrupted_at,
+        });
+        if let Some(interruption) = turn.interruption {
+            events.push(VoiceEvent::VoiceInterrupted {
+                run_id: run_id.clone(),
+                turn_id: turn.key.turn_id,
+                spoken_prefix: interruption.spoken_prefix,
+                delta_index: interruption.assistant_delta_index,
+            });
+        }
+    }
+    Ok(events)
+}
+
+fn turn_evidence<'a>(
+    turns: &'a mut Vec<VoiceTurnEvidence>,
+    key: &ResponseKey,
+) -> &'a mut VoiceTurnEvidence {
+    if let Some(index) = turns.iter().position(|turn| turn.key == *key) {
+        return &mut turns[index];
+    }
+    turns.push(VoiceTurnEvidence {
+        key: key.clone(),
+        audible_sequences: BTreeSet::new(),
+        interruption: None,
+    });
+    turns.last_mut().expect("voice turn was just inserted")
 }
 
 #[derive(Default)]
@@ -632,11 +870,13 @@ struct PendingResponse {
 struct NarratedSentence {
     sentence: Sentence,
     source: SpeechSource,
+    key: ResponseKey,
 }
 
 #[derive(Default)]
 struct AssistantTextStream {
     pending: Option<PendingResponse>,
+    first_committed: Option<ResponseKey>,
     last_committed: Option<ResponseKey>,
     next_sentence_index: u64,
 }
@@ -707,7 +947,7 @@ impl AssistantTextStream {
         pending.next_delta_index += 1;
         pending.text.push_str(&delta.text);
         let sentences = pending.cutter.push(&delta.text);
-        Ok(self.tag_sentences(sentences, delta_index))
+        Ok(self.tag_sentences(sentences, delta_index, &key))
     }
 
     fn commit_response(
@@ -748,21 +988,29 @@ impl AssistantTextStream {
                 0
             }
         };
-        self.last_committed = Some(key);
-        Ok(self.tag_sentences(sentences, assistant_delta_index))
+        if self.first_committed.is_none() {
+            self.first_committed = Some(key.clone());
+        }
+        self.last_committed = Some(key.clone());
+        Ok(self.tag_sentences(sentences, assistant_delta_index, &key))
     }
 
     fn tag_sentences(
         &mut self,
         sentences: Vec<Sentence>,
         assistant_delta_index: u64,
+        key: &ResponseKey,
     ) -> Vec<NarratedSentence> {
         sentences
             .into_iter()
             .map(|sentence| {
                 let source = SpeechSource::new(self.next_sentence_index, assistant_delta_index);
                 self.next_sentence_index = self.next_sentence_index.saturating_add(1);
-                NarratedSentence { sentence, source }
+                NarratedSentence {
+                    sentence,
+                    source,
+                    key: key.clone(),
+                }
             })
             .collect()
     }
@@ -774,6 +1022,10 @@ impl AssistantTextStream {
             )));
         }
         Ok(())
+    }
+
+    fn first_committed(&self) -> Option<&ResponseKey> {
+        self.first_committed.as_ref()
     }
 }
 
@@ -790,6 +1042,26 @@ mod timing_tests;
 mod tests {
     use super::*;
     use platonic_core::{Message, MessageRole, RecordedEvent};
+
+    fn playback_report(sequence: u64, ttfa_us: u64) -> PlaybackReport {
+        PlaybackReport {
+            sequence,
+            accepted_ns: 1_000,
+            synth_started_ns: 2_000,
+            synth_finished_ns: 3_000,
+            first_pcm_ns: 4_000,
+            first_non_silent_ns: 1_000 + ttfa_us * 1_000,
+            pcm_end_ns: 9_000_000,
+            accepted_to_first_non_silent_us: ttfa_us,
+            synthesis_us: 1,
+            gap_before_us: None,
+            first_callback_frames: 256,
+            callback_count: 3,
+            source_frames: 1_000,
+            device_frames: 3_000,
+            underrun: plato_audio::PlaybackUnderrun::default(),
+        }
+    }
 
     fn run_options(question: &str) -> RunOptions {
         RunOptions {
@@ -841,6 +1113,122 @@ mod tests {
             .into_iter()
             .map(|sentence| sentence.sentence.into_string())
             .collect()
+    }
+
+    #[test]
+    fn interrupted_voice_facts_use_exact_au2_and_au5_boundaries() {
+        let run_id = RunId::new("run_voice").unwrap();
+        let turn_id = TurnId::new("turn_1").unwrap();
+        let key = ResponseKey {
+            run_id: run_id.clone(),
+            turn_id: turn_id.clone(),
+            step: 0,
+        };
+        let accepted = BTreeMap::from([
+            (
+                40,
+                AcceptedNarrationSource {
+                    key: key.clone(),
+                    source: SpeechSource::new(0, 3),
+                },
+            ),
+            (
+                41,
+                AcceptedNarrationSource {
+                    key,
+                    source: SpeechSource::new(1, 4),
+                },
+            ),
+        ]);
+        let sentences = vec![NarratedSentenceReport {
+            sentence: "First sentence.".into(),
+            playback: playback_report(40, 321_999),
+        }];
+        let interruption = SpokenInterruption {
+            played_samples: 8_192,
+            sentence_index: 1,
+            assistant_delta_index: 4,
+            spoken_prefix: "Second sentence was".into(),
+        };
+
+        let events = voice_events_for_observations(
+            &run_id,
+            &sentences,
+            None,
+            None,
+            &accepted,
+            Some(&interruption),
+            |sequence| match sequence {
+                40 => Some(321_999),
+                41 => Some(280_000),
+                _ => None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            events,
+            [
+                VoiceEvent::VoiceSpoken {
+                    run_id: run_id.clone(),
+                    turn_id: turn_id.clone(),
+                    ttfa_ms: 321,
+                    sentence_count: 2,
+                    interrupted_at: Some(1),
+                },
+                VoiceEvent::VoiceInterrupted {
+                    run_id,
+                    turn_id,
+                    spoken_prefix: "Second sentence was".into(),
+                    delta_index: 4,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn interrupted_first_sentence_without_first_audio_timing_emits_no_success_facts() {
+        let run_id = RunId::new("run_voice").unwrap();
+        let key = ResponseKey {
+            run_id: run_id.clone(),
+            turn_id: TurnId::new("turn_1").unwrap(),
+            step: 0,
+        };
+        let accepted = BTreeMap::from([(
+            9,
+            AcceptedNarrationSource {
+                key,
+                source: SpeechSource::new(0, 0),
+            },
+        )]);
+        let interruption = SpokenInterruption {
+            played_samples: 64,
+            sentence_index: 0,
+            assistant_delta_index: 0,
+            spoken_prefix: "Audible".into(),
+        };
+
+        assert!(matches!(
+            voice_events_for_observations(
+                &run_id,
+                &[],
+                None,
+                None,
+                &accepted,
+                Some(&interruption),
+                |_| None,
+            ),
+            Err(VoiceError::EventContract { .. })
+        ));
+    }
+
+    #[test]
+    fn voice_fact_emission_rejects_jsonl_instead_of_claiming_durability() {
+        assert!(matches!(
+            require_voice_sqlite(&RunLedger::Jsonl("events.jsonl".into())),
+            Err(VoiceError::SqliteRequired)
+        ));
+        assert!(require_voice_sqlite(&RunLedger::Sqlite("events.db".into())).is_ok());
     }
 
     #[test]
