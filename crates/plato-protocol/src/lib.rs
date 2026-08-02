@@ -89,6 +89,15 @@ impl RunOverrides {
 /// Current daemon protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Package version, full source commit, and UTC build date embedded at compile time.
+///
+/// Repository builds that do not provide deploy provenance remain visibly
+/// unknown instead of resembling a dated release build.
+pub const BUILD_IDENTITY: &str = match option_env!("PLATO_BUILD_IDENTITY") {
+    Some(identity) => identity,
+    None => concat!(env!("CARGO_PKG_VERSION"), " unknown unknown"),
+};
+
 /// Capability name for the initial daemon handshake.
 pub const CAPABILITY_HELLO: &str = "hello";
 /// Capability name for starting a fresh run.
@@ -304,7 +313,7 @@ pub struct HelloParams {
 /// Daemon identity and capability readback returned by `hello`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HelloResult {
-    /// Daemon package version.
+    /// Daemon package version and build provenance.
     pub daemon_version: String,
     /// Workspace identifier served by the daemon.
     pub workspace_id: String,

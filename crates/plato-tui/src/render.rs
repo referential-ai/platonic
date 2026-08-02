@@ -245,7 +245,7 @@ fn intro_lines(state: &TuiState) -> Vec<Line<'static>> {
             ]),
             Line::from(vec![
                 Span::styled("daemon    ", Style::default().fg(Color::DarkGray)),
-                Span::raw(daemon_version.clone()),
+                Span::raw(daemon_identity_label(daemon_version)),
             ]),
             Line::from(vec![
                 Span::styled("ledger    ", Style::default().fg(Color::DarkGray)),
@@ -782,14 +782,19 @@ fn status_line(state: &TuiState, width: u16) -> Line<'static> {
         ConnectionState::Connected { .. } => "online",
         ConnectionState::Disconnected { .. } => "offline",
     };
+    let identity = match &state.connection {
+        ConnectionState::Connected { daemon_version, .. } => daemon_identity_label(daemon_version),
+        ConnectionState::Disconnected { .. } => "provenance unknown".into(),
+    };
     let queued = state.queued_messages.len();
     let mode = match state.display_mode {
         DisplayMode::Conversation => "conversation",
         DisplayMode::Audit => "audit",
     };
-    let full =
-        format!("{connection} | {run_status} {elapsed} | {model} | queued {queued} | {mode}");
-    let medium = format!("{connection} | {run_status} | {model} | q {queued} | {mode}");
+    let full = format!(
+        "{connection} {identity} | {run_status} {elapsed} | {model} | queued {queued} | {mode}"
+    );
+    let medium = format!("{connection} {identity} | {run_status} | q {queued} | {mode}");
     let short_connection = if connection == "online" { "on" } else { "off" };
     let short_mode = if state.display_mode == DisplayMode::Conversation {
         "chat"
@@ -805,6 +810,28 @@ fn status_line(state: &TuiState, width: u16) -> Line<'static> {
         bounded_status_text(text, width),
         Style::default().fg(Color::DarkGray),
     ))
+}
+
+fn daemon_identity_label(identity: &str) -> String {
+    let mut parts = identity.split_whitespace();
+    let Some(version) = parts.next() else {
+        return "unknown unknown unknown".into();
+    };
+    let Some(commit) = parts.next() else {
+        return format!("{version} unknown unknown");
+    };
+    let Some(date) = parts.next() else {
+        return format!("{version} {commit} unknown");
+    };
+    if parts.next().is_some() {
+        return identity.into();
+    }
+    let commit = if commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        &commit[..7]
+    } else {
+        commit
+    };
+    format!("{version} {commit} {date}")
 }
 
 fn bounded_status_text(mut text: String, width: u16) -> String {
@@ -1263,7 +1290,7 @@ mod tests {
             "/tmp/work".into(),
             "/tmp/agent.sock".into(),
             HelloResult {
-                daemon_version: "0.1.0".into(),
+                daemon_version: "0.1.0 0123456789abcdef0123456789abcdef01234567 2026-08-01".into(),
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
@@ -1276,9 +1303,11 @@ mod tests {
 
         assert!(output.contains("Plato Agent"));
         assert!(output.contains("Local Rust agent runtime"));
+        assert!(output.contains("0.1.0 0123456 2026-08-01"));
+        assert!(!output.contains("0123456789abcdef"));
         assert!(output.contains("work-1234"));
         assert!(output.contains("model pending"));
-        assert!(output.contains("online | ready"));
+        assert!(output.contains("online 0.1.0 0123456 2026-08-01 | ready"));
         assert!(output.contains("Try \"read README.md and summarize it\""));
         assert!(!output.contains("? help"));
         assert!(!output.contains("v toggle"));
@@ -1286,6 +1315,15 @@ mod tests {
         assert!(!output.contains("Sessions"));
         assert!(!output.contains("Live Events"));
         assert!(!output.contains("Composer"));
+    }
+
+    #[test]
+    fn daemon_identity_keeps_unknown_provenance_explicit() {
+        assert_eq!(
+            daemon_identity_label("0.1.0 unknown unknown"),
+            "0.1.0 unknown unknown"
+        );
+        assert_eq!(daemon_identity_label("legacy"), "legacy unknown unknown");
     }
 
     #[test]
@@ -1366,7 +1404,7 @@ mod tests {
         let narrow_conversation = focused_snapshot(&state, 48, 24);
         assert_eq!(
             normal_conversation,
-            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow widths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n> | Try \"read README.md and summarize it\"\nonline | ready 0s | openrouter/auto | queued 0 | conversation"
+            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow widths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | ready 0s | openrouter/auto | queued 0 | conversation"
         );
         assert_eq!(
             narrow_conversation,
@@ -1393,11 +1431,11 @@ mod tests {
         let narrow_audit = focused_snapshot(&state, 48, 24);
         assert_eq!(
             normal_audit,
-            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise summary.\ntool      call_alpha file.read {\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at narrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission denied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\nonline | ready 0s | openrouter/auto | queued 0 | audit"
+            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise summary.\ntool      call_alpha file.read {\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at narrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission denied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | ready 0s | openrouter/auto | queued 0 | audit"
         );
         assert_eq!(
             narrow_audit,
-            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise\nsummary.\ntool      call_alpha file.read\n{\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at\nnarrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission\ndenied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\nonline | ready | openrouter/auto | q 0 | audit"
+            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise\nsummary.\ntool      call_alpha file.read\n{\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at\nnarrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission\ndenied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\non | ready | openrouter/auto | q0 | audit"
         );
         for snapshot in [&normal_audit, &narrow_audit] {
             assert!(snapshot.contains("run_alpha_full_identifier"));
@@ -1578,7 +1616,7 @@ mod tests {
         assert!(output.contains("daemon unavailable"));
         assert!(output.contains("cargo run --bin plato-agentd"));
         assert!(output.contains("press r to reconnect"));
-        assert!(output.contains("offline | ready"));
+        assert!(output.contains("offline provenance unknown | ready"));
     }
 
     #[test]

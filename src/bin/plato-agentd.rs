@@ -16,6 +16,7 @@ use std::thread;
 #[derive(Debug, Parser)]
 #[command(name = "plato-agentd")]
 #[command(about = "Plato Agent local daemon")]
+#[command(version = plato_protocol::BUILD_IDENTITY)]
 #[command(args_conflicts_with_subcommands = true)]
 struct Cli {
     #[cfg(windows)]
