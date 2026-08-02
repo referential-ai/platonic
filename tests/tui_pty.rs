@@ -114,9 +114,9 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
     );
     let visible_draft = resized_row
         .strip_prefix("> ")
-        .and_then(|line| line.strip_suffix('|'))
-        .expect("resized composer row should contain the visible draft and cursor");
+        .expect("resized composer row should contain the visible draft");
     assert_eq!(visible_draft, EXPECTED_DRAFT);
+    assert!(!resized_row.contains('|'));
 
     let daemon_event_at = Instant::now();
     let daemon_output_at = shell.output_len();
@@ -177,6 +177,31 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
     assert!(
         !endpoint.with_file_name("agent.lock").exists(),
         "the pre-bound fake must prevent a real daemon from starting"
+    );
+}
+
+#[test]
+fn nonempty_no_color_suppresses_only_color_sgr_in_the_pty() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+
+    let colored = capture_initial_frame(&workspace, &runtime, &state, &home, None);
+    let no_color = capture_initial_frame(&workspace, &runtime, &state, &home, Some("1"));
+
+    assert!(contains_color_sgr(&colored.output));
+    assert!(!contains_color_sgr(&no_color.output));
+    assert!(contains_sgr_parameter(&no_color.output, 1));
+    assert!(contains_sgr_parameter(&no_color.output, 2));
+    assert_eq!(colored.screen.contents(), no_color.screen.contents());
+    assert_eq!(
+        colored.screen.cursor_position(),
+        no_color.screen.cursor_position()
     );
 }
 
@@ -514,6 +539,70 @@ fn bare_plato_session_picker_resumes_exact_hidden_session_id() {
     );
 }
 
+struct CapturedFrame {
+    output: Vec<u8>,
+    screen: vt100::Screen,
+}
+
+fn capture_initial_frame(
+    workspace: &Path,
+    runtime: &Path,
+    state: &Path,
+    home: &Path,
+    no_color: Option<&str>,
+) -> CapturedFrame {
+    let workspace_id = paths::workspace_id(workspace).unwrap();
+    let endpoint = runtime
+        .join("plato-agent")
+        .join("workspaces")
+        .join(&workspace_id)
+        .join("agent.sock");
+    let ledger = state.join("fake-agent.db");
+    let fake = FakeDaemon::bind(&endpoint, workspace, &workspace_id, &ledger);
+    let mut shell = PtyShell::spawn_with_no_color(workspace, runtime, state, home, no_color);
+
+    shell.write(
+        br#""$PLATO_BIN"; printf '\n%sSTATUS:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Try \"read README.md and summarize it\"",
+    );
+    let output = shell.output.lock().unwrap().clone();
+    let screen = parsed_screen(&output, INITIAL_ROWS, INITIAL_COLS, None);
+
+    shell.write(b"q");
+    assert_eq!(shell.wait_for_marker("STATUS"), "0");
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+    fake.finish();
+    fs::remove_file(endpoint).unwrap();
+
+    CapturedFrame { output, screen }
+}
+
+fn contains_color_sgr(output: &[u8]) -> bool {
+    sgr_parameters(output).any(|parameter| matches!(parameter, 30..=49 | 58 | 59 | 90..=107))
+}
+
+fn contains_sgr_parameter(output: &[u8], expected: u16) -> bool {
+    sgr_parameters(output).any(|parameter| parameter == expected)
+}
+
+fn sgr_parameters(output: &[u8]) -> impl Iterator<Item = u16> + '_ {
+    output
+        .split(|byte| *byte == b'\x1b')
+        .filter_map(|sequence| sequence.strip_prefix(b"["))
+        .filter_map(|sequence| {
+            let end = sequence.iter().position(|byte| *byte == b'm')?;
+            std::str::from_utf8(&sequence[..end]).ok()
+        })
+        .flat_map(|parameters| parameters.split([';', ':']))
+        .filter_map(|parameter| parameter.parse().ok())
+}
+
 struct PtyShell {
     pty: Pty,
     child: Child,
@@ -523,13 +612,23 @@ struct PtyShell {
 
 impl PtyShell {
     fn spawn(workspace: &Path, runtime: &Path, state: &Path, home: &Path) -> Self {
+        Self::spawn_with_no_color(workspace, runtime, state, home, None)
+    }
+
+    fn spawn_with_no_color(
+        workspace: &Path,
+        runtime: &Path,
+        state: &Path,
+        home: &Path,
+        no_color: Option<&str>,
+    ) -> Self {
         let (pty, pts) = open().unwrap();
         pty.resize(Size::new(INITIAL_ROWS, INITIAL_COLS)).unwrap();
         let reader_file = File::from(pty.as_fd().try_clone_to_owned().unwrap());
         let output = Arc::new(Mutex::new(Vec::new()));
         let reader_output = Arc::clone(&output);
         let reader = thread::spawn(move || read_pty(reader_file, reader_output));
-        let child = Command::new("/bin/sh")
+        let command = Command::new("/bin/sh")
             .arg("-i")
             .current_dir(workspace)
             .env("TERM", "xterm-256color")
@@ -543,8 +642,12 @@ impl PtyShell {
             .env("PS2", "")
             .env_remove("ENV")
             .env_remove("PLATO_CONFIG")
-            .spawn(pts)
-            .unwrap();
+            .env_remove("NO_COLOR");
+        let command = match no_color {
+            Some(value) => command.env("NO_COLOR", value),
+            None => command,
+        };
+        let child = command.spawn(pts).unwrap();
         Self {
             pty,
             child,

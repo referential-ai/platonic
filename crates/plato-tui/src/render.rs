@@ -1,10 +1,11 @@
 use ratatui::{
     Frame, Terminal,
     backend::TestBackend,
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
 };
 
 use super::{
@@ -27,6 +28,7 @@ const SESSION_AGE_WIDTH: usize = 5;
 const SESSION_QUESTION_MAX_CHARS: usize = 72;
 const WORKING_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 const WORKING_FRAME_MILLIS: u64 = 80;
+const CURSOR_PROBE: Modifier = Modifier::RAPID_BLINK;
 
 /// Renders the current client state into a terminal frame.
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
@@ -50,6 +52,10 @@ fn render_at(frame: &mut Frame<'_>, state: &TuiState, now_ms: u64) {
     if let Some(status) = &state.status_modal {
         render_status_modal(frame, frame.area(), status);
     }
+}
+
+fn chrome_style() -> Style {
+    Style::default().add_modifier(Modifier::DIM)
 }
 
 /// Renders client state into a plain-text test snapshot of the requested size.
@@ -320,19 +326,19 @@ fn intro_lines(state: &TuiState) -> Vec<Line<'static>> {
     {
         lines.extend([
             Line::from(vec![
-                Span::styled("workspace ", Style::default().fg(Color::DarkGray)),
+                Span::styled("workspace ", chrome_style()),
                 Span::raw(workspace_id.clone()),
             ]),
             Line::from(vec![
-                Span::styled("daemon    ", Style::default().fg(Color::DarkGray)),
+                Span::styled("daemon    ", chrome_style()),
                 Span::raw(daemon_identity_label(daemon_version)),
             ]),
             Line::from(vec![
-                Span::styled("ledger    ", Style::default().fg(Color::DarkGray)),
+                Span::styled("ledger    ", chrome_style()),
                 Span::raw(ledger_path.clone()),
             ]),
             Line::from(vec![
-                Span::styled("cwd       ", Style::default().fg(Color::DarkGray)),
+                Span::styled("cwd       ", chrome_style()),
                 Span::raw(state.workspace_root.clone()),
             ]),
             Line::from(""),
@@ -949,8 +955,8 @@ fn push_trace_part(parts: &mut Vec<&'static str>, part: &'static str) {
 
 fn push_trace_row(lines: &mut Vec<Line<'static>>, summary: String) {
     let row = Line::from(vec![
-        Span::styled("Trace  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(summary, Style::default().fg(Color::DarkGray)),
+        Span::styled("Trace  ", chrome_style()),
+        Span::styled(summary, chrome_style()),
     ]);
     append_spaced_rows(lines, std::iter::once(row));
 }
@@ -1079,7 +1085,7 @@ fn status_line(state: &TuiState, width: u16) -> Line<'static> {
         .unwrap_or(model);
     Line::from(Span::styled(
         bounded_status_text(text, width),
-        Style::default().fg(Color::DarkGray),
+        chrome_style(),
     ))
 }
 
@@ -1140,42 +1146,159 @@ fn issue_prep_activity(state: &TuiState) -> Option<u64> {
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let mut lines = slash_popup_lines(state);
-    let mut composer_lines = if state.composer.is_empty() {
-        vec![Line::from(vec![
-            Span::styled(
-                ">",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled("|", Style::default().fg(Color::Yellow)),
-            Span::raw(" "),
-            Span::styled(
-                "Try \"read README.md and summarize it\"",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])]
-    } else {
-        composer_with_cursor(state)
-            .lines()
-            .enumerate()
-            .map(|(index, line)| {
-                let prefix = if index == 0 { ">" } else { "|" };
-                Line::from(vec![
-                    Span::styled(
-                        prefix,
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!(" {line}")),
-                ])
-            })
-            .collect()
-    };
-    lines.append(&mut composer_lines);
+    lines.extend(composer_lines(state));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    if composer_has_focus(state)
+        && let Some(position) = composer_cursor_position(area, state, true)
+        && position.0 < area.right()
+        && position.1 < area.bottom()
+    {
+        frame.set_cursor_position(position);
+    }
+}
+
+fn composer_has_focus(state: &TuiState) -> bool {
+    !state.help_visible
+        && state.session_picker.is_none()
+        && state.approval.is_none()
+        && state.status_modal.is_none()
+}
+
+fn composer_lines(state: &TuiState) -> Vec<Line<'static>> {
+    if state.composer.is_empty() {
+        return vec![Line::from(vec![
+            Span::styled(">", composer_prefix_style()),
+            Span::raw("   "),
+            Span::styled("Try \"read README.md and summarize it\"", chrome_style()),
+        ])];
+    }
+    state
+        .composer
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            Line::from(vec![
+                Span::styled(composer_prefix(index), composer_prefix_style()),
+                Span::raw(format!(" {line}")),
+            ])
+        })
+        .collect()
+}
+
+fn composer_prefix(index: usize) -> &'static str {
+    if index == 0 { ">" } else { "|" }
+}
+
+fn composer_prefix_style() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn composer_cursor_position(
+    area: Rect,
+    state: &TuiState,
+    include_popup: bool,
+) -> Option<(u16, u16)> {
+    if area.is_empty() {
+        return None;
+    }
+    let (lines, after_last_probe) = composer_cursor_probe_lines(state, include_popup);
+    let mut buffer = Buffer::empty(area);
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(area, &mut buffer);
+
+    let mut probes = area.rows().flat_map(|row| {
+        row.columns()
+            .filter(|position| buffer[*position].modifier.contains(CURSOR_PROBE))
+    });
+    if after_last_probe {
+        let position = probes.last()?;
+        let width = Line::from(buffer[position].symbol()).width().max(1) as u16;
+        let next_x = position.x.saturating_add(width);
+        if next_x >= area.right() {
+            Some((area.left(), position.y.saturating_add(1)))
+        } else {
+            Some((next_x, position.y))
+        }
+    } else {
+        probes.next().map(|position| (position.x, position.y))
+    }
+}
+
+fn composer_cursor_probe_lines(
+    state: &TuiState,
+    include_popup: bool,
+) -> (Vec<Line<'static>>, bool) {
+    let mut lines = if include_popup {
+        slash_popup_lines(state)
+    } else {
+        Vec::new()
+    };
+    if state.composer.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(">", composer_prefix_style()),
+            Span::raw(" "),
+            Span::styled(" ", Style::default().add_modifier(CURSOR_PROBE)),
+            Span::raw(" "),
+            Span::styled("Try \"read README.md and summarize it\"", chrome_style()),
+        ]));
+        return (lines, false);
+    }
+
+    let cursor = clamped_composer_cursor(state);
+    let cursor_line = state.composer[..cursor]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    let cursor_line_start = state.composer[..cursor]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let cursor_in_line = cursor - cursor_line_start;
+    let mut after_last_probe = false;
+    lines.extend(state.composer.split('\n').enumerate().map(|(index, line)| {
+        let prefix = Span::styled(composer_prefix(index), composer_prefix_style());
+        if index != cursor_line {
+            return Line::from(vec![prefix, Span::raw(format!(" {line}"))]);
+        }
+
+        let before = &line[..cursor_in_line];
+        let after = &line[cursor_in_line..];
+        if Line::from(after).width() > 0 {
+            Line::from(vec![
+                prefix,
+                Span::raw(format!(" {before}")),
+                Span::styled(
+                    after.to_owned(),
+                    Style::default().add_modifier(CURSOR_PROBE),
+                ),
+            ])
+        } else if Line::from(line).width() > 0 {
+            after_last_probe = true;
+            Line::from(vec![
+                prefix,
+                Span::raw(" "),
+                Span::styled(line.to_owned(), Style::default().add_modifier(CURSOR_PROBE)),
+            ])
+        } else {
+            after_last_probe = true;
+            Line::from(vec![
+                prefix,
+                Span::styled(" ", Style::default().add_modifier(CURSOR_PROBE)),
+                Span::raw(line.to_owned()),
+            ])
+        }
+    }));
+    (lines, after_last_probe)
+}
+
+fn clamped_composer_cursor(state: &TuiState) -> usize {
+    let mut cursor = state.composer_cursor.min(state.composer.len());
+    while !state.composer.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    cursor
 }
 
 fn slash_popup_lines(state: &TuiState) -> Vec<Line<'static>> {
@@ -1186,7 +1309,7 @@ fn slash_popup_lines(state: &TuiState) -> Vec<Line<'static>> {
     if matches.is_empty() {
         return vec![Line::from(Span::styled(
             "  no commands match",
-            Style::default().fg(Color::DarkGray),
+            chrome_style(),
         ))];
     }
     matches
@@ -1199,16 +1322,13 @@ fn slash_popup_lines(state: &TuiState) -> Vec<Line<'static>> {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                chrome_style()
             };
             Line::from(vec![
                 Span::styled(if index == popup.selected { "> " } else { "  " }, style),
                 Span::styled(format!("/{}", command.name), style),
                 Span::raw("  "),
-                Span::styled(
-                    command.description.to_owned(),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(command.description.to_owned(), chrome_style()),
             ])
         })
         .collect()
@@ -1304,16 +1424,6 @@ fn status_row(text: impl Into<String>) -> Line<'static> {
 
 fn warning_row(text: impl Into<String>) -> Line<'static> {
     role_row("warning", Color::Red, &text.into())
-}
-
-fn composer_with_cursor(state: &TuiState) -> String {
-    let mut draft = state.composer.clone();
-    let mut cursor = state.composer_cursor.min(draft.len());
-    while !draft.is_char_boundary(cursor) {
-        cursor -= 1;
-    }
-    draft.insert(cursor, '|');
-    draft
 }
 
 fn format_elapsed(seconds: u64) -> String {
@@ -1531,10 +1641,7 @@ fn session_picker_row(
             status_style(&session.status),
         ),
         Span::raw(" "),
-        Span::styled(
-            format!("{age:>SESSION_AGE_WIDTH$}"),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("{age:>SESSION_AGE_WIDTH$}"), chrome_style()),
         Span::raw(" "),
         Span::raw(question),
     ])
@@ -1660,7 +1767,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 fn vertical(area: Rect, state: &TuiState) -> [Rect; 3] {
-    let composer_height = composer_height(state);
+    let composer_height = composer_height(state, area.width);
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1671,18 +1778,22 @@ fn vertical(area: Rect, state: &TuiState) -> [Rect; 3] {
         .areas(area)
 }
 
-fn composer_height(state: &TuiState) -> u16 {
-    let draft_lines = if state.composer.is_empty() {
-        1
-    } else {
-        state.composer.lines().count().max(1)
-    };
+fn composer_height(state: &TuiState, width: u16) -> u16 {
     let popup_lines = state
         .slash_popup
         .as_ref()
         .map(|popup| matching_slash_commands(&popup.filter).len().clamp(1, 5))
         .unwrap_or(0);
-    (draft_lines + popup_lines).clamp(1, 9) as u16
+    let rendered_lines = if state.composer.is_empty() {
+        1
+    } else {
+        Paragraph::new(composer_lines(state))
+            .wrap(Wrap { trim: false })
+            .line_count(width.max(1))
+    };
+    let cursor_lines = composer_cursor_position(Rect::new(0, 0, width, 9), state, false)
+        .map_or(0, |(_, y)| usize::from(y) + 1);
+    (popup_lines + rendered_lines.max(cursor_lines)).clamp(1, 9) as u16
 }
 
 #[cfg(test)]
@@ -1693,6 +1804,7 @@ mod tests {
         TranscriptReadResult, TypedRun, TypedTranscript, TypedTranscriptEntry,
     };
     use platonic_core::EffectClass;
+    use ratatui::backend::Backend;
 
     use super::super::state::approval_from_snapshot;
     use super::super::{ActiveRunView, LiveEventLine};
@@ -1842,11 +1954,11 @@ mod tests {
         let narrow_conversation = focused_snapshot(&state, 48, 24);
         assert_eq!(
             normal_conversation,
-            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow widths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | ready 0s | selected openrouter/auto | queued 0 | conversation"
+            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow widths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n>   Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | ready 0s | selected openrouter/auto | queued 0 | conversation"
         );
         assert_eq!(
             narrow_conversation,
-            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow\nwidths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n> | Try \"read README.md and summarize it\"\non | ready | selected openrouter/auto"
+            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow\nwidths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n>   Try \"read README.md and summarize it\"\non | ready | selected openrouter/auto"
         );
         for snapshot in [&normal_conversation, &narrow_conversation] {
             assert_eq!(snapshot.lines().filter(|line| *line == "You").count(), 2);
@@ -1869,11 +1981,11 @@ mod tests {
         let narrow_audit = focused_snapshot(&state, 48, 24);
         assert_eq!(
             normal_audit,
-            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise summary.\nassistant\ntool      call_alpha file.read {\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at narrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission denied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | ready 0s | selected openrouter/auto | queued 0 | audit"
+            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise summary.\nassistant\ntool      call_alpha file.read {\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at narrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission denied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n>   Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | ready 0s | selected openrouter/auto | queued 0 | audit"
         );
         assert_eq!(
             narrow_audit,
-            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise\nsummary.\nassistant\ntool      call_alpha file.read\n{\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at\nnarrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission\ndenied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\non | ready | selected openrouter/auto"
+            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise\nsummary.\nassistant\ntool      call_alpha file.read\n{\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at\nnarrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission\ndenied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n>   Try \"read README.md and summarize it\"\non | ready | selected openrouter/auto"
         );
         for snapshot in [&normal_audit, &narrow_audit] {
             assert!(snapshot.contains("run_alpha_full_identifier"));
@@ -1882,6 +1994,35 @@ mod tests {
             assert!(snapshot.contains("#42"));
             assert!(snapshot.contains("call_alpha"));
         }
+    }
+
+    #[test]
+    fn chrome_is_dim_without_recoloring_status_roles() {
+        assert_eq!(chrome_style(), Style::default().add_modifier(Modifier::DIM));
+
+        let state = conversation_fixture();
+        assert_eq!(status_line(&state, 100).spans[0].style, chrome_style());
+        let intro = intro_lines(&state);
+        for line in &intro[3..7] {
+            assert_eq!(line.spans[0].style, chrome_style());
+        }
+        let mut trace = Vec::new();
+        push_trace_row(&mut trace, "tools | finished".into());
+        assert!(
+            trace[0]
+                .spans
+                .iter()
+                .all(|span| span.style == chrome_style())
+        );
+
+        assert_eq!(
+            status_row("ready").spans[0].style,
+            Style::default().fg(Color::DarkGray)
+        );
+        assert_eq!(
+            status_style(&RunStateName::Finished),
+            Style::default().fg(Color::DarkGray)
+        );
     }
 
     #[test]
@@ -2205,7 +2346,46 @@ mod tests {
         assert!(output.contains("running"));
         assert!(!output.contains("run_1"));
         assert!(output.contains("assistant response"));
-        assert!(output.contains("> summarize| this file"));
+        assert!(output.contains("> summarize this file"));
+        assert!(!output.contains("summarize|"));
+    }
+
+    #[test]
+    fn composer_cursor_tracks_unicode_newlines_and_soft_wrap_without_a_caret_glyph() {
+        let mut state = conversation_fixture();
+
+        state.composer = "ab界café".into();
+        state.composer_cursor = "ab界".len();
+        assert_eq!(render_cursor_position(&state, 20, 12), (6, 10));
+        let unicode = render_snapshot_at(&state, 20, 12, 0).unwrap();
+        assert!(unicode.contains("> ab界"));
+        assert!(unicode.contains("café"));
+        assert!(!unicode.contains("界|"));
+
+        state.composer = "first\n界second".into();
+        state.composer_cursor = "first\n界".len();
+        assert_eq!(render_cursor_position(&state, 20, 12), (4, 10));
+        let multiline = render_snapshot_at(&state, 20, 12, 0).unwrap();
+        assert!(multiline.contains("> first"));
+        assert!(multiline.contains("| 界"));
+        assert!(multiline.contains("second"));
+        assert!(!multiline.contains("界|"));
+
+        state.composer = "abcdefgh".into();
+        state.composer_cursor = state.composer.len();
+        assert_eq!(render_cursor_position(&state, 10, 8), (0, 6));
+        let wrapped = render_snapshot_at(&state, 10, 8, 0).unwrap();
+        assert!(wrapped.contains("> abcdefgh"));
+        assert!(!wrapped.contains("abcdefgh|"));
+    }
+
+    #[test]
+    fn empty_composer_keeps_placeholder_geometry_and_uses_the_terminal_cursor() {
+        let state = conversation_fixture();
+        let output = render_snapshot_at(&state, 48, 12, 0).unwrap();
+
+        assert!(output.contains(">   Try \"read README.md and summarize it\""));
+        assert_eq!(render_cursor_position(&state, 48, 12), (2, 10));
     }
 
     #[test]
@@ -2361,7 +2541,8 @@ mod tests {
         assert!(output.contains("queued 1"));
         assert!(output.contains("1 queued next"));
         assert!(output.contains("> first line"));
-        assert!(output.contains("| second line|"));
+        assert!(output.contains("| second line"));
+        assert!(!output.contains("second line|"));
     }
 
     #[test]
@@ -2513,13 +2694,13 @@ mod tests {
         let mut state = approval_trace_fixture();
         assert_eq!(
             focused_snapshot(&state, 96, 24),
-            "You\n  Review the proposed edit.\n\nTrace  approval | running\n\n⣾ Working  0s  Esc to interrupt\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | running 0s | model pending | queued 0 | conversation"
+            "You\n  Review the proposed edit.\n\nTrace  approval | running\n\n⣾ Working  0s  Esc to interrupt\n\n>   Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | running 0s | model pending | queued 0 | conversation"
         );
 
         state.toggle_display_mode();
         assert_eq!(
             focused_snapshot(&state, 96, 24),
-            "status    run run_approval\n\nuser      Review the proposed edit.\n\ntranscript\nstatus    running run_approval\nwarning   #4 approval pending file.write (workspace_write)\nstatus    #5 approval granted call_approval\n\n⣾ Working  0s  Esc to interrupt\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | running 0s | model pending | queued 0 | audit"
+            "status    run run_approval\n\nuser      Review the proposed edit.\n\ntranscript\nstatus    running run_approval\nwarning   #4 approval pending file.write (workspace_write)\nstatus    #5 approval granted call_approval\n\n⣾ Working  0s  Esc to interrupt\n\n>   Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | running 0s | model pending | queued 0 | audit"
         );
     }
 
@@ -3238,5 +3419,13 @@ mod tests {
 
     fn render_to_text_at(state: &TuiState, now_ms: u64) -> String {
         render_snapshot_at(state, 100, 24, now_ms).unwrap()
+    }
+
+    fn render_cursor_position(state: &TuiState, width: u16, height: u16) -> (u16, u16) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render_at(frame, state, 0)).unwrap();
+        let position = terminal.backend_mut().get_cursor_position().unwrap();
+        (position.x, position.y)
     }
 }

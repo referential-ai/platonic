@@ -545,6 +545,8 @@ the complete ordered audit view without reloading the session.
 Assistant messages render headings, emphasis, lists, quotes, inline code,
 fenced code, and unified diffs in conversation view. User messages remain
 literal, while audit view retains the exact stored transcript source.
+The composer uses the terminal cursor without adding a caret glyph to its text.
+A nonempty `NO_COLOR` suppresses colors while retaining emphasis and layout.
 
 ```bash
 cargo run --bin plato
