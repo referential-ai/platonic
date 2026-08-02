@@ -965,8 +965,7 @@ mod tests {
                             };
                             write_response(&mut stream, &script);
                             let _ = stream.shutdown(Shutdown::Write);
-                            let mut byte = [0u8; 1];
-                            if matches!(stream.read(&mut byte), Ok(0)) {
+                            if wait_for_peer_close(&mut stream) {
                                 *worker_closed.lock().unwrap() += 1;
                             }
                         }
@@ -1040,6 +1039,40 @@ mod tests {
             }
         }
         String::from_utf8(bytes).unwrap()
+    }
+
+    fn wait_for_peer_close(stream: &mut TcpStream) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut byte = [0u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::NotConnected
+                            | io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    return true;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => return false,
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+        }
     }
 
     fn write_response(stream: &mut TcpStream, script: &ResponseScript) {
