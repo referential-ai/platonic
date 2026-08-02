@@ -529,7 +529,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             if stream_enabled(&options) {
                 let delta_run_id = run_id.clone();
                 let delta_turn_id = turn_id.clone();
-                client.send_streaming(&request, |text| {
+                client.send_streaming_with_cancel(&request, options.cancel.as_deref(), |text| {
                     if cancel_requested(&options) {
                         return Err(AppError::RunCanceled);
                     }
@@ -553,7 +553,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                     Ok(())
                 })
             } else {
-                client.send(&request)
+                client.send_with_cancel(&request, options.cancel.as_deref())
             }
         };
         let mut response_result = send_request();
@@ -4473,7 +4473,6 @@ enabled = ["file.read"]
                 ("requested", "turn_1".into(), 0),
                 ("failed", "turn_1".into(), 0),
                 ("requested", "turn_1".into(), 0),
-                ("responded", "turn_1".into(), 0),
             ],
         );
     }
@@ -4795,15 +4794,19 @@ enabled = ["file.read"]
     }
 
     #[test]
-    fn streaming_cancel_records_terminal_failed_and_canceled_session() {
-        let (continue_sender, continue_receiver) = std::sync::mpsc::channel();
-        let server = spawn_cancelable_streaming_provider(continue_receiver);
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("plato.toml");
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
+    fn stalled_stream_cancel_reaches_canceled_session_within_500_ms_for_25_trials() {
+        const TRIALS: usize = 25;
+        let mut latencies = Vec::with_capacity(TRIALS);
+
+        for trial in 0..TRIALS {
+            let (continue_sender, continue_receiver) = std::sync::mpsc::channel();
+            let server = spawn_cancelable_streaming_provider(continue_receiver);
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join("plato.toml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    r#"
 [provider]
 kind = "open_ai"
 model = "test-model"
@@ -4819,74 +4822,77 @@ max_turns = 1
 [tools]
 enabled = ["file.read"]
 "#,
-                server.base_url
-            ),
-        )
-        .unwrap();
-        let ledger_path = dir.path().join("events.db");
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (event_sender, event_receiver) = std::sync::mpsc::channel();
-        let run_cancel = cancel.clone();
-        let run_config_path = config_path.clone();
-        let run_ledger_path = ledger_path.clone();
-        let workspace_root = dir.path().to_path_buf();
-
-        let handle = thread::spawn(move || {
-            run_question(RunOptions {
-                question: "say hello".into(),
-                config_path: Some(run_config_path),
-                overrides: RunOverrides::default(),
-                ledger: RunLedger::Sqlite(run_ledger_path),
-                workspace_root,
-                approval_mode: ApprovalMode::Deny { actor: "test" },
-                run_id: Some(RunId::new("run_stream_cancel").unwrap()),
-                session: Some(RunSession::Fresh {
-                    session_id: "session_1".into(),
-                }),
-                event_sender: Some(event_sender),
-                stream_to_stderr: false,
-                cancel: Some(run_cancel),
-                voice_interruption_context: None,
-            })
-        });
-
-        let first_delta = loop {
-            match event_receiver
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .expect("run should emit first streamed delta before cancel")
-            {
-                RunEvent::AssistantDelta(delta) => break delta,
-                RunEvent::Ledger(_) => {}
-            }
-        };
-        assert_eq!(first_delta.text, "Hel");
-
-        cancel.store(true, Ordering::SeqCst);
-        let started = std::time::Instant::now();
-        continue_sender.send(()).unwrap();
-        let error = handle.join().unwrap().unwrap_err();
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "stream cancel should not wait for provider timeout"
-        );
-        assert!(matches!(error, AppError::RunCanceled));
-        let _provider_request = server.handle.join().unwrap();
-
-        let records =
-            crate::ledger::read_sqlite_records(&ledger_path, Some("run_stream_cancel")).unwrap();
-        assert!(records.iter().any(|record| matches!(
-            &record.event,
-            HarnessEvent::RunFailed { reason, .. } if reason == RUN_CANCELED_REASON
-        )));
-        let readback = RunReadback::from_events(&records).unwrap();
-        assert!(matches!(readback.final_phase, RunPhase::Failed { .. }));
-        let summaries = SqliteLedger::open_readonly(&ledger_path)
-            .unwrap()
-            .session_summaries()
+                    server.base_url
+                ),
+            )
             .unwrap();
-        assert_eq!(
-            summaries[0].status,
-            crate::daemon::protocol::RunStateName::Canceled
+            let ledger_path = dir.path().join("events.db");
+            let run_id = format!("run_stream_cancel_{trial}");
+            let session_id = format!("session_stream_cancel_{trial}");
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (event_sender, event_receiver) = std::sync::mpsc::channel();
+            let options = retry_session_test_options(
+                config_path,
+                ledger_path.clone(),
+                dir.path().to_path_buf(),
+                &run_id,
+                &session_id,
+                Some(event_sender),
+                Arc::clone(&cancel),
+            );
+            let handle = thread::spawn(move || run_question(options));
+
+            let first_delta = loop {
+                match event_receiver
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("run should emit first streamed delta before cancel")
+                {
+                    RunEvent::AssistantDelta(delta) => break delta,
+                    RunEvent::Ledger(_) => {}
+                }
+            };
+            assert_eq!(first_delta.text, "Hel");
+
+            let canceled_at = std::time::Instant::now();
+            cancel.store(true, Ordering::SeqCst);
+            let error = handle.join().unwrap().unwrap_err();
+            assert!(matches!(error, AppError::RunCanceled));
+            let summaries = SqliteLedger::open_readonly(&ledger_path)
+                .unwrap()
+                .session_summaries()
+                .unwrap();
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(
+                summaries[0].status,
+                crate::daemon::protocol::RunStateName::Canceled
+            );
+            let elapsed = canceled_at.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_millis(500),
+                "trial {trial} stalled-stream terminal readback took {elapsed:?}"
+            );
+            latencies.push(elapsed);
+
+            assert_canceled_retry_session(
+                &ledger_path,
+                &run_id,
+                &session_id,
+                vec![("requested", "turn_1".into(), 0)],
+            );
+            continue_sender.send(()).unwrap();
+            let provider_request = server.handle.join().unwrap();
+            assert!(provider_request.starts_with("POST /chat/completions "));
+        }
+
+        latencies.sort_unstable();
+        let p50 = latencies[TRIALS / 2];
+        let p95 = latencies[23];
+        let max = latencies[TRIALS - 1];
+        eprintln!(
+            "STALLED_STREAM_CANCEL_METRICS trials={TRIALS} p50_ms={:.3} p95_ms={:.3} max_ms={:.3}",
+            p50.as_secs_f64() * 1_000.0,
+            p95.as_secs_f64() * 1_000.0,
+            max.as_secs_f64() * 1_000.0,
         );
     }
 

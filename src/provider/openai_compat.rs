@@ -12,9 +12,11 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     io::{self, BufRead, BufReader, Read},
-    time::Duration,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
 };
 
+const RESPONSE_READ_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_DECODED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_NON_STREAM_BODY_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
@@ -91,13 +93,30 @@ impl OpenAiCompatibleClient {
     }
 
     pub fn send(&self, request: &ModelRequest) -> AppResult<ModelResponse> {
+        self.send_with_cancel(request, None)
+    }
+
+    pub(crate) fn send_with_cancel(
+        &self,
+        request: &ModelRequest,
+        cancel: Option<&AtomicBool>,
+    ) -> AppResult<ModelResponse> {
         let body = ChatCompletionRequest::from_model_request(request, self.token_limit_field)?;
-        self.send_body(body)
+        self.send_body(body, cancel)
     }
 
     pub fn send_streaming(
         &self,
         request: &ModelRequest,
+        on_delta: impl FnMut(&str) -> AppResult<()>,
+    ) -> AppResult<ModelResponse> {
+        self.send_streaming_with_cancel(request, None, on_delta)
+    }
+
+    pub(crate) fn send_streaming_with_cancel(
+        &self,
+        request: &ModelRequest,
+        cancel: Option<&AtomicBool>,
         mut on_delta: impl FnMut(&str) -> AppResult<()>,
     ) -> AppResult<ModelResponse> {
         let mut body = ChatCompletionRequest::from_model_request(request, self.token_limit_field)?;
@@ -105,24 +124,42 @@ impl OpenAiCompatibleClient {
         body.stream_options = Some(ChatStreamOptions {
             include_usage: true,
         });
-        let response = self.post_completion(body)?;
-        parse_chat_completion_stream(BufReader::new(response.into_reader()), &mut on_delta)
+        let response = self.post_completion(body, cancel.is_some())?;
+        let reader =
+            ResponseBodyReader::new(response.into_reader(), cancel, self.stream_idle_timeout);
+        parse_chat_completion_stream(BufReader::new(reader), &mut on_delta)
     }
 
-    fn send_body(&self, body: ChatCompletionRequest) -> AppResult<ModelResponse> {
-        let response = self.post_completion(body)?;
-        let body = read_non_stream_body(response.into_reader())?;
+    fn send_body(
+        &self,
+        body: ChatCompletionRequest,
+        cancel: Option<&AtomicBool>,
+    ) -> AppResult<ModelResponse> {
+        let response = self.post_completion(body, cancel.is_some())?;
+        let reader =
+            ResponseBodyReader::new(response.into_reader(), cancel, self.stream_idle_timeout);
+        let body = read_non_stream_body(reader)?;
         serde_json::from_slice::<ChatCompletionResponse>(&body)
             .map_err(|error| AppError::Provider(error.to_string()))?
             .into_model_response()
     }
 
-    fn post_completion(&self, body: ChatCompletionRequest) -> AppResult<ureq::Response> {
+    fn post_completion(
+        &self,
+        body: ChatCompletionRequest,
+        cancellation_observable: bool,
+    ) -> AppResult<ureq::Response> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let read_timeout = if cancellation_observable {
+            self.stream_idle_timeout
+                .min(RESPONSE_READ_CANCEL_POLL_INTERVAL)
+        } else {
+            self.stream_idle_timeout
+        };
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(self.connect_timeout)
             .timeout_write(self.connect_timeout)
-            .timeout_read(self.stream_idle_timeout)
+            .timeout_read(read_timeout)
             .build();
         self.authorized_post(&agent, &url)
             .send_json(body)
@@ -158,11 +195,122 @@ fn provider_send_error(error: ureq::Error) -> AppError {
     }
 }
 
+struct ResponseBodyReader<'a, R> {
+    inner: R,
+    cancel: Option<&'a AtomicBool>,
+    idle_timeout: Duration,
+    idle_deadline: Option<Instant>,
+}
+
+impl<'a, R> ResponseBodyReader<'a, R> {
+    fn new(inner: R, cancel: Option<&'a AtomicBool>, idle_timeout: Duration) -> Self {
+        Self {
+            inner,
+            cancel,
+            idle_timeout,
+            idle_deadline: Instant::now().checked_add(idle_timeout),
+        }
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.cancel
+            .is_some_and(|cancel| cancel.load(Ordering::SeqCst))
+    }
+
+    fn reset_idle_deadline(&mut self) {
+        self.idle_deadline = Instant::now().checked_add(self.idle_timeout);
+    }
+
+    fn idle_deadline_elapsed(&self) -> bool {
+        self.idle_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn remaining_idle(&self) -> Duration {
+        self.idle_deadline
+            .map_or(RESPONSE_READ_CANCEL_POLL_INTERVAL, |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            })
+    }
+}
+
+impl<R: Read> Read for ResponseBodyReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            if self.cancellation_requested() {
+                return Err(response_read_canceled());
+            }
+
+            let poll_started = Instant::now();
+            match self.inner.read(buffer) {
+                Ok(0) => return Ok(0),
+                Ok(read) => {
+                    self.reset_idle_deadline();
+                    return Ok(read);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    if self.cancellation_requested() {
+                        return Err(response_read_canceled());
+                    }
+                    if self.idle_deadline_elapsed() {
+                        return Err(error);
+                    }
+
+                    let remaining_poll =
+                        RESPONSE_READ_CANCEL_POLL_INTERVAL.saturating_sub(poll_started.elapsed());
+                    let wait = remaining_poll.min(self.remaining_idle());
+                    if !wait.is_zero() {
+                        std::thread::sleep(wait);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ResponseReadCanceled;
+
+impl std::fmt::Display for ResponseReadCanceled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("provider response read canceled")
+    }
+}
+
+impl std::error::Error for ResponseReadCanceled {}
+
+fn response_read_canceled() -> io::Error {
+    io::Error::other(ResponseReadCanceled)
+}
+
+fn response_body_read_error(error: io::Error) -> AppError {
+    if error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<ResponseReadCanceled>())
+        .is_some()
+    {
+        AppError::RunCanceled
+    } else {
+        AppError::Io(error)
+    }
+}
+
 fn read_non_stream_body(reader: impl Read) -> AppResult<Vec<u8>> {
     let mut body = Vec::new();
     reader
         .take((MAX_NON_STREAM_BODY_BYTES + 1) as u64)
-        .read_to_end(&mut body)?;
+        .read_to_end(&mut body)
+        .map_err(response_body_read_error)?;
     if body.len() > MAX_NON_STREAM_BODY_BYTES {
         return Err(AppError::Provider(NON_STREAM_BODY_LIMIT_ERROR.into()));
     }
@@ -539,7 +687,8 @@ fn parse_chat_completion_stream(
             (MAX_DECODED_RESPONSE_BYTES - decoded_bytes).min(MAX_SSE_EVENT_BYTES - event_bytes);
         let read = Read::by_ref(&mut reader)
             .take((remaining + 1) as u64)
-            .read_until(b'\n', &mut line)?;
+            .read_until(b'\n', &mut line)
+            .map_err(response_body_read_error)?;
         if read == 0 {
             break;
         }
@@ -827,7 +976,7 @@ mod tests {
     use std::{
         io::{BufReader, Cursor, ErrorKind, Read, Write},
         net::{TcpListener, TcpStream},
-        sync::mpsc,
+        sync::{Arc, mpsc},
         thread,
         time::Instant,
     };
@@ -1230,20 +1379,27 @@ mod tests {
             stream.flush().unwrap();
             let _ = stop_receiver.recv_timeout(Duration::from_secs(5));
         });
-        let client = timeout_test_client(base_url, 2_000, 100);
+        let idle_budget = Duration::from_millis(350);
+        let client = timeout_test_client(base_url, 2_000, idle_budget.as_millis() as u64);
+        let cancel = AtomicBool::new(false);
         let mut deltas = Vec::new();
 
         let started = Instant::now();
-        let result = client.send_streaming(&reasoning_request(None), |delta| {
-            deltas.push(delta.to_string());
-            Ok(())
-        });
+        let result =
+            client.send_streaming_with_cancel(&reasoning_request(None), Some(&cancel), |delta| {
+                deltas.push(delta.to_string());
+                Ok(())
+            });
         let elapsed = started.elapsed();
         let _ = stop_sender.send(());
         server.join().unwrap();
 
         assert_timeout(result.unwrap_err());
         assert_eq!(deltas, ["start"]);
+        assert!(
+            elapsed >= idle_budget.saturating_sub(Duration::from_millis(25)),
+            "streaming response timed out before its idle budget: {elapsed:?}"
+        );
         assert!(
             elapsed < Duration::from_secs(2),
             "streaming response read took {elapsed:?}"
@@ -1266,17 +1422,18 @@ mod tests {
             for event in events {
                 stream.write_all(event.as_bytes()).unwrap();
                 stream.flush().unwrap();
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(Duration::from_millis(150));
             }
             stream.write_all(finish.as_bytes()).unwrap();
             stream.flush().unwrap();
         });
-        let idle_budget = Duration::from_millis(500);
+        let idle_budget = Duration::from_millis(400);
         let client = timeout_test_client(base_url, 2_000, idle_budget.as_millis() as u64);
+        let cancel = AtomicBool::new(false);
 
         let started = Instant::now();
         let response = client
-            .send_streaming(&reasoning_request(None), |_| Ok(()))
+            .send_streaming_with_cancel(&reasoning_request(None), Some(&cancel), |_| Ok(()))
             .unwrap();
         let elapsed = started.elapsed();
         server.join().unwrap();
@@ -1304,19 +1461,157 @@ mod tests {
             stream.flush().unwrap();
             let _ = stop_receiver.recv_timeout(Duration::from_secs(5));
         });
-        let client = timeout_test_client(base_url, 2_000, 100);
+        let idle_budget = Duration::from_millis(350);
+        let client = timeout_test_client(base_url, 2_000, idle_budget.as_millis() as u64);
+        let cancel = AtomicBool::new(false);
 
         let started = Instant::now();
-        let result = client.send(&reasoning_request(None));
+        let result = client.send_with_cancel(&reasoning_request(None), Some(&cancel));
         let elapsed = started.elapsed();
         let _ = stop_sender.send(());
         server.join().unwrap();
 
         assert_timeout(result.unwrap_err());
         assert!(
+            elapsed >= idle_budget.saturating_sub(Duration::from_millis(25)),
+            "non-streaming response timed out before its idle budget: {elapsed:?}"
+        );
+        assert!(
             elapsed < Duration::from_secs(2),
             "non-streaming response read took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn stalled_stream_reads_cancel_at_every_partial_boundary_without_more_bytes() {
+        let first = sse_delta("start");
+        let partial_event = format!("{first}data: {{\"choices\":[");
+        let unicode_event = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\u{754c}\"},",
+            "\"finish_reason\":null}]}\n\n",
+        );
+        let unicode_split = unicode_event
+            .as_bytes()
+            .iter()
+            .position(|byte| *byte >= 0x80)
+            .expect("fixture contains UTF-8");
+        let mut partial_utf8 = first.as_bytes().to_vec();
+        partial_utf8.extend_from_slice(&unicode_event.as_bytes()[..=unicode_split]);
+
+        let cases = [
+            ("before_first_data", Vec::new(), false),
+            ("between_chunks", first.as_bytes().to_vec(), true),
+            ("partial_event", partial_event.into_bytes(), true),
+            ("partial_utf8", partial_utf8, true),
+        ];
+
+        for (name, prefix, expect_first_delta) in cases {
+            let provider = spawn_stalled_body_provider("text/event-stream", prefix);
+            let client = timeout_test_client(provider.base_url.clone(), 2_000, 2_000);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let run_cancel = Arc::clone(&cancel);
+            let (delta_sender, delta_receiver) = mpsc::channel();
+            let handle = thread::spawn(move || {
+                client.send_streaming_with_cancel(
+                    &reasoning_request(None),
+                    Some(run_cancel.as_ref()),
+                    |delta| {
+                        delta_sender.send(delta.to_owned()).unwrap();
+                        Ok(())
+                    },
+                )
+            });
+
+            provider
+                .ready_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            if expect_first_delta {
+                assert_eq!(
+                    delta_receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    "start",
+                    "boundary: {name}"
+                );
+            } else {
+                thread::sleep(Duration::from_millis(25));
+            }
+
+            let canceled_at = Instant::now();
+            cancel.store(true, Ordering::SeqCst);
+            let result = handle.join().unwrap();
+            let elapsed = canceled_at.elapsed();
+
+            assert!(
+                matches!(result, Err(AppError::RunCanceled)),
+                "boundary {name} returned {result:?}"
+            );
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "boundary {name} cancellation took {elapsed:?}"
+            );
+            assert!(delta_receiver.try_recv().is_err(), "boundary: {name}");
+
+            provider.release_sender.send(()).unwrap();
+            provider.handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn stalled_non_stream_body_read_returns_typed_cancellation_without_more_bytes() {
+        let body = br#"{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}"#;
+        let provider =
+            spawn_stalled_body_provider("application/json", body[..body.len() / 2].to_vec());
+        let client = timeout_test_client(provider.base_url.clone(), 2_000, 2_000);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let run_cancel = Arc::clone(&cancel);
+        let handle = thread::spawn(move || {
+            client.send_with_cancel(&reasoning_request(None), Some(run_cancel.as_ref()))
+        });
+
+        provider
+            .ready_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        thread::sleep(Duration::from_millis(25));
+        let canceled_at = Instant::now();
+        cancel.store(true, Ordering::SeqCst);
+        let result = handle.join().unwrap();
+        let elapsed = canceled_at.elapsed();
+
+        assert!(matches!(result, Err(AppError::RunCanceled)));
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "non-stream cancellation took {elapsed:?}"
+        );
+        provider.release_sender.send(()).unwrap();
+        provider.handle.join().unwrap();
+    }
+
+    #[test]
+    fn response_reader_preserves_eof_and_non_timeout_io_failures() {
+        let mut deltas = Vec::new();
+        let error = parse_chat_completion_stream(Cursor::new(sse_delta("orphan")), &mut |delta| {
+            deltas.push(delta.to_owned());
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(deltas, ["orphan"]);
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == "provider stream ended before [DONE]"
+        ));
+
+        let cancel = AtomicBool::new(false);
+        let reader = ResponseBodyReader::new(
+            FixedReadError(ErrorKind::ConnectionReset),
+            Some(&cancel),
+            Duration::from_secs(1),
+        );
+        let error = read_non_stream_body(reader).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Io(error) if error.kind() == ErrorKind::ConnectionReset
+        ));
     }
 
     #[test]
@@ -1356,6 +1651,60 @@ mod tests {
             )
             .unwrap()
         })
+    }
+
+    struct StalledBodyProvider {
+        base_url: String,
+        ready_receiver: mpsc::Receiver<()>,
+        release_sender: mpsc::Sender<()>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    fn spawn_stalled_body_provider(
+        content_type: &'static str,
+        prefix: Vec<u8>,
+    ) -> StalledBodyProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_provider_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                prefix.len() + 4_096
+            )
+            .unwrap();
+            stream.write_all(&prefix).unwrap();
+            stream.flush().unwrap();
+            ready_sender.send(()).unwrap();
+            release_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+
+            listener.set_nonblocking(true).unwrap();
+            match listener.accept() {
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Ok(_) => panic!("canceled provider read issued an extra request"),
+                Err(error) => panic!("extra-request probe failed: {error}"),
+            }
+        });
+        StalledBodyProvider {
+            base_url,
+            ready_receiver,
+            release_sender,
+            handle,
+        }
+    }
+
+    struct FixedReadError(ErrorKind);
+
+    impl Read for FixedReadError {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(self.0, "fixed provider read failure"))
+        }
     }
 
     fn spawn_loopback_provider(
