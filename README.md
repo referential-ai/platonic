@@ -79,7 +79,7 @@ api_key_env = "OPENAI_API_KEY"
 progress receives a fresh idle window. The legacy `timeout_ms` name remains an
 alias for `stream_idle_timeout_ms`; setting both names is an error. Cancelable
 runs poll for cancellation during stalled response-body reads on a fixed
-100-millisecond interval without shortening that configured idle window.
+25-millisecond interval without shortening that configured idle window.
 
 A completion POST rejected with HTTP 429 before any response body or streaming
 delta retries once and records the failed attempt plus repeated request at the

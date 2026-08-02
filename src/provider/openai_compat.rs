@@ -12,11 +12,15 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     io::{self, BufRead, BufReader, Read},
-    sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
 };
 
-const RESPONSE_READ_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const RESPONSE_READ_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_DECODED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_NON_STREAM_BODY_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
@@ -124,10 +128,13 @@ impl OpenAiCompatibleClient {
         body.stream_options = Some(ChatStreamOptions {
             include_usage: true,
         });
-        let response = self.post_completion(body, cancel.is_some())?;
-        let reader =
-            ResponseBodyReader::new(response.into_reader(), cancel, self.stream_idle_timeout);
-        parse_chat_completion_stream(BufReader::new(reader), &mut on_delta)
+        let response = self.post_completion(body)?;
+        match cancel {
+            Some(cancel) => read_streaming_response_with_cancel(response, cancel, &mut on_delta),
+            None => {
+                parse_chat_completion_stream(BufReader::new(response.into_reader()), &mut on_delta)
+            }
+        }
     }
 
     fn send_body(
@@ -135,31 +142,19 @@ impl OpenAiCompatibleClient {
         body: ChatCompletionRequest,
         cancel: Option<&AtomicBool>,
     ) -> AppResult<ModelResponse> {
-        let response = self.post_completion(body, cancel.is_some())?;
-        let reader =
-            ResponseBodyReader::new(response.into_reader(), cancel, self.stream_idle_timeout);
-        let body = read_non_stream_body(reader)?;
-        serde_json::from_slice::<ChatCompletionResponse>(&body)
-            .map_err(|error| AppError::Provider(error.to_string()))?
-            .into_model_response()
+        let response = self.post_completion(body)?;
+        match cancel {
+            Some(cancel) => read_non_stream_response_with_cancel(response, cancel),
+            None => parse_non_stream_response(response.into_reader()),
+        }
     }
 
-    fn post_completion(
-        &self,
-        body: ChatCompletionRequest,
-        cancellation_observable: bool,
-    ) -> AppResult<ureq::Response> {
+    fn post_completion(&self, body: ChatCompletionRequest) -> AppResult<ureq::Response> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let read_timeout = if cancellation_observable {
-            self.stream_idle_timeout
-                .min(RESPONSE_READ_CANCEL_POLL_INTERVAL)
-        } else {
-            self.stream_idle_timeout
-        };
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(self.connect_timeout)
             .timeout_write(self.connect_timeout)
-            .timeout_read(read_timeout)
+            .timeout_read(self.stream_idle_timeout)
             .build();
         self.authorized_post(&agent, &url)
             .send_json(body)
@@ -195,122 +190,160 @@ fn provider_send_error(error: ureq::Error) -> AppError {
     }
 }
 
-struct ResponseBodyReader<'a, R> {
-    inner: R,
-    cancel: Option<&'a AtomicBool>,
-    idle_timeout: Duration,
-    idle_deadline: Option<Instant>,
+// Keep ureq's blocking body reads off the run thread; rendezvous delivery leaves
+// every result and user-visible delta under the run thread's cancel check.
+enum StreamingBodyMessage {
+    Delta(String),
+    Finished(AppResult<ModelResponse>),
 }
 
-impl<'a, R> ResponseBodyReader<'a, R> {
-    fn new(inner: R, cancel: Option<&'a AtomicBool>, idle_timeout: Duration) -> Self {
-        Self {
-            inner,
-            cancel,
-            idle_timeout,
-            idle_deadline: Instant::now().checked_add(idle_timeout),
-        }
-    }
-
-    fn cancellation_requested(&self) -> bool {
-        self.cancel
-            .is_some_and(|cancel| cancel.load(Ordering::SeqCst))
-    }
-
-    fn reset_idle_deadline(&mut self) {
-        self.idle_deadline = Instant::now().checked_add(self.idle_timeout);
-    }
-
-    fn idle_deadline_elapsed(&self) -> bool {
-        self.idle_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-    }
-
-    fn remaining_idle(&self) -> Duration {
-        self.idle_deadline
-            .map_or(RESPONSE_READ_CANCEL_POLL_INTERVAL, |deadline| {
-                deadline.saturating_duration_since(Instant::now())
-            })
-    }
+fn parse_non_stream_response(reader: impl Read) -> AppResult<ModelResponse> {
+    let body = read_non_stream_body(reader)?;
+    serde_json::from_slice::<ChatCompletionResponse>(&body)
+        .map_err(|error| AppError::Provider(error.to_string()))?
+        .into_model_response()
 }
 
-impl<R: Read> Read for ResponseBodyReader<'_, R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
+fn read_non_stream_response_with_cancel(
+    response: ureq::Response,
+    cancel: &AtomicBool,
+) -> AppResult<ModelResponse> {
+    let (result_sender, result_receiver) = mpsc::sync_channel(0);
+    let worker = thread::Builder::new()
+        .name("plato-provider-body".into())
+        .spawn(move || {
+            let result = parse_non_stream_response(response.into_reader());
+            let _ = result_sender.send(result);
+        })?;
 
-        loop {
-            if self.cancellation_requested() {
-                return Err(response_read_canceled());
+    receive_body_result(result_receiver, cancel, worker)
+}
+
+fn read_streaming_response_with_cancel(
+    response: ureq::Response,
+    cancel: &AtomicBool,
+    on_delta: &mut impl FnMut(&str) -> AppResult<()>,
+) -> AppResult<ModelResponse> {
+    let (message_sender, message_receiver) = mpsc::sync_channel(0);
+    let worker = thread::Builder::new()
+        .name("plato-provider-stream".into())
+        .spawn(move || {
+            let result = parse_chat_completion_stream(
+                BufReader::new(response.into_reader()),
+                &mut |delta| {
+                    message_sender
+                        .send(StreamingBodyMessage::Delta(delta.to_owned()))
+                        .map_err(|_| AppError::RunCanceled)
+                },
+            );
+            let _ = message_sender.send(StreamingBodyMessage::Finished(result));
+        })?;
+
+    loop {
+        check_response_read_cancel(cancel)?;
+        match message_receiver.recv_timeout(RESPONSE_READ_CANCEL_POLL_INTERVAL) {
+            Ok(StreamingBodyMessage::Delta(delta)) => {
+                check_response_read_cancel(cancel)?;
+                on_delta(&delta)?;
             }
-
-            let poll_started = Instant::now();
-            match self.inner.read(buffer) {
-                Ok(0) => return Ok(0),
-                Ok(read) => {
-                    self.reset_idle_deadline();
-                    return Ok(read);
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                    ) =>
-                {
-                    if self.cancellation_requested() {
-                        return Err(response_read_canceled());
-                    }
-                    if self.idle_deadline_elapsed() {
-                        return Err(error);
-                    }
-
-                    let remaining_poll =
-                        RESPONSE_READ_CANCEL_POLL_INTERVAL.saturating_sub(poll_started.elapsed());
-                    let wait = remaining_poll.min(self.remaining_idle());
-                    if !wait.is_zero() {
-                        std::thread::sleep(wait);
-                    }
-                }
-                Err(error) => return Err(error),
+            Ok(StreamingBodyMessage::Finished(result)) => {
+                check_response_read_cancel(cancel)?;
+                join_response_body_worker(worker)?;
+                return result;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(response_body_worker_error(worker));
             }
         }
     }
 }
 
-#[derive(Debug)]
-struct ResponseReadCanceled;
-
-impl std::fmt::Display for ResponseReadCanceled {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("provider response read canceled")
+fn receive_body_result<T>(
+    result_receiver: mpsc::Receiver<AppResult<T>>,
+    cancel: &AtomicBool,
+    worker: thread::JoinHandle<()>,
+) -> AppResult<T> {
+    loop {
+        check_response_read_cancel(cancel)?;
+        match result_receiver.recv_timeout(RESPONSE_READ_CANCEL_POLL_INTERVAL) {
+            Ok(result) => {
+                check_response_read_cancel(cancel)?;
+                join_response_body_worker(worker)?;
+                return result;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(response_body_worker_error(worker));
+            }
+        }
     }
 }
 
-impl std::error::Error for ResponseReadCanceled {}
-
-fn response_read_canceled() -> io::Error {
-    io::Error::other(ResponseReadCanceled)
+fn check_response_read_cancel(cancel: &AtomicBool) -> AppResult<()> {
+    if cancel.load(Ordering::SeqCst) {
+        record_response_read_cancel_observation();
+        return Err(AppError::RunCanceled);
+    }
+    Ok(())
 }
 
-fn response_body_read_error(error: io::Error) -> AppError {
-    if error
-        .get_ref()
-        .and_then(|source| source.downcast_ref::<ResponseReadCanceled>())
-        .is_some()
-    {
-        AppError::RunCanceled
-    } else {
-        AppError::Io(error)
+fn join_response_body_worker(worker: thread::JoinHandle<()>) -> AppResult<()> {
+    worker.join().map_err(|_| {
+        AppError::Provider("provider response body worker panicked after returning a result".into())
+    })
+}
+
+fn response_body_worker_error(worker: thread::JoinHandle<()>) -> AppError {
+    match worker.join() {
+        Ok(()) => AppError::Provider("provider response body worker ended without a result".into()),
+        Err(_) => AppError::Provider("provider response body worker panicked".into()),
     }
 }
+
+#[cfg(test)]
+std::thread_local! {
+    static RESPONSE_READ_CANCEL_OBSERVER: std::cell::RefCell<Option<mpsc::Sender<std::time::Instant>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_response_read_cancel_observer<T>(
+    observer: mpsc::Sender<std::time::Instant>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct ObserverGuard(Option<mpsc::Sender<std::time::Instant>>);
+
+    impl Drop for ObserverGuard {
+        fn drop(&mut self) {
+            RESPONSE_READ_CANCEL_OBSERVER.with(|slot| {
+                slot.replace(self.0.take());
+            });
+        }
+    }
+
+    let previous = RESPONSE_READ_CANCEL_OBSERVER.with(|slot| slot.replace(Some(observer)));
+    let _guard = ObserverGuard(previous);
+    run()
+}
+
+#[cfg(test)]
+fn record_response_read_cancel_observation() {
+    RESPONSE_READ_CANCEL_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow_mut().take() {
+            let _ = observer.send(std::time::Instant::now());
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn record_response_read_cancel_observation() {}
 
 fn read_non_stream_body(reader: impl Read) -> AppResult<Vec<u8>> {
     let mut body = Vec::new();
     reader
         .take((MAX_NON_STREAM_BODY_BYTES + 1) as u64)
-        .read_to_end(&mut body)
-        .map_err(response_body_read_error)?;
+        .read_to_end(&mut body)?;
     if body.len() > MAX_NON_STREAM_BODY_BYTES {
         return Err(AppError::Provider(NON_STREAM_BODY_LIMIT_ERROR.into()));
     }
@@ -687,8 +720,7 @@ fn parse_chat_completion_stream(
             (MAX_DECODED_RESPONSE_BYTES - decoded_bytes).min(MAX_SSE_EVENT_BYTES - event_bytes);
         let read = Read::by_ref(&mut reader)
             .take((remaining + 1) as u64)
-            .read_until(b'\n', &mut line)
-            .map_err(response_body_read_error)?;
+            .read_until(b'\n', &mut line)?;
         if read == 0 {
             break;
         }
@@ -1364,6 +1396,59 @@ mod tests {
     }
 
     #[test]
+    fn cancellable_429_wait_keeps_the_configured_response_header_deadline() {
+        assert!(RESPONSE_READ_CANCEL_POLL_INTERVAL <= Duration::from_millis(100));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (request_sender, request_receiver) = mpsc::channel();
+        let (response_sender, response_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_provider_request(&mut stream);
+            request_sender.send(()).unwrap();
+            response_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 429 Too Many Requests\r\nretry-after: 0.1\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        let client = timeout_test_client(base_url, 2_000, 500);
+        let cancel = AtomicBool::new(false);
+        let (result_sender, result_receiver) = mpsc::channel();
+        let request = thread::spawn(move || {
+            result_sender
+                .send(client.send_with_cancel(&reasoning_request(None), Some(&cancel)))
+                .unwrap();
+        });
+
+        request_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(matches!(
+            result_receiver.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        response_sender.send(()).unwrap();
+        let error = result_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        request.join().unwrap();
+        server.join().unwrap();
+
+        assert!(matches!(
+            error,
+            AppError::ProviderCompletionRateLimited {
+                retry_after_seconds: Some(seconds)
+            } if seconds == 0.1
+        ));
+    }
+
+    #[test]
     fn streaming_response_stall_uses_idle_budget() {
         let (stop_sender, stop_receiver) = mpsc::channel();
         let first = sse_delta("start");
@@ -1601,13 +1686,7 @@ mod tests {
             AppError::Provider(message) if message == "provider stream ended before [DONE]"
         ));
 
-        let cancel = AtomicBool::new(false);
-        let reader = ResponseBodyReader::new(
-            FixedReadError(ErrorKind::ConnectionReset),
-            Some(&cancel),
-            Duration::from_secs(1),
-        );
-        let error = read_non_stream_body(reader).unwrap_err();
+        let error = read_non_stream_body(FixedReadError(ErrorKind::ConnectionReset)).unwrap_err();
         assert!(matches!(
             error,
             AppError::Io(error) if error.kind() == ErrorKind::ConnectionReset
