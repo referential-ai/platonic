@@ -144,6 +144,82 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
 }
 
 #[test]
+fn bare_plato_status_modal_sends_one_read_only_request_and_escape_closes() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+
+    let workspace_id = paths::workspace_id(&workspace).unwrap();
+    let endpoint = runtime
+        .join("plato-agent")
+        .join("workspaces")
+        .join(&workspace_id)
+        .join("agent.sock");
+    let ledger = state.join("fake-agent.db");
+    let fake = FakeDaemon::bind(&endpoint, &workspace, &workspace_id, &ledger);
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        br#"pre=$(stty -g); printf '\n%sPRE:%s\n' "$PTY_MARK" "$pre"; "$PLATO_BIN"; status=$?; post=$(stty -g); printf '\n%sPOST:%s\n%sSTATUS:%s\n' "$PTY_MARK" "$post" "$PTY_MARK" "$status"
+"#,
+    );
+    let before_termios = shell.wait_for_marker("PRE");
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Try \"read README.md and summarize it\"",
+    );
+
+    shell.write(b"/status\r");
+    let request = fake.wait_for_request("daemon.status");
+    let params = request.params.as_ref().unwrap();
+    assert!(params["session_id"].is_null());
+    assert!(params["config_path"].is_null());
+    let modal = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "TRUST");
+    for heading in ["MODEL", "DAEMON", "SESSION", "USAGE", "TRUST"] {
+        assert!(modal.contains(heading), "missing {heading}: {modal}");
+    }
+    assert!(modal.contains("~openai/gpt-latest"));
+    assert!(modal.contains("served model    unknown"));
+    assert!(modal.contains("selected        none"));
+    assert!(modal.contains("Esc close"));
+
+    shell.write(b"g");
+    thread::sleep(Duration::from_millis(50));
+    assert!(fake.requests_for("approval.decide").is_empty());
+    assert_eq!(fake.requests_for("daemon.status").len(), 1);
+
+    shell.write(b"\x1b");
+    let closed = shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "MODEL");
+    assert!(closed.contains("Plato Agent"));
+    shell.write(b"q");
+
+    let after_termios = shell.wait_for_marker("POST");
+    assert_eq!(after_termios, before_termios);
+    assert_eq!(shell.wait_for_marker("STATUS"), "0");
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+
+    let requests = fake.finish();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method.as_deref() == Some("daemon.status"))
+            .count(),
+        1
+    );
+    assert!(!requests.iter().any(|request| matches!(
+        request.method.as_deref(),
+        Some("run.start" | "message.append" | "approval.decide" | "run.cancel")
+    )));
+}
+
+#[test]
 fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -923,6 +999,7 @@ fn fake_response(
                     "transcript.read",
                     "transcript.read.typed",
                     "transcript.read.pending_approval",
+                    "daemon.status",
                     "approval.decide"
                 ]
             })
@@ -1015,6 +1092,45 @@ fn fake_response(
             "ledger_path": ledger.to_string_lossy(),
             "status": "running",
             "final_answer": null
+        }),
+        "daemon.status" => json!({
+            "model": {
+                "requested_alias": "~openai/gpt-latest",
+                "served_model": null,
+                "provider_kind": "open_router",
+                "key_present": false
+            },
+            "daemon": {
+                "package_version": "0.1.0",
+                "build_commit": null,
+                "build_date_utc": null,
+                "uptime_ms": 42,
+                "endpoint_path": "/tmp/fake-agent.sock",
+                "workspace_id": workspace_id
+            },
+            "session": {
+                "session_id": null,
+                "latest_run_id": null,
+                "human_turn_count": 0,
+                "ledger_path": ledger.to_string_lossy(),
+                "core_event_count": 0
+            },
+            "usage": {
+                "last_run": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "unknown_response_count": 0
+                },
+                "session": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "unknown_response_count": 0
+                }
+            },
+            "trust": {
+                "approval_granted_count": 0,
+                "approval_denied_count": 0
+            }
         }),
         "events.stream" => {
             let from_offset = request

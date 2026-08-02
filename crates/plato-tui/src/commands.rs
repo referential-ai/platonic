@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlashCommandAction {
     Help,
+    Status,
     Clear,
     Sessions,
     NewSession,
@@ -41,6 +42,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "issue-prep",
         description: "prepare and review an issue",
         action: SlashCommandAction::IssuePrep,
+    },
+    SlashCommandSpec {
+        name: "status",
+        description: "show authoritative runtime status",
+        action: SlashCommandAction::Status,
     },
     SlashCommandSpec {
         name: "reconnect",

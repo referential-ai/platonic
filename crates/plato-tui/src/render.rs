@@ -16,7 +16,10 @@ use super::{
     },
 };
 use crate::commands::{SLASH_COMMANDS, matching_slash_commands};
-use plato_protocol::{ModelIdentityStatus, RunStateName, TypedRun, TypedTranscriptEntry};
+use plato_protocol::{
+    DaemonStatusResult, DaemonStatusTokenUsage, ModelIdentityStatus, RunStateName, TypedRun,
+    TypedTranscriptEntry,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SESSION_STATUS_WIDTH: usize = 16;
@@ -41,6 +44,9 @@ fn render_at(frame: &mut Frame<'_>, state: &TuiState, now_ms: u64) {
     }
     if let Some(approval) = &state.approval {
         render_approval_modal(frame, frame.area(), approval);
+    }
+    if let Some(status) = &state.status_modal {
+        render_status_modal(frame, frame.area(), status);
     }
 }
 
@@ -1288,7 +1294,7 @@ fn format_elapsed(seconds: u64) -> String {
 }
 
 fn render_help_modal(frame: &mut Frame<'_>, area: Rect) {
-    let area = centered_rect(68, 92, area);
+    let area = centered_rect(68, 100, area);
     let mut lines = vec![Line::from(vec![Span::styled(
         "Commands",
         Style::default().add_modifier(Modifier::BOLD),
@@ -1326,6 +1332,98 @@ fn render_help_modal(frame: &mut Frame<'_>, area: Rect) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn render_status_modal(frame: &mut Frame<'_>, area: Rect, status: &DaemonStatusResult) {
+    let area = status_modal_rect(area);
+    let lines = vec![
+        modal_heading("MODEL"),
+        Line::from(format!("requested alias  {}", status.model.requested_alias)),
+        Line::from(format!(
+            "served model    {}",
+            known_or_unknown(status.model.served_model.as_deref())
+        )),
+        Line::from(format!(
+            "provider        {}    key present: {}",
+            status.model.provider_kind, status.model.key_present
+        )),
+        modal_heading("DAEMON"),
+        Line::from(format!(
+            "package         {}    commit {}",
+            status.daemon.package_version,
+            known_or_unknown(status.daemon.build_commit.as_deref())
+        )),
+        Line::from(format!(
+            "build UTC       {}    uptime {} ms",
+            known_or_unknown(status.daemon.build_date_utc.as_deref()),
+            status.daemon.uptime_ms
+        )),
+        Line::from(format!("endpoint        {}", status.daemon.endpoint_path)),
+        Line::from(format!("workspace       {}", status.daemon.workspace_id)),
+        modal_heading("SESSION"),
+        Line::from(format!(
+            "selected        {}",
+            selected_or_none(status.session.session_id.as_deref())
+        )),
+        Line::from(format!(
+            "latest run      {}",
+            selected_or_none(status.session.latest_run_id.as_deref())
+        )),
+        Line::from(format!(
+            "human turns     {}    core events {}",
+            status.session.human_turn_count, status.session.core_event_count
+        )),
+        Line::from(format!("ledger          {}", status.session.ledger_path)),
+        modal_heading("USAGE"),
+        usage_line("last run", &status.usage.last_run),
+        usage_line("session", &status.usage.session),
+        modal_heading("TRUST"),
+        Line::from(format!(
+            "granted         {}    denied {}",
+            status.trust.approval_granted_count, status.trust.approval_denied_count
+        )),
+        Line::from("Esc close"),
+    ];
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Status")),
+        area,
+    );
+}
+
+fn status_modal_rect(area: Rect) -> Rect {
+    let width = (area.width.saturating_mul(92) / 100).max(1);
+    let height = area.height.clamp(1, 22);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn modal_heading(heading: &'static str) -> Line<'static> {
+    Line::from(Span::styled(
+        heading,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn usage_line(label: &str, usage: &DaemonStatusTokenUsage) -> Line<'static> {
+    Line::from(format!(
+        "{label:<9} input {}    output {}    unknown {}",
+        usage.input_tokens, usage.output_tokens, usage.unknown_response_count
+    ))
+}
+
+fn known_or_unknown(value: Option<&str>) -> &str {
+    value.unwrap_or("unknown")
+}
+
+fn selected_or_none(value: Option<&str>) -> &str {
+    value.unwrap_or("none")
 }
 
 fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState, now_ms: u64) {
@@ -2419,6 +2517,7 @@ mod tests {
 
         assert!(output.contains("Help"));
         assert!(output.contains("/help"));
+        assert!(output.contains("/status"));
         assert!(output.contains("/clear"));
         assert!(output.contains("/issue-prep"));
         assert!(output.contains("/reconnect"));
@@ -2426,6 +2525,40 @@ mod tests {
         assert!(output.contains("PgUp/PgDown"));
         assert!(output.contains("toggle conversation/audit"));
         assert!(output.contains("Ctrl-C"));
+        assert!(output.contains("Esc or q     close"));
+    }
+
+    #[test]
+    fn status_modal_has_stable_normal_and_narrow_read_only_snapshots() {
+        const SECRET: &str = "plato-status-secret-sentinel-355";
+        let mut state = conversation_fixture();
+        state.status_modal = Some(status_fixture());
+
+        let normal = focused_snapshot(&state, 100, 24);
+        let narrow = focused_snapshot(&state, 48, 24);
+
+        for snapshot in [&normal, &narrow] {
+            let mut previous = 0;
+            for heading in ["MODEL", "DAEMON", "SESSION", "USAGE", "TRUST"] {
+                assert_eq!(snapshot.matches(heading).count(), 1, "{snapshot}");
+                let position = snapshot.find(heading).unwrap();
+                assert!(
+                    position >= previous,
+                    "headings overlapped or reordered: {snapshot}"
+                );
+                previous = position;
+            }
+            assert!(snapshot.contains("Esc close"));
+            assert!(!snapshot.contains(SECRET));
+            assert!(snapshot.lines().count() <= 24);
+        }
+        assert!(normal.contains("~openai/gpt-latest"));
+        assert!(normal.contains("openai/gpt-5.5-2026-08-01"));
+        assert!(normal.contains("0123456789abcdef0123456789abcdef01234567"));
+        assert!(normal.contains("human turns     2    core events 17"));
+        assert!(normal.contains("last run  input 7    output 3    unknown 1"));
+        assert!(normal.contains("session   input 17    output 8    unknown 2"));
+        assert!(normal.contains("granted         2    denied 1"));
     }
 
     #[test]
@@ -2891,6 +3024,49 @@ mod tests {
                 .with_run_id("run_beta_full_identifier"),
         ];
         state
+    }
+
+    fn status_fixture() -> DaemonStatusResult {
+        serde_json::from_value(serde_json::json!({
+            "model": {
+                "requested_alias": "~openai/gpt-latest",
+                "served_model": "openai/gpt-5.5-2026-08-01",
+                "provider_kind": "open_router",
+                "key_present": true
+            },
+            "daemon": {
+                "package_version": "0.1.0",
+                "build_commit": "0123456789abcdef0123456789abcdef01234567",
+                "build_date_utc": "2026-08-01",
+                "uptime_ms": 42,
+                "endpoint_path": "/tmp/agent.sock",
+                "workspace_id": "work-1234"
+            },
+            "session": {
+                "session_id": "session_1",
+                "latest_run_id": "run_2",
+                "human_turn_count": 2,
+                "ledger_path": "/tmp/agent.db",
+                "core_event_count": 17
+            },
+            "usage": {
+                "last_run": {
+                    "input_tokens": 7,
+                    "output_tokens": 3,
+                    "unknown_response_count": 1
+                },
+                "session": {
+                    "input_tokens": 17,
+                    "output_tokens": 8,
+                    "unknown_response_count": 2
+                }
+            },
+            "trust": {
+                "approval_granted_count": 2,
+                "approval_denied_count": 1
+            }
+        }))
+        .unwrap()
     }
 
     fn approval_trace_fixture() -> TuiState {

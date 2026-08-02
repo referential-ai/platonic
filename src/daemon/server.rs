@@ -729,10 +729,11 @@ mod tests {
         daemon::{
             client::DaemonClient,
             protocol::{
-                ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
-                ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
-                ERROR_SESSIONS_LIST_FAILED, ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind,
-                ProtocolError, RunStateName, ShutdownIfIdleResultName, StreamEvent,
+                DaemonStatusProviderKind, DaemonStatusResult, ERROR_DAEMON_SHUTTING_DOWN,
+                ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
+                ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED,
+                ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind, ProtocolError, RunStateName,
+                ShutdownIfIdleResultName, StreamEvent,
             },
             runtime::{MAX_EVENT_BUFFER, MAX_TERMINAL_RUNS, PendingApproval, RunRecord},
         },
@@ -1093,9 +1094,123 @@ mod tests {
                 "transcript.read",
                 "transcript.read.typed",
                 "transcript.read.pending_approval",
+                "daemon.status",
                 "daemon.shutdown_if_idle"
             ])
         );
+    }
+
+    #[test]
+    fn daemon_status_uses_authorized_config_and_keeps_secrets_out_of_every_response() {
+        const KEY_ENV: &str = "PLATO_STATUS_TEST_SECRET_NAME";
+        const SECRET: &str = "plato-status-secret-sentinel-355";
+
+        temp_env::with_var(KEY_ENV, Some(SECRET), || {
+            let workspace = tempfile::tempdir().unwrap();
+            let socket_dir = tempfile::tempdir().unwrap();
+            let config_path = workspace.path().join("status.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+[provider]
+kind = "open_ai"
+model = "requested-status-alias"
+api_key_env = "{KEY_ENV}"
+base_url = "https://example.invalid/v1"
+"#,
+                ),
+            )
+            .unwrap();
+            let server = DaemonServer::bind(
+                workspace.path(),
+                Some(socket_dir.path().join("status.sock")),
+            )
+            .unwrap();
+            let paths = server.paths().clone();
+            let request = |id: &str, session_id: Option<&str>, config_path: &Path| {
+                json!({
+                    "v": 1,
+                    "id": id,
+                    "kind": "request",
+                    "method": "daemon.status",
+                    "params": {
+                        "session_id": session_id,
+                        "config_path": config_path
+                    }
+                })
+                .to_string()
+            };
+
+            let first = server.handle_line(&request("status_1", None, &config_path));
+            let first_wire = serde_json::to_string(&first).unwrap();
+            let first: DaemonStatusResult = serde_json::from_value(first.result.unwrap()).unwrap();
+            thread::sleep(Duration::from_millis(5));
+            let second = server.handle_line(&request("status_2", None, &config_path));
+            let second_wire = serde_json::to_string(&second).unwrap();
+            let second: DaemonStatusResult =
+                serde_json::from_value(second.result.unwrap()).unwrap();
+
+            assert_eq!(first.model.requested_alias, "requested-status-alias");
+            assert_eq!(first.model.served_model, None);
+            assert_eq!(first.model.provider_kind, DaemonStatusProviderKind::OpenAi);
+            assert!(first.model.key_present);
+            assert_eq!(
+                first.daemon.endpoint_path,
+                paths.socket_path.to_string_lossy()
+            );
+            assert_eq!(first.daemon.workspace_id, paths.workspace_id);
+            let mut build_identity = plato_protocol::BUILD_IDENTITY.split_whitespace();
+            assert_eq!(first.daemon.package_version, build_identity.next().unwrap());
+            assert_eq!(
+                first.daemon.build_commit.as_deref(),
+                build_identity.next().filter(|part| *part != "unknown")
+            );
+            assert_eq!(
+                first.daemon.build_date_utc.as_deref(),
+                build_identity.next().filter(|part| *part != "unknown")
+            );
+            assert!(second.daemon.uptime_ms > first.daemon.uptime_ms);
+            assert_eq!(first.session.session_id, None);
+            assert_eq!(first.session.latest_run_id, None);
+            assert_eq!(first.session.human_turn_count, 0);
+            assert_eq!(first.session.core_event_count, 0);
+            assert_eq!(first.usage.last_run.unknown_response_count, 0);
+            assert_eq!(first.usage.session.unknown_response_count, 0);
+            assert_eq!(first.trust.approval_granted_count, 0);
+            assert_eq!(first.trust.approval_denied_count, 0);
+            assert!(!paths.ledger_path.exists());
+            for wire in [&first_wire, &second_wire] {
+                assert!(!wire.contains(KEY_ENV));
+                assert!(!wire.contains(SECRET));
+            }
+
+            let missing = server.handle_line(&request(
+                "status_missing",
+                Some("missing-session"),
+                &config_path,
+            ));
+            assert_eq!(missing.kind, EnvelopeKind::Error);
+            assert_eq!(missing.error.as_ref().unwrap().code, ERROR_NOT_FOUND);
+            let missing_wire = serde_json::to_string(&missing).unwrap();
+            assert!(!missing_wire.contains(KEY_ENV));
+            assert!(!missing_wire.contains(SECRET));
+
+            let invalid_config = workspace.path().join("invalid-status.toml");
+            fs::write(
+                &invalid_config,
+                format!(
+                    "[provider]\nkind = \"open_ai\"\napi_key_env = \"{KEY_ENV}\"\nfuture = \"{SECRET}\"\n"
+                ),
+            )
+            .unwrap();
+            let invalid = server.handle_line(&request("status_invalid", None, &invalid_config));
+            assert_eq!(invalid.kind, EnvelopeKind::Error);
+            assert_eq!(invalid.error.as_ref().unwrap().code, ERROR_INTERNAL);
+            let invalid_wire = serde_json::to_string(&invalid).unwrap();
+            assert!(!invalid_wire.contains(KEY_ENV));
+            assert!(!invalid_wire.contains(SECRET));
+        });
     }
 
     #[test]

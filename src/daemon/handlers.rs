@@ -1,17 +1,21 @@
 use crate::{
     AppError, AppResult, ApprovalMode, RunEvent, RunLedger, RunOptions, RunOutcome, RunSession,
+    config::{Config, ProviderKind},
     daemon::{
         protocol::{
             ApprovalDecideParams, ApprovalDecision, ApprovalDecisionName, CAPABILITIES,
-            CommandAcceptedResult, ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL,
-            ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED, ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND,
-            ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED, ERROR_UNSUPPORTED_METHOD,
-            ERROR_WORKSPACE_MISMATCH, Envelope, EventsStreamParams, EventsStreamResult,
-            HelloParams, HelloResult, IssuePrepResult, IssuePrepStartParams, IssuePrepStartResult,
-            MessageAppendParams, ModelIdentityStatus, RunCancelParams, RunStartParams,
-            RunStartResult, RunStateName, SessionSummary, SessionsListResult, ShutdownIfIdleResult,
-            ShutdownIfIdleResultName, StreamEvent, TranscriptReadParams, TranscriptReadResult,
-            TypedRun, TypedTranscript, TypedTranscriptEntry, decode_request,
+            CommandAcceptedResult, DaemonStatusDaemon, DaemonStatusModel, DaemonStatusParams,
+            DaemonStatusProviderKind, DaemonStatusResult, DaemonStatusSession,
+            DaemonStatusTokenUsage, DaemonStatusTrust, DaemonStatusUsage,
+            ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
+            ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
+            ERROR_SESSIONS_LIST_FAILED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH,
+            Envelope, EventsStreamParams, EventsStreamResult, HelloParams, HelloResult,
+            IssuePrepResult, IssuePrepStartParams, IssuePrepStartResult, MessageAppendParams,
+            ModelIdentityStatus, RunCancelParams, RunStartParams, RunStartResult, RunStateName,
+            SessionSummary, SessionsListResult, ShutdownIfIdleResult, ShutdownIfIdleResultName,
+            StreamEvent, TranscriptReadParams, TranscriptReadResult, TypedRun, TypedTranscript,
+            TypedTranscriptEntry, decode_request,
         },
         runtime::{
             DaemonRuntime, IssuePrepAdmissionError, RunAdmissionError, RunRecord,
@@ -19,7 +23,7 @@ use crate::{
         },
     },
     issue_prep::{IssuePrepOptions, IssuePrepOutcome, run_issue_prep},
-    ledger::{SessionRunRecords, SqliteLedger},
+    ledger::{PersistedTokenUsage, SessionRunRecords, SqliteLedger},
     model::RunOverrides,
     new_run_id, new_session_id,
     paths::DefaultSqlitePath,
@@ -29,7 +33,7 @@ use crate::{
 };
 use platonic_core::{HarnessEvent, ReadbackEntry, RecordedEvent, RunReadback};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering, mpsc},
     thread,
 };
@@ -67,6 +71,9 @@ fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
         }
         Some("run.cancel") => handle_with_params(runtime, request, "run.cancel", handle_run_cancel),
         Some("sessions.list") => handle_sessions_list(runtime, request),
+        Some("daemon.status") => {
+            handle_with_params(runtime, request, "daemon.status", handle_daemon_status)
+        }
         Some("daemon.shutdown_if_idle") => handle_shutdown_if_idle(runtime, request),
         Some("transcript.read") => {
             handle_with_params(runtime, request, "transcript.read", handle_transcript_read)
@@ -133,6 +140,125 @@ fn handle_hello(runtime: &DaemonRuntime, request: Envelope, params: HelloParams)
             capabilities: CAPABILITIES.into_iter().map(str::to_owned).collect(),
         },
     )
+}
+
+fn handle_daemon_status(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: DaemonStatusParams,
+) -> Envelope {
+    match daemon_status(runtime, params) {
+        Ok(status) => Envelope::response_from(request.id, Some("daemon.status".into()), status),
+        Err(error) => match error {
+            AppError::SessionNotFound(session_id) => Envelope::error(
+                request.id,
+                Some("daemon.status".into()),
+                ERROR_NOT_FOUND,
+                format!("session not found: {session_id}"),
+            ),
+            _ => Envelope::error(
+                request.id,
+                Some("daemon.status".into()),
+                ERROR_INTERNAL,
+                "daemon status readback failed",
+            ),
+        },
+    }
+}
+
+fn daemon_status(
+    runtime: &DaemonRuntime,
+    params: DaemonStatusParams,
+) -> AppResult<DaemonStatusResult> {
+    let config = Config::load(
+        &runtime.paths.workspace_root,
+        params.config_path.as_deref().map(Path::new),
+    )?;
+    let persisted = crate::ledger::default_sqlite_session_status(
+        &runtime.paths.default_ledger(),
+        params.session_id.as_deref(),
+    )?;
+    let ledger_path = runtime.paths.ledger_path.to_string_lossy().into_owned();
+    let (served_model, session, usage, trust) = match persisted {
+        Some(status) => {
+            let usage = DaemonStatusUsage {
+                last_run: protocol_usage(status.last_run_usage),
+                session: protocol_usage(status.session_usage),
+            };
+            let trust = DaemonStatusTrust {
+                approval_granted_count: status.approval_granted_count,
+                approval_denied_count: status.approval_denied_count,
+            };
+            let session = DaemonStatusSession {
+                session_id: Some(status.session_id),
+                latest_run_id: Some(status.latest_run_id),
+                human_turn_count: status.human_turn_count,
+                ledger_path,
+                core_event_count: status.core_event_count,
+            };
+            (status.served_model, session, usage, trust)
+        }
+        None => (
+            None,
+            DaemonStatusSession {
+                session_id: None,
+                latest_run_id: None,
+                human_turn_count: 0,
+                ledger_path,
+                core_event_count: 0,
+            },
+            DaemonStatusUsage {
+                last_run: DaemonStatusTokenUsage::default(),
+                session: DaemonStatusTokenUsage::default(),
+            },
+            DaemonStatusTrust::default(),
+        ),
+    };
+    let (package_version, build_commit, build_date_utc) = build_identity_parts();
+    let provider_kind = match config.provider.kind {
+        ProviderKind::OpenAi => DaemonStatusProviderKind::OpenAi,
+        ProviderKind::OpenRouter => DaemonStatusProviderKind::OpenRouter,
+    };
+
+    Ok(DaemonStatusResult {
+        model: DaemonStatusModel {
+            requested_alias: config.provider.model,
+            served_model,
+            provider_kind,
+            key_present: std::env::var_os(&config.provider.api_key_env).is_some(),
+        },
+        daemon: DaemonStatusDaemon {
+            package_version,
+            build_commit,
+            build_date_utc,
+            uptime_ms: runtime.uptime_ms(),
+            endpoint_path: runtime.paths.socket_path.to_string_lossy().into_owned(),
+            workspace_id: runtime.paths.workspace_id.clone(),
+        },
+        session,
+        usage,
+        trust,
+    })
+}
+
+fn protocol_usage(usage: PersistedTokenUsage) -> DaemonStatusTokenUsage {
+    DaemonStatusTokenUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        unknown_response_count: usage.unknown_response_count,
+    }
+}
+
+fn build_identity_parts() -> (String, Option<String>, Option<String>) {
+    let mut parts = plato_protocol::BUILD_IDENTITY.split_whitespace();
+    let package_version = parts.next().unwrap_or("unknown").into();
+    let build_commit = known_build_part(parts.next());
+    let build_date_utc = known_build_part(parts.next());
+    (package_version, build_commit, build_date_utc)
+}
+
+fn known_build_part(part: Option<&str>) -> Option<String> {
+    part.filter(|part| *part != "unknown").map(str::to_owned)
 }
 
 fn handle_run_start(

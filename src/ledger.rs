@@ -300,6 +300,26 @@ pub struct PersistedSessionSummary {
     pub updated_at_ms: u64,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PersistedTokenUsage {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) unknown_response_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PersistedSessionStatus {
+    pub(crate) session_id: String,
+    pub(crate) latest_run_id: String,
+    pub(crate) human_turn_count: u64,
+    pub(crate) core_event_count: u64,
+    pub(crate) served_model: Option<String>,
+    pub(crate) last_run_usage: PersistedTokenUsage,
+    pub(crate) session_usage: PersistedTokenUsage,
+    pub(crate) approval_granted_count: u64,
+    pub(crate) approval_denied_count: u64,
+}
+
 impl SqliteLedger {
     pub fn open_or_create(path: &Path) -> AppResult<Self> {
         if path.as_os_str().is_empty() {
@@ -799,6 +819,21 @@ impl SqliteLedger {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub(crate) fn session_status(
+        &self,
+        session_id: Option<&str>,
+    ) -> AppResult<Option<PersistedSessionStatus>> {
+        let session = match session_id {
+            Some(session_id) => self.read_session(session_id)?,
+            None => match self.read_latest_session() {
+                Ok(session) => session,
+                Err(AppError::NoSqliteSessions) => return Ok(None),
+                Err(error) => return Err(error),
+            },
+        };
+        Ok(Some(project_session_status(&session)?))
+    }
+
     fn session_exists(&self, session_id: &str) -> AppResult<bool> {
         session_exists_in(&self.connection, session_id)
     }
@@ -891,6 +926,58 @@ impl SqliteLedger {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))?;
         Ok(version)
+    }
+}
+
+fn project_session_status(session: &SessionRecords) -> AppResult<PersistedSessionStatus> {
+    let latest_run = session
+        .runs
+        .last()
+        .ok_or_else(|| AppError::SessionNotFound(session.session_id.clone()))?;
+    let mut status = PersistedSessionStatus {
+        session_id: session.session_id.clone(),
+        latest_run_id: latest_run.run_id.clone(),
+        human_turn_count: session.runs.len() as u64,
+        core_event_count: 0,
+        served_model: None,
+        last_run_usage: PersistedTokenUsage::default(),
+        session_usage: PersistedTokenUsage::default(),
+        approval_granted_count: 0,
+        approval_denied_count: 0,
+    };
+
+    for run in &session.runs {
+        let is_latest_run = run.run_id == latest_run.run_id;
+        status.core_event_count += run.records.len() as u64;
+        for record in &run.records {
+            match &record.event {
+                HarnessEvent::ModelResponded {
+                    served_model,
+                    usage,
+                    ..
+                } => {
+                    status.served_model = served_model.as_ref().map(ToString::to_string);
+                    observe_usage(&mut status.session_usage, usage.as_ref());
+                    if is_latest_run {
+                        observe_usage(&mut status.last_run_usage, usage.as_ref());
+                    }
+                }
+                HarnessEvent::ApprovalGranted { .. } => status.approval_granted_count += 1,
+                HarnessEvent::ApprovalDenied { .. } => status.approval_denied_count += 1,
+                _ => {}
+            }
+        }
+    }
+    Ok(status)
+}
+
+fn observe_usage(aggregate: &mut PersistedTokenUsage, usage: Option<&platonic_core::ModelUsage>) {
+    match usage {
+        Some(usage) => {
+            aggregate.input_tokens += u64::from(usage.input_tokens);
+            aggregate.output_tokens += u64::from(usage.output_tokens);
+        }
+        None => aggregate.unknown_response_count += 1,
     }
 }
 
@@ -1795,6 +1882,21 @@ pub fn default_sqlite_session_summaries(
     SqliteLedger::open_default_readonly(path)?.session_summaries()
 }
 
+pub(crate) fn default_sqlite_session_status(
+    path: &DefaultSqlitePath,
+    session_id: Option<&str>,
+) -> AppResult<Option<PersistedSessionStatus>> {
+    if fs::symlink_metadata(path.as_path())
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return match session_id {
+            Some(session_id) => Err(AppError::SessionNotFound(session_id.into())),
+            None => Ok(None),
+        };
+    }
+    SqliteLedger::open_default_readonly(path)?.session_status(session_id)
+}
+
 pub fn interrupt_orphaned_sqlite_runs(path: &Path) -> AppResult<usize> {
     if !path.exists() {
         return Ok(0);
@@ -1822,8 +1924,8 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use platonic_core::{
-        AgentId, ContextPack, HarnessEvent, Message, MessageRole, ModelName, ModelUsage, RunId,
-        RunReadback, TurnId,
+        ActorId, AgentId, ContextPack, HarnessEvent, Message, MessageRole, ModelName, ModelUsage,
+        PolicyDecision, RunId, RunReadback, ToolCallId, TurnId,
     };
     use serde_json::Value;
     use std::{
@@ -2551,6 +2653,130 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_status_projects_exact_multi_run_usage_trust_and_session_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        ledger
+            .connection
+            .execute_batch(
+                r#"
+                INSERT INTO sessions (session_id, created_at_ms, updated_at_ms)
+                VALUES ('session_1', 10, 20);
+                INSERT INTO session_runs
+                  (session_id, run_id, session_index, question, final_answer, status, error, created_at_ms, updated_at_ms)
+                VALUES
+                  ('session_1', 'run_1', 0, 'first question', 'first answer', 'finished', NULL, 10, 10),
+                  ('session_1', 'run_2', 1, 'second question', 'second answer', 'finished', NULL, 20, 20);
+                "#,
+            )
+            .unwrap();
+
+        append_status_records(
+            &mut ledger,
+            "run_1",
+            vec![
+                status_started_event("run_1"),
+                status_response_event(
+                    "run_1",
+                    "turn_1",
+                    0,
+                    Some("served-old"),
+                    Some(ModelUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    }),
+                ),
+                status_response_event("run_1", "turn_1", 1, Some("served-older"), None),
+                HarnessEvent::ApprovalGranted {
+                    run_id: RunId::new("run_1").unwrap(),
+                    call_id: ToolCallId::new("call_granted_1").unwrap(),
+                    actor_id: ActorId::new("human").unwrap(),
+                },
+                HarnessEvent::PolicyEvaluated {
+                    run_id: RunId::new("run_1").unwrap(),
+                    call_id: ToolCallId::new("call_pending_only").unwrap(),
+                    decision: PolicyDecision::RequireApproval {
+                        reason: "approval required".into(),
+                    },
+                },
+            ],
+        );
+        append_status_records(
+            &mut ledger,
+            "run_2",
+            vec![
+                status_started_event("run_2"),
+                status_response_event(
+                    "run_2",
+                    "turn_2",
+                    0,
+                    None,
+                    Some(ModelUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    }),
+                ),
+                status_response_event("run_2", "turn_2", 1, Some("served-candidate"), None),
+                status_response_event(
+                    "run_2",
+                    "turn_2",
+                    2,
+                    Some("served-latest"),
+                    Some(ModelUsage {
+                        input_tokens: 7,
+                        output_tokens: 3,
+                    }),
+                ),
+                HarnessEvent::ApprovalGranted {
+                    run_id: RunId::new("run_2").unwrap(),
+                    call_id: ToolCallId::new("call_granted_2").unwrap(),
+                    actor_id: ActorId::new("human").unwrap(),
+                },
+                HarnessEvent::ApprovalDenied {
+                    run_id: RunId::new("run_2").unwrap(),
+                    call_id: ToolCallId::new("call_denied_1").unwrap(),
+                    actor_id: ActorId::new("human").unwrap(),
+                    reason: "not now".into(),
+                },
+                HarnessEvent::ApprovalDenied {
+                    run_id: RunId::new("run_2").unwrap(),
+                    call_id: ToolCallId::new("call_denied_2").unwrap(),
+                    actor_id: ActorId::new("human").unwrap(),
+                    reason: "still no".into(),
+                },
+            ],
+        );
+
+        assert_eq!(
+            ledger.session_status(None).unwrap(),
+            Some(PersistedSessionStatus {
+                session_id: "session_1".into(),
+                latest_run_id: "run_2".into(),
+                human_turn_count: 2,
+                core_event_count: 12,
+                served_model: Some("served-latest".into()),
+                last_run_usage: PersistedTokenUsage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    unknown_response_count: 1,
+                },
+                session_usage: PersistedTokenUsage {
+                    input_tokens: 17,
+                    output_tokens: 8,
+                    unknown_response_count: 2,
+                },
+                approval_granted_count: 2,
+                approval_denied_count: 2,
+            })
+        );
+        assert!(matches!(
+            ledger.session_status(Some("missing-session")),
+            Err(AppError::SessionNotFound(session_id)) if session_id == "missing-session"
+        ));
+    }
+
+    #[test]
     fn sqlite_concurrent_sessions_avoid_deferred_write_upgrade_race() {
         FIRST_SESSION_BUSY.store(false, Ordering::SeqCst);
         SECOND_SESSION_BUSY.store(false, Ordering::SeqCst);
@@ -3212,6 +3438,49 @@ mod tests {
                 run_id: RunId::new(run_id).unwrap(),
                 agent_id: AgentId::new("plato").unwrap(),
             },
+        }
+    }
+
+    fn append_status_records(ledger: &mut SqliteLedger, run_id: &str, events: Vec<HarnessEvent>) {
+        for (seq, event) in events.into_iter().enumerate() {
+            ledger
+                .append(
+                    run_id,
+                    &RecordedEvent {
+                        seq: seq as u64,
+                        occurred_at_ms: 100 + seq as u64,
+                        event,
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    fn status_started_event(run_id: &str) -> HarnessEvent {
+        HarnessEvent::RunStarted {
+            run_id: RunId::new(run_id).unwrap(),
+            agent_id: AgentId::new("plato").unwrap(),
+        }
+    }
+
+    fn status_response_event(
+        run_id: &str,
+        turn_id: &str,
+        step: u32,
+        served_model: Option<&str>,
+        usage: Option<ModelUsage>,
+    ) -> HarnessEvent {
+        HarnessEvent::ModelResponded {
+            run_id: RunId::new(run_id).unwrap(),
+            turn_id: TurnId::new(turn_id).unwrap(),
+            step,
+            output: Message {
+                role: MessageRole::Assistant,
+                content: format!("response {step}"),
+            },
+            proposed_calls: vec![],
+            served_model: served_model.map(|model| ModelName::new(model).unwrap()),
+            usage,
         }
     }
 
