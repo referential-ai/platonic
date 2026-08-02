@@ -1,6 +1,7 @@
 #[cfg(windows)]
 use plato_agent::daemon::installer_gate::InstallerStartupGate;
 use plato_agent::{
+    VoiceEvent,
     daemon::{client::DaemonClient, lock::LockMetadata, protocol::ShutdownIfIdleResultName},
     ledger::SqliteLedger,
     paths,
@@ -369,23 +370,77 @@ fn replay_cli_reads_literal_v1_without_mutation_and_rejects_future_schema() {
     );
     assert_eq!(fs::read(&v1_path).unwrap(), bytes_before);
 
-    let v3_path = proof.workspace.join("schema-v3.db");
-    let connection = Connection::open(&v3_path).unwrap();
-    connection.pragma_update(None, "user_version", 3).unwrap();
+    let v4_path = proof.workspace.join("schema-v4.db");
+    let connection = Connection::open(&v4_path).unwrap();
+    connection.pragma_update(None, "user_version", 4).unwrap();
     drop(connection);
-    let v3_bytes_before = fs::read(&v3_path).unwrap();
+    let v4_bytes_before = fs::read(&v4_path).unwrap();
     let future = proof.cli_output(&[
         "replay".into(),
-        format!("--db={}", v3_path.display()).into(),
+        format!("--db={}", v4_path.display()).into(),
     ]);
     assert!(!future.status.success());
     assert!(future.stdout.is_empty());
     assert!(
         String::from_utf8(future.stderr)
             .unwrap()
-            .contains("sqlite schema version mismatch: expected 2, actual 3")
+            .contains("sqlite schema version mismatch: expected 3, actual 4")
     );
-    assert_eq!(fs::read(&v3_path).unwrap(), v3_bytes_before);
+    assert_eq!(fs::read(&v4_path).unwrap(), v4_bytes_before);
+}
+
+#[test]
+fn selected_run_cli_replays_typed_voice_companion_without_writes() {
+    let proof = ProofContext::new();
+    let path = proof.workspace.join("voice-replay.db");
+    seed_sqlite_session(
+        &path,
+        "session_voice",
+        "run_voice",
+        "voice question",
+        "voice answer",
+    );
+    let run_id = RunId::new("run_voice").unwrap();
+    let turn_id = TurnId::new("turn_run_voice").unwrap();
+    let events = [
+        VoiceEvent::VoiceSpoken {
+            run_id: run_id.clone(),
+            turn_id: turn_id.clone(),
+            ttfa_ms: 274,
+            sentence_count: 2,
+            interrupted_at: Some(1),
+        },
+        VoiceEvent::VoiceInterrupted {
+            run_id,
+            turn_id,
+            spoken_prefix: "voice answer".into(),
+            delta_index: 6,
+        },
+    ];
+    let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+    let envelopes = ledger.append_voice_events(&events).unwrap();
+    drop(ledger);
+    let bytes_before = fs::read(&path).unwrap();
+
+    let arguments = [
+        "replay".into(),
+        format!("--db={}", path.display()).into(),
+        "--run".into(),
+        "run_voice".into(),
+    ];
+    let first = proof.cli_output(&arguments);
+    let second = proof.cli_output(&arguments);
+    assert_success("first selected voice replay", &first);
+    assert_success("second selected voice replay", &second);
+    assert_eq!(first.stdout, second.stdout);
+    let stdout = String::from_utf8(first.stdout).unwrap();
+    for envelope in envelopes {
+        assert!(stdout.contains(&format!(
+            "voice_event: {}",
+            serde_json::to_string(&envelope).unwrap()
+        )));
+    }
+    assert_eq!(fs::read(&path).unwrap(), bytes_before);
 }
 
 struct ProofContext {

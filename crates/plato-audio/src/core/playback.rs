@@ -249,6 +249,14 @@ impl PlaybackTimeline {
         })
     }
 
+    pub(crate) fn accepted_to_first_non_silent_us(&self, sequence: u64) -> Option<u64> {
+        let slot = self.checked_slot(sequence).ok()?;
+        let accepted_ns = slot.accepted_ns.load(Ordering::Acquire);
+        let first_non_silent_ns = slot.first_non_silent_ns.load(Ordering::Acquire);
+        (first_non_silent_ns != UNSET)
+            .then(|| first_non_silent_ns.saturating_sub(accepted_ns) / 1_000)
+    }
+
     pub(crate) fn stream_failed(&self) -> bool {
         self.stream_failed.load(Ordering::Acquire)
     }
@@ -642,6 +650,9 @@ mod tests {
         assert_eq!(stopped, [0.0; 4]);
         assert_eq!(callback.consumed_samples, 4);
         assert_eq!(timeline.played_samples(), 4);
+        assert!(timeline.accepted_to_first_non_silent_us(0).is_some());
+        timeline.mark_canceled(0);
+        assert!(timeline.accepted_to_first_non_silent_us(0).is_some());
     }
 
     #[test]

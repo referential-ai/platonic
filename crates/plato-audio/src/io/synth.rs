@@ -390,6 +390,13 @@ impl SynthWorker {
         self.barge_in.metrics()
     }
 
+    /// Reads AU2's acceptance-to-first-audible boundary for a completed or canceled sentence.
+    pub fn accepted_to_first_non_silent_us(&self, sequence: u64) -> Option<u64> {
+        self.shared
+            .timeline
+            .accepted_to_first_non_silent_us(sequence)
+    }
+
     /// Returns a cloneable capture-side handle bound to this worker's cancel atomic.
     pub fn barge_in_handle(&self) -> BargeInHandle {
         self.barge_in.clone()

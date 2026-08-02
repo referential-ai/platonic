@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use plato_agent::{ApprovalMode, RunLedger, RunOptions, RunOverrides, VoiceSession};
+use plato_agent::{ApprovalMode, RunLedger, RunOptions, RunOverrides, VoiceSession, replay_sqlite};
 use plato_audio::{
     CaptureConfig, InputDeviceSelection, KokoroConfig, PlaybackConfig, SentenceCutter,
     SileroConfig, WhisperConfig, capture_devices,
@@ -28,6 +28,8 @@ struct ProofOutput {
     model: plato_audio::KokoroProvenance,
     output: plato_audio::PlaybackDeviceInfo,
     narration: plato_agent::NarrationReport,
+    voice_events: Vec<plato_agent::VoiceEventEnvelope>,
+    voice_replay: String,
     capture: Option<CaptureProof>,
     shutdown: plato_agent::VoiceSessionShutdown,
     synthesis_overlapped_playback: bool,
@@ -77,7 +79,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?,
     };
     let ledger = arguments.events.unwrap_or_else(|| {
-        std::env::temp_dir().join(format!("plato-narrated-run-{}.jsonl", std::process::id()))
+        std::env::temp_dir().join(format!("plato-narrated-run-{}.db", std::process::id()))
     });
     let fixture = arguments.fixture.then(FixtureProvider::start).transpose()?;
     let config_path = fixture
@@ -88,7 +90,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         question: arguments.question,
         config_path,
         overrides: RunOverrides::default(),
-        ledger: RunLedger::Jsonl(ledger.clone()),
+        ledger: RunLedger::Sqlite(ledger.clone()),
         workspace_root: arguments.workspace_root,
         approval_mode: ApprovalMode::Deny {
             actor: "narrated_run_example",
@@ -100,7 +102,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         cancel: None,
         voice_interruption_context: None,
     };
-    let (run, narration, capture) = if arguments.whisper_model.is_some() {
+    let (run, narration, voice_events, capture) = if arguments.whisper_model.is_some() {
         let outcome = voice.capture_question(options, arguments.capture_timeout)?;
         let capture = CaptureProof {
             timing_boundary: "closing CaptureWorker vad.push evaluation entry through one final Transcript construction; warm resident model/session loads excluded",
@@ -143,7 +145,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             || capture.report.vad_close_to_final_us > 120_000
             || capture.vad_metrics.session_loads != 1
             || capture.vad_metrics.inference_frames == 0
-            || capture.vad_metrics.state_resets != 1
+            || capture.vad_metrics.state_resets != 2
             || capture.ort_runtime.environment_instances != 1
             || capture.ort_runtime.session_loads != 2
             || capture.vad.ort_runtime_owner != voice.provenance().ort_runtime_owner
@@ -164,11 +166,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         (
             outcome.narrated.run,
             outcome.narrated.narration,
+            outcome.narrated.voice_events,
             Some(capture),
         )
     } else {
         let outcome = voice.run_question(options)?;
-        (outcome.run, outcome.narration, None)
+        (outcome.run, outcome.narration, outcome.voice_events, None)
     };
     if let Some(fixture) = fixture {
         fixture.finish()?;
@@ -203,8 +206,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let model = voice.provenance().clone();
     let output = voice.device_info().clone();
     let shutdown = voice.shutdown()?;
+    let voice_replay = replay_sqlite(&ledger, Some(run.run_id.as_str()))?;
     let proof = ProofOutput {
-        schema: "plato_agent.narrated_run.v4",
+        schema: "plato_agent.narrated_run.v5",
         run_id: run.run_id.to_string(),
         final_answer: run.final_answer,
         ledger: ledger.display().to_string(),
@@ -216,6 +220,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         model,
         output,
         narration,
+        voice_events,
+        voice_replay,
         capture,
         shutdown,
         synthesis_overlapped_playback,
@@ -314,7 +320,7 @@ impl Arguments {
                 }
                 "-h" | "--help" => {
                     println!(
-                        "Usage: narrated_run --model-dir PATH [--config PATH] [--events PATH]\n\
+                        "Usage: narrated_run --model-dir PATH [--config PATH] [--events SQLITE_PATH]\n\
                          \x20      [--workspace-root PATH] [--fixture] [QUESTION ...]\n\
                          \x20      [--whisper-model PATH --silero-model PATH]\n\
                          \x20      [--input-device CPAL_ID]\n\

@@ -14,6 +14,7 @@ pub mod tool_catalog;
 pub mod tools;
 pub mod tui;
 pub mod voice;
+pub mod voice_session;
 
 pub use tools::github::issues as issue_prep;
 
@@ -32,3 +33,4 @@ pub use voice::{
     CapturedRunOutcome, NarratedRunOutcome, NarratedSentenceReport, NarrationReport, VoiceError,
     VoiceRunError, VoiceSession, VoiceSessionShutdown,
 };
+pub use voice_session::{VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope};

@@ -26,7 +26,12 @@ fn replay_open_sqlite(ledger: &SqliteLedger, run_id: Option<&str>) -> AppResult<
     if let Some(run_id) = run_id {
         let records = ledger.read_run(run_id)?;
         let readback = RunReadback::from_events(&records)?;
-        return Ok(format_readback(&readback));
+        let mut output = format_readback(&readback);
+        for envelope in ledger.read_voice_events(run_id)? {
+            output.push_str("\nvoice_event: ");
+            output.push_str(&serde_json::to_string(&envelope)?);
+        }
+        return Ok(output);
     }
 
     if ledger.is_legacy_schema() {
@@ -132,7 +137,7 @@ pub(crate) fn format_session_readback(session: &ledger::SessionRecords) -> AppRe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::SqliteLedger;
+    use crate::{ledger::SqliteLedger, voice_session::VoiceEvent};
     use platonic_core::{
         ActorId, AgentId, ContextPack, EffectClass, HarnessEvent, Message, MessageRole, ModelName,
         ModelUsage, PolicyDecision, ResultVisibility, RunId, ToolCall, ToolCallId, ToolName,
@@ -202,6 +207,7 @@ mod tests {
         let path = dir.path().join("v1-events.db");
         write_v1_sqlite_fixture(&path);
         let replay_before = replay_sqlite(&path, None).unwrap();
+        let selected_before = replay_sqlite(&path, Some("run_v1")).unwrap();
 
         let ledger = SqliteLedger::open_or_create(&path).unwrap();
         let records = ledger.read_run("run_v1").unwrap();
@@ -212,7 +218,7 @@ mod tests {
         let schema_version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(schema_version, 2);
+        assert_eq!(schema_version, 3);
         let tables = connection
             .prepare(
                 "SELECT name FROM sqlite_schema
@@ -224,7 +230,10 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(tables, ["ledger_events", "session_runs", "sessions"]);
+        assert_eq!(
+            tables,
+            ["ledger_events", "session_runs", "sessions", "voice_events"]
+        );
         let envelope_versions = connection
             .prepare("SELECT v FROM ledger_events ORDER BY seq ASC")
             .unwrap()
@@ -239,22 +248,26 @@ mod tests {
         drop(SqliteLedger::open_or_create(&path).unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), bytes_after_migration);
         assert_eq!(replay_sqlite(&path, None).unwrap(), replay_before);
+        assert_eq!(
+            replay_sqlite(&path, Some("run_v1")).unwrap(),
+            selected_before
+        );
     }
 
     #[test]
     fn replay_rejects_future_schema_before_table_queries_without_mutation() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v3-events.db");
+        let path = dir.path().join("v4-events.db");
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 3).unwrap();
+        connection.pragma_update(None, "user_version", 4).unwrap();
         drop(connection);
         let bytes_before = std::fs::read(&path).unwrap();
 
         assert!(matches!(
             replay_sqlite(&path, None),
             Err(AppError::SqliteSchemaVersion {
-                expected: 2,
-                actual: 3
+                expected: 3,
+                actual: 4
             })
         ));
         assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
@@ -291,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_v2_replay_preserves_latest_session_and_exact_run_selection() {
+    fn sqlite_v3_replay_preserves_latest_session_and_exact_run_selection() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.db");
         let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
@@ -385,6 +398,126 @@ mod tests {
         assert!(latest.contains("next_seq: 2"));
         assert!(latest.contains("next_seq: 3"));
         assert_eq!(latest.matches("final_phase: Failed").count(), 2);
+    }
+
+    #[test]
+    fn twenty_turn_voice_ttfa_readback_is_exact_readonly_and_interruption_aware() {
+        const AU2_DEVICE_TTFA_US: [u64; 20] = [
+            63_856, 63_647, 52_563, 58_177, 57_994, 63_259, 46_904, 52_527, 57_985, 52_907, 48_019,
+            52_296, 53_022, 63_165, 52_605, 52_654, 52_653, 52_711, 58_470, 57_639,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voice-events.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let expected_ttfa = AU2_DEVICE_TTFA_US
+            .iter()
+            .map(|ttfa_us| ttfa_us / 1_000)
+            .collect::<Vec<_>>();
+        let mut expected_streams = Vec::new();
+
+        for (turn, ttfa_ms) in expected_ttfa.iter().copied().enumerate() {
+            let run_id = RunId::new(format!("run_voice_{turn:02}")).unwrap();
+            let turn_id = TurnId::new("turn_1").unwrap();
+            append_finished_run(&mut ledger, &run_id, &turn_id, turn);
+            let interrupted = turn % 5 == 4;
+            let mut events = Vec::new();
+            if turn == 0 {
+                events.push(VoiceEvent::VoiceCaptured {
+                    run_id: run_id.clone(),
+                    turn_id: turn_id.clone(),
+                    transcript_sha256: "b".repeat(64),
+                    transcript_bytes: 17,
+                    transcript_span_ms: 920,
+                    input_frames: 44_160,
+                    output_frames: 14_720,
+                    vad_start_sample: 160,
+                    vad_speech_end_sample: 13_120,
+                    vad_close_sample: 14_720,
+                    vad_close_to_final_us: 110_000,
+                    normalization_resampling_us: 1_100,
+                });
+            }
+            events.push(VoiceEvent::VoiceSpoken {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                ttfa_ms,
+                sentence_count: if interrupted { 2 } else { 3 },
+                interrupted_at: interrupted.then_some(1),
+            });
+            if interrupted {
+                events.push(VoiceEvent::VoiceInterrupted {
+                    run_id: run_id.clone(),
+                    turn_id,
+                    spoken_prefix: format!("audible prefix {turn}"),
+                    delta_index: u64::try_from(turn).unwrap() + 10,
+                });
+            }
+            expected_streams.push((
+                run_id.to_string(),
+                ledger.append_voice_events(&events).unwrap(),
+            ));
+        }
+        drop(ledger);
+
+        let connection = Connection::open(&path).unwrap();
+        let rows_before = (
+            connection
+                .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            connection
+                .query_row("SELECT COUNT(*) FROM voice_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+        );
+        drop(connection);
+        let bytes_before = std::fs::read(&path).unwrap();
+        let readonly = SqliteLedger::open_readonly(&path).unwrap();
+        let mut observed_ttfa = Vec::new();
+
+        for (run_id, expected) in &expected_streams {
+            let first = replay_sqlite(&path, Some(run_id)).unwrap();
+            let second = replay_sqlite(&path, Some(run_id)).unwrap();
+            assert_eq!(first, second);
+            for envelope in expected {
+                assert!(first.contains(&format!(
+                    "voice_event: {}",
+                    serde_json::to_string(envelope).unwrap()
+                )));
+            }
+            let readback = readonly.read_voice_events(run_id).unwrap();
+            assert_eq!(&readback, expected);
+            observed_ttfa.extend(
+                readback
+                    .iter()
+                    .filter_map(|envelope| match &envelope.event {
+                        VoiceEvent::VoiceSpoken { ttfa_ms, .. } => Some(*ttfa_ms),
+                        VoiceEvent::VoiceCaptured { .. } | VoiceEvent::VoiceInterrupted { .. } => {
+                            None
+                        }
+                    }),
+            );
+        }
+        drop(readonly);
+
+        assert_eq!(observed_ttfa, expected_ttfa);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+        let connection = Connection::open(&path).unwrap();
+        let rows_after = (
+            connection
+                .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            connection
+                .query_row("SELECT COUNT(*) FROM voice_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+        );
+        assert_eq!(rows_after, rows_before);
     }
 
     #[test]
@@ -556,6 +689,59 @@ mod tests {
             tool: ToolName::new("shell.exec").unwrap(),
             effect: EffectClass::ExternalSideEffect,
             input: json!({"command": "cargo test"}),
+        }
+    }
+
+    fn append_finished_run(
+        ledger: &mut SqliteLedger,
+        run_id: &RunId,
+        turn_id: &TurnId,
+        turn: usize,
+    ) {
+        let events = [
+            HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: AgentId::new("plato").unwrap(),
+            },
+            HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                context: ContextPack {
+                    token_budget: 4_000,
+                    fragments: vec![],
+                },
+            },
+            HarnessEvent::ModelRequested {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 0,
+                model: ModelName::new("test-model").unwrap(),
+            },
+            HarnessEvent::ModelResponded {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 0,
+                output: Message {
+                    role: MessageRole::Assistant,
+                    content: format!("voice answer {turn}"),
+                },
+                proposed_calls: vec![],
+                usage: Some(ModelUsage {
+                    input_tokens: 4,
+                    output_tokens: 3,
+                }),
+            },
+            HarnessEvent::RunFinished {
+                run_id: run_id.clone(),
+            },
+        ];
+        for (sequence, event) in events.into_iter().enumerate() {
+            ledger
+                .append(
+                    run_id.as_str(),
+                    &record(u64::try_from(sequence).unwrap(), event),
+                )
+                .unwrap();
         }
     }
 

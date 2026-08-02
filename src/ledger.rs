@@ -1,4 +1,8 @@
-use crate::{AppError, AppResult, paths::DefaultSqlitePath};
+use crate::{
+    AppError, AppResult,
+    paths::DefaultSqlitePath,
+    voice_session::{VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope},
+};
 use plato_protocol::RunStateName;
 use platonic_core::{HarnessEvent, MessageRole, RecordedEvent, RunId, RunPhase, RunState};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
@@ -21,7 +25,8 @@ const LEGACY_LEDGER_VERSION: u32 = 1;
 pub const LEDGER_VERSION: u32 = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const LEGACY_SQLITE_SCHEMA_VERSION: u32 = 1;
-const SQLITE_SCHEMA_VERSION: u32 = 2;
+const SESSION_SQLITE_SCHEMA_VERSION: u32 = 2;
+const SQLITE_SCHEMA_VERSION: u32 = 3;
 pub(crate) const RUN_CANCELED_REASON: &str = "run canceled";
 const ORPHANED_RUN_ERROR: &str = "daemon restarted before run completed";
 #[cfg(unix)]
@@ -259,6 +264,8 @@ pub struct SqliteLedger {
     schema_version: u32,
     #[cfg(test)]
     terminal_fault: Option<TerminalFaultBoundary>,
+    #[cfg(test)]
+    voice_fault: Option<VoiceFaultBoundary>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -307,6 +314,8 @@ impl SqliteLedger {
             schema_version: SQLITE_SCHEMA_VERSION,
             #[cfg(test)]
             terminal_fault: None,
+            #[cfg(test)]
+            voice_fault: None,
         })
     }
 
@@ -331,6 +340,8 @@ impl SqliteLedger {
             schema_version,
             #[cfg(test)]
             terminal_fault: None,
+            #[cfg(test)]
+            voice_fault: None,
         })
     }
 
@@ -351,6 +362,91 @@ impl SqliteLedger {
 
     pub fn read_run(&self, run_id: &str) -> AppResult<Vec<RecordedEvent>> {
         read_run_from(&self.connection, run_id)
+    }
+
+    /// Atomically persists one complete, immutable per-run voice companion stream.
+    pub fn append_voice_events(
+        &mut self,
+        events: &[VoiceEvent],
+    ) -> AppResult<Vec<VoiceEventEnvelope>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let run_id = events[0].run_id().as_str().to_owned();
+        for event in events {
+            event.validate().map_err(AppError::VoiceEventContract)?;
+            if event.run_id().as_str() != run_id {
+                return Err(AppError::VoiceEventContract(
+                    "one companion commit contained multiple run IDs".into(),
+                ));
+            }
+        }
+        validate_voice_event_stream(events)?;
+        let envelopes = events
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(sequence, event)| {
+                let sequence = u64::try_from(sequence).map_err(|_| {
+                    AppError::VoiceEventContract("voice event sequence overflowed u64".into())
+                })?;
+                Ok(VoiceEventEnvelope::revision_one(sequence, event))
+            })
+            .collect::<AppResult<Vec<_>>>()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_voice_event_keys(&transaction, &run_id, &envelopes)?;
+        let existing = read_voice_events_from(&transaction, &run_id)?;
+        if !existing.is_empty() {
+            if existing == envelopes {
+                transaction.commit()?;
+                return Ok(envelopes);
+            }
+            let sequence = first_voice_difference(&existing, &envelopes);
+            return Err(AppError::VoiceLedgerConflict { run_id, sequence });
+        }
+
+        for envelope in &envelopes {
+            let event_json = serde_json::to_string(&envelope.event)?;
+            transaction.execute(
+                "INSERT INTO voice_events (run_id, turn_id, sequence, v, event_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    envelope.event.run_id().as_str(),
+                    envelope.event.turn_id().as_str(),
+                    sqlite_i64(envelope.sequence, "voice sequence")?,
+                    envelope.v,
+                    event_json
+                ],
+            )?;
+            #[cfg(test)]
+            inject_voice_fault(
+                &mut self.voice_fault,
+                VoiceFaultBoundary::AfterFirstInsert,
+                envelope.sequence == 0,
+            )?;
+        }
+        #[cfg(test)]
+        inject_voice_fault(
+            &mut self.voice_fault,
+            VoiceFaultBoundary::BeforeCommit,
+            true,
+        )?;
+        transaction.commit()?;
+        Ok(envelopes)
+    }
+
+    /// Reads and validates one selected run's ordered voice companion stream.
+    pub fn read_voice_events(&self, run_id: &str) -> AppResult<Vec<VoiceEventEnvelope>> {
+        if self.schema_version < SQLITE_SCHEMA_VERSION {
+            return Ok(Vec::new());
+        }
+        let envelopes = read_voice_events_from(&self.connection, run_id)?;
+        if !envelopes.is_empty() {
+            validate_voice_event_keys(&self.connection, run_id, &envelopes)?;
+        }
+        Ok(envelopes)
     }
 
     pub fn read_latest_run(&self) -> AppResult<(String, Vec<RecordedEvent>)> {
@@ -768,6 +864,11 @@ impl SqliteLedger {
     }
 
     #[cfg(test)]
+    fn inject_voice_fault_at(&mut self, boundary: VoiceFaultBoundary) {
+        self.voice_fault = Some(boundary);
+    }
+
+    #[cfg(test)]
     fn user_version(&self) -> AppResult<u32> {
         let version: u32 = self
             .connection
@@ -841,6 +942,174 @@ fn read_run_records_from(connection: &Connection, run_id: &str) -> AppResult<Vec
         records.push(sqlite_record_from_row(row)?);
     }
     Ok(records)
+}
+
+fn read_voice_events_from(
+    connection: &Connection,
+    selected_run_id: &str,
+) -> AppResult<Vec<VoiceEventEnvelope>> {
+    let mut statement = connection.prepare(
+        "SELECT run_id, turn_id, sequence, v, event_json
+         FROM voice_events
+         WHERE run_id = ?1
+         ORDER BY sequence ASC",
+    )?;
+    let mut rows = statement.query(params![selected_run_id])?;
+    let mut envelopes = Vec::new();
+    while let Some(row) = rows.next()? {
+        let run_id = row.get::<_, String>(0)?;
+        let turn_id = row.get::<_, String>(1)?;
+        let sequence = row_u64(row, 2, "voice sequence")?;
+        let version = row.get::<_, u32>(3)?;
+        if version != VOICE_EVENT_VERSION {
+            return Err(AppError::VoiceEventVersion {
+                expected: VOICE_EVENT_VERSION,
+                actual: version,
+            });
+        }
+        let event = serde_json::from_str::<VoiceEvent>(&row.get::<_, String>(4)?)?;
+        event.validate().map_err(AppError::VoiceEventContract)?;
+        if event.run_id().as_str() != run_id || event.turn_id().as_str() != turn_id {
+            return Err(AppError::VoiceEventContract(format!(
+                "voice event columns disagree with payload at run {selected_run_id} sequence {sequence}"
+            )));
+        }
+        let expected_sequence = u64::try_from(envelopes.len()).map_err(|_| {
+            AppError::VoiceEventContract("voice event sequence overflowed u64".into())
+        })?;
+        if sequence != expected_sequence {
+            return Err(AppError::VoiceEventContract(format!(
+                "voice event sequence was {sequence}, expected {expected_sequence} for run {selected_run_id}"
+            )));
+        }
+        envelopes.push(VoiceEventEnvelope {
+            v: version,
+            sequence,
+            event,
+        });
+    }
+    Ok(envelopes)
+}
+
+fn first_voice_difference(existing: &[VoiceEventEnvelope], proposed: &[VoiceEventEnvelope]) -> u64 {
+    existing
+        .iter()
+        .zip(proposed)
+        .position(|(left, right)| left != right)
+        .or_else(|| {
+            (existing.len() != proposed.len()).then_some(existing.len().min(proposed.len()))
+        })
+        .and_then(|index| u64::try_from(index).ok())
+        .unwrap_or(u64::MAX)
+}
+
+fn validate_voice_event_stream(events: &[VoiceEvent]) -> AppResult<()> {
+    let mut capture_seen = false;
+    let mut interruption_seen = false;
+    for (index, event) in events.iter().enumerate() {
+        match event {
+            VoiceEvent::VoiceCaptured { .. } => {
+                if capture_seen || index != 0 {
+                    return Err(AppError::VoiceEventContract(
+                        "voice capture must appear at most once and first".into(),
+                    ));
+                }
+                capture_seen = true;
+            }
+            VoiceEvent::VoiceSpoken {
+                run_id,
+                turn_id,
+                interrupted_at,
+                ..
+            } => {
+                if interruption_seen {
+                    return Err(AppError::VoiceEventContract(
+                        "voice interruption must terminate its companion stream".into(),
+                    ));
+                }
+                if interrupted_at.is_some()
+                    && !matches!(
+                        events.get(index + 1),
+                        Some(VoiceEvent::VoiceInterrupted {
+                            run_id: interrupted_run,
+                            turn_id: interrupted_turn,
+                            ..
+                        }) if interrupted_run == run_id && interrupted_turn == turn_id
+                    )
+                {
+                    return Err(AppError::VoiceEventContract(
+                        "interrupted voice speech must be followed by its exact interruption fact"
+                            .into(),
+                    ));
+                }
+            }
+            VoiceEvent::VoiceInterrupted {
+                run_id, turn_id, ..
+            } => {
+                let paired = matches!(
+                    index.checked_sub(1).and_then(|previous| events.get(previous)),
+                    Some(VoiceEvent::VoiceSpoken {
+                        run_id: spoken_run,
+                        turn_id: spoken_turn,
+                        interrupted_at: Some(_),
+                        ..
+                    }) if spoken_run == run_id && spoken_turn == turn_id
+                );
+                if interruption_seen || !paired || index + 1 != events.len() {
+                    return Err(AppError::VoiceEventContract(
+                        "voice interruption must be paired with the preceding spoken fact and terminate the stream"
+                            .into(),
+                    ));
+                }
+                interruption_seen = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_voice_event_keys(
+    connection: &Connection,
+    run_id: &str,
+    envelopes: &[VoiceEventEnvelope],
+) -> AppResult<()> {
+    let records = read_run_records_from(connection, run_id)?;
+    if records.is_empty() {
+        return Err(AppError::RunNotFound(run_id.into()));
+    }
+    for envelope in envelopes {
+        let turn_id = envelope.event.turn_id();
+        if !records
+            .iter()
+            .any(|record| harness_event_turn_id(&record.event) == Some(turn_id))
+        {
+            return Err(AppError::VoiceEventContract(format!(
+                "voice event turn {turn_id} is absent from core run {run_id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn harness_event_turn_id(event: &HarnessEvent) -> Option<&platonic_core::TurnId> {
+    match event {
+        HarnessEvent::ContextBuilt { turn_id, .. }
+        | HarnessEvent::ContextCompacted { turn_id, .. }
+        | HarnessEvent::ModelRequested { turn_id, .. }
+        | HarnessEvent::ModelFailed { turn_id, .. }
+        | HarnessEvent::ModelResponded { turn_id, .. }
+        | HarnessEvent::ToolProposalsRejected { turn_id, .. }
+        | HarnessEvent::ToolCallProposed { turn_id, .. } => Some(turn_id),
+        HarnessEvent::RunStarted { .. }
+        | HarnessEvent::PolicyEvaluated { .. }
+        | HarnessEvent::ApprovalGranted { .. }
+        | HarnessEvent::ApprovalDenied { .. }
+        | HarnessEvent::ToolStarted { .. }
+        | HarnessEvent::ToolFinished { .. }
+        | HarnessEvent::ToolFailed { .. }
+        | HarnessEvent::RunFinished { .. }
+        | HarnessEvent::RunFailed { .. } => None,
+    }
 }
 
 fn replay_records(records: &[RecordedEvent]) -> AppResult<RunState> {
@@ -927,6 +1196,13 @@ enum TerminalFaultBoundary {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VoiceFaultBoundary {
+    AfterFirstInsert,
+    BeforeCommit,
+}
+
+#[cfg(test)]
 fn inject_terminal_fault(
     configured: &mut Option<TerminalFaultBoundary>,
     boundary: TerminalFaultBoundary,
@@ -935,6 +1211,21 @@ fn inject_terminal_fault(
         *configured = None;
         return Err(AppError::Config(format!(
             "injected terminal fault at {boundary:?}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn inject_voice_fault(
+    configured: &mut Option<VoiceFaultBoundary>,
+    boundary: VoiceFaultBoundary,
+    reached: bool,
+) -> AppResult<()> {
+    if reached && *configured == Some(boundary) {
+        *configured = None;
+        return Err(AppError::Config(format!(
+            "injected voice transaction fault at {boundary:?}"
         )));
     }
     Ok(())
@@ -1092,6 +1383,8 @@ fn open_private_default_sqlite(
         schema_version,
         #[cfg(test)]
         terminal_fault: None,
+        #[cfg(test)]
+        voice_fault: None,
     })
 }
 
@@ -1340,8 +1633,11 @@ fn migrate_sqlite(connection: &mut Connection) -> AppResult<()> {
             "#,
         )?;
     }
-    if version < SQLITE_SCHEMA_VERSION {
+    if version < SESSION_SQLITE_SCHEMA_VERSION {
         create_session_tables(&transaction)?;
+    }
+    if version < SQLITE_SCHEMA_VERSION {
+        create_voice_event_table(&transaction)?;
     }
     if version < SQLITE_SCHEMA_VERSION {
         transaction.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)?;
@@ -1374,6 +1670,22 @@ fn create_session_tables(connection: &Connection) -> AppResult<()> {
 
         CREATE INDEX IF NOT EXISTS session_runs_session_index
           ON session_runs(session_id, session_index);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn create_voice_event_table(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS voice_events (
+          run_id TEXT NOT NULL,
+          turn_id TEXT NOT NULL,
+          sequence INTEGER NOT NULL,
+          v INTEGER NOT NULL,
+          event_json TEXT NOT NULL,
+          PRIMARY KEY (run_id, sequence)
+        );
         "#,
     )?;
     Ok(())
@@ -1525,6 +1837,65 @@ mod tests {
     #[cfg(unix)]
     fn set_mode(path: &Path, mode: u32) {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn captured_voice_event(run_id: &str, turn_id: &str) -> VoiceEvent {
+        VoiceEvent::VoiceCaptured {
+            run_id: RunId::new(run_id).unwrap(),
+            turn_id: TurnId::new(turn_id).unwrap(),
+            transcript_sha256: "a".repeat(64),
+            transcript_bytes: 14,
+            transcript_span_ms: 800,
+            input_frames: 38_400,
+            output_frames: 12_800,
+            vad_start_sample: 320,
+            vad_speech_end_sample: 11_200,
+            vad_close_sample: 12_800,
+            vad_close_to_final_us: 105_000,
+            normalization_resampling_us: 900,
+        }
+    }
+
+    fn completed_voice_events(run_id: &str) -> Vec<VoiceEvent> {
+        vec![
+            captured_voice_event(run_id, "turn_1"),
+            VoiceEvent::VoiceSpoken {
+                run_id: RunId::new(run_id).unwrap(),
+                turn_id: TurnId::new("turn_1").unwrap(),
+                ttfa_ms: 289,
+                sentence_count: 2,
+                interrupted_at: Some(1),
+            },
+            VoiceEvent::VoiceInterrupted {
+                run_id: RunId::new(run_id).unwrap(),
+                turn_id: TurnId::new("turn_1").unwrap(),
+                spoken_prefix: "This prefix was audible".into(),
+                delta_index: 7,
+            },
+        ]
+    }
+
+    fn append_voice_core_keys(ledger: &mut SqliteLedger, run_id: &str, turn_id: &str) {
+        ledger
+            .append(run_id, &started_record(run_id, 0, 0))
+            .unwrap();
+        ledger
+            .append(
+                run_id,
+                &RecordedEvent {
+                    seq: 1,
+                    occurred_at_ms: 1,
+                    event: HarnessEvent::ContextBuilt {
+                        run_id: RunId::new(run_id).unwrap(),
+                        turn_id: TurnId::new(turn_id).unwrap(),
+                        context: ContextPack {
+                            fragments: vec![],
+                            token_budget: 4_000,
+                        },
+                    },
+                },
+            )
+            .unwrap();
     }
 
     #[cfg(unix)]
@@ -1853,6 +2224,68 @@ mod tests {
         let ledger = SqliteLedger::open_or_create(&path).unwrap();
 
         assert_eq!(ledger.user_version().unwrap(), SQLITE_SCHEMA_VERSION);
+        let voice_schema = ledger
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'voice_events'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            voice_schema,
+            "CREATE TABLE voice_events (\n          run_id TEXT NOT NULL,\n          turn_id TEXT NOT NULL,\n          sequence INTEGER NOT NULL,\n          v INTEGER NOT NULL,\n          event_json TEXT NOT NULL,\n          PRIMARY KEY (run_id, sequence)\n        )"
+        );
+    }
+
+    #[test]
+    fn voice_table_migration_is_additive_idempotent_and_readonly_v2_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2-events.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE ledger_events (
+                  run_id TEXT NOT NULL,
+                  seq INTEGER NOT NULL,
+                  occurred_at_ms INTEGER NOT NULL,
+                  v INTEGER NOT NULL,
+                  event_json TEXT NOT NULL,
+                  PRIMARY KEY (run_id, seq)
+                );
+                PRAGMA user_version = 2;
+                "#,
+            )
+            .unwrap();
+        create_session_tables(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (session_id, created_at_ms, updated_at_ms) VALUES ('kept', 1, 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let bytes_before_read = fs::read(&path).unwrap();
+        let readonly = SqliteLedger::open_readonly(&path).unwrap();
+        assert!(readonly.read_voice_events("run_absent").unwrap().is_empty());
+        drop(readonly);
+        assert_eq!(fs::read(&path).unwrap(), bytes_before_read);
+
+        let migrated = SqliteLedger::open_or_create(&path).unwrap();
+        assert_eq!(migrated.user_version().unwrap(), 3);
+        let kept: String = migrated
+            .connection
+            .query_row("SELECT session_id FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, "kept");
+        assert!(migrated.read_voice_events("run_absent").unwrap().is_empty());
+        drop(migrated);
+
+        let bytes_after_migration = fs::read(&path).unwrap();
+        drop(SqliteLedger::open_or_create(&path).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), bytes_after_migration);
     }
 
     #[test]
@@ -1871,6 +2304,138 @@ mod tests {
             ledger.append("run_1", &changed),
             Err(AppError::LedgerConflict { .. })
         ));
+    }
+
+    #[test]
+    fn voice_companion_commit_is_ordered_idempotent_and_conflict_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let events = completed_voice_events("run_voice");
+        append_voice_core_keys(&mut ledger, "run_voice", "turn_1");
+
+        let committed = ledger.append_voice_events(&events).unwrap();
+        assert_eq!(
+            committed
+                .iter()
+                .map(|envelope| envelope.sequence)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(ledger.read_voice_events("run_voice").unwrap(), committed);
+        let bytes_after_commit = fs::read(&path).unwrap();
+        assert_eq!(ledger.append_voice_events(&events).unwrap(), committed);
+        assert_eq!(fs::read(&path).unwrap(), bytes_after_commit);
+
+        let mut changed = events.clone();
+        let VoiceEvent::VoiceSpoken { ttfa_ms, .. } = &mut changed[1] else {
+            unreachable!()
+        };
+        *ttfa_ms += 1;
+        assert!(matches!(
+            ledger.append_voice_events(&changed),
+            Err(AppError::VoiceLedgerConflict {
+                run_id,
+                sequence: 1
+            }) if run_id == "run_voice"
+        ));
+        assert_eq!(ledger.read_voice_events("run_voice").unwrap(), committed);
+    }
+
+    #[test]
+    fn voice_companion_rejects_orphan_and_misordered_interruption_facts() {
+        let run_id = RunId::new("run_voice").unwrap();
+        let turn_id = TurnId::new("turn_1").unwrap();
+        let spoken = VoiceEvent::VoiceSpoken {
+            run_id: run_id.clone(),
+            turn_id: turn_id.clone(),
+            ttfa_ms: 280,
+            sentence_count: 1,
+            interrupted_at: Some(0),
+        };
+        let interrupted = VoiceEvent::VoiceInterrupted {
+            run_id,
+            turn_id,
+            spoken_prefix: "audible".into(),
+            delta_index: 2,
+        };
+
+        assert!(validate_voice_event_stream(std::slice::from_ref(&spoken)).is_err());
+        assert!(validate_voice_event_stream(std::slice::from_ref(&interrupted)).is_err());
+        assert!(validate_voice_event_stream(&[interrupted, spoken]).is_err());
+    }
+
+    #[test]
+    fn voice_companion_faults_roll_back_the_entire_stream_before_reopen() {
+        for boundary in [
+            VoiceFaultBoundary::AfterFirstInsert,
+            VoiceFaultBoundary::BeforeCommit,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("voice-{boundary:?}.db"));
+            let events = completed_voice_events("run_fault");
+            let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+            append_voice_core_keys(&mut ledger, "run_fault", "turn_1");
+            ledger.inject_voice_fault_at(boundary);
+
+            assert!(matches!(
+                ledger.append_voice_events(&events),
+                Err(AppError::Config(message)) if message.contains("injected voice transaction fault")
+            ));
+            let rows: i64 = ledger
+                .connection
+                .query_row("SELECT COUNT(*) FROM voice_events", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(rows, 0);
+            drop(ledger);
+
+            let mut reopened = SqliteLedger::open_or_create(&path).unwrap();
+            assert!(reopened.read_voice_events("run_fault").unwrap().is_empty());
+            let committed = reopened.append_voice_events(&events).unwrap();
+            drop(reopened);
+            assert_eq!(
+                SqliteLedger::open_readonly(&path)
+                    .unwrap()
+                    .read_voice_events("run_fault")
+                    .unwrap(),
+                committed
+            );
+        }
+    }
+
+    #[test]
+    fn voice_companion_read_rejects_version_sequence_and_key_corruption() {
+        let corruptions = [
+            (
+                "UPDATE voice_events SET v = 2 WHERE sequence = 0",
+                "voice event version mismatch",
+            ),
+            (
+                "UPDATE voice_events SET sequence = 4 WHERE sequence = 2",
+                "voice event sequence was 4, expected 2",
+            ),
+            (
+                "UPDATE voice_events SET turn_id = 'turn_wrong' WHERE sequence = 1",
+                "voice event columns disagree with payload",
+            ),
+        ];
+        for (sql, expected) in corruptions {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("events.db");
+            let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+            append_voice_core_keys(&mut ledger, "run_corrupt", "turn_1");
+            ledger
+                .append_voice_events(&completed_voice_events("run_corrupt"))
+                .unwrap();
+            ledger.connection.execute(sql, []).unwrap();
+            assert!(
+                ledger
+                    .read_voice_events("run_corrupt")
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
+        }
     }
 
     #[test]
