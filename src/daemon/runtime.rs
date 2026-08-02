@@ -16,6 +16,7 @@ use std::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 pub(super) const MAX_EVENT_BUFFER: usize = 256;
@@ -24,6 +25,7 @@ pub(super) const MAX_TERMINAL_RUNS: usize = 32;
 #[derive(Clone, Debug)]
 pub(super) struct DaemonRuntime {
     pub(super) paths: DaemonPaths,
+    started_at: Instant,
     pub(super) state: Arc<Mutex<RuntimeState>>,
     pub(super) stop_requested: Arc<AtomicBool>,
     #[cfg(all(test, unix))]
@@ -67,11 +69,20 @@ impl DaemonRuntime {
     pub(super) fn new(paths: DaemonPaths) -> Self {
         Self {
             paths,
+            started_at: Instant::now(),
             state: Arc::new(Mutex::new(RuntimeState::default())),
             stop_requested: Arc::new(AtomicBool::new(false)),
             #[cfg(all(test, unix))]
             shutdown_flush_barrier: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(super) fn uptime_ms(&self) -> u64 {
+        self.started_at
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 
     pub(super) fn reserve_run(&self, record: Arc<RunRecord>) -> Result<(), RunAdmissionError> {
@@ -388,7 +399,7 @@ fn approval_requested_event(request: &ApprovalRequest) -> StreamEvent {
 mod tests {
     use super::*;
     use platonic_core::{EffectClass, RunId, ToolCallId};
-    use std::{path::PathBuf, sync::Barrier, thread};
+    use std::{path::PathBuf, sync::Barrier, thread, time::Duration};
 
     fn runtime() -> DaemonRuntime {
         DaemonRuntime::new(DaemonPaths {
@@ -406,6 +417,20 @@ mod tests {
             format!("session_{index}"),
             PathBuf::from("/tmp/agent.db"),
         ))
+    }
+
+    #[test]
+    fn uptime_is_monotonic_from_one_runtime_start_instant() {
+        let runtime = runtime();
+        let cloned = runtime.clone();
+        let first = runtime.uptime_ms();
+        thread::sleep(Duration::from_millis(5));
+        let second = cloned.uptime_ms();
+
+        assert!(
+            second > first,
+            "uptime did not increase: {first} -> {second}"
+        );
     }
 
     #[test]

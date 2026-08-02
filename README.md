@@ -567,6 +567,9 @@ to approval, while a failed decision remains available to retry.
 While a provider response is pending, the status row labels the selected model
 or alias. After the response is durable, it labels the provider-reported served
 model, or `served unknown` when the provider omits that identity.
+Use `/status` for one authoritative daemon readback of the effective model,
+daemon identity, selected session, reported token usage, and persisted approval
+facts. The read-only modal does not invoke a model or change the session.
 
 ```bash
 cargo run --bin plato-agentd -- --workspace "$PWD"
@@ -587,6 +590,8 @@ Keys:
   an exact session ID for recovery (`q` is text); `Backspace` edits; `Up`/`Down`
   and `Ctrl-P`/`Ctrl-N` wrap through matches; `Enter` resumes the focused match;
   `Esc` closes. With no matches, `Enter` keeps the picker open.
+- `/status`: request one authoritative runtime readback; `Esc` closes the
+  read-only modal.
 - `/new`: clear the selected session so the next submitted message starts fresh.
 - `/issue-prep <rough issue>`: prepare and review an implementation issue.
   It is unavailable while another run or issue-prep command is active, and the

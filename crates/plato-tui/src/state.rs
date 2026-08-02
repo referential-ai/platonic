@@ -1,6 +1,6 @@
 use plato_protocol::{
-    HelloResult, ModelIdentityStatus, PendingApprovalSnapshot, RunStateName, SessionSummary,
-    TranscriptReadResult, TypedTranscript,
+    DaemonStatusResult, HelloResult, ModelIdentityStatus, PendingApprovalSnapshot, RunStateName,
+    SessionSummary, TranscriptReadResult, TypedTranscript,
 };
 use platonic_core::EffectClass;
 use ratatui::text::Line;
@@ -74,6 +74,8 @@ pub struct TuiState {
     pub approval: Option<ApprovalModalView>,
     /// Whether the help overlay is open.
     pub help_visible: bool,
+    /// Authoritative daemon status currently shown in its read-only modal.
+    pub status_modal: Option<DaemonStatusResult>,
     /// Whether cancellation has already been requested.
     pub cancel_requested: bool,
 }
@@ -143,6 +145,7 @@ impl TuiState {
             stream_warning: None,
             approval: None,
             help_visible: false,
+            status_modal: None,
             cancel_requested: false,
         }
     }
@@ -199,7 +202,7 @@ impl TuiState {
     }
 
     pub(super) fn handle_paste_text(&mut self, text: &str) {
-        if self.help_visible || self.approval.is_some() {
+        if self.help_visible || self.status_modal.is_some() || self.approval.is_some() {
             return;
         }
         self.insert_composer_text(&text.replace('\r', "\n"));

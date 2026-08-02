@@ -109,6 +109,13 @@ fn handle_key_press(
     initial_run_id: Option<String>,
     config_path: Option<String>,
 ) -> bool {
+    if state.status_modal.is_some() {
+        if key.code == KeyCode::Esc {
+            state.status_modal = None;
+        }
+        return true;
+    }
+
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         if state.issue_prep_started_at.is_some() {
             state.status_message = Some("issue prep is still running".into());
@@ -671,6 +678,19 @@ fn dispatch_slash_command(
             state.status_message = Some("help opened".into());
             true
         }
+        SlashCommandAction::Status => {
+            state.status_modal = None;
+            state.status_message = Some("loading status".into());
+            send_command(
+                commands,
+                ClientCommand::DaemonStatus {
+                    session_id: state.selected_session_id.clone(),
+                    config_path,
+                },
+                state,
+            );
+            true
+        }
         SlashCommandAction::Clear => {
             clear_visible_transcript(state);
             state.status_message = Some("visible transcript cleared".into());
@@ -906,9 +926,10 @@ mod tests {
     use crate::TranscriptState;
     use plato_daemon_client::ClientError;
     use plato_protocol::{
-        BufferedStreamEvent, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION, ERROR_WORKSPACE_MISMATCH,
-        EventsStreamResult, HelloResult, IssuePrepResult, IssuePrepStartResult,
-        ModelIdentityStatus, ProtocolError, RunStartResult, SessionSummary, TranscriptReadResult,
+        BufferedStreamEvent, DaemonStatusResult, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
+        ERROR_WORKSPACE_MISMATCH, EventsStreamResult, HelloResult, IssuePrepResult,
+        IssuePrepStartResult, ModelIdentityStatus, ProtocolError, RunStartResult, SessionSummary,
+        TranscriptReadResult,
     };
     use serde_json::json;
     #[cfg(unix)]
@@ -931,6 +952,49 @@ mod tests {
                 }
             }),
         )
+    }
+
+    fn status_fixture() -> DaemonStatusResult {
+        serde_json::from_value(json!({
+            "model": {
+                "requested_alias": "~openai/gpt-latest",
+                "served_model": "openai/gpt-5.5-2026-08-01",
+                "provider_kind": "open_router",
+                "key_present": true
+            },
+            "daemon": {
+                "package_version": "0.1.0",
+                "build_commit": "0123456789abcdef0123456789abcdef01234567",
+                "build_date_utc": "2026-08-01",
+                "uptime_ms": 42,
+                "endpoint_path": "/tmp/agent.sock",
+                "workspace_id": "work-1234"
+            },
+            "session": {
+                "session_id": "session_1",
+                "latest_run_id": "run_2",
+                "human_turn_count": 2,
+                "ledger_path": "/tmp/agent.db",
+                "core_event_count": 17
+            },
+            "usage": {
+                "last_run": {
+                    "input_tokens": 7,
+                    "output_tokens": 3,
+                    "unknown_response_count": 1
+                },
+                "session": {
+                    "input_tokens": 17,
+                    "output_tokens": 8,
+                    "unknown_response_count": 2
+                }
+            },
+            "trust": {
+                "approval_granted_count": 2,
+                "approval_denied_count": 1
+            }
+        }))
+        .unwrap()
     }
 
     fn press_key(
@@ -1198,6 +1262,95 @@ mod tests {
         assert!(state.help_visible);
         assert_eq!(state.status_message.as_deref(), Some("help opened"));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn status_command_opens_read_only_modal_without_submitting_a_prompt() {
+        let (sender, receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.selected_session_id = Some("session_1".into());
+        state.insert_composer_text("/status");
+        let mut runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(
+            &sender,
+            &mut state,
+            &runtime,
+            None,
+            Some("config/plato.toml".into())
+        ));
+        match receiver.try_recv().unwrap() {
+            ClientCommand::DaemonStatus {
+                session_id,
+                config_path,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("session_1"));
+                assert_eq!(config_path.as_deref(), Some("config/plato.toml"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "status sent more than one command"
+        );
+        assert!(state.composer.is_empty());
+        assert!(state.live_events.is_empty());
+        assert_eq!(state.selected_session_id.as_deref(), Some("session_1"));
+
+        event_sender
+            .send(ClientEvent::StatusLoaded(Box::new(status_fixture())))
+            .unwrap();
+        drain_client_events(&mut state, &mut runtime, &event_receiver, &sender);
+        assert!(state.status_modal.is_some());
+
+        let unchanged = state.clone();
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert_eq!(state, unchanged);
+        assert!(receiver.try_recv().is_err());
+        state.handle_paste_text("must not reach the composer");
+        assert_eq!(state, unchanged);
+
+        let mut expected = state.clone();
+        expected.status_modal = None;
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert_eq!(state, expected);
+        assert!(receiver.try_recv().is_err());
+
+        state.insert_composer_text("/status");
+        assert!(submit_composer(
+            &sender,
+            &mut state,
+            &runtime,
+            None,
+            Some("config/plato.toml".into())
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientCommand::DaemonStatus { .. }
+        ));
+        assert!(receiver.try_recv().is_err());
+        let mut refreshed = status_fixture();
+        refreshed.model.requested_alias = "refreshed-alias".into();
+        refreshed.daemon.uptime_ms = 99;
+        event_sender
+            .send(ClientEvent::StatusLoaded(Box::new(refreshed)))
+            .unwrap();
+        drain_client_events(&mut state, &mut runtime, &event_receiver, &sender);
+        let modal = state.status_modal.as_ref().unwrap();
+        assert_eq!(modal.model.requested_alias, "refreshed-alias");
+        assert_eq!(modal.daemon.uptime_ms, 99);
+        assert!(state.live_events.is_empty());
     }
 
     #[test]

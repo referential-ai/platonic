@@ -4,7 +4,7 @@ use plato_daemon_client::{
     client::{DaemonClient, DaemonConnectionConfig},
 };
 use plato_protocol::{
-    ApprovalDecisionName, CommandAcceptedResult, ERROR_LAGGED, ERROR_OVERLOAD,
+    ApprovalDecisionName, CommandAcceptedResult, DaemonStatusResult, ERROR_LAGGED, ERROR_OVERLOAD,
     ERROR_UNSUPPORTED_VERSION, ERROR_WORKSPACE_MISMATCH, EventsStreamResult, IssuePrepResult,
     IssuePrepStartResult, RunStartResult, RunStateName, StreamEvent,
 };
@@ -184,6 +184,10 @@ pub(super) enum ClientCommand {
     LoadSession {
         session_id: String,
     },
+    DaemonStatus {
+        session_id: Option<String>,
+        config_path: Option<String>,
+    },
     RunStart {
         question: String,
         config_path: Option<String>,
@@ -218,6 +222,7 @@ pub(super) enum ClientCommand {
 #[derive(Debug)]
 pub(super) enum ClientEvent {
     Loaded(Box<TuiState>),
+    StatusLoaded(Box<DaemonStatusResult>),
     RunStarted(RunStartResult),
     IssuePrepFinished(IssuePrepStartResult),
     EventsPolled(EventsStreamResult),
@@ -235,6 +240,7 @@ pub(super) enum ClientEvent {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ClientOperation {
+    DaemonStatus,
     RunStart,
     MessageAppend,
     IssuePrepStart,
@@ -246,6 +252,7 @@ pub(super) enum ClientOperation {
 impl ClientOperation {
     fn method(self) -> &'static str {
         match self {
+            Self::DaemonStatus => "daemon.status",
             Self::RunStart => "run.start",
             Self::MessageAppend => "message.append",
             Self::IssuePrepStart => "issue-prep.start",
@@ -280,6 +287,15 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
         ClientCommand::LoadSession { session_id } => {
             ClientEvent::Loaded(Box::new(load_selected_session_state(config, &session_id)))
         }
+        ClientCommand::DaemonStatus {
+            session_id,
+            config_path,
+        } => with_client(config, |client| {
+            client.daemon_status(session_id, config_path)
+        })
+        .map_or_else(failed_event(ClientOperation::DaemonStatus), |status| {
+            ClientEvent::StatusLoaded(Box::new(status))
+        }),
         ClientCommand::RunStart {
             question,
             config_path,
@@ -394,6 +410,10 @@ pub(super) fn drain_client_events(
             ClientEvent::Loaded(loaded) => {
                 apply_loaded_state(state, *loaded);
                 runtime.sync_from_state(state);
+            }
+            ClientEvent::StatusLoaded(status) => {
+                state.status_modal = Some(*status);
+                state.status_message = Some("status opened".into());
             }
             ClientEvent::RunStarted(result) => {
                 apply_run_response(state, runtime, result, "run started")
@@ -519,7 +539,8 @@ pub(super) fn drain_client_events(
                         ClientOperation::RunStart
                         | ClientOperation::MessageAppend
                         | ClientOperation::EventsStream
-                        | ClientOperation::ApprovalDecide => {}
+                        | ClientOperation::ApprovalDecide
+                        | ClientOperation::DaemonStatus => {}
                     }
                 }
             }
@@ -551,6 +572,7 @@ pub(super) fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
     loaded.input_history = std::mem::take(&mut state.input_history);
     loaded.history_index = state.history_index;
     loaded.help_visible = state.help_visible;
+    loaded.status_modal = state.status_modal.clone();
     loaded.display_mode = state.display_mode;
     if loaded.status_message.is_none() {
         loaded.status_message = state.status_message.clone();

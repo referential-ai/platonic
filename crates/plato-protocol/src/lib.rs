@@ -120,11 +120,13 @@ pub const CAPABILITY_TRANSCRIPT_READ: &str = "transcript.read";
 pub const CAPABILITY_TRANSCRIPT_READ_TYPED: &str = "transcript.read.typed";
 /// Capability name for pending-approval transcript readback.
 pub const CAPABILITY_TRANSCRIPT_READ_PENDING_APPROVAL: &str = "transcript.read.pending_approval";
+/// Capability name for authoritative daemon status readback.
+pub const CAPABILITY_DAEMON_STATUS: &str = "daemon.status";
 /// Capability name for shutting down an idle daemon.
 pub const CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE: &str = "daemon.shutdown_if_idle";
 
 /// Capabilities advertised by a protocol v1 daemon, in wire order.
-pub const CAPABILITIES: [&str; 12] = [
+pub const CAPABILITIES: [&str; 13] = [
     CAPABILITY_HELLO,
     CAPABILITY_RUN_START,
     CAPABILITY_MESSAGE_APPEND,
@@ -136,6 +138,7 @@ pub const CAPABILITIES: [&str; 12] = [
     CAPABILITY_TRANSCRIPT_READ,
     CAPABILITY_TRANSCRIPT_READ_TYPED,
     CAPABILITY_TRANSCRIPT_READ_PENDING_APPROVAL,
+    CAPABILITY_DAEMON_STATUS,
     CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE,
 ];
 
@@ -321,6 +324,140 @@ pub struct HelloResult {
     pub ledger_path: String,
     /// Advertised protocol capabilities.
     pub capabilities: Vec<String>,
+}
+
+/// Parameters for one authoritative daemon status readback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonStatusParams {
+    /// Selected session, or the latest persisted session when omitted.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Optional explicit configuration path resolved under the run-start rules.
+    #[serde(default)]
+    pub config_path: Option<String>,
+}
+
+/// Authoritative read-only status returned by `daemon.status`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonStatusResult {
+    /// Effective model and provider facts.
+    pub model: DaemonStatusModel,
+    /// Current daemon identity facts.
+    pub daemon: DaemonStatusDaemon,
+    /// Selected persisted-session facts.
+    pub session: DaemonStatusSession,
+    /// Provider-reported token usage facts.
+    pub usage: DaemonStatusUsage,
+    /// Persisted approval facts.
+    pub trust: DaemonStatusTrust,
+}
+
+/// Effective model facts returned by `daemon.status`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonStatusModel {
+    /// Model or alias selected by the effective current configuration.
+    pub requested_alias: String,
+    /// Provider-reported model from the latest selected-session response.
+    pub served_model: Option<String>,
+    /// Configured provider kind.
+    pub provider_kind: DaemonStatusProviderKind,
+    /// Whether the configured provider key environment variable is present.
+    pub key_present: bool,
+}
+
+/// Provider kind returned by `daemon.status`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonStatusProviderKind {
+    /// OpenAI-compatible direct OpenAI provider.
+    OpenAi,
+    /// OpenRouter provider.
+    OpenRouter,
+}
+
+impl DaemonStatusProviderKind {
+    /// Returns the exact provider-kind wire value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "open_ai",
+            Self::OpenRouter => "open_router",
+        }
+    }
+}
+
+impl fmt::Display for DaemonStatusProviderKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.pad(self.as_str())
+    }
+}
+
+/// Current daemon identity facts returned by `daemon.status`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonStatusDaemon {
+    /// Daemon package version.
+    pub package_version: String,
+    /// Full source commit from build provenance, when known.
+    pub build_commit: Option<String>,
+    /// UTC build date from build provenance, when known.
+    pub build_date_utc: Option<String>,
+    /// Monotonic process uptime in milliseconds.
+    pub uptime_ms: u64,
+    /// Daemon socket or named-pipe endpoint path.
+    pub endpoint_path: String,
+    /// Workspace identifier served by the daemon.
+    pub workspace_id: String,
+}
+
+/// Selected persisted-session facts returned by `daemon.status`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonStatusSession {
+    /// Explicitly selected or latest persisted session, or none.
+    pub session_id: Option<String>,
+    /// Latest run in the selected session, or none.
+    pub latest_run_id: Option<String>,
+    /// Number of persisted runs and human questions in the selected session.
+    pub human_turn_count: u64,
+    /// Daemon-owned SQLite ledger path.
+    pub ledger_path: String,
+    /// Number of persisted core events in the selected session.
+    pub core_event_count: u64,
+}
+
+/// Last-run and session-cumulative usage returned by `daemon.status`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonStatusUsage {
+    /// Usage aggregated across responses in the latest selected-session run.
+    pub last_run: DaemonStatusTokenUsage,
+    /// Usage aggregated across every response in the selected session.
+    pub session: DaemonStatusTokenUsage,
+}
+
+/// Known token subtotals plus the count of responses with unknown usage.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonStatusTokenUsage {
+    /// Sum of known provider-reported input tokens.
+    pub input_tokens: u64,
+    /// Sum of known provider-reported output tokens.
+    pub output_tokens: u64,
+    /// Number of model responses whose usage was unknown.
+    pub unknown_response_count: u64,
+}
+
+/// Persisted approval facts returned by `daemon.status`.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonStatusTrust {
+    /// Number of persisted `approval_granted` events.
+    pub approval_granted_count: u64,
+    /// Number of persisted `approval_denied` events.
+    pub approval_denied_count: u64,
 }
 
 /// Parameters for starting a fresh run.
@@ -993,6 +1130,7 @@ mod tests {
                 "transcript.read",
                 "transcript.read.typed",
                 "transcript.read.pending_approval",
+                "daemon.status",
                 "daemon.shutdown_if_idle",
             ]
         );
@@ -1052,6 +1190,40 @@ mod tests {
             serde_json::to_string(&response).unwrap(),
             RUN_FAILED_RESPONSE
         );
+    }
+
+    #[test]
+    fn daemon_status_known_and_unknown_fixtures_keep_exact_v1_bytes() {
+        const STATUS_REQUEST: &str = r#"{"v":1,"id":"status_1","kind":"request","method":"daemon.status","params":{"config_path":"config/plato.toml","session_id":"session_1"}}"#;
+        const STATUS_KNOWN_RESPONSE: &str = r#"{"v":1,"id":"status_1","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":"0123456789abcdef0123456789abcdef01234567","build_date_utc":"2026-08-01","endpoint_path":"/tmp/agent.sock","package_version":"0.1.0","uptime_ms":42,"workspace_id":"work-1234"},"model":{"key_present":true,"provider_kind":"open_router","requested_alias":"~openai/gpt-latest","served_model":"openai/gpt-5.5-2026-08-01"},"session":{"core_event_count":17,"human_turn_count":2,"latest_run_id":"run_2","ledger_path":"/tmp/agent.db","session_id":"session_1"},"trust":{"approval_denied_count":1,"approval_granted_count":2},"usage":{"last_run":{"input_tokens":7,"output_tokens":3,"unknown_response_count":1},"session":{"input_tokens":17,"output_tokens":8,"unknown_response_count":2}}}}"#;
+        const STATUS_UNKNOWN_RESPONSE: &str = r#"{"v":1,"id":"status_2","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":null,"build_date_utc":null,"endpoint_path":"/tmp/agent.sock","package_version":"0.1.0","uptime_ms":0,"workspace_id":"work-1234"},"model":{"key_present":false,"provider_kind":"open_ai","requested_alias":"gpt-5.5","served_model":null},"session":{"core_event_count":0,"human_turn_count":0,"latest_run_id":null,"ledger_path":"/tmp/agent.db","session_id":null},"trust":{"approval_denied_count":0,"approval_granted_count":0},"usage":{"last_run":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0},"session":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0}}}}"#;
+
+        let request = decode_request(STATUS_REQUEST).unwrap();
+        let params: DaemonStatusParams =
+            serde_json::from_value(request.params.clone().unwrap()).unwrap();
+        assert_eq!(params.session_id.as_deref(), Some("session_1"));
+        assert_eq!(params.config_path.as_deref(), Some("config/plato.toml"));
+        assert_eq!(serde_json::to_string(&request).unwrap(), STATUS_REQUEST);
+
+        for fixture in [STATUS_KNOWN_RESPONSE, STATUS_UNKNOWN_RESPONSE] {
+            let envelope: Envelope = serde_json::from_str(fixture).unwrap();
+            let result: DaemonStatusResult =
+                serde_json::from_value(envelope.result.clone().unwrap()).unwrap();
+            let rebuilt = Envelope::response_from(envelope.id, envelope.method, result);
+            assert_eq!(serde_json::to_string(&rebuilt).unwrap(), fixture);
+        }
+    }
+
+    #[test]
+    fn daemon_status_provider_kinds_keep_exact_wire_values() {
+        for (kind, wire_value) in [
+            (DaemonStatusProviderKind::OpenAi, "open_ai"),
+            (DaemonStatusProviderKind::OpenRouter, "open_router"),
+        ] {
+            assert_eq!(kind.as_str(), wire_value);
+            assert_eq!(kind.to_string(), wire_value);
+            assert_eq!(serde_json::to_value(kind).unwrap(), wire_value);
+        }
     }
 
     #[test]
@@ -1128,6 +1300,57 @@ mod tests {
         }));
         assert_unknown_field_rejected::<RunCancelParams>(json!({
             "run_id": "run_1",
+            "future": true
+        }));
+        assert_unknown_field_rejected::<DaemonStatusParams>(json!({
+            "session_id": "session_1",
+            "future": true
+        }));
+        assert_unknown_field_rejected::<DaemonStatusResult>(json!({
+            "model": {
+                "requested_alias": "gpt-5.5",
+                "served_model": null,
+                "provider_kind": "open_ai",
+                "key_present": false
+            },
+            "daemon": {
+                "package_version": "0.1.0",
+                "build_commit": null,
+                "build_date_utc": null,
+                "uptime_ms": 0,
+                "endpoint_path": "/tmp/agent.sock",
+                "workspace_id": "work-1234"
+            },
+            "session": {
+                "session_id": null,
+                "latest_run_id": null,
+                "human_turn_count": 0,
+                "ledger_path": "/tmp/agent.db",
+                "core_event_count": 0
+            },
+            "usage": {
+                "last_run": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "unknown_response_count": 0
+                },
+                "session": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "unknown_response_count": 0
+                }
+            },
+            "trust": {
+                "approval_granted_count": 0,
+                "approval_denied_count": 0
+            },
+            "future": true
+        }));
+        assert_unknown_field_rejected::<DaemonStatusModel>(json!({
+            "requested_alias": "gpt-5.5",
+            "served_model": null,
+            "provider_kind": "open_ai",
+            "key_present": false,
             "future": true
         }));
         assert_unknown_field_rejected::<TranscriptReadParams>(json!({

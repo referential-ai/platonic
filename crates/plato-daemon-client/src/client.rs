@@ -6,11 +6,12 @@ use crate::{
     transport::{self, Stream},
 };
 use plato_protocol::{
-    ApprovalDecideParams, ApprovalDecision, CommandAcceptedResult, Envelope, EnvelopeKind,
-    EventsStreamParams, EventsStreamResult, HelloParams, HelloResult, IssuePrepStartParams,
-    IssuePrepStartResult, MessageAppendParams, PROTOCOL_VERSION, RunCancelParams, RunOverrides,
-    RunStartParams, RunStartResult, SessionSummary, SessionsListResult, ShutdownIfIdleResult,
-    TranscriptReadParams, TranscriptReadResult,
+    ApprovalDecideParams, ApprovalDecision, CommandAcceptedResult, DaemonStatusParams,
+    DaemonStatusResult, Envelope, EnvelopeKind, EventsStreamParams, EventsStreamResult,
+    HelloParams, HelloResult, IssuePrepStartParams, IssuePrepStartResult, MessageAppendParams,
+    PROTOCOL_VERSION, RunCancelParams, RunOverrides, RunStartParams, RunStartResult,
+    SessionSummary, SessionsListResult, ShutdownIfIdleResult, TranscriptReadParams,
+    TranscriptReadResult,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -98,6 +99,21 @@ impl DaemonClient {
     pub fn sessions_list(&mut self) -> ClientResult<Vec<SessionSummary>> {
         let result: SessionsListResult = self.request_without_params("sessions.list")?;
         Ok(result.sessions)
+    }
+
+    /// Reads authoritative daemon, model, session, usage, and trust status.
+    pub fn daemon_status(
+        &mut self,
+        session_id: Option<String>,
+        config_path: Option<String>,
+    ) -> ClientResult<DaemonStatusResult> {
+        self.request(
+            "daemon.status",
+            DaemonStatusParams {
+                session_id,
+                config_path,
+            },
+        )
     }
 
     /// Requests daemon shutdown when no run or approval is active.
@@ -735,7 +751,10 @@ mod timeout_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use plato_protocol::{ProtocolError, RunStateName, SessionSummary, ShutdownIfIdleResultName};
+    use plato_protocol::{
+        DaemonStatusProviderKind, ProtocolError, RunStateName, SessionSummary,
+        ShutdownIfIdleResultName,
+    };
     use serde_json::json;
     use std::{
         io::{BufRead, BufReader, Write},
@@ -816,6 +835,92 @@ mod tests {
                 ledger_path: "/tmp/agent.db".into(),
             }]
         );
+    }
+
+    #[test]
+    fn client_sends_typed_daemon_status_request_and_decodes_every_section() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            let request = read_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some("daemon.status"));
+            assert_eq!(
+                request.params,
+                Some(json!({
+                    "session_id": "session_1",
+                    "config_path": "config/plato.toml"
+                }))
+            );
+            write_response(
+                &mut writer,
+                request.id,
+                "daemon.status",
+                json!({
+                    "model": {
+                        "requested_alias": "~openai/gpt-latest",
+                        "served_model": "openai/gpt-5.5-2026-08-01",
+                        "provider_kind": "open_router",
+                        "key_present": true
+                    },
+                    "daemon": {
+                        "package_version": "0.1.0",
+                        "build_commit": "0123456789abcdef0123456789abcdef01234567",
+                        "build_date_utc": "2026-08-01",
+                        "uptime_ms": 42,
+                        "endpoint_path": "/tmp/agent.sock",
+                        "workspace_id": "work-1234"
+                    },
+                    "session": {
+                        "session_id": "session_1",
+                        "latest_run_id": "run_2",
+                        "human_turn_count": 2,
+                        "ledger_path": "/tmp/agent.db",
+                        "core_event_count": 17
+                    },
+                    "usage": {
+                        "last_run": {
+                            "input_tokens": 7,
+                            "output_tokens": 3,
+                            "unknown_response_count": 1
+                        },
+                        "session": {
+                            "input_tokens": 17,
+                            "output_tokens": 8,
+                            "unknown_response_count": 2
+                        }
+                    },
+                    "trust": {
+                        "approval_granted_count": 2,
+                        "approval_denied_count": 1
+                    }
+                }),
+            );
+        });
+
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        let status = client
+            .daemon_status(Some("session_1".into()), Some("config/plato.toml".into()))
+            .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(
+            status.model.provider_kind,
+            DaemonStatusProviderKind::OpenRouter
+        );
+        assert_eq!(
+            status.model.served_model.as_deref(),
+            Some("openai/gpt-5.5-2026-08-01")
+        );
+        assert_eq!(status.daemon.uptime_ms, 42);
+        assert_eq!(status.session.latest_run_id.as_deref(), Some("run_2"));
+        assert_eq!(status.usage.last_run.unknown_response_count, 1);
+        assert_eq!(status.usage.session.input_tokens, 17);
+        assert_eq!(status.trust.approval_granted_count, 2);
+        assert_eq!(status.trust.approval_denied_count, 1);
     }
 
     #[test]
