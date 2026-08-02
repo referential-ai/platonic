@@ -560,7 +560,10 @@ fn conversation_live_event_lines(
                 push_notice_rows(&mut lines, &event.text, color);
                 continue;
             }
-            LiveEventKind::Tool | LiveEventKind::Status | LiveEventKind::Warning => continue,
+            LiveEventKind::Tool
+            | LiveEventKind::Approval
+            | LiveEventKind::Status
+            | LiveEventKind::Warning => continue,
         };
         if let Some(run_id) = event.run_id.as_deref()
             && let Some(index) =
@@ -621,7 +624,10 @@ fn push_message_rows(lines: &mut Vec<Line<'static>>, kind: LiveEventKind, text: 
                 .add_modifier(Modifier::BOLD),
             Style::default(),
         ),
-        LiveEventKind::Tool | LiveEventKind::Status | LiveEventKind::Warning => return,
+        LiveEventKind::Tool
+        | LiveEventKind::Approval
+        | LiveEventKind::Status
+        | LiveEventKind::Warning => return,
     };
     lines.push(Line::from(Span::styled(label, label_style)));
     let mut text_lines = text.lines().peekable();
@@ -666,6 +672,7 @@ fn trace_summary(
         }
     }
     let mut has_live_detail = false;
+    let mut approval_warning = false;
     for event in live_events {
         if event.run_id.as_deref() != live_run_id {
             continue;
@@ -680,9 +687,18 @@ fn trace_summary(
                 has_live_detail = true;
                 push_trace_part(&mut parts, "tools");
             }
+            LiveEventKind::Approval => {
+                has_live_detail = true;
+                approval_warning = false;
+                push_trace_part(&mut parts, "approval");
+            }
             LiveEventKind::Warning => {
                 has_live_detail = true;
-                push_trace_part(&mut parts, "warning");
+                if event.text.starts_with("approval pending ") {
+                    approval_warning = true;
+                } else {
+                    push_trace_part(&mut parts, "warning");
+                }
             }
             LiveEventKind::Status => has_live_detail = true,
             LiveEventKind::User | LiveEventKind::Assistant | LiveEventKind::AssistantDelta => {}
@@ -694,6 +710,12 @@ fn trace_summary(
     }
     if approval_pending {
         has_live_detail = true;
+        approval_warning = true;
+    }
+    if approval_warning {
+        push_trace_part(&mut parts, "warning");
+    }
+    if approval_pending {
         push_trace_part(&mut parts, "approval pending");
     }
     match status {
@@ -958,7 +980,7 @@ fn event_rows(event: &super::LiveEventLine) -> Vec<Line<'static>> {
         LiveEventKind::User => ("user", Color::Cyan),
         LiveEventKind::Assistant | LiveEventKind::AssistantDelta => ("assistant", Color::Green),
         LiveEventKind::Tool => ("tool", Color::Magenta),
-        LiveEventKind::Status => ("status", Color::DarkGray),
+        LiveEventKind::Approval | LiveEventKind::Status => ("status", Color::DarkGray),
         LiveEventKind::Warning => ("warning", Color::Red),
     };
     let mut text_lines = event.text.lines();
@@ -1284,8 +1306,8 @@ fn composer_height(state: &TuiState) -> u16 {
 mod tests {
     use super::*;
     use plato_protocol::{
-        HelloResult, PendingApprovalSnapshot, SessionSummary, TranscriptReadResult, TypedRun,
-        TypedTranscript, TypedTranscriptEntry,
+        ApprovalDecisionName, HelloResult, PendingApprovalSnapshot, SessionSummary,
+        TranscriptReadResult, TypedRun, TypedTranscript, TypedTranscriptEntry,
     };
     use platonic_core::EffectClass;
 
@@ -1868,6 +1890,126 @@ mod tests {
     }
 
     #[test]
+    fn approval_trace_reduces_pending_and_decisions_in_order() {
+        for (decision, text) in [
+            (ApprovalDecisionName::Granted, "approval granted call_1"),
+            (ApprovalDecisionName::Denied, "approval denied call_1"),
+        ] {
+            let pending = vec![
+                LiveEventLine::warning(Some(4), "approval pending file.write (workspace_write)")
+                    .with_run_id("run_1"),
+            ];
+            let pending_summary = trace_summary(
+                None,
+                &pending,
+                Some("run_1"),
+                Some(RunStateName::Running),
+                false,
+                true,
+            );
+            assert_eq!(
+                pending_summary.as_deref(),
+                Some("warning | approval pending | running")
+            );
+            let pending_readback = TypedRun {
+                run_id: "run_1".into(),
+                session_index: 0,
+                status: RunStateName::Running,
+                entries: Vec::new(),
+            };
+            assert_eq!(
+                trace_summary(
+                    Some(&pending_readback),
+                    &[],
+                    None,
+                    Some(RunStateName::Running),
+                    false,
+                    true,
+                )
+                .as_deref(),
+                pending_summary.as_deref()
+            );
+
+            let mut resolved = pending;
+            resolved.push(LiveEventLine::approval(Some(5), text).with_run_id("run_1"));
+            assert_eq!(
+                trace_summary(
+                    None,
+                    &resolved,
+                    Some("run_1"),
+                    Some(RunStateName::Running),
+                    false,
+                    false,
+                )
+                .as_deref(),
+                Some("approval | running")
+            );
+
+            let typed = TypedRun {
+                run_id: "run_1".into(),
+                session_index: 0,
+                status: RunStateName::Running,
+                entries: vec![TypedTranscriptEntry::Approval {
+                    call_id: "call_1".into(),
+                    decision,
+                    actor_id: "human".into(),
+                    reason: None,
+                }],
+            };
+            assert_eq!(
+                trace_summary(
+                    Some(&typed),
+                    &[],
+                    None,
+                    Some(RunStateName::Running),
+                    false,
+                    false,
+                )
+                .as_deref(),
+                Some("approval | running")
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_approval_keeps_unrelated_warning_and_terminal_priority() {
+        let events = vec![
+            LiveEventLine::warning(Some(4), "approval pending file.write (workspace_write)")
+                .with_run_id("run_1"),
+            LiveEventLine::approval(Some(5), "approval granted call_1").with_run_id("run_1"),
+            LiveEventLine::warning(Some(6), "provider failed").with_run_id("run_1"),
+        ];
+
+        assert_eq!(
+            trace_summary(
+                None,
+                &events,
+                Some("run_1"),
+                Some(RunStateName::Failed),
+                false,
+                false,
+            )
+            .as_deref(),
+            Some("approval | warning | failed")
+        );
+    }
+
+    #[test]
+    fn approval_conversation_and_audit_snapshots_keep_current_and_historical_facts() {
+        let mut state = approval_trace_fixture();
+        assert_eq!(
+            focused_snapshot(&state, 96, 24),
+            "You\n  Review the proposed edit.\n\nTrace  approval | running\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | running 0s | model pending | queued 0 | conversation"
+        );
+
+        state.toggle_display_mode();
+        assert_eq!(
+            focused_snapshot(&state, 96, 24),
+            "status    run run_approval\n\nuser      Review the proposed edit.\n\ntranscript\nstatus    running run_approval\nwarning   #4 approval pending file.write (workspace_write)\nstatus    #5 approval granted call_approval\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | running 0s | model pending | queued 0 | audit"
+        );
+    }
+
+    #[test]
     fn renders_scrolled_transcript_window() {
         let mut state = TuiState::connected(
             "/tmp/work".into(),
@@ -2309,6 +2451,51 @@ mod tests {
                 .with_run_id("run_beta_full_identifier"),
             LiveEventLine::warning(Some(42), "permission denied for call_beta")
                 .with_run_id("run_beta_full_identifier"),
+        ];
+        state
+    }
+
+    fn approval_trace_fixture() -> TuiState {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            Vec::new(),
+            TranscriptState::Loaded(
+                TranscriptReadResult {
+                    run_id: "run_approval".into(),
+                    status: RunStateName::Running,
+                    final_answer: None,
+                    transcript: "[turn_approval] user: Review the proposed edit.\n".into(),
+                    typed: Some(TypedTranscript {
+                        runs: vec![TypedRun {
+                            run_id: "run_approval".into(),
+                            session_index: 0,
+                            status: RunStateName::Running,
+                            entries: vec![TypedTranscriptEntry::User {
+                                text: "Review the proposed edit.".into(),
+                            }],
+                        }],
+                    }),
+                    pending_approval: None,
+                }
+                .into(),
+            ),
+        );
+        state.active_run = Some(ActiveRunView::new(
+            "run_approval".into(),
+            RunStateName::Running,
+        ));
+        state.live_events = vec![
+            LiveEventLine::warning(Some(4), "approval pending file.write (workspace_write)")
+                .with_run_id("run_approval"),
+            LiveEventLine::approval(Some(5), "approval granted call_approval")
+                .with_run_id("run_approval"),
         ];
         state
     }

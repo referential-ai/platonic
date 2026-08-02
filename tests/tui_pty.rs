@@ -202,8 +202,15 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
 
     let decided = shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, PENDING_CALL_ID);
     assert!(decided.contains("You"));
+    assert!(decided.contains("Trace  approval | running"));
+    assert!(!decided.contains("Trace  warning"));
     assert!(!decided.contains(PENDING_RUN_ID));
     assert!(!decided.contains(PENDING_CALL_ID));
+
+    shell.write(b"v");
+    let audit = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "approval denied");
+    assert!(audit.contains(PENDING_CALL_ID));
+    assert!(audit.contains("audit"));
     shell.write(b"q");
 
     let after_termios = shell.wait_for_marker("POST");

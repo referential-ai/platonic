@@ -145,6 +145,12 @@ fn ledger_event_line(offset: Option<u64>, event: &HarnessEvent) -> LiveEventLine
             LiveEventLine::tool(offset, format!("{call_id} running"))
         }
         HarnessEvent::ToolFinished { result, .. } => LiveEventLine::tool(offset, &result.summary),
+        HarnessEvent::ApprovalGranted { call_id, .. } => {
+            LiveEventLine::approval(offset, format!("approval granted {call_id}"))
+        }
+        HarnessEvent::ApprovalDenied { call_id, .. } => {
+            LiveEventLine::approval(offset, format!("approval denied {call_id}"))
+        }
         HarnessEvent::ToolFailed { reason, .. } => {
             LiveEventLine::warning(offset, format!("tool failed: {reason}"))
         }
@@ -198,7 +204,7 @@ mod tests {
                 "reason": "approval required"
             }),
         ));
-        let ledger = live_event_line(&ledger(
+        let proposed = live_event_line(&ledger(
             5,
             serde_json::json!({
                 "event": "tool_call_proposed",
@@ -223,6 +229,25 @@ mod tests {
                 "text": "hello"
             }),
         ));
+        let granted = live_event_line(&ledger(
+            7,
+            serde_json::json!({
+                "event": "approval_granted",
+                "run_id": "run_1",
+                "call_id": "call_1",
+                "actor_id": "human"
+            }),
+        ));
+        let denied = live_event_line(&ledger(
+            8,
+            serde_json::json!({
+                "event": "approval_denied",
+                "run_id": "run_1",
+                "call_id": "call_2",
+                "actor_id": "human",
+                "reason": "not now"
+            }),
+        ));
 
         assert_eq!(
             approval,
@@ -230,12 +255,20 @@ mod tests {
                 .with_run_id("run_1")
         );
         assert_eq!(
-            ledger,
+            proposed,
             LiveEventLine::tool(Some(5), "file.read proposed").with_run_id("run_1")
         );
         assert_eq!(
             delta,
             LiveEventLine::assistant_delta(Some(6), "hello").with_run_id("run_1")
+        );
+        assert_eq!(
+            granted,
+            LiveEventLine::approval(Some(7), "approval granted call_1").with_run_id("run_1")
+        );
+        assert_eq!(
+            denied,
+            LiveEventLine::approval(Some(8), "approval denied call_2").with_run_id("run_1")
         );
     }
 

@@ -4,9 +4,9 @@ use plato_daemon_client::{
     client::{DaemonClient, DaemonConnectionConfig},
 };
 use plato_protocol::{
-    CommandAcceptedResult, ERROR_LAGGED, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
-    ERROR_WORKSPACE_MISMATCH, EventsStreamResult, IssuePrepResult, IssuePrepStartResult,
-    RunStartResult, RunStateName, StreamEvent,
+    ApprovalDecisionName, CommandAcceptedResult, ERROR_LAGGED, ERROR_OVERLOAD,
+    ERROR_UNSUPPORTED_VERSION, ERROR_WORKSPACE_MISMATCH, EventsStreamResult, IssuePrepResult,
+    IssuePrepStartResult, RunStartResult, RunStateName, StreamEvent,
 };
 use std::{
     collections::HashMap,
@@ -221,7 +221,11 @@ pub(super) enum ClientEvent {
     RunStarted(RunStartResult),
     IssuePrepFinished(IssuePrepStartResult),
     EventsPolled(EventsStreamResult),
-    ApprovalDecided(CommandAcceptedResult),
+    ApprovalDecided {
+        result: CommandAcceptedResult,
+        tool_call_id: String,
+        decision: ApprovalDecisionName,
+    },
     RunCanceled(CommandAcceptedResult),
     Failed {
         operation: ClientOperation,
@@ -322,24 +326,34 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
         ClientCommand::ApprovalGrant {
             run_id,
             tool_call_id,
-        } => with_client(config, |client| {
-            client.approval_grant(&run_id, &tool_call_id)
-        })
-        .map_or_else(
-            failed_event(ClientOperation::ApprovalDecide),
-            ClientEvent::ApprovalDecided,
-        ),
+        } => {
+            let result = with_client(config, |client| {
+                client.approval_grant(&run_id, &tool_call_id)
+            });
+            result.map_or_else(failed_event(ClientOperation::ApprovalDecide), |result| {
+                ClientEvent::ApprovalDecided {
+                    result,
+                    tool_call_id,
+                    decision: ApprovalDecisionName::Granted,
+                }
+            })
+        }
         ClientCommand::ApprovalDeny {
             run_id,
             tool_call_id,
             reason,
-        } => with_client(config, |client| {
-            client.approval_deny(&run_id, &tool_call_id, reason)
-        })
-        .map_or_else(
-            failed_event(ClientOperation::ApprovalDecide),
-            ClientEvent::ApprovalDecided,
-        ),
+        } => {
+            let result = with_client(config, |client| {
+                client.approval_deny(&run_id, &tool_call_id, reason)
+            });
+            result.map_or_else(failed_event(ClientOperation::ApprovalDecide), |result| {
+                ClientEvent::ApprovalDecided {
+                    result,
+                    tool_call_id,
+                    decision: ApprovalDecisionName::Denied,
+                }
+            })
+        }
         ClientCommand::RunCancel { run_id } => {
             with_client(config, |client| client.run_cancel(&run_id)).map_or_else(
                 failed_event(ClientOperation::RunCancel),
@@ -427,11 +441,27 @@ pub(super) fn drain_client_events(
             ClientEvent::EventsPolled(result) => {
                 apply_events_result(state, runtime, commands, result)
             }
-            ClientEvent::ApprovalDecided(result) => {
+            ClientEvent::ApprovalDecided {
+                result,
+                tool_call_id,
+                decision,
+            } => {
                 state.status_message =
                     Some(format!("approval decision sent for {}", result.run_id));
                 state.approval = None;
-                state.active_run = Some(ActiveRunView::new(result.run_id, result.status));
+                state.active_run = Some(ActiveRunView::new(result.run_id.clone(), result.status));
+                let decision = match decision {
+                    ApprovalDecisionName::Granted => "granted",
+                    ApprovalDecisionName::Denied => "denied",
+                };
+                push_live_event(
+                    state,
+                    crate::LiveEventLine::approval(
+                        None,
+                        format!("approval {decision} {tool_call_id}"),
+                    )
+                    .with_run_id(result.run_id),
+                );
             }
             ClientEvent::RunCanceled(result) => {
                 state.status_message = Some(format!("cancel requested for {}", result.run_id));
@@ -1099,6 +1129,10 @@ mod tests {
             approval.diff_preview.as_deref(),
             Some("-old selected\n+new selected\n")
         );
+        state.live_events.push(
+            crate::LiveEventLine::warning(Some(11), "approval pending file.edit (workspace_write)")
+                .with_run_id("run_selected"),
+        );
 
         let (commands, events) = spawn_client_worker(harness.config.clone());
         let mut runtime = UiRuntime::from_state(&state, None);
@@ -1132,12 +1166,30 @@ mod tests {
         let failed = events.recv_timeout(OUTER_WATCHDOG).unwrap();
         apply_event(&commands, failed, &mut state, &mut runtime);
         assert_eq!(state.approval.as_ref(), Some(&approval));
+        assert!(
+            !state
+                .live_events
+                .iter()
+                .any(|event| event.kind == crate::LiveEventKind::Approval)
+        );
 
         commands.send(decision()).unwrap();
         let succeeded = events.recv_timeout(OUTER_WATCHDOG).unwrap();
         assert_eq!(state.approval.as_ref(), Some(&approval));
         apply_event(&commands, succeeded, &mut state, &mut runtime);
         assert!(state.approval.is_none());
+        assert!(state.live_events.iter().any(|event| {
+            event.kind == crate::LiveEventKind::Approval
+                && event.run_id.as_deref() == Some("run_selected")
+                && event.text
+                    == format!(
+                        "approval {} call_selected",
+                        if grant { "granted" } else { "denied" }
+                    )
+        }));
+        let resolved = render_snapshot(&state, 100, 24).unwrap();
+        assert!(resolved.contains("Trace  approval | running"));
+        assert!(!resolved.contains("Trace  warning"));
 
         drop(commands);
         let requests = harness.finish();
