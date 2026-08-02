@@ -2472,6 +2472,8 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(result["sessions"][0]["session_id"], "session_1");
         assert_eq!(result["sessions"][0]["run_id"], "run_1");
         assert_eq!(result["sessions"][0]["status"], "running");
+        assert_eq!(result["sessions"][0]["first_question"], "");
+        assert_eq!(result["sessions"][0]["updated_at_ms"], 0);
 
         let cancel = server.handle_line(
             r#"{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"run_id":"run_1"}}"#,
@@ -2502,6 +2504,14 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             "first answer",
             true,
         );
+        seed_finished_session_run(
+            &ledger_path,
+            "run_2",
+            "session_1",
+            "approved, go ahead",
+            "second answer",
+            false,
+        );
         drop(first_server);
 
         let second_socket = socket_dir.path().join("agent-2.sock");
@@ -2512,9 +2522,14 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(result["sessions"][0]["session_id"], "session_1");
-        assert_eq!(result["sessions"][0]["run_id"], "run_1");
+        assert_eq!(result["sessions"][0]["run_id"], "run_2");
         assert_eq!(result["sessions"][0]["status"], "finished");
-        assert_eq!(result["sessions"][0]["latest_question"], "first question");
+        assert_eq!(
+            result["sessions"][0]["latest_question"],
+            "approved, go ahead"
+        );
+        assert_eq!(result["sessions"][0]["first_question"], "first question");
+        assert!(result["sessions"][0]["updated_at_ms"].as_u64().unwrap() > 0);
     }
 
     #[test]
@@ -2629,6 +2644,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             result["sessions"][0]["latest_question"],
             format!("{}...", "x".repeat(120))
         );
+        assert_eq!(result["sessions"][0]["first_question"], long_question);
     }
 
     #[test]

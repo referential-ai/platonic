@@ -331,6 +331,67 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
     );
 }
 
+#[test]
+fn bare_plato_session_picker_resumes_exact_hidden_session_id() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+
+    let workspace_id = paths::workspace_id(&workspace).unwrap();
+    let endpoint = runtime
+        .join("plato-agent")
+        .join("workspaces")
+        .join(&workspace_id)
+        .join("agent.sock");
+    let ledger = state.join("fake-agent.db");
+    let fake = FakeDaemon::bind_conversation_audit(&endpoint, &workspace, &workspace_id, &ledger);
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        br#""$PLATO_BIN"; printf '\n%sSTATUS:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Conversation-first PTY question",
+    );
+
+    shell.write(b"/sessions\r");
+    let picker = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Sessions");
+    assert!(picker.contains("running"));
+    assert!(picker.contains("Conversation-first PTY question"));
+    assert!(!picker.contains("approved, go ahead"));
+    assert!(!picker.contains("session_pty_conversation"));
+
+    shell.write(b"\r");
+    fake.wait_for_request_count("transcript.read", 2);
+    let transcript_requests = fake.requests_for("transcript.read");
+    assert_eq!(
+        transcript_requests[1].params.as_ref().unwrap()["session_id"],
+        "session_pty_conversation"
+    );
+
+    shell.write(b"q");
+    assert_eq!(shell.wait_for_marker("STATUS"), "0");
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+
+    let requests = fake.finish();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method.as_deref() == Some("transcript.read"))
+            .count(),
+        2
+    );
+}
+
 struct PtyShell {
     pty: Pty,
     child: Child,
@@ -866,6 +927,8 @@ fn fake_response(
                         "run_id": PENDING_RUN_ID,
                         "status": "running",
                         "latest_question": "review the PTY edit",
+                        "first_question": "review the PTY edit",
+                        "updated_at_ms": 1_785_638_400_000_u64,
                         "ledger_path": ledger.to_string_lossy()
                     },
                     {
@@ -873,6 +936,8 @@ fn fake_response(
                         "run_id": "run_pty_other",
                         "status": "running",
                         "latest_question": "other simultaneous run",
+                        "first_question": "other simultaneous run",
+                        "updated_at_ms": 1_785_638_300_000_u64,
                         "ledger_path": ledger.to_string_lossy()
                     }
                 ]
@@ -882,7 +947,9 @@ fn fake_response(
                     "session_id": "session_pty_conversation",
                     "run_id": CONVERSATION_RUN_ID,
                     "status": "running",
-                    "latest_question": "Conversation-first PTY question",
+                    "latest_question": "approved, go ahead",
+                    "first_question": "Conversation-first PTY question",
+                    "updated_at_ms": 1_785_638_400_000_u64,
                     "ledger_path": ledger.to_string_lossy()
                 }]
             }),

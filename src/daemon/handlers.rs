@@ -614,6 +614,8 @@ fn session_summaries(runtime: &DaemonRuntime) -> crate::AppResult<Vec<SessionSum
                 run_id: session.run_id,
                 status: session.status,
                 latest_question: latest_question_preview(&session.latest_question),
+                first_question: session.first_question,
+                updated_at_ms: session.updated_at_ms,
                 ledger_path: ledger_path.to_string_lossy().into_owned(),
             })
             .collect::<Vec<_>>();
@@ -635,6 +637,8 @@ fn session_summaries(runtime: &DaemonRuntime) -> crate::AppResult<Vec<SessionSum
                 run_id: record.run_id.clone(),
                 status: status.state,
                 latest_question: String::new(),
+                first_question: String::new(),
+                updated_at_ms: 0,
                 ledger_path: record.ledger_path.to_string_lossy().into_owned(),
             })
         })

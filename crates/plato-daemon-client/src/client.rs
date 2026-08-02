@@ -790,6 +790,8 @@ mod tests {
                         "run_id": "run_1",
                         "status": "finished",
                         "latest_question": "hello",
+                        "first_question": "hello",
+                        "updated_at_ms": 123456,
                         "ledger_path": "/tmp/agent.db"
                     }]
                 }),
@@ -809,6 +811,8 @@ mod tests {
                 run_id: "run_1".into(),
                 status: RunStateName::Finished,
                 latest_question: "hello".into(),
+                first_question: "hello".into(),
+                updated_at_ms: 123_456,
                 ledger_path: "/tmp/agent.db".into(),
             }]
         );

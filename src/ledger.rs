@@ -296,6 +296,8 @@ pub struct PersistedSessionSummary {
     pub run_id: String,
     pub status: RunStateName,
     pub latest_question: String,
+    pub first_question: String,
+    pub updated_at_ms: u64,
 }
 
 impl SqliteLedger {
@@ -765,7 +767,15 @@ impl SqliteLedger {
 
     pub fn session_summaries(&self) -> AppResult<Vec<PersistedSessionSummary>> {
         let mut statement = self.connection.prepare(
-            "SELECT s.session_id, sr.run_id, sr.status, sr.question
+            "SELECT s.session_id, sr.run_id, sr.status, sr.question,
+                    (
+                      SELECT first_run.question
+                      FROM session_runs first_run
+                      WHERE first_run.session_id = s.session_id
+                      ORDER BY first_run.session_index ASC
+                      LIMIT 1
+                    ),
+                    s.updated_at_ms
              FROM sessions s
              JOIN session_runs sr ON sr.session_id = s.session_id
              WHERE sr.session_index = (
@@ -782,6 +792,8 @@ impl SqliteLedger {
                     run_id: row.get(1)?,
                     status: status_from_row(row, 2)?,
                     latest_question: row.get(3)?,
+                    first_question: row.get(4)?,
+                    updated_at_ms: row_u64(row, 5, "updated_at_ms")?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
@@ -2675,7 +2687,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_session_summaries_report_latest_session_run() {
+    fn sqlite_session_summaries_report_first_and_latest_session_questions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.db");
         let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
@@ -2692,6 +2704,14 @@ mod tests {
         ledger
             .begin_session_run("session_1", &second_run, "second question", false)
             .unwrap();
+        let updated_at_ms = ledger
+            .connection
+            .query_row(
+                "SELECT updated_at_ms FROM sessions WHERE session_id = 'session_1'",
+                [],
+                |row| row_u64(row, 0, "updated_at_ms"),
+            )
+            .unwrap();
 
         assert_eq!(
             ledger.session_summaries().unwrap(),
@@ -2700,7 +2720,94 @@ mod tests {
                 run_id: "run_2".into(),
                 status: RunStateName::Running,
                 latest_question: "second question".into(),
+                first_question: "first question".into(),
+                updated_at_ms,
             }]
+        );
+    }
+
+    #[test]
+    fn sqlite_session_summaries_preserve_newest_first_lifecycle_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let ledger = SqliteLedger::open_or_create(&path).unwrap();
+        ledger
+            .connection
+            .execute_batch(
+                r#"
+                INSERT INTO sessions (session_id, created_at_ms, updated_at_ms) VALUES
+                  ('session_new', 40, 400),
+                  ('session_continued', 30, 300),
+                  ('session_interrupted', 20, 200),
+                  ('session_failed', 10, 100);
+                INSERT INTO session_runs
+                  (session_id, run_id, session_index, question, final_answer, status, error, created_at_ms, updated_at_ms)
+                VALUES
+                  ('session_new', 'run_new', 0, 'new question', NULL, 'running', NULL, 40, 400),
+                  ('session_continued', 'run_continued_1', 0, 'continued first question', 'first answer', 'finished', NULL, 30, 30),
+                  ('session_continued', 'run_continued_2', 1, 'approved, go ahead', 'second answer', 'finished', NULL, 300, 300),
+                  ('session_interrupted', 'run_interrupted', 0, 'interrupted question', NULL, 'interrupted', 'daemon restarted', 20, 200),
+                  ('session_failed', 'run_failed', 0, 'failed question', NULL, 'failed', 'provider failed', 10, 100);
+                "#,
+            )
+            .unwrap();
+
+        let summaries = ledger.session_summaries().unwrap();
+
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| (summary.session_id.as_str(), summary.status))
+                .collect::<Vec<_>>(),
+            vec![
+                ("session_new", RunStateName::Running),
+                ("session_continued", RunStateName::Finished),
+                ("session_interrupted", RunStateName::Interrupted),
+                ("session_failed", RunStateName::Failed),
+            ]
+        );
+        assert_eq!(summaries[1].first_question, "continued first question");
+        assert_eq!(summaries[1].latest_question, "approved, go ahead");
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.updated_at_ms)
+                .collect::<Vec<_>>(),
+            vec![400, 300, 200, 100]
+        );
+    }
+
+    #[test]
+    fn sqlite_session_summary_read_is_readonly_and_never_creates_a_missing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.db");
+        assert!(sqlite_session_summaries(&missing).unwrap().is_empty());
+        assert!(!missing.exists());
+
+        let path = dir.path().join("events.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        ledger
+            .begin_session_run(
+                "session_1",
+                &RunId::new("run_1").unwrap(),
+                "first question",
+                true,
+            )
+            .unwrap();
+        let schema_version = ledger.user_version().unwrap();
+        drop(ledger);
+        let bytes_before = fs::read(&path).unwrap();
+
+        let summaries = sqlite_session_summaries(&path).unwrap();
+
+        assert_eq!(summaries[0].first_question, "first question");
+        assert_eq!(fs::read(&path).unwrap(), bytes_before);
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            schema_version
         );
     }
 
