@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1 — 2026-08-01
+
+- Added optional `ModelResponded.served_model` and matching readback data to retain the validated provider-reported model identity while preserving pre-field 0.3.0 event compatibility.
+
 ## 0.3.0 — 2026-07-31
 
 - Enforced run-wide uniqueness for accepted `TurnId` and `ToolCallId` values during transitions and replay, including the public `ToolCallReused` error.
