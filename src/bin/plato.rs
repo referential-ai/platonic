@@ -31,6 +31,7 @@ const DAEMON_EVENT_PAGE: usize = 128;
 #[derive(Debug, Parser)]
 #[command(name = "plato")]
 #[command(about = "Plato Agent CLI")]
+#[command(version = plato_protocol::BUILD_IDENTITY)]
 struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,

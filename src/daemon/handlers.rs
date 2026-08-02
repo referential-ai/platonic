@@ -127,7 +127,7 @@ fn handle_hello(runtime: &DaemonRuntime, request: Envelope, params: HelloParams)
         request.id,
         Some("hello".into()),
         HelloResult {
-            daemon_version: env!("CARGO_PKG_VERSION").into(),
+            daemon_version: plato_protocol::BUILD_IDENTITY.into(),
             workspace_id: runtime.paths.workspace_id.clone(),
             ledger_path: runtime.paths.ledger_path.to_string_lossy().into_owned(),
             capabilities: CAPABILITIES.into_iter().map(str::to_owned).collect(),

@@ -343,6 +343,34 @@ The TUI, desktop shell, embedded-daemon CLI probe, and Discord gateway bound
 daemon connects and each complete request to three seconds. The desktop uses a
 fresh budget for hello and every normal read or mutation.
 
+## Local Dogfood Deployment
+
+From a clean `develop` checkout, refresh the current-user binaries with:
+
+```bash
+./scripts/deploy-local.sh
+```
+
+The command fetches `origin/develop`, requires local `develop` to equal it,
+builds the three locked release binaries, and installs them at
+`~/.local/lib/plato-agent/{plato,plato-agentd,plato-tui}-real`. Existing wrapper
+scripts are not changed. It prints before/after checksums, gracefully retires
+only an owner-validated idle installed daemon, and verifies a new isolated
+daemon hello plus TUI snapshot before completing the atomic set replacement.
+
+Dirty, detached, non-`develop`, ahead, behind, failed-build, incomplete-stage,
+invalid-daemon, active-daemon, and failed-readback cases fail closed without
+changing the installed set. The immediately previous complete set is retained
+at `~/.local/lib/plato-agent.rollback`; restore all three binaries together
+with:
+
+```bash
+./scripts/deploy-local.sh --rollback
+```
+
+Deployed hello and TUI identity is `version commit UTC-date`. Builds made
+outside the deploy command report `unknown` provenance explicitly.
+
 ## Desktop (Development)
 
 The Plato Agent root and desktop packages require Rust 1.88. Platonic Core

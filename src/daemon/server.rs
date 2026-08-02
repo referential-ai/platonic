@@ -1077,6 +1077,7 @@ mod tests {
         assert_eq!(response.id.as_deref(), Some("req_1"));
         assert_eq!(response.method.as_deref(), Some("hello"));
         let result = response.result.unwrap();
+        assert_eq!(result["daemon_version"], plato_protocol::BUILD_IDENTITY);
         assert_eq!(result["workspace_id"], paths.workspace_id);
         assert_eq!(
             result["capabilities"],
