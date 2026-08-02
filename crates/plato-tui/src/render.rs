@@ -9,7 +9,11 @@ use ratatui::{
 
 use super::{
     ApprovalModalView, ConnectionState, LiveEventKind, TranscriptState, TuiState,
-    state::{DisplayMode, session_question_label},
+    markdown::{DEFAULT_SYNTAX_THEME, MarkdownRenderer, SyntaxTheme},
+    state::{
+        CachedLiveEventRows, CachedTranscriptRows, DisplayMode, LiveEventRowsKey,
+        TranscriptRowsKey, session_question_label,
+    },
 };
 use crate::commands::{SLASH_COMMANDS, matching_slash_commands};
 use plato_protocol::{ModelIdentityStatus, RunStateName, TypedRun, TypedTranscriptEntry};
@@ -67,7 +71,7 @@ fn render_snapshot_at(
 }
 
 fn render_history(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let mut lines = history_lines(state);
+    let mut lines = history_lines(state, area.width);
     if lines.is_empty() {
         lines.push(Line::from(""));
     }
@@ -82,20 +86,39 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     );
 }
 
-fn history_lines(state: &TuiState) -> Vec<Line<'static>> {
+fn history_lines(state: &TuiState, width: u16) -> Vec<Line<'static>> {
+    history_lines_with_theme(state, width, DEFAULT_SYNTAX_THEME)
+}
+
+fn history_lines_with_theme(
+    state: &TuiState,
+    width: u16,
+    syntax_theme: SyntaxTheme,
+) -> Vec<Line<'static>> {
     match state.display_mode {
-        DisplayMode::Conversation => conversation_history_lines(state),
-        DisplayMode::Audit => audit_history_lines(state),
+        DisplayMode::Conversation => conversation_history_lines(state, width, syntax_theme),
+        DisplayMode::Audit => audit_history_lines(state, width, syntax_theme),
     }
 }
 
-fn audit_history_lines(state: &TuiState) -> Vec<Line<'static>> {
+fn audit_history_lines(
+    state: &TuiState,
+    width: u16,
+    syntax_theme: SyntaxTheme,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match &state.transcript {
         TranscriptState::Loaded(transcript) => {
             lines.push(status_row(format!("run {}", transcript.run_id)));
             lines.push(Line::from(""));
-            append_transcript_rows(&mut lines, state, transcript, DisplayMode::Audit);
+            append_transcript_rows(
+                &mut lines,
+                state,
+                transcript,
+                width,
+                DisplayMode::Audit,
+                syntax_theme,
+            );
         }
         TranscriptState::Unavailable { run_id, error } => {
             clear_transcript_rows(state);
@@ -132,17 +155,28 @@ fn audit_history_lines(state: &TuiState) -> Vec<Line<'static>> {
         }
     }
 
-    append_audit_live_transcript(&mut lines, state);
+    append_audit_live_transcript(&mut lines, state, width, syntax_theme);
     append_queue_preview(&mut lines, state);
     lines
 }
 
-fn conversation_history_lines(state: &TuiState) -> Vec<Line<'static>> {
+fn conversation_history_lines(
+    state: &TuiState,
+    width: u16,
+    syntax_theme: SyntaxTheme,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut latest_transcript = None;
     match &state.transcript {
         TranscriptState::Loaded(transcript) => {
-            append_transcript_rows(&mut lines, state, transcript, DisplayMode::Conversation);
+            append_transcript_rows(
+                &mut lines,
+                state,
+                transcript,
+                width,
+                DisplayMode::Conversation,
+                syntax_theme,
+            );
             latest_transcript = Some(transcript);
         }
         TranscriptState::Unavailable { run_id, error } => {
@@ -177,7 +211,7 @@ fn conversation_history_lines(state: &TuiState) -> Vec<Line<'static>> {
         }
     }
 
-    append_conversation_activity(&mut lines, state, latest_transcript);
+    append_conversation_activity(&mut lines, state, latest_transcript, width, syntax_theme);
     append_queue_preview(&mut lines, state);
     lines
 }
@@ -203,7 +237,9 @@ fn append_transcript_rows(
     lines: &mut Vec<Line<'static>>,
     state: &TuiState,
     transcript: &super::TranscriptView,
+    width: u16,
     mode: DisplayMode,
+    syntax_theme: SyntaxTheme,
 ) {
     let changed = state
         .history_rows
@@ -211,13 +247,29 @@ fn append_transcript_rows(
         .read()
         .expect("transcript row cache lock poisoned")
         .as_ref()
-        .is_none_or(|(cached_transcript, _)| cached_transcript != transcript);
+        .is_none_or(|cached| {
+            &cached.key.source != transcript
+                || cached.key.width != width
+                || cached.key.display_mode != mode
+                || cached.key.syntax_theme != syntax_theme
+        });
     if changed {
+        let key = TranscriptRowsKey {
+            source: transcript.clone(),
+            width,
+            display_mode: mode,
+            syntax_theme,
+        };
         let rows = match mode {
-            DisplayMode::Conversation => conversation_transcript_lines(transcript),
+            DisplayMode::Conversation => conversation_transcript_lines(
+                transcript,
+                width,
+                syntax_theme,
+                &state.history_rows.markdown,
+            ),
             DisplayMode::Audit => readback_lines(&transcript.content),
         };
-        let cached = (transcript.clone(), rows);
+        let cached = CachedTranscriptRows { key, rows };
         *state
             .history_rows
             .transcript
@@ -229,7 +281,10 @@ fn append_transcript_rows(
         .transcript
         .read()
         .expect("transcript row cache lock poisoned");
-    let (_, rows) = cached.as_ref().expect("transcript rows were initialized");
+    let rows = &cached
+        .as_ref()
+        .expect("transcript rows were initialized")
+        .rows;
     if mode == DisplayMode::Conversation {
         append_spaced_rows(lines, rows.iter().cloned());
     } else {
@@ -284,7 +339,12 @@ fn intro_lines(state: &TuiState) -> Vec<Line<'static>> {
     lines
 }
 
-fn append_audit_live_transcript(lines: &mut Vec<Line<'static>>, state: &TuiState) {
+fn append_audit_live_transcript(
+    lines: &mut Vec<Line<'static>>,
+    state: &TuiState,
+    width: u16,
+    syntax_theme: SyntaxTheme,
+) {
     let has_activity = state.active_run.is_some()
         || state.status_message.is_some()
         || state.stream_warning.is_some()
@@ -314,7 +374,7 @@ fn append_audit_live_transcript(lines: &mut Vec<Line<'static>>, state: &TuiState
     if let Some(warning) = &state.stream_warning {
         lines.push(warning_row(format!("stream warning {warning}")));
     }
-    append_audit_live_event_rows(lines, state);
+    append_audit_live_event_rows(lines, state, width, syntax_theme);
 }
 
 fn clear_live_event_rows(state: &TuiState) {
@@ -334,19 +394,35 @@ fn clear_live_event_rows(state: &TuiState) {
     }
 }
 
-fn append_audit_live_event_rows(lines: &mut Vec<Line<'static>>, state: &TuiState) {
+fn append_audit_live_event_rows(
+    lines: &mut Vec<Line<'static>>,
+    state: &TuiState,
+    width: u16,
+    syntax_theme: SyntaxTheme,
+) {
     let changed = state
         .history_rows
         .live_events
         .read()
         .expect("live event row cache lock poisoned")
         .as_ref()
-        .is_none_or(|(cached_events, committed, _)| {
-            cached_events != &state.live_events || !committed.is_empty()
+        .is_none_or(|cached| {
+            cached.key.source != state.live_events
+                || !cached.key.committed.is_empty()
+                || cached.key.width != width
+                || cached.key.display_mode != DisplayMode::Audit
+                || cached.key.syntax_theme != syntax_theme
         });
     if changed {
+        let key = LiveEventRowsKey {
+            source: state.live_events.clone(),
+            committed: Vec::new(),
+            width,
+            display_mode: DisplayMode::Audit,
+            syntax_theme,
+        };
         let rows = state.live_events.iter().flat_map(event_rows).collect();
-        let cached = (state.live_events.clone(), Vec::new(), rows);
+        let cached = CachedLiveEventRows { key, rows };
         *state
             .history_rows
             .live_events
@@ -358,21 +434,45 @@ fn append_audit_live_event_rows(lines: &mut Vec<Line<'static>>, state: &TuiState
         .live_events
         .read()
         .expect("live event row cache lock poisoned");
-    let (_, _, rows) = cached.as_ref().expect("live event rows were initialized");
+    let rows = &cached
+        .as_ref()
+        .expect("live event rows were initialized")
+        .rows;
     lines.extend(rows.iter().cloned());
 }
 
-fn conversation_transcript_lines(transcript: &super::TranscriptView) -> Vec<Line<'static>> {
+fn conversation_transcript_lines(
+    transcript: &super::TranscriptView,
+    width: u16,
+    syntax_theme: SyntaxTheme,
+    markdown: &MarkdownRenderer,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(typed) = &transcript.typed {
         for run in &typed.runs {
             for entry in &run.entries {
                 match entry {
                     TypedTranscriptEntry::User { text } => {
-                        push_message_rows(&mut lines, LiveEventKind::User, text);
+                        push_message_rows(
+                            &mut lines,
+                            LiveEventKind::User,
+                            text,
+                            width,
+                            syntax_theme,
+                            markdown,
+                            true,
+                        );
                     }
                     TypedTranscriptEntry::Assistant { text } => {
-                        push_message_rows(&mut lines, LiveEventKind::Assistant, text);
+                        push_message_rows(
+                            &mut lines,
+                            LiveEventKind::Assistant,
+                            text,
+                            width,
+                            syntax_theme,
+                            markdown,
+                            true,
+                        );
                     }
                     TypedTranscriptEntry::ToolCall { .. }
                     | TypedTranscriptEntry::ToolResult { .. }
@@ -391,9 +491,25 @@ fn conversation_transcript_lines(transcript: &super::TranscriptView) -> Vec<Line
     } else {
         for line in transcript.content.lines() {
             if let Some(text) = turn_text(line, "user: ") {
-                push_message_rows(&mut lines, LiveEventKind::User, text);
+                push_message_rows(
+                    &mut lines,
+                    LiveEventKind::User,
+                    text,
+                    width,
+                    syntax_theme,
+                    markdown,
+                    false,
+                );
             } else if let Some(text) = turn_text(line, "assistant: ") {
-                push_message_rows(&mut lines, LiveEventKind::Assistant, text);
+                push_message_rows(
+                    &mut lines,
+                    LiveEventKind::Assistant,
+                    text,
+                    width,
+                    syntax_theme,
+                    markdown,
+                    false,
+                );
             }
         }
     }
@@ -404,6 +520,8 @@ fn append_conversation_activity(
     lines: &mut Vec<Line<'static>>,
     state: &TuiState,
     transcript: Option<&super::TranscriptView>,
+    width: u16,
+    syntax_theme: SyntaxTheme,
 ) {
     let latest_run = transcript.and_then(latest_typed_run);
     let live_run_id = state
@@ -432,7 +550,7 @@ fn append_conversation_activity(
         clear_live_event_rows(state);
     } else {
         let committed = committed_message_keys(transcript);
-        append_conversation_live_event_rows(lines, state, committed);
+        append_conversation_live_event_rows(lines, state, committed, width, syntax_theme);
     }
 
     let live_status = state
@@ -523,6 +641,8 @@ fn append_conversation_live_event_rows(
     lines: &mut Vec<Line<'static>>,
     state: &TuiState,
     committed: Vec<(String, LiveEventKind, String)>,
+    width: u16,
+    syntax_theme: SyntaxTheme,
 ) {
     let changed = state
         .history_rows
@@ -530,12 +650,29 @@ fn append_conversation_live_event_rows(
         .read()
         .expect("live event row cache lock poisoned")
         .as_ref()
-        .is_none_or(|(cached_events, cached_committed, _)| {
-            cached_events != &state.live_events || cached_committed != &committed
+        .is_none_or(|cached| {
+            cached.key.source != state.live_events
+                || cached.key.committed != committed
+                || cached.key.width != width
+                || cached.key.display_mode != DisplayMode::Conversation
+                || cached.key.syntax_theme != syntax_theme
         });
     if changed {
-        let rows = conversation_live_event_lines(&state.live_events, &committed);
-        let cached = (state.live_events.clone(), committed, rows);
+        let key = LiveEventRowsKey {
+            source: state.live_events.clone(),
+            committed,
+            width,
+            display_mode: DisplayMode::Conversation,
+            syntax_theme,
+        };
+        let rows = conversation_live_event_lines(
+            &state.live_events,
+            &key.committed,
+            width,
+            syntax_theme,
+            &state.history_rows.markdown,
+        );
+        let cached = CachedLiveEventRows { key, rows };
         *state
             .history_rows
             .live_events
@@ -547,13 +684,19 @@ fn append_conversation_live_event_rows(
         .live_events
         .read()
         .expect("live event row cache lock poisoned");
-    let (_, _, rows) = cached.as_ref().expect("live event rows were initialized");
+    let rows = &cached
+        .as_ref()
+        .expect("live event rows were initialized")
+        .rows;
     append_spaced_rows(lines, rows.iter().cloned());
 }
 
 fn conversation_live_event_lines(
     events: &[super::LiveEventLine],
     committed: &[(String, LiveEventKind, String)],
+    width: u16,
+    syntax_theme: SyntaxTheme,
+    markdown: &MarkdownRenderer,
 ) -> Vec<Line<'static>> {
     let mut committed = committed.to_vec();
     let mut lines = Vec::new();
@@ -593,7 +736,15 @@ fn conversation_live_event_lines(
             committed.remove(index);
             continue;
         }
-        push_message_rows(&mut lines, kind, &event.text);
+        push_message_rows(
+            &mut lines,
+            kind,
+            &event.text,
+            width,
+            syntax_theme,
+            markdown,
+            true,
+        );
     }
     lines
 }
@@ -614,7 +765,15 @@ fn push_notice_rows(lines: &mut Vec<Line<'static>>, text: &str, color: Color) {
     }));
 }
 
-fn push_message_rows(lines: &mut Vec<Line<'static>>, kind: LiveEventKind, text: &str) {
+fn push_message_rows(
+    lines: &mut Vec<Line<'static>>,
+    kind: LiveEventKind,
+    text: &str,
+    width: u16,
+    syntax_theme: SyntaxTheme,
+    markdown: &MarkdownRenderer,
+    assistant_markdown: bool,
+) {
     if text.is_empty()
         && matches!(
             kind,
@@ -626,20 +785,18 @@ fn push_message_rows(lines: &mut Vec<Line<'static>>, kind: LiveEventKind, text: 
     if !lines.is_empty() {
         lines.push(Line::from(""));
     }
-    let (label, label_style, text_style) = match kind {
+    let (label, label_style) = match kind {
         LiveEventKind::User => (
             "You",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Cyan),
         ),
         LiveEventKind::Assistant | LiveEventKind::AssistantDelta => (
             "Plato",
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
-            Style::default(),
         ),
         LiveEventKind::Tool
         | LiveEventKind::Approval
@@ -647,16 +804,34 @@ fn push_message_rows(lines: &mut Vec<Line<'static>>, kind: LiveEventKind, text: 
         | LiveEventKind::Warning => return,
     };
     lines.push(Line::from(Span::styled(label, label_style)));
-    let mut text_lines = text.lines().peekable();
-    if text_lines.peek().is_none() {
-        lines.push(Line::from("  "));
-    } else {
-        lines.extend(text_lines.map(|line| {
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled(line.to_owned(), text_style),
-            ])
-        }));
+    match kind {
+        LiveEventKind::User => {
+            let mut text_lines = text.lines().peekable();
+            if text_lines.peek().is_none() {
+                lines.push(Line::from("  "));
+            } else {
+                lines.extend(text_lines.map(|line| {
+                    Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(line.to_owned(), Style::default().fg(Color::Cyan)),
+                    ])
+                }));
+            }
+        }
+        LiveEventKind::Assistant | LiveEventKind::AssistantDelta => {
+            if assistant_markdown {
+                lines.extend(markdown.render(text, width, syntax_theme));
+            } else {
+                lines.extend(
+                    text.lines()
+                        .map(|line| Line::from(vec![Span::raw("  "), Span::raw(line.to_owned())])),
+                );
+            }
+        }
+        LiveEventKind::Tool
+        | LiveEventKind::Approval
+        | LiveEventKind::Status
+        | LiveEventKind::Warning => {}
     }
 }
 
@@ -1576,24 +1751,35 @@ mod tests {
     }
 
     #[test]
-    fn typed_and_live_conversation_skip_empty_assistant_cells() {
+    fn typed_and_live_markdown_match_on_reload_and_skip_empty_assistant_cells() {
         let TranscriptState::Loaded(mut transcript) = conversation_fixture().transcript else {
             panic!("expected loaded transcript");
         };
         transcript.run_id = "run_alpha_full_identifier".into();
         transcript.typed.as_mut().unwrap().runs.truncate(1);
-        let typed = conversation_transcript_lines(&transcript);
+        let entries = &mut transcript.typed.as_mut().unwrap().runs[0].entries;
+        entries[0] = TypedTranscriptEntry::User {
+            text: "**literal user**".into(),
+        };
+        entries[4] = TypedTranscriptEntry::Assistant {
+            text: "# Reloaded\n\nA **bold** answer.".into(),
+        };
+        let markdown = MarkdownRenderer::default();
+        let typed =
+            conversation_transcript_lines(&transcript, 100, DEFAULT_SYNTAX_THEME, &markdown);
         let live = conversation_live_event_lines(
             &[
-                LiveEventLine::user("First question asks for a concise summary.")
-                    .with_run_id("run_alpha_full_identifier"),
+                LiveEventLine::user("**literal user**").with_run_id("run_alpha_full_identifier"),
                 LiveEventLine::assistant(Some(1), "").with_run_id("run_alpha_full_identifier"),
                 LiveEventLine::tool(Some(2), "call_alpha proposed")
                     .with_run_id("run_alpha_full_identifier"),
-                LiveEventLine::assistant(Some(3), "First answer is short and clear.")
+                LiveEventLine::assistant(Some(3), "# Reloaded\n\nA **bold** answer.")
                     .with_run_id("run_alpha_full_identifier"),
             ],
             &[],
+            100,
+            DEFAULT_SYNTAX_THEME,
+            &markdown,
         );
 
         assert_eq!(live, typed);
@@ -1601,17 +1787,25 @@ mod tests {
             typed.iter().map(ToString::to_string).collect::<Vec<_>>(),
             vec![
                 "You",
-                "  First question asks for a concise summary.",
+                "  **literal user**",
                 "",
                 "Plato",
-                "  First answer is short and clear."
+                "  Reloaded",
+                "",
+                "  A bold answer."
             ]
         );
     }
 
     #[test]
     fn conversation_preserves_whitespace_bearing_assistant_content() {
-        let rows = conversation_live_event_lines(&[LiveEventLine::assistant(Some(1), " \t")], &[]);
+        let rows = conversation_live_event_lines(
+            &[LiveEventLine::assistant(Some(1), " \t")],
+            &[],
+            100,
+            DEFAULT_SYNTAX_THEME,
+            &MarkdownRenderer::default(),
+        );
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].to_string(), "Plato");
@@ -1624,7 +1818,12 @@ mod tests {
         let TranscriptState::Loaded(transcript) = &state.transcript else {
             panic!("expected loaded transcript");
         };
-        let rows = conversation_transcript_lines(transcript);
+        let rows = conversation_transcript_lines(
+            transcript,
+            100,
+            DEFAULT_SYNTAX_THEME,
+            &MarkdownRenderer::default(),
+        );
         let you = rows
             .iter()
             .find(|line| line.spans.first().is_some_and(|span| span.content == "You"))
@@ -1705,6 +1904,42 @@ mod tests {
         assert!(!second.contains("dynamic warning"));
         assert!(second.contains("dynamic queue"));
         assert_eq!(cached_row_ptrs(&state), cached_ptrs);
+    }
+
+    #[test]
+    fn cache_key_covers_exact_source_width_mode_and_theme_revision() {
+        let mut state = conversation_fixture();
+        history_lines_with_theme(&state, 80, DEFAULT_SYNTAX_THEME);
+        let calls = state.history_rows.markdown.render_calls();
+        history_lines_with_theme(&state, 80, DEFAULT_SYNTAX_THEME);
+        assert_eq!(state.history_rows.markdown.render_calls(), calls);
+
+        history_lines_with_theme(&state, 81, DEFAULT_SYNTAX_THEME);
+        assert!(state.history_rows.markdown.render_calls() > calls);
+        assert_eq!(transcript_cache_key(&state).width, 81);
+
+        let calls = state.history_rows.markdown.render_calls();
+        let TranscriptState::Loaded(transcript) = &mut state.transcript else {
+            panic!("expected loaded transcript");
+        };
+        transcript.content.push_str("raw source changed\n");
+        history_lines_with_theme(&state, 81, DEFAULT_SYNTAX_THEME);
+        assert!(state.history_rows.markdown.render_calls() > calls);
+
+        let calls = state.history_rows.markdown.render_calls();
+        state.toggle_display_mode();
+        history_lines_with_theme(&state, 81, DEFAULT_SYNTAX_THEME);
+        assert_eq!(state.history_rows.markdown.render_calls(), calls);
+        assert_eq!(
+            transcript_cache_key(&state).display_mode,
+            DisplayMode::Audit
+        );
+
+        state.toggle_display_mode();
+        let revised = DEFAULT_SYNTAX_THEME.with_revision(1);
+        history_lines_with_theme(&state, 81, revised);
+        assert!(state.history_rows.markdown.render_calls() > calls);
+        assert_eq!(transcript_cache_key(&state).syntax_theme, revised);
     }
 
     #[test]
@@ -1887,9 +2122,11 @@ mod tests {
 
         let output = render_to_text(&state);
 
-        assert!(output.lines().any(|line| line.contains("# Prepared issue")));
-        assert!(output.lines().any(|line| line.contains("## Problem")));
-        assert!(!output.contains("# Prepared issue## Problem"));
+        assert!(output.lines().any(|line| line.contains("Prepared issue")));
+        assert!(output.lines().any(|line| line.contains("Problem")));
+        assert!(!output.contains("# Prepared issue"));
+        assert!(!output.contains("## Problem"));
+        assert!(!output.contains("Prepared issueProblem"));
     }
 
     #[test]
@@ -2728,9 +2965,21 @@ mod tests {
         let transcript = state.history_rows.transcript.read().unwrap();
         let live_events = state.history_rows.live_events.read().unwrap();
         (
-            transcript.as_ref().unwrap().1.as_ptr(),
-            live_events.as_ref().unwrap().2.as_ptr(),
+            transcript.as_ref().unwrap().rows.as_ptr(),
+            live_events.as_ref().unwrap().rows.as_ptr(),
         )
+    }
+
+    fn transcript_cache_key(state: &TuiState) -> TranscriptRowsKey {
+        state
+            .history_rows
+            .transcript
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .key
+            .clone()
     }
 
     fn render_to_text(state: &TuiState) -> String {

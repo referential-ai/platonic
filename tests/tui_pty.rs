@@ -259,8 +259,13 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
     let default = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Trace");
     assert!(default.contains("You"));
     assert!(default.contains("Plato"));
-    assert!(default.contains("Conversation-first PTY question"));
+    assert!(default.contains("**Conversation-first PTY question**"));
     assert!(default.contains("Conversation-first PTY answer"));
+    assert!(default.contains("rendered Markdown"));
+    assert!(default.contains("fn pty_rendered() {}"));
+    assert!(!default.contains("## Conversation-first PTY answer"));
+    assert!(!default.contains("**rendered Markdown**"));
+    assert!(!default.contains("```rust"));
     assert_eq!(
         default
             .lines()
@@ -277,6 +282,10 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
         let audit = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, CONVERSATION_RUN_ID);
         assert!(audit.contains("#7 model_stage"));
         assert!(audit.contains("audit"));
+        assert!(audit.contains("**Conversation-first PTY question**"));
+        assert!(audit.contains("## Conversation-first PTY answer"));
+        assert!(audit.contains("**rendered Markdown**"));
+        assert!(audit.contains("```rust"));
         let audit_rows = audit.lines().map(str::trim_end).collect::<Vec<_>>();
         let empty_assistant = audit_rows
             .iter()
@@ -974,7 +983,7 @@ fn fake_response(
             "status": "running",
             "final_answer": null,
             "transcript": format!(
-                "run_id: {CONVERSATION_RUN_ID}\n[turn_pty] user: Conversation-first PTY question\n[turn_pty] assistant: \n[turn_pty] tool_call call_pty file.read {{\"path\":\"README.md\"}}\ntool_result call_pty README loaded\n[turn_pty] assistant: Conversation-first PTY answer\n"
+                "run_id: {CONVERSATION_RUN_ID}\n[turn_pty] user: **Conversation-first PTY question**\n[turn_pty] assistant: \n[turn_pty] tool_call call_pty file.read {{\"path\":\"README.md\"}}\ntool_result call_pty README loaded\n[turn_pty] assistant: ## Conversation-first PTY answer\n\nUse **rendered Markdown**.\n\n```rust\nfn pty_rendered() {{}}\n```\n"
             ),
             "typed": {
                 "runs": [{
@@ -982,7 +991,7 @@ fn fake_response(
                     "session_index": 0,
                     "status": "running",
                     "entries": [
-                        {"kind": "user", "text": "Conversation-first PTY question"},
+                        {"kind": "user", "text": "**Conversation-first PTY question**"},
                         {"kind": "assistant", "text": ""},
                         {
                             "kind": "tool_call",
@@ -995,7 +1004,7 @@ fn fake_response(
                             "call_id": "call_pty",
                             "summary": "README loaded"
                         },
-                        {"kind": "assistant", "text": "Conversation-first PTY answer"}
+                        {"kind": "assistant", "text": "## Conversation-first PTY answer\n\nUse **rendered Markdown**.\n\n```rust\nfn pty_rendered() {}\n```"}
                     ]
                 }]
             }
