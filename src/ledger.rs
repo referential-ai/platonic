@@ -443,6 +443,11 @@ impl SqliteLedger {
             return Ok(Vec::new());
         }
         let envelopes = read_voice_events_from(&self.connection, run_id)?;
+        let events = envelopes
+            .iter()
+            .map(|envelope| envelope.event.clone())
+            .collect::<Vec<_>>();
+        validate_voice_event_stream(&events)?;
         if !envelopes.is_empty() {
             validate_voice_event_keys(&self.connection, run_id, &envelopes)?;
         }
@@ -2436,6 +2441,59 @@ mod tests {
                     .contains(expected)
             );
         }
+    }
+
+    #[test]
+    fn voice_companion_read_rejects_durable_cross_row_contract_corruption_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let unpaired_path = dir.path().join("unpaired-interruption.db");
+        let mut ledger = SqliteLedger::open_or_create(&unpaired_path).unwrap();
+        append_voice_core_keys(&mut ledger, "run_unpaired", "turn_1");
+        ledger
+            .append_voice_events(&completed_voice_events("run_unpaired"))
+            .unwrap();
+        ledger
+            .connection
+            .execute("DELETE FROM voice_events WHERE sequence = 2", [])
+            .unwrap();
+        drop(ledger);
+
+        let error = SqliteLedger::open_readonly(&unpaired_path)
+            .unwrap()
+            .read_voice_events("run_unpaired")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted voice speech must be followed")
+        );
+
+        let capture_path = dir.path().join("repeated-capture.db");
+        let mut ledger = SqliteLedger::open_or_create(&capture_path).unwrap();
+        append_voice_core_keys(&mut ledger, "run_capture", "turn_1");
+        ledger
+            .append_voice_events(&completed_voice_events("run_capture"))
+            .unwrap();
+        let repeated_capture =
+            serde_json::to_string(&captured_voice_event("run_capture", "turn_1")).unwrap();
+        ledger
+            .connection
+            .execute(
+                "UPDATE voice_events SET event_json = ?1 WHERE sequence = 1",
+                params![repeated_capture],
+            )
+            .unwrap();
+        drop(ledger);
+
+        let error = SqliteLedger::open_readonly(&capture_path)
+            .unwrap()
+            .read_voice_events("run_capture")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("voice capture must appear at most once and first")
+        );
     }
 
     #[test]
