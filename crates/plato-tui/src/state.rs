@@ -817,6 +817,16 @@ impl LiveEventLine {
         }
     }
 
+    /// Creates an approval-decision row.
+    pub fn approval(offset: Option<u64>, text: impl Into<String>) -> Self {
+        Self {
+            run_id: None,
+            offset,
+            kind: LiveEventKind::Approval,
+            text: text.into(),
+        }
+    }
+
     /// Creates a status row.
     pub fn status(offset: Option<u64>, text: impl Into<String>) -> Self {
         Self {
@@ -854,6 +864,8 @@ pub enum LiveEventKind {
     AssistantDelta,
     /// Tool activity.
     Tool,
+    /// Accepted approval decision.
+    Approval,
     /// Run or client status.
     Status,
     /// Recoverable warning or failure.

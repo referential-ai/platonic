@@ -824,6 +824,19 @@ pub(super) fn push_live_event(state: &mut TuiState, mut line: crate::LiveEventLi
     use crate::LiveEventKind;
 
     state.invalidate_live_event_rows();
+    if line.kind == LiveEventKind::Approval
+        && line.offset.is_some()
+        && let Some(immediate) = state.live_events.iter_mut().rev().find(|event| {
+            event.kind == LiveEventKind::Approval
+                && event.run_id == line.run_id
+                && event.text == line.text
+                && event.offset.is_none()
+        })
+    {
+        *immediate = line;
+        state.reset_scroll();
+        return;
+    }
     if line.kind == LiveEventKind::AssistantDelta {
         if let Some(last) = state.live_events.last_mut()
             && last.kind == LiveEventKind::Assistant
@@ -2006,6 +2019,24 @@ mod tests {
     }
 
     #[test]
+    fn durable_approval_replaces_the_immediate_client_fact() {
+        let mut state = test_state();
+        push_live_event(
+            &mut state,
+            crate::LiveEventLine::approval(None, "approval granted call_1").with_run_id("run_1"),
+        );
+
+        push_live_event(
+            &mut state,
+            crate::LiveEventLine::approval(Some(7), "approval granted call_1").with_run_id("run_1"),
+        );
+
+        assert_eq!(state.live_events.len(), 1);
+        assert_eq!(state.live_events[0].offset, Some(7));
+        assert_eq!(state.live_events[0].text, "approval granted call_1");
+    }
+
+    #[test]
     fn assistant_delta_flood_accumulates_into_one_message() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
@@ -2761,15 +2792,30 @@ mod tests {
         assert_eq!(state.approval.as_ref(), Some(&approval));
 
         event_sender
-            .send(ClientEvent::ApprovalDecided(
-                plato_protocol::CommandAcceptedResult {
+            .send(ClientEvent::ApprovalDecided {
+                result: plato_protocol::CommandAcceptedResult {
                     run_id: "run_retry".into(),
                     status: RunStateName::Running,
                 },
-            ))
+                tool_call_id: approval.tool_call_id.clone(),
+                decision: if grant {
+                    plato_protocol::ApprovalDecisionName::Granted
+                } else {
+                    plato_protocol::ApprovalDecisionName::Denied
+                },
+            })
             .unwrap();
         drain_client_events(&mut state, &mut runtime, &event_receiver, &command_sender);
         assert!(state.approval.is_none());
+        assert!(state.live_events.iter().any(|event| {
+            event.kind == crate::LiveEventKind::Approval
+                && event.run_id.as_deref() == Some("run_retry")
+                && event.text
+                    == format!(
+                        "approval {} call_retry",
+                        if grant { "granted" } else { "denied" }
+                    )
+        }));
     }
 
     #[test]
