@@ -254,6 +254,13 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
     assert!(default.contains("Plato"));
     assert!(default.contains("Conversation-first PTY question"));
     assert!(default.contains("Conversation-first PTY answer"));
+    assert_eq!(
+        default
+            .lines()
+            .filter(|line| line.trim_end() == "Plato")
+            .count(),
+        1
+    );
     assert!(!default.contains(CONVERSATION_RUN_ID));
     assert!(!default.contains("#7"));
     assert_eq!(fake.requests_for("transcript.read").len(), 1);
@@ -263,10 +270,37 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
         let audit = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, CONVERSATION_RUN_ID);
         assert!(audit.contains("#7 model_stage"));
         assert!(audit.contains("audit"));
+        let audit_rows = audit.lines().map(str::trim_end).collect::<Vec<_>>();
+        let empty_assistant = audit_rows
+            .iter()
+            .position(|line| *line == "assistant")
+            .unwrap();
+        let tool_call = audit_rows
+            .iter()
+            .position(|line| line.contains("call_pty file.read"))
+            .unwrap();
+        let tool_result = audit_rows
+            .iter()
+            .position(|line| line.contains("call_pty README loaded"))
+            .unwrap();
+        let final_assistant = audit_rows
+            .iter()
+            .position(|line| line.contains("Conversation-first PTY answer"))
+            .unwrap();
+        assert!(empty_assistant < tool_call);
+        assert!(tool_call < tool_result);
+        assert!(tool_result < final_assistant);
 
         shell.write(b"v");
         let conversation = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "You");
         assert!(conversation.contains("Plato"));
+        assert_eq!(
+            conversation
+                .lines()
+                .filter(|line| line.trim_end() == "Plato")
+                .count(),
+            1
+        );
         assert!(!conversation.contains(CONVERSATION_RUN_ID));
         assert!(!conversation.contains("#7"));
         assert!(conversation.contains("conversation"));
@@ -866,7 +900,7 @@ fn fake_response(
             "status": "running",
             "final_answer": null,
             "transcript": format!(
-                "run_id: {CONVERSATION_RUN_ID}\n[turn_pty] user: Conversation-first PTY question\n[turn_pty] assistant: Conversation-first PTY answer\n"
+                "run_id: {CONVERSATION_RUN_ID}\n[turn_pty] user: Conversation-first PTY question\n[turn_pty] assistant: \n[turn_pty] tool_call call_pty file.read {{\"path\":\"README.md\"}}\ntool_result call_pty README loaded\n[turn_pty] assistant: Conversation-first PTY answer\n"
             ),
             "typed": {
                 "runs": [{
@@ -875,6 +909,18 @@ fn fake_response(
                     "status": "running",
                     "entries": [
                         {"kind": "user", "text": "Conversation-first PTY question"},
+                        {"kind": "assistant", "text": ""},
+                        {
+                            "kind": "tool_call",
+                            "call_id": "call_pty",
+                            "tool": "file.read",
+                            "input": {"path": "README.md"}
+                        },
+                        {
+                            "kind": "tool_result",
+                            "call_id": "call_pty",
+                            "summary": "README loaded"
+                        },
                         {"kind": "assistant", "text": "Conversation-first PTY answer"}
                     ]
                 }]

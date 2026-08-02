@@ -595,6 +595,14 @@ fn push_notice_rows(lines: &mut Vec<Line<'static>>, text: &str, color: Color) {
 }
 
 fn push_message_rows(lines: &mut Vec<Line<'static>>, kind: LiveEventKind, text: &str) {
+    if text.is_empty()
+        && matches!(
+            kind,
+            LiveEventKind::Assistant | LiveEventKind::AssistantDelta
+        )
+    {
+        return;
+    }
     if !lines.is_empty() {
         lines.push(Line::from(""));
     }
@@ -1431,11 +1439,11 @@ mod tests {
         let narrow_audit = focused_snapshot(&state, 48, 24);
         assert_eq!(
             normal_audit,
-            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise summary.\ntool      call_alpha file.read {\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at narrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission denied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | ready 0s | openrouter/auto | queued 0 | audit"
+            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise summary.\nassistant\ntool      call_alpha file.read {\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at narrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission denied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | ready 0s | openrouter/auto | queued 0 | audit"
         );
         assert_eq!(
             narrow_audit,
-            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise\nsummary.\ntool      call_alpha file.read\n{\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at\nnarrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission\ndenied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\non | ready | openrouter/auto | q0 | audit"
+            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise\nsummary.\nassistant\ntool      call_alpha file.read\n{\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at\nnarrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission\ndenied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n> | Try \"read README.md and summarize it\"\non | ready | openrouter/auto | q0 | audit"
         );
         for snapshot in [&normal_audit, &narrow_audit] {
             assert!(snapshot.contains("run_alpha_full_identifier"));
@@ -1444,6 +1452,49 @@ mod tests {
             assert!(snapshot.contains("#42"));
             assert!(snapshot.contains("call_alpha"));
         }
+    }
+
+    #[test]
+    fn typed_and_live_conversation_skip_empty_assistant_cells() {
+        let TranscriptState::Loaded(mut transcript) = conversation_fixture().transcript else {
+            panic!("expected loaded transcript");
+        };
+        transcript.run_id = "run_alpha_full_identifier".into();
+        transcript.typed.as_mut().unwrap().runs.truncate(1);
+        let typed = conversation_transcript_lines(&transcript);
+        let live = conversation_live_event_lines(
+            &[
+                LiveEventLine::user("First question asks for a concise summary.")
+                    .with_run_id("run_alpha_full_identifier"),
+                LiveEventLine::assistant(Some(1), "").with_run_id("run_alpha_full_identifier"),
+                LiveEventLine::tool(Some(2), "call_alpha proposed")
+                    .with_run_id("run_alpha_full_identifier"),
+                LiveEventLine::assistant(Some(3), "First answer is short and clear.")
+                    .with_run_id("run_alpha_full_identifier"),
+            ],
+            &[],
+        );
+
+        assert_eq!(live, typed);
+        assert_eq!(
+            typed.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "You",
+                "  First question asks for a concise summary.",
+                "",
+                "Plato",
+                "  First answer is short and clear."
+            ]
+        );
+    }
+
+    #[test]
+    fn conversation_preserves_whitespace_bearing_assistant_content() {
+        let rows = conversation_live_event_lines(&[LiveEventLine::assistant(Some(1), " \t")], &[]);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].to_string(), "Plato");
+        assert_eq!(rows[1].spans[1].content.as_ref(), " \t");
     }
 
     #[test]
@@ -1561,6 +1612,20 @@ mod tests {
         assert!(second.contains("new live event"));
         assert!(!second.contains("old live event"));
         assert!(second.contains("directly pushed event"));
+
+        let TranscriptState::Loaded(transcript) = &mut state.transcript else {
+            panic!("expected loaded transcript");
+        };
+        transcript.content = "[turn_1] assistant: \n".into();
+        state.live_events = vec![LiveEventLine::assistant(Some(3), "")];
+        let empty = render_to_text(&state);
+        assert_eq!(
+            empty
+                .lines()
+                .filter(|line| line.trim_end() == "Plato")
+                .count(),
+            0
+        );
 
         state.transcript = TranscriptState::None;
         state.live_events.clear();
@@ -2185,7 +2250,7 @@ mod tests {
                     run_id: "run_beta_full_identifier".into(),
                     status: RunStateName::Failed,
                     final_answer: Some("Second answer stays readable.".into()),
-                    transcript: "run_id: run_alpha_full_identifier\n[turn_alpha] user: First question asks for a concise summary.\n[turn_alpha] tool_call call_alpha file.read {\\\"path\\\":\\\"README.md\\\"}\ntool_result call_alpha README loaded\n[turn_alpha] assistant: First answer is short and clear.\nrun_id: run_beta_full_identifier\n[turn_beta] user: Second question remains readable at narrow widths.\n[turn_beta] assistant: Second answer stays readable.\ntool_failed call_beta: permission denied\n".into(),
+                    transcript: "run_id: run_alpha_full_identifier\n[turn_alpha] user: First question asks for a concise summary.\n[turn_alpha] assistant: \n[turn_alpha] tool_call call_alpha file.read {\\\"path\\\":\\\"README.md\\\"}\ntool_result call_alpha README loaded\n[turn_alpha] assistant: First answer is short and clear.\nrun_id: run_beta_full_identifier\n[turn_beta] user: Second question remains readable at narrow widths.\n[turn_beta] assistant: Second answer stays readable.\ntool_failed call_beta: permission denied\n".into(),
                     typed: Some(TypedTranscript {
                         runs: vec![
                             TypedRun {
@@ -2195,6 +2260,9 @@ mod tests {
                                 entries: vec![
                                     TypedTranscriptEntry::User {
                                         text: "First question asks for a concise summary.".into(),
+                                    },
+                                    TypedTranscriptEntry::Assistant {
+                                        text: String::new(),
                                     },
                                     TypedTranscriptEntry::ToolCall {
                                         call_id: "call_alpha".into(),
