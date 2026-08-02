@@ -819,7 +819,7 @@ mod tests {
     };
 
     const MOCK_PROVIDER_READINESS_ALLOWANCE: Duration = Duration::from_secs(10);
-    const LOADED_RUNNER_REQUEST_OBSERVATION_ALLOWANCE: Duration = Duration::from_secs(10);
+    const MOCK_PROVIDER_TEARDOWN_ALLOWANCE: Duration = Duration::from_secs(10);
     #[cfg(not(windows))]
     const NATIVE_WINDOWS_FIXTURE_TRIALS: usize = 1;
     #[cfg(windows)]
@@ -1169,6 +1169,7 @@ mod tests {
             let mut first_stdout = Vec::new();
             let mut first_stderr = Vec::new();
 
+            let provider = provider.arm();
             run_daemon_prompt(
                 &mut client,
                 "first question".into(),
@@ -1235,6 +1236,7 @@ mod tests {
             let daemon = TestDaemon::start(workspace.path());
             let mut client = daemon.client();
 
+            let provider = provider.arm();
             run_daemon_prompt(
                 &mut client,
                 "old question".into(),
@@ -1305,6 +1307,7 @@ mod tests {
                 let mut stdout = Vec::new();
                 let mut stderr = Vec::new();
 
+                let provider = provider.arm();
                 run_daemon_prompt(
                     &mut client,
                     "write the file".into(),
@@ -1356,6 +1359,7 @@ mod tests {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
 
+            let provider = provider.arm();
             let error = run_daemon_prompt(
                 &mut client,
                 "fail".into(),
@@ -1626,33 +1630,59 @@ mod tests {
 
     struct FakeProvider {
         base_url: String,
-        handle: thread::JoinHandle<Vec<Value>>,
+        listener: TcpListener,
+        responses: Vec<String>,
+    }
+
+    struct ArmedFakeProvider {
+        listener: TcpListener,
+        abort_requested: Arc<AtomicBool>,
+        completion: std::sync::mpsc::Receiver<FakeProviderCompletion>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    enum FakeProviderCompletion {
+        Completed(Vec<Value>),
+        Aborted,
     }
 
     impl FakeProvider {
         fn start(responses: Vec<String>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
             let base_url = format!("http://{}", listener.local_addr().unwrap());
+            Self {
+                base_url,
+                listener,
+                responses,
+            }
+        }
+
+        fn arm(self) -> ArmedFakeProvider {
+            let Self {
+                listener,
+                responses,
+                ..
+            } = self;
+            let accept_listener = listener.try_clone().unwrap();
+            let abort_requested = Arc::new(AtomicBool::new(false));
+            let accept_abort_requested = Arc::clone(&abort_requested);
             let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(0);
+            let (completion_sender, completion) = std::sync::mpsc::sync_channel(1);
             let handle = thread::spawn(move || {
-                ready_sender.send(()).unwrap();
-                let deadline = Instant::now() + LOADED_RUNNER_REQUEST_OBSERVATION_ALLOWANCE;
+                if ready_sender.send(()).is_err() {
+                    return;
+                }
                 let mut requests = Vec::new();
                 for body in responses {
-                    let mut stream = loop {
-                        match listener.accept() {
-                            Ok((stream, _)) => break stream,
-                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                                assert!(
-                                    Instant::now() < deadline,
-                                    "timed out waiting for provider request"
-                                );
-                                thread::sleep(Duration::from_millis(10));
-                            }
-                            Err(error) => panic!("provider accept failed: {error}"),
-                        }
-                    };
+                    if accept_abort_requested.load(Ordering::SeqCst) {
+                        let _ = completion_sender.send(FakeProviderCompletion::Aborted);
+                        return;
+                    }
+                    let (mut stream, _) = accept_listener.accept().unwrap();
+                    if accept_abort_requested.load(Ordering::SeqCst) {
+                        let _ = completion_sender.send(FakeProviderCompletion::Aborted);
+                        return;
+                    }
                     let request = read_provider_request(&mut stream);
                     requests.push(serde_json::from_str(&request).unwrap());
                     write!(
@@ -1663,16 +1693,114 @@ mod tests {
                     )
                     .unwrap();
                 }
-                requests
+                let _ = completion_sender.send(FakeProviderCompletion::Completed(requests));
             });
+            let provider = ArmedFakeProvider {
+                listener,
+                abort_requested,
+                completion,
+                handle: Some(handle),
+            };
             ready_receiver
                 .recv_timeout(MOCK_PROVIDER_READINESS_ALLOWANCE)
-                .unwrap();
-            Self { base_url, handle }
+                .expect("fake provider accept thread did not become ready");
+            provider
+        }
+    }
+
+    impl ArmedFakeProvider {
+        fn join(mut self) -> Vec<Value> {
+            let completion = match self
+                .completion
+                .recv_timeout(MOCK_PROVIDER_TEARDOWN_ALLOWANCE)
+            {
+                Ok(completion) => completion,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.join_finished_thread();
+                    unreachable!("fake provider thread exited without reporting completion");
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.abort();
+                    self.await_abort();
+                    panic!("timed out waiting for fake provider completion");
+                }
+            };
+            self.join_finished_thread();
+            match completion {
+                FakeProviderCompletion::Completed(requests) => requests,
+                FakeProviderCompletion::Aborted => {
+                    panic!("fake provider aborted before completion")
+                }
+            }
         }
 
-        fn join(self) -> Vec<Value> {
-            self.handle.join().unwrap()
+        fn abort(&self) {
+            self.abort_requested.store(true, Ordering::SeqCst);
+            let address = self.listener.local_addr().unwrap();
+            let _ = TcpStream::connect_timeout(&address, MOCK_PROVIDER_TEARDOWN_ALLOWANCE);
+        }
+
+        fn await_abort(&mut self) {
+            match self
+                .completion
+                .recv_timeout(MOCK_PROVIDER_TEARDOWN_ALLOWANCE)
+            {
+                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.join_finished_thread();
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.handle.take();
+                    panic!("timed out aborting fake provider");
+                }
+            }
+        }
+
+        fn join_finished_thread(&mut self) {
+            match self.take_finished_thread() {
+                Some(result) => result.unwrap(),
+                None => panic!("timed out waiting for fake provider thread teardown"),
+            }
+        }
+
+        fn take_finished_thread(&mut self) -> Option<std::thread::Result<()>> {
+            let deadline = Instant::now() + MOCK_PROVIDER_TEARDOWN_ALLOWANCE;
+            while !self.handle.as_ref().unwrap().is_finished() {
+                if Instant::now() >= deadline {
+                    self.handle.take();
+                    return None;
+                }
+                thread::yield_now();
+            }
+            Some(self.handle.take().unwrap().join())
+        }
+    }
+
+    impl Drop for ArmedFakeProvider {
+        fn drop(&mut self) {
+            if self.handle.is_none() {
+                return;
+            }
+            self.abort();
+            match self
+                .completion
+                .recv_timeout(MOCK_PROVIDER_TEARDOWN_ALLOWANCE)
+            {
+                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let result = self.take_finished_thread();
+                    if !thread::panicking() {
+                        match result {
+                            Some(result) => result.unwrap(),
+                            None => panic!("timed out waiting for fake provider thread teardown"),
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.handle.take();
+                    if !thread::panicking() {
+                        panic!("timed out aborting fake provider");
+                    }
+                }
+            }
         }
     }
 
