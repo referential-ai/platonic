@@ -1768,6 +1768,113 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
     }
 
     #[test]
+    fn stalled_provider_cancel_reaches_terminal_daemon_readback_within_500_ms() {
+        let provider = spawn_stalled_text_provider();
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let config_path = workspace.path().join("plato.toml");
+        write_provider_config(&config_path, &provider.base_url, "file.read");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+
+        let started = server.handle_line(&format!(
+            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"wait for an answer","config_path":"{}"}}}}"#,
+            config_path.display()
+        ));
+        assert_eq!(started.kind, EnvelopeKind::Response);
+        let started = started.result.unwrap();
+        let run_id = started["run_id"].as_str().unwrap().to_owned();
+        let session_id = started["session_id"].as_str().unwrap().to_owned();
+        let record = server.runtime.state.lock().unwrap().runs[&run_id].clone();
+
+        provider
+            .ready_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let cancel = server.handle_line(&format!(
+            r#"{{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
+        ));
+        assert_eq!(cancel.kind, EnvelopeKind::Response);
+        assert_eq!(cancel.result.unwrap()["status"], "cancel_requested");
+
+        let accepted_at = Instant::now();
+        while matches!(
+            record.status().state,
+            RunStateName::Running | RunStateName::CancelRequested
+        ) {
+            assert!(
+                accepted_at.elapsed() < Duration::from_millis(500),
+                "stalled provider remained cancel_requested"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_canceled_terminal(&server, &record);
+
+        let events = server.handle_line(&format!(
+            r#"{{"v":1,"id":"events_1","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0}}}}"#
+        ));
+        assert_eq!(events.kind, EnvelopeKind::Response);
+        assert_eq!(events.result.unwrap()["status"], "canceled");
+        let sessions = server
+            .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
+        assert_eq!(sessions.kind, EnvelopeKind::Response);
+        let sessions = sessions.result.unwrap();
+        assert_eq!(sessions["sessions"][0]["session_id"], session_id);
+        assert_eq!(sessions["sessions"][0]["status"], "canceled");
+        let transcript = server.handle_line(&format!(
+            r#"{{"v":1,"id":"transcript_1","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
+        ));
+        assert_eq!(transcript.kind, EnvelopeKind::Response);
+        assert_eq!(transcript.result.as_ref().unwrap()["status"], "canceled");
+        assert!(
+            transcript.result.unwrap()["transcript"]
+                .as_str()
+                .unwrap()
+                .contains("run canceled")
+        );
+        let replay =
+            crate::replay::replay_sqlite_session(&server.paths().ledger_path, &session_id).unwrap();
+        assert!(replay.contains("final_phase: Failed"));
+        assert!(replay.contains("run canceled"));
+        let elapsed = accepted_at.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "daemon terminal/session readback took {elapsed:?}"
+        );
+
+        provider.release_sender.send(()).unwrap();
+        let request = provider.handle.join().unwrap();
+        assert!(request.starts_with("POST /chat/completions "));
+        let ledger = SqliteLedger::open_readonly(&server.paths().ledger_path).unwrap();
+        let run = ledger
+            .read_session(&session_id)
+            .unwrap()
+            .runs
+            .into_iter()
+            .find(|run| run.run_id == run_id)
+            .unwrap();
+        assert_eq!(
+            run.records
+                .iter()
+                .filter(|record| matches!(record.event, HarnessEvent::ModelRequested { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            run.records
+                .iter()
+                .filter(|record| matches!(record.event, HarnessEvent::RunFailed { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !run.records
+                .iter()
+                .any(|record| matches!(record.event, HarnessEvent::ModelResponded { .. }))
+        );
+    }
+
+    #[test]
     fn different_sessions_run_concurrently_with_separate_ledgers() {
         let provider = spawn_concurrent_text_provider();
         let workspace = tempfile::tempdir().unwrap();
@@ -2913,6 +3020,13 @@ enabled = ["file.read"]
         handle: thread::JoinHandle<Vec<String>>,
     }
 
+    struct StalledTextProvider {
+        base_url: String,
+        ready_receiver: mpsc::Receiver<()>,
+        release_sender: mpsc::Sender<()>,
+        handle: thread::JoinHandle<String>,
+    }
+
     fn write_provider_config(path: &Path, base_url: &str, enabled_tool: &str) {
         let timeout_ms = FAKE_PROVIDER_TIMEOUT.as_millis();
         std::fs::write(
@@ -2993,6 +3107,41 @@ enabled = ["{enabled_tool}"]
             request
         });
         TextProvider { base_url, handle }
+    }
+
+    fn spawn_stalled_text_provider() -> StalledTextProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 4096\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            ready_sender.send(()).unwrap();
+            release_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+
+            listener.set_nonblocking(true).unwrap();
+            match listener.accept() {
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Ok(_) => panic!("canceled daemon run issued an extra provider request"),
+                Err(error) => panic!("extra-request probe failed: {error}"),
+            }
+            request
+        });
+        StalledTextProvider {
+            base_url,
+            ready_receiver,
+            release_sender,
+            handle,
+        }
     }
 
     fn spawn_concurrent_text_provider() -> ConcurrentTextProvider {
