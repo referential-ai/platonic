@@ -130,9 +130,13 @@ pub const CAPABILITY_THREAD_SPAWN: &str = "thread.spawn";
 pub const CAPABILITY_THREAD_LIST: &str = "thread.list";
 /// Capability name for reading one durable thread with live daemon state.
 pub const CAPABILITY_THREAD_STATUS: &str = "thread.status";
+/// Capability name for starting or steering one daemon-owned thread turn.
+pub const CAPABILITY_THREAD_SEND: &str = "thread.send";
+/// Capability name for observing retained live thread events.
+pub const CAPABILITY_THREAD_EVENTS: &str = "thread.events";
 
 /// Capabilities advertised by a protocol v1 daemon, in wire order.
-pub const CAPABILITIES: [&str; 16] = [
+pub const CAPABILITIES: [&str; 18] = [
     CAPABILITY_HELLO,
     CAPABILITY_RUN_START,
     CAPABILITY_MESSAGE_APPEND,
@@ -149,6 +153,8 @@ pub const CAPABILITIES: [&str; 16] = [
     CAPABILITY_THREAD_SPAWN,
     CAPABILITY_THREAD_LIST,
     CAPABILITY_THREAD_STATUS,
+    CAPABILITY_THREAD_SEND,
+    CAPABILITY_THREAD_EVENTS,
 ];
 
 /// Error code returned once daemon shutdown has begun.
@@ -171,10 +177,14 @@ pub const ERROR_RUN_FAILED: &str = "run_failed";
 pub const ERROR_SESSIONS_LIST_FAILED: &str = "sessions_list_failed";
 /// Error code returned when requested thread authority exceeds its parent.
 pub const ERROR_THREAD_AUTHORITY_EXCEEDED: &str = "thread_authority_exceeded";
+/// Error code returned when live thread event observation fails.
+pub const ERROR_THREAD_EVENTS_FAILED: &str = "thread_events_failed";
 /// Error code returned when durable thread enumeration fails.
 pub const ERROR_THREAD_LIST_FAILED: &str = "thread_list_failed";
 /// Error code returned when thread spawn admission or persistence fails.
 pub const ERROR_THREAD_SPAWN_FAILED: &str = "thread_spawn_failed";
+/// Error code returned when an admitted thread send cannot start its run.
+pub const ERROR_THREAD_SEND_FAILED: &str = "thread_send_failed";
 /// Error code returned when one thread status cannot be read.
 pub const ERROR_THREAD_STATUS_FAILED: &str = "thread_status_failed";
 /// Error code returned for an unknown method.
@@ -678,6 +688,107 @@ pub struct ThreadStatusParams {
 pub struct ThreadStatusResult {
     /// Complete durable and live readback.
     pub thread: ThreadStatus,
+}
+
+/// Parameters for starting or steering one daemon-owned thread turn.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadSendParams {
+    /// Durable thread receiving the message.
+    pub thread_id: String,
+    /// Live controller identity claiming or retaining this turn.
+    pub controller_id: String,
+    /// Exact active turn expected for a steer, or none when starting from idle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// User text to submit to the thread.
+    pub message: String,
+}
+
+/// Stable reason an otherwise well-formed thread send was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadSendRejectedReason {
+    /// A different controller owns the active turn.
+    ControllerOwned,
+    /// The supplied turn expectation does not match current live state.
+    TurnMismatch,
+    /// The bounded continuation queue cannot accept another steer.
+    QueueFull,
+}
+
+/// Typed receipt returned by `thread.send`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum ThreadSendResult {
+    /// An idle thread accepted a new external turn.
+    Started {
+        /// Exact durable thread receiving the message.
+        thread_id: String,
+        /// Daemon-minted external turn identifier.
+        turn_id: String,
+    },
+    /// The owning controller atomically queued a continuation.
+    Steered {
+        /// Exact durable thread receiving the message.
+        thread_id: String,
+        /// Exact external turn retained by the steer.
+        turn_id: String,
+    },
+    /// Live controller or turn arbitration rejected the send without mutation.
+    Rejected {
+        /// Exact durable thread targeted by the send.
+        thread_id: String,
+        /// Current active turn, or none while the thread is idle.
+        turn_id: Option<String>,
+        /// Stable rejection reason.
+        reason: ThreadSendRejectedReason,
+    },
+}
+
+/// Parameters for reading retained events from one live thread.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadEventsParams {
+    /// Durable thread whose live events should be observed.
+    pub thread_id: String,
+    /// First thread-local offset, or the current tip when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_offset: Option<u64>,
+    /// Maximum number of events to return.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Bounded long-poll wait when no event is immediately available.
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
+}
+
+/// One retained thread event paired with its thread-local offset and turn.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BufferedThreadEvent {
+    /// Contiguous thread-local event offset.
+    pub offset: u64,
+    /// External thread turn that owns this event.
+    pub turn_id: String,
+    /// Existing typed or forward-compatible daemon run event.
+    pub event: StreamEvent,
+}
+
+/// Retained event page returned by `thread.events`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadEventsResult {
+    /// Exact durable thread whose events were read.
+    pub thread_id: String,
+    /// First requested thread-local offset.
+    pub from_offset: u64,
+    /// Offset to use for the next page.
+    pub next_offset: u64,
+    /// Current external turn, or none after controller release.
+    pub current_turn_id: Option<String>,
+    /// Events in contiguous thread-local order.
+    pub events: Vec<BufferedThreadEvent>,
 }
 
 /// Parameters for starting a fresh run.
@@ -1357,6 +1468,8 @@ mod tests {
                 "thread.spawn",
                 "thread.list",
                 "thread.status",
+                "thread.send",
+                "thread.events",
             ]
         );
         assert_eq!(
@@ -1371,8 +1484,10 @@ mod tests {
                 ERROR_RUN_FAILED,
                 ERROR_SESSIONS_LIST_FAILED,
                 ERROR_THREAD_AUTHORITY_EXCEEDED,
+                ERROR_THREAD_EVENTS_FAILED,
                 ERROR_THREAD_LIST_FAILED,
                 ERROR_THREAD_SPAWN_FAILED,
+                ERROR_THREAD_SEND_FAILED,
                 ERROR_THREAD_STATUS_FAILED,
                 ERROR_UNSUPPORTED_METHOD,
                 ERROR_UNSUPPORTED_VERSION,
@@ -1389,8 +1504,10 @@ mod tests {
                 "run_failed",
                 "sessions_list_failed",
                 "thread_authority_exceeded",
+                "thread_events_failed",
                 "thread_list_failed",
                 "thread_spawn_failed",
+                "thread_send_failed",
                 "thread_status_failed",
                 "unsupported_method",
                 "unsupported_version",
@@ -1430,6 +1547,13 @@ mod tests {
         const SPAWN_REQUIRED_RESPONSE: &str = r#"{"v":1,"id":"spawn_start_1","kind":"response","method":"thread.spawn","result":{"effect":"workspace_write","reason":"thread.spawn requires approval","spawn_id":"spawn_1","status":"approval_required","thread_id":"thread_1"}}"#;
         const STATUS_RESPONSE: &str = r#"{"v":1,"id":"status_1","kind":"response","method":"thread.status","result":{"thread":{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1"},"live":{"current_turn_id":null,"loaded":true}}}}"#;
         const LIST_RESPONSE: &str = r#"{"v":1,"id":"list_1","kind":"response","method":"thread.list","result":{"threads":[{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1"},"live":{"current_turn_id":null,"loaded":false}}]}}"#;
+        const SEND_START_REQUEST: &str = r#"{"v":1,"id":"send_1","kind":"request","method":"thread.send","params":{"controller_id":"terminal_a","message":"inspect it","thread_id":"thread_1"}}"#;
+        const SEND_STEER_REQUEST: &str = r#"{"v":1,"id":"send_2","kind":"request","method":"thread.send","params":{"controller_id":"terminal_a","message":"also summarize","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
+        const SEND_STARTED_RESPONSE: &str = r#"{"v":1,"id":"send_1","kind":"response","method":"thread.send","result":{"status":"started","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
+        const SEND_STEERED_RESPONSE: &str = r#"{"v":1,"id":"send_2","kind":"response","method":"thread.send","result":{"status":"steered","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
+        const SEND_REJECTED_RESPONSE: &str = r#"{"v":1,"id":"send_3","kind":"response","method":"thread.send","result":{"reason":"controller_owned","status":"rejected","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
+        const EVENTS_REQUEST: &str = r#"{"v":1,"id":"events_1","kind":"request","method":"thread.events","params":{"from_offset":0,"limit":128,"thread_id":"thread_1","wait_ms":1000}}"#;
+        const EVENTS_RESPONSE: &str = r#"{"v":1,"id":"events_1","kind":"response","method":"thread.events","result":{"current_turn_id":"thread_turn_1","events":[],"from_offset":0,"next_offset":0,"thread_id":"thread_1"}}"#;
 
         for fixture in [SPAWN_START_REQUEST, SPAWN_DECIDE_REQUEST] {
             let request = decode_request(fixture).unwrap();
@@ -1496,6 +1620,63 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(serde_json::to_string(&list).unwrap(), LIST_RESPONSE);
+
+        for fixture in [SEND_START_REQUEST, SEND_STEER_REQUEST] {
+            let request = decode_request(fixture).unwrap();
+            serde_json::from_value::<ThreadSendParams>(request.params.clone().unwrap()).unwrap();
+            assert_eq!(serde_json::to_string(&request).unwrap(), fixture);
+        }
+        let events_request = decode_request(EVENTS_REQUEST).unwrap();
+        serde_json::from_value::<ThreadEventsParams>(events_request.params.clone().unwrap())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_string(&events_request).unwrap(),
+            EVENTS_REQUEST
+        );
+
+        for (id, result, fixture) in [
+            (
+                "send_1",
+                ThreadSendResult::Started {
+                    thread_id: "thread_1".into(),
+                    turn_id: "thread_turn_1".into(),
+                },
+                SEND_STARTED_RESPONSE,
+            ),
+            (
+                "send_2",
+                ThreadSendResult::Steered {
+                    thread_id: "thread_1".into(),
+                    turn_id: "thread_turn_1".into(),
+                },
+                SEND_STEERED_RESPONSE,
+            ),
+            (
+                "send_3",
+                ThreadSendResult::Rejected {
+                    thread_id: "thread_1".into(),
+                    turn_id: Some("thread_turn_1".into()),
+                    reason: ThreadSendRejectedReason::ControllerOwned,
+                },
+                SEND_REJECTED_RESPONSE,
+            ),
+        ] {
+            let response =
+                Envelope::response_from(Some(id.into()), Some("thread.send".into()), result);
+            assert_eq!(serde_json::to_string(&response).unwrap(), fixture);
+        }
+        let events = Envelope::response_from(
+            Some("events_1".into()),
+            Some("thread.events".into()),
+            ThreadEventsResult {
+                thread_id: "thread_1".into(),
+                from_offset: 0,
+                next_offset: 0,
+                current_turn_id: Some("thread_turn_1".into()),
+                events: Vec::new(),
+            },
+        );
+        assert_eq!(serde_json::to_string(&events).unwrap(), EVENTS_RESPONSE);
     }
 
     #[test]
@@ -1525,6 +1706,16 @@ mod tests {
             )
             .is_err()
         );
+        assert_unknown_field_rejected::<ThreadSendParams>(json!({
+            "thread_id": "thread_1",
+            "controller_id": "terminal_a",
+            "message": "hello",
+            "future": true
+        }));
+        assert_unknown_field_rejected::<ThreadEventsParams>(json!({
+            "thread_id": "thread_1",
+            "future": true
+        }));
     }
 
     #[test]

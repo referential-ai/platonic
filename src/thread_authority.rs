@@ -220,6 +220,10 @@ pub(crate) fn new_spawn_id() -> String {
     generated_id("spawn")
 }
 
+pub(crate) fn new_thread_turn_id() -> String {
+    generated_id("thread_turn")
+}
+
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

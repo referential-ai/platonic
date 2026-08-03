@@ -4,8 +4,9 @@ use crate::{
     daemon::{
         DaemonPaths,
         protocol::{
-            ApprovalDecision, BufferedStreamEvent, PendingApprovalSnapshot, RunStateName,
-            StreamEvent, ThreadLiveState,
+            ApprovalDecision, BufferedStreamEvent, BufferedThreadEvent, PendingApprovalSnapshot,
+            RunStateName, StreamEvent, ThreadEventsResult, ThreadLiveState,
+            ThreadSendRejectedReason, ThreadSendResult,
         },
     },
     ledger::DurableThreadAuthority,
@@ -22,11 +23,13 @@ use std::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 pub(super) const MAX_EVENT_BUFFER: usize = 256;
 pub(super) const MAX_TERMINAL_RUNS: usize = 32;
+pub(super) const MAX_THREAD_EVENT_BUFFER: usize = 256;
+const MAX_PENDING_THREAD_STEERS: usize = 32;
 
 #[cfg(test)]
 type SessionGrantInstallBarriers = Option<(Arc<Barrier>, Arc<Barrier>)>;
@@ -47,7 +50,7 @@ pub(super) struct DaemonRuntime {
 #[derive(Debug, Default)]
 pub(super) struct RuntimeState {
     pub(super) runs: HashMap<String, Arc<RunRecord>>,
-    live_threads: HashMap<String, LiveThread>,
+    live_threads: HashMap<String, Arc<LiveThread>>,
     pending_thread_spawns: HashMap<String, PendingThreadSpawn>,
     terminal_runs: VecDeque<String>,
     shutdown_accepted: bool,
@@ -71,6 +74,26 @@ pub(super) enum ThreadSpawnClaimError {
     NotFound,
     WrongWorkspace,
     DecisionInProgress,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum ThreadSendAdmission {
+    ShuttingDown,
+    Started {
+        receipt: ThreadSendResult,
+        turn: ThreadTurnBinding,
+    },
+    Steered {
+        receipt: ThreadSendResult,
+    },
+    Rejected {
+        receipt: ThreadSendResult,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ThreadEventsError {
+    Lagged { first_offset: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -219,10 +242,7 @@ impl DaemonRuntime {
         debug_assert_eq!(pending.draft.thread_id, record.thread_id);
         state.live_threads.insert(
             record.thread_id.clone(),
-            LiveThread {
-                workspace_id: self.paths.workspace_id.clone(),
-                current_turn_id: None,
-            },
+            Arc::new(LiveThread::new(self.paths.workspace_id.clone())),
         );
     }
 
@@ -240,6 +260,86 @@ impl DaemonRuntime {
             .is_some_and(|thread| thread.workspace_id == self.paths.workspace_id)
     }
 
+    pub(super) fn load_thread(&self, thread_id: &str) -> Arc<LiveThread> {
+        let mut state = self.state.lock().expect("runtime state lock poisoned");
+        if let Some(thread) = state
+            .live_threads
+            .get(thread_id)
+            .filter(|thread| thread.workspace_id == self.paths.workspace_id)
+        {
+            return Arc::clone(thread);
+        }
+        let thread = Arc::new(LiveThread::new(self.paths.workspace_id.clone()));
+        state
+            .live_threads
+            .insert(thread_id.to_owned(), Arc::clone(&thread));
+        thread
+    }
+
+    pub(super) fn send_thread(
+        &self,
+        thread_id: &str,
+        controller_id: String,
+        expected_turn_id: Option<&str>,
+        message: String,
+        new_turn_id: String,
+    ) -> ThreadSendAdmission {
+        let mut state = self.state.lock().expect("runtime state lock poisoned");
+        if state.shutdown_accepted {
+            return ThreadSendAdmission::ShuttingDown;
+        }
+        let thread = state
+            .live_threads
+            .get(thread_id)
+            .filter(|thread| thread.workspace_id == self.paths.workspace_id)
+            .cloned();
+        let thread = match thread {
+            Some(thread) => thread,
+            None if expected_turn_id.is_some() => {
+                return ThreadSendAdmission::Rejected {
+                    receipt: ThreadSendResult::Rejected {
+                        thread_id: thread_id.into(),
+                        turn_id: None,
+                        reason: ThreadSendRejectedReason::TurnMismatch,
+                    },
+                };
+            }
+            None => {
+                let thread = Arc::new(LiveThread::new(self.paths.workspace_id.clone()));
+                state
+                    .live_threads
+                    .insert(thread_id.to_owned(), Arc::clone(&thread));
+                thread
+            }
+        };
+        thread.send(
+            thread_id,
+            controller_id,
+            expected_turn_id,
+            message,
+            new_turn_id,
+        )
+    }
+
+    pub(super) fn thread_events(
+        &self,
+        thread_id: &str,
+        from_offset: Option<u64>,
+        limit: usize,
+        wait: Duration,
+    ) -> Result<ThreadEventsResult, ThreadEventsError> {
+        self.load_thread(thread_id)
+            .events(thread_id, from_offset, limit, wait)
+    }
+
+    pub(super) fn next_thread_message(&self, turn: &ThreadTurnBinding) -> Option<String> {
+        turn.thread.next_message_or_finish(&turn.turn_id)
+    }
+
+    pub(super) fn abort_thread_turn(&self, turn: &ThreadTurnBinding) {
+        turn.thread.abort(&turn.turn_id);
+    }
+
     pub(super) fn thread_live_state(&self, thread_id: &str) -> ThreadLiveState {
         let state = self.state.lock().expect("runtime state lock poisoned");
         match state
@@ -249,7 +349,7 @@ impl DaemonRuntime {
         {
             Some(thread) => ThreadLiveState {
                 loaded: true,
-                current_turn_id: thread.current_turn_id.clone(),
+                current_turn_id: thread.current_turn_id(),
             },
             None => ThreadLiveState {
                 loaded: false,
@@ -322,6 +422,9 @@ impl DaemonRuntime {
         }
         if state.issue_prep_active
             || !state.pending_thread_spawns.is_empty()
+            || state.live_threads.values().any(|thread| {
+                thread.workspace_id == self.paths.workspace_id && thread.current_turn_id().is_some()
+            })
             || state.runs.values().any(|record| {
                 matches!(
                     record.status().state,
@@ -412,10 +515,227 @@ pub(super) struct PendingThreadSpawn {
     decision_in_progress: bool,
 }
 
-#[derive(Clone, Debug)]
-struct LiveThread {
+#[derive(Debug)]
+pub(super) struct LiveThread {
     workspace_id: String,
-    current_turn_id: Option<String>,
+    state: Mutex<LiveThreadState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct LiveThreadState {
+    current_turn: Option<ActiveThreadTurn>,
+    first_offset: u64,
+    next_offset: u64,
+    events: VecDeque<BufferedThreadEvent>,
+    observers: usize,
+}
+
+#[derive(Debug)]
+struct ActiveThreadTurn {
+    turn_id: String,
+    controller_id: String,
+    pending_messages: VecDeque<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ThreadTurnBinding {
+    pub(super) turn_id: String,
+    thread: Arc<LiveThread>,
+}
+
+impl LiveThread {
+    fn new(workspace_id: String) -> Self {
+        Self {
+            workspace_id,
+            state: Mutex::new(LiveThreadState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn current_turn_id(&self) -> Option<String> {
+        self.state
+            .lock()
+            .expect("live thread lock poisoned")
+            .current_turn
+            .as_ref()
+            .map(|turn| turn.turn_id.clone())
+    }
+
+    fn send(
+        self: &Arc<Self>,
+        thread_id: &str,
+        controller_id: String,
+        expected_turn_id: Option<&str>,
+        message: String,
+        new_turn_id: String,
+    ) -> ThreadSendAdmission {
+        let mut state = self.state.lock().expect("live thread lock poisoned");
+        if let Some(active) = state.current_turn.as_mut() {
+            if active.controller_id != controller_id {
+                return ThreadSendAdmission::Rejected {
+                    receipt: ThreadSendResult::Rejected {
+                        thread_id: thread_id.into(),
+                        turn_id: Some(active.turn_id.clone()),
+                        reason: ThreadSendRejectedReason::ControllerOwned,
+                    },
+                };
+            }
+            if expected_turn_id != Some(active.turn_id.as_str()) {
+                return ThreadSendAdmission::Rejected {
+                    receipt: ThreadSendResult::Rejected {
+                        thread_id: thread_id.into(),
+                        turn_id: Some(active.turn_id.clone()),
+                        reason: ThreadSendRejectedReason::TurnMismatch,
+                    },
+                };
+            }
+            if active.pending_messages.len() >= MAX_PENDING_THREAD_STEERS {
+                return ThreadSendAdmission::Rejected {
+                    receipt: ThreadSendResult::Rejected {
+                        thread_id: thread_id.into(),
+                        turn_id: Some(active.turn_id.clone()),
+                        reason: ThreadSendRejectedReason::QueueFull,
+                    },
+                };
+            }
+            active.pending_messages.push_back(message);
+            let receipt = ThreadSendResult::Steered {
+                thread_id: thread_id.into(),
+                turn_id: active.turn_id.clone(),
+            };
+            self.changed.notify_all();
+            return ThreadSendAdmission::Steered { receipt };
+        }
+
+        if expected_turn_id.is_some() {
+            return ThreadSendAdmission::Rejected {
+                receipt: ThreadSendResult::Rejected {
+                    thread_id: thread_id.into(),
+                    turn_id: None,
+                    reason: ThreadSendRejectedReason::TurnMismatch,
+                },
+            };
+        }
+        state.current_turn = Some(ActiveThreadTurn {
+            turn_id: new_turn_id.clone(),
+            controller_id,
+            pending_messages: VecDeque::new(),
+        });
+        self.changed.notify_all();
+        ThreadSendAdmission::Started {
+            receipt: ThreadSendResult::Started {
+                thread_id: thread_id.into(),
+                turn_id: new_turn_id.clone(),
+            },
+            turn: ThreadTurnBinding {
+                turn_id: new_turn_id,
+                thread: Arc::clone(self),
+            },
+        }
+    }
+
+    fn publish(&self, turn_id: &str, event: StreamEvent) {
+        let mut state = self.state.lock().expect("live thread lock poisoned");
+        if state.events.len() == MAX_THREAD_EVENT_BUFFER {
+            state.events.pop_front();
+            state.first_offset += 1;
+        }
+        let offset = state.next_offset;
+        state.next_offset += 1;
+        state.events.push_back(BufferedThreadEvent {
+            offset,
+            turn_id: turn_id.into(),
+            event,
+        });
+        self.changed.notify_all();
+    }
+
+    fn events(
+        &self,
+        thread_id: &str,
+        from_offset: Option<u64>,
+        limit: usize,
+        wait: Duration,
+    ) -> Result<ThreadEventsResult, ThreadEventsError> {
+        let mut state = self.state.lock().expect("live thread lock poisoned");
+        state.observers += 1;
+        let from_offset = from_offset.unwrap_or(state.next_offset);
+        if from_offset < state.first_offset {
+            let first_offset = state.first_offset;
+            state.observers -= 1;
+            return Err(ThreadEventsError::Lagged { first_offset });
+        }
+        if from_offset >= state.next_offset && !wait.is_zero() {
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, wait)
+                .expect("live thread lock poisoned while observing");
+            state = next;
+        }
+        if from_offset < state.first_offset {
+            let first_offset = state.first_offset;
+            state.observers -= 1;
+            return Err(ThreadEventsError::Lagged { first_offset });
+        }
+        let start = (from_offset - state.first_offset) as usize;
+        let events = state
+            .events
+            .iter()
+            .skip(start)
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        let result = ThreadEventsResult {
+            thread_id: thread_id.into(),
+            from_offset,
+            next_offset: from_offset + events.len() as u64,
+            current_turn_id: state.current_turn.as_ref().map(|turn| turn.turn_id.clone()),
+            events,
+        };
+        state.observers -= 1;
+        Ok(result)
+    }
+
+    fn next_message_or_finish(&self, turn_id: &str) -> Option<String> {
+        let mut state = self.state.lock().expect("live thread lock poisoned");
+        let active = state
+            .current_turn
+            .as_mut()
+            .filter(|active| active.turn_id == turn_id)?;
+        if let Some(message) = active.pending_messages.pop_front() {
+            return Some(message);
+        }
+        state.current_turn = None;
+        self.changed.notify_all();
+        None
+    }
+
+    fn abort(&self, turn_id: &str) {
+        let mut state = self.state.lock().expect("live thread lock poisoned");
+        if state
+            .current_turn
+            .as_ref()
+            .is_some_and(|active| active.turn_id == turn_id)
+        {
+            state.current_turn = None;
+            self.changed.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    fn observer_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("live thread lock poisoned")
+            .observers
+    }
+}
+
+impl ThreadTurnBinding {
+    fn publish(&self, event: StreamEvent) {
+        self.thread.publish(&self.turn_id, event);
+    }
 }
 
 impl Drop for IssuePrepReservation {
@@ -437,6 +757,7 @@ pub(super) struct RunRecord {
     pub(super) events: Mutex<EventBuffer>,
     pub(super) approvals: Mutex<HashMap<String, PendingApproval>>,
     pub(super) approval_changed: Condvar,
+    thread_turn: Option<ThreadTurnBinding>,
     #[cfg(test)]
     event_snapshot_barriers: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
 }
@@ -493,6 +814,24 @@ impl PendingApproval {
 
 impl RunRecord {
     pub(super) fn new(run_id: String, session_id: String, ledger_path: PathBuf) -> Self {
+        Self::new_inner(run_id, session_id, ledger_path, None)
+    }
+
+    pub(super) fn new_for_thread(
+        run_id: String,
+        session_id: String,
+        ledger_path: PathBuf,
+        turn: ThreadTurnBinding,
+    ) -> Self {
+        Self::new_inner(run_id, session_id, ledger_path, Some(turn))
+    }
+
+    fn new_inner(
+        run_id: String,
+        session_id: String,
+        ledger_path: PathBuf,
+        thread_turn: Option<ThreadTurnBinding>,
+    ) -> Self {
         Self {
             session_id,
             run_id,
@@ -510,6 +849,7 @@ impl RunRecord {
             }),
             approvals: Mutex::new(HashMap::new()),
             approval_changed: Condvar::new(),
+            thread_turn,
             #[cfg(test)]
             event_snapshot_barriers: Mutex::new(None),
         }
@@ -523,9 +863,14 @@ impl RunRecord {
         }
         let offset = buffer.next_offset;
         buffer.next_offset += 1;
-        buffer
-            .events
-            .push_back(BufferedStreamEvent { offset, event });
+        buffer.events.push_back(BufferedStreamEvent {
+            offset,
+            event: event.clone(),
+        });
+        drop(buffer);
+        if let Some(turn) = &self.thread_turn {
+            turn.publish(event);
+        }
     }
 
     pub(super) fn push_recorded_event(&self, record: RecordedEvent) {
@@ -715,6 +1060,238 @@ mod tests {
     }
 
     #[test]
+    fn thread_send_holds_one_controller_and_turn_across_queued_continuations() {
+        let runtime = runtime();
+        let (started, turn) = match runtime.send_thread(
+            "thread_1",
+            "controller_a".into(),
+            None,
+            "start".into(),
+            "thread_turn_1".into(),
+        ) {
+            ThreadSendAdmission::Started { receipt, turn } => (receipt, turn),
+            other => panic!("unexpected start admission: {other:?}"),
+        };
+        assert_eq!(
+            started,
+            ThreadSendResult::Started {
+                thread_id: "thread_1".into(),
+                turn_id: "thread_turn_1".into(),
+            }
+        );
+        assert!(matches!(
+            runtime.send_thread(
+                "thread_1",
+                "controller_b".into(),
+                Some("thread_turn_1"),
+                "compete".into(),
+                "unused".into(),
+            ),
+            ThreadSendAdmission::Rejected {
+                receipt: ThreadSendResult::Rejected {
+                    reason: ThreadSendRejectedReason::ControllerOwned,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            runtime.send_thread(
+                "thread_1",
+                "controller_a".into(),
+                Some("thread_turn_1"),
+                "steered text".into(),
+                "unused".into(),
+            ),
+            ThreadSendAdmission::Steered {
+                receipt: ThreadSendResult::Steered {
+                    turn_id,
+                    ..
+                }
+            } if turn_id == "thread_turn_1"
+        ));
+
+        assert_eq!(
+            runtime.next_thread_message(&turn).as_deref(),
+            Some("steered text")
+        );
+        assert_eq!(
+            runtime
+                .thread_live_state("thread_1")
+                .current_turn_id
+                .as_deref(),
+            Some("thread_turn_1")
+        );
+        assert!(matches!(
+            runtime.send_thread(
+                "thread_1",
+                "controller_b".into(),
+                Some("thread_turn_1"),
+                "boundary compete".into(),
+                "unused".into(),
+            ),
+            ThreadSendAdmission::Rejected {
+                receipt: ThreadSendResult::Rejected {
+                    reason: ThreadSendRejectedReason::ControllerOwned,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(runtime.next_thread_message(&turn), None);
+        assert_eq!(runtime.thread_live_state("thread_1").current_turn_id, None);
+        assert!(matches!(
+            runtime.send_thread(
+                "thread_1",
+                "controller_b".into(),
+                None,
+                "new turn".into(),
+                "thread_turn_2".into(),
+            ),
+            ThreadSendAdmission::Started {
+                receipt: ThreadSendResult::Started { turn_id, .. },
+                ..
+            } if turn_id == "thread_turn_2"
+        ));
+    }
+
+    #[test]
+    fn three_thread_observers_receive_identical_order_and_detach_cleanly() {
+        let runtime = runtime();
+        let turn = match runtime.send_thread(
+            "thread_1",
+            "controller_a".into(),
+            None,
+            "start".into(),
+            "thread_turn_1".into(),
+        ) {
+            ThreadSendAdmission::Started { turn, .. } => turn,
+            other => panic!("unexpected start admission: {other:?}"),
+        };
+        let live = runtime.load_thread("thread_1");
+        let ready = Arc::new(Barrier::new(4));
+        let observers = (0..3)
+            .map(|_| {
+                let runtime = runtime.clone();
+                let ready = ready.clone();
+                thread::spawn(move || {
+                    ready.wait();
+                    let mut offset = 0;
+                    let mut received = Vec::new();
+                    while received.len() < 3 {
+                        let page = runtime
+                            .thread_events("thread_1", Some(offset), 3, Duration::from_secs(1))
+                            .unwrap();
+                        offset = page.next_offset;
+                        received.extend(page.events);
+                    }
+                    received
+                })
+            })
+            .collect::<Vec<_>>();
+        ready.wait();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while live.observer_count() != 3 {
+            assert!(Instant::now() < deadline, "observers did not attach");
+            thread::yield_now();
+        }
+        for sequence in 0..3 {
+            turn.publish(StreamEvent::Unknown(serde_json::json!({
+                "kind": "test_event",
+                "sequence": sequence,
+            })));
+        }
+
+        let streams = observers
+            .into_iter()
+            .map(|observer| observer.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(streams[0], streams[1]);
+        assert_eq!(streams[1], streams[2]);
+        assert_eq!(
+            streams[0]
+                .iter()
+                .map(|event| event.offset)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(live.observer_count(), 0);
+    }
+
+    #[test]
+    fn thread_event_buffer_reports_lag_without_leaking_observers() {
+        let runtime = runtime();
+        let turn = match runtime.send_thread(
+            "thread_1",
+            "controller_a".into(),
+            None,
+            "start".into(),
+            "thread_turn_1".into(),
+        ) {
+            ThreadSendAdmission::Started { turn, .. } => turn,
+            other => panic!("unexpected start admission: {other:?}"),
+        };
+        for sequence in 0..=MAX_THREAD_EVENT_BUFFER {
+            turn.publish(StreamEvent::Unknown(serde_json::json!({
+                "kind": "test_event",
+                "sequence": sequence,
+            })));
+        }
+        assert_eq!(
+            runtime.thread_events("thread_1", Some(0), 1, Duration::ZERO),
+            Err(ThreadEventsError::Lagged { first_offset: 1 })
+        );
+        assert_eq!(runtime.load_thread("thread_1").observer_count(), 0);
+    }
+
+    #[test]
+    fn thread_steer_queue_is_bounded_and_preserves_fifo_order() {
+        let runtime = runtime();
+        let turn = match runtime.send_thread(
+            "thread_1",
+            "controller_a".into(),
+            None,
+            "start".into(),
+            "thread_turn_1".into(),
+        ) {
+            ThreadSendAdmission::Started { turn, .. } => turn,
+            other => panic!("unexpected start admission: {other:?}"),
+        };
+        for index in 0..MAX_PENDING_THREAD_STEERS {
+            assert!(matches!(
+                runtime.send_thread(
+                    "thread_1",
+                    "controller_a".into(),
+                    Some("thread_turn_1"),
+                    format!("steer {index}"),
+                    "unused".into(),
+                ),
+                ThreadSendAdmission::Steered { .. }
+            ));
+        }
+        assert!(matches!(
+            runtime.send_thread(
+                "thread_1",
+                "controller_a".into(),
+                Some("thread_turn_1"),
+                "overflow".into(),
+                "unused".into(),
+            ),
+            ThreadSendAdmission::Rejected {
+                receipt: ThreadSendResult::Rejected {
+                    reason: ThreadSendRejectedReason::QueueFull,
+                    ..
+                }
+            }
+        ));
+        for index in 0..MAX_PENDING_THREAD_STEERS {
+            assert_eq!(
+                runtime.next_thread_message(&turn),
+                Some(format!("steer {index}"))
+            );
+        }
+        assert_eq!(runtime.next_thread_message(&turn), None);
+    }
+
+    #[test]
     fn late_cancel_does_not_reclassify_failure() {
         let runtime = runtime();
         let record = run_record(1);
@@ -822,6 +1399,46 @@ mod tests {
                         Err(RunAdmissionError::ShuttingDown),
                         ShutdownIfIdleDecision::Shutdown
                     )
+            ));
+        }
+    }
+
+    #[test]
+    fn shutdown_and_thread_controller_admission_linearize() {
+        for index in 0..256 {
+            let runtime = runtime();
+            let barrier = Arc::new(Barrier::new(3));
+            let admit_runtime = runtime.clone();
+            let admit_barrier = barrier.clone();
+            let admission = thread::spawn(move || {
+                admit_barrier.wait();
+                admit_runtime.send_thread(
+                    "thread_1",
+                    "controller_a".into(),
+                    None,
+                    "start".into(),
+                    format!("thread_turn_{index}"),
+                )
+            });
+            let shutdown_runtime = runtime.clone();
+            let shutdown_barrier = barrier.clone();
+            let shutdown = thread::spawn(move || {
+                shutdown_barrier.wait();
+                shutdown_runtime.shutdown_if_idle()
+            });
+
+            barrier.wait();
+            let admission = admission.join().unwrap();
+            let shutdown = shutdown.join().unwrap();
+            assert!(matches!(
+                (admission, shutdown),
+                (
+                    ThreadSendAdmission::Started { .. },
+                    ShutdownIfIdleDecision::RefusedActive
+                ) | (
+                    ThreadSendAdmission::ShuttingDown,
+                    ShutdownIfIdleDecision::Shutdown
+                )
             ));
         }
     }

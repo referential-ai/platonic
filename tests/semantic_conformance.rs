@@ -3,9 +3,11 @@ use plato_agent::{
     daemon::{
         client::{ClientError, DaemonClient},
         protocol::{
-            CAPABILITY_THREAD_LIST, CAPABILITY_THREAD_SPAWN, CAPABILITY_THREAD_STATUS,
+            BufferedThreadEvent, CAPABILITY_THREAD_EVENTS, CAPABILITY_THREAD_LIST,
+            CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_SPAWN, CAPABILITY_THREAD_STATUS,
             ERROR_NOT_FOUND, ReasoningEffort, RunStateName, ShutdownIfIdleResultName, StreamEvent,
-            ThreadApprovalPolicy, ThreadSpawnDecision, ThreadSpawnResult,
+            ThreadApprovalPolicy, ThreadSendRejectedReason, ThreadSendResult, ThreadSpawnDecision,
+            ThreadSpawnResult,
         },
     },
     ledger::SqliteLedger,
@@ -481,6 +483,323 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
         ClientError::DaemonResponse(error) if error.code == ERROR_NOT_FOUND
     ));
     restarted.stop(restarted_client);
+}
+
+#[test]
+fn thread_send_and_three_observers_are_semantically_conformant_on_host_daemon() {
+    const INITIAL_MESSAGE: &str = "begin the controlled thread proof";
+    const STEERED_MESSAGE: &str = "include the exact steered phrase in the continuation";
+    const CONTINUATION_ANSWER: &str = "The continuation used the exact steered phrase.";
+
+    let _serial = SCENARIO_SERIAL.lock().unwrap();
+    let proof = ProofContext::new();
+    let provider = ControlledThreadProvider::start(CONTINUATION_ANSWER);
+    write_provider_config(&proof.config_path, &provider.base_url);
+    let host = ProofDaemon::start_host(&proof);
+    let mut controller_a = host.connect();
+    let mut controller_b = host.connect();
+    let hello = controller_a.hello(&proof.workspace).unwrap();
+    for capability in [
+        CAPABILITY_THREAD_SEND,
+        CAPABILITY_THREAD_EVENTS,
+        CAPABILITY_THREAD_SPAWN,
+        CAPABILITY_THREAD_LIST,
+        CAPABILITY_THREAD_STATUS,
+    ] {
+        assert!(hello.capabilities.iter().any(|served| served == capability));
+    }
+    let (spawn_id, thread_id) = match controller_a
+        .thread_spawn_start(
+            None,
+            proof
+                .workspace
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "test-model".into(),
+            ReasoningEffort::High,
+            ThreadApprovalPolicy::Yolo,
+        )
+        .unwrap()
+    {
+        ThreadSpawnResult::ApprovalRequired {
+            spawn_id,
+            thread_id,
+            ..
+        } => (spawn_id, thread_id),
+        unexpected => panic!("expected root approval, got {unexpected:?}"),
+    };
+    assert!(matches!(
+        controller_a
+            .thread_spawn_decide(
+                spawn_id,
+                ThreadSpawnDecision::Grant {
+                    actor: "semantic_fixture".into(),
+                },
+            )
+            .unwrap(),
+        ThreadSpawnResult::Spawned { .. }
+    ));
+
+    let mut observers = Vec::new();
+    let mut observer_ready = Vec::new();
+    for _ in 0..2 {
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        observers.push(spawn_thread_observer(
+            host.socket_path.clone(),
+            proof.workspace.clone(),
+            thread_id.clone(),
+            ready_sender,
+        ));
+        observer_ready.push(ready_receiver);
+    }
+    for ready in observer_ready {
+        ready.recv_timeout(PROOF_TIMEOUT).unwrap();
+    }
+
+    let started = controller_a
+        .thread_send(
+            thread_id.clone(),
+            "controller_a".into(),
+            None,
+            INITIAL_MESSAGE.into(),
+        )
+        .unwrap();
+    let turn_id = match started {
+        ThreadSendResult::Started {
+            thread_id: ref receipt_thread,
+            ref turn_id,
+        } => {
+            assert_eq!(receipt_thread, &thread_id);
+            turn_id.clone()
+        }
+        unexpected => panic!("expected started receipt, got {unexpected:?}"),
+    };
+    let first_request = provider
+        .first_request
+        .recv_timeout(PROOF_TIMEOUT)
+        .expect("first child did not reach the provider");
+    assert!(first_request.to_string().contains(INITIAL_MESSAGE));
+
+    assert_controller_owned_rejection(
+        &mut controller_b,
+        &thread_id,
+        &turn_id,
+        "controller_b",
+        "competing send during child one",
+    );
+    let steered = controller_a
+        .thread_send(
+            thread_id.clone(),
+            "controller_a".into(),
+            Some(turn_id.clone()),
+            STEERED_MESSAGE.into(),
+        )
+        .unwrap();
+    assert_eq!(
+        steered,
+        ThreadSendResult::Steered {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+        }
+    );
+
+    let (ready_sender, ready_receiver) = mpsc::channel();
+    observers.push(spawn_thread_observer(
+        host.socket_path.clone(),
+        proof.workspace.clone(),
+        thread_id.clone(),
+        ready_sender,
+    ));
+    ready_receiver.recv_timeout(PROOF_TIMEOUT).unwrap();
+
+    provider.release_first.send(()).unwrap();
+    let second_request = loop {
+        match provider.second_request.try_recv() {
+            Ok(request) => break request,
+            Err(mpsc::TryRecvError::Empty) => {
+                assert_controller_owned_rejection(
+                    &mut controller_b,
+                    &thread_id,
+                    &turn_id,
+                    "controller_b",
+                    "competing send across the child boundary",
+                );
+                assert_eq!(
+                    controller_a
+                        .thread_status(thread_id.clone())
+                        .unwrap()
+                        .thread
+                        .live
+                        .current_turn_id
+                        .as_deref(),
+                    Some(turn_id.as_str())
+                );
+                thread::sleep(POLL_INTERVAL);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => panic!("controlled provider disconnected"),
+        }
+    };
+    assert!(
+        second_request.to_string().contains(STEERED_MESSAGE),
+        "continuation request did not contain the accepted steer"
+    );
+    assert_controller_owned_rejection(
+        &mut controller_b,
+        &thread_id,
+        &turn_id,
+        "controller_b",
+        "competing send during continuation child",
+    );
+    provider.release_second.send(()).unwrap();
+    wait_for_thread_idle(&mut controller_a, &thread_id);
+
+    let streams = observers
+        .into_iter()
+        .map(|observer| observer.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(streams[0], streams[1]);
+    assert_eq!(streams[1], streams[2]);
+    assert!(
+        streams[0].iter().all(|event| event.turn_id == turn_id),
+        "observer stream crossed external turn ids"
+    );
+    assert_eq!(
+        streams[0]
+            .iter()
+            .filter(|event| matches!(
+                &event.event,
+                StreamEvent::Ledger { record }
+                    if matches!(
+                        record.event,
+                        HarnessEvent::RunFinished { .. } | HarnessEvent::RunFailed { .. }
+                    )
+            ))
+            .count(),
+        2,
+        "both child terminal records must remain observer-visible"
+    );
+    assert!(streams[0].iter().any(|event| matches!(
+        &event.event,
+        StreamEvent::Ledger { record }
+            if matches!(
+                &record.event,
+                HarnessEvent::ModelResponded { output, .. }
+                    if output.content == CONTINUATION_ANSWER
+            )
+    )));
+    assert_eq!(
+        streams[0]
+            .iter()
+            .map(|event| event.offset)
+            .collect::<Vec<_>>(),
+        (0..streams[0].len() as u64).collect::<Vec<_>>()
+    );
+
+    let next_turn = controller_b
+        .thread_send(
+            thread_id.clone(),
+            "controller_b".into(),
+            None,
+            "start after final idle".into(),
+        )
+        .unwrap();
+    assert!(matches!(
+        next_turn,
+        ThreadSendResult::Started {
+            thread_id: receipt_thread,
+            turn_id: next_turn_id,
+        } if receipt_thread == thread_id && next_turn_id != turn_id
+    ));
+    wait_for_thread_idle(&mut controller_b, &thread_id);
+    let requests = provider.join();
+    assert_eq!(requests.len(), 3);
+
+    drop(controller_b);
+    host.stop(controller_a);
+}
+
+fn assert_controller_owned_rejection(
+    client: &mut DaemonClient,
+    thread_id: &str,
+    turn_id: &str,
+    controller_id: &str,
+    message: &str,
+) {
+    assert_eq!(
+        client
+            .thread_send(
+                thread_id.into(),
+                controller_id.into(),
+                Some(turn_id.into()),
+                message.into(),
+            )
+            .unwrap(),
+        ThreadSendResult::Rejected {
+            thread_id: thread_id.into(),
+            turn_id: Some(turn_id.into()),
+            reason: ThreadSendRejectedReason::ControllerOwned,
+        }
+    );
+}
+
+fn spawn_thread_observer(
+    socket_path: PathBuf,
+    workspace: PathBuf,
+    thread_id: String,
+    ready: mpsc::Sender<()>,
+) -> thread::JoinHandle<Vec<BufferedThreadEvent>> {
+    thread::spawn(move || {
+        let mut client =
+            DaemonClient::connect_with_timeout(&socket_path, Duration::from_secs(2)).unwrap();
+        client.hello(&workspace).unwrap();
+        ready.send(()).unwrap();
+        let mut offset = 0;
+        let mut observed_turn = None;
+        let mut events = Vec::new();
+        let deadline = Instant::now() + PROOF_TIMEOUT;
+        loop {
+            let page = client
+                .thread_events(thread_id.clone(), Some(offset), 128, 1_000)
+                .unwrap();
+            offset = page.next_offset;
+            if observed_turn.is_none() {
+                observed_turn = page
+                    .current_turn_id
+                    .clone()
+                    .or_else(|| page.events.first().map(|event| event.turn_id.clone()));
+            }
+            let empty = page.events.is_empty();
+            events.extend(page.events);
+            if observed_turn.is_some()
+                && page.current_turn_id.as_ref() != observed_turn.as_ref()
+                && empty
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "thread observer did not detach");
+        }
+        events
+    })
+}
+
+fn wait_for_thread_idle(client: &mut DaemonClient, thread_id: &str) {
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    loop {
+        if client
+            .thread_status(thread_id.into())
+            .unwrap()
+            .thread
+            .live
+            .current_turn_id
+            .is_none()
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "thread turn did not become idle");
+        thread::sleep(POLL_INTERVAL);
+    }
 }
 
 #[test]
@@ -1293,7 +1612,9 @@ impl ProofContext {
             .env("XDG_STATE_HOME", &self.state_root);
         #[cfg(windows)]
         command.env("LOCALAPPDATA", &self.local_app_data);
-        command.env(API_KEY_ENV, "test-key");
+        command
+            .env(API_KEY_ENV, "test-key")
+            .env("PLATO_CONFIG", &self.config_path);
     }
 
     fn plato_command(&self) -> Command {
@@ -1748,6 +2069,81 @@ fn event_stream(events: [Value; 2], usage: UsageFixture) -> String {
 struct ScriptedProvider {
     base_url: String,
     handle: Option<thread::JoinHandle<Vec<Value>>>,
+}
+
+struct ControlledThreadProvider {
+    base_url: String,
+    first_request: mpsc::Receiver<Value>,
+    second_request: mpsc::Receiver<Value>,
+    release_first: mpsc::Sender<()>,
+    release_second: mpsc::Sender<()>,
+    handle: Option<thread::JoinHandle<Vec<Value>>>,
+}
+
+impl ControlledThreadProvider {
+    fn start(continuation_answer: &'static str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (first_request_sender, first_request) = mpsc::channel();
+        let (second_request_sender, second_request) = mpsc::channel();
+        let (release_first, first_release) = mpsc::channel();
+        let (release_second, second_release) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+
+            let mut first = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let first_value = read_http_request(&mut first);
+            first_request_sender.send(first_value.clone()).unwrap();
+            first_release.recv_timeout(PROOF_TIMEOUT).unwrap();
+            write_http_response(
+                &mut first,
+                &ProviderReply::answer("The first child finished.", UsageFixture::Known(5, 2)).body,
+            );
+            requests.push(first_value);
+
+            let mut second = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let second_value = read_http_request(&mut second);
+            second_request_sender.send(second_value.clone()).unwrap();
+            second_release.recv_timeout(PROOF_TIMEOUT).unwrap();
+            write_http_response(
+                &mut second,
+                &ProviderReply::answer(continuation_answer, UsageFixture::Known(8, 3)).body,
+            );
+            requests.push(second_value);
+
+            let mut third = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let third_value = read_http_request(&mut third);
+            write_http_response(
+                &mut third,
+                &ProviderReply::answer("The later turn finished.", UsageFixture::Known(9, 3)).body,
+            );
+            requests.push(third_value);
+            requests
+        });
+        Self {
+            base_url,
+            first_request,
+            second_request,
+            release_first,
+            release_second,
+            handle: Some(handle),
+        }
+    }
+
+    fn join(mut self) -> Vec<Value> {
+        self.handle.take().unwrap().join().unwrap()
+    }
+}
+
+impl Drop for ControlledThreadProvider {
+    fn drop(&mut self) {
+        let _ = self.release_first.send(());
+        let _ = self.release_second.send(());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl ScriptedProvider {

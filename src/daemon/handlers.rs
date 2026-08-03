@@ -10,21 +10,23 @@ use crate::{
             DaemonStatusTokenUsage, DaemonStatusTrust, DaemonStatusUsage,
             ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
             ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
-            ERROR_SESSIONS_LIST_FAILED, ERROR_THREAD_AUTHORITY_EXCEEDED, ERROR_THREAD_LIST_FAILED,
+            ERROR_SESSIONS_LIST_FAILED, ERROR_THREAD_AUTHORITY_EXCEEDED,
+            ERROR_THREAD_EVENTS_FAILED, ERROR_THREAD_LIST_FAILED, ERROR_THREAD_SEND_FAILED,
             ERROR_THREAD_SPAWN_FAILED, ERROR_THREAD_STATUS_FAILED, ERROR_UNSUPPORTED_METHOD,
             ERROR_WORKSPACE_MISMATCH, Envelope, EventsStreamParams, EventsStreamResult,
             HelloParams, HelloResult, IssuePrepResult, IssuePrepStartParams, IssuePrepStartResult,
             MessageAppendParams, ModelIdentityStatus, RunCancelParams, RunStartParams,
             RunStartResult, RunStateName, SessionSummary, SessionsListResult, ShutdownIfIdleResult,
-            ShutdownIfIdleResultName, StreamEvent, ThreadListResult, ThreadSpawnDecision,
-            ThreadSpawnParams, ThreadSpawnResult, ThreadStatus, ThreadStatusParams,
-            ThreadStatusResult, TranscriptReadParams, TranscriptReadResult, TypedRun,
-            TypedTranscript, TypedTranscriptEntry, decode_request,
+            ShutdownIfIdleResultName, StreamEvent, ThreadApprovalPolicy, ThreadEventsParams,
+            ThreadListResult, ThreadSendParams, ThreadSpawnDecision, ThreadSpawnParams,
+            ThreadSpawnResult, ThreadStatus, ThreadStatusParams, ThreadStatusResult,
+            TranscriptReadParams, TranscriptReadResult, TypedRun, TypedTranscript,
+            TypedTranscriptEntry, decode_request,
         },
         runtime::{
             DaemonRuntime, IssuePrepAdmissionError, RunAdmissionError, RunRecord,
-            ShutdownIfIdleDecision, ThreadSpawnAdmissionError, ThreadSpawnClaimError,
-            approval_handler,
+            ShutdownIfIdleDecision, ThreadEventsError, ThreadSendAdmission,
+            ThreadSpawnAdmissionError, ThreadSpawnClaimError, ThreadTurnBinding, approval_handler,
         },
     },
     issue_prep::{IssuePrepOptions, IssuePrepOutcome, run_issue_prep},
@@ -35,12 +37,14 @@ use crate::{
     replay::{format_readback, format_session_readback},
     thread_authority::{
         THREAD_SPAWN_APPROVAL_REASON, ThreadAuthorityDraft, ThreadAuthorityError,
-        ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, new_spawn_id, now_ms,
-        thread_spawn_effect, validate_child_authority,
+        ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, new_spawn_id, new_thread_turn_id,
+        now_ms, thread_spawn_effect, validate_child_authority,
     },
     tool_catalog::SHELL_EXEC,
 };
-use platonic_core::{EffectClass, HarnessEvent, ReadbackEntry, RecordedEvent, RunReadback};
+use platonic_core::{
+    ActorId, EffectClass, HarnessEvent, ReadbackEntry, RecordedEvent, RunReadback, TurnId,
+};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering, mpsc},
@@ -49,6 +53,7 @@ use std::{
 
 const DEFAULT_EVENT_LIMIT: usize = 64;
 const MAX_EVENT_LIMIT: usize = 128;
+const MAX_THREAD_EVENT_WAIT_MS: u64 = 1_000;
 const LATEST_QUESTION_MAX_CHARS: usize = 120;
 const EVENT_COLLECTOR_PANIC: &str = "daemon event collector panicked";
 
@@ -86,6 +91,12 @@ pub(super) fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Enve
         Some("thread.list") => handle_thread_list(runtime, request),
         Some("thread.status") => {
             handle_with_params(runtime, request, "thread.status", handle_thread_status)
+        }
+        Some("thread.send") => {
+            handle_with_params(runtime, request, "thread.send", handle_thread_send)
+        }
+        Some("thread.events") => {
+            handle_with_params(runtime, request, "thread.events", handle_thread_events)
         }
         Some("daemon.status") => {
             handle_with_params(runtime, request, "daemon.status", handle_daemon_status)
@@ -646,6 +657,195 @@ fn handle_thread_status(
     }
 }
 
+fn handle_thread_send(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: ThreadSendParams,
+) -> Envelope {
+    if runtime.shutdown_accepted() {
+        return shutting_down_response(request.id, "thread.send");
+    }
+    if let Err(message) = validate_thread_send(&params) {
+        return Envelope::error(
+            request.id,
+            Some("thread.send".into()),
+            ERROR_MALFORMED_REQUEST,
+            message,
+        );
+    }
+    let authority = match crate::ledger::default_thread_authority(
+        &runtime.paths.default_ledger(),
+        &params.thread_id,
+    ) {
+        Ok(Some(authority)) => authority,
+        Ok(None) => {
+            return Envelope::error(
+                request.id,
+                Some("thread.send".into()),
+                ERROR_NOT_FOUND,
+                format!("thread not found: {}", params.thread_id),
+            );
+        }
+        Err(_) => {
+            return Envelope::error(
+                request.id,
+                Some("thread.send".into()),
+                ERROR_THREAD_SEND_FAILED,
+                "thread authority readback failed",
+            );
+        }
+    };
+    let admission = runtime.send_thread(
+        &params.thread_id,
+        params.controller_id,
+        params.turn_id.as_deref(),
+        params.message.clone(),
+        new_thread_turn_id(),
+    );
+    let (receipt, turn) = match admission {
+        ThreadSendAdmission::ShuttingDown => {
+            return shutting_down_response(request.id, "thread.send");
+        }
+        ThreadSendAdmission::Started { receipt, turn } => (receipt, turn),
+        ThreadSendAdmission::Steered { receipt } | ThreadSendAdmission::Rejected { receipt } => {
+            return Envelope::response_from(request.id, Some("thread.send".into()), receipt);
+        }
+    };
+    let session_id = thread_session_id(&params.thread_id);
+    let session = match crate::ledger::default_sqlite_session_status(
+        &runtime.paths.default_ledger(),
+        Some(&session_id),
+    ) {
+        Ok(Some(_)) => RunSession::Continue { session_id },
+        Err(AppError::SessionNotFound(_)) => RunSession::Fresh { session_id },
+        Ok(None) => RunSession::Fresh { session_id },
+        Err(_) => {
+            runtime.abort_thread_turn(&turn);
+            return Envelope::error(
+                request.id,
+                Some("thread.send".into()),
+                ERROR_THREAD_SEND_FAILED,
+                "thread session readback failed",
+            );
+        }
+    };
+    let context = ThreadRunContext {
+        workspace_root: PathBuf::from(authority.cwd),
+        approval_policy: authority.approval_policy,
+        turn: turn.clone(),
+    };
+    let response = start_run(
+        runtime,
+        StartRunRequest {
+            request_id: request.id.clone(),
+            question: params.message,
+            session,
+            config_path: None,
+            overrides: RunOverrides {
+                model: Some(authority.model),
+                reasoning_effort: Some(authority.reasoning_effort),
+            },
+            wait: Some(false),
+            thread_context: Some(context),
+        },
+    );
+    if response.error.is_some() {
+        runtime.abort_thread_turn(&turn);
+        return response;
+    }
+    Envelope::response_from(request.id, Some("thread.send".into()), receipt)
+}
+
+fn validate_thread_send(params: &ThreadSendParams) -> Result<(), String> {
+    ActorId::new(params.thread_id.clone()).map_err(|error| error.to_string())?;
+    ActorId::new(params.controller_id.clone()).map_err(|error| error.to_string())?;
+    if let Some(turn_id) = &params.turn_id {
+        TurnId::new(turn_id.clone()).map_err(|error| error.to_string())?;
+    }
+    if params.message.trim().is_empty() {
+        return Err("thread.send message must not be empty".into());
+    }
+    Ok(())
+}
+
+fn handle_thread_events(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: ThreadEventsParams,
+) -> Envelope {
+    let ThreadEventsParams {
+        thread_id,
+        from_offset,
+        limit,
+        wait_ms,
+    } = params;
+    if ActorId::new(thread_id.clone()).is_err() {
+        return Envelope::error(
+            request.id,
+            Some("thread.events".into()),
+            ERROR_MALFORMED_REQUEST,
+            "thread.events thread_id is invalid",
+        );
+    }
+    let limit = limit.unwrap_or(DEFAULT_EVENT_LIMIT);
+    if limit == 0 || limit > MAX_EVENT_LIMIT {
+        return Envelope::error(
+            request.id,
+            Some("thread.events".into()),
+            ERROR_MALFORMED_REQUEST,
+            format!("thread.events limit must be between 1 and {MAX_EVENT_LIMIT}"),
+        );
+    }
+    let wait_ms = wait_ms.unwrap_or(0);
+    if wait_ms > MAX_THREAD_EVENT_WAIT_MS {
+        return Envelope::error(
+            request.id,
+            Some("thread.events".into()),
+            ERROR_MALFORMED_REQUEST,
+            format!("thread.events wait_ms must not exceed {MAX_THREAD_EVENT_WAIT_MS}"),
+        );
+    }
+    match crate::ledger::default_thread_authority(&runtime.paths.default_ledger(), &thread_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Envelope::error(
+                request.id,
+                Some("thread.events".into()),
+                ERROR_NOT_FOUND,
+                format!("thread not found: {thread_id}"),
+            );
+        }
+        Err(_) => {
+            return Envelope::error(
+                request.id,
+                Some("thread.events".into()),
+                ERROR_THREAD_EVENTS_FAILED,
+                "thread authority readback failed",
+            );
+        }
+    }
+    match runtime.thread_events(
+        &thread_id,
+        from_offset,
+        limit,
+        std::time::Duration::from_millis(wait_ms),
+    ) {
+        Ok(result) => Envelope::response_from(request.id, Some("thread.events".into()), result),
+        Err(ThreadEventsError::Lagged { first_offset }) => Envelope::error(
+            request.id,
+            Some("thread.events".into()),
+            ERROR_LAGGED,
+            format!(
+                "requested thread events were evicted; first available offset is {first_offset}"
+            ),
+        ),
+    }
+}
+
+fn thread_session_id(thread_id: &str) -> String {
+    format!("session_{thread_id}")
+}
+
 fn joined_thread_status(
     runtime: &DaemonRuntime,
     authority: crate::daemon::protocol::ThreadAuthorityRecord,
@@ -669,14 +869,17 @@ fn handle_run_start(
 ) -> Envelope {
     start_run(
         runtime,
-        request.id,
-        params.question,
-        RunSession::Fresh {
-            session_id: new_session_id(),
+        StartRunRequest {
+            request_id: request.id,
+            question: params.question,
+            session: RunSession::Fresh {
+                session_id: new_session_id(),
+            },
+            config_path: params.config_path,
+            overrides: params.overrides,
+            wait: params.wait,
+            thread_context: None,
         },
-        params.config_path,
-        params.overrides,
-        params.wait,
     )
 }
 
@@ -707,12 +910,15 @@ fn handle_message_append(
     };
     start_run(
         runtime,
-        request.id,
-        params.message,
-        RunSession::Continue { session_id },
-        params.config_path,
-        params.overrides,
-        params.wait,
+        StartRunRequest {
+            request_id: request.id,
+            question: params.message,
+            session: RunSession::Continue { session_id },
+            config_path: params.config_path,
+            overrides: params.overrides,
+            wait: params.wait,
+            thread_context: None,
+        },
     )
 }
 
@@ -783,18 +989,49 @@ fn handle_issue_prep_start(
     }
 }
 
-fn start_run(
-    runtime: &DaemonRuntime,
+#[derive(Clone, Debug)]
+struct ThreadRunContext {
+    workspace_root: PathBuf,
+    approval_policy: ThreadApprovalPolicy,
+    turn: ThreadTurnBinding,
+}
+
+struct StartRunRequest {
     request_id: Option<String>,
     question: String,
     session: RunSession,
     config_path: Option<String>,
     overrides: RunOverrides,
     wait: Option<bool>,
-) -> Envelope {
-    let method = match &session {
-        RunSession::Fresh { .. } => "run.start",
-        RunSession::Continue { .. } => "message.append",
+    thread_context: Option<ThreadRunContext>,
+}
+
+struct ThreadTurnDriver {
+    context: ThreadRunContext,
+    session_id: String,
+    config_path: Option<String>,
+    overrides: RunOverrides,
+}
+
+fn start_run(runtime: &DaemonRuntime, request: StartRunRequest) -> Envelope {
+    let StartRunRequest {
+        request_id,
+        question,
+        session,
+        config_path,
+        overrides,
+        wait,
+        thread_context,
+    } = request;
+    let method = match (&thread_context, &session) {
+        (Some(_), _) => "thread.send",
+        (None, RunSession::Fresh { .. }) => "run.start",
+        (None, RunSession::Continue { .. }) => "message.append",
+    };
+    let error_code = if thread_context.is_some() {
+        ERROR_THREAD_SEND_FAILED
+    } else {
+        ERROR_RUN_FAILED
     };
     let session_id = session.session_id().to_string();
     let run_id = match new_run_id() {
@@ -803,17 +1040,25 @@ fn start_run(
             return Envelope::error(
                 request_id,
                 Some(method.into()),
-                ERROR_RUN_FAILED,
+                error_code,
                 error.to_string(),
             );
         }
     };
     let run_id_string = run_id.to_string();
-    let record = Arc::new(RunRecord::new(
-        run_id_string.clone(),
-        session_id,
-        runtime.paths.ledger_path.clone(),
-    ));
+    let record = Arc::new(match &thread_context {
+        Some(context) => RunRecord::new_for_thread(
+            run_id_string.clone(),
+            session_id.clone(),
+            runtime.paths.ledger_path.clone(),
+            context.turn.clone(),
+        ),
+        None => RunRecord::new(
+            run_id_string.clone(),
+            session_id.clone(),
+            runtime.paths.ledger_path.clone(),
+        ),
+    });
     match runtime.reserve_run(record.clone()) {
         Ok(()) => {}
         Err(RunAdmissionError::ShuttingDown) => {
@@ -834,16 +1079,27 @@ fn start_run(
 
     let (event_sender, event_receiver) = mpsc::channel::<RunEvent>();
     let event_collector = spawn_event_collector(record.clone(), event_receiver);
+    let continuation_config_path = config_path.clone();
+    let continuation_overrides = overrides.clone();
     let options = RunOptions {
         question,
         config_path: config_path.map(PathBuf::from),
         overrides,
         ledger: RunLedger::DefaultSqlite(runtime.paths.default_ledger()),
-        workspace_root: runtime.paths.workspace_root.clone(),
-        approval_mode: ApprovalMode::external_with_actor(
-            "daemon",
-            approval_handler(runtime.clone(), record.clone()),
+        workspace_root: thread_context.as_ref().map_or_else(
+            || runtime.paths.workspace_root.clone(),
+            |context| context.workspace_root.clone(),
         ),
+        approval_mode: match thread_context
+            .as_ref()
+            .map(|context| context.approval_policy)
+        {
+            Some(ThreadApprovalPolicy::Yolo) => ApprovalMode::from_yolo(true),
+            _ => ApprovalMode::external_with_actor(
+                "daemon",
+                approval_handler(runtime.clone(), record.clone()),
+            ),
+        },
         run_id: Some(run_id),
         session: Some(session),
         event_sender: Some(event_sender),
@@ -858,18 +1114,70 @@ fn start_run(
             Err(error) => Envelope::error(
                 request_id,
                 Some(method.into()),
-                ERROR_RUN_FAILED,
+                error_code,
                 error.to_string(),
             ),
         }
     } else {
         let worker_runtime = runtime.clone();
         let worker_record = record.clone();
-        thread::spawn(move || {
-            let _ = run_to_completion(&worker_runtime, &worker_record, options, event_collector);
-        });
+        match thread_context {
+            Some(context) => {
+                thread::spawn(move || {
+                    drive_thread_turn(
+                        worker_runtime,
+                        worker_record,
+                        options,
+                        event_collector,
+                        ThreadTurnDriver {
+                            context,
+                            session_id,
+                            config_path: continuation_config_path,
+                            overrides: continuation_overrides,
+                        },
+                    );
+                });
+            }
+            None => {
+                thread::spawn(move || {
+                    let _ = run_to_completion(
+                        &worker_runtime,
+                        &worker_record,
+                        options,
+                        event_collector,
+                    );
+                });
+            }
+        }
         run_start_response(request_id, method, &record)
     }
+}
+
+fn drive_thread_turn(
+    runtime: DaemonRuntime,
+    record: Arc<RunRecord>,
+    options: RunOptions,
+    event_collector: thread::JoinHandle<()>,
+    driver: ThreadTurnDriver,
+) {
+    let _ = run_to_completion(&runtime, &record, options, event_collector);
+    while let Some(message) = runtime.next_thread_message(&driver.context.turn) {
+        let _ = start_run(
+            &runtime,
+            StartRunRequest {
+                request_id: None,
+                question: message,
+                session: RunSession::Continue {
+                    session_id: driver.session_id.clone(),
+                },
+                config_path: driver.config_path.clone(),
+                overrides: driver.overrides.clone(),
+                wait: Some(true),
+                thread_context: Some(driver.context.clone()),
+            },
+        );
+    }
+    runtime.abort_thread_turn(&driver.context.turn);
 }
 
 fn run_to_completion(
@@ -2028,6 +2336,69 @@ mod tests {
         assert_eq!(response.error.unwrap().code, ERROR_MALFORMED_REQUEST);
         let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
         assert!(ledger.thread_authorities().unwrap().is_empty());
+    }
+
+    #[test]
+    fn denied_and_stale_thread_sends_leave_authority_ledger_and_turn_unchanged() {
+        let (_root, runtime) = thread_test_runtime();
+        let (spawn_id, thread_id) = pending_spawn(
+            start_thread(
+                &runtime,
+                None,
+                &runtime.paths.workspace_root,
+                crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+            )
+            .unwrap(),
+        );
+        let authority = grant_thread(&runtime, &spawn_id, "stdin").authority;
+        let malformed = handle_line(
+            &runtime,
+            &format!(
+                r#"{{"v":1,"id":"bad","kind":"request","method":"thread.send","params":{{"thread_id":"{thread_id}","controller_id":"","message":"no"}}}}"#
+            ),
+        );
+        assert_eq!(malformed.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+
+        let stale = handle_line(
+            &runtime,
+            &format!(
+                r#"{{"v":1,"id":"stale","kind":"request","method":"thread.send","params":{{"thread_id":"{thread_id}","controller_id":"controller_a","turn_id":"thread_turn_stale","message":"no"}}}}"#
+            ),
+        );
+        assert_eq!(
+            serde_json::from_value::<crate::daemon::protocol::ThreadSendResult>(
+                stale.result.unwrap()
+            )
+            .unwrap(),
+            crate::daemon::protocol::ThreadSendResult::Rejected {
+                thread_id: thread_id.clone(),
+                turn_id: None,
+                reason: crate::daemon::protocol::ThreadSendRejectedReason::TurnMismatch,
+            }
+        );
+
+        let invalid_events = handle_line(
+            &runtime,
+            &format!(
+                r#"{{"v":1,"id":"events","kind":"request","method":"thread.events","params":{{"thread_id":"{thread_id}","limit":0}}}}"#
+            ),
+        );
+        assert_eq!(invalid_events.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+        assert_eq!(runtime.thread_live_state(&thread_id).current_turn_id, None);
+        let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
+        assert_eq!(
+            ledger.thread_authority(&thread_id).unwrap(),
+            Some(authority)
+        );
+        let connection = rusqlite::Connection::open(&runtime.paths.ledger_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM session_runs", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

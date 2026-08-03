@@ -11,8 +11,9 @@ use plato_protocol::{
     HelloParams, HelloResult, IssuePrepStartParams, IssuePrepStartResult, MessageAppendParams,
     PROTOCOL_VERSION, RunCancelParams, RunOverrides, RunStartParams, RunStartResult,
     SessionSummary, SessionsListResult, ShutdownIfIdleResult, ThreadApprovalPolicy,
-    ThreadListResult, ThreadSpawnDecision, ThreadSpawnParams, ThreadSpawnResult,
-    ThreadStatusParams, ThreadStatusResult, TranscriptReadParams, TranscriptReadResult,
+    ThreadEventsParams, ThreadEventsResult, ThreadListResult, ThreadSendParams, ThreadSendResult,
+    ThreadSpawnDecision, ThreadSpawnParams, ThreadSpawnResult, ThreadStatusParams,
+    ThreadStatusResult, TranscriptReadParams, TranscriptReadResult,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -143,6 +144,44 @@ impl DaemonClient {
     /// Reads one durable thread joined with current daemon state.
     pub fn thread_status(&mut self, thread_id: String) -> ClientResult<ThreadStatusResult> {
         self.request("thread.status", ThreadStatusParams { thread_id })
+    }
+
+    /// Starts an idle thread turn or steers the exact active turn owned by `controller_id`.
+    pub fn thread_send(
+        &mut self,
+        thread_id: String,
+        controller_id: String,
+        turn_id: Option<String>,
+        message: String,
+    ) -> ClientResult<ThreadSendResult> {
+        self.request(
+            "thread.send",
+            ThreadSendParams {
+                thread_id,
+                controller_id,
+                turn_id,
+                message,
+            },
+        )
+    }
+
+    /// Reads one bounded retained event page for a live thread.
+    pub fn thread_events(
+        &mut self,
+        thread_id: String,
+        from_offset: Option<u64>,
+        limit: usize,
+        wait_ms: u64,
+    ) -> ClientResult<ThreadEventsResult> {
+        self.request(
+            "thread.events",
+            ThreadEventsParams {
+                thread_id,
+                from_offset,
+                limit: Some(limit),
+                wait_ms: Some(wait_ms),
+            },
+        )
     }
 
     /// Reads authoritative daemon, model, session, usage, and trust status.
@@ -899,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn client_sends_typed_thread_spawn_list_and_status_requests() {
+    fn client_sends_typed_thread_management_requests() {
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
@@ -997,6 +1036,73 @@ mod tests {
                     }
                 }),
             );
+
+            let start_turn = read_request(&mut reader);
+            assert_eq!(start_turn.method.as_deref(), Some("thread.send"));
+            assert_eq!(
+                start_turn.params,
+                Some(json!({
+                    "thread_id": "thread_1",
+                    "controller_id": "terminal_a",
+                    "message": "inspect it"
+                }))
+            );
+            write_response(
+                &mut writer,
+                start_turn.id,
+                "thread.send",
+                json!({
+                    "status": "started",
+                    "thread_id": "thread_1",
+                    "turn_id": "thread_turn_1"
+                }),
+            );
+
+            let steer = read_request(&mut reader);
+            assert_eq!(steer.method.as_deref(), Some("thread.send"));
+            assert_eq!(
+                steer.params,
+                Some(json!({
+                    "thread_id": "thread_1",
+                    "controller_id": "terminal_a",
+                    "turn_id": "thread_turn_1",
+                    "message": "also summarize"
+                }))
+            );
+            write_response(
+                &mut writer,
+                steer.id,
+                "thread.send",
+                json!({
+                    "status": "steered",
+                    "thread_id": "thread_1",
+                    "turn_id": "thread_turn_1"
+                }),
+            );
+
+            let events = read_request(&mut reader);
+            assert_eq!(events.method.as_deref(), Some("thread.events"));
+            assert_eq!(
+                events.params,
+                Some(json!({
+                    "thread_id": "thread_1",
+                    "from_offset": 0,
+                    "limit": 128,
+                    "wait_ms": 1000
+                }))
+            );
+            write_response(
+                &mut writer,
+                events.id,
+                "thread.events",
+                json!({
+                    "thread_id": "thread_1",
+                    "from_offset": 0,
+                    "next_offset": 0,
+                    "current_turn_id": "thread_turn_1",
+                    "events": []
+                }),
+            );
         });
 
         let mut client = DaemonClient::connect(&socket_path).unwrap();
@@ -1033,6 +1139,35 @@ mod tests {
             .unwrap(),
             authority
         );
+        let started = client
+            .thread_send(
+                "thread_1".into(),
+                "terminal_a".into(),
+                None,
+                "inspect it".into(),
+            )
+            .unwrap();
+        assert!(matches!(
+            started,
+            ThreadSendResult::Started { ref turn_id, .. } if turn_id == "thread_turn_1"
+        ));
+        let steered = client
+            .thread_send(
+                "thread_1".into(),
+                "terminal_a".into(),
+                Some("thread_turn_1".into()),
+                "also summarize".into(),
+            )
+            .unwrap();
+        assert!(matches!(
+            steered,
+            ThreadSendResult::Steered { ref turn_id, .. } if turn_id == "thread_turn_1"
+        ));
+        let events = client
+            .thread_events("thread_1".into(), Some(0), 128, 1_000)
+            .unwrap();
+        assert_eq!(events.thread_id, "thread_1");
+        assert_eq!(events.current_turn_id.as_deref(), Some("thread_turn_1"));
         handle.join().unwrap();
     }
 

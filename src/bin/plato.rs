@@ -7,9 +7,11 @@ use plato_agent::{
         client::{DaemonClient, DaemonConnectionConfig},
         lock::WorkspaceLock,
         protocol::{
-            CAPABILITY_THREAD_LIST, CAPABILITY_THREAD_SPAWN, CAPABILITY_THREAD_STATUS, HelloResult,
+            CAPABILITY_THREAD_EVENTS, CAPABILITY_THREAD_LIST, CAPABILITY_THREAD_SEND,
+            CAPABILITY_THREAD_SPAWN, CAPABILITY_THREAD_STATUS, HelloResult,
             PendingApprovalSnapshot, ReasoningEffort, RunStateName, StreamEvent,
-            ThreadApprovalPolicy, ThreadSpawnDecision, ThreadSpawnResult, ThreadStatus,
+            ThreadApprovalPolicy, ThreadSendResult, ThreadSpawnDecision, ThreadSpawnResult,
+            ThreadStatus,
         },
     },
     discord_gateway::preflight_discord_gateway_daemon,
@@ -155,6 +157,24 @@ enum ThreadCommand {
     Status {
         #[arg(value_name = "THREAD_ID")]
         thread_id: String,
+    },
+    /// Start an idle turn or steer the exact active turn owned by this controller.
+    Send {
+        #[arg(value_name = "THREAD_ID")]
+        thread_id: String,
+        #[arg(long, value_name = "CONTROLLER_ID")]
+        controller: String,
+        #[arg(long, value_name = "TURN_ID")]
+        turn: Option<String>,
+        #[arg(value_name = "MESSAGE", required = true, num_args = 1..)]
+        message: Vec<String>,
+    },
+    /// Attach as an observer to the ordered live thread event stream.
+    Attach {
+        #[arg(value_name = "THREAD_ID")]
+        thread_id: String,
+        #[arg(long, value_name = "OFFSET")]
+        from_offset: Option<u64>,
     },
 }
 
@@ -333,6 +353,8 @@ fn connect_host_thread_daemon(workspace_root: &Path) -> plato_agent::AppResult<D
         CAPABILITY_THREAD_SPAWN,
         CAPABILITY_THREAD_LIST,
         CAPABILITY_THREAD_STATUS,
+        CAPABILITY_THREAD_SEND,
+        CAPABILITY_THREAD_EVENTS,
     ] {
         if !hello.capabilities.iter().any(|served| served == capability) {
             return Err(AppError::Config(format!(
@@ -435,6 +457,31 @@ fn run_thread_cli_with_io(
             let status = client.thread_status(thread_id)?;
             write_thread_status(output, &status.thread)
         }
+        ThreadCommand::Send {
+            thread_id,
+            controller,
+            turn,
+            message,
+        } => write_thread_send_result(
+            output,
+            &client.thread_send(thread_id, controller, turn, message.join(" "))?,
+        ),
+        ThreadCommand::Attach {
+            thread_id,
+            from_offset,
+        } => {
+            let mut offset = from_offset;
+            loop {
+                let page =
+                    client.thread_events(thread_id.clone(), offset, DAEMON_EVENT_PAGE, 1_000)?;
+                offset = Some(page.next_offset);
+                for event in page.events {
+                    serde_json::to_writer(&mut *output, &event)?;
+                    writeln!(output)?;
+                }
+                output.flush()?;
+            }
+        }
     }
 }
 
@@ -443,6 +490,15 @@ fn write_thread_status(
     thread: &ThreadStatus,
 ) -> plato_agent::AppResult<()> {
     serde_json::to_writer(&mut *output, thread)?;
+    writeln!(output)?;
+    Ok(())
+}
+
+fn write_thread_send_result(
+    output: &mut dyn Write,
+    result: &ThreadSendResult,
+) -> plato_agent::AppResult<()> {
+    serde_json::to_writer(&mut *output, result)?;
     writeln!(output)?;
     Ok(())
 }
@@ -1149,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_cli_exposes_only_spawn_list_and_status_with_explicit_authority() {
+    fn thread_cli_exposes_spawn_send_attach_and_readback_with_explicit_authority() {
         let spawn = Cli::try_parse_from([
             "plato",
             "thread",
@@ -1196,7 +1252,70 @@ mod tests {
                 command: ThreadCommand::Status { thread_id }
             }) if thread_id == "thread_1"
         ));
-        assert!(Cli::try_parse_from(["plato", "thread", "send"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from([
+                "plato",
+                "thread",
+                "send",
+                "thread_1",
+                "--controller",
+                "terminal_a",
+                "hello",
+                "from",
+                "a",
+            ])
+            .unwrap()
+            .command,
+            Some(Command::Thread {
+                command: ThreadCommand::Send {
+                    thread_id,
+                    controller,
+                    turn: None,
+                    message,
+                }
+            }) if thread_id == "thread_1"
+                && controller == "terminal_a"
+                && message == ["hello", "from", "a"]
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "plato",
+                "thread",
+                "send",
+                "thread_1",
+                "--controller",
+                "terminal_a",
+                "--turn",
+                "thread_turn_1",
+                "steer",
+            ])
+            .unwrap()
+            .command,
+            Some(Command::Thread {
+                command: ThreadCommand::Send {
+                    turn: Some(turn),
+                    ..
+                }
+            }) if turn == "thread_turn_1"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "plato",
+                "thread",
+                "attach",
+                "thread_1",
+                "--from-offset",
+                "7",
+            ])
+            .unwrap()
+            .command,
+            Some(Command::Thread {
+                command: ThreadCommand::Attach {
+                    thread_id,
+                    from_offset: Some(7),
+                }
+            }) if thread_id == "thread_1"
+        ));
         assert!(
             Cli::try_parse_from([
                 "plato",
