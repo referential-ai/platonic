@@ -1,7 +1,10 @@
 use clap::Parser;
 #[cfg(windows)]
 use clap::Subcommand;
-use plato_agent::daemon::{server::DaemonServer, wake_listener};
+use plato_agent::daemon::{
+    server::{DaemonServer, HostDaemonServer},
+    wake_listener,
+};
 #[cfg(unix)]
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
@@ -23,10 +26,18 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    #[arg(long, default_value = ".")]
+    #[arg(
+        long,
+        help = "Serve multiple workspaces on the stable host endpoint",
+        conflicts_with = "workspace",
+        conflicts_with = "socket"
+    )]
+    host: bool,
+
+    #[arg(long, default_value = ".", conflicts_with = "host")]
     workspace: PathBuf,
 
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "host")]
     socket: Option<PathBuf>,
 }
 
@@ -87,6 +98,19 @@ fn run() -> plato_agent::AppResult<()> {
     #[cfg(windows)]
     let installer_gate =
         plato_agent::daemon::installer_gate::InstallerStartupGate::acquire_for_daemon_startup()?;
+    if cli.host {
+        let server = HostDaemonServer::bind()?;
+        #[cfg(windows)]
+        drop(installer_gate);
+        let socket_path = server.socket_path().to_path_buf();
+        eprintln!("daemon_scope: host");
+        eprintln!("socket_path: {}", socket_path.display());
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        install_shutdown_handler(shutdown.clone(), socket_path)?;
+        return server.serve_forever(shutdown);
+    }
+
     let server = DaemonServer::bind(&cli.workspace, cli.socket)?;
     #[cfg(windows)]
     drop(installer_gate);
@@ -196,6 +220,14 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn host_mode_conflicts_with_workspace_and_custom_socket() {
+        let host = Cli::try_parse_from(["plato-agentd", "--host"]).unwrap();
+        assert!(host.host);
+        assert!(Cli::try_parse_from(["plato-agentd", "--host", "--workspace", "."]).is_err());
+        assert!(Cli::try_parse_from(["plato-agentd", "--host", "--socket", "agent.sock"]).is_err());
     }
 
     #[test]

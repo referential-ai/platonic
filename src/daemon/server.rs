@@ -3,17 +3,27 @@ pub use super::DaemonPaths;
 use crate::paths;
 use crate::{
     AppResult,
-    daemon::{handlers::handle_line, lock::WorkspaceLock, runtime::DaemonRuntime, transport},
+    daemon::{
+        handlers::{handle_line, handle_request},
+        lock::WorkspaceLock,
+        protocol::{
+            ERROR_MALFORMED_REQUEST, ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind, HelloParams,
+            decode_request,
+        },
+        runtime::{DaemonRuntime, RuntimeState},
+        transport,
+    },
 };
 use std::{
+    collections::HashMap,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(windows)]
@@ -30,6 +40,7 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 #[cfg(unix)]
 const SOCKET_MODE: u32 = 0o600;
 const MAX_CONNECTION_HANDLERS: usize = 64;
+const HOST_DAEMON_SCOPE: &str = "host";
 
 #[derive(Debug, Default)]
 struct HandlerCapacity {
@@ -61,12 +72,51 @@ impl Drop for HandlerPermit {
 }
 
 #[derive(Debug)]
-pub struct DaemonServer {
+struct BoundEndpoint {
     listener: transport::Listener,
+    socket_path: PathBuf,
     #[cfg(unix)]
     socket_device: u64,
     #[cfg(unix)]
     socket_inode: u64,
+}
+
+impl BoundEndpoint {
+    fn bind(socket_path: PathBuf, reclaim_default_socket: bool) -> AppResult<Self> {
+        #[cfg(unix)]
+        prepare_socket_for_bind(&socket_path, reclaim_default_socket)?;
+        #[cfg(windows)]
+        let _ = reclaim_default_socket;
+        let listener = transport::bind(&socket_path)?;
+        #[cfg(unix)]
+        let (socket_device, socket_inode) = bound_socket_identity(&socket_path)?;
+        #[cfg(unix)]
+        if let Err(error) = restrict_socket(&socket_path) {
+            drop(listener);
+            let _ = remove_socket_if_matches(&socket_path, socket_device, socket_inode);
+            return Err(error.into());
+        }
+        Ok(Self {
+            listener,
+            socket_path,
+            #[cfg(unix)]
+            socket_device,
+            #[cfg(unix)]
+            socket_inode,
+        })
+    }
+}
+
+impl Drop for BoundEndpoint {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ = remove_socket_if_matches(&self.socket_path, self.socket_device, self.socket_inode);
+    }
+}
+
+#[derive(Debug)]
+pub struct DaemonServer {
+    endpoint: BoundEndpoint,
     runtime: DaemonRuntime,
     handlers: Arc<HandlerCapacity>,
     _lock: WorkspaceLock,
@@ -89,42 +139,17 @@ impl DaemonServer {
         #[cfg(unix)]
         let reclaim_default_socket =
             paths.socket_path == crate::paths::default_socket_path(&paths.workspace_root)?;
-        #[cfg(unix)]
-        {
-            let (runtime_home, is_fallback) = paths::runtime_home_and_fallback();
-            if is_fallback {
-                prepare_temp_runtime_home(&runtime_home)?;
-            }
-            prepare_runtime_path(&runtime_home, &paths.lock_path)?;
-            prepare_socket_parent(&runtime_home, &paths.socket_path)?;
-        }
         #[cfg(windows)]
-        fs::create_dir_all(
-            paths
-                .lock_path
-                .parent()
-                .expect("default Windows lock path has a parent"),
-        )?;
+        let reclaim_default_socket = false;
+        prepare_workspace_lock_parent(&paths)?;
+        #[cfg(unix)]
+        prepare_socket_parent(&paths::runtime_home_and_fallback().0, &paths.socket_path)?;
         let lock = WorkspaceLock::acquire_for_workspace(&paths.workspace_root, &paths.socket_path)?;
         crate::ledger::interrupt_orphaned_default_sqlite_runs(&paths.default_ledger())?;
-        #[cfg(unix)]
-        prepare_socket_for_bind(&paths.socket_path, reclaim_default_socket)?;
-        let listener = transport::bind(&paths.socket_path)?;
-        #[cfg(unix)]
-        let (socket_device, socket_inode) = bound_socket_identity(&paths.socket_path)?;
-        #[cfg(unix)]
-        if let Err(error) = restrict_socket(&paths.socket_path) {
-            drop(listener);
-            let _ = remove_socket_if_matches(&paths.socket_path, socket_device, socket_inode);
-            return Err(error.into());
-        }
+        let endpoint = BoundEndpoint::bind(paths.socket_path.clone(), reclaim_default_socket)?;
         let runtime = DaemonRuntime::new(paths);
         Ok(Self {
-            listener,
-            #[cfg(unix)]
-            socket_device,
-            #[cfg(unix)]
-            socket_inode,
+            endpoint,
             runtime,
             handlers: Arc::new(HandlerCapacity::default()),
             _lock: lock,
@@ -141,14 +166,14 @@ impl DaemonServer {
             &shutdown,
             &self.runtime.stop_requested,
             Arc::clone(&self.handlers),
-            || transport::accept(&self.listener),
+            || transport::accept(&self.endpoint.listener),
             move |stream| handle_stream(runtime.clone(), stream),
             thread::sleep,
         )
     }
 
     pub fn serve_next(&self) -> AppResult<()> {
-        let stream = transport::accept(&self.listener)?;
+        let stream = transport::accept(&self.endpoint.listener)?;
         handle_stream(self.runtime.clone(), stream)
     }
 
@@ -156,6 +181,156 @@ impl DaemonServer {
     fn handle_line(&self, line: &str) -> crate::daemon::protocol::Envelope {
         handle_line(&self.runtime, line)
     }
+}
+
+#[derive(Debug)]
+struct HostWorkspaceRuntime {
+    runtime: DaemonRuntime,
+    _lock: WorkspaceLock,
+}
+
+#[derive(Clone, Debug)]
+struct HostRuntime {
+    socket_path: PathBuf,
+    started_at: Instant,
+    state: Arc<Mutex<RuntimeState>>,
+    stop_requested: Arc<AtomicBool>,
+    workspaces: Arc<Mutex<HashMap<PathBuf, HostWorkspaceRuntime>>>,
+}
+
+impl HostRuntime {
+    fn new(socket_path: PathBuf) -> Self {
+        Self {
+            socket_path,
+            started_at: Instant::now(),
+            state: Arc::new(Mutex::new(RuntimeState::default())),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            workspaces: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn workspace_runtime(&self, params: &HelloParams) -> Result<DaemonRuntime, String> {
+        let workspace_root = PathBuf::from(&params.workspace_root)
+            .canonicalize()
+            .map_err(|error| format!("workspace_root cannot be resolved: {error}"))?;
+        let workspace_id = crate::paths::workspace_id(&workspace_root)
+            .map_err(|error| format!("workspace_id cannot be derived: {error}"))?;
+        if params.workspace_id != workspace_id {
+            return Err(format!(
+                "workspace_id mismatch: expected {workspace_id}, got {}",
+                params.workspace_id
+            ));
+        }
+
+        let mut workspaces = self
+            .workspaces
+            .lock()
+            .expect("host workspace runtime lock poisoned");
+        if let Some(workspace) = workspaces.get(&workspace_root) {
+            return Ok(workspace.runtime.clone());
+        }
+
+        let paths = DaemonPaths::resolve(&workspace_root, Some(self.socket_path.clone()))
+            .map_err(|error| error.to_string())?;
+        prepare_workspace_lock_parent(&paths).map_err(|error| error.to_string())?;
+        let workspace_lock =
+            WorkspaceLock::acquire_for_workspace(&paths.workspace_root, &paths.socket_path)
+                .map_err(|error| error.to_string())?;
+        crate::ledger::interrupt_orphaned_default_sqlite_runs(&paths.default_ledger())
+            .map_err(|error| error.to_string())?;
+        let runtime = DaemonRuntime::new_shared(
+            paths,
+            self.started_at,
+            Arc::clone(&self.state),
+            Arc::clone(&self.stop_requested),
+        );
+        workspaces.insert(
+            workspace_root,
+            HostWorkspaceRuntime {
+                runtime: runtime.clone(),
+                _lock: workspace_lock,
+            },
+        );
+        Ok(runtime)
+    }
+}
+
+#[derive(Debug)]
+pub struct HostDaemonServer {
+    endpoint: BoundEndpoint,
+    runtime: HostRuntime,
+    handlers: Arc<HandlerCapacity>,
+    _lock: WorkspaceLock,
+}
+
+impl HostDaemonServer {
+    pub fn bind() -> AppResult<Self> {
+        let socket_path = crate::paths::host_socket_path()?;
+        let lock_path = crate::paths::host_lock_path()?;
+        #[cfg(unix)]
+        {
+            let (runtime_home, is_fallback) = paths::runtime_home_and_fallback();
+            if is_fallback {
+                prepare_temp_runtime_home(&runtime_home)?;
+            }
+            prepare_runtime_path(&runtime_home, &lock_path)?;
+            prepare_socket_parent(&runtime_home, &socket_path)?;
+        }
+        #[cfg(windows)]
+        fs::create_dir_all(
+            lock_path
+                .parent()
+                .expect("default Windows host lock path has a parent"),
+        )?;
+        let lock = WorkspaceLock::acquire_for_host(lock_path, &socket_path)?;
+        let endpoint = BoundEndpoint::bind(socket_path.clone(), true)?;
+        Ok(Self {
+            endpoint,
+            runtime: HostRuntime::new(socket_path),
+            handlers: Arc::new(HandlerCapacity::default()),
+            _lock: lock,
+        })
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.endpoint.socket_path
+    }
+
+    pub fn serve_forever(&self, shutdown: Arc<AtomicBool>) -> AppResult<()> {
+        let runtime = self.runtime.clone();
+        serve_connections(
+            &shutdown,
+            &self.runtime.stop_requested,
+            Arc::clone(&self.handlers),
+            || transport::accept(&self.endpoint.listener),
+            move |stream| handle_host_stream(runtime.clone(), stream),
+            thread::sleep,
+        )
+    }
+
+    pub fn serve_next(&self) -> AppResult<()> {
+        let stream = transport::accept(&self.endpoint.listener)?;
+        handle_host_stream(self.runtime.clone(), stream)
+    }
+}
+
+fn prepare_workspace_lock_parent(paths: &DaemonPaths) -> AppResult<()> {
+    #[cfg(unix)]
+    {
+        let (runtime_home, is_fallback) = paths::runtime_home_and_fallback();
+        if is_fallback {
+            prepare_temp_runtime_home(&runtime_home)?;
+        }
+        prepare_runtime_path(&runtime_home, &paths.lock_path)?;
+    }
+    #[cfg(windows)]
+    fs::create_dir_all(
+        paths
+            .lock_path
+            .parent()
+            .expect("default Windows lock path has a parent"),
+    )?;
+    Ok(())
 }
 
 fn serve_connections<S, A, H, B>(
@@ -416,6 +591,123 @@ fn verify_mode(path: &Path, expected: u32) -> std::io::Result<()> {
 }
 
 fn handle_stream(runtime: DaemonRuntime, stream: transport::Stream) -> AppResult<()> {
+    let stop_requested = Arc::clone(&runtime.stop_requested);
+    let socket_path = runtime.paths.socket_path.clone();
+    #[cfg(all(test, unix))]
+    let shutdown_runtime = runtime.clone();
+    handle_stream_lines(
+        stream,
+        stop_requested,
+        socket_path,
+        move |line| handle_line(&runtime, line),
+        move || {
+            #[cfg(all(test, unix))]
+            shutdown_runtime.wait_after_shutdown_flush();
+        },
+    )
+}
+
+fn handle_host_stream(runtime: HostRuntime, stream: transport::Stream) -> AppResult<()> {
+    let stop_requested = Arc::clone(&runtime.stop_requested);
+    let socket_path = runtime.socket_path.clone();
+    let mut workspace_runtime = None;
+    handle_stream_lines(
+        stream,
+        stop_requested,
+        socket_path,
+        move |line| handle_host_line(&runtime, &mut workspace_runtime, line),
+        || {},
+    )
+}
+
+fn handle_host_line(
+    host: &HostRuntime,
+    workspace_runtime: &mut Option<DaemonRuntime>,
+    line: &str,
+) -> Envelope {
+    if let Some(runtime) = workspace_runtime {
+        return add_host_scope(handle_line(runtime, line));
+    }
+
+    let request = match decode_request(line) {
+        Ok(request) => request,
+        Err(error) => return *error,
+    };
+    if request.method.as_deref() != Some("hello") {
+        let method = request.method.clone();
+        return Envelope::error(
+            request.id,
+            method.clone(),
+            ERROR_MALFORMED_REQUEST,
+            format!(
+                "host daemon requires hello before {}",
+                method.as_deref().unwrap_or("request")
+            ),
+        );
+    }
+    let params = match request.params.as_ref() {
+        Some(params) => match serde_json::from_value::<HelloParams>(params.clone()) {
+            Ok(params) => params,
+            Err(error) => {
+                return Envelope::error(
+                    request.id,
+                    Some("hello".into()),
+                    ERROR_MALFORMED_REQUEST,
+                    format!("hello params are invalid: {error}"),
+                );
+            }
+        },
+        None => {
+            return Envelope::error(
+                request.id,
+                Some("hello".into()),
+                ERROR_MALFORMED_REQUEST,
+                "hello params are required",
+            );
+        }
+    };
+    let runtime = match host.workspace_runtime(&params) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return Envelope::error(
+                request.id,
+                Some("hello".into()),
+                ERROR_WORKSPACE_MISMATCH,
+                error,
+            );
+        }
+    };
+    let response = add_host_scope(handle_request(&runtime, request));
+    if response.kind == EnvelopeKind::Response {
+        *workspace_runtime = Some(runtime);
+    }
+    response
+}
+
+fn add_host_scope(mut response: Envelope) -> Envelope {
+    if response.kind == EnvelopeKind::Response
+        && response.method.as_deref() == Some("hello")
+        && let Some(result) = response
+            .result
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        result.insert("daemon_scope".into(), HOST_DAEMON_SCOPE.into());
+    }
+    response
+}
+
+fn handle_stream_lines<H, F>(
+    stream: transport::Stream,
+    stop_requested: Arc<AtomicBool>,
+    socket_path: PathBuf,
+    mut handle: H,
+    after_shutdown_flush: F,
+) -> AppResult<()>
+where
+    H: FnMut(&str) -> Envelope,
+    F: FnOnce(),
+{
     let mut writer = transport::try_clone(&stream)?;
     let reader = BufReader::new(stream);
     for line in reader.lines() {
@@ -423,7 +715,7 @@ fn handle_stream(runtime: DaemonRuntime, stream: transport::Stream) -> AppResult
         if line.trim().is_empty() {
             continue;
         }
-        let response = handle_line(&runtime, &line);
+        let response = handle(&line);
         let stop_after_response = response.method.as_deref() == Some("daemon.shutdown_if_idle")
             && response.kind == crate::daemon::protocol::EnvelopeKind::Response
             && response
@@ -439,26 +731,14 @@ fn handle_stream(runtime: DaemonRuntime, stream: transport::Stream) -> AppResult
             Ok(())
         })();
         if stop_after_response {
-            #[cfg(all(test, unix))]
-            runtime.wait_after_shutdown_flush();
-            runtime.stop_requested.store(true, Ordering::SeqCst);
-            transport::wake(&runtime.paths.socket_path);
+            after_shutdown_flush();
+            stop_requested.store(true, Ordering::SeqCst);
+            transport::wake(&socket_path);
             return write_result;
         }
         write_result?;
     }
     Ok(())
-}
-
-impl Drop for DaemonServer {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        let _ = remove_socket_if_matches(
-            &self.runtime.paths.socket_path,
-            self.socket_device,
-            self.socket_inode,
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1038,7 +1318,7 @@ mod tests {
         let socket_path = socket_root.path().join("agent.sock");
         let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
         assert_eq!(
-            (server.socket_device, server.socket_inode),
+            (server.endpoint.socket_device, server.endpoint.socket_inode),
             socket_identity(&socket_path)
         );
 
@@ -1081,6 +1361,7 @@ mod tests {
         let result = response.result.unwrap();
         assert_eq!(result["daemon_version"], plato_protocol::BUILD_IDENTITY);
         assert_eq!(result["workspace_id"], paths.workspace_id);
+        assert!(result.get("daemon_scope").is_none());
         assert_eq!(
             result["capabilities"],
             serde_json::json!([
@@ -1099,6 +1380,46 @@ mod tests {
                 "daemon.shutdown_if_idle"
             ])
         );
+    }
+
+    #[test]
+    fn host_hello_reports_scope_and_existing_build_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        paths::with_test_xdg(root.path(), || {
+            let server = HostDaemonServer::bind().unwrap();
+            let socket_path = server.socket_path().to_path_buf();
+            let workspace_id = paths::workspace_id(&workspace).unwrap();
+            assert_eq!(socket_path, paths::host_socket_path().unwrap());
+            assert_ne!(socket_path, paths::default_socket_path(&workspace).unwrap());
+
+            let handle = thread::spawn(move || server.serve_next().unwrap());
+            let mut stream = UnixStream::connect(&socket_path).unwrap();
+            writeln!(
+                stream,
+                r#"{{"v":1,"id":"host_hello","kind":"request","method":"hello","params":{{"workspace_root":"{}","workspace_id":"{}"}}}}"#,
+                workspace.display(),
+                workspace_id
+            )
+            .unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+
+            let mut raw = String::new();
+            stream.read_to_string(&mut raw).unwrap();
+            handle.join().unwrap();
+            let response: Envelope = serde_json::from_str(raw.trim()).unwrap();
+            let result = response.result.unwrap();
+
+            assert_eq!(response.kind, EnvelopeKind::Response);
+            assert_eq!(result["daemon_scope"], "host");
+            assert_eq!(result["daemon_version"], plato_protocol::BUILD_IDENTITY);
+            assert_eq!(result["workspace_id"], workspace_id);
+            assert_eq!(
+                Path::new(result["ledger_path"].as_str().unwrap()),
+                paths::default_sqlite_path(&workspace).unwrap()
+            );
+        });
     }
 
     #[test]
