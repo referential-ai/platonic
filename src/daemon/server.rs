@@ -1380,7 +1380,9 @@ mod tests {
                 "daemon.shutdown_if_idle",
                 "thread.spawn",
                 "thread.list",
-                "thread.status"
+                "thread.status",
+                "thread.send",
+                "thread.events"
             ])
         );
     }

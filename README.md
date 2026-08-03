@@ -28,7 +28,7 @@ The bootstrap surface is intentionally small:
 - `plato replay --db[=<path>] [--run <id>]` replays an explicit SQLite ledger.
 - `plato issue-prep start <run-dir>` runs the fixed issue preparation pipeline from Markdown on stdin.
 - `plato daemon` runs the current workspace daemon in the foreground.
-- `plato thread spawn|list|status` manages durable thread authority on a serving host daemon.
+- `plato thread spawn|list|status|send|attach` manages and observes durable threads on a serving host daemon.
 - `plato gateway discord` checks that daemon, then runs the Discord connector.
 
 ## Configuration
@@ -267,6 +267,14 @@ plato thread spawn --cwd "$PWD" --model gpt-5.6-sol \
   --reasoning-effort xhigh --approval-policy prompt
 plato thread list
 plato thread status <thread-id>
+
+# Terminal 3: observe from the retained-stream tip before the turn starts
+plato thread attach <thread-id>
+
+# Terminal 2: start a turn, then use its returned turn_id to steer it
+plato thread send <thread-id> --controller terminal-2 "inspect the workspace"
+plato thread send <thread-id> --controller terminal-2 \
+  --turn <thread-turn-id> "also summarize the findings"
 ```
 
 Spawn and status print one typed JSON object. List prints one object per durable
@@ -274,6 +282,20 @@ thread. Each joins its immutable `authority` record with transient `live`
 fields (`loaded` and `current_turn_id`); liveness is never persisted. Restarted,
 clientless, and orphaned threads therefore remain enumerable with
 `loaded: false`.
+
+Send also prints a typed JSON receipt. An idle thread returns `started` with a
+daemon-minted turn id. The same controller can supply that exact id with
+`--turn` to queue a continuation and receive `steered`; another controller is
+typed-rejected for the entire turn. Accepted continuations keep the same turn
+id until their queue drains and the final run is terminal. Controller ownership
+is daemon-live state and is never added to the immutable authority record.
+
+Attach prints one JSON event per line until interrupted. Any number of attach
+clients can read the same ordered thread-local offsets without becoming
+controllers. Omit `--from-offset` to start at the retained tip, or use
+`--from-offset 0` for a late attach that should replay everything still in the
+bounded live buffer. A lagged offset fails explicitly rather than skipping
+events; retained events and observer subscriptions are not persisted.
 
 On startup it prints:
 
@@ -693,6 +715,8 @@ cargo run --bin plato -- daemon
 cargo run --bin plato -- thread spawn --model gpt-5.6-sol --reasoning-effort xhigh
 cargo run --bin plato -- thread list
 cargo run --bin plato -- thread status thread_123
+cargo run --bin plato -- thread send thread_123 --controller terminal_a "inspect the workspace"
+cargo run --bin plato -- thread attach thread_123 --from-offset 0
 cargo run --bin plato -- gateway discord --config ~/.config/plato/gateway.toml
 cargo run --bin plato -- replay
 cargo run --bin plato -- replay events.jsonl
