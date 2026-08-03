@@ -29,7 +29,7 @@ The bootstrap surface is intentionally small:
 - `plato replay --db[=<path>] [--run <id>]` replays an explicit SQLite ledger.
 - `plato issue-prep start <run-dir>` runs the fixed issue preparation pipeline from Markdown on stdin.
 - `plato daemon` runs the current workspace daemon in the foreground.
-- `plato thread spawn|list|status|send|attach` manages and observes durable threads on a serving host daemon.
+- `plato thread spawn|list|status|send|attach|stop` manages and observes durable threads on a serving host daemon.
 - `plato gateway discord` checks that daemon, then runs the Discord connector.
 
 ## Configuration
@@ -197,8 +197,9 @@ Every run uses this exact convention:
 - `plato replay --run <id>` replays a single run.
 - `--events <file>` is the explicit JSONL export/debug path.
 - Read-only SQLite replay reads `user_version` first: schema v1 uses only
-  `ledger_events`, v2 adds sessions, v3 adds voice companions, and v4 adds
-  immutable thread authority. Newer schemas fail without migration. Write-open
+  `ledger_events`, v2 adds sessions, v3 adds voice companions, v4 adds
+  immutable thread authority, and v5 adds immutable thread-stop records. Newer
+  schemas fail without migration. Write-open
   remains the sole migration path to the current schema.
 - With a live workspace daemon, default-ledger prompts delegate to it. Replay,
   explicit `--db=<path>`, and direct `--yolo` SQLite paths remain direct and
@@ -278,6 +279,7 @@ plato thread send <thread-id> --controller terminal-2 "inspect the workspace"
 plato thread send <thread-id> --controller terminal-2 \
   --turn <thread-turn-id> "also summarize the findings"
 plato thread attach <thread-id>
+plato thread stop <thread-id>
 ```
 
 Spawn and status print one typed JSON object. List prints one object per durable
@@ -303,6 +305,14 @@ controllers. Omit `--from-offset` to start at the retained tip, or use
 `--from-offset 0` for a late attach that should replay everything still in the
 bounded live buffer. A lagged offset fails explicitly rather than skipping
 events; retained events and observer subscriptions are not persisted.
+
+The transient `live` fields also include monotone `last_activity_at_ms` while
+the thread is loaded; live activity is never copied into immutable authority
+storage. `thread stop` is the only management mutation: it records the
+requesting actor after the supervised child process tree reaches zero
+residuals, then unloads the thread. There is no pause or live approval-policy
+edit; changing authority requires stopping and spawning a new thread through
+the approval gate.
 
 On startup it prints:
 

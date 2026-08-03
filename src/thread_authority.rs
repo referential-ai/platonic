@@ -60,6 +60,14 @@ pub(crate) struct ThreadSpawnApprovalRecord {
     pub(crate) occurred_at_ms: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ThreadStopRecord {
+    pub(crate) thread_id: String,
+    pub(crate) actor: String,
+    pub(crate) stopped_turn_id: Option<String>,
+    pub(crate) occurred_at_ms: u64,
+}
+
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub(crate) enum ThreadAuthorityError {
     #[error("child approval policy {child} exceeds parent policy {parent}")]
@@ -167,6 +175,27 @@ impl ThreadSpawnApprovalRecord {
                     && self.reason.is_none()
             }
         }
+    }
+}
+
+impl ThreadStopRecord {
+    pub(crate) fn new(
+        thread_id: String,
+        actor: String,
+        stopped_turn_id: Option<String>,
+        occurred_at_ms: u64,
+    ) -> AppResult<Self> {
+        ActorId::new(thread_id.clone())?;
+        ActorId::new(actor.clone())?;
+        if let Some(turn_id) = stopped_turn_id.as_ref() {
+            ActorId::new(turn_id.clone())?;
+        }
+        Ok(Self {
+            thread_id,
+            actor,
+            stopped_turn_id,
+            occurred_at_ms,
+        })
     }
 }
 

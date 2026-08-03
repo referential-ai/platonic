@@ -370,23 +370,23 @@ fn replay_cli_reads_literal_v1_without_mutation_and_rejects_future_schema() {
     );
     assert_eq!(fs::read(&v1_path).unwrap(), bytes_before);
 
-    let v5_path = proof.workspace.join("schema-v5.db");
-    let connection = Connection::open(&v5_path).unwrap();
-    connection.pragma_update(None, "user_version", 5).unwrap();
+    let v6_path = proof.workspace.join("schema-v6.db");
+    let connection = Connection::open(&v6_path).unwrap();
+    connection.pragma_update(None, "user_version", 6).unwrap();
     drop(connection);
-    let v5_bytes_before = fs::read(&v5_path).unwrap();
+    let v6_bytes_before = fs::read(&v6_path).unwrap();
     let future = proof.cli_output(&[
         "replay".into(),
-        format!("--db={}", v5_path.display()).into(),
+        format!("--db={}", v6_path.display()).into(),
     ]);
     assert!(!future.status.success());
     assert!(future.stdout.is_empty());
     assert!(
         String::from_utf8(future.stderr)
             .unwrap()
-            .contains("sqlite schema version mismatch: expected 4, actual 5")
+            .contains("sqlite schema version mismatch: expected 5, actual 6")
     );
-    assert_eq!(fs::read(&v5_path).unwrap(), v5_bytes_before);
+    assert_eq!(fs::read(&v6_path).unwrap(), v6_bytes_before);
 }
 
 #[test]

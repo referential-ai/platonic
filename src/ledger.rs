@@ -2,8 +2,8 @@ use crate::{
     AppError, AppResult,
     paths::DefaultSqlitePath,
     thread_authority::{
-        ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, validate_child_authority,
-        validate_complete_authority,
+        ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, ThreadStopRecord,
+        validate_child_authority, validate_complete_authority,
     },
     voice_session::{VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope},
 };
@@ -32,7 +32,8 @@ const LEGACY_SQLITE_SCHEMA_VERSION: u32 = 1;
 const SESSION_SQLITE_SCHEMA_VERSION: u32 = 2;
 const VOICE_EVENT_SQLITE_SCHEMA_VERSION: u32 = 3;
 const THREAD_AUTHORITY_SQLITE_SCHEMA_VERSION: u32 = 4;
-const SQLITE_SCHEMA_VERSION: u32 = THREAD_AUTHORITY_SQLITE_SCHEMA_VERSION;
+const THREAD_STOP_SQLITE_SCHEMA_VERSION: u32 = 5;
+const SQLITE_SCHEMA_VERSION: u32 = THREAD_STOP_SQLITE_SCHEMA_VERSION;
 pub(crate) const RUN_CANCELED_REASON: &str = "run canceled";
 const ORPHANED_RUN_ERROR: &str = "daemon restarted before run completed";
 #[cfg(unix)]
@@ -669,6 +670,44 @@ impl SqliteLedger {
             return Ok(None);
         }
         thread_spawn_approval_from(&self.connection, spawn_id)
+    }
+
+    pub(crate) fn persist_thread_stop(
+        &mut self,
+        stop: &ThreadStopRecord,
+    ) -> AppResult<(ThreadStopRecord, bool)> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = thread_stop_from(&transaction, &stop.thread_id)? {
+            transaction.commit()?;
+            return Ok((existing, false));
+        }
+        if thread_authority_from(&transaction, &stop.thread_id)?.is_none() {
+            return Err(AppError::Config(format!(
+                "thread stop has no durable authority: {}",
+                stop.thread_id
+            )));
+        }
+        transaction.execute(
+            "INSERT INTO thread_stops (thread_id, actor, stopped_turn_id, occurred_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                stop.thread_id,
+                stop.actor,
+                stop.stopped_turn_id,
+                sqlite_i64(stop.occurred_at_ms, "thread stop occurred_at_ms")?
+            ],
+        )?;
+        transaction.commit()?;
+        Ok((stop.clone(), true))
+    }
+
+    pub(crate) fn thread_stop(&self, thread_id: &str) -> AppResult<Option<ThreadStopRecord>> {
+        if self.schema_version < THREAD_STOP_SQLITE_SCHEMA_VERSION {
+            return Ok(None);
+        }
+        thread_stop_from(&self.connection, thread_id)
     }
 
     pub fn read_latest_run(&self) -> AppResult<(String, Vec<RecordedEvent>)> {
@@ -1606,6 +1645,37 @@ fn thread_spawn_approval_from(
         .optional()?)
 }
 
+fn thread_stop_from(
+    connection: &Connection,
+    thread_id: &str,
+) -> AppResult<Option<ThreadStopRecord>> {
+    let record = connection
+        .query_row(
+            "SELECT thread_id, actor, stopped_turn_id, occurred_at_ms
+             FROM thread_stops
+             WHERE thread_id = ?1",
+            params![thread_id],
+            |row| {
+                Ok(ThreadStopRecord {
+                    thread_id: row.get(0)?,
+                    actor: row.get(1)?,
+                    stopped_turn_id: row.get(2)?,
+                    occurred_at_ms: row_u64(row, 3, "thread stop occurred_at_ms")?,
+                })
+            },
+        )
+        .optional()?;
+    match record {
+        Some(record) => Ok(Some(ThreadStopRecord::new(
+            record.thread_id,
+            record.actor,
+            record.stopped_turn_id,
+            record.occurred_at_ms,
+        )?)),
+        None => Ok(None),
+    }
+}
+
 fn invalid_thread_column(index: usize, message: String) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
         index,
@@ -2021,6 +2091,9 @@ fn migrate_sqlite(connection: &mut Connection) -> AppResult<()> {
     if version < THREAD_AUTHORITY_SQLITE_SCHEMA_VERSION {
         create_thread_authority_tables(&transaction)?;
     }
+    if version < THREAD_STOP_SQLITE_SCHEMA_VERSION {
+        create_thread_stop_table(&transaction)?;
+    }
     if version < SQLITE_SCHEMA_VERSION {
         transaction.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)?;
     }
@@ -2118,6 +2191,32 @@ fn create_thread_authority_tables(connection: &Connection) -> AppResult<()> {
         BEFORE DELETE ON thread_spawn_approvals
         BEGIN
           SELECT RAISE(ABORT, 'thread spawn approvals are immutable');
+        END;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn create_thread_stop_table(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS thread_stops (
+          thread_id TEXT PRIMARY KEY,
+          actor TEXT NOT NULL,
+          stopped_turn_id TEXT,
+          occurred_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TRIGGER IF NOT EXISTS thread_stops_no_update
+        BEFORE UPDATE ON thread_stops
+        BEGIN
+          SELECT RAISE(ABORT, 'thread stop records are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS thread_stops_no_delete
+        BEFORE DELETE ON thread_stops
+        BEGIN
+          SELECT RAISE(ABORT, 'thread stop records are immutable');
         END;
         "#,
     )?;
@@ -2232,6 +2331,18 @@ pub(crate) fn default_thread_authority(
         return Ok(None);
     }
     SqliteLedger::open_default_readonly(path)?.thread_authority(thread_id)
+}
+
+pub(crate) fn default_thread_stop(
+    path: &DefaultSqlitePath,
+    thread_id: &str,
+) -> AppResult<Option<ThreadStopRecord>> {
+    if fs::symlink_metadata(path.as_path())
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(None);
+    }
+    SqliteLedger::open_default_readonly(path)?.thread_stop(thread_id)
 }
 
 pub(crate) fn default_sqlite_session_status(
@@ -2791,6 +2902,7 @@ mod tests {
         assert_eq!(kept, "kept");
         assert!(migrated.read_voice_events("run_absent").unwrap().is_empty());
         assert!(migrated.thread_authorities().unwrap().is_empty());
+        assert!(migrated.thread_stop("thread_absent").unwrap().is_none());
         drop(migrated);
 
         let bytes_after_migration = fs::read(&path).unwrap();
@@ -2878,6 +2990,82 @@ mod tests {
     }
 
     #[test]
+    fn thread_stop_is_immutable_idempotent_and_separate_from_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thread-stop.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let authority = thread_authority(
+            "thread_stop_target",
+            None,
+            "stdin",
+            dir.path(),
+            ThreadApprovalPolicy::Prompt,
+            42,
+        );
+        let approval = thread_approval(
+            "spawn_stop_target",
+            "thread_stop_target",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            42,
+        );
+        ledger
+            .persist_thread_spawn(&approval, Some(&authority))
+            .unwrap();
+        let stop = ThreadStopRecord::new(
+            "thread_stop_target".into(),
+            "operator".into(),
+            Some("turn_active".into()),
+            52,
+        )
+        .unwrap();
+        assert_eq!(
+            ledger.persist_thread_stop(&stop).unwrap(),
+            (stop.clone(), true)
+        );
+        let conflicting_retry = ThreadStopRecord::new(
+            "thread_stop_target".into(),
+            "other_operator".into(),
+            None,
+            99,
+        )
+        .unwrap();
+        assert_eq!(
+            ledger.persist_thread_stop(&conflicting_retry).unwrap(),
+            (stop.clone(), false)
+        );
+        assert_eq!(
+            ledger.thread_authority("thread_stop_target").unwrap(),
+            Some(authority.clone())
+        );
+        for statement in [
+            "UPDATE thread_stops SET actor = 'changed' WHERE thread_id = 'thread_stop_target'",
+            "DELETE FROM thread_stops WHERE thread_id = 'thread_stop_target'",
+        ] {
+            assert!(
+                ledger
+                    .connection
+                    .execute(statement, [])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("immutable")
+            );
+        }
+        drop(ledger);
+
+        let reopened = SqliteLedger::open_readonly(&path).unwrap();
+        assert_eq!(
+            reopened.thread_stop("thread_stop_target").unwrap(),
+            Some(stop)
+        );
+        assert_eq!(
+            reopened.thread_authority("thread_stop_target").unwrap(),
+            Some(authority)
+        );
+    }
+
+    #[test]
     fn literal_v4_thread_authority_fixture_reads_exactly_without_mutation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("literal-v4.db");
@@ -2927,6 +3115,7 @@ mod tests {
                 created_at_ms: 42,
             })
         );
+        assert!(ledger.thread_stop("thread_literal").unwrap().is_none());
         drop(ledger);
         assert_eq!(fs::read(&path).unwrap(), bytes_before);
     }

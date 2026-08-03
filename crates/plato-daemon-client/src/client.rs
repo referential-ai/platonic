@@ -13,7 +13,8 @@ use plato_protocol::{
     SessionSummary, SessionsListResult, ShutdownIfIdleResult, ThreadApprovalPolicy,
     ThreadEventsParams, ThreadEventsResult, ThreadListResult, ThreadSendParams, ThreadSendResult,
     ThreadSpawnDecision, ThreadSpawnParams, ThreadSpawnResult, ThreadStatusParams,
-    ThreadStatusResult, TranscriptReadParams, TranscriptReadResult,
+    ThreadStatusResult, ThreadStopParams, ThreadStopResult, TranscriptReadParams,
+    TranscriptReadResult,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -182,6 +183,15 @@ impl DaemonClient {
                 wait_ms: Some(wait_ms),
             },
         )
+    }
+
+    /// Stops one durable thread and records the requesting actor.
+    pub fn thread_stop(
+        &mut self,
+        thread_id: String,
+        actor: String,
+    ) -> ClientResult<ThreadStopResult> {
+        self.request("thread.stop", ThreadStopParams { thread_id, actor })
     }
 
     /// Reads authoritative daemon, model, session, usage, and trust status.
@@ -1002,7 +1012,7 @@ mod tests {
                     "status": "spawned",
                     "thread": {
                         "authority": server_authority.clone(),
-                        "live": {"loaded": true, "current_turn_id": null}
+                        "live": {"loaded": true, "current_turn_id": null, "last_activity_at_ms": 42}
                     }
                 }),
             );
@@ -1103,6 +1113,24 @@ mod tests {
                     "events": []
                 }),
             );
+
+            let stop = read_request(&mut reader);
+            assert_eq!(stop.method.as_deref(), Some("thread.stop"));
+            assert_eq!(
+                stop.params,
+                Some(json!({"thread_id": "thread_1", "actor": "stdin"}))
+            );
+            write_response(
+                &mut writer,
+                stop.id,
+                "thread.stop",
+                json!({
+                    "status": "stopped",
+                    "thread_id": "thread_1",
+                    "stopped_turn_id": null,
+                    "stopped_at_ms": 52
+                }),
+            );
         });
 
         let mut client = DaemonClient::connect(&socket_path).unwrap();
@@ -1168,6 +1196,16 @@ mod tests {
             .unwrap();
         assert_eq!(events.thread_id, "thread_1");
         assert_eq!(events.current_turn_id.as_deref(), Some("thread_turn_1"));
+        assert_eq!(
+            client
+                .thread_stop("thread_1".into(), "stdin".into())
+                .unwrap(),
+            ThreadStopResult::Stopped {
+                thread_id: "thread_1".into(),
+                stopped_turn_id: None,
+                stopped_at_ms: 52,
+            }
+        );
         handle.join().unwrap();
     }
 

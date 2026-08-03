@@ -8,7 +8,7 @@ use plato_agent::{
         lock::WorkspaceLock,
         protocol::{
             CAPABILITY_THREAD_EVENTS, CAPABILITY_THREAD_LIST, CAPABILITY_THREAD_SEND,
-            CAPABILITY_THREAD_SPAWN, CAPABILITY_THREAD_STATUS, HelloResult,
+            CAPABILITY_THREAD_SPAWN, CAPABILITY_THREAD_STATUS, CAPABILITY_THREAD_STOP, HelloResult,
             PendingApprovalSnapshot, ReasoningEffort, RunStateName, StreamEvent,
             ThreadApprovalPolicy, ThreadSendResult, ThreadSpawnDecision, ThreadSpawnResult,
             ThreadStatus,
@@ -183,6 +183,11 @@ enum ThreadCommand {
         thread_id: String,
         #[arg(long, value_name = "OFFSET")]
         from_offset: Option<u64>,
+    },
+    /// Stop one thread and its active child process.
+    Stop {
+        #[arg(value_name = "THREAD_ID")]
+        thread_id: String,
     },
 }
 
@@ -363,6 +368,7 @@ fn connect_host_thread_daemon(workspace_root: &Path) -> plato_agent::AppResult<D
         CAPABILITY_THREAD_STATUS,
         CAPABILITY_THREAD_SEND,
         CAPABILITY_THREAD_EVENTS,
+        CAPABILITY_THREAD_STOP,
     ] {
         if !hello.capabilities.iter().any(|served| served == capability) {
             return Err(AppError::Config(format!(
@@ -456,6 +462,12 @@ fn run_thread_cli_with_io(
                 }
                 output.flush()?;
             }
+        }
+        ThreadCommand::Stop { thread_id } => {
+            let result = client.thread_stop(thread_id, "stdin".into())?;
+            serde_json::to_writer(&mut *output, &result)?;
+            writeln!(output)?;
+            Ok(())
         }
     }
 }
@@ -1388,6 +1400,16 @@ mod tests {
                 }
             }) if thread_id == "thread_1"
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["plato", "thread", "stop", "thread_1"])
+                .unwrap()
+                .command,
+            Some(Command::Thread {
+                command: ThreadCommand::Stop { thread_id }
+            }) if thread_id == "thread_1"
+        ));
+        assert!(Cli::try_parse_from(["plato", "thread", "pause", "thread_1"]).is_err());
+        assert!(Cli::try_parse_from(["plato", "thread", "policy", "thread_1", "yolo"]).is_err());
         assert!(
             Cli::try_parse_from([
                 "plato",

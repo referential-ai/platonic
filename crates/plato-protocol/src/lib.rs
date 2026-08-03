@@ -134,9 +134,11 @@ pub const CAPABILITY_THREAD_STATUS: &str = "thread.status";
 pub const CAPABILITY_THREAD_SEND: &str = "thread.send";
 /// Capability name for observing retained live thread events.
 pub const CAPABILITY_THREAD_EVENTS: &str = "thread.events";
+/// Capability name for stopping one durable thread and its active child process.
+pub const CAPABILITY_THREAD_STOP: &str = "thread.stop";
 
 /// Capabilities advertised by a protocol v1 daemon, in wire order.
-pub const CAPABILITIES: [&str; 18] = [
+pub const CAPABILITIES: [&str; 19] = [
     CAPABILITY_HELLO,
     CAPABILITY_RUN_START,
     CAPABILITY_MESSAGE_APPEND,
@@ -155,6 +157,7 @@ pub const CAPABILITIES: [&str; 18] = [
     CAPABILITY_THREAD_STATUS,
     CAPABILITY_THREAD_SEND,
     CAPABILITY_THREAD_EVENTS,
+    CAPABILITY_THREAD_STOP,
 ];
 
 /// Error code returned once daemon shutdown has begun.
@@ -187,6 +190,8 @@ pub const ERROR_THREAD_SPAWN_FAILED: &str = "thread_spawn_failed";
 pub const ERROR_THREAD_SEND_FAILED: &str = "thread_send_failed";
 /// Error code returned when one thread status cannot be read.
 pub const ERROR_THREAD_STATUS_FAILED: &str = "thread_status_failed";
+/// Error code returned when a thread cannot be stopped and recorded.
+pub const ERROR_THREAD_STOP_FAILED: &str = "thread_stop_failed";
 /// Error code returned for an unknown method.
 pub const ERROR_UNSUPPORTED_METHOD: &str = "unsupported_method";
 /// Error code returned for an unsupported protocol version.
@@ -563,6 +568,9 @@ pub struct ThreadLiveState {
     pub loaded: bool,
     /// Active turn identifier, or none while the loaded thread is idle.
     pub current_turn_id: Option<String>,
+    /// Latest daemon-observed activity time, absent when the thread is not loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at_ms: Option<u64>,
 }
 
 /// One immutable thread authority record joined with current daemon state.
@@ -789,6 +797,40 @@ pub struct ThreadEventsResult {
     pub current_turn_id: Option<String>,
     /// Events in contiguous thread-local order.
     pub events: Vec<BufferedThreadEvent>,
+}
+
+/// Parameters for stopping one durable thread.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadStopParams {
+    /// Durable thread to stop.
+    pub thread_id: String,
+    /// Actor requesting the ledger-recorded stop.
+    pub actor: String,
+}
+
+/// Typed outcome returned by `thread.stop`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum ThreadStopResult {
+    /// This request stopped the thread and recorded the action.
+    Stopped {
+        /// Exact durable thread that was stopped.
+        thread_id: String,
+        /// Active turn terminated by the stop, or none for an idle thread.
+        stopped_turn_id: Option<String>,
+        /// Durable stop time in Unix milliseconds.
+        stopped_at_ms: u64,
+    },
+    /// The thread was already durably stopped by an earlier request.
+    AlreadyStopped {
+        /// Exact durable thread that was already stopped.
+        thread_id: String,
+        /// Turn terminated by the original stop, when one was active.
+        stopped_turn_id: Option<String>,
+        /// Durable original stop time in Unix milliseconds.
+        stopped_at_ms: u64,
+    },
 }
 
 /// Parameters for starting a fresh run.
@@ -1470,6 +1512,7 @@ mod tests {
                 "thread.status",
                 "thread.send",
                 "thread.events",
+                "thread.stop",
             ]
         );
         assert_eq!(
@@ -1489,6 +1532,7 @@ mod tests {
                 ERROR_THREAD_SPAWN_FAILED,
                 ERROR_THREAD_SEND_FAILED,
                 ERROR_THREAD_STATUS_FAILED,
+                ERROR_THREAD_STOP_FAILED,
                 ERROR_UNSUPPORTED_METHOD,
                 ERROR_UNSUPPORTED_VERSION,
                 ERROR_WORKSPACE_MISMATCH,
@@ -1509,6 +1553,7 @@ mod tests {
                 "thread_spawn_failed",
                 "thread_send_failed",
                 "thread_status_failed",
+                "thread_stop_failed",
                 "unsupported_method",
                 "unsupported_version",
                 "workspace_mismatch",
@@ -1545,7 +1590,7 @@ mod tests {
         const SPAWN_START_REQUEST: &str = r#"{"v":1,"id":"spawn_start_1","kind":"request","method":"thread.spawn","params":{"action":"start","approval_policy":"prompt","cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh"}}"#;
         const SPAWN_DECIDE_REQUEST: &str = r#"{"v":1,"id":"spawn_decide_1","kind":"request","method":"thread.spawn","params":{"action":"decide","approval":{"actor":"stdin","decision":"grant"},"spawn_id":"spawn_1"}}"#;
         const SPAWN_REQUIRED_RESPONSE: &str = r#"{"v":1,"id":"spawn_start_1","kind":"response","method":"thread.spawn","result":{"effect":"workspace_write","reason":"thread.spawn requires approval","spawn_id":"spawn_1","status":"approval_required","thread_id":"thread_1"}}"#;
-        const STATUS_RESPONSE: &str = r#"{"v":1,"id":"status_1","kind":"response","method":"thread.status","result":{"thread":{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1"},"live":{"current_turn_id":null,"loaded":true}}}}"#;
+        const STATUS_RESPONSE: &str = r#"{"v":1,"id":"status_1","kind":"response","method":"thread.status","result":{"thread":{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1"},"live":{"current_turn_id":null,"last_activity_at_ms":47,"loaded":true}}}}"#;
         const LIST_RESPONSE: &str = r#"{"v":1,"id":"list_1","kind":"response","method":"thread.list","result":{"threads":[{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1"},"live":{"current_turn_id":null,"loaded":false}}]}}"#;
         const SEND_START_REQUEST: &str = r#"{"v":1,"id":"send_1","kind":"request","method":"thread.send","params":{"controller_id":"terminal_a","message":"inspect it","thread_id":"thread_1"}}"#;
         const SEND_STEER_REQUEST: &str = r#"{"v":1,"id":"send_2","kind":"request","method":"thread.send","params":{"controller_id":"terminal_a","message":"also summarize","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
@@ -1554,6 +1599,8 @@ mod tests {
         const SEND_REJECTED_RESPONSE: &str = r#"{"v":1,"id":"send_3","kind":"response","method":"thread.send","result":{"reason":"controller_owned","status":"rejected","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
         const EVENTS_REQUEST: &str = r#"{"v":1,"id":"events_1","kind":"request","method":"thread.events","params":{"from_offset":0,"limit":128,"thread_id":"thread_1","wait_ms":1000}}"#;
         const EVENTS_RESPONSE: &str = r#"{"v":1,"id":"events_1","kind":"response","method":"thread.events","result":{"current_turn_id":"thread_turn_1","events":[],"from_offset":0,"next_offset":0,"thread_id":"thread_1"}}"#;
+        const STOP_REQUEST: &str = r#"{"v":1,"id":"stop_1","kind":"request","method":"thread.stop","params":{"actor":"stdin","thread_id":"thread_1"}}"#;
+        const STOP_RESPONSE: &str = r#"{"v":1,"id":"stop_1","kind":"response","method":"thread.stop","result":{"status":"stopped","stopped_at_ms":52,"stopped_turn_id":"turn_1","thread_id":"thread_1"}}"#;
 
         for fixture in [SPAWN_START_REQUEST, SPAWN_DECIDE_REQUEST] {
             let request = decode_request(fixture).unwrap();
@@ -1566,6 +1613,9 @@ mod tests {
                 ThreadSpawnParams::Start { .. } | ThreadSpawnParams::Decide { .. }
             ));
         }
+        let stop_request = decode_request(STOP_REQUEST).unwrap();
+        serde_json::from_value::<ThreadStopParams>(stop_request.params.clone().unwrap()).unwrap();
+        assert_eq!(serde_json::to_string(&stop_request).unwrap(), STOP_REQUEST);
 
         let approval_required = Envelope::response(
             Some("spawn_start_1".into()),
@@ -1597,6 +1647,7 @@ mod tests {
             live: ThreadLiveState {
                 loaded: true,
                 current_turn_id: None,
+                last_activity_at_ms: Some(47),
             },
         };
         let status = Envelope::response(
@@ -1611,6 +1662,7 @@ mod tests {
 
         let mut unloaded = thread;
         unloaded.live.loaded = false;
+        unloaded.live.last_activity_at_ms = None;
         let list = Envelope::response(
             Some("list_1".into()),
             Some("thread.list".into()),
@@ -1677,6 +1729,17 @@ mod tests {
             },
         );
         assert_eq!(serde_json::to_string(&events).unwrap(), EVENTS_RESPONSE);
+
+        let stop = Envelope::response_from(
+            Some("stop_1".into()),
+            Some("thread.stop".into()),
+            ThreadStopResult::Stopped {
+                thread_id: "thread_1".into(),
+                stopped_turn_id: Some("turn_1".into()),
+                stopped_at_ms: 52,
+            },
+        );
+        assert_eq!(serde_json::to_string(&stop).unwrap(), STOP_RESPONSE);
     }
 
     #[test]
@@ -1714,6 +1777,11 @@ mod tests {
         }));
         assert_unknown_field_rejected::<ThreadEventsParams>(json!({
             "thread_id": "thread_1",
+            "future": true
+        }));
+        assert_unknown_field_rejected::<ThreadStopParams>(json!({
+            "thread_id": "thread_1",
+            "actor": "stdin",
             "future": true
         }));
     }

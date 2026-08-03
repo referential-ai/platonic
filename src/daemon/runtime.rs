@@ -51,6 +51,9 @@ pub(super) struct DaemonRuntime {
 pub(super) struct RuntimeState {
     pub(super) runs: HashMap<String, Arc<RunRecord>>,
     live_threads: HashMap<String, Arc<LiveThread>>,
+    active_thread_runs: HashMap<String, Arc<RunRecord>>,
+    stopping_threads: HashSet<String>,
+    stopped_threads: HashSet<String>,
     pending_thread_spawns: HashMap<String, PendingThreadSpawn>,
     terminal_runs: VecDeque<String>,
     shutdown_accepted: bool,
@@ -79,6 +82,7 @@ pub(super) enum ThreadSpawnClaimError {
 #[derive(Clone, Debug)]
 pub(super) enum ThreadSendAdmission {
     ShuttingDown,
+    Stopped,
     Started {
         receipt: ThreadSendResult,
         turn: ThreadTurnBinding,
@@ -94,6 +98,26 @@ pub(super) enum ThreadSendAdmission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ThreadEventsError {
     Lagged { first_offset: u64 },
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ThreadRunBindError {
+    NotLoaded,
+    Stopping,
+    RunActive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ThreadStopError {
+    InProgress,
+    AlreadyStopped,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ThreadStopTarget {
+    pub(super) turn_id: Option<String>,
+    pub(super) run: Option<Arc<RunRecord>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,7 +266,10 @@ impl DaemonRuntime {
         debug_assert_eq!(pending.draft.thread_id, record.thread_id);
         state.live_threads.insert(
             record.thread_id.clone(),
-            Arc::new(LiveThread::new(self.paths.workspace_id.clone())),
+            Arc::new(LiveThread::new(
+                self.paths.workspace_id.clone(),
+                record.created_at_ms,
+            )),
         );
     }
 
@@ -252,28 +279,41 @@ impl DaemonRuntime {
     }
 
     pub(super) fn thread_is_loaded(&self, thread_id: &str) -> bool {
-        self.state
-            .lock()
-            .expect("runtime state lock poisoned")
-            .live_threads
-            .get(thread_id)
-            .is_some_and(|thread| thread.workspace_id == self.paths.workspace_id)
+        let state = self.state.lock().expect("runtime state lock poisoned");
+        !state.stopping_threads.contains(thread_id)
+            && !state.stopped_threads.contains(thread_id)
+            && state
+                .live_threads
+                .get(thread_id)
+                .is_some_and(|thread| thread.workspace_id == self.paths.workspace_id)
     }
 
-    pub(super) fn load_thread(&self, thread_id: &str) -> Arc<LiveThread> {
+    pub(super) fn load_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<Arc<LiveThread>, ThreadEventsError> {
         let mut state = self.state.lock().expect("runtime state lock poisoned");
+        if state.stopped_threads.contains(thread_id) {
+            return Err(ThreadEventsError::Stopped);
+        }
         if let Some(thread) = state
             .live_threads
             .get(thread_id)
             .filter(|thread| thread.workspace_id == self.paths.workspace_id)
         {
-            return Arc::clone(thread);
+            return Ok(Arc::clone(thread));
         }
-        let thread = Arc::new(LiveThread::new(self.paths.workspace_id.clone()));
+        if state.stopping_threads.contains(thread_id) {
+            return Err(ThreadEventsError::Stopped);
+        }
+        let thread = Arc::new(LiveThread::new(
+            self.paths.workspace_id.clone(),
+            crate::thread_authority::now_ms(),
+        ));
         state
             .live_threads
             .insert(thread_id.to_owned(), Arc::clone(&thread));
-        thread
+        Ok(thread)
     }
 
     pub(super) fn send_thread(
@@ -287,6 +327,9 @@ impl DaemonRuntime {
         let mut state = self.state.lock().expect("runtime state lock poisoned");
         if state.shutdown_accepted {
             return ThreadSendAdmission::ShuttingDown;
+        }
+        if state.stopping_threads.contains(thread_id) || state.stopped_threads.contains(thread_id) {
+            return ThreadSendAdmission::Stopped;
         }
         let thread = state
             .live_threads
@@ -305,7 +348,10 @@ impl DaemonRuntime {
                 };
             }
             None => {
-                let thread = Arc::new(LiveThread::new(self.paths.workspace_id.clone()));
+                let thread = Arc::new(LiveThread::new(
+                    self.paths.workspace_id.clone(),
+                    crate::thread_authority::now_ms(),
+                ));
                 state
                     .live_threads
                     .insert(thread_id.to_owned(), Arc::clone(&thread));
@@ -328,8 +374,113 @@ impl DaemonRuntime {
         limit: usize,
         wait: Duration,
     ) -> Result<ThreadEventsResult, ThreadEventsError> {
-        self.load_thread(thread_id)
+        self.load_thread(thread_id)?
             .events(thread_id, from_offset, limit, wait)
+    }
+
+    pub(super) fn bind_thread_run(
+        &self,
+        turn: &ThreadTurnBinding,
+        record: Arc<RunRecord>,
+    ) -> Result<(), ThreadRunBindError> {
+        loop {
+            let mut state = self.state.lock().expect("runtime state lock poisoned");
+            if state.stopped_threads.contains(&turn.thread_id) {
+                return Err(ThreadRunBindError::Stopping);
+            }
+            let thread = state
+                .live_threads
+                .get(&turn.thread_id)
+                .filter(|thread| {
+                    thread.workspace_id == self.paths.workspace_id
+                        && Arc::ptr_eq(thread, &turn.thread)
+                })
+                .cloned()
+                .ok_or(ThreadRunBindError::NotLoaded)?;
+            if state.stopping_threads.contains(&turn.thread_id) {
+                drop(state);
+                if thread.wait_for_stop_resolution() == LiveThreadLifecycle::Running {
+                    continue;
+                }
+                return Err(ThreadRunBindError::Stopping);
+            }
+            if state
+                .active_thread_runs
+                .get(&turn.thread_id)
+                .is_some_and(|active| {
+                    matches!(
+                        active.status().state,
+                        RunStateName::Running | RunStateName::CancelRequested
+                    )
+                })
+            {
+                return Err(ThreadRunBindError::RunActive);
+            }
+            thread.bind_run(&turn.turn_id)?;
+            state
+                .active_thread_runs
+                .insert(turn.thread_id.clone(), record);
+            return Ok(());
+        }
+    }
+
+    pub(super) fn release_run_reservation(&self, record: &RunRecord) {
+        let mut state = self.state.lock().expect("runtime state lock poisoned");
+        if state
+            .runs
+            .get(&record.run_id)
+            .is_some_and(|reserved| std::ptr::eq(Arc::as_ptr(reserved), record))
+        {
+            state.runs.remove(&record.run_id);
+        }
+    }
+
+    pub(super) fn begin_thread_stop(
+        &self,
+        thread_id: &str,
+    ) -> Result<ThreadStopTarget, ThreadStopError> {
+        let mut state = self.state.lock().expect("runtime state lock poisoned");
+        if state.stopped_threads.contains(thread_id) {
+            return Err(ThreadStopError::AlreadyStopped);
+        }
+        if !state.stopping_threads.insert(thread_id.into()) {
+            return Err(ThreadStopError::InProgress);
+        }
+        let turn_id = state
+            .live_threads
+            .get(thread_id)
+            .filter(|thread| thread.workspace_id == self.paths.workspace_id)
+            .and_then(|thread| thread.begin_stop());
+        let run = state.active_thread_runs.get(thread_id).cloned();
+        Ok(ThreadStopTarget { turn_id, run })
+    }
+
+    pub(super) fn complete_thread_stop(&self, thread_id: &str) {
+        let mut state = self.state.lock().expect("runtime state lock poisoned");
+        if let Some(thread) = state.live_threads.get(thread_id) {
+            thread.complete_stop();
+        }
+        state.live_threads.remove(thread_id);
+        state.active_thread_runs.remove(thread_id);
+        state.stopping_threads.remove(thread_id);
+        state.stopped_threads.insert(thread_id.into());
+    }
+
+    pub(super) fn abort_thread_stop(&self, thread_id: &str) {
+        let mut state = self.state.lock().expect("runtime state lock poisoned");
+        if let Some(thread) = state.live_threads.get(thread_id) {
+            thread.abort_stop();
+        }
+        state.stopping_threads.remove(thread_id);
+    }
+
+    #[cfg(test)]
+    pub(super) fn thread_is_stopped(&self, thread_id: &str) -> bool {
+        self.state
+            .lock()
+            .expect("runtime state lock poisoned")
+            .stopped_threads
+            .contains(thread_id)
     }
 
     pub(super) fn next_thread_message(&self, turn: &ThreadTurnBinding) -> Option<String> {
@@ -347,14 +498,34 @@ impl DaemonRuntime {
             .get(thread_id)
             .filter(|thread| thread.workspace_id == self.paths.workspace_id)
         {
-            Some(thread) => ThreadLiveState {
-                loaded: true,
-                current_turn_id: thread.current_turn_id(),
-            },
+            Some(thread) => {
+                let (current_turn_id, last_activity_at_ms) = thread.live_snapshot();
+                ThreadLiveState {
+                    loaded: true,
+                    current_turn_id,
+                    last_activity_at_ms: Some(last_activity_at_ms),
+                }
+            }
             None => ThreadLiveState {
                 loaded: false,
                 current_turn_id: None,
+                last_activity_at_ms: None,
             },
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn note_thread_activity_at(&self, thread_id: &str, activity_at_ms: u64) {
+        let state = self.state.lock().expect("runtime state lock poisoned");
+        if state.stopping_threads.contains(thread_id) || state.stopped_threads.contains(thread_id) {
+            return;
+        }
+        if let Some(thread) = state
+            .live_threads
+            .get(thread_id)
+            .filter(|thread| thread.workspace_id == self.paths.workspace_id)
+        {
+            thread.note_activity_at(activity_at_ms);
         }
     }
 
@@ -391,6 +562,9 @@ impl DaemonRuntime {
         drop(approvals);
 
         let mut state = self.state.lock().expect("runtime state lock poisoned");
+        state
+            .active_thread_runs
+            .retain(|_, active| !std::ptr::eq(Arc::as_ptr(active), record));
         state.terminal_runs.push_back(record.run_id.clone());
         while state.terminal_runs.len() > MAX_TERMINAL_RUNS {
             if let Some(run_id) = state.terminal_runs.pop_front() {
@@ -422,6 +596,7 @@ impl DaemonRuntime {
         }
         if state.issue_prep_active
             || !state.pending_thread_spawns.is_empty()
+            || !state.stopping_threads.is_empty()
             || state.live_threads.values().any(|thread| {
                 thread.workspace_id == self.paths.workspace_id && thread.current_turn_id().is_some()
             })
@@ -522,13 +697,22 @@ pub(super) struct LiveThread {
     changed: Condvar,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct LiveThreadState {
+    lifecycle: LiveThreadLifecycle,
     current_turn: Option<ActiveThreadTurn>,
+    last_activity_at_ms: u64,
     first_offset: u64,
     next_offset: u64,
     events: VecDeque<BufferedThreadEvent>,
     observers: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveThreadLifecycle {
+    Running,
+    Stopping,
+    Stopped,
 }
 
 #[derive(Debug)]
@@ -540,15 +724,24 @@ struct ActiveThreadTurn {
 
 #[derive(Clone, Debug)]
 pub(super) struct ThreadTurnBinding {
+    pub(super) thread_id: String,
     pub(super) turn_id: String,
     thread: Arc<LiveThread>,
 }
 
 impl LiveThread {
-    fn new(workspace_id: String) -> Self {
+    fn new(workspace_id: String, last_activity_at_ms: u64) -> Self {
         Self {
             workspace_id,
-            state: Mutex::new(LiveThreadState::default()),
+            state: Mutex::new(LiveThreadState {
+                lifecycle: LiveThreadLifecycle::Running,
+                current_turn: None,
+                last_activity_at_ms,
+                first_offset: 0,
+                next_offset: 0,
+                events: VecDeque::new(),
+                observers: 0,
+            }),
             changed: Condvar::new(),
         }
     }
@@ -562,6 +755,38 @@ impl LiveThread {
             .map(|turn| turn.turn_id.clone())
     }
 
+    fn live_snapshot(&self) -> (Option<String>, u64) {
+        let state = self.state.lock().expect("live thread lock poisoned");
+        (
+            state.current_turn.as_ref().map(|turn| turn.turn_id.clone()),
+            state.last_activity_at_ms,
+        )
+    }
+
+    #[cfg(test)]
+    fn note_activity_at(&self, activity_at_ms: u64) {
+        let mut state = self.state.lock().expect("live thread lock poisoned");
+        state.last_activity_at_ms = state.last_activity_at_ms.max(activity_at_ms);
+    }
+
+    fn bind_run(&self, turn_id: &str) -> Result<(), ThreadRunBindError> {
+        let mut state = self.state.lock().expect("live thread lock poisoned");
+        if state.lifecycle != LiveThreadLifecycle::Running {
+            return Err(ThreadRunBindError::Stopping);
+        }
+        if state
+            .current_turn
+            .as_ref()
+            .is_none_or(|turn| turn.turn_id != turn_id)
+        {
+            return Err(ThreadRunBindError::NotLoaded);
+        }
+        state.last_activity_at_ms = state
+            .last_activity_at_ms
+            .max(crate::thread_authority::now_ms());
+        Ok(())
+    }
+
     fn send(
         self: &Arc<Self>,
         thread_id: &str,
@@ -571,6 +796,9 @@ impl LiveThread {
         new_turn_id: String,
     ) -> ThreadSendAdmission {
         let mut state = self.state.lock().expect("live thread lock poisoned");
+        if state.lifecycle != LiveThreadLifecycle::Running {
+            return ThreadSendAdmission::Stopped;
+        }
         if let Some(active) = state.current_turn.as_mut() {
             if active.controller_id != controller_id {
                 return ThreadSendAdmission::Rejected {
@@ -600,9 +828,13 @@ impl LiveThread {
                 };
             }
             active.pending_messages.push_back(message);
+            let turn_id = active.turn_id.clone();
+            state.last_activity_at_ms = state
+                .last_activity_at_ms
+                .max(crate::thread_authority::now_ms());
             let receipt = ThreadSendResult::Steered {
                 thread_id: thread_id.into(),
-                turn_id: active.turn_id.clone(),
+                turn_id,
             };
             self.changed.notify_all();
             return ThreadSendAdmission::Steered { receipt };
@@ -622,6 +854,9 @@ impl LiveThread {
             controller_id,
             pending_messages: VecDeque::new(),
         });
+        state.last_activity_at_ms = state
+            .last_activity_at_ms
+            .max(crate::thread_authority::now_ms());
         self.changed.notify_all();
         ThreadSendAdmission::Started {
             receipt: ThreadSendResult::Started {
@@ -629,6 +864,7 @@ impl LiveThread {
                 turn_id: new_turn_id.clone(),
             },
             turn: ThreadTurnBinding {
+                thread_id: thread_id.into(),
                 turn_id: new_turn_id,
                 thread: Arc::clone(self),
             },
@@ -637,6 +873,9 @@ impl LiveThread {
 
     fn publish(&self, turn_id: &str, event: StreamEvent) {
         let mut state = self.state.lock().expect("live thread lock poisoned");
+        if state.lifecycle == LiveThreadLifecycle::Stopped {
+            return;
+        }
         if state.events.len() == MAX_THREAD_EVENT_BUFFER {
             state.events.pop_front();
             state.first_offset += 1;
@@ -648,6 +887,9 @@ impl LiveThread {
             turn_id: turn_id.into(),
             event,
         });
+        state.last_activity_at_ms = state
+            .last_activity_at_ms
+            .max(crate::thread_authority::now_ms());
         self.changed.notify_all();
     }
 
@@ -699,6 +941,15 @@ impl LiveThread {
 
     fn next_message_or_finish(&self, turn_id: &str) -> Option<String> {
         let mut state = self.state.lock().expect("live thread lock poisoned");
+        while state.lifecycle == LiveThreadLifecycle::Stopping {
+            state = self
+                .changed
+                .wait(state)
+                .expect("live thread lock poisoned while stopping");
+        }
+        if state.lifecycle == LiveThreadLifecycle::Stopped {
+            return None;
+        }
         let active = state
             .current_turn
             .as_mut()
@@ -711,12 +962,45 @@ impl LiveThread {
         None
     }
 
+    fn begin_stop(&self) -> Option<String> {
+        let mut state = self.state.lock().expect("live thread lock poisoned");
+        state.lifecycle = LiveThreadLifecycle::Stopping;
+        state.current_turn.as_ref().map(|turn| turn.turn_id.clone())
+    }
+
+    fn complete_stop(&self) {
+        let mut state = self.state.lock().expect("live thread lock poisoned");
+        state.lifecycle = LiveThreadLifecycle::Stopped;
+        state.current_turn = None;
+        self.changed.notify_all();
+    }
+
+    fn abort_stop(&self) {
+        let mut state = self.state.lock().expect("live thread lock poisoned");
+        if state.lifecycle == LiveThreadLifecycle::Stopping {
+            state.lifecycle = LiveThreadLifecycle::Running;
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait_for_stop_resolution(&self) -> LiveThreadLifecycle {
+        let mut state = self.state.lock().expect("live thread lock poisoned");
+        while state.lifecycle == LiveThreadLifecycle::Stopping {
+            state = self
+                .changed
+                .wait(state)
+                .expect("live thread lock poisoned while awaiting stop resolution");
+        }
+        state.lifecycle
+    }
+
     fn abort(&self, turn_id: &str) {
         let mut state = self.state.lock().expect("live thread lock poisoned");
-        if state
-            .current_turn
-            .as_ref()
-            .is_some_and(|active| active.turn_id == turn_id)
+        if state.lifecycle == LiveThreadLifecycle::Running
+            && state
+                .current_turn
+                .as_ref()
+                .is_some_and(|active| active.turn_id == turn_id)
         {
             state.current_turn = None;
             self.changed.notify_all();
@@ -892,6 +1176,62 @@ impl RunRecord {
             .lock()
             .expect("run status lock poisoned")
             .clone()
+    }
+
+    pub(super) fn request_cancel(&self) -> Option<RunStateName> {
+        let mut approvals = self.approvals.lock().expect("approvals lock poisoned");
+        let state = {
+            let mut status = self.status.lock().expect("run status lock poisoned");
+            match status.state {
+                RunStateName::Running => {
+                    status.state = RunStateName::CancelRequested;
+                    self.cancel.store(true, Ordering::SeqCst);
+                    self.push_event(StreamEvent::Canceled {
+                        run_id: self.run_id.clone(),
+                    });
+                    approvals.retain(|_, pending| pending.decision.is_some());
+                    self.approval_changed.notify_all();
+                    RunStateName::CancelRequested
+                }
+                RunStateName::CancelRequested => RunStateName::CancelRequested,
+                RunStateName::Finished
+                | RunStateName::Failed
+                | RunStateName::Canceled
+                | RunStateName::Interrupted => return None,
+            }
+        };
+        drop(approvals);
+        Some(state)
+    }
+
+    pub(super) fn wait_for_terminal(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut approvals = self.approvals.lock().expect("approvals lock poisoned");
+        loop {
+            if !matches!(
+                self.status().state,
+                RunStateName::Running | RunStateName::CancelRequested
+            ) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, wait) = self
+                .approval_changed
+                .wait_timeout(approvals, deadline - now)
+                .expect("approval condvar lock poisoned while stopping thread");
+            approvals = next;
+            if wait.timed_out()
+                && matches!(
+                    self.status().state,
+                    RunStateName::Running | RunStateName::CancelRequested
+                )
+            {
+                return false;
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1166,7 +1506,7 @@ mod tests {
             ThreadSendAdmission::Started { turn, .. } => turn,
             other => panic!("unexpected start admission: {other:?}"),
         };
-        let live = runtime.load_thread("thread_1");
+        let live = runtime.load_thread("thread_1").unwrap();
         let ready = Arc::new(Barrier::new(4));
         let observers = (0..3)
             .map(|_| {
@@ -1239,7 +1579,7 @@ mod tests {
             runtime.thread_events("thread_1", Some(0), 1, Duration::ZERO),
             Err(ThreadEventsError::Lagged { first_offset: 1 })
         );
-        assert_eq!(runtime.load_thread("thread_1").observer_count(), 0);
+        assert_eq!(runtime.load_thread("thread_1").unwrap().observer_count(), 0);
     }
 
     #[test]
@@ -1288,6 +1628,166 @@ mod tests {
                 Some(format!("steer {index}"))
             );
         }
+        assert_eq!(runtime.next_thread_message(&turn), None);
+    }
+
+    #[test]
+    fn thread_stop_wins_run_bind_without_child_admission() {
+        let runtime = runtime();
+        let turn = match runtime.send_thread(
+            "thread_1",
+            "controller_a".into(),
+            None,
+            "start".into(),
+            "thread_turn_1".into(),
+        ) {
+            ThreadSendAdmission::Started { turn, .. } => turn,
+            other => panic!("unexpected start admission: {other:?}"),
+        };
+        let record = Arc::new(RunRecord::new_for_thread(
+            "run_bind_race".into(),
+            "session_bind_race".into(),
+            PathBuf::from("/tmp/agent.db"),
+            turn.clone(),
+        ));
+        runtime.reserve_run(record.clone()).unwrap();
+
+        let target = runtime.begin_thread_stop("thread_1").unwrap();
+        assert_eq!(target.turn_id.as_deref(), Some("thread_turn_1"));
+        assert!(target.run.is_none());
+        runtime.complete_thread_stop("thread_1");
+
+        assert_eq!(
+            runtime.bind_thread_run(&turn, record.clone()),
+            Err(ThreadRunBindError::Stopping)
+        );
+        runtime.release_run_reservation(&record);
+        assert!(
+            !runtime
+                .state
+                .lock()
+                .unwrap()
+                .runs
+                .contains_key(&record.run_id)
+        );
+    }
+
+    #[test]
+    fn thread_stop_discards_queued_continuation_only_after_completion() {
+        let runtime = runtime();
+        let turn = match runtime.send_thread(
+            "thread_1",
+            "controller_a".into(),
+            None,
+            "start".into(),
+            "thread_turn_1".into(),
+        ) {
+            ThreadSendAdmission::Started { turn, .. } => turn,
+            other => panic!("unexpected start admission: {other:?}"),
+        };
+        assert!(matches!(
+            runtime.send_thread(
+                "thread_1",
+                "controller_a".into(),
+                Some("thread_turn_1"),
+                "queued".into(),
+                "unused".into(),
+            ),
+            ThreadSendAdmission::Steered { .. }
+        ));
+
+        runtime.begin_thread_stop("thread_1").unwrap();
+        assert!(matches!(
+            runtime.send_thread(
+                "thread_1",
+                "controller_a".into(),
+                Some("thread_turn_1"),
+                "late".into(),
+                "unused".into(),
+            ),
+            ThreadSendAdmission::Stopped
+        ));
+        runtime.complete_thread_stop("thread_1");
+
+        assert_eq!(runtime.next_thread_message(&turn), None);
+    }
+
+    #[test]
+    fn aborted_thread_stop_preserves_controller_and_queued_continuation() {
+        let runtime = runtime();
+        let turn = match runtime.send_thread(
+            "thread_1",
+            "controller_a".into(),
+            None,
+            "start".into(),
+            "thread_turn_1".into(),
+        ) {
+            ThreadSendAdmission::Started { turn, .. } => turn,
+            other => panic!("unexpected start admission: {other:?}"),
+        };
+        assert!(matches!(
+            runtime.send_thread(
+                "thread_1",
+                "controller_a".into(),
+                Some("thread_turn_1"),
+                "queued".into(),
+                "unused".into(),
+            ),
+            ThreadSendAdmission::Steered { .. }
+        ));
+
+        runtime.begin_thread_stop("thread_1").unwrap();
+        runtime.abort_thread_stop("thread_1");
+
+        assert_eq!(
+            runtime.next_thread_message(&turn).as_deref(),
+            Some("queued")
+        );
+        assert_eq!(
+            runtime
+                .thread_live_state("thread_1")
+                .current_turn_id
+                .as_deref(),
+            Some("thread_turn_1")
+        );
+        assert_eq!(runtime.next_thread_message(&turn), None);
+    }
+
+    #[test]
+    fn stopped_thread_cannot_be_recreated_by_send_events_or_load() {
+        let runtime = runtime();
+        let turn = match runtime.send_thread(
+            "thread_1",
+            "controller_a".into(),
+            None,
+            "start".into(),
+            "thread_turn_1".into(),
+        ) {
+            ThreadSendAdmission::Started { turn, .. } => turn,
+            other => panic!("unexpected start admission: {other:?}"),
+        };
+        runtime.begin_thread_stop("thread_1").unwrap();
+        runtime.complete_thread_stop("thread_1");
+
+        assert!(matches!(
+            runtime.send_thread(
+                "thread_1",
+                "controller_b".into(),
+                None,
+                "restart".into(),
+                "thread_turn_2".into(),
+            ),
+            ThreadSendAdmission::Stopped
+        ));
+        assert_eq!(
+            runtime.thread_events("thread_1", Some(0), 1, Duration::ZERO),
+            Err(ThreadEventsError::Stopped)
+        );
+        assert!(matches!(
+            runtime.load_thread("thread_1"),
+            Err(ThreadEventsError::Stopped)
+        ));
+        assert!(!runtime.thread_live_state("thread_1").loaded);
         assert_eq!(runtime.next_thread_message(&turn), None);
     }
 
