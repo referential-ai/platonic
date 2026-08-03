@@ -3,7 +3,9 @@ use crate::{AppError, AppResult};
 pub(crate) use plato_daemon_client::paths::runtime_home;
 #[cfg(unix)]
 pub(crate) use plato_daemon_client::paths::runtime_home_and_fallback;
-pub use plato_daemon_client::paths::{default_lock_path, default_socket_path, workspace_id};
+pub use plato_daemon_client::paths::{
+    default_lock_path, default_socket_path, host_lock_path, host_socket_path, workspace_id,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]

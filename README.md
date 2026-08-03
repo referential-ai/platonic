@@ -232,6 +232,19 @@ This delegates to the same-revision sibling `plato-agentd` and preserves its
 terminal, signals, output, and exit result. The direct
 `plato-agentd --workspace "$PWD"` technical command remains supported.
 
+The expansion-only host mode runs one local daemon for multiple workspaces:
+
+```bash
+plato-agentd --host
+```
+
+It uses `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/plato-agent/host/agent.sock`
+on Unix or `\\.\pipe\plato-agent-host` on Windows. Each connection selects its
+workspace through the existing `hello` request; the response adds
+`"daemon_scope":"host"` while retaining the existing build-provenance
+`daemon_version`. Existing CLI, TUI, gateway, and workspace-daemon defaults are
+not repointed by this mode.
+
 On startup it prints:
 
 ```text

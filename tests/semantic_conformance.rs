@@ -19,7 +19,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -50,6 +50,59 @@ fn approved_workspace_write_is_semantically_conformant() {
 fn denied_workspace_write_is_semantically_conformant() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     run_scenario(Scenario::DeniedWrite);
+}
+
+#[test]
+fn one_host_daemon_serves_two_workspaces_and_coexists_with_legacy_daemon() {
+    let _serial = SCENARIO_SERIAL.lock().unwrap();
+    let root = Arc::new(tempfile::tempdir().unwrap());
+    let first = ProofContext::in_root(Arc::clone(&root), "workspace-a");
+    let second = ProofContext::in_root(Arc::clone(&root), "workspace-b");
+    let first_workspace = first.workspace.clone();
+    let first_socket = first.socket_path.clone();
+    let mut prepared = Vec::new();
+
+    for (proof, scenario) in [
+        (first, Scenario::ApprovedWrite),
+        (second, Scenario::DeniedWrite),
+    ] {
+        proof.restore_fixture();
+        let provider = ScriptedProvider::start(scenario.provider_replies());
+        write_provider_config(&proof.config_path, &provider.base_url);
+        let direct = run_direct_leg(&proof, scenario);
+        proof.restore_fixture();
+        prepared.push((proof, scenario, provider, direct));
+    }
+
+    let host = ProofDaemon::start_host(&prepared[0].0);
+    let host_pid = host.pid();
+    let host_socket = host.socket_path.clone();
+    for (proof, scenario, provider, direct) in prepared {
+        let mut client = host.connect_workspace(&proof.workspace);
+        let hello = client.hello(&proof.workspace).unwrap();
+        assert_eq!(Path::new(&hello.ledger_path), proof.ledger_path);
+        let daemon = run_daemon_leg(&proof, scenario, &mut client);
+        drop(client);
+        assert_scenario_conformance(scenario, direct, daemon, provider.join());
+        assert_eq!(
+            host.pid(),
+            host_pid,
+            "host daemon process changed between cwds"
+        );
+    }
+
+    let legacy_proof = ProofContext::in_root(root, "legacy-workspace");
+    let legacy = ProofDaemon::start(&legacy_proof);
+    let legacy_client = legacy.connect();
+    let mut host_client = host.connect_workspace(&first_workspace);
+    host_client.hello(&first_workspace).unwrap();
+    assert_ne!(host_socket, first_socket);
+    assert_ne!(host_socket, legacy.socket_path);
+    assert!(legacy_proof.lock_path().exists());
+    assert!(legacy_proof.host_lock_path().exists());
+    assert_eq!(host.pid(), host_pid);
+    legacy.stop(legacy_client);
+    host.stop(host_client);
 }
 
 #[test]
@@ -258,14 +311,22 @@ fn run_scenario(scenario: Scenario) {
     let daemon_leg = run_daemon_leg(&proof, scenario, &mut client);
     daemon.stop(client);
 
-    let requests = provider.join();
+    assert_scenario_conformance(scenario, direct, daemon_leg, provider.join());
+}
+
+fn assert_scenario_conformance(
+    scenario: Scenario,
+    direct: RunEvidence,
+    daemon: RunEvidence,
+    requests: Vec<Value>,
+) {
     assert_eq!(
         requests.len(),
         REQUESTS_PER_LEG * 2,
         "{scenario:?} provider request count"
     );
     let direct = direct.with_provider_requests(requests[..REQUESTS_PER_LEG].to_vec());
-    let daemon = daemon_leg.with_provider_requests(requests[REQUESTS_PER_LEG..].to_vec());
+    let daemon = daemon.with_provider_requests(requests[REQUESTS_PER_LEG..].to_vec());
 
     assert_eq!(
         direct.usage_known,
@@ -710,7 +771,7 @@ fn set_approval_actor(records: &mut [RecordedEvent], actor: &str) {
 }
 
 struct ProofContext {
-    _root: tempfile::TempDir,
+    _root: Arc<tempfile::TempDir>,
     workspace: PathBuf,
     config_path: PathBuf,
     fixture_path: PathBuf,
@@ -726,8 +787,11 @@ struct ProofContext {
 
 impl ProofContext {
     fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
+        Self::in_root(Arc::new(tempfile::tempdir().unwrap()), "workspace")
+    }
+
+    fn in_root(root: Arc<tempfile::TempDir>, workspace_name: &str) -> Self {
+        let workspace = root.path().join(workspace_name);
         fs::create_dir(&workspace).unwrap();
         let workspace_id = paths::workspace_id(&workspace).unwrap();
 
@@ -781,6 +845,44 @@ impl ProofContext {
         }
     }
 
+    fn host_socket_path(&self) -> PathBuf {
+        #[cfg(unix)]
+        {
+            self.runtime_root
+                .join("plato-agent")
+                .join("host")
+                .join("agent.sock")
+        }
+        #[cfg(windows)]
+        {
+            PathBuf::from(r"\\.\pipe\plato-agent-host")
+        }
+    }
+
+    fn host_lock_path(&self) -> PathBuf {
+        #[cfg(unix)]
+        let runtime_root = &self.runtime_root;
+        #[cfg(windows)]
+        let runtime_root = &self.local_app_data;
+        runtime_root
+            .join("plato-agent")
+            .join("host")
+            .join("agent.lock")
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        let workspace_id = paths::workspace_id(&self.workspace).unwrap();
+        #[cfg(unix)]
+        let runtime_root = &self.runtime_root;
+        #[cfg(windows)]
+        let runtime_root = &self.local_app_data;
+        runtime_root
+            .join("plato-agent")
+            .join("workspaces")
+            .join(workspace_id)
+            .join("agent.lock")
+    }
+
     fn restore_fixture(&self) {
         fs::write(&self.fixture_path, FIXTURE_INITIAL).unwrap();
     }
@@ -807,6 +909,16 @@ impl ProofContext {
         command
             .arg("--workspace")
             .arg(&self.workspace)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        self.apply_environment(&mut command);
+        command
+    }
+
+    fn host_daemon_command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_plato-agentd"));
+        command
+            .arg("--host")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         self.apply_environment(&mut command);
@@ -844,11 +956,30 @@ impl ProofDaemon {
         }
     }
 
+    fn start_host(proof: &ProofContext) -> Self {
+        let socket_path = proof.host_socket_path();
+        let mut child = proof.host_daemon_command().spawn().unwrap();
+        wait_for_endpoint(&socket_path, &mut child);
+        Self {
+            child: Some(child),
+            workspace: proof.workspace.clone(),
+            socket_path,
+        }
+    }
+
     fn connect(&self) -> DaemonClient {
+        self.connect_workspace(&self.workspace)
+    }
+
+    fn connect_workspace(&self, workspace: &Path) -> DaemonClient {
         let mut client =
             DaemonClient::connect_with_timeout(&self.socket_path, Duration::from_secs(2)).unwrap();
-        client.hello(&self.workspace).unwrap();
+        client.hello(workspace).unwrap();
         client
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.as_ref().unwrap().id()
     }
 
     fn stop(mut self, mut client: DaemonClient) {
@@ -865,6 +996,23 @@ impl ProofDaemon {
                 read_pipe(child.stderr.take())
             );
         }
+    }
+}
+
+fn wait_for_endpoint(socket_path: &Path, child: &mut Child) {
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    loop {
+        if DaemonClient::connect_with_timeout(socket_path, Duration::from_millis(200)).is_ok() {
+            return;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "daemon exited before binding ({status}): {}",
+                read_pipe(child.stderr.take())
+            );
+        }
+        assert!(Instant::now() < deadline, "daemon did not bind");
+        thread::sleep(POLL_INTERVAL);
     }
 }
 

@@ -51,7 +51,7 @@ pub(super) fn handle_line(runtime: &DaemonRuntime, line: &str) -> Envelope {
     }
 }
 
-fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
+pub(super) fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
     match request.method.as_deref() {
         Some("hello") => handle_with_params(runtime, request, "hello", handle_hello),
         Some("run.start") => handle_with_params(runtime, request, "run.start", handle_run_start),

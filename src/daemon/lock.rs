@@ -100,6 +100,20 @@ impl WorkspaceLock {
         let metadata = LockMetadata::for_workspace(workspace_root, socket_path)?;
         Self::acquire(lock_path, metadata).map_err(|conflict| lock_conflict_error(*conflict))
     }
+
+    pub fn acquire_for_host(lock_path: PathBuf, socket_path: &Path) -> AppResult<Self> {
+        let metadata = LockMetadata {
+            v: LOCK_VERSION,
+            pid: std::process::id(),
+            executable: std::env::current_exe()
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned()),
+            workspace_root: "host".into(),
+            workspace_id: "host".into(),
+            socket_path: socket_path.to_string_lossy().into_owned(),
+        };
+        Self::acquire(lock_path, metadata).map_err(|conflict| lock_conflict_error(*conflict))
+    }
 }
 
 #[cfg(unix)]

@@ -77,12 +77,26 @@ pub(super) enum ShutdownIfIdleDecision {
 
 impl DaemonRuntime {
     pub(super) fn new(paths: DaemonPaths) -> Self {
+        Self::new_shared(
+            paths,
+            Instant::now(),
+            Arc::new(Mutex::new(RuntimeState::default())),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    pub(super) fn new_shared(
+        paths: DaemonPaths,
+        started_at: Instant,
+        state: Arc<Mutex<RuntimeState>>,
+        stop_requested: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             paths,
-            started_at: Instant::now(),
-            state: Arc::new(Mutex::new(RuntimeState::default())),
+            started_at,
+            state,
             session_tool_grants: Arc::new(Mutex::new(HashSet::new())),
-            stop_requested: Arc::new(AtomicBool::new(false)),
+            stop_requested,
             #[cfg(test)]
             session_grant_install_barriers: Arc::new(Mutex::new(None)),
             #[cfg(all(test, unix))]

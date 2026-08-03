@@ -9,6 +9,29 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Returns the stable host-scoped local daemon endpoint.
+#[cfg(unix)]
+pub fn host_socket_path() -> ClientResult<PathBuf> {
+    Ok(runtime_home()?
+        .join("plato-agent")
+        .join("host")
+        .join("agent.sock"))
+}
+
+/// Returns the stable host-scoped local daemon endpoint.
+#[cfg(windows)]
+pub fn host_socket_path() -> ClientResult<PathBuf> {
+    Ok(PathBuf::from(r"\\.\pipe\plato-agent-host"))
+}
+
+/// Returns the stable host-scoped daemon lock path.
+pub fn host_lock_path() -> ClientResult<PathBuf> {
+    Ok(runtime_home()?
+        .join("plato-agent")
+        .join("host")
+        .join("agent.lock"))
+}
+
 /// Returns the default local daemon endpoint for a workspace.
 #[cfg(unix)]
 pub fn default_socket_path(workspace_root: &Path) -> ClientResult<PathBuf> {
@@ -152,6 +175,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn host_paths_are_stable_and_outside_workspace_directories() {
+        let runtime_home = tempfile::tempdir().unwrap();
+        temp_env::with_var(
+            "XDG_RUNTIME_DIR",
+            Some(runtime_home.path().as_os_str()),
+            || {
+                let socket_path = host_socket_path().unwrap();
+                let lock_path = host_lock_path().unwrap();
+
+                assert_eq!(
+                    socket_path,
+                    runtime_home
+                        .path()
+                        .join("plato-agent")
+                        .join("host")
+                        .join("agent.sock")
+                );
+                assert_eq!(lock_path, socket_path.with_file_name("agent.lock"));
+                assert!(
+                    !socket_path
+                        .components()
+                        .any(|part| part.as_os_str() == "workspaces")
+                );
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn default_socket_and_lock_paths_use_workspace_directory() {
         let workspace = tempfile::tempdir().unwrap();
         let runtime_home = tempfile::tempdir().unwrap();
@@ -175,6 +227,30 @@ mod tests {
                 assert_eq!(socket_path.file_name().unwrap(), "agent.sock");
                 assert_eq!(lock_path.file_name().unwrap(), "agent.lock");
                 assert_eq!(socket_path.parent(), lock_path.parent());
+            },
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_host_paths_are_stable_and_outside_workspace_directories() {
+        let local_app_data = tempfile::tempdir().unwrap();
+        temp_env::with_var(
+            "LOCALAPPDATA",
+            Some(local_app_data.path().as_os_str()),
+            || {
+                assert_eq!(
+                    host_socket_path().unwrap(),
+                    PathBuf::from(r"\\.\pipe\plato-agent-host")
+                );
+                assert_eq!(
+                    host_lock_path().unwrap(),
+                    local_app_data
+                        .path()
+                        .join("plato-agent")
+                        .join("host")
+                        .join("agent.lock")
+                );
             },
         );
     }
