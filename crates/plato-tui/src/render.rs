@@ -4,6 +4,7 @@ use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
 };
@@ -12,16 +13,20 @@ use super::{
     ApprovalModalView, ConnectionState, LiveEventKind, TranscriptState, TuiState,
     markdown::{DEFAULT_SYNTAX_THEME, MarkdownRenderer, SyntaxTheme},
     state::{
-        CachedLiveEventRows, CachedTranscriptRows, DisplayMode, LiveEventRowsKey, MotionMode,
-        TranscriptRowsKey, session_question_label,
+        CachedLiveEventRows, CachedTranscriptRows, DisplayMode, FooterMode, LiveEventRowsKey,
+        MotionMode, TranscriptRowsKey, session_question_label,
     },
 };
-use crate::commands::{SLASH_COMMANDS, matching_slash_commands};
+use crate::commands::{
+    FooterHintPriority, FooterHintWhen, KEY_MAP, KeyAction, KeyBinding, KeyLabelPlatform, KeyMap,
+    matching_slash_commands,
+};
 use plato_protocol::{
     DaemonStatusResult, DaemonStatusTokenUsage, ModelIdentityStatus, RunStateName, TypedRun,
     TypedTranscriptEntry,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
+use unicode_width::UnicodeWidthChar;
 
 const SESSION_STATUS_WIDTH: usize = 16;
 const SESSION_AGE_WIDTH: usize = 5;
@@ -29,6 +34,9 @@ const SESSION_QUESTION_MAX_CHARS: usize = 72;
 const WORKING_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 const WORKING_FRAME_MILLIS: u64 = 80;
 const CURSOR_PROBE: Modifier = Modifier::RAPID_BLINK;
+const FOOTER_HELP_WIDTH: u16 = 40;
+const FOOTER_QUEUE_WIDTH: u16 = 80;
+const FOOTER_CONTEXT_WIDTH: u16 = 120;
 
 /// Renders the current client state into a terminal frame.
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
@@ -36,15 +44,15 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
 }
 
 fn render_at(frame: &mut Frame<'_>, state: &TuiState, now_ms: u64) {
-    let [history, approval, composer, status] = vertical(frame.area(), state);
+    let [history, approval, composer, footer] = vertical(frame.area(), state);
     render_history(frame, history, state);
     if let Some(approval_view) = &state.approval {
         render_approval_pane(frame, approval, approval_view, state.approval_scroll_offset);
     }
     render_composer(frame, composer, state);
-    render_status_line(frame, status, state);
-    if state.help_visible {
-        render_help_modal(frame, frame.area());
+    render_footer(frame, footer, state);
+    if state.footer_mode() == FooterMode::Shortcuts {
+        render_shortcuts_overlay(frame, history);
     }
     if state.session_picker.is_some() {
         render_session_picker(frame, frame.area(), state, now_ms);
@@ -1032,61 +1040,162 @@ fn working_task(state: &TuiState) -> Option<(&'static str, u64, bool)> {
     })
 }
 
-fn render_status_line(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    frame.render_widget(Paragraph::new(status_line(state, area.width)), area);
+fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    frame.render_widget(Paragraph::new(footer_line(state, area.width)), area);
 }
 
-fn status_line(state: &TuiState, width: u16) -> Line<'static> {
-    let (run_status, elapsed) = if let Some(elapsed) = issue_prep_activity(state) {
-        ("issue prep".to_owned(), format_elapsed(elapsed))
-    } else {
-        (
-            state
-                .active_run
-                .as_ref()
-                .map(|run| run.status.as_str())
-                .unwrap_or("ready")
-                .into(),
-            state
-                .active_run_elapsed_secs
-                .map(format_elapsed)
-                .unwrap_or_else(|| "0s".into()),
-        )
+fn footer_line(state: &TuiState, width: u16) -> Line<'static> {
+    footer_line_with_keymap(state, width, KEY_MAP, KeyLabelPlatform::current())
+}
+
+fn footer_line_with_keymap(
+    state: &TuiState,
+    width: u16,
+    key_map: KeyMap<'_>,
+    platform: KeyLabelPlatform,
+) -> Line<'static> {
+    let line = match state.footer_mode() {
+        FooterMode::Contextual => contextual_footer(state, width, key_map, platform),
+        FooterMode::Shortcuts => shortcut_footer(key_map, platform),
+        FooterMode::QuitConfirm => quit_confirm_footer(key_map, platform),
+        FooterMode::Offline => offline_footer(key_map, platform),
     };
-    let model = model_status_label(state.active_model.as_ref());
-    let connection = match &state.connection {
-        ConnectionState::Connected { .. } => "online",
-        ConnectionState::Disconnected { .. } => "offline",
-    };
-    let identity = match &state.connection {
-        ConnectionState::Connected { daemon_version, .. } => daemon_identity_label(daemon_version),
-        ConnectionState::Disconnected { .. } => "provenance unknown".into(),
-    };
-    let queued = state.queued_messages.len();
-    let mode = match state.display_mode {
-        DisplayMode::Conversation => "conversation",
-        DisplayMode::Audit => "audit",
-    };
-    let full = format!(
-        "{connection} {identity} | {run_status} {elapsed} | {model} | queued {queued} | {mode}"
+    truncate_line(line, width)
+}
+
+fn contextual_footer(
+    state: &TuiState,
+    width: u16,
+    key_map: KeyMap<'_>,
+    platform: KeyLabelPlatform,
+) -> Line<'static> {
+    let mut spans = footer_hint_spans(
+        key_map.bindings().iter().filter(|binding| {
+            binding.footer.is_some_and(|hint| {
+                hint.priority == FooterHintPriority::Essential
+                    && hint.when == FooterHintWhen::Always
+            })
+        }),
+        state,
+        platform,
     );
-    let medium = format!("{connection} | {run_status} | {model} | q {queued} | {mode}");
-    let short_connection = if connection == "online" { "on" } else { "off" };
-    let short_mode = if state.display_mode == DisplayMode::Conversation {
-        "chat"
-    } else {
-        "audit"
-    };
-    let short = format!("{short_connection} | {run_status} | {model} | q{queued} | {short_mode}");
-    let compact = format!("{short_connection} | {run_status} | {model}");
-    let text = [full, medium, short, compact]
-        .into_iter()
-        .find(|candidate| candidate.chars().count() <= usize::from(width))
-        .unwrap_or(model);
-    Line::from(Span::styled(
-        bounded_status_text(text, width),
-        chrome_style(),
-    ))
+    if width < FOOTER_HELP_WIDTH {
+        return Line::from(spans);
+    }
+    if width >= FOOTER_QUEUE_WIDTH {
+        append_footer_hints(
+            &mut spans,
+            key_map.bindings().iter().filter(|binding| {
+                binding.footer.is_some_and(|hint| {
+                    hint.priority == FooterHintPriority::Queue
+                        && (hint.when == FooterHintWhen::Always
+                            || active_run_is_interruptible(state))
+                })
+            }),
+            state,
+            platform,
+        );
+    }
+    if width >= FOOTER_CONTEXT_WIDTH {
+        push_footer_separator(&mut spans);
+        spans.push(Span::styled(
+            model_status_label(state.active_model.as_ref()),
+            chrome_style(),
+        ));
+        push_footer_separator(&mut spans);
+        spans.push(Span::styled(
+            format!("workspace {}", state.workspace_root),
+            chrome_style(),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn shortcut_footer(key_map: KeyMap<'_>, platform: KeyLabelPlatform) -> Line<'static> {
+    let mut spans = key_hint_spans(key_map.binding(KeyAction::Shortcuts), "shortcuts", platform);
+    push_footer_separator(&mut spans);
+    spans.extend(key_hint_spans(
+        key_map.binding(KeyAction::Interrupt),
+        "close",
+        platform,
+    ));
+    Line::from(spans)
+}
+
+fn quit_confirm_footer(key_map: KeyMap<'_>, platform: KeyLabelPlatform) -> Line<'static> {
+    let mut spans = vec![Span::styled("press ", chrome_style())];
+    spans.extend(key_label_spans(key_map.binding(KeyAction::Quit), platform));
+    spans.push(Span::styled(" again to quit", chrome_style()));
+    Line::from(spans)
+}
+
+fn offline_footer(key_map: KeyMap<'_>, platform: KeyLabelPlatform) -> Line<'static> {
+    let mut spans = vec![Span::styled("daemon unavailable — ", chrome_style())];
+    spans.extend(key_label_spans(
+        key_map.binding(KeyAction::Reconnect),
+        platform,
+    ));
+    spans.push(Span::styled(" to reconnect", chrome_style()));
+    Line::from(spans)
+}
+
+fn footer_hint_spans<'a>(
+    bindings: impl IntoIterator<Item = &'a KeyBinding>,
+    state: &TuiState,
+    platform: KeyLabelPlatform,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    append_footer_hints(&mut spans, bindings, state, platform);
+    spans
+}
+
+fn append_footer_hints<'a>(
+    spans: &mut Vec<Span<'static>>,
+    bindings: impl IntoIterator<Item = &'a KeyBinding>,
+    state: &TuiState,
+    platform: KeyLabelPlatform,
+) {
+    for binding in bindings {
+        if !spans.is_empty() {
+            push_footer_separator(spans);
+        }
+        let description = match binding.action {
+            KeyAction::Queue => format!("queue {}", state.queued_messages.len()),
+            KeyAction::Interrupt => "interrupt".into(),
+            _ => binding.description.into(),
+        };
+        spans.extend(key_hint_spans(binding, &description, platform));
+    }
+}
+
+fn key_hint_spans(
+    binding: &KeyBinding,
+    description: &str,
+    platform: KeyLabelPlatform,
+) -> Vec<Span<'static>> {
+    let mut spans = key_label_spans(binding, platform);
+    spans.push(Span::styled(format!(" {description}"), chrome_style()));
+    spans
+}
+
+fn key_label_spans(binding: &KeyBinding, platform: KeyLabelPlatform) -> Vec<Span<'static>> {
+    vec![Span::styled(
+        binding.label.text(platform),
+        composer_prefix_style(),
+    )]
+}
+
+fn push_footer_separator(spans: &mut Vec<Span<'static>>) {
+    spans.push(Span::styled(" · ", chrome_style()));
+}
+
+fn active_run_is_interruptible(state: &TuiState) -> bool {
+    state.active_run.as_ref().is_some_and(|run| {
+        matches!(
+            run.status,
+            RunStateName::Running | RunStateName::CancelRequested
+        )
+    })
 }
 
 fn model_status_label(status: Option<&ModelIdentityStatus>) -> String {
@@ -1122,21 +1231,40 @@ fn daemon_identity_label(identity: &str) -> String {
     format!("{version} {commit} {date}")
 }
 
-fn bounded_status_text(mut text: String, width: u16) -> String {
+fn truncate_line(line: Line<'static>, width: u16) -> Line<'static> {
     let width = usize::from(width);
-    if Line::from(text.as_str()).width() <= width {
-        return text;
+    if line.width() <= width {
+        return line;
     }
     if width == 0 {
-        return String::new();
+        return Line::from("");
     }
-    while Line::from(text.as_str()).width() >= width {
-        if text.pop().is_none() {
+
+    let content_width = width - 1;
+    let mut used = 0;
+    let mut spans = Vec::new();
+    'spans: for span in line.spans {
+        let mut content = String::new();
+        for character in span.content.chars() {
+            let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if used + character_width > content_width {
+                if !content.is_empty() {
+                    spans.push(Span::styled(content, span.style));
+                }
+                break 'spans;
+            }
+            content.push(character);
+            used += character_width;
+        }
+        if !content.is_empty() {
+            spans.push(Span::styled(content, span.style));
+        }
+        if used >= content_width {
             break;
         }
     }
-    text.push('~');
-    text
+    spans.push(Span::styled("~", chrome_style()));
+    Line::from(spans)
 }
 
 fn issue_prep_activity(state: &TuiState) -> Option<u64> {
@@ -1476,45 +1604,65 @@ fn format_elapsed(seconds: u64) -> String {
     }
 }
 
-fn render_help_modal(frame: &mut Frame<'_>, area: Rect) {
-    let area = centered_rect(68, 100, area);
-    let mut lines = vec![Line::from(vec![Span::styled(
-        "Commands",
-        Style::default().add_modifier(Modifier::BOLD),
-    )])];
-    for command in SLASH_COMMANDS
-        .iter()
-        .filter(|command| command.name != "exit")
-    {
-        lines.push(Line::from(format!(
-            "/{:<10} {}",
-            command.name, command.description
-        )));
+fn render_shortcuts_overlay(frame: &mut Frame<'_>, area: Rect) {
+    let lines = shortcut_lines(KEY_MAP, KeyLabelPlatform::current());
+    let area = centered_overlay_rect(area, 68, lines.len().saturating_add(2));
+    if area.is_empty() {
+        return;
     }
-    lines.extend([
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "Keys",
-            Style::default().add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("Enter        submit"),
-        Line::from("Shift-Enter  newline"),
-        Line::from("Alt-Enter    newline"),
-        Line::from("Ctrl-J/M     newline"),
-        Line::from("Tab          complete command or submit/queue"),
-        Line::from("v            toggle conversation/audit"),
-        Line::from("PgUp/PgDown  scroll"),
-        Line::from("Up/Down      input history"),
-        Line::from("Ctrl-C       cancel active run"),
-        Line::from("Esc or q     close"),
-    ]);
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title("Help"))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_set(symbols::border::ROUNDED)
+                .title("Shortcuts"),
+        ),
         area,
     );
+}
+
+fn shortcut_lines(key_map: KeyMap<'_>, platform: KeyLabelPlatform) -> Vec<Line<'static>> {
+    let labels = key_map
+        .bindings()
+        .iter()
+        .map(|binding| binding.label.text(platform))
+        .collect::<Vec<_>>();
+    let label_width = labels
+        .iter()
+        .map(|label| Line::from(label.as_str()).width())
+        .max()
+        .unwrap_or(0);
+    key_map
+        .bindings()
+        .iter()
+        .zip(labels)
+        .map(|(binding, label)| {
+            let padding = label_width.saturating_sub(Line::from(label.as_str()).width()) + 2;
+            Line::from(vec![
+                Span::styled(label, composer_prefix_style()),
+                Span::styled(" ".repeat(padding), chrome_style()),
+                Span::styled(binding.description, chrome_style()),
+            ])
+        })
+        .collect()
+}
+
+fn centered_overlay_rect(area: Rect, percent_x: u16, content_height: usize) -> Rect {
+    if area.is_empty() {
+        return Rect::default();
+    }
+    let width = area.width.saturating_mul(percent_x) / 100;
+    let width = width.clamp(1, area.width);
+    let height = u16::try_from(content_height)
+        .unwrap_or(u16::MAX)
+        .clamp(1, area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
 }
 
 fn render_status_modal(frame: &mut Frame<'_>, area: Rect, status: &DaemonStatusResult) {
@@ -1824,21 +1972,30 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 fn vertical(area: Rect, state: &TuiState) -> [Rect; 4] {
-    let composer_height = composer_height(state, area.width);
+    let footer_height = u16::from(area.height >= 2);
+    let composer_height =
+        composer_height(state, area.width).min(area.height.saturating_sub(footer_height));
+    let reserved_history_height =
+        u16::from(area.height > composer_height.saturating_add(footer_height));
     let approval_height = state.approval.as_ref().map_or(0, |_| {
         area.height
-            .saturating_sub(composer_height.saturating_add(2))
+            .saturating_sub(
+                composer_height
+                    .saturating_add(footer_height)
+                    .saturating_add(reserved_history_height),
+            )
             .min(14)
     });
-    Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(approval_height),
-            Constraint::Length(composer_height),
-            Constraint::Length(1),
-        ])
-        .areas(area)
+    let history_height = area.height.saturating_sub(
+        approval_height
+            .saturating_add(composer_height)
+            .saturating_add(footer_height),
+    );
+    let history = Rect::new(area.x, area.y, area.width, history_height);
+    let approval = Rect::new(area.x, history.bottom(), area.width, approval_height);
+    let composer = Rect::new(area.x, approval.bottom(), area.width, composer_height);
+    let footer = Rect::new(area.x, composer.bottom(), area.width, footer_height);
+    [history, approval, composer, footer]
 }
 
 fn composer_height(state: &TuiState, width: u16) -> u16 {
@@ -1894,8 +2051,7 @@ mod tests {
         assert!(output.contains("0.1.0 0123456 2026-08-01"));
         assert!(!output.contains("0123456789abcdef"));
         assert!(output.contains("work-1234"));
-        assert!(output.contains("model pending"));
-        assert!(output.contains("online 0.1.0 0123456 2026-08-01 | ready"));
+        assert!(output.contains("? shortcuts · Tab queue 0"));
         assert!(output.contains("Try \"read README.md and summarize it\""));
         assert!(!output.contains("? help"));
         assert!(!output.contains("v toggle"));
@@ -1936,7 +2092,7 @@ mod tests {
     }
 
     #[test]
-    fn status_chrome_stays_one_bounded_row() {
+    fn footer_uses_literal_40_80_120_collapse_order_without_wrapping() {
         let mut state = conversation_fixture();
         state.active_run = Some(ActiveRunView {
             run_id: "run_hidden_identifier".into(),
@@ -1947,19 +2103,32 @@ mod tests {
         });
         state.queued_messages = vec!["one".into(), "two".into()];
 
-        for width in [0, 8, 24, 48, 96] {
-            let line = status_line(&state, width);
+        assert_eq!(
+            [FOOTER_HELP_WIDTH, FOOTER_QUEUE_WIDTH, FOOTER_CONTEXT_WIDTH],
+            [40, 80, 120]
+        );
+        assert_eq!(footer_line(&state, 40).to_string(), "? shortcuts");
+        assert_eq!(
+            footer_line(&state, 80).to_string(),
+            "? shortcuts · Tab queue 2 · Esc interrupt"
+        );
+        assert_eq!(
+            footer_line(&state, 120).to_string(),
+            "? shortcuts · Tab queue 2 · Esc interrupt · selected model-with-a-very-long-display-name · workspace /tmp/work"
+        );
+
+        for width in [0, 8, 24, 40, 79, 80, 119, 120] {
+            let line = footer_line(&state, width);
             assert!(line.width() <= usize::from(width));
             assert!(!line.to_string().contains("run_hidden_identifier"));
-            assert!(!line.to_string().contains("? help"));
             assert!(!line.to_string().contains("v toggle"));
         }
 
-        let [history, approval, composer, status] = vertical(Rect::new(0, 0, 48, 12), &state);
+        let [history, approval, composer, footer] = vertical(Rect::new(0, 0, 48, 12), &state);
         assert_eq!(history.height, 10);
         assert_eq!(approval.height, 0);
         assert_eq!(composer.height, 1);
-        assert_eq!(status.height, 1);
+        assert_eq!(footer.height, 1);
     }
 
     #[test]
@@ -1999,7 +2168,6 @@ mod tests {
 
         let output = render_to_text(&state);
 
-        assert!(output.contains("ready"));
         assert!(!output.contains("run_1"));
         assert!(output.contains("You"));
         assert!(output.contains("read README"));
@@ -2017,12 +2185,16 @@ mod tests {
         let normal_conversation = focused_snapshot(&state, 96, 24);
         let narrow_conversation = focused_snapshot(&state, 48, 24);
         assert_eq!(
+            render_to_text(&state).lines().next().map(str::trim_end),
+            Some("You")
+        );
+        assert_eq!(
             normal_conversation,
-            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow widths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n>   Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | ready 0s | selected openrouter/auto | queued 0 | conversation"
+            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow widths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n>   Try \"read README.md and summarize it\"\n? shortcuts · Tab queue 0"
         );
         assert_eq!(
             narrow_conversation,
-            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow\nwidths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n>   Try \"read README.md and summarize it\"\non | ready | selected openrouter/auto"
+            "You\n  First question asks for a concise summary.\n\nPlato\n  First answer is short and clear.\n\nTrace  tools | finished\n\nYou\n  Second question remains readable at narrow\nwidths.\n\nPlato\n  Second answer stays readable.\n\nTrace  tool failed | warning | failed\n\n>   Try \"read README.md and summarize it\"\n? shortcuts"
         );
         for snapshot in [&normal_conversation, &narrow_conversation] {
             assert_eq!(snapshot.lines().filter(|line| *line == "You").count(), 2);
@@ -2045,11 +2217,11 @@ mod tests {
         let narrow_audit = focused_snapshot(&state, 48, 24);
         assert_eq!(
             normal_audit,
-            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise summary.\nassistant\ntool      call_alpha file.read {\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at narrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission denied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n>   Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | ready 0s | selected openrouter/auto | queued 0 | audit"
+            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise summary.\nassistant\ntool      call_alpha file.read {\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at narrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission denied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n>   Try \"read README.md and summarize it\"\n? shortcuts · Tab queue 0"
         );
         assert_eq!(
             narrow_audit,
-            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise\nsummary.\nassistant\ntool      call_alpha file.read\n{\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at\nnarrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission\ndenied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n>   Try \"read README.md and summarize it\"\non | ready | selected openrouter/auto"
+            "status    run run_beta_full_identifier\n\nstatus    run run_alpha_full_identifier\nuser      First question asks for a concise\nsummary.\nassistant\ntool      call_alpha file.read\n{\\\"path\\\":\\\"README.md\\\"}\ntool      call_alpha README loaded\nassistant First answer is short and clear.\nstatus    run run_beta_full_identifier\nuser      Second question remains readable at\nnarrow widths.\nassistant Second answer stays readable.\nwarning   tool_failed call_beta: permission\ndenied\n\ntranscript\nassistant #41 Second answer stays readable.\nwarning   #42 permission denied for call_beta\n\n>   Try \"read README.md and summarize it\"\n? shortcuts"
         );
         for snapshot in [&normal_audit, &narrow_audit] {
             assert!(snapshot.contains("run_alpha_full_identifier"));
@@ -2065,7 +2237,9 @@ mod tests {
         assert_eq!(chrome_style(), Style::default().add_modifier(Modifier::DIM));
 
         let state = conversation_fixture();
-        assert_eq!(status_line(&state, 100).spans[0].style, chrome_style());
+        let footer = footer_line(&state, 100);
+        assert_eq!(footer.spans[0].style, composer_prefix_style());
+        assert_eq!(footer.spans[1].style, chrome_style());
         let intro = intro_lines(&state);
         for line in &intro[3..7] {
             assert_eq!(line.spans[0].style, chrome_style());
@@ -2378,7 +2552,7 @@ mod tests {
         assert!(output.contains("daemon unavailable"));
         assert!(output.contains("cargo run --bin plato-agentd"));
         assert!(output.contains("press r to reconnect"));
-        assert!(output.contains("offline provenance unknown | ready"));
+        assert!(output.contains("daemon unavailable — r to reconnect"));
     }
 
     #[test]
@@ -2409,7 +2583,8 @@ mod tests {
 
         let output = render_to_text(&state);
 
-        assert!(output.contains("running"));
+        assert!(output.contains("Working"));
+        assert!(output.contains("Esc interrupt"));
         assert!(!output.contains("run_1"));
         assert!(output.contains("assistant response"));
         assert!(output.contains("> summarize this file"));
@@ -2498,7 +2673,6 @@ mod tests {
 
         let output = render_to_text(&state);
 
-        assert!(output.contains("issue prep"));
         assert!(output.contains("2s"));
         assert!(output.contains("Preparing"));
     }
@@ -2626,7 +2800,7 @@ mod tests {
         let output = render_to_text(&state);
 
         assert!(output.contains("queued"));
-        assert!(output.contains("queued 1"));
+        assert!(output.contains("Tab queue 1"));
         assert!(output.contains("1 queued next"));
         assert!(output.contains("> first line"));
         assert!(output.contains("| second line"));
@@ -2657,9 +2831,8 @@ mod tests {
             LiveEventLine::warning(Some(4), "approval pending shell.exec"),
         ];
 
-        let output = render_to_text(&state);
+        let output = render_snapshot_at(&state, 120, 24, 0).unwrap();
 
-        assert!(output.contains("1m 05s"));
         assert!(output.contains("selected openrouter/auto"));
         assert!(output.contains("You"));
         assert!(output.contains("read README"));
@@ -2782,13 +2955,13 @@ mod tests {
         let mut state = approval_trace_fixture();
         assert_eq!(
             focused_snapshot(&state, 96, 24),
-            "You\n  Review the proposed edit.\n\nTrace  approval | running\n\n⣾ Working  0s  Esc to interrupt\n\n>   Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | running 0s | model pending | queued 0 | conversation"
+            "You\n  Review the proposed edit.\n\nTrace  approval | running\n\n⣾ Working  0s  Esc to interrupt\n\n>   Try \"read README.md and summarize it\"\n? shortcuts · Tab queue 0 · Esc interrupt"
         );
 
         state.toggle_display_mode();
         assert_eq!(
             focused_snapshot(&state, 96, 24),
-            "status    run run_approval\n\nuser      Review the proposed edit.\n\ntranscript\nstatus    running run_approval\nwarning   #4 approval pending file.write (workspace_write)\nstatus    #5 approval granted call_approval\n\n⣾ Working  0s  Esc to interrupt\n\n>   Try \"read README.md and summarize it\"\nonline 0.1.0 unknown unknown | running 0s | model pending | queued 0 | audit"
+            "status    run run_approval\n\nuser      Review the proposed edit.\n\ntranscript\nstatus    running run_approval\nwarning   #4 approval pending file.write (workspace_write)\nstatus    #5 approval granted call_approval\n\n⣾ Working  0s  Esc to interrupt\n\n>   Try \"read README.md and summarize it\"\n? shortcuts · Tab queue 0 · Esc interrupt"
         );
     }
 
@@ -2841,7 +3014,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_help_modal() {
+    fn renders_shortcuts_overlay_from_styled_platform_keymap() {
         let mut state = TuiState::connected(
             "/tmp/work".into(),
             "/tmp/agent.sock".into(),
@@ -2858,17 +3031,116 @@ mod tests {
 
         let output = render_to_text(&state);
 
-        assert!(output.contains("Help"));
-        assert!(output.contains("/help"));
-        assert!(output.contains("/status"));
-        assert!(output.contains("/clear"));
-        assert!(output.contains("/issue-prep"));
-        assert!(output.contains("/reconnect"));
-        assert!(output.contains("/quit"));
+        assert!(output.contains("╭Shortcuts"));
+        assert!(output.contains("alt + enter"));
         assert!(output.contains("PgUp/PgDown"));
-        assert!(output.contains("toggle conversation/audit"));
-        assert!(output.contains("Ctrl-C"));
-        assert!(output.contains("Esc or q     close"));
+        assert!(output.contains("toggle conversation / audit"));
+        assert!(output.contains("Ctrl+C"));
+        assert!(output.contains("close overlay"));
+        assert!(output.contains("? shortcuts · Esc close"));
+
+        let lines = shortcut_lines(KEY_MAP, KeyLabelPlatform::Other);
+        assert!(lines.iter().all(|line| {
+            line.spans
+                .first()
+                .is_some_and(|span| span.style == composer_prefix_style())
+                && line.spans[1..]
+                    .iter()
+                    .all(|span| span.style == chrome_style())
+        }));
+    }
+
+    #[test]
+    fn four_footer_modes_render_their_documented_transient_hints() {
+        let mut state = conversation_fixture();
+        assert_eq!(state.footer_mode(), FooterMode::Contextual);
+        assert_eq!(
+            footer_line(&state, 80).to_string(),
+            "? shortcuts · Tab queue 0"
+        );
+
+        state.help_visible = true;
+        assert_eq!(state.footer_mode(), FooterMode::Shortcuts);
+        assert_eq!(
+            footer_line(&state, 80).to_string(),
+            "? shortcuts · Esc close"
+        );
+
+        state.help_visible = false;
+        state.cancel_requested = true;
+        assert_eq!(state.footer_mode(), FooterMode::QuitConfirm);
+        assert_eq!(
+            footer_line(&state, 80).to_string(),
+            "press Ctrl+C again to quit"
+        );
+
+        let offline = TuiState::disconnected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            "connection closed".into(),
+        );
+        assert_eq!(offline.footer_mode(), FooterMode::Offline);
+        assert_eq!(
+            footer_line(&offline, 80).to_string(),
+            "daemon unavailable — r to reconnect"
+        );
+    }
+
+    #[test]
+    fn one_keymap_binding_updates_compact_footer_and_shortcuts_overlay() {
+        let extra = KeyBinding {
+            action: KeyAction::ToggleView,
+            label: crate::commands::KeyLabel::Literal("x"),
+            description: "inspect",
+            footer: Some(crate::commands::FooterHint {
+                priority: FooterHintPriority::Essential,
+                when: FooterHintWhen::Always,
+            }),
+        };
+        let mut bindings = KEY_MAP.bindings().to_vec();
+        bindings.push(extra);
+        let key_map = KeyMap::new(&bindings);
+        let state = conversation_fixture();
+
+        let footer = footer_line_with_keymap(&state, 40, key_map, KeyLabelPlatform::Other);
+        let overlay = shortcut_lines(key_map, KeyLabelPlatform::Other)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(footer.to_string().contains("x inspect"));
+        assert!(
+            overlay
+                .lines()
+                .any(|line| line.starts_with('x') && line.ends_with("inspect"))
+        );
+    }
+
+    #[test]
+    fn short_terminal_layout_keeps_composer_and_footer_separate_without_panics() {
+        let mut state = conversation_fixture();
+        state.help_visible = true;
+
+        for height in 0..=6 {
+            let [history, approval, composer, footer] =
+                vertical(Rect::new(0, 0, 40, height), &state);
+            assert!(history.bottom() <= approval.top());
+            assert!(approval.bottom() <= composer.top());
+            assert!(composer.bottom() <= footer.top());
+            assert!(footer.bottom() <= height);
+            render_snapshot_at(&state, 40, height, 0).unwrap();
+        }
+
+        let [history, approval, composer, footer] = vertical(Rect::new(0, 0, 40, 2), &state);
+        assert_eq!(history.height, 0);
+        assert_eq!(approval.height, 0);
+        assert_eq!(composer.height, 1);
+        assert_eq!(footer.height, 1);
+        let two_rows = render_snapshot_at(&state, 40, 2, 0).unwrap();
+        let rows = two_rows.lines().collect::<Vec<_>>();
+        assert!(rows[0].starts_with(">"));
+        assert!(rows[1].starts_with("? shortcuts"));
     }
 
     #[test]
@@ -2929,7 +3201,7 @@ mod tests {
 
         assert!(output.contains("/clear"));
         assert!(output.contains("clear the visible transcript"));
-        assert!(output.contains("conversation"));
+        assert!(output.contains("? shortcuts · Tab queue 0"));
     }
 
     #[test]
