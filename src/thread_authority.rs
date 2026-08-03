@@ -256,7 +256,10 @@ mod tests {
             thread_id: "thread_parent".into(),
             parent_thread_id: None,
             spawning_actor: "stdin".into(),
-            cwd: cwd.to_string_lossy().into_owned(),
+            cwd: canonical_directory(cwd)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
             model: "gpt-parent".into(),
             reasoning_effort: ReasoningEffort::High,
             approval_policy: policy,
