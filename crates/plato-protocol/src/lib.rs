@@ -124,9 +124,15 @@ pub const CAPABILITY_TRANSCRIPT_READ_PENDING_APPROVAL: &str = "transcript.read.p
 pub const CAPABILITY_DAEMON_STATUS: &str = "daemon.status";
 /// Capability name for shutting down an idle daemon.
 pub const CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE: &str = "daemon.shutdown_if_idle";
+/// Capability name for durably creating a thread authority record.
+pub const CAPABILITY_THREAD_SPAWN: &str = "thread.spawn";
+/// Capability name for listing durable threads with live daemon state.
+pub const CAPABILITY_THREAD_LIST: &str = "thread.list";
+/// Capability name for reading one durable thread with live daemon state.
+pub const CAPABILITY_THREAD_STATUS: &str = "thread.status";
 
 /// Capabilities advertised by a protocol v1 daemon, in wire order.
-pub const CAPABILITIES: [&str; 13] = [
+pub const CAPABILITIES: [&str; 16] = [
     CAPABILITY_HELLO,
     CAPABILITY_RUN_START,
     CAPABILITY_MESSAGE_APPEND,
@@ -140,6 +146,9 @@ pub const CAPABILITIES: [&str; 13] = [
     CAPABILITY_TRANSCRIPT_READ_PENDING_APPROVAL,
     CAPABILITY_DAEMON_STATUS,
     CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE,
+    CAPABILITY_THREAD_SPAWN,
+    CAPABILITY_THREAD_LIST,
+    CAPABILITY_THREAD_STATUS,
 ];
 
 /// Error code returned once daemon shutdown has begun.
@@ -160,6 +169,14 @@ pub const ERROR_OVERLOAD: &str = "overload";
 pub const ERROR_RUN_FAILED: &str = "run_failed";
 /// Error code returned when sessions cannot be listed.
 pub const ERROR_SESSIONS_LIST_FAILED: &str = "sessions_list_failed";
+/// Error code returned when requested thread authority exceeds its parent.
+pub const ERROR_THREAD_AUTHORITY_EXCEEDED: &str = "thread_authority_exceeded";
+/// Error code returned when durable thread enumeration fails.
+pub const ERROR_THREAD_LIST_FAILED: &str = "thread_list_failed";
+/// Error code returned when thread spawn admission or persistence fails.
+pub const ERROR_THREAD_SPAWN_FAILED: &str = "thread_spawn_failed";
+/// Error code returned when one thread status cannot be read.
+pub const ERROR_THREAD_STATUS_FAILED: &str = "thread_status_failed";
 /// Error code returned for an unknown method.
 pub const ERROR_UNSUPPORTED_METHOD: &str = "unsupported_method";
 /// Error code returned for an unsupported protocol version.
@@ -461,6 +478,206 @@ pub struct DaemonStatusTrust {
     /// Whether the selected session has a live daemon-lifetime `shell.exec` grant.
     #[serde(default)]
     pub shell_session_grant: bool,
+}
+
+/// Immutable startup approval policy carried by a thread authority record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadApprovalPolicy {
+    /// Effects requiring approval pause for an explicit actor decision.
+    Prompt,
+    /// Eligible workspace-write effects follow the existing yolo auto-grant rules.
+    Yolo,
+}
+
+impl ThreadApprovalPolicy {
+    /// Returns the exact wire and persistence value for this policy.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prompt => "prompt",
+            Self::Yolo => "yolo",
+        }
+    }
+
+    /// Parses an exact thread approval-policy value.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "prompt" => Some(Self::Prompt),
+            "yolo" => Some(Self::Yolo),
+            _ => None,
+        }
+    }
+
+    /// Returns whether this parent policy permits the requested child policy.
+    pub const fn permits(self, child: Self) -> bool {
+        matches!(
+            (self, child),
+            (Self::Yolo, _) | (Self::Prompt, Self::Prompt)
+        )
+    }
+}
+
+impl fmt::Display for ThreadApprovalPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.pad(self.as_str())
+    }
+}
+
+/// Complete immutable authority written before a spawned thread becomes live.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadAuthorityRecord {
+    /// Stable daemon-minted thread identifier.
+    pub thread_id: String,
+    /// Durable parent thread, or none for a locally approved root thread.
+    pub parent_thread_id: Option<String>,
+    /// Actor whose approval admitted this spawn.
+    pub spawning_actor: String,
+    /// Canonical working directory bounding workspace access.
+    pub cwd: String,
+    /// Exact model requested for the thread.
+    pub model: String,
+    /// Exact provider reasoning effort requested for the thread.
+    pub reasoning_effort: ReasoningEffort,
+    /// Immutable startup approval policy.
+    pub approval_policy: ThreadApprovalPolicy,
+    /// Authority creation time in Unix milliseconds.
+    pub created_at_ms: u64,
+}
+
+/// Transient daemon state joined to a durable thread authority record.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadLiveState {
+    /// Whether this daemon process currently has the thread loaded.
+    pub loaded: bool,
+    /// Active turn identifier, or none while the loaded thread is idle.
+    pub current_turn_id: Option<String>,
+}
+
+/// One immutable thread authority record joined with current daemon state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadStatus {
+    /// Durable authority facts.
+    pub authority: ThreadAuthorityRecord,
+    /// Transient state queried from the serving daemon.
+    pub live: ThreadLiveState,
+}
+
+/// Typed decision resolving a prompting `thread.spawn` request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "decision")]
+pub enum ThreadSpawnDecision {
+    /// Grant the pending spawn.
+    Grant {
+        /// Actor granting the effect.
+        actor: String,
+    },
+    /// Deny the pending spawn.
+    Deny {
+        /// Actor denying the effect.
+        actor: String,
+        /// Human-readable denial reason.
+        reason: String,
+    },
+    /// Cancel the pending spawn without granting authority.
+    Cancel {
+        /// Actor canceling the prompt.
+        actor: String,
+    },
+}
+
+/// Parameters for starting or resolving a `thread.spawn` effect.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "action")]
+pub enum ThreadSpawnParams {
+    /// Start one spawn admission.
+    Start {
+        /// Parent thread, or none for a locally approved root thread.
+        parent_thread_id: Option<String>,
+        /// Requested working directory.
+        cwd: String,
+        /// Requested model.
+        model: String,
+        /// Requested reasoning effort.
+        reasoning_effort: ReasoningEffort,
+        /// Requested immutable approval policy.
+        approval_policy: ThreadApprovalPolicy,
+    },
+    /// Resolve a spawn waiting for explicit approval.
+    Decide {
+        /// Daemon-minted pending spawn identifier.
+        spawn_id: String,
+        /// Grant, deny, or cancel decision with its exact actor.
+        approval: ThreadSpawnDecision,
+    },
+}
+
+/// Typed outcome returned by `thread.spawn`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum ThreadSpawnResult {
+    /// The spawning policy requires an explicit decision.
+    ApprovalRequired {
+        /// Daemon-minted pending spawn identifier.
+        spawn_id: String,
+        /// Thread identifier reserved by this pending spawn.
+        thread_id: String,
+        /// Typed effect evaluated for spawn admission.
+        effect: EffectClass,
+        /// Policy reason presented to the approving actor.
+        reason: String,
+    },
+    /// Authority is durable and the thread is now loaded.
+    Spawned {
+        /// Complete durable and live readback.
+        thread: ThreadStatus,
+    },
+    /// Approval was durably denied and no authority record exists.
+    Denied {
+        /// Resolved pending spawn identifier.
+        spawn_id: String,
+        /// Thread identifier that was not admitted.
+        thread_id: String,
+        /// Actor denying the spawn.
+        actor: String,
+        /// Durable denial reason.
+        reason: String,
+    },
+    /// Approval was durably canceled and no authority record exists.
+    Canceled {
+        /// Resolved pending spawn identifier.
+        spawn_id: String,
+        /// Thread identifier that was not admitted.
+        thread_id: String,
+        /// Actor canceling the spawn.
+        actor: String,
+    },
+}
+
+/// Result returned by `thread.list`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadListResult {
+    /// Every durable thread in the selected authority ledger.
+    pub threads: Vec<ThreadStatus>,
+}
+
+/// Parameters for one `thread.status` readback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadStatusParams {
+    /// Thread to read.
+    pub thread_id: String,
+}
+
+/// Result returned by `thread.status`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadStatusResult {
+    /// Complete durable and live readback.
+    pub thread: ThreadStatus,
 }
 
 /// Parameters for starting a fresh run.
@@ -1137,6 +1354,9 @@ mod tests {
                 "transcript.read.pending_approval",
                 "daemon.status",
                 "daemon.shutdown_if_idle",
+                "thread.spawn",
+                "thread.list",
+                "thread.status",
             ]
         );
         assert_eq!(
@@ -1150,6 +1370,10 @@ mod tests {
                 ERROR_OVERLOAD,
                 ERROR_RUN_FAILED,
                 ERROR_SESSIONS_LIST_FAILED,
+                ERROR_THREAD_AUTHORITY_EXCEEDED,
+                ERROR_THREAD_LIST_FAILED,
+                ERROR_THREAD_SPAWN_FAILED,
+                ERROR_THREAD_STATUS_FAILED,
                 ERROR_UNSUPPORTED_METHOD,
                 ERROR_UNSUPPORTED_VERSION,
                 ERROR_WORKSPACE_MISMATCH,
@@ -1164,6 +1388,10 @@ mod tests {
                 "overload",
                 "run_failed",
                 "sessions_list_failed",
+                "thread_authority_exceeded",
+                "thread_list_failed",
+                "thread_spawn_failed",
+                "thread_status_failed",
                 "unsupported_method",
                 "unsupported_version",
                 "workspace_mismatch",
@@ -1175,6 +1403,128 @@ mod tests {
             message: "synthetic failure".into(),
         };
         assert_eq!(error.to_string(), "run_failed: synthetic failure");
+    }
+
+    #[test]
+    fn thread_approval_policy_keeps_exact_literals_and_never_expands() {
+        for (wire, policy) in [
+            ("prompt", ThreadApprovalPolicy::Prompt),
+            ("yolo", ThreadApprovalPolicy::Yolo),
+        ] {
+            assert_eq!(ThreadApprovalPolicy::parse(wire), Some(policy));
+            assert_eq!(policy.as_str(), wire);
+            assert_eq!(policy.to_string(), wire);
+            assert_eq!(serde_json::to_value(policy).unwrap(), json!(wire));
+        }
+        assert_eq!(ThreadApprovalPolicy::parse("auto"), None);
+        assert!(ThreadApprovalPolicy::Prompt.permits(ThreadApprovalPolicy::Prompt));
+        assert!(!ThreadApprovalPolicy::Prompt.permits(ThreadApprovalPolicy::Yolo));
+        assert!(ThreadApprovalPolicy::Yolo.permits(ThreadApprovalPolicy::Prompt));
+        assert!(ThreadApprovalPolicy::Yolo.permits(ThreadApprovalPolicy::Yolo));
+    }
+
+    #[test]
+    fn thread_management_fixtures_keep_exact_v1_bytes() {
+        const SPAWN_START_REQUEST: &str = r#"{"v":1,"id":"spawn_start_1","kind":"request","method":"thread.spawn","params":{"action":"start","approval_policy":"prompt","cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh"}}"#;
+        const SPAWN_DECIDE_REQUEST: &str = r#"{"v":1,"id":"spawn_decide_1","kind":"request","method":"thread.spawn","params":{"action":"decide","approval":{"actor":"stdin","decision":"grant"},"spawn_id":"spawn_1"}}"#;
+        const SPAWN_REQUIRED_RESPONSE: &str = r#"{"v":1,"id":"spawn_start_1","kind":"response","method":"thread.spawn","result":{"effect":"workspace_write","reason":"thread.spawn requires approval","spawn_id":"spawn_1","status":"approval_required","thread_id":"thread_1"}}"#;
+        const STATUS_RESPONSE: &str = r#"{"v":1,"id":"status_1","kind":"response","method":"thread.status","result":{"thread":{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1"},"live":{"current_turn_id":null,"loaded":true}}}}"#;
+        const LIST_RESPONSE: &str = r#"{"v":1,"id":"list_1","kind":"response","method":"thread.list","result":{"threads":[{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1"},"live":{"current_turn_id":null,"loaded":false}}]}}"#;
+
+        for fixture in [SPAWN_START_REQUEST, SPAWN_DECIDE_REQUEST] {
+            let request = decode_request(fixture).unwrap();
+            let params =
+                serde_json::from_value::<ThreadSpawnParams>(request.params.clone().unwrap())
+                    .unwrap();
+            assert_eq!(serde_json::to_string(&request).unwrap(), fixture);
+            assert!(matches!(
+                params,
+                ThreadSpawnParams::Start { .. } | ThreadSpawnParams::Decide { .. }
+            ));
+        }
+
+        let approval_required = Envelope::response(
+            Some("spawn_start_1".into()),
+            Some("thread.spawn".into()),
+            serde_json::to_value(ThreadSpawnResult::ApprovalRequired {
+                spawn_id: "spawn_1".into(),
+                thread_id: "thread_1".into(),
+                effect: EffectClass::WorkspaceWrite,
+                reason: "thread.spawn requires approval".into(),
+            })
+            .unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_string(&approval_required).unwrap(),
+            SPAWN_REQUIRED_RESPONSE
+        );
+
+        let thread = ThreadStatus {
+            authority: ThreadAuthorityRecord {
+                thread_id: "thread_1".into(),
+                parent_thread_id: Some("thread_parent".into()),
+                spawning_actor: "stdin".into(),
+                cwd: "/tmp/work".into(),
+                model: "gpt-5.6-sol".into(),
+                reasoning_effort: ReasoningEffort::Xhigh,
+                approval_policy: ThreadApprovalPolicy::Prompt,
+                created_at_ms: 42,
+            },
+            live: ThreadLiveState {
+                loaded: true,
+                current_turn_id: None,
+            },
+        };
+        let status = Envelope::response(
+            Some("status_1".into()),
+            Some("thread.status".into()),
+            serde_json::to_value(ThreadStatusResult {
+                thread: thread.clone(),
+            })
+            .unwrap(),
+        );
+        assert_eq!(serde_json::to_string(&status).unwrap(), STATUS_RESPONSE);
+
+        let mut unloaded = thread;
+        unloaded.live.loaded = false;
+        let list = Envelope::response(
+            Some("list_1".into()),
+            Some("thread.list".into()),
+            serde_json::to_value(ThreadListResult {
+                threads: vec![unloaded],
+            })
+            .unwrap(),
+        );
+        assert_eq!(serde_json::to_string(&list).unwrap(), LIST_RESPONSE);
+    }
+
+    #[test]
+    fn thread_request_dtos_reject_unknown_fields() {
+        for value in [
+            json!({
+                "action": "start",
+                "parent_thread_id": null,
+                "cwd": "/tmp/work",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "xhigh",
+                "approval_policy": "prompt",
+                "extra": true
+            }),
+            json!({
+                "action": "decide",
+                "spawn_id": "spawn_1",
+                "approval": {"decision": "grant", "actor": "stdin"},
+                "extra": true
+            }),
+        ] {
+            assert!(serde_json::from_value::<ThreadSpawnParams>(value).is_err());
+        }
+        assert!(
+            serde_json::from_value::<ThreadStatusParams>(
+                json!({"thread_id": "thread_1", "extra": true})
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -5,9 +5,11 @@ use crate::{
         DaemonPaths,
         protocol::{
             ApprovalDecision, BufferedStreamEvent, PendingApprovalSnapshot, RunStateName,
-            StreamEvent,
+            StreamEvent, ThreadLiveState,
         },
     },
+    ledger::DurableThreadAuthority,
+    thread_authority::ThreadAuthorityDraft,
     tool_catalog::SHELL_EXEC,
 };
 use platonic_core::{EffectClass, RecordedEvent};
@@ -45,6 +47,8 @@ pub(super) struct DaemonRuntime {
 #[derive(Debug, Default)]
 pub(super) struct RuntimeState {
     pub(super) runs: HashMap<String, Arc<RunRecord>>,
+    live_threads: HashMap<String, LiveThread>,
+    pending_thread_spawns: HashMap<String, PendingThreadSpawn>,
     terminal_runs: VecDeque<String>,
     shutdown_accepted: bool,
     issue_prep_active: bool,
@@ -54,6 +58,19 @@ pub(super) struct RuntimeState {
 pub(super) enum RunAdmissionError {
     ShuttingDown,
     SessionActive { run_id: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ThreadSpawnAdmissionError {
+    ShuttingDown,
+    Duplicate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ThreadSpawnClaimError {
+    NotFound,
+    WrongWorkspace,
+    DecisionInProgress,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,6 +152,112 @@ impl DaemonRuntime {
         Ok(())
     }
 
+    pub(super) fn reserve_thread_spawn(
+        &self,
+        spawn_id: String,
+        draft: ThreadAuthorityDraft,
+    ) -> Result<(), ThreadSpawnAdmissionError> {
+        let mut state = self.state.lock().expect("runtime state lock poisoned");
+        if state.shutdown_accepted {
+            return Err(ThreadSpawnAdmissionError::ShuttingDown);
+        }
+        if state.pending_thread_spawns.contains_key(&spawn_id)
+            || state.live_threads.contains_key(&draft.thread_id)
+            || state
+                .pending_thread_spawns
+                .values()
+                .any(|pending| pending.draft.thread_id == draft.thread_id)
+        {
+            return Err(ThreadSpawnAdmissionError::Duplicate);
+        }
+        state.pending_thread_spawns.insert(
+            spawn_id.clone(),
+            PendingThreadSpawn {
+                spawn_id,
+                workspace_id: self.paths.workspace_id.clone(),
+                draft,
+                decision_in_progress: false,
+            },
+        );
+        Ok(())
+    }
+
+    pub(super) fn claim_thread_spawn(
+        &self,
+        spawn_id: &str,
+    ) -> Result<PendingThreadSpawn, ThreadSpawnClaimError> {
+        let mut state = self.state.lock().expect("runtime state lock poisoned");
+        let pending = state
+            .pending_thread_spawns
+            .get_mut(spawn_id)
+            .ok_or(ThreadSpawnClaimError::NotFound)?;
+        if pending.workspace_id != self.paths.workspace_id {
+            return Err(ThreadSpawnClaimError::WrongWorkspace);
+        }
+        if pending.decision_in_progress {
+            return Err(ThreadSpawnClaimError::DecisionInProgress);
+        }
+        pending.decision_in_progress = true;
+        Ok(pending.clone())
+    }
+
+    pub(super) fn release_thread_spawn_claim(&self, spawn_id: &str) {
+        let mut state = self.state.lock().expect("runtime state lock poisoned");
+        if let Some(pending) = state.pending_thread_spawns.get_mut(spawn_id) {
+            pending.decision_in_progress = false;
+        }
+    }
+
+    pub(super) fn complete_thread_spawn(&self, spawn_id: &str, durable: DurableThreadAuthority) {
+        let record = durable.record();
+        let mut state = self.state.lock().expect("runtime state lock poisoned");
+        let pending = state
+            .pending_thread_spawns
+            .remove(spawn_id)
+            .expect("durable thread spawn retains its runtime reservation");
+        debug_assert_eq!(pending.workspace_id, self.paths.workspace_id);
+        debug_assert_eq!(pending.draft.thread_id, record.thread_id);
+        state.live_threads.insert(
+            record.thread_id.clone(),
+            LiveThread {
+                workspace_id: self.paths.workspace_id.clone(),
+                current_turn_id: None,
+            },
+        );
+    }
+
+    pub(super) fn complete_thread_spawn_without_authority(&self, spawn_id: &str) {
+        let mut state = self.state.lock().expect("runtime state lock poisoned");
+        state.pending_thread_spawns.remove(spawn_id);
+    }
+
+    pub(super) fn thread_is_loaded(&self, thread_id: &str) -> bool {
+        self.state
+            .lock()
+            .expect("runtime state lock poisoned")
+            .live_threads
+            .get(thread_id)
+            .is_some_and(|thread| thread.workspace_id == self.paths.workspace_id)
+    }
+
+    pub(super) fn thread_live_state(&self, thread_id: &str) -> ThreadLiveState {
+        let state = self.state.lock().expect("runtime state lock poisoned");
+        match state
+            .live_threads
+            .get(thread_id)
+            .filter(|thread| thread.workspace_id == self.paths.workspace_id)
+        {
+            Some(thread) => ThreadLiveState {
+                loaded: true,
+                current_turn_id: thread.current_turn_id.clone(),
+            },
+            None => ThreadLiveState {
+                loaded: false,
+                current_turn_id: None,
+            },
+        }
+    }
+
     pub(super) fn finish_run(&self, record: &RunRecord, final_answer: String) {
         self.complete_run(
             record,
@@ -198,6 +321,7 @@ impl DaemonRuntime {
             return ShutdownIfIdleDecision::AlreadyShuttingDown;
         }
         if state.issue_prep_active
+            || !state.pending_thread_spawns.is_empty()
             || state.runs.values().any(|record| {
                 matches!(
                     record.status().state,
@@ -278,6 +402,20 @@ impl DaemonRuntime {
             barrier.wait();
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PendingThreadSpawn {
+    pub(super) spawn_id: String,
+    pub(super) workspace_id: String,
+    pub(super) draft: ThreadAuthorityDraft,
+    decision_in_progress: bool,
+}
+
+#[derive(Clone, Debug)]
+struct LiveThread {
+    workspace_id: String,
+    current_turn_id: Option<String>,
 }
 
 impl Drop for IssuePrepReservation {
@@ -550,6 +688,30 @@ mod tests {
             second > first,
             "uptime did not increase: {first} -> {second}"
         );
+    }
+
+    #[test]
+    fn pending_thread_spawn_blocks_shutdown_until_resolved() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = runtime();
+        let draft = ThreadAuthorityDraft::new(
+            None,
+            root.path(),
+            "gpt-5.6-sol".into(),
+            crate::daemon::protocol::ReasoningEffort::Xhigh,
+            crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+        )
+        .unwrap();
+        runtime
+            .reserve_thread_spawn("spawn_1".into(), draft)
+            .unwrap();
+
+        assert_eq!(
+            runtime.shutdown_if_idle(),
+            ShutdownIfIdleDecision::RefusedActive
+        );
+        runtime.complete_thread_spawn_without_authority("spawn_1");
+        assert_eq!(runtime.shutdown_if_idle(), ShutdownIfIdleDecision::Shutdown);
     }
 
     #[test]

@@ -6,7 +6,11 @@ use plato_agent::{
     daemon::{
         client::{DaemonClient, DaemonConnectionConfig},
         lock::WorkspaceLock,
-        protocol::{HelloResult, PendingApprovalSnapshot, RunStateName, StreamEvent},
+        protocol::{
+            CAPABILITY_THREAD_LIST, CAPABILITY_THREAD_SPAWN, CAPABILITY_THREAD_STATUS, HelloResult,
+            PendingApprovalSnapshot, ReasoningEffort, RunStateName, StreamEvent,
+            ThreadApprovalPolicy, ThreadSpawnDecision, ThreadSpawnResult, ThreadStatus,
+        },
     },
     discord_gateway::preflight_discord_gateway_daemon,
     ledger::{latest_default_sqlite_session_id, latest_sqlite_session_id},
@@ -100,6 +104,11 @@ enum Command {
         #[command(subcommand)]
         command: IssuePrepCommand,
     },
+    /// Manage durable threads on the host daemon.
+    Thread {
+        #[command(subcommand)]
+        command: ThreadCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -117,6 +126,35 @@ enum IssuePrepCommand {
     Start {
         #[arg(value_name = "RUN_DIR", help = "New artifact directory")]
         run_dir: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ThreadCommand {
+    /// Create a thread after its spawning policy admits the typed effect.
+    Spawn {
+        #[arg(long, value_name = "THREAD_ID")]
+        parent: Option<String>,
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        cwd: PathBuf,
+        #[arg(long, value_name = "MODEL")]
+        model: String,
+        #[arg(long, value_name = "EFFORT", value_parser = parse_reasoning_effort)]
+        reasoning_effort: ReasoningEffort,
+        #[arg(
+            long,
+            value_name = "POLICY",
+            default_value = "prompt",
+            value_parser = parse_thread_approval_policy
+        )]
+        approval_policy: ThreadApprovalPolicy,
+    },
+    /// List every durable thread and its current daemon state.
+    List,
+    /// Read one durable thread and its current daemon state.
+    Status {
+        #[arg(value_name = "THREAD_ID")]
+        thread_id: String,
     },
 }
 
@@ -146,6 +184,9 @@ fn run(workspace_lock: &mut Option<WorkspaceLock>) -> plato_agent::AppResult<()>
     if matches!(&cli.command, Some(Command::Gateway { .. })) {
         validate_gateway_cli(&cli)?;
     }
+    if matches!(&cli.command, Some(Command::Thread { .. })) {
+        validate_thread_cli(&cli)?;
+    }
     match cli.command {
         Some(Command::Daemon { socket }) => run_daemon_service(workspace_root, socket),
         Some(Command::Gateway { command }) => match command {
@@ -161,6 +202,7 @@ fn run(workspace_lock: &mut Option<WorkspaceLock>) -> plato_agent::AppResult<()>
         Some(Command::IssuePrep { command }) => {
             run_issue_prep_cli(command, cli.config, workspace_root)
         }
+        Some(Command::Thread { command }) => run_thread_cli(command, workspace_root),
         None => run_prompt(cli, workspace_root, workspace_lock),
     }
 }
@@ -194,6 +236,22 @@ fn validate_gateway_cli(cli: &Cli) -> plato_agent::AppResult<()> {
     {
         return Err(AppError::Config(
             "plato gateway cannot be combined with --events, --db, --yolo, -c, or a question"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_thread_cli(cli: &Cli) -> plato_agent::AppResult<()> {
+    if cli.config.is_some()
+        || cli.events.is_some()
+        || cli.db.is_some()
+        || cli.yolo
+        || cli.continue_session
+        || !cli.question.is_empty()
+    {
+        return Err(AppError::Config(
+            "plato thread cannot be combined with --config, --events, --db, --yolo, -c, or a question"
                 .into(),
         ));
     }
@@ -246,6 +304,160 @@ fn run_discord_gateway_service(
         command.arg("--config").arg(config);
     }
     handoff(command)
+}
+
+fn run_thread_cli(command: ThreadCommand, workspace_root: PathBuf) -> plato_agent::AppResult<()> {
+    let mut client = connect_host_thread_daemon(&workspace_root)?;
+    let stdin = io::stdin();
+    run_thread_cli_with_io(
+        command,
+        &workspace_root,
+        &mut client,
+        &mut stdin.lock(),
+        &mut io::stdout(),
+        &mut io::stderr(),
+    )
+}
+
+fn connect_host_thread_daemon(workspace_root: &Path) -> plato_agent::AppResult<DaemonClient> {
+    let socket_path = paths::host_socket_path()?;
+    let mut client = DaemonClient::connect_with_timeout(&socket_path, DAEMON_CLIENT_TIMEOUT)
+        .map_err(|error| {
+            AppError::Config(format!(
+                "host daemon is unavailable at {}: {error}; start it with `plato-agentd --host`",
+                socket_path.display()
+            ))
+        })?;
+    let hello = client.hello(workspace_root)?;
+    for capability in [
+        CAPABILITY_THREAD_SPAWN,
+        CAPABILITY_THREAD_LIST,
+        CAPABILITY_THREAD_STATUS,
+    ] {
+        if !hello.capabilities.iter().any(|served| served == capability) {
+            return Err(AppError::Config(format!(
+                "host daemon does not advertise required capability {capability}"
+            )));
+        }
+    }
+    Ok(client)
+}
+
+fn run_thread_cli_with_io(
+    command: ThreadCommand,
+    workspace_root: &Path,
+    client: &mut DaemonClient,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    errors: &mut dyn Write,
+) -> plato_agent::AppResult<()> {
+    match command {
+        ThreadCommand::Spawn {
+            parent,
+            cwd,
+            model,
+            reasoning_effort,
+            approval_policy,
+        } => {
+            let cwd = if cwd.is_absolute() {
+                cwd
+            } else {
+                workspace_root.join(cwd)
+            }
+            .canonicalize()?;
+            if !cwd.is_dir() {
+                return Err(AppError::Config(format!(
+                    "thread cwd is not a directory: {}",
+                    cwd.display()
+                )));
+            }
+            let result = client.thread_spawn_start(
+                parent,
+                cwd.to_string_lossy().into_owned(),
+                model,
+                reasoning_effort,
+                approval_policy,
+            )?;
+            let result = match result {
+                ThreadSpawnResult::ApprovalRequired {
+                    spawn_id,
+                    thread_id,
+                    effect,
+                    reason,
+                } => {
+                    let effect = serde_json::to_value(effect)?
+                        .as_str()
+                        .ok_or_else(|| {
+                            AppError::DaemonProtocol("thread.spawn returned invalid effect".into())
+                        })?
+                        .to_owned();
+                    writeln!(errors, "thread.spawn {thread_id} ({effect}): {reason}")?;
+                    write!(errors, "Approve thread.spawn? [y/N/c] ")?;
+                    errors.flush()?;
+                    let mut line = String::new();
+                    input.read_line(&mut line)?;
+                    let approval = match line.trim().to_ascii_lowercase().as_str() {
+                        "y" | "yes" => ThreadSpawnDecision::Grant {
+                            actor: "stdin".into(),
+                        },
+                        "c" | "cancel" => ThreadSpawnDecision::Cancel {
+                            actor: "stdin".into(),
+                        },
+                        _ => ThreadSpawnDecision::Deny {
+                            actor: "stdin".into(),
+                            reason: "approval denied by stdin".into(),
+                        },
+                    };
+                    client.thread_spawn_decide(spawn_id, approval)?
+                }
+                result => result,
+            };
+            match result {
+                ThreadSpawnResult::Spawned { thread } => write_thread_status(output, &thread),
+                ThreadSpawnResult::Denied { reason, .. } => {
+                    Err(AppError::Config(format!("thread spawn denied: {reason}")))
+                }
+                ThreadSpawnResult::Canceled { .. } => {
+                    Err(AppError::Config("thread spawn canceled".into()))
+                }
+                ThreadSpawnResult::ApprovalRequired { .. } => Err(AppError::DaemonProtocol(
+                    "thread spawn remained pending after a decision".into(),
+                )),
+            }
+        }
+        ThreadCommand::List => {
+            for thread in client.thread_list()?.threads {
+                write_thread_status(output, &thread)?;
+            }
+            Ok(())
+        }
+        ThreadCommand::Status { thread_id } => {
+            let status = client.thread_status(thread_id)?;
+            write_thread_status(output, &status.thread)
+        }
+    }
+}
+
+fn write_thread_status(
+    output: &mut dyn Write,
+    thread: &ThreadStatus,
+) -> plato_agent::AppResult<()> {
+    serde_json::to_writer(&mut *output, thread)?;
+    writeln!(output)?;
+    Ok(())
+}
+
+fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort, String> {
+    ReasoningEffort::parse(value).ok_or_else(|| {
+        format!(
+            "unknown reasoning effort {value}; expected none, minimal, low, medium, high, xhigh, or max"
+        )
+    })
+}
+
+fn parse_thread_approval_policy(value: &str) -> Result<ThreadApprovalPolicy, String> {
+    ThreadApprovalPolicy::parse(value)
+        .ok_or_else(|| format!("unknown approval policy {value}; expected prompt or yolo"))
 }
 
 #[cfg(unix)]
@@ -937,6 +1149,69 @@ mod tests {
     }
 
     #[test]
+    fn thread_cli_exposes_only_spawn_list_and_status_with_explicit_authority() {
+        let spawn = Cli::try_parse_from([
+            "plato",
+            "thread",
+            "spawn",
+            "--parent",
+            "thread_parent",
+            "--cwd",
+            "workspace/child",
+            "--model",
+            "gpt-5.6-sol",
+            "--reasoning-effort",
+            "xhigh",
+            "--approval-policy",
+            "prompt",
+        ])
+        .unwrap();
+        assert!(matches!(
+            spawn.command,
+            Some(Command::Thread {
+                command: ThreadCommand::Spawn {
+                    parent: Some(parent),
+                    cwd,
+                    model,
+                    reasoning_effort: ReasoningEffort::Xhigh,
+                    approval_policy: ThreadApprovalPolicy::Prompt,
+                },
+            }) if parent == "thread_parent"
+                && cwd == Path::new("workspace/child")
+                && model == "gpt-5.6-sol"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["plato", "thread", "list"])
+                .unwrap()
+                .command,
+            Some(Command::Thread {
+                command: ThreadCommand::List
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["plato", "thread", "status", "thread_1"])
+                .unwrap()
+                .command,
+            Some(Command::Thread {
+                command: ThreadCommand::Status { thread_id }
+            }) if thread_id == "thread_1"
+        ));
+        assert!(Cli::try_parse_from(["plato", "thread", "send"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "plato",
+                "thread",
+                "spawn",
+                "--model",
+                "gpt-5.6-sol",
+                "--reasoning-effort",
+                "unsupported",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn service_commands_reject_unrelated_run_options() {
         let daemon = Cli::try_parse_from(["plato", "--config", "plato.toml", "daemon"]).unwrap();
         assert!(matches!(
@@ -950,6 +1225,23 @@ mod tests {
             validate_gateway_cli(&gateway),
             Err(AppError::Config(message))
                 if message.starts_with("plato gateway cannot be combined")
+        ));
+
+        let thread = Cli::try_parse_from([
+            "plato",
+            "--yolo",
+            "thread",
+            "spawn",
+            "--model",
+            "gpt-5.6-sol",
+            "--reasoning-effort",
+            "xhigh",
+        ])
+        .unwrap();
+        assert!(matches!(
+            validate_thread_cli(&thread),
+            Err(AppError::Config(message))
+                if message.starts_with("plato thread cannot be combined")
         ));
     }
 

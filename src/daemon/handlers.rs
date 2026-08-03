@@ -10,17 +10,21 @@ use crate::{
             DaemonStatusTokenUsage, DaemonStatusTrust, DaemonStatusUsage,
             ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
             ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
-            ERROR_SESSIONS_LIST_FAILED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH,
-            Envelope, EventsStreamParams, EventsStreamResult, HelloParams, HelloResult,
-            IssuePrepResult, IssuePrepStartParams, IssuePrepStartResult, MessageAppendParams,
-            ModelIdentityStatus, RunCancelParams, RunStartParams, RunStartResult, RunStateName,
-            SessionSummary, SessionsListResult, ShutdownIfIdleResult, ShutdownIfIdleResultName,
-            StreamEvent, TranscriptReadParams, TranscriptReadResult, TypedRun, TypedTranscript,
-            TypedTranscriptEntry, decode_request,
+            ERROR_SESSIONS_LIST_FAILED, ERROR_THREAD_AUTHORITY_EXCEEDED, ERROR_THREAD_LIST_FAILED,
+            ERROR_THREAD_SPAWN_FAILED, ERROR_THREAD_STATUS_FAILED, ERROR_UNSUPPORTED_METHOD,
+            ERROR_WORKSPACE_MISMATCH, Envelope, EventsStreamParams, EventsStreamResult,
+            HelloParams, HelloResult, IssuePrepResult, IssuePrepStartParams, IssuePrepStartResult,
+            MessageAppendParams, ModelIdentityStatus, RunCancelParams, RunStartParams,
+            RunStartResult, RunStateName, SessionSummary, SessionsListResult, ShutdownIfIdleResult,
+            ShutdownIfIdleResultName, StreamEvent, ThreadListResult, ThreadSpawnDecision,
+            ThreadSpawnParams, ThreadSpawnResult, ThreadStatus, ThreadStatusParams,
+            ThreadStatusResult, TranscriptReadParams, TranscriptReadResult, TypedRun,
+            TypedTranscript, TypedTranscriptEntry, decode_request,
         },
         runtime::{
             DaemonRuntime, IssuePrepAdmissionError, RunAdmissionError, RunRecord,
-            ShutdownIfIdleDecision, approval_handler,
+            ShutdownIfIdleDecision, ThreadSpawnAdmissionError, ThreadSpawnClaimError,
+            approval_handler,
         },
     },
     issue_prep::{IssuePrepOptions, IssuePrepOutcome, run_issue_prep},
@@ -30,6 +34,11 @@ use crate::{
     paths::DefaultSqlitePath,
     replay::{format_readback, format_session_readback},
     run_question,
+    thread_authority::{
+        THREAD_SPAWN_APPROVAL_REASON, ThreadAuthorityDraft, ThreadAuthorityError,
+        ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, new_spawn_id, now_ms,
+        thread_spawn_effect, validate_child_authority,
+    },
     tool_catalog::SHELL_EXEC,
 };
 use platonic_core::{EffectClass, HarnessEvent, ReadbackEntry, RecordedEvent, RunReadback};
@@ -72,6 +81,13 @@ pub(super) fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Enve
         }
         Some("run.cancel") => handle_with_params(runtime, request, "run.cancel", handle_run_cancel),
         Some("sessions.list") => handle_sessions_list(runtime, request),
+        Some("thread.spawn") => {
+            handle_with_params(runtime, request, "thread.spawn", handle_thread_spawn)
+        }
+        Some("thread.list") => handle_thread_list(runtime, request),
+        Some("thread.status") => {
+            handle_with_params(runtime, request, "thread.status", handle_thread_status)
+        }
         Some("daemon.status") => {
             handle_with_params(runtime, request, "daemon.status", handle_daemon_status)
         }
@@ -261,6 +277,390 @@ fn build_identity_parts() -> (String, Option<String>, Option<String>) {
 
 fn known_build_part(part: Option<&str>) -> Option<String> {
     part.filter(|part| *part != "unknown").map(str::to_owned)
+}
+
+#[derive(Debug)]
+enum ThreadSpawnFailure {
+    ShuttingDown,
+    Malformed(String),
+    NotFound(String),
+    Authority(ThreadAuthorityError),
+    Overload(String),
+    Conflict(String),
+    Persistence,
+}
+
+fn handle_thread_spawn(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: ThreadSpawnParams,
+) -> Envelope {
+    match thread_spawn(runtime, params) {
+        Ok(result) => Envelope::response_from(request.id, Some("thread.spawn".into()), result),
+        Err(ThreadSpawnFailure::ShuttingDown) => shutting_down_response(request.id, "thread.spawn"),
+        Err(ThreadSpawnFailure::Malformed(message)) => Envelope::error(
+            request.id,
+            Some("thread.spawn".into()),
+            ERROR_MALFORMED_REQUEST,
+            message,
+        ),
+        Err(ThreadSpawnFailure::NotFound(message)) => Envelope::error(
+            request.id,
+            Some("thread.spawn".into()),
+            ERROR_NOT_FOUND,
+            message,
+        ),
+        Err(ThreadSpawnFailure::Authority(error)) => Envelope::error(
+            request.id,
+            Some("thread.spawn".into()),
+            ERROR_THREAD_AUTHORITY_EXCEEDED,
+            error.to_string(),
+        ),
+        Err(ThreadSpawnFailure::Overload(message)) => Envelope::error(
+            request.id,
+            Some("thread.spawn".into()),
+            ERROR_OVERLOAD,
+            message,
+        ),
+        Err(ThreadSpawnFailure::Conflict(message)) => Envelope::error(
+            request.id,
+            Some("thread.spawn".into()),
+            ERROR_THREAD_SPAWN_FAILED,
+            message,
+        ),
+        Err(ThreadSpawnFailure::Persistence) => Envelope::error(
+            request.id,
+            Some("thread.spawn".into()),
+            ERROR_THREAD_SPAWN_FAILED,
+            "thread spawn could not be persisted",
+        ),
+    }
+}
+
+fn thread_spawn(
+    runtime: &DaemonRuntime,
+    params: ThreadSpawnParams,
+) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
+    match params {
+        ThreadSpawnParams::Start {
+            parent_thread_id,
+            cwd,
+            model,
+            reasoning_effort,
+            approval_policy,
+        } => start_thread_spawn(
+            runtime,
+            parent_thread_id,
+            Path::new(&cwd),
+            model,
+            reasoning_effort,
+            approval_policy,
+        ),
+        ThreadSpawnParams::Decide { spawn_id, approval } => {
+            decide_thread_spawn(runtime, &spawn_id, approval)
+        }
+    }
+}
+
+fn start_thread_spawn(
+    runtime: &DaemonRuntime,
+    parent_thread_id: Option<String>,
+    cwd: &Path,
+    model: String,
+    reasoning_effort: crate::model::ReasoningEffort,
+    approval_policy: crate::daemon::protocol::ThreadApprovalPolicy,
+) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
+    if runtime.shutdown_accepted() {
+        return Err(ThreadSpawnFailure::ShuttingDown);
+    }
+    if !cwd.is_absolute() {
+        return Err(ThreadSpawnFailure::Malformed(
+            "thread cwd must be an absolute path".into(),
+        ));
+    }
+    let draft = ThreadAuthorityDraft::new(
+        parent_thread_id,
+        cwd,
+        model,
+        reasoning_effort,
+        approval_policy,
+    )
+    .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
+    let mut ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger())
+        .map_err(|_| ThreadSpawnFailure::Persistence)?;
+    let parent = read_live_parent(runtime, &ledger, &draft)?;
+    let auto_grant = parent.as_ref().is_some_and(|parent| {
+        parent.approval_policy == crate::daemon::protocol::ThreadApprovalPolicy::Yolo
+    });
+    let spawn_id = new_spawn_id();
+    runtime
+        .reserve_thread_spawn(spawn_id.clone(), draft.clone())
+        .map_err(|error| match error {
+            ThreadSpawnAdmissionError::ShuttingDown => ThreadSpawnFailure::ShuttingDown,
+            ThreadSpawnAdmissionError::Duplicate => {
+                ThreadSpawnFailure::Conflict("duplicate thread spawn reservation".into())
+            }
+        })?;
+
+    if auto_grant {
+        let pending = runtime
+            .claim_thread_spawn(&spawn_id)
+            .expect("newly reserved thread spawn can be claimed");
+        return resolve_thread_spawn(
+            runtime,
+            &mut ledger,
+            pending,
+            ThreadSpawnDecision::Grant {
+                actor: "yolo".into(),
+            },
+        );
+    }
+
+    Ok(ThreadSpawnResult::ApprovalRequired {
+        spawn_id,
+        thread_id: draft.thread_id,
+        effect: thread_spawn_effect(),
+        reason: THREAD_SPAWN_APPROVAL_REASON.into(),
+    })
+}
+
+fn decide_thread_spawn(
+    runtime: &DaemonRuntime,
+    spawn_id: &str,
+    decision: ThreadSpawnDecision,
+) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
+    if runtime.shutdown_accepted() {
+        return Err(ThreadSpawnFailure::ShuttingDown);
+    }
+    let mut ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger())
+        .map_err(|_| ThreadSpawnFailure::Persistence)?;
+    if let Some(existing) = ledger
+        .thread_spawn_approval(spawn_id)
+        .map_err(|_| ThreadSpawnFailure::Persistence)?
+    {
+        return persisted_thread_spawn_result(runtime, &ledger, existing, &decision);
+    }
+    let pending = runtime
+        .claim_thread_spawn(spawn_id)
+        .map_err(|error| match error {
+            ThreadSpawnClaimError::NotFound => {
+                ThreadSpawnFailure::NotFound(format!("pending thread spawn not found: {spawn_id}"))
+            }
+            ThreadSpawnClaimError::WrongWorkspace => ThreadSpawnFailure::NotFound(format!(
+                "pending thread spawn belongs to another workspace: {spawn_id}"
+            )),
+            ThreadSpawnClaimError::DecisionInProgress => ThreadSpawnFailure::Overload(format!(
+                "thread spawn decision is already in progress: {spawn_id}"
+            )),
+        })?;
+    resolve_thread_spawn(runtime, &mut ledger, pending, decision)
+}
+
+fn resolve_thread_spawn(
+    runtime: &DaemonRuntime,
+    ledger: &mut SqliteLedger,
+    pending: crate::daemon::runtime::PendingThreadSpawn,
+    decision: ThreadSpawnDecision,
+) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
+    let result = resolve_thread_spawn_inner(runtime, ledger, &pending, decision);
+    if result.is_err() {
+        runtime.release_thread_spawn_claim(&pending.spawn_id);
+    }
+    result
+}
+
+fn resolve_thread_spawn_inner(
+    runtime: &DaemonRuntime,
+    ledger: &mut SqliteLedger,
+    pending: &crate::daemon::runtime::PendingThreadSpawn,
+    decision: ThreadSpawnDecision,
+) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
+    let decided_at_ms = now_ms();
+    let approval = ThreadSpawnApprovalRecord::from_decision(
+        pending.spawn_id.clone(),
+        pending.draft.thread_id.clone(),
+        &decision,
+        decided_at_ms,
+    )
+    .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
+    match decision {
+        ThreadSpawnDecision::Grant { actor } => {
+            read_live_parent(runtime, ledger, &pending.draft)?;
+            let authority = pending
+                .draft
+                .complete(actor, decided_at_ms)
+                .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
+            let durable = ledger
+                .persist_thread_spawn(&approval, Some(&authority))
+                .map_err(|_| ThreadSpawnFailure::Persistence)?
+                .expect("granted spawn persistence returns durable authority");
+            let authority = durable.record().clone();
+            runtime.complete_thread_spawn(&pending.spawn_id, durable);
+            Ok(ThreadSpawnResult::Spawned {
+                thread: joined_thread_status(runtime, authority),
+            })
+        }
+        ThreadSpawnDecision::Deny { actor, reason } => {
+            ledger
+                .persist_thread_spawn(&approval, None)
+                .map_err(|_| ThreadSpawnFailure::Persistence)?;
+            runtime.complete_thread_spawn_without_authority(&pending.spawn_id);
+            Ok(ThreadSpawnResult::Denied {
+                spawn_id: pending.spawn_id.clone(),
+                thread_id: pending.draft.thread_id.clone(),
+                actor,
+                reason,
+            })
+        }
+        ThreadSpawnDecision::Cancel { actor } => {
+            ledger
+                .persist_thread_spawn(&approval, None)
+                .map_err(|_| ThreadSpawnFailure::Persistence)?;
+            runtime.complete_thread_spawn_without_authority(&pending.spawn_id);
+            Ok(ThreadSpawnResult::Canceled {
+                spawn_id: pending.spawn_id.clone(),
+                thread_id: pending.draft.thread_id.clone(),
+                actor,
+            })
+        }
+    }
+}
+
+fn persisted_thread_spawn_result(
+    runtime: &DaemonRuntime,
+    ledger: &SqliteLedger,
+    approval: ThreadSpawnApprovalRecord,
+    requested: &ThreadSpawnDecision,
+) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
+    if !approval.matches(requested) {
+        return Err(ThreadSpawnFailure::Conflict(format!(
+            "thread spawn {} already has a different durable decision",
+            approval.spawn_id
+        )));
+    }
+    match approval.decision {
+        ThreadSpawnDecisionName::Granted => {
+            let authority = ledger
+                .thread_authority(&approval.thread_id)
+                .map_err(|_| ThreadSpawnFailure::Persistence)?
+                .ok_or(ThreadSpawnFailure::Persistence)?;
+            Ok(ThreadSpawnResult::Spawned {
+                thread: joined_thread_status(runtime, authority),
+            })
+        }
+        ThreadSpawnDecisionName::Denied => Ok(ThreadSpawnResult::Denied {
+            spawn_id: approval.spawn_id,
+            thread_id: approval.thread_id,
+            actor: approval.actor,
+            reason: approval.reason.ok_or(ThreadSpawnFailure::Persistence)?,
+        }),
+        ThreadSpawnDecisionName::Canceled => Ok(ThreadSpawnResult::Canceled {
+            spawn_id: approval.spawn_id,
+            thread_id: approval.thread_id,
+            actor: approval.actor,
+        }),
+    }
+}
+
+fn read_live_parent(
+    runtime: &DaemonRuntime,
+    ledger: &SqliteLedger,
+    draft: &ThreadAuthorityDraft,
+) -> Result<Option<crate::daemon::protocol::ThreadAuthorityRecord>, ThreadSpawnFailure> {
+    let Some(parent_thread_id) = draft.parent_thread_id.as_deref() else {
+        return Ok(None);
+    };
+    let parent = ledger
+        .thread_authority(parent_thread_id)
+        .map_err(|_| ThreadSpawnFailure::Persistence)?
+        .ok_or_else(|| {
+            ThreadSpawnFailure::NotFound(format!(
+                "parent thread authority not found: {parent_thread_id}"
+            ))
+        })?;
+    if !runtime.thread_is_loaded(parent_thread_id) {
+        return Err(ThreadSpawnFailure::NotFound(format!(
+            "parent thread is not loaded: {parent_thread_id}"
+        )));
+    }
+    validate_child_authority(&parent, draft).map_err(ThreadSpawnFailure::Authority)?;
+    Ok(Some(parent))
+}
+
+fn handle_thread_list(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
+    if !params_are_empty(request.params.as_ref()) {
+        return Envelope::error(
+            request.id,
+            request.method,
+            ERROR_MALFORMED_REQUEST,
+            "thread.list params must be omitted or an empty object",
+        );
+    }
+    match crate::ledger::default_thread_authorities(&runtime.paths.default_ledger()) {
+        Ok(authorities) => Envelope::response_from(
+            request.id,
+            Some("thread.list".into()),
+            ThreadListResult {
+                threads: authorities
+                    .into_iter()
+                    .map(|authority| joined_thread_status(runtime, authority))
+                    .collect(),
+            },
+        ),
+        Err(_) => Envelope::error(
+            request.id,
+            Some("thread.list".into()),
+            ERROR_THREAD_LIST_FAILED,
+            "thread list readback failed",
+        ),
+    }
+}
+
+fn handle_thread_status(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: ThreadStatusParams,
+) -> Envelope {
+    match crate::ledger::default_thread_authority(
+        &runtime.paths.default_ledger(),
+        &params.thread_id,
+    ) {
+        Ok(Some(authority)) => Envelope::response_from(
+            request.id,
+            Some("thread.status".into()),
+            ThreadStatusResult {
+                thread: joined_thread_status(runtime, authority),
+            },
+        ),
+        Ok(None) => Envelope::error(
+            request.id,
+            Some("thread.status".into()),
+            ERROR_NOT_FOUND,
+            format!("thread not found: {}", params.thread_id),
+        ),
+        Err(_) => Envelope::error(
+            request.id,
+            Some("thread.status".into()),
+            ERROR_THREAD_STATUS_FAILED,
+            "thread status readback failed",
+        ),
+    }
+}
+
+fn joined_thread_status(
+    runtime: &DaemonRuntime,
+    authority: crate::daemon::protocol::ThreadAuthorityRecord,
+) -> ThreadStatus {
+    let live = runtime.thread_live_state(&authority.thread_id);
+    ThreadStatus { authority, live }
+}
+
+fn params_are_empty(params: Option<&serde_json::Value>) -> bool {
+    match params {
+        None => true,
+        Some(serde_json::Value::Object(params)) => params.is_empty(),
+        Some(_) => false,
+    }
 }
 
 fn handle_run_start(
@@ -1136,6 +1536,436 @@ mod tests {
     };
     use serde_json::json;
     use std::{sync::Barrier, time::Duration};
+
+    fn thread_test_runtime() -> (tempfile::TempDir, DaemonRuntime) {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir(&workspace_root).unwrap();
+        let ledger_path = root
+            .path()
+            .join("state")
+            .join("plato-agent")
+            .join("workspaces")
+            .join("thread-tests")
+            .join("agent.db");
+        let runtime = DaemonRuntime::new(crate::daemon::server::DaemonPaths {
+            workspace_root: workspace_root.canonicalize().unwrap(),
+            workspace_id: "thread-tests".into(),
+            socket_path: root.path().join("agent.sock"),
+            lock_path: root.path().join("agent.lock"),
+            ledger_path,
+        });
+        (root, runtime)
+    }
+
+    fn start_thread(
+        runtime: &DaemonRuntime,
+        parent_thread_id: Option<String>,
+        cwd: &Path,
+        approval_policy: crate::daemon::protocol::ThreadApprovalPolicy,
+    ) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
+        thread_spawn(
+            runtime,
+            ThreadSpawnParams::Start {
+                parent_thread_id,
+                cwd: cwd.to_string_lossy().into_owned(),
+                model: "gpt-5.6-sol".into(),
+                reasoning_effort: crate::daemon::protocol::ReasoningEffort::Xhigh,
+                approval_policy,
+            },
+        )
+    }
+
+    fn pending_spawn(result: ThreadSpawnResult) -> (String, String) {
+        match result {
+            ThreadSpawnResult::ApprovalRequired {
+                spawn_id,
+                thread_id,
+                effect,
+                reason,
+            } => {
+                assert_eq!(effect, EffectClass::WorkspaceWrite);
+                assert_eq!(reason, THREAD_SPAWN_APPROVAL_REASON);
+                (spawn_id, thread_id)
+            }
+            unexpected => panic!("expected approval-required spawn, got {unexpected:?}"),
+        }
+    }
+
+    fn decide_thread(
+        runtime: &DaemonRuntime,
+        spawn_id: &str,
+        approval: ThreadSpawnDecision,
+    ) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
+        thread_spawn(
+            runtime,
+            ThreadSpawnParams::Decide {
+                spawn_id: spawn_id.into(),
+                approval,
+            },
+        )
+    }
+
+    fn grant_thread(runtime: &DaemonRuntime, spawn_id: &str, actor: &str) -> ThreadStatus {
+        match decide_thread(
+            runtime,
+            spawn_id,
+            ThreadSpawnDecision::Grant {
+                actor: actor.into(),
+            },
+        )
+        .unwrap()
+        {
+            ThreadSpawnResult::Spawned { thread } => thread,
+            unexpected => panic!("expected spawned thread, got {unexpected:?}"),
+        }
+    }
+
+    #[test]
+    fn thread_spawn_becomes_live_only_after_complete_authority_is_durable() {
+        let (_root, runtime) = thread_test_runtime();
+        let (spawn_id, thread_id) = pending_spawn(
+            start_thread(
+                &runtime,
+                None,
+                &runtime.paths.workspace_root,
+                crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+            )
+            .unwrap(),
+        );
+        let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
+        assert!(ledger.thread_authority(&thread_id).unwrap().is_none());
+        assert!(!runtime.thread_is_loaded(&thread_id));
+        drop(ledger);
+
+        let status = grant_thread(&runtime, &spawn_id, "stdin");
+        assert_eq!(status.authority.thread_id, thread_id);
+        assert_eq!(status.authority.spawning_actor, "stdin");
+        assert_eq!(status.authority.parent_thread_id, None);
+        assert_eq!(
+            status.authority.cwd,
+            runtime.paths.workspace_root.to_string_lossy().into_owned()
+        );
+        assert_eq!(status.authority.model, "gpt-5.6-sol");
+        assert_eq!(
+            status.authority.reasoning_effort,
+            crate::daemon::protocol::ReasoningEffort::Xhigh
+        );
+        assert_eq!(
+            status.authority.approval_policy,
+            crate::daemon::protocol::ThreadApprovalPolicy::Prompt
+        );
+        assert!(status.authority.created_at_ms > 0);
+        assert_eq!(
+            status.live,
+            crate::daemon::protocol::ThreadLiveState {
+                loaded: true,
+                current_turn_id: None,
+            }
+        );
+        let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
+        assert_eq!(
+            ledger.thread_authority(&thread_id).unwrap(),
+            Some(status.authority.clone())
+        );
+        let approval = ledger.thread_spawn_approval(&spawn_id).unwrap().unwrap();
+        assert_eq!(approval.decision, ThreadSpawnDecisionName::Granted);
+        assert_eq!(approval.actor, status.authority.spawning_actor);
+    }
+
+    #[test]
+    fn thread_spawn_denial_and_cancellation_leave_no_live_authority() {
+        for (case, decision, expected) in [
+            (
+                "denied",
+                ThreadSpawnDecision::Deny {
+                    actor: "reviewer".into(),
+                    reason: "not admitted".into(),
+                },
+                ThreadSpawnDecisionName::Denied,
+            ),
+            (
+                "canceled",
+                ThreadSpawnDecision::Cancel {
+                    actor: "stdin".into(),
+                },
+                ThreadSpawnDecisionName::Canceled,
+            ),
+        ] {
+            let (_root, runtime) = thread_test_runtime();
+            let (spawn_id, thread_id) = pending_spawn(
+                start_thread(
+                    &runtime,
+                    None,
+                    &runtime.paths.workspace_root,
+                    crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+                )
+                .unwrap(),
+            );
+            let result = decide_thread(&runtime, &spawn_id, decision).unwrap();
+            assert!(matches!(
+                (&result, case),
+                (ThreadSpawnResult::Denied { .. }, "denied")
+                    | (ThreadSpawnResult::Canceled { .. }, "canceled")
+            ));
+            let ledger =
+                SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
+            let approval = ledger.thread_spawn_approval(&spawn_id).unwrap().unwrap();
+            assert_eq!(approval.decision, expected);
+            assert!(ledger.thread_authority(&thread_id).unwrap().is_none());
+            assert!(!runtime.thread_is_loaded(&thread_id));
+        }
+    }
+
+    #[test]
+    fn thread_spawn_persistence_failure_releases_claim_without_live_thread() {
+        let (_root, runtime) = thread_test_runtime();
+        let (spawn_id, thread_id) = pending_spawn(
+            start_thread(
+                &runtime,
+                None,
+                &runtime.paths.workspace_root,
+                crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+            )
+            .unwrap(),
+        );
+        let connection = rusqlite::Connection::open(&runtime.paths.ledger_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_thread_authority_insert
+                 BEFORE INSERT ON thread_authorities
+                 BEGIN SELECT RAISE(ABORT, 'injected authority failure'); END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            decide_thread(
+                &runtime,
+                &spawn_id,
+                ThreadSpawnDecision::Grant {
+                    actor: "stdin".into()
+                }
+            ),
+            Err(ThreadSpawnFailure::Persistence)
+        ));
+        let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
+        assert!(ledger.thread_authority(&thread_id).unwrap().is_none());
+        assert!(ledger.thread_spawn_approval(&spawn_id).unwrap().is_none());
+        assert!(!runtime.thread_is_loaded(&thread_id));
+        drop(ledger);
+
+        let connection = rusqlite::Connection::open(&runtime.paths.ledger_path).unwrap();
+        connection
+            .execute_batch("DROP TRIGGER fail_thread_authority_insert")
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            grant_thread(&runtime, &spawn_id, "stdin")
+                .authority
+                .thread_id,
+            thread_id
+        );
+    }
+
+    #[test]
+    fn spawned_thread_never_exceeds_parent_policy_or_cwd_authority() {
+        let (root, runtime) = thread_test_runtime();
+        let child_dir = runtime.paths.workspace_root.join("child");
+        std::fs::create_dir(&child_dir).unwrap();
+        let outside_dir = root.path().join("outside");
+        std::fs::create_dir(&outside_dir).unwrap();
+        let (spawn_id, _) = pending_spawn(
+            start_thread(
+                &runtime,
+                None,
+                &runtime.paths.workspace_root,
+                crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+            )
+            .unwrap(),
+        );
+        let parent = grant_thread(&runtime, &spawn_id, "stdin");
+
+        assert!(matches!(
+            start_thread(
+                &runtime,
+                Some(parent.authority.thread_id.clone()),
+                &child_dir,
+                crate::daemon::protocol::ThreadApprovalPolicy::Yolo,
+            ),
+            Err(ThreadSpawnFailure::Authority(
+                ThreadAuthorityError::ApprovalPolicy { .. }
+            ))
+        ));
+        assert!(matches!(
+            start_thread(
+                &runtime,
+                Some(parent.authority.thread_id),
+                &outside_dir,
+                crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+            ),
+            Err(ThreadSpawnFailure::Authority(
+                ThreadAuthorityError::WorkingDirectory { .. }
+            ))
+        ));
+        let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
+        assert_eq!(ledger.thread_authorities().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn yolo_parent_auto_grants_child_with_exact_actor() {
+        let (_root, runtime) = thread_test_runtime();
+        let child_dir = runtime.paths.workspace_root.join("child");
+        std::fs::create_dir(&child_dir).unwrap();
+        let (spawn_id, _) = pending_spawn(
+            start_thread(
+                &runtime,
+                None,
+                &runtime.paths.workspace_root,
+                crate::daemon::protocol::ThreadApprovalPolicy::Yolo,
+            )
+            .unwrap(),
+        );
+        let parent = grant_thread(&runtime, &spawn_id, "stdin");
+        let child = match start_thread(
+            &runtime,
+            Some(parent.authority.thread_id),
+            &child_dir,
+            crate::daemon::protocol::ThreadApprovalPolicy::Yolo,
+        )
+        .unwrap()
+        {
+            ThreadSpawnResult::Spawned { thread } => thread,
+            unexpected => panic!("expected auto-granted child, got {unexpected:?}"),
+        };
+        assert_eq!(child.authority.spawning_actor, "yolo");
+        let connection = rusqlite::Connection::open(&runtime.paths.ledger_path).unwrap();
+        let approvals = connection
+            .query_row(
+                "SELECT COUNT(*) FROM thread_spawn_approvals WHERE actor = 'yolo' AND decision = 'granted'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(approvals, 1);
+    }
+
+    #[test]
+    fn thread_list_and_status_keep_clientless_orphans_after_restart() {
+        let (_root, runtime) = thread_test_runtime();
+        let child_dir = runtime.paths.workspace_root.join("child");
+        std::fs::create_dir(&child_dir).unwrap();
+        let (spawn_id, _) = pending_spawn(
+            start_thread(
+                &runtime,
+                None,
+                &runtime.paths.workspace_root,
+                crate::daemon::protocol::ThreadApprovalPolicy::Yolo,
+            )
+            .unwrap(),
+        );
+        let parent = grant_thread(&runtime, &spawn_id, "stdin");
+        let child = match start_thread(
+            &runtime,
+            Some(parent.authority.thread_id.clone()),
+            &child_dir,
+            crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+        )
+        .unwrap()
+        {
+            ThreadSpawnResult::Spawned { thread } => thread,
+            unexpected => panic!("expected auto-granted child, got {unexpected:?}"),
+        };
+
+        let restarted = DaemonRuntime::new(runtime.paths.clone());
+        assert!(matches!(
+            start_thread(
+                &restarted,
+                Some(parent.authority.thread_id.clone()),
+                &child_dir,
+                crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+            ),
+            Err(ThreadSpawnFailure::NotFound(message)) if message.contains("not loaded")
+        ));
+        let list = handle_line(
+            &restarted,
+            r#"{"v":1,"id":"list","kind":"request","method":"thread.list"}"#,
+        );
+        let listed: ThreadListResult = serde_json::from_value(list.result.unwrap()).unwrap();
+        assert_eq!(listed.threads.len(), 2);
+        assert!(listed.threads.iter().all(|thread| !thread.live.loaded));
+        assert!(listed.threads.iter().any(|thread| {
+            thread.authority.thread_id == child.authority.thread_id
+                && thread.authority.parent_thread_id.as_deref()
+                    == Some(parent.authority.thread_id.as_str())
+        }));
+
+        let status = handle_line(
+            &restarted,
+            &format!(
+                r#"{{"v":1,"id":"status","kind":"request","method":"thread.status","params":{{"thread_id":"{}"}}}}"#,
+                child.authority.thread_id
+            ),
+        );
+        let status: ThreadStatusResult = serde_json::from_value(status.result.unwrap()).unwrap();
+        assert_eq!(status.thread.authority, child.authority);
+        assert!(!status.thread.live.loaded);
+    }
+
+    #[test]
+    fn duplicate_thread_decision_is_idempotent_and_conflicts_fail_closed() {
+        let (_root, runtime) = thread_test_runtime();
+        let (spawn_id, thread_id) = pending_spawn(
+            start_thread(
+                &runtime,
+                None,
+                &runtime.paths.workspace_root,
+                crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+            )
+            .unwrap(),
+        );
+        let first = grant_thread(&runtime, &spawn_id, "stdin");
+        let duplicate = grant_thread(&runtime, &spawn_id, "stdin");
+        assert_eq!(duplicate, first);
+        assert!(matches!(
+            decide_thread(
+                &runtime,
+                &spawn_id,
+                ThreadSpawnDecision::Deny {
+                    actor: "stdin".into(),
+                    reason: "changed".into(),
+                }
+            ),
+            Err(ThreadSpawnFailure::Conflict(message)) if message.contains("different durable decision")
+        ));
+        let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
+        assert_eq!(ledger.thread_authorities().unwrap().len(), 1);
+        assert_eq!(
+            ledger.thread_authority(&thread_id).unwrap(),
+            Some(first.authority)
+        );
+    }
+
+    #[test]
+    fn malformed_thread_requests_fail_before_reservation() {
+        let (_root, runtime) = thread_test_runtime();
+        assert!(matches!(
+            start_thread(
+                &runtime,
+                None,
+                Path::new("relative"),
+                crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+            ),
+            Err(ThreadSpawnFailure::Malformed(message)) if message.contains("absolute")
+        ));
+        let response = handle_line(
+            &runtime,
+            r#"{"v":1,"id":"bad","kind":"request","method":"thread.spawn","params":{"action":"start","parent_thread_id":null,"cwd":"/tmp","model":"gpt-5.6-sol","reasoning_effort":"xhigh","approval_policy":"prompt","extra":true}}"#,
+        );
+        assert_eq!(response.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+        let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
+        assert!(ledger.thread_authorities().unwrap().is_empty());
+    }
 
     #[test]
     fn terminal_status_waits_for_collected_events_on_success_failure_and_cancellation() {

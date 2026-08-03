@@ -1,7 +1,11 @@
 use plato_agent::{
     daemon::{
-        client::DaemonClient,
-        protocol::{RunStateName, ShutdownIfIdleResultName, StreamEvent},
+        client::{ClientError, DaemonClient},
+        protocol::{
+            CAPABILITY_THREAD_LIST, CAPABILITY_THREAD_SPAWN, CAPABILITY_THREAD_STATUS,
+            ERROR_NOT_FOUND, ReasoningEffort, RunStateName, ShutdownIfIdleResultName, StreamEvent,
+            ThreadApprovalPolicy, ThreadSpawnDecision, ThreadSpawnResult,
+        },
     },
     ledger::SqliteLedger,
     paths,
@@ -103,6 +107,138 @@ fn one_host_daemon_serves_two_workspaces_and_coexists_with_legacy_daemon() {
     assert_eq!(host.pid(), host_pid);
     legacy.stop(legacy_client);
     host.stop(host_client);
+}
+
+#[test]
+fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
+    let _serial = SCENARIO_SERIAL.lock().unwrap();
+    let proof = ProofContext::new();
+    let child_cwd = proof.workspace.join("child");
+    fs::create_dir(&child_cwd).unwrap();
+    let host = ProofDaemon::start_host(&proof);
+    let mut client = host.connect();
+    let hello = client.hello(&proof.workspace).unwrap();
+    for capability in [
+        CAPABILITY_THREAD_SPAWN,
+        CAPABILITY_THREAD_LIST,
+        CAPABILITY_THREAD_STATUS,
+    ] {
+        assert!(hello.capabilities.iter().any(|served| served == capability));
+    }
+
+    let (spawn_id, root_thread_id) = match client
+        .thread_spawn_start(
+            None,
+            proof
+                .workspace
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "gpt-5.6-sol".into(),
+            ReasoningEffort::Xhigh,
+            ThreadApprovalPolicy::Yolo,
+        )
+        .unwrap()
+    {
+        ThreadSpawnResult::ApprovalRequired {
+            spawn_id,
+            thread_id,
+            effect,
+            ..
+        } => {
+            assert_eq!(effect, EffectClass::WorkspaceWrite);
+            (spawn_id, thread_id)
+        }
+        unexpected => panic!("expected root approval, got {unexpected:?}"),
+    };
+    let root = match client
+        .thread_spawn_decide(
+            spawn_id,
+            ThreadSpawnDecision::Grant {
+                actor: "semantic_fixture".into(),
+            },
+        )
+        .unwrap()
+    {
+        ThreadSpawnResult::Spawned { thread } => thread,
+        unexpected => panic!("expected spawned root, got {unexpected:?}"),
+    };
+    assert_eq!(root.authority.thread_id, root_thread_id);
+    assert_eq!(root.authority.parent_thread_id, None);
+    assert_eq!(root.authority.spawning_actor, "semantic_fixture");
+    assert_eq!(
+        Path::new(&root.authority.cwd),
+        proof.workspace.canonicalize().unwrap()
+    );
+    assert_eq!(root.authority.model, "gpt-5.6-sol");
+    assert_eq!(root.authority.reasoning_effort, ReasoningEffort::Xhigh);
+    assert_eq!(root.authority.approval_policy, ThreadApprovalPolicy::Yolo);
+    assert!(root.authority.created_at_ms > 0);
+    assert!(root.live.loaded);
+    assert_eq!(root.live.current_turn_id, None);
+
+    let child = match client
+        .thread_spawn_start(
+            Some(root_thread_id.clone()),
+            child_cwd
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "gpt-5.6-sol".into(),
+            ReasoningEffort::High,
+            ThreadApprovalPolicy::Prompt,
+        )
+        .unwrap()
+    {
+        ThreadSpawnResult::Spawned { thread } => thread,
+        unexpected => panic!("expected yolo auto-grant, got {unexpected:?}"),
+    };
+    assert_eq!(
+        child.authority.parent_thread_id.as_deref(),
+        Some(root_thread_id.as_str())
+    );
+    assert_eq!(child.authority.spawning_actor, "yolo");
+    assert!(child.live.loaded);
+
+    let listed = client.thread_list().unwrap().threads;
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().all(|thread| thread.live.loaded));
+    assert_eq!(
+        client
+            .thread_status(child.authority.thread_id.clone())
+            .unwrap()
+            .thread,
+        child
+    );
+    host.stop(client);
+
+    let restarted = ProofDaemon::start_host(&proof);
+    let mut restarted_client = restarted.connect();
+    let listed = restarted_client.thread_list().unwrap().threads;
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().all(|thread| !thread.live.loaded));
+    let readback = restarted_client
+        .thread_status(child.authority.thread_id.clone())
+        .unwrap()
+        .thread;
+    assert_eq!(readback.authority, child.authority);
+    assert!(!readback.live.loaded);
+    let stale_parent = restarted_client
+        .thread_spawn_start(
+            Some(root_thread_id),
+            child_cwd.to_string_lossy().into_owned(),
+            "gpt-5.6-sol".into(),
+            ReasoningEffort::High,
+            ThreadApprovalPolicy::Prompt,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        stale_parent,
+        ClientError::DaemonResponse(error) if error.code == ERROR_NOT_FOUND
+    ));
+    restarted.stop(restarted_client);
 }
 
 #[test]

@@ -1,9 +1,13 @@
 use crate::{
     AppError, AppResult,
     paths::DefaultSqlitePath,
+    thread_authority::{
+        ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, validate_child_authority,
+        validate_complete_authority,
+    },
     voice_session::{VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope},
 };
-use plato_protocol::RunStateName;
+use plato_protocol::{ReasoningEffort, RunStateName, ThreadApprovalPolicy, ThreadAuthorityRecord};
 use platonic_core::{HarnessEvent, MessageRole, RecordedEvent, RunId, RunPhase, RunState};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use serde::{Deserialize, Serialize};
@@ -26,7 +30,9 @@ pub const LEDGER_VERSION: u32 = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const LEGACY_SQLITE_SCHEMA_VERSION: u32 = 1;
 const SESSION_SQLITE_SCHEMA_VERSION: u32 = 2;
-const SQLITE_SCHEMA_VERSION: u32 = 3;
+const VOICE_EVENT_SQLITE_SCHEMA_VERSION: u32 = 3;
+const THREAD_AUTHORITY_SQLITE_SCHEMA_VERSION: u32 = 4;
+const SQLITE_SCHEMA_VERSION: u32 = THREAD_AUTHORITY_SQLITE_SCHEMA_VERSION;
 pub(crate) const RUN_CANCELED_REASON: &str = "run canceled";
 const ORPHANED_RUN_ERROR: &str = "daemon restarted before run completed";
 #[cfg(unix)]
@@ -300,6 +306,15 @@ pub struct PersistedSessionSummary {
     pub updated_at_ms: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DurableThreadAuthority(ThreadAuthorityRecord);
+
+impl DurableThreadAuthority {
+    pub(crate) fn record(&self) -> &ThreadAuthorityRecord {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PersistedTokenUsage {
     pub(crate) input_tokens: u64,
@@ -461,7 +476,7 @@ impl SqliteLedger {
 
     /// Reads and validates one selected run's ordered voice companion stream.
     pub fn read_voice_events(&self, run_id: &str) -> AppResult<Vec<VoiceEventEnvelope>> {
-        if self.schema_version < SQLITE_SCHEMA_VERSION {
+        if self.schema_version < VOICE_EVENT_SQLITE_SCHEMA_VERSION {
             return Ok(Vec::new());
         }
         let envelopes = read_voice_events_from(&self.connection, run_id)?;
@@ -474,6 +489,160 @@ impl SqliteLedger {
             validate_voice_event_keys(&self.connection, run_id, &envelopes)?;
         }
         Ok(envelopes)
+    }
+
+    pub(crate) fn persist_thread_spawn(
+        &mut self,
+        approval: &ThreadSpawnApprovalRecord,
+        authority: Option<&ThreadAuthorityRecord>,
+    ) -> AppResult<Option<DurableThreadAuthority>> {
+        if let Some(authority) = authority {
+            validate_complete_authority(authority)?;
+            if authority.spawning_actor != approval.actor {
+                return Err(AppError::Config(
+                    "thread.spawn approval actor must match spawning actor".into(),
+                ));
+            }
+        }
+        match (approval.decision, authority) {
+            (ThreadSpawnDecisionName::Granted, Some(authority))
+                if authority.thread_id == approval.thread_id => {}
+            (ThreadSpawnDecisionName::Granted, Some(_)) => {
+                return Err(AppError::Config(
+                    "thread.spawn approval and authority thread ids differ".into(),
+                ));
+            }
+            (ThreadSpawnDecisionName::Granted, None) => {
+                return Err(AppError::Config(
+                    "granted thread.spawn approval requires an authority record".into(),
+                ));
+            }
+            (ThreadSpawnDecisionName::Denied | ThreadSpawnDecisionName::Canceled, None) => {}
+            (ThreadSpawnDecisionName::Denied | ThreadSpawnDecisionName::Canceled, Some(_)) => {
+                return Err(AppError::Config(
+                    "denied or canceled thread.spawn cannot create authority".into(),
+                ));
+            }
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = thread_spawn_approval_from(&transaction, &approval.spawn_id)? {
+            if existing != *approval {
+                return Err(AppError::Config(format!(
+                    "thread.spawn decision conflicts with durable spawn {}",
+                    approval.spawn_id
+                )));
+            }
+            if let Some(authority) = authority {
+                let existing_authority = thread_authority_from(&transaction, &authority.thread_id)?
+                    .ok_or_else(|| {
+                        AppError::Config(format!(
+                            "granted spawn {} has no authority record",
+                            approval.spawn_id
+                        ))
+                    })?;
+                if existing_authority != *authority {
+                    return Err(AppError::Config(format!(
+                        "thread authority conflicts with durable thread {}",
+                        authority.thread_id
+                    )));
+                }
+            }
+            transaction.commit()?;
+            return Ok(authority.cloned().map(DurableThreadAuthority));
+        }
+
+        if let Some(authority) = authority
+            && let Some(parent_thread_id) = authority.parent_thread_id.as_deref()
+        {
+            let parent =
+                thread_authority_from(&transaction, parent_thread_id)?.ok_or_else(|| {
+                    AppError::Config(format!(
+                        "parent thread is no longer durable: {parent_thread_id}"
+                    ))
+                })?;
+            let draft = crate::thread_authority::ThreadAuthorityDraft {
+                thread_id: authority.thread_id.clone(),
+                parent_thread_id: authority.parent_thread_id.clone(),
+                cwd: authority.cwd.clone(),
+                model: authority.model.clone(),
+                reasoning_effort: authority.reasoning_effort,
+                approval_policy: authority.approval_policy,
+            };
+            validate_child_authority(&parent, &draft)
+                .map_err(|error| AppError::Config(error.to_string()))?;
+        }
+
+        transaction.execute(
+            "INSERT INTO thread_spawn_approvals
+               (spawn_id, thread_id, decision, actor, reason, occurred_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                approval.spawn_id,
+                approval.thread_id,
+                approval.decision.as_str(),
+                approval.actor,
+                approval.reason,
+                sqlite_i64(approval.occurred_at_ms, "thread approval occurred_at_ms")?
+            ],
+        )?;
+        if let Some(authority) = authority {
+            transaction.execute(
+                "INSERT INTO thread_authorities
+                   (thread_id, parent_thread_id, spawning_actor, cwd, model,
+                    reasoning_effort, approval_policy, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    authority.thread_id,
+                    authority.parent_thread_id,
+                    authority.spawning_actor,
+                    authority.cwd,
+                    authority.model,
+                    authority.reasoning_effort.as_str(),
+                    authority.approval_policy.as_str(),
+                    sqlite_i64(authority.created_at_ms, "thread created_at_ms")?
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(authority.cloned().map(DurableThreadAuthority))
+    }
+
+    pub(crate) fn thread_authority(
+        &self,
+        thread_id: &str,
+    ) -> AppResult<Option<ThreadAuthorityRecord>> {
+        if self.schema_version < THREAD_AUTHORITY_SQLITE_SCHEMA_VERSION {
+            return Ok(None);
+        }
+        thread_authority_from(&self.connection, thread_id)
+    }
+
+    pub(crate) fn thread_authorities(&self) -> AppResult<Vec<ThreadAuthorityRecord>> {
+        if self.schema_version < THREAD_AUTHORITY_SQLITE_SCHEMA_VERSION {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT thread_id, parent_thread_id, spawning_actor, cwd, model,
+                    reasoning_effort, approval_policy, created_at_ms
+             FROM thread_authorities
+             ORDER BY created_at_ms ASC, thread_id ASC",
+        )?;
+        Ok(statement
+            .query_map([], thread_authority_from_row)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn thread_spawn_approval(
+        &self,
+        spawn_id: &str,
+    ) -> AppResult<Option<ThreadSpawnApprovalRecord>> {
+        if self.schema_version < THREAD_AUTHORITY_SQLITE_SCHEMA_VERSION {
+            return Ok(None);
+        }
+        thread_spawn_approval_from(&self.connection, spawn_id)
     }
 
     pub fn read_latest_run(&self) -> AppResult<(String, Vec<RecordedEvent>)> {
@@ -1342,6 +1511,86 @@ fn status_from_row(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Ru
     })
 }
 
+fn thread_authority_from(
+    connection: &Connection,
+    thread_id: &str,
+) -> AppResult<Option<ThreadAuthorityRecord>> {
+    Ok(connection
+        .query_row(
+            "SELECT thread_id, parent_thread_id, spawning_actor, cwd, model,
+                    reasoning_effort, approval_policy, created_at_ms
+             FROM thread_authorities
+             WHERE thread_id = ?1",
+            params![thread_id],
+            thread_authority_from_row,
+        )
+        .optional()?)
+}
+
+fn thread_authority_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadAuthorityRecord> {
+    let reasoning_value: String = row.get(5)?;
+    let reasoning_effort = ReasoningEffort::parse(&reasoning_value).ok_or_else(|| {
+        invalid_thread_column(5, format!("unknown reasoning effort: {reasoning_value}"))
+    })?;
+    let policy_value: String = row.get(6)?;
+    let approval_policy = ThreadApprovalPolicy::parse(&policy_value).ok_or_else(|| {
+        invalid_thread_column(6, format!("unknown approval policy: {policy_value}"))
+    })?;
+    Ok(ThreadAuthorityRecord {
+        thread_id: row.get(0)?,
+        parent_thread_id: row.get(1)?,
+        spawning_actor: row.get(2)?,
+        cwd: row.get(3)?,
+        model: row.get(4)?,
+        reasoning_effort,
+        approval_policy,
+        created_at_ms: row_u64(row, 7, "thread created_at_ms")?,
+    })
+}
+
+fn thread_spawn_approval_from(
+    connection: &Connection,
+    spawn_id: &str,
+) -> AppResult<Option<ThreadSpawnApprovalRecord>> {
+    Ok(connection
+        .query_row(
+            "SELECT spawn_id, thread_id, decision, actor, reason, occurred_at_ms
+             FROM thread_spawn_approvals
+             WHERE spawn_id = ?1",
+            params![spawn_id],
+            |row| {
+                let decision_value: String = row.get(2)?;
+                let decision =
+                    ThreadSpawnDecisionName::parse(&decision_value).ok_or_else(|| {
+                        invalid_thread_column(
+                            2,
+                            format!("unknown thread spawn decision: {decision_value}"),
+                        )
+                    })?;
+                Ok(ThreadSpawnApprovalRecord {
+                    spawn_id: row.get(0)?,
+                    thread_id: row.get(1)?,
+                    decision,
+                    actor: row.get(3)?,
+                    reason: row.get(4)?,
+                    occurred_at_ms: row_u64(row, 5, "thread approval occurred_at_ms")?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn invalid_thread_column(index: usize, message: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        index,
+        Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        )),
+    )
+}
+
 struct ExistingEvent {
     occurred_at_ms: u64,
     version: u32,
@@ -1740,8 +1989,11 @@ fn migrate_sqlite(connection: &mut Connection) -> AppResult<()> {
     if version < SESSION_SQLITE_SCHEMA_VERSION {
         create_session_tables(&transaction)?;
     }
-    if version < SQLITE_SCHEMA_VERSION {
+    if version < VOICE_EVENT_SQLITE_SCHEMA_VERSION {
         create_voice_event_table(&transaction)?;
+    }
+    if version < THREAD_AUTHORITY_SQLITE_SCHEMA_VERSION {
+        create_thread_authority_tables(&transaction)?;
     }
     if version < SQLITE_SCHEMA_VERSION {
         transaction.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)?;
@@ -1790,6 +2042,57 @@ fn create_voice_event_table(connection: &Connection) -> AppResult<()> {
           event_json TEXT NOT NULL,
           PRIMARY KEY (run_id, sequence)
         );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn create_thread_authority_tables(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS thread_authorities (
+          thread_id TEXT PRIMARY KEY,
+          parent_thread_id TEXT,
+          spawning_actor TEXT NOT NULL,
+          cwd TEXT NOT NULL,
+          model TEXT NOT NULL,
+          reasoning_effort TEXT NOT NULL,
+          approval_policy TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS thread_spawn_approvals (
+          spawn_id TEXT PRIMARY KEY,
+          thread_id TEXT NOT NULL,
+          decision TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          reason TEXT,
+          occurred_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TRIGGER IF NOT EXISTS thread_authorities_no_update
+        BEFORE UPDATE ON thread_authorities
+        BEGIN
+          SELECT RAISE(ABORT, 'thread authority records are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS thread_authorities_no_delete
+        BEFORE DELETE ON thread_authorities
+        BEGIN
+          SELECT RAISE(ABORT, 'thread authority records are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS thread_spawn_approvals_no_update
+        BEFORE UPDATE ON thread_spawn_approvals
+        BEGIN
+          SELECT RAISE(ABORT, 'thread spawn approvals are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS thread_spawn_approvals_no_delete
+        BEFORE DELETE ON thread_spawn_approvals
+        BEGIN
+          SELECT RAISE(ABORT, 'thread spawn approvals are immutable');
+        END;
         "#,
     )?;
     Ok(())
@@ -1880,6 +2183,29 @@ pub fn default_sqlite_session_summaries(
         return Ok(Vec::new());
     }
     SqliteLedger::open_default_readonly(path)?.session_summaries()
+}
+
+pub(crate) fn default_thread_authorities(
+    path: &DefaultSqlitePath,
+) -> AppResult<Vec<ThreadAuthorityRecord>> {
+    if fs::symlink_metadata(path.as_path())
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(Vec::new());
+    }
+    SqliteLedger::open_default_readonly(path)?.thread_authorities()
+}
+
+pub(crate) fn default_thread_authority(
+    path: &DefaultSqlitePath,
+    thread_id: &str,
+) -> AppResult<Option<ThreadAuthorityRecord>> {
+    if fs::symlink_metadata(path.as_path())
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(None);
+    }
+    SqliteLedger::open_default_readonly(path)?.thread_authority(thread_id)
 }
 
 pub(crate) fn default_sqlite_session_status(
@@ -1992,6 +2318,44 @@ mod tests {
                 delta_index: 7,
             },
         ]
+    }
+
+    fn thread_authority(
+        thread_id: &str,
+        parent_thread_id: Option<&str>,
+        actor: &str,
+        cwd: &Path,
+        policy: ThreadApprovalPolicy,
+        created_at_ms: u64,
+    ) -> ThreadAuthorityRecord {
+        ThreadAuthorityRecord {
+            thread_id: thread_id.into(),
+            parent_thread_id: parent_thread_id.map(str::to_owned),
+            spawning_actor: actor.into(),
+            cwd: cwd.canonicalize().unwrap().to_string_lossy().into_owned(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: ReasoningEffort::Xhigh,
+            approval_policy: policy,
+            created_at_ms,
+        }
+    }
+
+    fn thread_approval(
+        spawn_id: &str,
+        thread_id: &str,
+        decision: ThreadSpawnDecisionName,
+        actor: &str,
+        reason: Option<&str>,
+        occurred_at_ms: u64,
+    ) -> ThreadSpawnApprovalRecord {
+        ThreadSpawnApprovalRecord {
+            spawn_id: spawn_id.into(),
+            thread_id: thread_id.into(),
+            decision,
+            actor: actor.into(),
+            reason: reason.map(str::to_owned),
+            occurred_at_ms,
+        }
     }
 
     fn append_voice_core_keys(ledger: &mut SqliteLedger, run_id: &str, turn_id: &str) {
@@ -2358,7 +2722,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_table_migration_is_additive_idempotent_and_readonly_v2_safe() {
+    fn authority_migration_is_additive_idempotent_and_readonly_v2_safe() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v2-events.db");
         let connection = Connection::open(&path).unwrap();
@@ -2393,18 +2757,405 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), bytes_before_read);
 
         let migrated = SqliteLedger::open_or_create(&path).unwrap();
-        assert_eq!(migrated.user_version().unwrap(), 3);
+        assert_eq!(migrated.user_version().unwrap(), SQLITE_SCHEMA_VERSION);
         let kept: String = migrated
             .connection
             .query_row("SELECT session_id FROM sessions", [], |row| row.get(0))
             .unwrap();
         assert_eq!(kept, "kept");
         assert!(migrated.read_voice_events("run_absent").unwrap().is_empty());
+        assert!(migrated.thread_authorities().unwrap().is_empty());
         drop(migrated);
 
         let bytes_after_migration = fs::read(&path).unwrap();
         drop(SqliteLedger::open_or_create(&path).unwrap());
         assert_eq!(fs::read(&path).unwrap(), bytes_after_migration);
+    }
+
+    #[test]
+    fn thread_authority_persists_all_eight_fields_and_is_immutable_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let columns = ledger
+            .connection
+            .prepare("PRAGMA table_info(thread_authorities)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            [
+                "thread_id",
+                "parent_thread_id",
+                "spawning_actor",
+                "cwd",
+                "model",
+                "reasoning_effort",
+                "approval_policy",
+                "created_at_ms",
+            ]
+        );
+
+        let authority = thread_authority(
+            "thread_root",
+            None,
+            "stdin",
+            dir.path(),
+            ThreadApprovalPolicy::Prompt,
+            42,
+        );
+        let approval = thread_approval(
+            "spawn_root",
+            "thread_root",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            42,
+        );
+        let durable = ledger
+            .persist_thread_spawn(&approval, Some(&authority))
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.record(), &authority);
+        assert_eq!(
+            ledger.thread_spawn_approval("spawn_root").unwrap(),
+            Some(approval.clone())
+        );
+
+        for statement in [
+            "UPDATE thread_authorities SET model = 'changed' WHERE thread_id = 'thread_root'",
+            "DELETE FROM thread_authorities WHERE thread_id = 'thread_root'",
+            "UPDATE thread_spawn_approvals SET actor = 'changed' WHERE spawn_id = 'spawn_root'",
+            "DELETE FROM thread_spawn_approvals WHERE spawn_id = 'spawn_root'",
+        ] {
+            let error = ledger.connection.execute(statement, []).unwrap_err();
+            assert!(error.to_string().contains("immutable"));
+        }
+        drop(ledger);
+
+        let reopened = SqliteLedger::open_readonly(&path).unwrap();
+        assert_eq!(
+            reopened.thread_authorities().unwrap(),
+            vec![authority.clone()]
+        );
+        assert_eq!(
+            reopened.thread_authority("thread_root").unwrap(),
+            Some(authority)
+        );
+        assert_eq!(
+            reopened.thread_spawn_approval("spawn_root").unwrap(),
+            Some(approval)
+        );
+    }
+
+    #[test]
+    fn literal_v4_thread_authority_fixture_reads_exactly_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("literal-v4.db");
+        let cwd = dir.path().canonicalize().unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE thread_authorities (
+                  thread_id TEXT PRIMARY KEY,
+                  parent_thread_id TEXT,
+                  spawning_actor TEXT NOT NULL,
+                  cwd TEXT NOT NULL,
+                  model TEXT NOT NULL,
+                  reasoning_effort TEXT NOT NULL,
+                  approval_policy TEXT NOT NULL,
+                  created_at_ms INTEGER NOT NULL
+                );
+                PRAGMA user_version = 4;
+                "#,
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO thread_authorities
+                   (thread_id, parent_thread_id, spawning_actor, cwd, model,
+                    reasoning_effort, approval_policy, created_at_ms)
+                 VALUES ('thread_literal', 'thread_parent', 'fixture_actor', ?1,
+                         'gpt-5.6-sol', 'xhigh', 'prompt', 42)",
+                params![cwd.to_string_lossy()],
+            )
+            .unwrap();
+        drop(connection);
+        let bytes_before = fs::read(&path).unwrap();
+
+        let ledger = SqliteLedger::open_readonly(&path).unwrap();
+        assert_eq!(
+            ledger.thread_authority("thread_literal").unwrap(),
+            Some(ThreadAuthorityRecord {
+                thread_id: "thread_literal".into(),
+                parent_thread_id: Some("thread_parent".into()),
+                spawning_actor: "fixture_actor".into(),
+                cwd: cwd.to_string_lossy().into_owned(),
+                model: "gpt-5.6-sol".into(),
+                reasoning_effort: ReasoningEffort::Xhigh,
+                approval_policy: ThreadApprovalPolicy::Prompt,
+                created_at_ms: 42,
+            })
+        );
+        drop(ledger);
+        assert_eq!(fs::read(&path).unwrap(), bytes_before);
+    }
+
+    #[test]
+    fn malformed_durable_thread_authority_fails_closed_on_readback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("malformed-v4.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE thread_authorities (
+                  thread_id TEXT PRIMARY KEY,
+                  parent_thread_id TEXT,
+                  spawning_actor TEXT NOT NULL,
+                  cwd TEXT NOT NULL,
+                  model TEXT NOT NULL,
+                  reasoning_effort TEXT NOT NULL,
+                  approval_policy TEXT NOT NULL,
+                  created_at_ms INTEGER NOT NULL
+                );
+                INSERT INTO thread_authorities VALUES
+                  ('thread_bad', NULL, 'fixture_actor', '/tmp', 'gpt-5.6-sol',
+                   'xhigh', 'expanded', 42);
+                PRAGMA user_version = 4;
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let ledger = SqliteLedger::open_readonly(&path).unwrap();
+        let error = ledger.thread_authority("thread_bad").unwrap_err();
+        assert!(error.to_string().contains("unknown approval policy"));
+    }
+
+    #[test]
+    fn denied_and_canceled_thread_spawns_record_actor_without_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        for approval in [
+            thread_approval(
+                "spawn_denied",
+                "thread_denied",
+                ThreadSpawnDecisionName::Denied,
+                "reviewer",
+                Some("not admitted"),
+                10,
+            ),
+            thread_approval(
+                "spawn_canceled",
+                "thread_canceled",
+                ThreadSpawnDecisionName::Canceled,
+                "stdin",
+                None,
+                11,
+            ),
+        ] {
+            assert!(
+                ledger
+                    .persist_thread_spawn(&approval, None)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                ledger.thread_spawn_approval(&approval.spawn_id).unwrap(),
+                Some(approval.clone())
+            );
+            assert!(
+                ledger
+                    .thread_authority(&approval.thread_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(ledger.thread_authorities().unwrap().is_empty());
+    }
+
+    #[test]
+    fn thread_spawn_persistence_failure_rolls_back_decision_and_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        ledger
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_thread_authority_insert
+                 BEFORE INSERT ON thread_authorities
+                 BEGIN SELECT RAISE(ABORT, 'injected authority failure'); END;",
+            )
+            .unwrap();
+        let authority = thread_authority(
+            "thread_failed",
+            None,
+            "stdin",
+            dir.path(),
+            ThreadApprovalPolicy::Prompt,
+            20,
+        );
+        let approval = thread_approval(
+            "spawn_failed",
+            "thread_failed",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            20,
+        );
+
+        assert!(
+            ledger
+                .persist_thread_spawn(&approval, Some(&authority))
+                .is_err()
+        );
+        assert!(
+            ledger
+                .thread_spawn_approval("spawn_failed")
+                .unwrap()
+                .is_none()
+        );
+        assert!(ledger.thread_authority("thread_failed").unwrap().is_none());
+    }
+
+    #[test]
+    fn duplicate_thread_spawn_is_idempotent_only_for_identical_durable_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let authority = thread_authority(
+            "thread_root",
+            None,
+            "stdin",
+            dir.path(),
+            ThreadApprovalPolicy::Yolo,
+            30,
+        );
+        let approval = thread_approval(
+            "spawn_root",
+            "thread_root",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            30,
+        );
+        ledger
+            .persist_thread_spawn(&approval, Some(&authority))
+            .unwrap();
+        assert_eq!(
+            ledger
+                .persist_thread_spawn(&approval, Some(&authority))
+                .unwrap()
+                .unwrap()
+                .record(),
+            &authority
+        );
+
+        let conflicting_approval = thread_approval(
+            "spawn_root",
+            "thread_root",
+            ThreadSpawnDecisionName::Granted,
+            "different_actor",
+            None,
+            30,
+        );
+        let conflicting_authority = ThreadAuthorityRecord {
+            spawning_actor: "different_actor".into(),
+            ..authority.clone()
+        };
+        assert!(matches!(
+            ledger.persist_thread_spawn(
+                &conflicting_approval,
+                Some(&conflicting_authority)
+            ),
+            Err(AppError::Config(message)) if message.contains("conflicts")
+        ));
+
+        let mismatched_actor = ThreadAuthorityRecord {
+            spawning_actor: "reviewer".into(),
+            thread_id: "thread_other".into(),
+            ..authority
+        };
+        let other_approval = thread_approval(
+            "spawn_other",
+            "thread_other",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            31,
+        );
+        assert!(matches!(
+            ledger.persist_thread_spawn(&other_approval, Some(&mismatched_actor)),
+            Err(AppError::Config(message)) if message.contains("actor")
+        ));
+    }
+
+    #[test]
+    fn durable_parent_gate_rejects_policy_and_cwd_expansion_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let child_dir = root.path().join("child");
+        fs::create_dir(&child_dir).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = root.path().join("threads.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let parent = thread_authority(
+            "thread_parent",
+            None,
+            "stdin",
+            root.path(),
+            ThreadApprovalPolicy::Prompt,
+            1,
+        );
+        let parent_approval = thread_approval(
+            "spawn_parent",
+            "thread_parent",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            1,
+        );
+        ledger
+            .persist_thread_spawn(&parent_approval, Some(&parent))
+            .unwrap();
+
+        for (spawn_id, thread_id, cwd, policy) in [
+            (
+                "spawn_policy_expansion",
+                "thread_policy_expansion",
+                child_dir.as_path(),
+                ThreadApprovalPolicy::Yolo,
+            ),
+            (
+                "spawn_cwd_expansion",
+                "thread_cwd_expansion",
+                outside.path(),
+                ThreadApprovalPolicy::Prompt,
+            ),
+        ] {
+            let authority =
+                thread_authority(thread_id, Some("thread_parent"), "stdin", cwd, policy, 2);
+            let approval = thread_approval(
+                spawn_id,
+                thread_id,
+                ThreadSpawnDecisionName::Granted,
+                "stdin",
+                None,
+                2,
+            );
+            assert!(
+                ledger
+                    .persist_thread_spawn(&approval, Some(&authority))
+                    .is_err()
+            );
+            assert!(ledger.thread_spawn_approval(spawn_id).unwrap().is_none());
+            assert!(ledger.thread_authority(thread_id).unwrap().is_none());
+        }
     }
 
     #[test]

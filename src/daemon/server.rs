@@ -1377,7 +1377,10 @@ mod tests {
                 "transcript.read.typed",
                 "transcript.read.pending_approval",
                 "daemon.status",
-                "daemon.shutdown_if_idle"
+                "daemon.shutdown_if_idle",
+                "thread.spawn",
+                "thread.list",
+                "thread.status"
             ])
         );
     }

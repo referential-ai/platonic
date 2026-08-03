@@ -28,6 +28,7 @@ The bootstrap surface is intentionally small:
 - `plato replay --db[=<path>] [--run <id>]` replays an explicit SQLite ledger.
 - `plato issue-prep start <run-dir>` runs the fixed issue preparation pipeline from Markdown on stdin.
 - `plato daemon` runs the current workspace daemon in the foreground.
+- `plato thread spawn|list|status` manages durable thread authority on a serving host daemon.
 - `plato gateway discord` checks that daemon, then runs the Discord connector.
 
 ## Configuration
@@ -195,8 +196,9 @@ Every run uses this exact convention:
 - `plato replay --run <id>` replays a single run.
 - `--events <file>` is the explicit JSONL export/debug path.
 - Read-only SQLite replay reads `user_version` first: schema v1 uses only
-  `ledger_events`, schema v2 keeps session selection, and newer schemas fail
-  without migration. Write-open remains the sole v1-to-v2 migration path.
+  `ledger_events`, v2 adds sessions, v3 adds voice companions, and v4 adds
+  immutable thread authority. Newer schemas fail without migration. Write-open
+  remains the sole migration path to the current schema.
 - With a live workspace daemon, default-ledger prompts delegate to it. Replay,
   explicit `--db=<path>`, and direct `--yolo` SQLite paths remain direct and
   fail closed if they conflict with the daemon-owned store.
@@ -244,6 +246,34 @@ workspace through the existing `hello` request; the response adds
 `"daemon_scope":"host"` while retaining the existing build-provenance
 `daemon_version`. Existing CLI, TUI, gateway, and workspace-daemon defaults are
 not repointed by this mode.
+
+The `plato thread` commands connect only to this host endpoint. Spawn requires
+an explicit cwd, model, reasoning effort, and approval policy; cwd defaults to
+the current directory and policy defaults to `prompt`. A root spawn prompts on
+stdin. A child spawn is evaluated by its loaded parent's immutable policy:
+`prompt` asks for a decision and `yolo` auto-grants the workspace-write spawn
+effect. A child cwd must remain within its parent's cwd, and a child policy can
+never be more permissive. Every final approval decision and actor is stored in
+the workspace ledger. A grant atomically stores all eight immutable authority
+fields before the thread becomes loaded; denial, cancellation, or persistence
+failure creates no thread authority.
+
+```bash
+# Terminal 1
+plato-agentd --host
+
+# Terminal 2
+plato thread spawn --cwd "$PWD" --model gpt-5.6-sol \
+  --reasoning-effort xhigh --approval-policy prompt
+plato thread list
+plato thread status <thread-id>
+```
+
+Spawn and status print one typed JSON object. List prints one object per durable
+thread. Each joins its immutable `authority` record with transient `live`
+fields (`loaded` and `current_turn_id`); liveness is never persisted. Restarted,
+clientless, and orphaned threads therefore remain enumerable with
+`loaded: false`.
 
 On startup it prints:
 
@@ -652,6 +682,9 @@ cargo run --bin plato -- -c "what did you just summarize?"
 cargo run --bin plato -- --yolo "write local-proof.txt with hello from Plato Agent"
 cargo run --bin plato -- "run cargo test --locked and summarize the result"
 cargo run --bin plato -- daemon
+cargo run --bin plato -- thread spawn --model gpt-5.6-sol --reasoning-effort xhigh
+cargo run --bin plato -- thread list
+cargo run --bin plato -- thread status thread_123
 cargo run --bin plato -- gateway discord --config ~/.config/plato/gateway.toml
 cargo run --bin plato -- replay
 cargo run --bin plato -- replay events.jsonl
