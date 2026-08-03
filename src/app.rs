@@ -111,7 +111,13 @@ pub enum ApprovalMode {
 #[derive(Clone)]
 pub struct ApprovalHandler {
     actor: &'static str,
-    decide: Arc<dyn Fn(ApprovalRequest) -> AppResult<ApprovalOutcome> + Send + Sync>,
+    decide: Arc<dyn Fn(ApprovalRequest) -> AppResult<ExternalApprovalOutcome> + Send + Sync>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ExternalApprovalOutcome {
+    Granted { actor: &'static str },
+    Denied { actor: &'static str, reason: String },
 }
 
 impl fmt::Debug for ApprovalMode {
@@ -188,6 +194,18 @@ impl ApprovalMode {
     pub fn external(
         actor: &'static str,
         decide: impl Fn(ApprovalRequest) -> AppResult<ApprovalOutcome> + Send + Sync + 'static,
+    ) -> Self {
+        Self::external_with_actor(actor, move |request| match decide(request)? {
+            ApprovalOutcome::Granted => Ok(ExternalApprovalOutcome::Granted { actor }),
+            ApprovalOutcome::Denied { reason } => {
+                Ok(ExternalApprovalOutcome::Denied { actor, reason })
+            }
+        })
+    }
+
+    pub(crate) fn external_with_actor(
+        actor: &'static str,
+        decide: impl Fn(ApprovalRequest) -> AppResult<ExternalApprovalOutcome> + Send + Sync + 'static,
     ) -> Self {
         Self::External(ApprovalHandler {
             actor,
@@ -790,14 +808,14 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                                 ),
                             };
                             match (handler.decide)(request)? {
-                                ApprovalOutcome::Granted => {
+                                ExternalApprovalOutcome::Granted { actor } => {
                                     record_event(
                                         &mut recorder,
                                         &options,
                                         HarnessEvent::ApprovalGranted {
                                             run_id: run_id.clone(),
                                             call_id: call_id.clone(),
-                                            actor_id: ActorId::new(handler.actor)?,
+                                            actor_id: ActorId::new(actor)?,
                                         },
                                     )?;
                                     execute_and_record_tool(
@@ -808,14 +826,14 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                                         call.clone(),
                                     )?
                                 }
-                                ApprovalOutcome::Denied { reason } => {
+                                ExternalApprovalOutcome::Denied { actor, reason } => {
                                     record_event(
                                         &mut recorder,
                                         &options,
                                         HarnessEvent::ApprovalDenied {
                                             run_id: run_id.clone(),
                                             call_id,
-                                            actor_id: ActorId::new(handler.actor)?,
+                                            actor_id: ActorId::new(actor)?,
                                             reason: reason.clone(),
                                         },
                                     )?;
@@ -2834,6 +2852,139 @@ base_url = "http://{}"
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn private_external_approval_actors_preserve_per_call_policy_ledger_and_replay() {
+        let shell_response = |provider_call_id: &str, command: &str| {
+            let arguments = json!({"command": command}).to_string();
+            json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": provider_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": "shell_exec",
+                                "arguments": arguments
+                            }
+                        }]
+                    }
+                }]
+            })
+        };
+        #[cfg(windows)]
+        let write_commands = (
+            r#"echo|set /p="first">session-grant.txt"#,
+            r#"echo|set /p="second">>session-grant.txt"#,
+        );
+        #[cfg(not(windows))]
+        let write_commands = (
+            "printf first > session-grant.txt",
+            "printf second >> session-grant.txt",
+        );
+        let provider = spawn_provider_sequence(vec![
+            shell_response("provider_shell_1", write_commands.0),
+            shell_response("provider_shell_2", write_commands.1),
+            provider_stop_response(),
+        ]);
+        let workspace = tempfile::tempdir().unwrap();
+        let config_path = workspace.path().join("plato.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "{}"
+timeout_ms = 5000
+
+[limits]
+token_budget = 100000
+max_output_tokens = 32
+max_turns = 3
+
+[tools]
+enabled = ["shell.exec"]
+"#,
+                provider.base_url
+            ),
+        )
+        .unwrap();
+        let ledger_path = workspace.path().join("events.jsonl");
+        let decisions = Arc::new(Mutex::new(0));
+        let captured_decisions = decisions.clone();
+
+        let outcome = run_question(RunOptions {
+            question: "run two shell commands".into(),
+            config_path: Some(config_path),
+            overrides: RunOverrides::default(),
+            ledger: RunLedger::Jsonl(ledger_path.clone()),
+            workspace_root: workspace.path().to_path_buf(),
+            approval_mode: ApprovalMode::external_with_actor("daemon", move |_| {
+                let mut decisions = captured_decisions.lock().unwrap();
+                *decisions += 1;
+                Ok(ExternalApprovalOutcome::Granted {
+                    actor: if *decisions == 1 {
+                        "tui_session_grant"
+                    } else {
+                        "session_grant"
+                    },
+                })
+            }),
+            run_id: Some(RunId::new("run_session_grant_actors").unwrap()),
+            session: None,
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: None,
+            voice_interruption_context: None,
+        })
+        .unwrap();
+        provider.handle.join().unwrap();
+
+        assert_eq!(outcome.final_answer, "done");
+        assert_eq!(*decisions.lock().unwrap(), 2);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("session-grant.txt")).unwrap(),
+            "firstsecond"
+        );
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    HarnessEvent::PolicyEvaluated {
+                        call_id,
+                        decision: PolicyDecision::RequireApproval { reason },
+                        ..
+                    } => Some((call_id.as_str(), reason.as_str())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("call_1", "shell.exec requires explicit local approval"),
+                ("call_2", "shell.exec requires explicit local approval"),
+            ]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    HarnessEvent::ApprovalGranted {
+                        call_id, actor_id, ..
+                    } => Some((call_id.as_str(), actor_id.as_str())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![("call_1", "tui_session_grant"), ("call_2", "session_grant"),]
+        );
+        let replay = crate::replay::replay_file(&ledger_path).unwrap();
+        assert!(replay.contains("approval_granted call_1 by tui_session_grant"));
+        assert!(replay.contains("approval_granted call_2 by session_grant"));
     }
 
     #[test]

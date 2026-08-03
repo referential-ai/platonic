@@ -732,13 +732,14 @@ mod tests {
                 DaemonStatusProviderKind, DaemonStatusResult, ERROR_DAEMON_SHUTTING_DOWN,
                 ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
                 ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED,
-                ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind, ProtocolError, RunStateName,
-                ShutdownIfIdleResultName, StreamEvent,
+                ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind, ProtocolError, RunStartResult,
+                RunStateName, ShutdownIfIdleResultName, StreamEvent, TypedTranscript,
+                TypedTranscriptEntry,
             },
             runtime::{MAX_EVENT_BUFFER, MAX_TERMINAL_RUNS, PendingApproval, RunRecord},
         },
         ledger::SqliteLedger,
-        tools::ApprovalOutcome,
+        tool_catalog::SHELL_EXEC,
     };
     use platonic_core::{
         AgentId, ContextPack, EffectClass, HarnessEvent, Message, MessageRole, ModelName,
@@ -1397,7 +1398,7 @@ base_url = "https://example.invalid/v1"
         ));
         record.approvals.lock().unwrap().insert(
             "call_1".into(),
-            PendingApproval::new(pending_request("run_1", "call_1")),
+            PendingApproval::new("session_1".into(), pending_request("run_1", "call_1")),
         );
         server.runtime.reserve_run(record.clone()).unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1653,6 +1654,140 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         stream.shutdown(std::net::Shutdown::Write).unwrap();
         handle.join().unwrap();
         let _provider_request = provider.handle.join().unwrap();
+    }
+
+    #[test]
+    fn shell_session_grant_is_session_scoped_daemon_lifetime_and_records_exact_actors() {
+        let provider = spawn_shell_run_sequence_provider(&[
+            "printf once > session-shell.txt",
+            "printf session >> session-shell.txt",
+            "printf repeat >> session-shell.txt",
+            "printf other >> other-shell.txt",
+            "printf restart >> restart-shell.txt",
+        ]);
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let config_path = workspace.path().join("plato.toml");
+        write_provider_config(&config_path, &provider.base_url, SHELL_EXEC);
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+
+        let first = start_test_run(&server, &config_path, "allow once");
+        let session_id = first.session_id.clone();
+        wait_for_pending_call(&server, &first.run_id, "call_1");
+        let allowed_once = server.handle_line(&format!(
+            r#"{{"v":1,"id":"allow_once","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"grant"}}}}"#,
+            first.run_id
+        ));
+        assert_eq!(allowed_once.kind, EnvelopeKind::Response);
+        wait_for_finished_run(&server, &first.run_id);
+
+        let establishing = append_test_run(&server, &config_path, &session_id, "grant session");
+        wait_for_pending_call(&server, &establishing.run_id, "call_1");
+        let granted_session = server.handle_line(&format!(
+            r#"{{"v":1,"id":"grant_session","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"grant_session"}}}}"#,
+            establishing.run_id
+        ));
+        assert_eq!(granted_session.kind, EnvelopeKind::Response);
+        wait_for_finished_run(&server, &establishing.run_id);
+
+        let status = server.handle_line(&format!(
+            r#"{{"v":1,"id":"status_granted","kind":"request","method":"daemon.status","params":{{"session_id":"{session_id}","config_path":"{}"}}}}"#,
+            config_path.display()
+        ));
+        assert_eq!(status.kind, EnvelopeKind::Response);
+        assert_eq!(status.result.unwrap()["trust"]["shell_session_grant"], true);
+
+        let repeated = append_test_run(&server, &config_path, &session_id, "repeat shell");
+        assert_run_finishes_without_pending_approval(&server, &repeated.run_id);
+
+        let different = start_test_run(&server, &config_path, "different session");
+        assert_ne!(different.session_id, session_id);
+        wait_for_pending_call(&server, &different.run_id, "call_1");
+        let other_status = server.handle_line(&format!(
+            r#"{{"v":1,"id":"status_other","kind":"request","method":"daemon.status","params":{{"session_id":"{}","config_path":"{}"}}}}"#,
+            different.session_id,
+            config_path.display()
+        ));
+        assert_eq!(other_status.kind, EnvelopeKind::Response);
+        assert_eq!(
+            other_status.result.unwrap()["trust"]["shell_session_grant"],
+            false
+        );
+        let denied = server.handle_line(&format!(
+            r#"{{"v":1,"id":"deny_other","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"deny","reason":"not this session"}}}}"#,
+            different.run_id
+        ));
+        assert_eq!(denied.kind, EnvelopeKind::Response);
+        wait_for_finished_run(&server, &different.run_id);
+        assert_run_denial_facts(
+            &server.paths().ledger_path,
+            &different.run_id,
+            "daemon",
+            "not this session",
+        );
+
+        let transcript = server.handle_line(&format!(
+            r#"{{"v":1,"id":"transcript_actors","kind":"request","method":"transcript.read","params":{{"session_id":"{session_id}"}}}}"#
+        ));
+        let typed: TypedTranscript =
+            serde_json::from_value(transcript.result.unwrap()["typed"].clone()).unwrap();
+        let actors = typed
+            .runs
+            .iter()
+            .flat_map(|run| &run.entries)
+            .filter_map(|entry| match entry {
+                TypedTranscriptEntry::Approval { actor_id, .. } => Some(actor_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actors, vec!["daemon", "tui_session_grant", "session_grant"]);
+
+        let ledger_path = server.paths().ledger_path.clone();
+        assert_run_approval_facts(&ledger_path, &first.run_id, "daemon");
+        assert_run_approval_facts(&ledger_path, &establishing.run_id, "tui_session_grant");
+        assert_run_approval_facts(&ledger_path, &repeated.run_id, "session_grant");
+        let replay = crate::replay::replay_sqlite(&ledger_path, Some(&repeated.run_id)).unwrap();
+        assert!(replay.contains("approval_granted call_1 by session_grant"));
+
+        drop(server);
+        let restarted = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let after_restart = append_test_run(
+            &restarted,
+            &config_path,
+            &session_id,
+            "restart expires grant",
+        );
+        wait_for_pending_call(&restarted, &after_restart.run_id, "call_1");
+        let restarted_status = restarted.handle_line(&format!(
+            r#"{{"v":1,"id":"status_restarted","kind":"request","method":"daemon.status","params":{{"session_id":"{session_id}","config_path":"{}"}}}}"#,
+            config_path.display()
+        ));
+        assert_eq!(restarted_status.kind, EnvelopeKind::Response);
+        assert_eq!(
+            restarted_status.result.unwrap()["trust"]["shell_session_grant"],
+            false
+        );
+        let denied = restarted.handle_line(&format!(
+            r#"{{"v":1,"id":"deny_restarted","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"deny"}}}}"#,
+            after_restart.run_id
+        ));
+        assert_eq!(denied.kind, EnvelopeKind::Response);
+        wait_for_finished_run(&restarted, &after_restart.run_id);
+        assert_run_denial_facts(
+            &restarted.paths().ledger_path,
+            &after_restart.run_id,
+            "daemon",
+            "approval denied by daemon client",
+        );
+
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("session-shell.txt")).unwrap(),
+            "oncesessionrepeat"
+        );
+        assert!(!workspace.path().join("other-shell.txt").exists());
+        assert!(!workspace.path().join("restart-shell.txt").exists());
+        assert_eq!(provider.handle.join().unwrap().len(), 10);
     }
 
     #[test]
@@ -2555,7 +2690,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         ));
         record.approvals.lock().unwrap().insert(
             "call_1".into(),
-            PendingApproval::new(pending_request("run_1", "call_1")),
+            PendingApproval::new("session_1".into(), pending_request("run_1", "call_1")),
         );
         server
             .runtime
@@ -2586,10 +2721,19 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(
-            record.approvals.lock().unwrap()["call_1"].decision,
-            Some(ApprovalOutcome::Granted)
+            record.approvals.lock().unwrap()["call_1"]
+                .decision
+                .as_ref()
+                .map(|decision| decision.decision),
+            Some(crate::daemon::protocol::ApprovalDecision::Grant)
         );
         assert_eq!(record.pending_approval(), None);
+
+        let duplicate = server.handle_line(
+            r#"{"v":1,"id":"approval_duplicate","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"grant"}}"#,
+        );
+        assert_eq!(duplicate.kind, EnvelopeKind::Response);
+        assert_eq!(server.runtime.session_tool_grant_count(), 0);
 
         let stale = server.handle_line(
             r#"{"v":1,"id":"approval_2","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"deny","reason":"too late"}}"#,
@@ -2597,26 +2741,36 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(stale.kind, EnvelopeKind::Error);
         assert_eq!(stale.error.unwrap().code, ERROR_NOT_FOUND);
         assert_eq!(
-            record.approvals.lock().unwrap()["call_1"].decision,
-            Some(ApprovalOutcome::Granted)
+            record.approvals.lock().unwrap()["call_1"]
+                .decision
+                .as_ref()
+                .map(|decision| decision.decision),
+            Some(crate::daemon::protocol::ApprovalDecision::Grant)
         );
         assert_eq!(record.pending_approval(), None);
 
         record.approvals.lock().unwrap().insert(
             "call_2".into(),
-            PendingApproval::new(pending_request("run_1", "call_2")),
+            PendingApproval::new("session_1".into(), pending_request("run_1", "call_2")),
         );
         let denied = server.handle_line(
             r#"{"v":1,"id":"approval_3","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_2","decision":"deny"}}"#,
         );
         assert_eq!(denied.kind, EnvelopeKind::Response);
         assert_eq!(
-            record.approvals.lock().unwrap()["call_2"].decision,
-            Some(ApprovalOutcome::Denied {
-                reason: "approval denied by daemon client".into()
-            })
+            record.approvals.lock().unwrap()["call_2"]
+                .decision
+                .as_ref()
+                .map(|decision| decision.decision),
+            Some(crate::daemon::protocol::ApprovalDecision::Deny)
         );
         assert_eq!(record.pending_approval(), None);
+
+        let duplicate = server.handle_line(
+            r#"{"v":1,"id":"approval_4","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_2","decision":"deny"}}"#,
+        );
+        assert_eq!(duplicate.kind, EnvelopeKind::Response);
+        assert_eq!(server.runtime.session_tool_grant_count(), 0);
     }
 
     #[test]
@@ -2640,7 +2794,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let mut approvals = record.approvals.lock().unwrap();
         approvals.insert(
             "call_1".into(),
-            PendingApproval::new(pending_request("run_1", "call_1")),
+            PendingApproval::new("session_1".into(), pending_request("run_1", "call_1")),
         );
         let (sender, receiver) = mpsc::channel();
         let (started_sender, started_receiver) = mpsc::channel();
@@ -3020,6 +3174,11 @@ enabled = ["file.read"]
         handle: thread::JoinHandle<Vec<String>>,
     }
 
+    struct ShellRunSequenceProvider {
+        base_url: String,
+        handle: thread::JoinHandle<Vec<String>>,
+    }
+
     struct StalledTextProvider {
         base_url: String,
         ready_receiver: mpsc::Receiver<()>,
@@ -3073,6 +3232,80 @@ enabled = ["{enabled_tool}"]
             request
         });
         ToolCallProvider { base_url, handle }
+    }
+
+    fn spawn_shell_run_sequence_provider(commands: &[&str]) -> ShellRunSequenceProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let commands = commands
+            .iter()
+            .map(|command| command.to_string())
+            .collect::<Vec<_>>();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (index, command) in commands.into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().unwrap();
+                requests.push(read_http_request(&mut stream));
+                let tool_delta = json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": format!("provider_shell_{index}"),
+                                "function": {
+                                    "name": "shell_exec",
+                                    "arguments": json!({"command": command}).to_string()
+                                }
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                });
+                let tool_finish = json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "tool_calls"
+                    }]
+                });
+                let body = format!("data: {tool_delta}\n\ndata: {tool_finish}\n\ndata: [DONE]\n\n");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+
+                let (mut stream, _) = listener.accept().unwrap();
+                requests.push(read_http_request(&mut stream));
+                let content = json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": "done"},
+                        "finish_reason": null
+                    }]
+                });
+                let finish = json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                });
+                let body = format!("data: {content}\n\ndata: {finish}\n\ndata: [DONE]\n\n");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+            requests
+        });
+        ShellRunSequenceProvider { base_url, handle }
     }
 
     fn spawn_text_provider(answer: &str) -> TextProvider {
@@ -3232,6 +3465,125 @@ enabled = ["{enabled_tool}"]
             assert!(Instant::now() < deadline, "run {run_id} did not finish");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn start_test_run(server: &DaemonServer, config_path: &Path, question: &str) -> RunStartResult {
+        let response = server.handle_line(&format!(
+            r#"{{"v":1,"id":"start","kind":"request","method":"run.start","params":{{"question":"{question}","config_path":"{}"}}}}"#,
+            config_path.display()
+        ));
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        serde_json::from_value(response.result.unwrap()).unwrap()
+    }
+
+    fn append_test_run(
+        server: &DaemonServer,
+        config_path: &Path,
+        session_id: &str,
+        message: &str,
+    ) -> RunStartResult {
+        let response = server.handle_line(&format!(
+            r#"{{"v":1,"id":"append","kind":"request","method":"message.append","params":{{"session_id":"{session_id}","message":"{message}","config_path":"{}"}}}}"#,
+            config_path.display()
+        ));
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        serde_json::from_value(response.result.unwrap()).unwrap()
+    }
+
+    fn wait_for_pending_call(server: &DaemonServer, run_id: &str, call_id: &str) {
+        let record = server.runtime.state.lock().unwrap().runs[run_id].clone();
+        let deadline = Instant::now() + FAKE_PROVIDER_TIMEOUT;
+        loop {
+            if record
+                .pending_approval()
+                .is_some_and(|pending| pending.tool_call_id == call_id)
+            {
+                return;
+            }
+            assert_eq!(record.status().state, RunStateName::Running);
+            assert!(
+                Instant::now() < deadline,
+                "run {run_id} did not publish pending approval {call_id}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn assert_run_finishes_without_pending_approval(server: &DaemonServer, run_id: &str) {
+        let record = server.runtime.state.lock().unwrap().runs[run_id].clone();
+        let deadline = Instant::now() + FAKE_PROVIDER_TIMEOUT;
+        loop {
+            assert_eq!(record.pending_approval(), None, "run {run_id} prompted");
+            match record.status().state {
+                RunStateName::Finished => return,
+                RunStateName::Running => {}
+                status => panic!("run {run_id} ended as {status}"),
+            }
+            assert!(Instant::now() < deadline, "run {run_id} did not finish");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn assert_run_approval_facts(ledger_path: &Path, run_id: &str, actor: &str) {
+        let records = crate::ledger::read_sqlite_records(ledger_path, Some(run_id)).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    HarnessEvent::PolicyEvaluated {
+                        call_id,
+                        decision: platonic_core::PolicyDecision::RequireApproval { reason },
+                        ..
+                    } => Some((call_id.as_str(), reason.as_str())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![("call_1", "shell.exec requires explicit local approval")]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    HarnessEvent::ApprovalGranted {
+                        call_id, actor_id, ..
+                    } => Some((call_id.as_str(), actor_id.as_str())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![("call_1", actor)]
+        );
+    }
+
+    fn assert_run_denial_facts(ledger_path: &Path, run_id: &str, actor: &str, reason: &str) {
+        let records = crate::ledger::read_sqlite_records(ledger_path, Some(run_id)).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(
+                    record.event,
+                    HarnessEvent::PolicyEvaluated {
+                        decision: platonic_core::PolicyDecision::RequireApproval { .. },
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    HarnessEvent::ApprovalDenied {
+                        call_id,
+                        actor_id,
+                        reason,
+                        ..
+                    } => Some((call_id.as_str(), actor_id.as_str(), reason.as_str())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![("call_1", actor, reason)]
+        );
     }
 
     fn assert_canceled_terminal(server: &DaemonServer, record: &RunRecord) {

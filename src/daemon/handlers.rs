@@ -1,5 +1,6 @@
 use crate::{
     AppError, AppResult, ApprovalMode, RunEvent, RunLedger, RunOptions, RunOutcome, RunSession,
+    app::ExternalApprovalOutcome,
     config::{Config, ProviderKind},
     daemon::{
         protocol::{
@@ -29,9 +30,9 @@ use crate::{
     paths::DefaultSqlitePath,
     replay::{format_readback, format_session_readback},
     run_question,
-    tools::ApprovalOutcome,
+    tool_catalog::SHELL_EXEC,
 };
-use platonic_core::{HarnessEvent, ReadbackEntry, RecordedEvent, RunReadback};
+use platonic_core::{EffectClass, HarnessEvent, ReadbackEntry, RecordedEvent, RunReadback};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering, mpsc},
@@ -188,6 +189,7 @@ fn daemon_status(
             let trust = DaemonStatusTrust {
                 approval_granted_count: status.approval_granted_count,
                 approval_denied_count: status.approval_denied_count,
+                shell_session_grant: runtime.has_shell_session_grant(&status.session_id),
             };
             let session = DaemonStatusSession {
                 session_id: Some(status.session_id),
@@ -439,7 +441,10 @@ fn start_run(
         overrides,
         ledger: RunLedger::DefaultSqlite(runtime.paths.default_ledger()),
         workspace_root: runtime.paths.workspace_root.clone(),
-        approval_mode: ApprovalMode::external("daemon", approval_handler(record.clone())),
+        approval_mode: ApprovalMode::external_with_actor(
+            "daemon",
+            approval_handler(runtime.clone(), record.clone()),
+        ),
         run_id: Some(run_id),
         session: Some(session),
         event_sender: Some(event_sender),
@@ -620,7 +625,8 @@ fn handle_approval_decide(
         Err(error) => return error_response(request.id, "approval.decide", error),
     };
     let mut approvals = record.approvals.lock().expect("approvals lock poisoned");
-    if record.cancel.load(Ordering::SeqCst) {
+    let status = record.status.lock().expect("run status lock poisoned");
+    if record.cancel.load(Ordering::SeqCst) || status.state != RunStateName::Running {
         return Envelope::error(
             request.id,
             Some("approval.decide".into()),
@@ -639,7 +645,10 @@ fn handle_approval_decide(
             );
         }
     };
-    if pending.decision.is_some() {
+    if pending.request.run_id.as_str() != record.run_id
+        || pending.session_id != record.session_id
+        || pending.request.call_id.as_str() != params.tool_call_id
+    {
         return Envelope::error(
             request.id,
             Some("approval.decide".into()),
@@ -647,15 +656,55 @@ fn handle_approval_decide(
             format!("pending approval not found: {}", params.tool_call_id),
         );
     }
-    pending.decision = Some(match params.decision {
-        ApprovalDecision::Grant => ApprovalOutcome::Granted,
-        ApprovalDecision::Deny => ApprovalOutcome::Denied {
+    if let Some(existing) = &pending.decision {
+        if existing.decision == params.decision {
+            return Envelope::response_from(
+                request.id,
+                Some("approval.decide".into()),
+                CommandAcceptedResult {
+                    run_id: record.run_id.clone(),
+                    status: status.state,
+                },
+            );
+        }
+        return Envelope::error(
+            request.id,
+            Some("approval.decide".into()),
+            ERROR_NOT_FOUND,
+            format!("pending approval not found: {}", params.tool_call_id),
+        );
+    }
+    let outcome = match params.decision {
+        ApprovalDecision::Grant => ExternalApprovalOutcome::Granted { actor: "daemon" },
+        ApprovalDecision::GrantSession => {
+            if pending.request.tool_name != SHELL_EXEC
+                || pending.request.effect != EffectClass::ExternalSideEffect
+            {
+                return Envelope::error(
+                    request.id,
+                    Some("approval.decide".into()),
+                    ERROR_NOT_FOUND,
+                    format!("pending approval not found: {}", params.tool_call_id),
+                );
+            }
+            runtime.install_shell_session_grant(&record.session_id);
+            ExternalApprovalOutcome::Granted {
+                actor: "tui_session_grant",
+            }
+        }
+        ApprovalDecision::Deny => ExternalApprovalOutcome::Denied {
+            actor: "daemon",
             reason: params
                 .reason
                 .unwrap_or_else(|| "approval denied by daemon client".into()),
         },
+    };
+    pending.decision = Some(crate::daemon::runtime::PendingApprovalDecision {
+        decision: params.decision,
+        outcome,
     });
     record.approval_changed.notify_all();
+    drop(status);
     drop(approvals);
     Envelope::response_from(
         request.id,
@@ -686,7 +735,7 @@ fn handle_run_cancel(
                 record.push_event(StreamEvent::Canceled {
                     run_id: record.run_id.clone(),
                 });
-                approvals.clear();
+                approvals.retain(|_, pending| pending.decision.is_some());
                 record.approval_changed.notify_all();
             }
             RunStateName::CancelRequested => {}
@@ -1076,7 +1125,10 @@ fn error_response(request_id: Option<String>, method: &'static str, message: Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AssistantDeltaEvent;
+    use crate::{
+        ApprovalRequest, AssistantDeltaEvent,
+        daemon::runtime::{PendingApproval, PendingApprovalDecision},
+    };
     use platonic_core::{
         ActorId, ContextFragment, ContextLane, EffectClass, HarnessEvent, Message, MessageRole,
         ModelName, RecordedEvent, ResultVisibility, RunId, ToolCall, ToolCallId, ToolName,
@@ -1312,6 +1364,317 @@ mod tests {
     }
 
     #[test]
+    fn grant_session_is_exact_idempotent_and_fail_closed_before_installation() {
+        for (case, tool_name, effect) in [
+            ("file_write", "file.write", EffectClass::WorkspaceWrite),
+            ("shell_network", SHELL_EXEC, EffectClass::Network),
+            ("shell_secret", SHELL_EXEC, EffectClass::SecretAccess),
+            ("shell_write", SHELL_EXEC, EffectClass::WorkspaceWrite),
+            (
+                "computer",
+                "computer.click",
+                EffectClass::ExternalSideEffect,
+            ),
+            ("unknown", "unknown.tool", EffectClass::ExternalSideEffect),
+        ] {
+            let runtime = test_runtime();
+            let record = test_run_record(case);
+            record.approvals.lock().unwrap().insert(
+                "call_1".into(),
+                PendingApproval::new(
+                    record.session_id.clone(),
+                    test_approval_request(&record.run_id, "call_1", tool_name, effect),
+                ),
+            );
+            runtime.reserve_run(record.clone()).unwrap();
+
+            let response = decide_session_grant(&runtime, case, &record.run_id, "call_1");
+
+            assert_eq!(response.kind, crate::daemon::protocol::EnvelopeKind::Error);
+            assert_eq!(response.error.unwrap().code, ERROR_NOT_FOUND);
+            assert_eq!(runtime.session_tool_grant_count(), 0);
+            assert_eq!(record.approvals.lock().unwrap()["call_1"].decision, None);
+        }
+
+        let runtime = test_runtime();
+        let record = test_run_record("exact");
+        record.approvals.lock().unwrap().insert(
+            "call_1".into(),
+            PendingApproval::new(
+                record.session_id.clone(),
+                test_approval_request(
+                    &record.run_id,
+                    "call_1",
+                    SHELL_EXEC,
+                    EffectClass::ExternalSideEffect,
+                ),
+            ),
+        );
+        runtime.reserve_run(record.clone()).unwrap();
+
+        record
+            .approvals
+            .lock()
+            .unwrap()
+            .get_mut("call_1")
+            .unwrap()
+            .session_id = "session_other".into();
+        let mismatched_session =
+            decide_session_grant(&runtime, "wrong_session", &record.run_id, "call_1");
+        assert_eq!(
+            mismatched_session.kind,
+            crate::daemon::protocol::EnvelopeKind::Error
+        );
+        assert_eq!(runtime.session_tool_grant_count(), 0);
+        assert_eq!(record.approvals.lock().unwrap()["call_1"].decision, None);
+        record
+            .approvals
+            .lock()
+            .unwrap()
+            .get_mut("call_1")
+            .unwrap()
+            .session_id = record.session_id.clone();
+
+        let mismatched_run = decide_session_grant(&runtime, "wrong_run", "run_missing", "call_1");
+        let mismatched_call =
+            decide_session_grant(&runtime, "wrong_call", &record.run_id, "call_missing");
+        assert_eq!(
+            mismatched_run.kind,
+            crate::daemon::protocol::EnvelopeKind::Error
+        );
+        assert_eq!(
+            mismatched_call.kind,
+            crate::daemon::protocol::EnvelopeKind::Error
+        );
+        assert_eq!(runtime.session_tool_grant_count(), 0);
+        assert_eq!(record.approvals.lock().unwrap()["call_1"].decision, None);
+
+        let first = decide_session_grant(&runtime, "first", &record.run_id, "call_1");
+        let duplicate = decide_session_grant(&runtime, "duplicate", &record.run_id, "call_1");
+        assert_eq!(first.kind, crate::daemon::protocol::EnvelopeKind::Response);
+        assert_eq!(
+            duplicate.kind,
+            crate::daemon::protocol::EnvelopeKind::Response
+        );
+        assert_eq!(runtime.session_tool_grant_count(), 1);
+        assert!(runtime.has_shell_session_grant(&record.session_id));
+        assert!(!runtime.has_shell_session_grant("session_other"));
+        assert_eq!(
+            record.approvals.lock().unwrap()["call_1"].decision,
+            Some(PendingApprovalDecision {
+                decision: ApprovalDecision::GrantSession,
+                outcome: ExternalApprovalOutcome::Granted {
+                    actor: "tui_session_grant"
+                },
+            })
+        );
+
+        let conflicting = handle_line(
+            &runtime,
+            &format!(
+                r#"{{"v":1,"id":"conflicting","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"deny"}}}}"#,
+                record.run_id
+            ),
+        );
+        assert_eq!(
+            conflicting.kind,
+            crate::daemon::protocol::EnvelopeKind::Error
+        );
+        assert_eq!(runtime.session_tool_grant_count(), 1);
+        assert_eq!(
+            record.approvals.lock().unwrap()["call_1"]
+                .decision
+                .as_ref()
+                .map(|decision| decision.decision),
+            Some(ApprovalDecision::GrantSession)
+        );
+    }
+
+    #[test]
+    fn canceled_and_terminal_session_grants_reject_before_mutation() {
+        for (case, state, canceled) in [
+            ("cancel_requested", RunStateName::CancelRequested, true),
+            ("finished", RunStateName::Finished, false),
+            ("failed", RunStateName::Failed, false),
+            ("canceled", RunStateName::Canceled, true),
+            ("interrupted", RunStateName::Interrupted, false),
+        ] {
+            let runtime = test_runtime();
+            let record = test_run_record(case);
+            record.approvals.lock().unwrap().insert(
+                "call_1".into(),
+                PendingApproval::new(
+                    record.session_id.clone(),
+                    test_approval_request(
+                        &record.run_id,
+                        "call_1",
+                        SHELL_EXEC,
+                        EffectClass::ExternalSideEffect,
+                    ),
+                ),
+            );
+            record.status.lock().unwrap().state = state;
+            record.cancel.store(canceled, Ordering::SeqCst);
+            runtime
+                .state
+                .lock()
+                .unwrap()
+                .runs
+                .insert(record.run_id.clone(), record.clone());
+
+            let response = decide_session_grant(&runtime, case, &record.run_id, "call_1");
+
+            assert_eq!(response.kind, crate::daemon::protocol::EnvelopeKind::Error);
+            assert_eq!(response.error.unwrap().code, ERROR_NOT_FOUND);
+            assert_eq!(runtime.session_tool_grant_count(), 0);
+            assert_eq!(record.approvals.lock().unwrap()["call_1"].decision, None);
+        }
+    }
+
+    #[test]
+    fn session_grant_decision_linearizes_before_concurrent_cancel_without_lost_wakeup() {
+        let runtime = test_runtime();
+        let record = test_run_record("grant_cancel");
+        runtime.reserve_run(record.clone()).unwrap();
+        let waiter = spawn_shell_approval_waiter(&runtime, &record);
+        wait_for_pending_approval(&record);
+
+        let install_reached = Arc::new(Barrier::new(2));
+        let install_release = Arc::new(Barrier::new(2));
+        runtime
+            .set_session_grant_install_barriers(install_reached.clone(), install_release.clone());
+        let decision_runtime = runtime.clone();
+        let decision_run_id = record.run_id.clone();
+        let (decision_sender, decision_receiver) = mpsc::channel();
+        let decision = thread::spawn(move || {
+            decision_sender
+                .send(decide_session_grant(
+                    &decision_runtime,
+                    "grant_cancel",
+                    &decision_run_id,
+                    "call_1",
+                ))
+                .unwrap();
+        });
+        install_reached.wait();
+
+        let cancel_runtime = runtime.clone();
+        let cancel_run_id = record.run_id.clone();
+        let (cancel_sender, cancel_receiver) = mpsc::channel();
+        let cancel = thread::spawn(move || {
+            cancel_sender
+                .send(cancel_run(&cancel_runtime, "cancel_race", &cancel_run_id))
+                .unwrap();
+        });
+        assert!(matches!(
+            cancel_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        install_release.wait();
+
+        let decision_response = decision_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let cancel_response = cancel_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        decision.join().unwrap();
+        cancel.join().unwrap();
+        assert_eq!(
+            decision_response.kind,
+            crate::daemon::protocol::EnvelopeKind::Response
+        );
+        assert_eq!(
+            cancel_response.kind,
+            crate::daemon::protocol::EnvelopeKind::Response
+        );
+        assert_eq!(
+            waiter.join().unwrap(),
+            ExternalApprovalOutcome::Granted {
+                actor: "tui_session_grant"
+            }
+        );
+        assert_eq!(runtime.session_tool_grant_count(), 1);
+        assert_eq!(record.status().state, RunStateName::CancelRequested);
+        assert_eq!(
+            record.approvals.lock().unwrap()["call_1"]
+                .decision
+                .as_ref()
+                .map(|decision| decision.decision),
+            Some(ApprovalDecision::GrantSession)
+        );
+    }
+
+    #[test]
+    fn session_grant_decision_linearizes_before_concurrent_terminal_without_lost_wakeup() {
+        let runtime = test_runtime();
+        let record = test_run_record("grant_terminal");
+        runtime.reserve_run(record.clone()).unwrap();
+        let waiter = spawn_shell_approval_waiter(&runtime, &record);
+        wait_for_pending_approval(&record);
+
+        let install_reached = Arc::new(Barrier::new(2));
+        let install_release = Arc::new(Barrier::new(2));
+        runtime
+            .set_session_grant_install_barriers(install_reached.clone(), install_release.clone());
+        let decision_runtime = runtime.clone();
+        let decision_run_id = record.run_id.clone();
+        let (decision_sender, decision_receiver) = mpsc::channel();
+        let decision = thread::spawn(move || {
+            decision_sender
+                .send(decide_session_grant(
+                    &decision_runtime,
+                    "grant_terminal",
+                    &decision_run_id,
+                    "call_1",
+                ))
+                .unwrap();
+        });
+        install_reached.wait();
+
+        let finish_runtime = runtime.clone();
+        let finish_record = record.clone();
+        let (finish_sender, finish_receiver) = mpsc::channel();
+        let finisher = thread::spawn(move || {
+            finish_runtime.finish_run(&finish_record, "done".into());
+            finish_sender.send(()).unwrap();
+        });
+        assert!(matches!(
+            finish_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        install_release.wait();
+
+        let decision_response = decision_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        finish_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        decision.join().unwrap();
+        finisher.join().unwrap();
+        assert_eq!(
+            decision_response.kind,
+            crate::daemon::protocol::EnvelopeKind::Response
+        );
+        assert_eq!(
+            waiter.join().unwrap(),
+            ExternalApprovalOutcome::Granted {
+                actor: "tui_session_grant"
+            }
+        );
+        assert_eq!(runtime.session_tool_grant_count(), 1);
+        assert_eq!(record.status().state, RunStateName::Finished);
+        assert_eq!(
+            record.approvals.lock().unwrap()["call_1"]
+                .decision
+                .as_ref()
+                .map(|decision| decision.decision),
+            Some(ApprovalDecision::GrantSession)
+        );
+    }
+
+    #[test]
     fn run_cancel_and_finish_linearize_in_both_barrier_schedules() {
         let cancel_first_runtime = test_runtime();
         let cancel_first_record = test_run_record("cancel_first");
@@ -1526,6 +1889,63 @@ mod tests {
                 r#"{{"v":1,"id":"{request_id}","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
             ),
         )
+    }
+
+    fn decide_session_grant(
+        runtime: &DaemonRuntime,
+        request_id: &str,
+        run_id: &str,
+        call_id: &str,
+    ) -> Envelope {
+        handle_line(
+            runtime,
+            &format!(
+                r#"{{"v":1,"id":"{request_id}","kind":"request","method":"approval.decide","params":{{"run_id":"{run_id}","tool_call_id":"{call_id}","decision":"grant_session"}}}}"#
+            ),
+        )
+    }
+
+    fn test_approval_request(
+        run_id: &str,
+        call_id: &str,
+        tool_name: &str,
+        effect: EffectClass,
+    ) -> ApprovalRequest {
+        ApprovalRequest {
+            run_id: RunId::new(run_id).unwrap(),
+            call_id: ToolCallId::new(call_id).unwrap(),
+            tool_name: tool_name.into(),
+            effect,
+            reason: "test approval required".into(),
+            input_preview: Some("{}".into()),
+            approval_preview: None,
+            diff_preview: None,
+        }
+    }
+
+    fn spawn_shell_approval_waiter(
+        runtime: &DaemonRuntime,
+        record: &Arc<RunRecord>,
+    ) -> thread::JoinHandle<ExternalApprovalOutcome> {
+        let decide = approval_handler(runtime.clone(), record.clone());
+        let request = test_approval_request(
+            &record.run_id,
+            "call_1",
+            SHELL_EXEC,
+            EffectClass::ExternalSideEffect,
+        );
+        thread::spawn(move || decide(request).unwrap())
+    }
+
+    fn wait_for_pending_approval(record: &RunRecord) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while record.pending_approval().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "approval did not become pending"
+            );
+            thread::yield_now();
+        }
     }
 
     fn stream_run(runtime: &DaemonRuntime, request_id: &str, run_id: &str) -> EventsStreamResult {

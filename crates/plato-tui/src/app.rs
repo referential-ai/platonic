@@ -1,4 +1,4 @@
-use crate::{TranscriptState, TuiState, render, render_snapshot};
+use crate::{ApprovalModalView, TranscriptState, TuiState, render, render_snapshot};
 use crossterm::{
     SynchronizedUpdate,
     event::{
@@ -292,7 +292,19 @@ fn handle_key_press(
             KeyCode::Char('q') => return false,
             KeyCode::Esc => return request_cancel(commands, state),
             KeyCode::Char('g') => decide_approval(commands, state, ApprovalAction::Grant),
+            KeyCode::Char('s')
+                if state
+                    .approval
+                    .as_ref()
+                    .is_some_and(ApprovalModalView::can_grant_shell_session) =>
+            {
+                decide_approval(commands, state, ApprovalAction::GrantSession)
+            }
             KeyCode::Char('d') => decide_approval(commands, state, ApprovalAction::Deny),
+            KeyCode::Up => state.scroll_approval_up(1),
+            KeyCode::Down => state.scroll_approval_down(1),
+            KeyCode::PageUp => state.scroll_approval_up(SCROLL_PAGE_LINES),
+            KeyCode::PageDown => state.scroll_approval_down(SCROLL_PAGE_LINES),
             _ => {}
         }
         return true;
@@ -706,6 +718,7 @@ fn scroll_history_down(state: &mut TuiState) {
 
 enum ApprovalAction {
     Grant,
+    GrantSession,
     Deny,
 }
 
@@ -718,6 +731,10 @@ fn decide_approval(commands: &Sender<ClientCommand>, state: &mut TuiState, actio
             run_id: approval.run_id.clone(),
             tool_call_id: approval.tool_call_id.clone(),
         },
+        ApprovalAction::GrantSession => ClientCommand::ApprovalGrantSession {
+            run_id: approval.run_id.clone(),
+            tool_call_id: approval.tool_call_id.clone(),
+        },
         ApprovalAction::Deny => ClientCommand::ApprovalDeny {
             run_id: approval.run_id.clone(),
             tool_call_id: approval.tool_call_id.clone(),
@@ -726,6 +743,9 @@ fn decide_approval(commands: &Sender<ClientCommand>, state: &mut TuiState, actio
     };
     state.status_message = Some(match action {
         ApprovalAction::Grant => format!("grant sent for {}", approval.tool_call_id),
+        ApprovalAction::GrantSession => {
+            format!("session grant sent for {}", approval.tool_call_id)
+        }
         ApprovalAction::Deny => format!("deny sent for {}", approval.tool_call_id),
     });
     send_command(commands, command, state);
@@ -3184,6 +3204,81 @@ mod tests {
     }
 
     #[test]
+    fn approval_session_key_is_shell_only_and_scroll_keys_do_not_change_actions() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, None);
+        state.approval = Some(crate::ApprovalModalView {
+            run_id: "run_1".into(),
+            tool_call_id: "call_1".into(),
+            tool_name: "file.write".into(),
+            effect: "workspace_write".into(),
+            reason: "requires approval".into(),
+            input_preview: "{}".into(),
+            approval_preview: None,
+            diff_preview: None,
+        });
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(state.approval_scroll_offset, 0);
+
+        for (key, expected_offset) in [
+            (KeyCode::Down, 1),
+            (KeyCode::PageDown, 1 + SCROLL_PAGE_LINES),
+            (KeyCode::Up, SCROLL_PAGE_LINES),
+            (KeyCode::PageUp, 0),
+        ] {
+            assert!(press_key(
+                KeyEvent::new(key, KeyModifiers::NONE),
+                &mut state,
+                &runtime,
+                &sender,
+            ));
+            assert_eq!(state.approval_scroll_offset, expected_offset);
+            assert!(receiver.try_recv().is_err());
+        }
+
+        state.approval = Some(crate::ApprovalModalView {
+            run_id: "run_shell".into(),
+            tool_call_id: "call_shell".into(),
+            tool_name: "shell.exec".into(),
+            effect: "external_side_effect".into(),
+            reason: "requires approval".into(),
+            input_preview: r#"{"command":"cargo test"}"#.into(),
+            approval_preview: Some("command: cargo test".into()),
+            diff_preview: None,
+        });
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientCommand::ApprovalGrantSession {
+                run_id,
+                tool_call_id,
+            } if run_id == "run_shell" && tool_call_id == "call_shell"
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            state
+                .approval
+                .as_ref()
+                .map(|approval| approval.tool_call_id.as_str()),
+            Some("call_shell")
+        );
+    }
+
+    #[test]
     fn failed_grant_keeps_same_approval_retryable_until_success() {
         assert_failed_approval_retry(true);
     }
@@ -3264,7 +3359,7 @@ mod tests {
         assert_eq!(state.approval.as_ref(), Some(&approval));
         let failed = render_snapshot(&state, 100, 24).unwrap();
         assert!(failed.contains("call_retry"));
-        assert!(failed.contains("g grant"));
+        assert!(failed.contains("g allow once"));
         assert!(failed.contains("d deny"));
 
         decide_approval(

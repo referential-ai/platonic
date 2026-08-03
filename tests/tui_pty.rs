@@ -1,9 +1,13 @@
 #![cfg(unix)]
 
 use plato_agent::{
-    daemon::protocol::{ERROR_LAGGED, Envelope, EnvelopeKind, PROTOCOL_VERSION},
+    daemon::protocol::{
+        ERROR_LAGGED, Envelope, EnvelopeKind, PROTOCOL_VERSION, RunStateName,
+        ShutdownIfIdleResultName,
+    },
     paths,
 };
+use plato_daemon_client::client::{DaemonClient, DaemonConnectionConfig};
 use pty_process::{
     Size,
     blocking::{Command, Pty, open},
@@ -12,6 +16,7 @@ use serde_json::{Value, json};
 use std::{
     fs::{self, File},
     io::{BufRead, BufReader, ErrorKind, Read, Write},
+    net::TcpListener,
     os::{
         fd::AsFd,
         unix::net::{UnixListener, UnixStream},
@@ -483,7 +488,9 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
     assert!(approval_screen.contains("file.edit (workspace_write)"));
     assert!(approval_screen.contains("review the PTY edit"));
     assert!(approval_screen.contains("-old PTY"));
-    assert!(approval_screen.contains("+new PTY"));
+    shell.write(b"\x1b[6~");
+    let scrolled_approval = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "+new PTY");
+    assert!(scrolled_approval.contains("+new PTY"));
 
     fake.wait_for_request_count("events.stream", 2);
     let stream_requests = fake.requests_for("events.stream");
@@ -536,6 +543,177 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
             .count(),
         1
     );
+}
+
+#[test]
+fn bare_plato_shell_session_grant_flow_is_scoped_and_expires_on_daemon_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+    let provider = spawn_pty_shell_sequence_provider(&[
+        ("printf once > pty-session.txt", "done-once"),
+        ("printf session >> pty-session.txt", "done-session"),
+        ("printf repeat >> pty-session.txt", "done-repeat"),
+        ("printf other > pty-other.txt", "done-other"),
+        ("printf restart > pty-restart.txt", "done-restart"),
+    ]);
+    let config_path = root.path().join("test-plato.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "{}"
+timeout_ms = 5000
+
+[limits]
+token_budget = 100000
+max_output_tokens = 32
+max_turns = 2
+
+[tools]
+enabled = ["shell.exec"]
+"#,
+            provider.base_url
+        ),
+    )
+    .unwrap();
+
+    let workspace_id = paths::workspace_id(&workspace).unwrap();
+    let endpoint = runtime
+        .join("plato-agent")
+        .join("workspaces")
+        .join(&workspace_id)
+        .join("agent.sock");
+    let config = DaemonConnectionConfig::resolve(&workspace, Some(endpoint.clone())).unwrap();
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        format!(
+            "\"$PLATO_BIN\" --config \"{}\"; printf '\\n%sSTATUS1:%s\\n' \"$PTY_MARK\" \"$?\"\n",
+            config_path.display()
+        )
+        .as_bytes(),
+    );
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Plato Agent");
+
+    shell.write(b"allow once\r");
+    let allow_once = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "printf once");
+    assert!(allow_once.contains("g allow once"));
+    assert!(allow_once.contains("s allow shell.exec for session"));
+    assert!(allow_once.contains("d deny"));
+    shell.write(b"g");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "done-once");
+
+    shell.write(b"grant session\r");
+    let session = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "printf session");
+    assert!(session.contains("s allow shell.exec for session"));
+    shell.write(b"s");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "done-session");
+
+    shell.write(b"repeat shell\r");
+    let repeated = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "done-repeat");
+    assert!(!repeated.contains("Approval"));
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "online | ready");
+
+    shell.write(b"/new\r");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Plato Agent");
+    shell.write(b"different session\r");
+    let different = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "printf other");
+    assert!(different.contains("s allow shell.exec for session"));
+    shell.write(b"d");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "done-other");
+
+    let mut client = connect_pty_daemon(&config);
+    let session_id = wait_for_finished_session(&mut client, "allow once");
+    let other_session_id = wait_for_finished_session(&mut client, "different session");
+    assert_ne!(session_id, other_session_id);
+    assert!(
+        client
+            .daemon_status(
+                Some(session_id.clone()),
+                Some(config_path.to_string_lossy().into_owned()),
+            )
+            .unwrap()
+            .trust
+            .shell_session_grant
+    );
+    assert!(
+        !client
+            .daemon_status(
+                Some(other_session_id),
+                Some(config_path.to_string_lossy().into_owned()),
+            )
+            .unwrap()
+            .trust
+            .shell_session_grant
+    );
+
+    shell.write(b"q");
+    assert_eq!(shell.wait_for_marker("STATUS1"), "0");
+    assert_eq!(
+        client.shutdown_if_idle().unwrap().result,
+        ShutdownIfIdleResultName::Shutdown
+    );
+    wait_for_endpoint_removal(&endpoint);
+
+    shell.write(
+        format!(
+            "\"$PLATO_BIN\" --config \"{}\"; printf '\\n%sSTATUS2:%s\\n' \"$PTY_MARK\" \"$?\"\n",
+            config_path.display()
+        )
+        .as_bytes(),
+    );
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "different session");
+    shell.write(b"/sessions\r");
+    let picker = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Sessions");
+    assert!(picker.contains("allow once"));
+    assert!(picker.contains("different session"));
+    shell.write(b"\x1b[B\r");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "repeat shell");
+
+    shell.write(b"restart expires grant\r");
+    let restarted = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "printf restart");
+    assert!(restarted.contains("s allow shell.exec for session"));
+    let mut restarted_client = connect_pty_daemon(&config);
+    assert!(
+        !restarted_client
+            .daemon_status(
+                Some(session_id),
+                Some(config_path.to_string_lossy().into_owned()),
+            )
+            .unwrap()
+            .trust
+            .shell_session_grant
+    );
+    shell.write(b"d");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "done-restart");
+
+    shell.write(b"q");
+    assert_eq!(shell.wait_for_marker("STATUS2"), "0");
+    assert_eq!(
+        restarted_client.shutdown_if_idle().unwrap().result,
+        ShutdownIfIdleResultName::Shutdown
+    );
+    wait_for_endpoint_removal(&endpoint);
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+
+    assert_eq!(
+        fs::read_to_string(workspace.join("pty-session.txt")).unwrap(),
+        "oncesessionrepeat"
+    );
+    assert!(!workspace.join("pty-other.txt").exists());
+    assert!(!workspace.join("pty-restart.txt").exists());
+    assert_eq!(provider.handle.join().unwrap(), 10);
 }
 
 #[test]
@@ -1115,6 +1293,165 @@ fn assert_synchronized_frames(output: &[u8]) {
         }
     }
     assert_eq!(depth, 0, "synchronized frame was not closed");
+}
+
+struct PtyShellSequenceProvider {
+    base_url: String,
+    handle: JoinHandle<usize>,
+}
+
+fn spawn_pty_shell_sequence_provider(runs: &[(&str, &str)]) -> PtyShellSequenceProvider {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let runs = runs
+        .iter()
+        .map(|(command, answer)| (command.to_string(), answer.to_string()))
+        .collect::<Vec<_>>();
+    let handle = thread::spawn(move || {
+        let mut request_count = 0;
+        for (index, (command, answer)) in runs.into_iter().enumerate() {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_pty_provider_request(&mut stream);
+            request_count += 1;
+            let tool_delta = json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": format!("provider_pty_shell_{index}"),
+                            "function": {
+                                "name": "shell_exec",
+                                "arguments": json!({"command": command}).to_string()
+                            }
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            });
+            let tool_finish = json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }]
+            });
+            write_pty_provider_response(
+                &mut stream,
+                &format!("data: {tool_delta}\n\ndata: {tool_finish}\n\ndata: [DONE]\n\n"),
+            );
+
+            let (mut stream, _) = listener.accept().unwrap();
+            read_pty_provider_request(&mut stream);
+            request_count += 1;
+            let content = json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": answer},
+                    "finish_reason": null
+                }]
+            });
+            let finish = json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            });
+            write_pty_provider_response(
+                &mut stream,
+                &format!("data: {content}\n\ndata: {finish}\n\ndata: [DONE]\n\n"),
+            );
+        }
+        request_count
+    });
+    PtyShellSequenceProvider { base_url, handle }
+}
+
+fn read_pty_provider_request(stream: &mut std::net::TcpStream) {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    let header_end = loop {
+        let read = stream.read(&mut buffer).unwrap();
+        assert_ne!(read, 0, "provider client closed before headers");
+        bytes.extend_from_slice(&buffer[..read]);
+        if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Content-Length:")
+                .or_else(|| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+        })
+        .unwrap_or(0);
+    while bytes.len() < header_end + content_length {
+        let read = stream.read(&mut buffer).unwrap();
+        assert_ne!(read, 0, "provider client closed before body");
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+}
+
+fn write_pty_provider_response(stream: &mut std::net::TcpStream, body: &str) {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .unwrap();
+    stream.flush().unwrap();
+}
+
+fn connect_pty_daemon(config: &DaemonConnectionConfig) -> DaemonClient {
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    loop {
+        match DaemonClient::connect(&config.socket_path) {
+            Ok(client) => return client,
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "could not connect to PTY daemon: {error}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+fn wait_for_finished_session(client: &mut DaemonClient, first_question: &str) -> String {
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    loop {
+        if let Some(session) = client
+            .sessions_list()
+            .unwrap()
+            .into_iter()
+            .find(|session| session.first_question == first_question)
+            && session.status == RunStateName::Finished
+        {
+            return session.session_id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session {first_question:?} did not finish"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_endpoint_removal(endpoint: &Path) {
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    while endpoint.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "daemon endpoint remained after shutdown: {}",
+            endpoint.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

@@ -103,6 +103,10 @@ from errors are never returned. `shell.exec` runs from the workspace root with
 a scrubbed child environment, no provider credentials, bounded stdout/stderr,
 and a timeout. It uses `sh -c` on Unix and
 `cmd.exe /C` on Windows; timeout or cancellation terminates the full process tree.
+In the TUI, a pending `shell.exec` can be allowed once or allowed for the
+selected session until the daemon process exits. Later shell calls in that
+session retain their approval policy and ledger facts but do not prompt again;
+other sessions and restarted daemons prompt normally.
 Use `--yolo` to auto-approve enabled workspace-write tools that would otherwise
 prompt. Yolo mode does not enable disabled or unknown tools, approve network
 tools, permit deny-class effects such as external side effects or secret access,
@@ -547,7 +551,8 @@ is its explicit equivalent. It attaches to a serving workspace daemon or starts
 the sibling `plato-agentd` detached. Exiting the TUI leaves that daemon running.
 It renders a conversation-first transcript with distinct `You` and `Plato`
 messages, at most one subtle trace summary per run, one status row, a composer,
-session picker, and approval modal. Press `v` from an empty composer to toggle
+session picker, and a bounded approval pane above the composer. Press `v` from
+an empty composer to toggle
 the complete ordered audit view without reloading the session.
 Assistant messages render headings, emphasis, lists, quotes, inline code,
 fenced code, and unified diffs in conversation view. User messages remain
@@ -580,8 +585,9 @@ While a provider response is pending, the status row labels the selected model
 or alias. After the response is durable, it labels the provider-reported served
 model, or `served unknown` when the provider omits that identity.
 Use `/status` for one authoritative daemon readback of the effective model,
-daemon identity, selected session, reported token usage, and persisted approval
-facts. The read-only modal does not invoke a model or change the session.
+daemon identity, selected session, reported token usage, persisted approval
+facts, and the selected session's live shell grant. The read-only modal does
+not invoke a model or change the session.
 
 ```bash
 cargo run --bin plato-agentd -- --workspace "$PWD"
@@ -614,7 +620,10 @@ Keys:
 - `/issue-prep <rough issue>`: prepare and review an implementation issue.
   It is unavailable while another run or issue-prep command is active, and the
   TUI waits for it before exiting.
-- `g` / `d`: grant or deny the focused approval request.
+- `g` / `d`: allow once or deny the focused approval request.
+- `s`: allow the focused `shell.exec` request and later shell calls in the
+  selected session until the daemon exits. This action is hidden for other tools.
+- `Up` / `Down` and `PageUp` / `PageDown`: scroll the focused approval pane.
 - `Ctrl-C`: request `run.cancel` for the active run; a second `Ctrl-C` exits the
   TUI. Exiting the TUI does not stop the daemon.
 - `r`: reconnect and reload daemon state.
