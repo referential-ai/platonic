@@ -7,12 +7,14 @@ pub const FILE_LIST: &str = "file.list";
 pub const FILE_WRITE: &str = "file.write";
 pub const FILE_EDIT: &str = "file.edit";
 pub const SHELL_EXEC: &str = "shell.exec";
+pub const WEB_FETCH: &str = "web.fetch";
 
 const PROVIDER_FILE_READ: &str = "file_read";
 const PROVIDER_FILE_LIST: &str = "file_list";
 const PROVIDER_FILE_WRITE: &str = "file_write";
 const PROVIDER_FILE_EDIT: &str = "file_edit";
 const PROVIDER_SHELL_EXEC: &str = "shell_exec";
+const PROVIDER_WEB_FETCH: &str = "web_fetch";
 
 const BOOTSTRAP_TOOLS: &[ToolDefinition] = &[
     ToolDefinition {
@@ -50,6 +52,13 @@ const BOOTSTRAP_TOOLS: &[ToolDefinition] = &[
         description: "Run one approved shell command from the workspace root with a scrubbed environment.",
         input_schema: ToolInputSchema::ShellExec,
     },
+    ToolDefinition {
+        internal_name: WEB_FETCH,
+        provider_name: PROVIDER_WEB_FETCH,
+        effect: EffectClass::Network,
+        description: "Fetch bounded UTF-8 text from one approved public HTTP(S) URL.",
+        input_schema: ToolInputSchema::WebFetch,
+    },
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,6 +76,7 @@ enum ToolInputSchema {
     List,
     Write,
     ShellExec,
+    WebFetch,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -190,6 +200,18 @@ impl ToolInputSchema {
                 "required": ["command"],
                 "additionalProperties": false
             }),
+            Self::WebFetch => json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Absolute public HTTP(S) URL to fetch.",
+                        "maxLength": 2048
+                    }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }),
         }
     }
 }
@@ -199,7 +221,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bootstrap_catalog_includes_file_tools_and_shell_exec() {
+    fn bootstrap_catalog_has_exact_names_and_effects() {
         let actual = bootstrap_tools()
             .iter()
             .map(|tool| (tool.internal_name, tool.effect.clone()))
@@ -213,12 +235,24 @@ mod tests {
                 (FILE_WRITE, EffectClass::WorkspaceWrite),
                 (FILE_EDIT, EffectClass::WorkspaceWrite),
                 (SHELL_EXEC, EffectClass::ExternalSideEffect),
+                (WEB_FETCH, EffectClass::Network),
             ]
         );
-        assert!(
-            !actual
-                .iter()
-                .any(|(_, effect)| matches!(effect, EffectClass::Network))
+
+        let provider_names = bootstrap_tools()
+            .iter()
+            .map(|tool| tool.provider_name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            provider_names,
+            vec![
+                PROVIDER_FILE_READ,
+                PROVIDER_FILE_LIST,
+                PROVIDER_FILE_WRITE,
+                PROVIDER_FILE_EDIT,
+                PROVIDER_SHELL_EXEC,
+                PROVIDER_WEB_FETCH,
+            ]
         );
     }
 
@@ -238,14 +272,16 @@ mod tests {
             FILE_WRITE.into(),
             FILE_EDIT.into(),
             SHELL_EXEC.into(),
+            WEB_FETCH.into(),
         ]);
 
-        assert_eq!(specs.len(), 5);
+        assert_eq!(specs.len(), 6);
         assert_eq!(specs[0].name, PROVIDER_FILE_READ);
         assert_eq!(specs[1].name, PROVIDER_FILE_LIST);
         assert_eq!(specs[2].name, PROVIDER_FILE_WRITE);
         assert_eq!(specs[3].name, PROVIDER_FILE_EDIT);
         assert_eq!(specs[4].name, PROVIDER_SHELL_EXEC);
+        assert_eq!(specs[5].name, PROVIDER_WEB_FETCH);
         assert_eq!(
             specs[4].input_schema,
             json!({
@@ -263,6 +299,21 @@ mod tests {
                     }
                 },
                 "required": ["command"],
+                "additionalProperties": false
+            })
+        );
+        assert_eq!(
+            specs[5].input_schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Absolute public HTTP(S) URL to fetch.",
+                        "maxLength": 2048
+                    }
+                },
+                "required": ["url"],
                 "additionalProperties": false
             })
         );

@@ -45,6 +45,7 @@ doc = false
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+html2text = "0.17.1"
 plato-audio = { version = "0.1.0", path = "crates/plato-audio" }
 plato-daemon-client = { version = "0.1.0", path = "crates/plato-daemon-client" }
 plato-gateway-discord = { version = "0.1.0", path = "crates/plato-gateway-discord" }
@@ -60,6 +61,7 @@ sha2 = "0.10"
 thiserror = "2"
 toml = "0.9"
 ureq = { version = "2", features = ["json"] }
+url = "2.5.8"
 
 [target.'cfg(windows)'.dependencies]
 ctrlc = "=3.5.2"

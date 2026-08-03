@@ -1,6 +1,7 @@
 pub mod github;
+pub mod web;
 
-use crate::tool_catalog::{FILE_EDIT, FILE_LIST, FILE_READ, FILE_WRITE, SHELL_EXEC};
+use crate::tool_catalog::{FILE_EDIT, FILE_LIST, FILE_READ, FILE_WRITE, SHELL_EXEC, WEB_FETCH};
 use crate::{AppError, AppResult};
 use platonic_core::{ResultVisibility, ToolResult};
 use serde::{Deserialize, Serialize};
@@ -312,6 +313,7 @@ pub fn execute_tool_with_context(
         FILE_WRITE => write_file(context.workspace_root, call_id, input, "wrote", "to"),
         FILE_EDIT => write_file(context.workspace_root, call_id, input, "edited", "at"),
         SHELL_EXEC => shell_exec(context, call_id, input),
+        WEB_FETCH => web::fetch(call_id, input, context.cancel),
         _ => Err(AppError::Tool(format!("unknown tool: {tool_name}"))),
     }
 }
@@ -366,23 +368,31 @@ pub fn approval_command_preview(
     tool_name: &str,
     input: &Value,
     provider_api_key_env: Option<&str>,
-) -> Option<String> {
+) -> AppResult<Option<String>> {
+    if tool_name == WEB_FETCH {
+        return web::approval_preview(input)
+            .map(Some)
+            .map_err(|error| AppError::Tool(error.to_string()));
+    }
     if tool_name != SHELL_EXEC {
-        return None;
+        return Ok(None);
     }
 
-    let input: ShellExecInput = serde_json::from_value(input.clone()).ok()?;
+    let input: ShellExecInput = match serde_json::from_value(input.clone()) {
+        Ok(input) => input,
+        Err(_) => return Ok(None),
+    };
     let timeout_seconds = normalize_timeout_seconds(input.timeout_seconds);
     let cwd = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
     let provider = provider_api_key_env.unwrap_or("configured provider key");
-    Some(format!(
+    Ok(Some(format!(
         "command: {}\ncwd: {}\ntimeout: {}s\neffect: ExternalSideEffect\nenv: scrubbed allowlist; credential-like names and {provider} removed",
         input.command,
         cwd.display(),
         timeout_seconds
-    ))
+    )))
 }
 
 fn read_file(
@@ -1811,6 +1821,7 @@ mod tests {
             &json!({"command": "cargo test", "timeout_seconds": 700}),
             Some("OPENROUTER_API_KEY"),
         )
+        .unwrap()
         .unwrap();
 
         assert!(preview.contains("command: cargo test"));

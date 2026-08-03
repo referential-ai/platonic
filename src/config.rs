@@ -524,7 +524,8 @@ mod tests {
                 "file.list",
                 "file.write",
                 "file.edit",
-                "shell.exec"
+                "shell.exec",
+                "web.fetch"
             ]
         );
     }

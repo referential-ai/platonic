@@ -62,7 +62,7 @@ max_output_tokens = 1024
 max_turns = 8
 
 [tools]
-enabled = ["file.read", "file.list", "file.write", "file.edit", "shell.exec"]
+enabled = ["file.read", "file.list", "file.write", "file.edit", "shell.exec", "web.fetch"]
 ```
 
 OpenAI-compatible direct OpenAI config remains available:
@@ -92,9 +92,16 @@ POST and is observed at the existing response boundary. Other provider failures
 are not retried.
 
 `file.read` and `file.list` are auto-allowed. `file.write`, `file.edit`, and
-`shell.exec` require stdin approval and default to no. `shell.exec` runs from
-the workspace root with a scrubbed child environment, no provider credentials,
-bounded stdout/stderr, and a timeout. It uses `sh -c` on Unix and
+`shell.exec` require stdin approval and default to no. `web.fetch` also requires
+explicit local approval for every URL and is never auto-approved by `--yolo`.
+Its approval preview shows the normalized public HTTP(S) URL, origin, and
+validated destination addresses. Each approved fetch is GET-only, disables
+environment proxies and automatic redirects, revalidates and pins public DNS
+answers for every same-origin hop, accepts supported UTF-8 text up to 1 MiB,
+and returns at most 48 KiB. HTML is converted to plain text; response bodies
+from errors are never returned. `shell.exec` runs from the workspace root with
+a scrubbed child environment, no provider credentials, bounded stdout/stderr,
+and a timeout. It uses `sh -c` on Unix and
 `cmd.exe /C` on Windows; timeout or cancellation terminates the full process tree.
 Use `--yolo` to auto-approve enabled workspace-write tools that would otherwise
 prompt. Yolo mode does not enable disabled or unknown tools, approve network
