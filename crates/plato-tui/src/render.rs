@@ -3,7 +3,7 @@ use ratatui::{
     backend::TestBackend,
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     symbols,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
@@ -17,9 +17,12 @@ use super::{
         MotionMode, TranscriptRowsKey, session_question_label,
     },
 };
-use crate::commands::{
-    FooterHintPriority, FooterHintWhen, KEY_MAP, KeyAction, KeyBinding, KeyLabelPlatform, KeyMap,
-    matching_slash_commands,
+use crate::{
+    color::{self, SemanticRole},
+    commands::{
+        FooterHintPriority, FooterHintWhen, KEY_MAP, KeyAction, KeyBinding, KeyLabelPlatform,
+        KeyMap, matching_slash_commands,
+    },
 };
 use plato_protocol::{
     DaemonStatusResult, DaemonStatusTokenUsage, ModelIdentityStatus, RunStateName, TypedRun,
@@ -64,6 +67,18 @@ fn render_at(frame: &mut Frame<'_>, state: &TuiState, now_ms: u64) {
 
 fn chrome_style() -> Style {
     Style::default().add_modifier(Modifier::DIM)
+}
+
+fn semantic_style(role: SemanticRole) -> Style {
+    color::active().semantic_style(role)
+}
+
+fn accent_style() -> Style {
+    color::active().accent_style()
+}
+
+fn user_message_style() -> Style {
+    color::active().user_message_style()
 }
 
 /// Renders client state into a plain-text test snapshot of the requested size.
@@ -147,7 +162,7 @@ fn audit_history_lines(
             lines.push(Line::from(vec![
                 Span::styled(
                     "transcript unavailable ",
-                    Style::default().fg(Color::Yellow),
+                    semantic_style(SemanticRole::Warning),
                 ),
                 Span::raw(run_id.clone()),
             ]));
@@ -161,7 +176,7 @@ fn audit_history_lines(
             clear_transcript_rows(state);
             lines.push(Line::from(vec![Span::styled(
                 "daemon unavailable",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                semantic_style(SemanticRole::Error).add_modifier(Modifier::BOLD),
             )]));
             if let ConnectionState::Disconnected { error } = &state.connection {
                 lines.push(Line::from(error.clone()));
@@ -205,7 +220,7 @@ fn conversation_history_lines(
             clear_transcript_rows(state);
             lines.push(Line::from(vec![Span::styled(
                 "Transcript unavailable",
-                Style::default().fg(Color::Yellow),
+                semantic_style(SemanticRole::Warning),
             )]));
             lines.push(Line::from(error.replace(run_id, "selected run")));
         }
@@ -217,7 +232,7 @@ fn conversation_history_lines(
             clear_transcript_rows(state);
             lines.push(Line::from(vec![Span::styled(
                 "daemon unavailable",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                semantic_style(SemanticRole::Error).add_modifier(Modifier::BOLD),
             )]));
             if let ConnectionState::Disconnected { error } = &state.connection {
                 lines.push(Line::from(error.clone()));
@@ -316,12 +331,7 @@ fn append_transcript_rows(
 
 fn intro_lines(state: &TuiState) -> Vec<Line<'static>> {
     let mut lines = vec![
-        Line::from(vec![Span::styled(
-            "Plato Agent",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )]),
+        Line::from(vec![Span::styled("Plato Agent", accent_style())]),
         Line::from("Local Rust agent runtime"),
         Line::from(""),
     ];
@@ -379,7 +389,7 @@ fn append_audit_live_transcript(
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
         "transcript",
-        Style::default().fg(Color::Yellow),
+        semantic_style(SemanticRole::Primary),
     )]));
 
     if let Some(active) = &state.active_run {
@@ -736,12 +746,12 @@ fn conversation_live_event_lines(
                         || (event.kind == LiveEventKind::Status
                             && event.text.starts_with("issue-prep artifacts:"))) =>
             {
-                let color = if event.kind == LiveEventKind::Warning {
-                    Color::Red
+                let role = if event.kind == LiveEventKind::Warning {
+                    SemanticRole::Error
                 } else {
-                    Color::DarkGray
+                    SemanticRole::Muted
                 };
-                push_notice_rows(&mut lines, &event.text, color);
+                push_notice_rows(&mut lines, &event.text, role);
                 continue;
             }
             LiveEventKind::Tool
@@ -773,20 +783,19 @@ fn conversation_live_event_lines(
     lines
 }
 
-fn push_notice_rows(lines: &mut Vec<Line<'static>>, text: &str, color: Color) {
+fn push_notice_rows(lines: &mut Vec<Line<'static>>, text: &str, role: SemanticRole) {
     if !lines.is_empty() {
         lines.push(Line::from(""));
     }
+    let style = semantic_style(role);
     lines.push(Line::from(Span::styled(
         "Notice",
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
+        style.add_modifier(Modifier::BOLD),
     )));
-    lines.extend(text.lines().map(|line| {
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(line.to_owned(), Style::default().fg(color)),
-        ])
-    }));
+    lines.extend(
+        text.lines()
+            .map(|line| Line::from(vec![Span::raw("  "), Span::styled(line.to_owned(), style)])),
+    );
 }
 
 fn push_message_rows(
@@ -810,17 +819,10 @@ fn push_message_rows(
         lines.push(Line::from(""));
     }
     let (label, label_style) = match kind {
-        LiveEventKind::User => (
-            "You",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+        LiveEventKind::User => ("You", accent_style()),
         LiveEventKind::Assistant | LiveEventKind::AssistantDelta => (
             "Plato",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
+            semantic_style(SemanticRole::Success).add_modifier(Modifier::BOLD),
         ),
         LiveEventKind::Tool
         | LiveEventKind::Approval
@@ -832,13 +834,11 @@ fn push_message_rows(
         LiveEventKind::User => {
             let mut text_lines = text.lines().peekable();
             if text_lines.peek().is_none() {
-                lines.push(Line::from("  "));
+                lines.push(Line::from("  ").style(user_message_style()));
             } else {
                 lines.extend(text_lines.map(|line| {
-                    Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(line.to_owned(), Style::default().fg(Color::Cyan)),
-                    ])
+                    Line::from(vec![Span::raw("  "), Span::raw(line.to_owned())])
+                        .style(user_message_style())
                 }));
             }
         }
@@ -991,7 +991,7 @@ fn append_queue_preview(lines: &mut Vec<Line<'static>>, state: &TuiState) {
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
         "queued",
-        Style::default().fg(Color::Yellow),
+        semantic_style(SemanticRole::Primary),
     )]));
     lines.extend(
         state
@@ -1014,15 +1014,12 @@ fn append_working_row(lines: &mut Vec<Line<'static>>, state: &TuiState) {
         MotionMode::Reduced => "•",
     };
     let mut spans = vec![
-        Span::styled(format!("{marker} "), Style::default().fg(Color::Yellow)),
+        Span::styled(format!("{marker} "), semantic_style(SemanticRole::Primary)),
         Span::styled(task, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!("  {}", format_elapsed(elapsed))),
     ];
     if interruptible {
-        spans.push(Span::styled(
-            "  Esc to interrupt",
-            Style::default().fg(Color::DarkGray),
-        ));
+        spans.push(Span::styled("  Esc to interrupt", chrome_style()));
     }
     append_spaced_rows(lines, std::iter::once(Line::from(spans)));
 }
@@ -1363,9 +1360,7 @@ fn composer_prefix(index: usize) -> &'static str {
 }
 
 fn composer_prefix_style() -> Style {
-    Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD)
+    accent_style()
 }
 
 fn composer_cursor_position(
@@ -1483,9 +1478,7 @@ fn slash_popup_lines(state: &TuiState) -> Vec<Line<'static>> {
         .enumerate()
         .map(|(index, command)| {
             let style = if index == popup.selected {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+                accent_style()
             } else {
                 chrome_style()
             };
@@ -1504,12 +1497,14 @@ fn plural(count: usize) -> &'static str {
 }
 
 fn event_rows(event: &super::LiveEventLine) -> Vec<Line<'static>> {
-    let (role, color) = match event.kind {
-        LiveEventKind::User => ("user", Color::Cyan),
-        LiveEventKind::Assistant | LiveEventKind::AssistantDelta => ("assistant", Color::Green),
-        LiveEventKind::Tool => ("tool", Color::Magenta),
-        LiveEventKind::Approval | LiveEventKind::Status => ("status", Color::DarkGray),
-        LiveEventKind::Warning => ("warning", Color::Red),
+    let (role, semantic_role) = match event.kind {
+        LiveEventKind::User => ("user", SemanticRole::Primary),
+        LiveEventKind::Assistant | LiveEventKind::AssistantDelta => {
+            ("assistant", SemanticRole::Success)
+        }
+        LiveEventKind::Tool => ("tool", SemanticRole::Primary),
+        LiveEventKind::Approval | LiveEventKind::Status => ("status", SemanticRole::Muted),
+        LiveEventKind::Warning => ("warning", SemanticRole::Warning),
     };
     let mut text_lines = event.text.lines();
     let first = text_lines.next().unwrap_or_default();
@@ -1517,8 +1512,8 @@ fn event_rows(event: &super::LiveEventLine) -> Vec<Line<'static>> {
         Some(offset) => format!("#{offset} {first}"),
         None => first.to_owned(),
     };
-    let mut rows = vec![role_row(role, color, &first)];
-    rows.extend(text_lines.map(|line| role_row("", color, line)));
+    let mut rows = vec![role_row(role, semantic_role, &first)];
+    rows.extend(text_lines.map(|line| role_row("", semantic_role, line)));
     rows
 }
 
@@ -1545,19 +1540,19 @@ fn readback_line(line: &str) -> Option<Line<'static>> {
         return Some(status_row(format!("run {run_id}")));
     }
     if let Some(text) = turn_text(line, "user: ") {
-        return Some(role_row("user", Color::Cyan, text));
+        return Some(role_row("user", SemanticRole::Primary, text));
     }
     if let Some(text) = turn_text(line, "assistant: ") {
-        return Some(role_row("assistant", Color::Green, text));
+        return Some(role_row("assistant", SemanticRole::Success, text));
     }
     if let Some(text) = turn_text(line, "tool: ") {
-        return Some(role_row("tool", Color::Magenta, text));
+        return Some(role_row("tool", SemanticRole::Primary, text));
     }
     if let Some(text) = turn_text(line, "tool_call ") {
-        return Some(role_row("tool", Color::Magenta, text));
+        return Some(role_row("tool", SemanticRole::Primary, text));
     }
     if let Some(text) = line.strip_prefix("tool_result ") {
-        return Some(role_row("tool", Color::Magenta, text));
+        return Some(role_row("tool", SemanticRole::Primary, text));
     }
     if line.starts_with("policy_denied ")
         || line.starts_with("approval_denied ")
@@ -1576,19 +1571,19 @@ fn turn_text<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
     line[start..].strip_prefix(marker)
 }
 
-fn role_row(role: &'static str, color: Color, text: &str) -> Line<'static> {
+fn role_row(role: &'static str, semantic_role: SemanticRole, text: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{role:<9} "), Style::default().fg(color)),
+        Span::styled(format!("{role:<9} "), semantic_style(semantic_role)),
         Span::raw(text.to_owned()),
     ])
 }
 
 fn status_row(text: impl Into<String>) -> Line<'static> {
-    role_row("status", Color::DarkGray, &text.into())
+    role_row("status", SemanticRole::Muted, &text.into())
 }
 
 fn warning_row(text: impl Into<String>) -> Line<'static> {
-    role_row("warning", Color::Red, &text.into())
+    role_row("warning", SemanticRole::Warning, &text.into())
 }
 
 fn format_elapsed(seconds: u64) -> String {
@@ -1744,9 +1739,7 @@ fn status_modal_rect(area: Rect) -> Rect {
 fn modal_heading(heading: &'static str) -> Line<'static> {
     Line::from(Span::styled(
         heading,
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
+        semantic_style(SemanticRole::Primary).add_modifier(Modifier::BOLD),
     ))
 }
 
@@ -1815,9 +1808,7 @@ fn session_picker_row(
         " "
     };
     let style = if focused {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
+        accent_style()
     } else {
         Style::default()
     };
@@ -1877,10 +1868,10 @@ fn bounded_question_preview(question: &str, max_chars: usize) -> String {
 
 fn status_style(status: &RunStateName) -> Style {
     match status {
-        RunStateName::Running => Style::default().fg(Color::Green),
-        RunStateName::Interrupted => Style::default().fg(Color::Yellow),
-        RunStateName::Failed | RunStateName::Canceled => Style::default().fg(Color::Red),
-        _ => Style::default().fg(Color::DarkGray),
+        RunStateName::Running => semantic_style(SemanticRole::Success),
+        RunStateName::Interrupted => semantic_style(SemanticRole::Warning),
+        RunStateName::Failed | RunStateName::Canceled => semantic_style(SemanticRole::Error),
+        _ => semantic_style(SemanticRole::Muted),
     }
 }
 
@@ -1941,7 +1932,12 @@ fn render_approval_pane(
         lines.extend(preview.lines().map(|line| Line::from(line.to_owned())));
     }
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title("Approval"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(semantic_style(SemanticRole::Border))
+                .title("Approval"),
+        )
         .wrap(Wrap { trim: false });
     let content_width = area.width.saturating_sub(2).max(1);
     let content_height = usize::from(area.height.saturating_sub(2));
@@ -2233,33 +2229,38 @@ mod tests {
     }
 
     #[test]
-    fn chrome_is_dim_without_recoloring_status_roles() {
+    fn chrome_is_dim_while_status_roles_use_the_terminal_palette() {
         assert_eq!(chrome_style(), Style::default().add_modifier(Modifier::DIM));
 
-        let state = conversation_fixture();
-        let footer = footer_line(&state, 100);
-        assert_eq!(footer.spans[0].style, composer_prefix_style());
-        assert_eq!(footer.spans[1].style, chrome_style());
-        let intro = intro_lines(&state);
-        for line in &intro[3..7] {
-            assert_eq!(line.spans[0].style, chrome_style());
-        }
-        let mut trace = Vec::new();
-        push_trace_row(&mut trace, "tools | finished".into());
-        assert!(
-            trace[0]
-                .spans
-                .iter()
-                .all(|span| span.style == chrome_style())
-        );
+        color::with_test_colors(
+            color::TerminalColors::forced(color::ColorCapability::TrueColor, Some((0, 0, 0))),
+            || {
+                let state = conversation_fixture();
+                let footer = footer_line(&state, 100);
+                assert_eq!(footer.spans[0].style, composer_prefix_style());
+                assert_eq!(footer.spans[1].style, chrome_style());
+                let intro = intro_lines(&state);
+                for line in &intro[3..7] {
+                    assert_eq!(line.spans[0].style, chrome_style());
+                }
+                let mut trace = Vec::new();
+                push_trace_row(&mut trace, "tools | finished".into());
+                assert!(
+                    trace[0]
+                        .spans
+                        .iter()
+                        .all(|span| span.style == chrome_style())
+                );
 
-        assert_eq!(
-            status_row("ready").spans[0].style,
-            Style::default().fg(Color::DarkGray)
-        );
-        assert_eq!(
-            status_style(&RunStateName::Finished),
-            Style::default().fg(Color::DarkGray)
+                assert_eq!(
+                    status_row("ready").spans[0].style,
+                    semantic_style(SemanticRole::Muted)
+                );
+                assert_eq!(
+                    status_style(&RunStateName::Finished),
+                    semantic_style(SemanticRole::Muted)
+                );
+            },
         );
     }
 
@@ -2327,42 +2328,108 @@ mod tests {
 
     #[test]
     fn conversation_labels_have_distinct_literal_styles() {
-        let state = conversation_fixture();
-        let TranscriptState::Loaded(transcript) = &state.transcript else {
-            panic!("expected loaded transcript");
-        };
-        let rows = conversation_transcript_lines(
-            transcript,
-            100,
-            DEFAULT_SYNTAX_THEME,
-            &MarkdownRenderer::default(),
+        color::with_test_colors(
+            color::TerminalColors::forced(color::ColorCapability::TrueColor, Some((0, 0, 0))),
+            || {
+                let state = conversation_fixture();
+                let TranscriptState::Loaded(transcript) = &state.transcript else {
+                    panic!("expected loaded transcript");
+                };
+                let rows = conversation_transcript_lines(
+                    transcript,
+                    100,
+                    DEFAULT_SYNTAX_THEME,
+                    &MarkdownRenderer::default(),
+                );
+                let you = rows
+                    .iter()
+                    .find(|line| line.spans.first().is_some_and(|span| span.content == "You"))
+                    .unwrap();
+                let plato = rows
+                    .iter()
+                    .find(|line| {
+                        line.spans
+                            .first()
+                            .is_some_and(|span| span.content == "Plato")
+                    })
+                    .unwrap();
+
+                assert_eq!(you.spans[0].style, accent_style());
+                assert_eq!(
+                    plato.spans[0].style,
+                    semantic_style(SemanticRole::Success).add_modifier(Modifier::BOLD)
+                );
+                assert_ne!(you.spans[0].style, plato.spans[0].style);
+            },
         );
-        let you = rows
-            .iter()
-            .find(|line| line.spans.first().is_some_and(|span| span.content == "You"))
-            .unwrap();
-        let plato = rows
-            .iter()
-            .find(|line| {
-                line.spans
-                    .first()
-                    .is_some_and(|span| span.content == "Plato")
+    }
+
+    #[test]
+    fn focused_dark_and_light_message_style_snapshots() {
+        fn snapshot(colors: color::TerminalColors) -> (Style, Style) {
+            color::with_test_colors(colors, || {
+                let state = conversation_fixture();
+                let TranscriptState::Loaded(transcript) = &state.transcript else {
+                    panic!("expected loaded transcript");
+                };
+                let rows = conversation_transcript_lines(
+                    transcript,
+                    100,
+                    DEFAULT_SYNTAX_THEME,
+                    &MarkdownRenderer::default(),
+                );
+                let label_index = rows
+                    .iter()
+                    .position(|line| line.spans.first().is_some_and(|span| span.content == "You"))
+                    .unwrap();
+                (
+                    rows[label_index].spans[0].style,
+                    rows[label_index + 1].style,
+                )
             })
-            .unwrap();
+        }
 
         assert_eq!(
-            you.spans[0].style,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            snapshot(color::TerminalColors::forced(
+                color::ColorCapability::TrueColor,
+                Some((0, 0, 0)),
+            )),
+            (
+                Style::default()
+                    .fg(ratatui::style::Color::Rgb(0, 255, 255))
+                    .add_modifier(Modifier::BOLD),
+                Style::default().bg(ratatui::style::Color::Rgb(30, 30, 30)),
+            )
         );
         assert_eq!(
-            plato.spans[0].style,
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD)
+            snapshot(color::TerminalColors::forced(
+                color::ColorCapability::TrueColor,
+                Some((255, 255, 255)),
+            )),
+            (
+                Style::default()
+                    .fg(ratatui::style::Color::Rgb(0, 95, 135))
+                    .add_modifier(Modifier::BOLD),
+                Style::default().bg(ratatui::style::Color::Rgb(244, 244, 244)),
+            )
         );
-        assert_ne!(you.spans[0].style, plato.spans[0].style);
+    }
+
+    #[test]
+    fn no_color_preserves_byte_identical_layout() {
+        let colored = color::with_test_colors(
+            color::TerminalColors::forced(color::ColorCapability::TrueColor, Some((0, 0, 0))),
+            || render_snapshot(&conversation_fixture(), 96, 24).unwrap(),
+        );
+        let no_color = color::with_test_colors(
+            color::TerminalColors::forced_no_color(
+                color::ColorCapability::TrueColor,
+                Some((0, 0, 0)),
+            ),
+            || render_snapshot(&conversation_fixture(), 96, 24).unwrap(),
+        );
+
+        assert_eq!(no_color, colored);
     }
 
     #[test]

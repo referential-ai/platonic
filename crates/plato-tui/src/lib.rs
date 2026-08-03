@@ -9,6 +9,7 @@
 
 mod app;
 mod client;
+mod color;
 mod commands;
 mod markdown;
 mod modal;

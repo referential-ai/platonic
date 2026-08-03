@@ -633,6 +633,10 @@ literal, while audit view retains the exact stored transcript source.
 The multiline composer uses the terminal cursor without adding a caret glyph to
 its text. Bracketed paste inserts literal text as one undoable edit.
 A nonempty `NO_COLOR` suppresses colors while retaining emphasis and layout.
+Otherwise, the TUI detects true color or xterm-256 support and makes one
+best-effort 100-millisecond OSC 11 background query at startup. User-message
+tint, accents, and semantic colors adapt to light or dark terminal backgrounds;
+16-color and unknown terminals keep default colors with dim chrome.
 
 ```bash
 cargo run --bin plato
