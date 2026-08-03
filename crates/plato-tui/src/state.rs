@@ -5,6 +5,7 @@ use plato_protocol::{
 use platonic_core::EffectClass;
 use ratatui::text::Line;
 use std::{fmt, sync::RwLock, time::Instant};
+use tui_textarea::{CursorMove, TextArea};
 
 use super::{
     ApprovalModalView,
@@ -26,7 +27,7 @@ pub(super) enum MotionMode {
     Reduced,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 /// Complete render and interaction state for the terminal client.
 pub struct TuiState {
     /// Canonical workspace root displayed by the client.
@@ -56,12 +57,8 @@ pub struct TuiState {
     /// Elapsed active-run time, in seconds.
     pub active_run_elapsed_secs: Option<u64>,
     pub(super) working_elapsed_millis: u64,
-    /// Composer text.
-    pub composer: String,
-    /// Composer cursor byte offset.
-    pub composer_cursor: usize,
-    /// Composer kill/yank buffer.
-    pub composer_kill_buffer: String,
+    /// Composer editing state.
+    pub composer: TextArea<'static>,
     /// Open slash-command popup state.
     pub slash_popup: Option<SlashPopupView>,
     /// Open session-picker state.
@@ -88,6 +85,80 @@ pub struct TuiState {
     pub status_modal: Option<DaemonStatusResult>,
     /// Whether cancellation has already been requested.
     pub cancel_requested: bool,
+}
+
+impl PartialEq for TuiState {
+    fn eq(&self, other: &Self) -> bool {
+        self.workspace_root == other.workspace_root
+            && self.socket_path == other.socket_path
+            && self.connection == other.connection
+            && self.sessions == other.sessions
+            && self.selected_session_id == other.selected_session_id
+            && self.transcript == other.transcript
+            && self.active_run == other.active_run
+            && self.live_events == other.live_events
+            && self.history_rows == other.history_rows
+            && self.scroll_offset == other.scroll_offset
+            && self.display_mode == other.display_mode
+            && self.conversation_scroll_offset == other.conversation_scroll_offset
+            && self.audit_scroll_offset == other.audit_scroll_offset
+            && self.active_model == other.active_model
+            && self.active_run_elapsed_secs == other.active_run_elapsed_secs
+            && self.working_elapsed_millis == other.working_elapsed_millis
+            && composer_eq(&self.composer, &other.composer)
+            && self.slash_popup == other.slash_popup
+            && self.session_picker == other.session_picker
+            && self.queued_messages == other.queued_messages
+            && self.issue_prep_started_at == other.issue_prep_started_at
+            && self.issue_prep_elapsed_secs == other.issue_prep_elapsed_secs
+            && self.motion_mode == other.motion_mode
+            && self.input_history == other.input_history
+            && self.history_index == other.history_index
+            && self.status_message == other.status_message
+            && self.stream_warning == other.stream_warning
+            && self.approval == other.approval
+            && self.help_visible == other.help_visible
+            && self.status_modal == other.status_modal
+            && self.cancel_requested == other.cancel_requested
+    }
+}
+
+impl Eq for TuiState {}
+
+fn composer_eq(left: &TextArea<'static>, right: &TextArea<'static>) -> bool {
+    if left.tab_length() != right.tab_length()
+        || left.hard_tab_indent() != right.hard_tab_indent()
+        || left.max_histories() != right.max_histories()
+        || !composer_surface_eq(left, right)
+    {
+        return false;
+    }
+
+    let (mut left_undo, mut right_undo) = (left.clone(), right.clone());
+    loop {
+        match (left_undo.undo(), right_undo.undo()) {
+            (false, false) => break,
+            (true, true) if composer_surface_eq(&left_undo, &right_undo) => {}
+            _ => return false,
+        }
+    }
+
+    let (mut left_redo, mut right_redo) = (left.clone(), right.clone());
+    loop {
+        match (left_redo.redo(), right_redo.redo()) {
+            (false, false) => break,
+            (true, true) if composer_surface_eq(&left_redo, &right_redo) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn composer_surface_eq(left: &TextArea<'static>, right: &TextArea<'static>) -> bool {
+    left.lines() == right.lines()
+        && left.cursor() == right.cursor()
+        && left.selection_range() == right.selection_range()
+        && left.yank_text() == right.yank_text()
 }
 
 impl TuiState {
@@ -143,9 +214,7 @@ impl TuiState {
             active_model: None,
             active_run_elapsed_secs: None,
             working_elapsed_millis: 0,
-            composer: String::new(),
-            composer_cursor: 0,
-            composer_kill_buffer: String::new(),
+            composer: TextArea::default(),
             slash_popup: None,
             session_picker: None,
             queued_messages: Vec::new(),
@@ -203,14 +272,17 @@ impl TuiState {
         let Some(command) = self.selected_slash_command() else {
             return;
         };
-        self.composer = format!("/{} ", command.name);
-        self.composer_cursor = self.composer.len();
+        self.set_composer_text(format!("/{} ", command.name));
         self.history_index = None;
         self.slash_popup = None;
     }
 
     fn sync_slash_popup(&mut self) {
-        let Some(filter) = slash_filter_at_cursor(&self.composer, self.composer_cursor) else {
+        let (row, column) = self.composer.cursor();
+        let Some(filter) = (row == 0)
+            .then(|| slash_filter_at_cursor(&self.composer.lines()[0], column))
+            .flatten()
+        else {
             self.slash_popup = None;
             return;
         };
@@ -226,194 +298,79 @@ impl TuiState {
         if self.help_visible || self.status_modal.is_some() || self.approval.is_some() {
             return;
         }
-        self.insert_composer_text(&text.replace('\r', "\n"));
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let modified = self.composer.insert_str(text);
+        self.finish_composer_edit(modified);
     }
 
-    pub(super) fn insert_composer_char(&mut self, ch: char) {
-        let mut buffer = [0; 4];
-        self.insert_composer_text(ch.encode_utf8(&mut buffer));
+    pub(super) fn handle_composer_key(&mut self, key: crossterm::event::KeyEvent) {
+        let modified = self.composer.input(key);
+        self.finish_composer_edit(modified);
     }
 
     pub(super) fn insert_composer_text(&mut self, text: &str) {
-        self.clamp_composer_cursor();
-        self.composer.insert_str(self.composer_cursor, text);
-        self.composer_cursor += text.len();
-        self.history_index = None;
+        let modified = self.composer.insert_str(text);
+        self.finish_composer_edit(modified);
+    }
+
+    pub(super) fn composer_text(&self) -> String {
+        self.composer.lines().join("\n")
+    }
+
+    pub(super) fn composer_is_empty(&self) -> bool {
+        self.composer.is_empty()
+    }
+
+    pub(super) fn set_composer_text(&mut self, text: impl AsRef<str>) {
+        self.composer = TextArea::from(text.as_ref().split('\n'));
+        self.composer.move_cursor(CursorMove::Bottom);
+        self.composer.move_cursor(CursorMove::End);
         self.sync_slash_popup();
     }
 
-    pub(super) fn delete_composer_before_cursor(&mut self) {
-        self.clamp_composer_cursor();
-        if self.composer_cursor == 0 {
-            return;
+    pub(super) fn move_composer_cursor(&mut self, motion: CursorMove, selecting: bool) {
+        if selecting {
+            if !self.composer.is_selecting() {
+                self.composer.start_selection();
+            }
+        } else {
+            self.composer.cancel_selection();
         }
-        let start = previous_boundary(&self.composer, self.composer_cursor);
-        self.composer.replace_range(start..self.composer_cursor, "");
-        self.composer_cursor = start;
-        self.history_index = None;
+        self.composer.move_cursor(motion);
         self.sync_slash_popup();
     }
 
-    pub(super) fn delete_composer_after_cursor(&mut self) {
-        self.clamp_composer_cursor();
-        if self.composer_cursor >= self.composer.len() {
-            return;
-        }
-        let end = next_boundary(&self.composer, self.composer_cursor);
-        self.composer.replace_range(self.composer_cursor..end, "");
-        self.history_index = None;
-        self.sync_slash_popup();
+    pub(super) fn delete_composer_to_start(&mut self) {
+        self.composer.start_selection();
+        self.composer.move_cursor(CursorMove::Jump(0, 0));
+        let modified = self.composer.cut();
+        self.finish_composer_edit(modified);
     }
 
-    pub(super) fn delete_composer_to_line_end(&mut self) {
-        self.clamp_composer_cursor();
-        let end = line_end_at(&self.composer, self.composer_cursor);
-        self.composer_kill_buffer = self.composer[self.composer_cursor..end].to_owned();
-        self.composer.replace_range(self.composer_cursor..end, "");
-        self.history_index = None;
-        self.sync_slash_popup();
+    pub(super) fn undo_composer(&mut self) {
+        let modified = self.composer.undo();
+        self.finish_composer_edit(modified);
     }
 
-    pub(super) fn delete_previous_word(&mut self) {
-        self.clamp_composer_cursor();
-        let mut start = self.composer_cursor;
-        while start > 0 && char_before(&self.composer, start).is_some_and(char::is_whitespace) {
-            start = previous_boundary(&self.composer, start);
-        }
-        while start > 0 && char_before(&self.composer, start).is_some_and(|ch| !ch.is_whitespace())
-        {
-            start = previous_boundary(&self.composer, start);
-        }
-        self.composer_kill_buffer = self.composer[start..self.composer_cursor].to_owned();
-        self.composer.replace_range(start..self.composer_cursor, "");
-        self.composer_cursor = start;
-        self.history_index = None;
-        self.sync_slash_popup();
-    }
-
-    pub(super) fn kill_composer_to_start(&mut self) {
-        self.clamp_composer_cursor();
-        self.composer_kill_buffer = self.composer[..self.composer_cursor].to_owned();
-        self.composer.replace_range(..self.composer_cursor, "");
-        self.composer_cursor = 0;
-        self.history_index = None;
-        self.sync_slash_popup();
-    }
-
-    pub(super) fn yank_composer_kill_buffer(&mut self) {
-        if self.composer_kill_buffer.is_empty() {
-            return;
-        }
-        let text = self.composer_kill_buffer.clone();
-        self.insert_composer_text(&text);
+    pub(super) fn redo_composer(&mut self) {
+        let modified = self.composer.redo();
+        self.finish_composer_edit(modified);
     }
 
     pub(super) fn clear_composer(&mut self) {
-        self.composer.clear();
-        self.composer_cursor = 0;
+        self.composer = TextArea::default();
         self.history_index = None;
         self.slash_popup = None;
     }
 
-    pub(super) fn move_composer_left(&mut self) {
-        self.clamp_composer_cursor();
-        self.composer_cursor = previous_boundary(&self.composer, self.composer_cursor);
-        self.sync_slash_popup();
-    }
-
-    pub(super) fn move_composer_right(&mut self) {
-        self.clamp_composer_cursor();
-        self.composer_cursor = next_boundary(&self.composer, self.composer_cursor);
-        self.sync_slash_popup();
-    }
-
-    pub(super) fn move_composer_line_start(&mut self) {
-        self.clamp_composer_cursor();
-        self.composer_cursor = line_start_at(&self.composer, self.composer_cursor);
-        self.sync_slash_popup();
-    }
-
-    pub(super) fn move_composer_line_end(&mut self) {
-        self.clamp_composer_cursor();
-        self.composer_cursor = line_end_at(&self.composer, self.composer_cursor);
-        self.sync_slash_popup();
-    }
-
-    pub(super) fn move_composer_word_left(&mut self) {
-        self.clamp_composer_cursor();
-        let mut start = self.composer_cursor;
-        while start > 0 && char_before(&self.composer, start).is_some_and(char::is_whitespace) {
-            start = previous_boundary(&self.composer, start);
-        }
-        while start > 0 && char_before(&self.composer, start).is_some_and(|ch| !ch.is_whitespace())
-        {
-            start = previous_boundary(&self.composer, start);
-        }
-        self.composer_cursor = start;
-        self.sync_slash_popup();
-    }
-
-    pub(super) fn move_composer_word_right(&mut self) {
-        self.clamp_composer_cursor();
-        let mut end = self.composer_cursor;
-        while end < self.composer.len()
-            && char_at(&self.composer, end).is_some_and(|ch| !ch.is_whitespace())
-        {
-            end = next_boundary(&self.composer, end);
-        }
-        while end < self.composer.len()
-            && char_at(&self.composer, end).is_some_and(char::is_whitespace)
-        {
-            end = next_boundary(&self.composer, end);
-        }
-        self.composer_cursor = end;
-        self.sync_slash_popup();
-    }
-
-    pub(super) fn move_composer_up(&mut self) -> bool {
-        self.clamp_composer_cursor();
-        let start = line_start_at(&self.composer, self.composer_cursor);
-        if start == 0 {
-            return false;
-        }
-        let column = self.composer[start..self.composer_cursor].chars().count();
-        let previous_end = previous_boundary(&self.composer, start);
-        let previous_start = line_start_at(&self.composer, previous_end);
-        self.composer_cursor =
-            nth_char_boundary(&self.composer, previous_start, previous_end, column);
-        self.sync_slash_popup();
-        true
-    }
-
-    pub(super) fn move_composer_down(&mut self) -> bool {
-        self.clamp_composer_cursor();
-        let start = line_start_at(&self.composer, self.composer_cursor);
-        let end = line_end_at(&self.composer, self.composer_cursor);
-        if end >= self.composer.len() {
-            return false;
-        }
-        let column = self.composer[start..self.composer_cursor].chars().count();
-        let next_start = next_boundary(&self.composer, end);
-        let next_end = line_end_at(&self.composer, next_start);
-        self.composer_cursor = nth_char_boundary(&self.composer, next_start, next_end, column);
-        self.sync_slash_popup();
-        true
-    }
-
     pub(super) fn consume_line_continuation(&mut self) -> bool {
-        self.clamp_composer_cursor();
-        if self.composer_cursor == 0 {
+        let (row, column) = self.composer.cursor();
+        if column == 0 || self.composer.lines()[row].chars().nth(column - 1) != Some('\\') {
             return false;
         }
-        let start = previous_boundary(&self.composer, self.composer_cursor);
-        if &self.composer[start..self.composer_cursor] != "\\" {
-            return false;
-        }
-        self.composer
-            .replace_range(start..self.composer_cursor, "\n");
-        self.composer_cursor = start + 1;
-        self.history_index = None;
-        self.sync_slash_popup();
+        self.composer.delete_char();
+        self.composer.insert_newline();
+        self.finish_composer_edit(true);
         true
     }
 
@@ -426,9 +383,8 @@ impl TuiState {
             .map(|index| index.saturating_sub(1))
             .unwrap_or_else(|| self.input_history.len() - 1);
         self.history_index = Some(index);
-        self.composer = self.input_history[index].clone();
-        self.composer_cursor = self.composer.len();
-        self.sync_slash_popup();
+        let text = self.input_history[index].clone();
+        self.set_composer_text(text);
     }
 
     pub(super) fn recall_history_next(&mut self) {
@@ -440,9 +396,8 @@ impl TuiState {
         } else {
             let next = index + 1;
             self.history_index = Some(next);
-            self.composer = self.input_history[next].clone();
-            self.composer_cursor = self.composer.len();
-            self.sync_slash_popup();
+            let text = self.input_history[next].clone();
+            self.set_composer_text(text);
         }
     }
 
@@ -453,11 +408,11 @@ impl TuiState {
         self.history_index = None;
     }
 
-    fn clamp_composer_cursor(&mut self) {
-        self.composer_cursor = self.composer_cursor.min(self.composer.len());
-        while !self.composer.is_char_boundary(self.composer_cursor) {
-            self.composer_cursor -= 1;
+    fn finish_composer_edit(&mut self, modified: bool) {
+        if modified {
+            self.history_index = None;
         }
+        self.sync_slash_popup();
     }
 
     pub(super) fn replace_transcript(&mut self, transcript: TranscriptState) {
@@ -569,20 +524,15 @@ fn slash_filter_at_cursor(text: &str, cursor: usize) -> Option<String> {
     if !text.starts_with('/') {
         return None;
     }
-    let first_line_end = text.find('\n').unwrap_or(text.len());
-    if cursor > first_line_end {
-        return None;
-    }
-    let after_slash = &text[1..first_line_end];
+    let after_slash = &text[1..];
     let name_len = after_slash
         .find(char::is_whitespace)
         .unwrap_or(after_slash.len());
-    let name_end = 1 + name_len;
-    if cursor > name_end {
+    if cursor > 1 + after_slash[..name_len].chars().count() {
         return None;
     }
     let name = &after_slash[..name_len];
-    let rest = &text[name_end..first_line_end];
+    let rest = &after_slash[name_len..];
     if name.is_empty() && !rest.is_empty() {
         return None;
     }
@@ -591,58 +541,6 @@ fn slash_filter_at_cursor(text: &str, cursor: usize) -> Option<String> {
     } else {
         None
     }
-}
-
-fn previous_boundary(value: &str, position: usize) -> usize {
-    if position == 0 {
-        return 0;
-    }
-    value[..position]
-        .char_indices()
-        .last()
-        .map_or(0, |(index, _)| index)
-}
-
-fn next_boundary(value: &str, position: usize) -> usize {
-    if position >= value.len() {
-        return value.len();
-    }
-    position + value[position..].chars().next().map_or(0, char::len_utf8)
-}
-
-fn char_before(value: &str, position: usize) -> Option<char> {
-    if position == 0 {
-        None
-    } else {
-        value[..position].chars().next_back()
-    }
-}
-
-fn char_at(value: &str, position: usize) -> Option<char> {
-    if position >= value.len() {
-        None
-    } else {
-        value[position..].chars().next()
-    }
-}
-
-fn line_start_at(value: &str, position: usize) -> usize {
-    value[..position].rfind('\n').map_or(0, |index| index + 1)
-}
-
-fn line_end_at(value: &str, position: usize) -> usize {
-    value[position..]
-        .find('\n')
-        .map_or(value.len(), |index| position + index)
-}
-
-fn nth_char_boundary(value: &str, start: usize, end: usize, column: usize) -> usize {
-    value[start..end]
-        .char_indices()
-        .map(|(index, _)| start + index)
-        .chain(std::iter::once(end))
-        .nth(column)
-        .unwrap_or(end)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -952,6 +850,55 @@ pub enum LiveEventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_equality_tracks_observable_composer_state_and_edit_history() {
+        let mut state = TuiState::disconnected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            "offline".into(),
+        );
+        state.set_composer_text("alpha beta");
+        state.composer.move_cursor(CursorMove::WordBack);
+        state.composer.start_selection();
+        state.composer.move_cursor(CursorMove::End);
+        state.composer.set_yank_text("saved");
+
+        assert_eq!(state, state.clone());
+
+        let mut different_text = state.clone();
+        different_text.composer.insert_char('!');
+        assert_ne!(state, different_text);
+
+        let mut different_cursor = state.clone();
+        different_cursor.composer.cancel_selection();
+        different_cursor.composer.move_cursor(CursorMove::Back);
+        assert_ne!(state, different_cursor);
+
+        let mut different_selection = state.clone();
+        different_selection.composer.cancel_selection();
+        assert_ne!(state, different_selection);
+
+        let mut different_yank = state.clone();
+        different_yank.composer.set_yank_text("other");
+        assert_ne!(state, different_yank);
+
+        let mut different_history = state.clone();
+        different_history.composer.cancel_selection();
+        different_history.composer.insert_char('!');
+        assert!(different_history.composer.undo());
+        let mut same_surface = state.clone();
+        same_surface.composer.cancel_selection();
+        assert_eq!(
+            different_history.composer.lines(),
+            same_surface.composer.lines()
+        );
+        assert_eq!(
+            different_history.composer.cursor(),
+            same_surface.composer.cursor()
+        );
+        assert_ne!(different_history, same_surface);
+    }
 
     #[test]
     fn connected_state_restores_known_and_unknown_served_model_status() {

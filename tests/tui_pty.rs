@@ -181,6 +181,177 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
 }
 
 #[test]
+fn composer_cursor_stays_real_at_placeholder_origin_and_narrow_wrap() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+
+    let workspace_id = paths::workspace_id(&workspace).unwrap();
+    let endpoint = runtime
+        .join("plato-agent")
+        .join("workspaces")
+        .join(&workspace_id)
+        .join("agent.sock");
+    let ledger = state.join("fake-agent.db");
+    let fake = FakeDaemon::bind(&endpoint, &workspace, &workspace_id, &ledger);
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        br#""$PLATO_BIN"; printf '\n%sSTATUS:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Try \"read README.md and summarize it\"",
+    );
+
+    let resize_at = shell.output_len();
+    shell.resize(12, 10);
+    shell.wait_for_screen_row(12, 10, Some(resize_at), 10, "Try");
+    shell.wait_for_cursor_position(12, 10, Some(resize_at), (10, 2));
+
+    shell.write(b"abcdefgh");
+    shell.wait_for_screen_row(12, 10, Some(resize_at), 9, "> abcdefgh");
+    shell.wait_for_cursor_position(12, 10, Some(resize_at), (10, 0));
+
+    shell.write(b"\x15");
+    shell.wait_for_screen_row(12, 10, Some(resize_at), 10, "Try");
+    shell.wait_for_cursor_position(12, 10, Some(resize_at), (10, 2));
+    assert!(fake.requests_for("run.start").is_empty());
+
+    shell.write(b"q");
+    assert_eq!(shell.wait_for_marker("STATUS"), "0");
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+    fake.finish();
+}
+
+#[test]
+fn composer_textarea_features_preserve_submit_queue_slash_and_history_contracts() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+
+    let workspace_id = paths::workspace_id(&workspace).unwrap();
+    let endpoint = runtime
+        .join("plato-agent")
+        .join("workspaces")
+        .join(&workspace_id)
+        .join("agent.sock");
+    let ledger = state.join("fake-agent.db");
+    let fake = FakeDaemon::bind(&endpoint, &workspace, &workspace_id, &ledger);
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        br#""$PLATO_BIN"; printf '\n%sSTATUS:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Try \"read README.md and summarize it\"",
+    );
+
+    shell.write(b"\x1b[200~alpha\r\nbeta\x1b[201~");
+    let pasted = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "beta");
+    assert!(pasted.contains("> alpha"));
+    assert!(pasted.contains("| beta"));
+    assert!(fake.requests_for("run.start").is_empty());
+
+    shell.write(b"\x1a");
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Try \"read README.md and summarize it\"",
+    );
+    shell.write(b"\x12");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "| beta");
+
+    shell.write(b"\x1bbX");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "| Xbeta");
+    let selection_at = shell.output_len();
+    shell.write(b"\x1b[1;2D");
+    shell.wait_for_output_after(selection_at);
+    assert!(contains_sgr_parameter(&shell.output_since(selection_at), 7));
+    shell.write(b"Y");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "| Ybeta");
+    assert!(fake.requests_for("run.start").is_empty());
+
+    shell.write(b"\r");
+    let run_start = fake.wait_for_request("run.start");
+    assert_eq!(
+        run_start.params.as_ref().unwrap()["question"],
+        "alpha\nYbeta"
+    );
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Working");
+
+    shell.write(b"next by tab\t");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "1 next by tab");
+    assert!(fake.requests_for("message.append").is_empty());
+
+    shell.write(b"\x1b[A");
+    shell.wait_for_screen_row(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        None,
+        INITIAL_ROWS - 2,
+        "next by tab",
+    );
+    shell.write(b"\x15/");
+    let popup = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "show this help");
+    assert!(popup.contains("clear the visible transcript"));
+    shell.write(b"\x1b[B\t");
+    shell.wait_for_screen_row(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        None,
+        INITIAL_ROWS - 2,
+        "/clear ",
+    );
+
+    shell.write(b"\x15/c");
+    let filtered = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "clear the visible");
+    assert!(!filtered.contains("show this help"));
+    shell.write(b"\t\r");
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Try \"read README.md and summarize it\"",
+    );
+    assert_eq!(fake.requests_for("run.start").len(), 1);
+
+    shell.write(b"q");
+    assert_eq!(shell.wait_for_marker("STATUS"), "0");
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+
+    let requests = fake.finish();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method.as_deref() == Some("run.start"))
+            .count(),
+        1
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.method.as_deref() == Some("message.append"))
+    );
+}
+
+#[test]
 fn nonempty_no_color_suppresses_only_color_sgr_in_the_pty() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -786,6 +957,47 @@ impl PtyShell {
                 "timed out waiting for {unexpected:?} to leave rendered screen\nrendered:\n{}\nraw:\n{}",
                 contents,
                 output_tail(&output)
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_cursor_position(
+        &mut self,
+        rows: u16,
+        cols: u16,
+        resize_at: Option<usize>,
+        expected: (u16, u16),
+    ) {
+        let deadline = Instant::now() + PROOF_TIMEOUT;
+        loop {
+            let output = self.output.lock().unwrap().clone();
+            let screen = parsed_screen(&output, rows, cols, resize_at);
+            if screen.cursor_position() == expected {
+                return;
+            }
+            self.assert_running("cursor position");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for cursor {expected:?}; got {:?}\nrendered:\n{}\nraw:\n{}",
+                screen.cursor_position(),
+                screen.contents(),
+                output_tail(&output)
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_output_after(&mut self, offset: usize) {
+        let deadline = Instant::now() + PROOF_TIMEOUT;
+        loop {
+            if self.output_len() > offset {
+                return;
+            }
+            self.assert_running("redraw after input");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for output after byte {offset}"
             );
             thread::sleep(Duration::from_millis(10));
         }

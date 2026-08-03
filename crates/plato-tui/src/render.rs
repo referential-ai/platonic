@@ -1165,24 +1165,69 @@ fn composer_has_focus(state: &TuiState) -> bool {
 }
 
 fn composer_lines(state: &TuiState) -> Vec<Line<'static>> {
-    if state.composer.is_empty() {
+    if state.composer_is_empty() {
         return vec![Line::from(vec![
             Span::styled(">", composer_prefix_style()),
             Span::raw("   "),
             Span::styled("Try \"read README.md and summarize it\"", chrome_style()),
         ])];
     }
+    let selection = state.composer.selection_range();
     state
         .composer
-        .split('\n')
+        .lines()
+        .iter()
         .enumerate()
         .map(|(index, line)| {
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(composer_prefix(index), composer_prefix_style()),
-                Span::raw(format!(" {line}")),
-            ])
+                Span::raw(" "),
+            ];
+            spans.extend(composer_text_spans(index, line, selection));
+            Line::from(spans)
         })
         .collect()
+}
+
+fn composer_text_spans(
+    row: usize,
+    line: &str,
+    selection: Option<((usize, usize), (usize, usize))>,
+) -> Vec<Span<'static>> {
+    let Some((start, end)) = selection.filter(|(start, end)| start != end) else {
+        return vec![Span::raw(line.to_owned())];
+    };
+    if row < start.0 || row > end.0 {
+        return vec![Span::raw(line.to_owned())];
+    }
+    let start_column = if row == start.0 { start.1 } else { 0 };
+    let end_column = if row == end.0 {
+        end.1
+    } else {
+        line.chars().count()
+    };
+    let start = char_byte_index(line, start_column);
+    let end = char_byte_index(line, end_column);
+    if start == end {
+        return vec![Span::raw(line.to_owned())];
+    }
+    vec![
+        Span::raw(line[..start].to_owned()),
+        Span::styled(
+            line[start..end].to_owned(),
+            Style::default().add_modifier(Modifier::REVERSED),
+        ),
+        Span::raw(line[end..].to_owned()),
+    ]
+}
+
+fn char_byte_index(value: &str, column: usize) -> usize {
+    value
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(value.len()))
+        .nth(column)
+        .unwrap_or(value.len())
 }
 
 fn composer_prefix(index: usize) -> &'static str {
@@ -1236,7 +1281,7 @@ fn composer_cursor_probe_lines(
     } else {
         Vec::new()
     };
-    if state.composer.is_empty() {
+    if state.composer_is_empty() {
         lines.push(Line::from(vec![
             Span::styled(">", composer_prefix_style()),
             Span::raw(" "),
@@ -1247,58 +1292,50 @@ fn composer_cursor_probe_lines(
         return (lines, false);
     }
 
-    let cursor = clamped_composer_cursor(state);
-    let cursor_line = state.composer[..cursor]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count();
-    let cursor_line_start = state.composer[..cursor]
-        .rfind('\n')
-        .map_or(0, |index| index + 1);
-    let cursor_in_line = cursor - cursor_line_start;
+    let (cursor_line, cursor_column) = state.composer.cursor();
     let mut after_last_probe = false;
-    lines.extend(state.composer.split('\n').enumerate().map(|(index, line)| {
-        let prefix = Span::styled(composer_prefix(index), composer_prefix_style());
-        if index != cursor_line {
-            return Line::from(vec![prefix, Span::raw(format!(" {line}"))]);
-        }
+    lines.extend(
+        state
+            .composer
+            .lines()
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let prefix = Span::styled(composer_prefix(index), composer_prefix_style());
+                if index != cursor_line {
+                    return Line::from(vec![prefix, Span::raw(format!(" {line}"))]);
+                }
 
-        let before = &line[..cursor_in_line];
-        let after = &line[cursor_in_line..];
-        if Line::from(after).width() > 0 {
-            Line::from(vec![
-                prefix,
-                Span::raw(format!(" {before}")),
-                Span::styled(
-                    after.to_owned(),
-                    Style::default().add_modifier(CURSOR_PROBE),
-                ),
-            ])
-        } else if Line::from(line).width() > 0 {
-            after_last_probe = true;
-            Line::from(vec![
-                prefix,
-                Span::raw(" "),
-                Span::styled(line.to_owned(), Style::default().add_modifier(CURSOR_PROBE)),
-            ])
-        } else {
-            after_last_probe = true;
-            Line::from(vec![
-                prefix,
-                Span::styled(" ", Style::default().add_modifier(CURSOR_PROBE)),
-                Span::raw(line.to_owned()),
-            ])
-        }
-    }));
+                let cursor_in_line = char_byte_index(line, cursor_column);
+                let before = &line[..cursor_in_line];
+                let after = &line[cursor_in_line..];
+                if Line::from(after).width() > 0 {
+                    Line::from(vec![
+                        prefix,
+                        Span::raw(format!(" {before}")),
+                        Span::styled(
+                            after.to_owned(),
+                            Style::default().add_modifier(CURSOR_PROBE),
+                        ),
+                    ])
+                } else if Line::from(line.as_str()).width() > 0 {
+                    after_last_probe = true;
+                    Line::from(vec![
+                        prefix,
+                        Span::raw(" "),
+                        Span::styled(line.to_owned(), Style::default().add_modifier(CURSOR_PROBE)),
+                    ])
+                } else {
+                    after_last_probe = true;
+                    Line::from(vec![
+                        prefix,
+                        Span::styled(" ", Style::default().add_modifier(CURSOR_PROBE)),
+                        Span::raw(line.to_owned()),
+                    ])
+                }
+            }),
+    );
     (lines, after_last_probe)
-}
-
-fn clamped_composer_cursor(state: &TuiState) -> usize {
-    let mut cursor = state.composer_cursor.min(state.composer.len());
-    while !state.composer.is_char_boundary(cursor) {
-        cursor -= 1;
-    }
-    cursor
 }
 
 fn slash_popup_lines(state: &TuiState) -> Vec<Line<'static>> {
@@ -1784,7 +1821,7 @@ fn composer_height(state: &TuiState, width: u16) -> u16 {
         .as_ref()
         .map(|popup| matching_slash_commands(&popup.filter).len().clamp(1, 5))
         .unwrap_or(0);
-    let rendered_lines = if state.composer.is_empty() {
+    let rendered_lines = if state.composer_is_empty() {
         1
     } else {
         Paragraph::new(composer_lines(state))
@@ -2335,8 +2372,10 @@ mod tests {
             run_id: "run_1".into(),
             status: RunStateName::Running,
         });
-        state.composer = "summarize this file".into();
-        state.composer_cursor = "summarize".len();
+        state.set_composer_text("summarize this file");
+        state
+            .composer
+            .move_cursor(tui_textarea::CursorMove::Jump(0, 9));
         state
             .live_events
             .push(LiveEventLine::assistant(Some(2), "assistant response"));
@@ -2354,16 +2393,20 @@ mod tests {
     fn composer_cursor_tracks_unicode_newlines_and_soft_wrap_without_a_caret_glyph() {
         let mut state = conversation_fixture();
 
-        state.composer = "ab界café".into();
-        state.composer_cursor = "ab界".len();
+        state.set_composer_text("ab界café");
+        state
+            .composer
+            .move_cursor(tui_textarea::CursorMove::Jump(0, 3));
         assert_eq!(render_cursor_position(&state, 20, 12), (6, 10));
         let unicode = render_snapshot_at(&state, 20, 12, 0).unwrap();
         assert!(unicode.contains("> ab界"));
         assert!(unicode.contains("café"));
         assert!(!unicode.contains("界|"));
 
-        state.composer = "first\n界second".into();
-        state.composer_cursor = "first\n界".len();
+        state.set_composer_text("first\n界second");
+        state
+            .composer
+            .move_cursor(tui_textarea::CursorMove::Jump(1, 1));
         assert_eq!(render_cursor_position(&state, 20, 12), (4, 10));
         let multiline = render_snapshot_at(&state, 20, 12, 0).unwrap();
         assert!(multiline.contains("> first"));
@@ -2371,12 +2414,31 @@ mod tests {
         assert!(multiline.contains("second"));
         assert!(!multiline.contains("界|"));
 
-        state.composer = "abcdefgh".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("abcdefgh");
         assert_eq!(render_cursor_position(&state, 10, 8), (0, 6));
         let wrapped = render_snapshot_at(&state, 10, 8, 0).unwrap();
         assert!(wrapped.contains("> abcdefgh"));
         assert!(!wrapped.contains("abcdefgh|"));
+    }
+
+    #[test]
+    fn composer_renders_textarea_selection_without_moving_the_real_cursor() {
+        let mut state = conversation_fixture();
+        state.set_composer_text("select this");
+        state
+            .composer
+            .move_cursor(tui_textarea::CursorMove::Jump(0, 7));
+        state.composer.start_selection();
+        state.composer.move_cursor(tui_textarea::CursorMove::End);
+
+        let lines = composer_lines(&state);
+        let selected = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .expect("selected composer span");
+        assert_eq!(selected.content, "this");
+        assert_eq!(render_cursor_position(&state, 20, 12), (13, 10));
     }
 
     #[test]
@@ -2532,8 +2594,7 @@ mod tests {
             TranscriptState::None,
         );
         state.queued_messages = vec!["queued next".into()];
-        state.composer = "first line\nsecond line".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("first line\nsecond line");
 
         let output = render_to_text(&state);
 
@@ -2830,8 +2891,7 @@ mod tests {
             Vec::new(),
             TranscriptState::None,
         );
-        state.composer = "/c".into();
-        state.composer_cursor = state.composer.len();
+        state.set_composer_text("/c");
         state.slash_popup = Some(super::super::state::SlashPopupView {
             filter: "c".into(),
             selected: 0,
