@@ -50,5 +50,6 @@ fn run() -> plato_agent::AppResult<()> {
         config: cli.config,
         snapshot: cli.snapshot,
         reduced_motion: cli.reduced_motion,
+        thread: None,
     })
 }

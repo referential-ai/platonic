@@ -16,7 +16,7 @@ mod modal;
 mod render;
 mod state;
 
-pub use app::{TuiOptions, run_tui};
+pub use app::{ThreadAttachment, TuiOptions, run_tui};
 pub use modal::{
     ApprovalModalView, approval_from_event, live_event_line, model_from_event,
     tool_input_preview_from_event,

@@ -19,7 +19,8 @@ identities remain unchanged.
 
 The bootstrap surface is intentionally small:
 
-- Bare `plato` in a terminal ensures the persistent workspace daemon and opens the TUI.
+- Bare `plato` in a terminal ensures the host daemon, creates an approved durable thread, and opens the TUI on it.
+- `plato --remote <thread-id>` opens another TUI on the same host socket and existing thread.
 - `plato "question"` runs directly when no daemon is serving, or delegates the same default-ledger run to a live daemon.
 - `plato -c "follow-up"` continues the latest workspace session from the SQLite ledger.
 - `plato --events <file> "question"` writes an explicit JSONL ledger.
@@ -244,8 +245,10 @@ It uses `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/plato-agent/host/ag
 on Unix or `\\.\pipe\plato-agent-host` on Windows. Each connection selects its
 workspace through the existing `hello` request; the response adds
 `"daemon_scope":"host"` while retaining the existing build-provenance
-`daemon_version`. Existing CLI, TUI, gateway, and workspace-daemon defaults are
-not repointed by this mode.
+`daemon_version`. Bare `plato` and `plato --tui` ensure this daemon and attach
+as thread clients. The gateway, standalone `plato-tui`, and explicit
+workspace-daemon commands retain their current per-workspace endpoint in this
+migration stage.
 
 The `plato thread` commands connect only to this host endpoint. Spawn requires
 an explicit cwd, model, reasoning effort, and approval policy; cwd defaults to
@@ -260,21 +263,21 @@ failure creates no thread authority.
 
 ```bash
 # Terminal 1
-plato-agentd --host
+plato
+# approve the root thread.spawn prompt, then use the TUI normally
 
 # Terminal 2
-plato thread spawn --cwd "$PWD" --model gpt-5.6-sol \
-  --reasoning-effort xhigh --approval-policy prompt
 plato thread list
 plato thread status <thread-id>
 
-# Terminal 3: observe from the retained-stream tip before the turn starts
-plato thread attach <thread-id>
+# Terminal 3: attach another interactive observer/controller
+plato --remote <thread-id>
 
-# Terminal 2: start a turn, then use its returned turn_id to steer it
+# The lower-level typed client remains available for scripting and proof
 plato thread send <thread-id> --controller terminal-2 "inspect the workspace"
 plato thread send <thread-id> --controller terminal-2 \
   --turn <thread-turn-id> "also summarize the findings"
+plato thread attach <thread-id>
 ```
 
 Spawn and status print one typed JSON object. List prints one object per durable
@@ -289,6 +292,10 @@ daemon-minted turn id. The same controller can supply that exact id with
 typed-rejected for the entire turn. Accepted continuations keep the same turn
 id until their queue drains and the final run is terminal. Controller ownership
 is daemon-live state and is never added to the immutable authority record.
+Each TUI uses a distinct controller identity. A remote TUI observes the same
+live events, can steer a turn it owns, receives the typed controller-owned
+refusal while another client owns that turn, and can take the next idle turn.
+Attaching never creates another authority record or registry.
 
 Attach prints one JSON event per line until interrupted. Any number of attach
 clients can read the same ordered thread-local offsets without becoming
@@ -312,6 +319,12 @@ Default paths are keyed by the workspace id:
 - Unix ledger: `${XDG_STATE_HOME:-$HOME/.local/state}/plato-agent/workspaces/<workspace-id>/agent.db`
 - Windows pipe: `\\.\pipe\plato-agent-<workspace-id>`
 - Windows lock and ledger: `%LOCALAPPDATA%\plato-agent\workspaces\<workspace-id>\agent.lock` and `agent.db`
+
+Those workspace socket and lock paths remain for the explicit legacy daemon
+clients during migration. Interactive `plato` uses the host endpoint above.
+One-shot `plato "question"` remains daemonless through the embedded engine
+unless an explicit legacy workspace daemon is already serving; it writes the
+same default ledger either way.
 
 Runtime directories are restricted to `0700` and the daemon socket to `0600`.
 A custom Unix `--socket` parent is restricted to `0700` at startup. Windows
@@ -620,8 +633,12 @@ oversized Discord input.` Accepted messages are forwarded unchanged.
 ## TUI
 
 Bare `plato` in a terminal is the interactive local entrypoint; `plato --tui`
-is its explicit equivalent. It attaches to a serving workspace daemon or starts
-the sibling `plato-agentd` detached. Exiting the TUI leaves that daemon running.
+is its explicit equivalent. It ensures the host daemon, obtains the root thread
+spawn decision, and attaches to that durable thread. `plato --remote
+<thread-id>` attaches a second TUI without creating another thread. Exiting a
+TUI leaves the host daemon and authority record available. The standalone
+`plato-tui` binary remains the explicit legacy workspace-daemon client during
+this migration stage.
 It renders a conversation-first transcript with distinct `You` and `Plato`
 messages, at most one subtle trace summary per run, one status row, a composer,
 session picker, and a bounded approval pane above the composer. Press `v` from

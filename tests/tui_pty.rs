@@ -43,6 +43,76 @@ const PENDING_CALL_ID: &str = "call_pty_pending";
 const CONVERSATION_RUN_ID: &str = "run_pty_conversation_full_identifier";
 
 #[test]
+fn plato_tui_cold_starts_host_thread_and_remote_reuses_it() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+    let endpoint = runtime.join("plato-agent").join("host").join("agent.sock");
+    let config = DaemonConnectionConfig::resolve(&workspace, Some(endpoint.clone())).unwrap();
+    let _daemon_cleanup = HostDaemonCleanup {
+        config: config.clone(),
+        endpoint: endpoint.clone(),
+    };
+    let mut local = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    local.write(
+        br#""$PLATO_ROOT_BIN" --tui; printf '\n%sLOCAL_STATUS:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Approve thread.spawn?");
+    local.write(b"y\r");
+    local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Plato Agent");
+
+    let mut client = connect_pty_daemon(&config);
+    client.hello(&workspace).unwrap();
+    let threads = client.thread_list().unwrap().threads;
+    assert_eq!(threads.len(), 1);
+    let thread = &threads[0];
+    assert!(thread.live.loaded);
+    assert_eq!(thread.authority.spawning_actor, "local_tui");
+    assert_eq!(thread.authority.cwd, workspace.to_string_lossy());
+    let thread_id = thread.authority.thread_id.clone();
+    assert_eq!(
+        client
+            .thread_status(thread_id.clone())
+            .unwrap()
+            .thread
+            .authority,
+        thread.authority
+    );
+
+    let mut remote = PtyShell::spawn(&workspace, &runtime, &state, &home);
+    remote.write(
+        format!(
+            "\"$PLATO_ROOT_BIN\" --remote \"{thread_id}\"; printf '\\n%sREMOTE_STATUS:%s\\n' \"$PTY_MARK\" \"$?\"\n"
+        )
+        .as_bytes(),
+    );
+    remote.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Plato Agent");
+    assert_eq!(client.thread_list().unwrap().threads.len(), 1);
+
+    remote.write(b"q");
+    assert_eq!(remote.wait_for_marker("REMOTE_STATUS"), "0");
+    remote.write(b"exit\r");
+    assert!(remote.wait_bounded(PROOF_TIMEOUT).success());
+    local.write(b"q");
+    assert_eq!(local.wait_for_marker("LOCAL_STATUS"), "0");
+    local.write(b"exit\r");
+    assert!(local.wait_bounded(PROOF_TIMEOUT).success());
+
+    assert_eq!(
+        client.shutdown_if_idle().unwrap().result,
+        ShutdownIfIdleResultName::Shutdown
+    );
+    wait_for_endpoint_removal(&endpoint);
+}
+
+#[test]
 fn bare_plato_preserves_draft_and_restores_parent_terminal() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -716,8 +786,9 @@ enabled = ["shell.exec"]
     remove_session_grant_owned_file(&endpoint).unwrap();
     remove_session_grant_owned_file(&lock_path).unwrap();
     assert_session_grant_lifecycle_absent(first_daemon_pid, &endpoint, &lock_path);
+    drop(daemon);
 
-    daemon = SessionGrantWorkspaceDaemon::start(
+    let mut daemon = SessionGrantWorkspaceDaemon::start(
         &workspace,
         &runtime,
         &state,
@@ -1041,6 +1112,11 @@ struct PtyShell {
     reader: Option<JoinHandle<()>>,
 }
 
+struct HostDaemonCleanup {
+    config: DaemonConnectionConfig,
+    endpoint: PathBuf,
+}
+
 struct SessionGrantWorkspaceDaemon {
     child: Option<Child>,
     pid: u32,
@@ -1209,6 +1285,19 @@ fn assert_session_grant_lifecycle_absent(pid: u32, endpoint: &Path, lock_path: &
     );
 }
 
+impl Drop for HostDaemonCleanup {
+    fn drop(&mut self) {
+        if let Ok(mut client) = DaemonClient::connect(&self.config.socket_path) {
+            let _ = client.hello(&self.config.workspace_root);
+            let _ = client.shutdown_if_idle();
+        }
+        let deadline = Instant::now() + PROOF_TIMEOUT;
+        while self.endpoint.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 impl PtyShell {
     fn spawn(workspace: &Path, runtime: &Path, state: &Path, home: &Path) -> Self {
         Self::spawn_with_no_color(workspace, runtime, state, home, None)
@@ -1235,7 +1324,8 @@ impl PtyShell {
             .env("HOME", home)
             .env("XDG_RUNTIME_DIR", runtime)
             .env("XDG_STATE_HOME", state)
-            .env("PLATO_BIN", env!("CARGO_BIN_EXE_plato"))
+            .env("PLATO_BIN", env!("CARGO_BIN_EXE_plato-tui"))
+            .env("PLATO_ROOT_BIN", env!("CARGO_BIN_EXE_plato"))
             .env("PTY_MARK", MARKER)
             .env("PS1", "")
             .env("PS2", "")

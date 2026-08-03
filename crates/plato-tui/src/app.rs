@@ -27,7 +27,7 @@ use tui_textarea::CursorMove;
 
 use super::{
     client::{
-        ClientCommand, ClientEvent, UiRuntime, apply_client_event, load_state,
+        ClientCommand, ClientEvent, UiRuntime, apply_client_event, load_state, load_thread_state,
         maybe_poll_events_at, spawn_client_worker_to,
     },
     commands::{SlashCommandAction, find_slash_command},
@@ -87,6 +87,15 @@ impl FrameScheduler {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// One durable daemon thread selected by this terminal client.
+pub struct ThreadAttachment {
+    /// Durable thread observed and driven by this client.
+    pub thread_id: String,
+    /// Unique controller identity used for turn arbitration.
+    pub controller_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 /// Options for connecting and starting the terminal client.
 pub struct TuiOptions {
     /// Workspace root served by the daemon.
@@ -101,6 +110,8 @@ pub struct TuiOptions {
     pub snapshot: bool,
     /// Whether animated working indicators are replaced with a static marker.
     pub reduced_motion: bool,
+    /// Optional durable thread selected on the host daemon.
+    pub thread: Option<ThreadAttachment>,
 }
 
 impl TuiOptions {
@@ -113,6 +124,7 @@ impl TuiOptions {
             config: None,
             snapshot: false,
             reduced_motion: false,
+            thread: None,
         }
     }
 }
@@ -120,7 +132,10 @@ impl TuiOptions {
 /// Connects to the workspace daemon and runs the terminal client.
 pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
     let config = DaemonConnectionConfig::resolve(&options.workspace, options.socket)?;
-    let mut state = load_state(&config, options.run.as_deref());
+    let mut state = match options.thread.as_ref() {
+        Some(thread) => load_thread_state(&config, thread),
+        None => load_state(&config, options.run.as_deref()),
+    };
     state.set_reduced_motion(options.reduced_motion || reduced_motion_from_env());
     let detected_colors = TerminalColors::detect(None);
     if options.snapshot {
@@ -133,8 +148,10 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
     let (event_sender, events) = mpsc::channel();
-    let commands = spawn_client_worker_to(config.clone(), event_sender.clone());
+    let commands =
+        spawn_client_worker_to(config.clone(), options.thread.clone(), event_sender.clone());
     let mut runtime = UiRuntime::from_state(&state, config_path.clone());
+    runtime.attach_thread(options.thread.clone());
     let mut terminal = TerminalSession::enter()?;
     let background = startup_terminal_background(detected_colors);
     color::install(TerminalColors::detect(background));
@@ -822,6 +839,15 @@ fn submit_composer(
     ) {
         return keep_running;
     }
+    if runtime.is_thread_attached() {
+        push_live_event(state, crate::LiveEventLine::user(message.clone()));
+        let command = runtime
+            .thread_send_command(message)
+            .expect("attached runtime builds thread sends");
+        state.status_message = Some("submitted to thread".into());
+        send_command(commands, command, state);
+        return true;
+    }
     if runtime_is_busy(runtime, state) {
         state.queued_messages.push(message);
         state.status_message = Some("queued for next turn".into());
@@ -876,6 +902,14 @@ fn dispatch_slash_command(
     config_path: Option<String>,
 ) -> bool {
     match action {
+        SlashCommandAction::Sessions
+        | SlashCommandAction::NewSession
+        | SlashCommandAction::IssuePrep
+            if runtime.is_thread_attached() =>
+        {
+            state.status_message = Some("command unavailable while attached to a thread".into());
+            true
+        }
         SlashCommandAction::Help => {
             state.help_visible = true;
             state.status_message = Some("help opened".into());
@@ -1383,6 +1417,9 @@ mod tests {
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
             active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
+            thread: None,
+            thread_next_offset: None,
+            thread_turn_id: None,
         };
 
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
@@ -1413,6 +1450,9 @@ mod tests {
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
             active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
+            thread: None,
+            thread_next_offset: None,
+            thread_turn_id: None,
         };
 
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
@@ -1858,6 +1898,33 @@ mod tests {
             Some("session picker opened")
         );
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn thread_attachment_keeps_session_commands_on_the_selected_thread() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.selected_session_id = Some("session_thread_selected".into());
+        let mut runtime = UiRuntime::from_state(&state, None);
+        runtime.attach_thread(Some(ThreadAttachment {
+            thread_id: "thread_selected".into(),
+            controller_id: "controller_local".into(),
+        }));
+
+        for command in ["/sessions", "/new", "/issue-prep draft"] {
+            state.set_composer_text(command);
+            assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+            assert_eq!(
+                state.status_message.as_deref(),
+                Some("command unavailable while attached to a thread")
+            );
+            assert_eq!(
+                state.selected_session_id.as_deref(),
+                Some("session_thread_selected")
+            );
+            assert!(state.session_picker.is_none());
+            assert!(receiver.try_recv().is_err());
+        }
     }
 
     #[test]
@@ -2439,6 +2506,9 @@ mod tests {
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
             active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
+            thread: None,
+            thread_next_offset: None,
+            thread_turn_id: None,
         };
         let result = EventsStreamResult {
             run_id: "run_1".into(),
@@ -2520,6 +2590,9 @@ mod tests {
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
             active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
+            thread: None,
+            thread_next_offset: None,
+            thread_turn_id: None,
         };
         let events = (0..500)
             .map(|index| {
@@ -2570,6 +2643,9 @@ mod tests {
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
             active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
+            thread: None,
+            thread_next_offset: None,
+            thread_turn_id: None,
         };
         let events = (0..EVENT_LIMIT)
             .map(|index| {
@@ -2627,6 +2703,9 @@ mod tests {
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
             active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
+            thread: None,
+            thread_next_offset: None,
+            thread_turn_id: None,
         };
 
         apply_events_result(
@@ -2672,6 +2751,9 @@ mod tests {
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
             active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
+            thread: None,
+            thread_next_offset: None,
+            thread_turn_id: None,
         };
 
         for (offset, served_model, expected) in [
@@ -2808,6 +2890,9 @@ mod tests {
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
             active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
+            thread: None,
+            thread_next_offset: None,
+            thread_turn_id: None,
         };
         let result = EventsStreamResult {
             run_id: "run_1".into(),
@@ -2855,6 +2940,9 @@ mod tests {
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
             active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
+            thread: None,
+            thread_next_offset: None,
+            thread_turn_id: None,
         };
         let result = EventsStreamResult {
             run_id: "run_1".into(),
@@ -3000,6 +3088,9 @@ mod tests {
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
             active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
+            thread: None,
+            thread_next_offset: None,
+            thread_turn_id: None,
         };
         event_sender
             .send(ClientEvent::Failed {
@@ -3048,6 +3139,9 @@ mod tests {
             last_poll: Instant::now() - ACTIVE_POLL_INTERVAL,
             tool_inputs: HashMap::new(),
             active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
+            thread: None,
+            thread_next_offset: None,
+            thread_turn_id: None,
         };
         event_sender
             .send(ClientEvent::Failed {
@@ -3112,6 +3206,9 @@ mod tests {
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
             active_timer: ActiveTimer::started_at(Instant::now(), Duration::ZERO),
+            thread: None,
+            thread_next_offset: None,
+            thread_turn_id: None,
         };
         let result = EventsStreamResult {
             run_id: "run_1".into(),
