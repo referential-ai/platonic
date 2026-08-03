@@ -220,7 +220,7 @@ mod tests {
         let schema_version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(schema_version, 3);
+        assert_eq!(schema_version, 4);
         let tables = connection
             .prepare(
                 "SELECT name FROM sqlite_schema
@@ -234,7 +234,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             tables,
-            ["ledger_events", "session_runs", "sessions", "voice_events"]
+            [
+                "ledger_events",
+                "session_runs",
+                "sessions",
+                "thread_authorities",
+                "thread_spawn_approvals",
+                "voice_events"
+            ]
         );
         let envelope_versions = connection
             .prepare("SELECT v FROM ledger_events ORDER BY seq ASC")
@@ -259,17 +266,17 @@ mod tests {
     #[test]
     fn replay_rejects_future_schema_before_table_queries_without_mutation() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v4-events.db");
+        let path = dir.path().join("v5-events.db");
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 4).unwrap();
+        connection.pragma_update(None, "user_version", 5).unwrap();
         drop(connection);
         let bytes_before = std::fs::read(&path).unwrap();
 
         assert!(matches!(
             replay_sqlite(&path, None),
             Err(AppError::SqliteSchemaVersion {
-                expected: 3,
-                actual: 4
+                expected: 4,
+                actual: 5
             })
         ));
         assert_eq!(std::fs::read(&path).unwrap(), bytes_before);

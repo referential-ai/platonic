@@ -10,6 +10,7 @@ pub mod model;
 pub mod paths;
 pub mod provider;
 pub mod replay;
+mod thread_authority;
 pub mod tool_catalog;
 pub mod tools;
 pub mod tui;

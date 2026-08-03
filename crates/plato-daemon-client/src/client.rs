@@ -10,8 +10,9 @@ use plato_protocol::{
     DaemonStatusResult, Envelope, EnvelopeKind, EventsStreamParams, EventsStreamResult,
     HelloParams, HelloResult, IssuePrepStartParams, IssuePrepStartResult, MessageAppendParams,
     PROTOCOL_VERSION, RunCancelParams, RunOverrides, RunStartParams, RunStartResult,
-    SessionSummary, SessionsListResult, ShutdownIfIdleResult, TranscriptReadParams,
-    TranscriptReadResult,
+    SessionSummary, SessionsListResult, ShutdownIfIdleResult, ThreadApprovalPolicy,
+    ThreadListResult, ThreadSpawnDecision, ThreadSpawnParams, ThreadSpawnResult,
+    ThreadStatusParams, ThreadStatusResult, TranscriptReadParams, TranscriptReadResult,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -99,6 +100,49 @@ impl DaemonClient {
     pub fn sessions_list(&mut self) -> ClientResult<Vec<SessionSummary>> {
         let result: SessionsListResult = self.request_without_params("sessions.list")?;
         Ok(result.sessions)
+    }
+
+    /// Starts one typed thread spawn admission.
+    pub fn thread_spawn_start(
+        &mut self,
+        parent_thread_id: Option<String>,
+        cwd: String,
+        model: String,
+        reasoning_effort: plato_protocol::ReasoningEffort,
+        approval_policy: ThreadApprovalPolicy,
+    ) -> ClientResult<ThreadSpawnResult> {
+        self.request(
+            "thread.spawn",
+            ThreadSpawnParams::Start {
+                parent_thread_id,
+                cwd,
+                model,
+                reasoning_effort,
+                approval_policy,
+            },
+        )
+    }
+
+    /// Resolves one pending typed thread spawn admission.
+    pub fn thread_spawn_decide(
+        &mut self,
+        spawn_id: String,
+        approval: ThreadSpawnDecision,
+    ) -> ClientResult<ThreadSpawnResult> {
+        self.request(
+            "thread.spawn",
+            ThreadSpawnParams::Decide { spawn_id, approval },
+        )
+    }
+
+    /// Lists every durable thread in the selected workspace authority ledger.
+    pub fn thread_list(&mut self) -> ClientResult<ThreadListResult> {
+        self.request_without_params("thread.list")
+    }
+
+    /// Reads one durable thread joined with current daemon state.
+    pub fn thread_status(&mut self, thread_id: String) -> ClientResult<ThreadStatusResult> {
+        self.request("thread.status", ThreadStatusParams { thread_id })
     }
 
     /// Reads authoritative daemon, model, session, usage, and trust status.
@@ -852,6 +896,144 @@ mod tests {
                 ledger_path: "/tmp/agent.db".into(),
             }]
         );
+    }
+
+    #[test]
+    fn client_sends_typed_thread_spawn_list_and_status_requests() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let authority = json!({
+            "thread_id": "thread_1",
+            "parent_thread_id": null,
+            "spawning_actor": "stdin",
+            "cwd": "/tmp/work",
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "xhigh",
+            "approval_policy": "prompt",
+            "created_at_ms": 42
+        });
+        let server_authority = authority.clone();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+
+            let start = read_request(&mut reader);
+            assert_eq!(start.method.as_deref(), Some("thread.spawn"));
+            assert_eq!(
+                start.params,
+                Some(json!({
+                    "action": "start",
+                    "parent_thread_id": null,
+                    "cwd": "/tmp/work",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "xhigh",
+                    "approval_policy": "prompt"
+                }))
+            );
+            write_response(
+                &mut writer,
+                start.id,
+                "thread.spawn",
+                json!({
+                    "status": "approval_required",
+                    "spawn_id": "spawn_1",
+                    "thread_id": "thread_1",
+                    "effect": "workspace_write",
+                    "reason": "thread.spawn requires approval"
+                }),
+            );
+
+            let decide = read_request(&mut reader);
+            assert_eq!(decide.method.as_deref(), Some("thread.spawn"));
+            assert_eq!(
+                decide.params,
+                Some(json!({
+                    "action": "decide",
+                    "spawn_id": "spawn_1",
+                    "approval": {"decision": "grant", "actor": "stdin"}
+                }))
+            );
+            write_response(
+                &mut writer,
+                decide.id,
+                "thread.spawn",
+                json!({
+                    "status": "spawned",
+                    "thread": {
+                        "authority": server_authority.clone(),
+                        "live": {"loaded": true, "current_turn_id": null}
+                    }
+                }),
+            );
+
+            let list = read_request(&mut reader);
+            assert_eq!(list.method.as_deref(), Some("thread.list"));
+            assert_eq!(list.params, None);
+            write_response(
+                &mut writer,
+                list.id,
+                "thread.list",
+                json!({
+                    "threads": [{
+                        "authority": server_authority.clone(),
+                        "live": {"loaded": true, "current_turn_id": null}
+                    }]
+                }),
+            );
+
+            let status = read_request(&mut reader);
+            assert_eq!(status.method.as_deref(), Some("thread.status"));
+            assert_eq!(status.params, Some(json!({"thread_id": "thread_1"})));
+            write_response(
+                &mut writer,
+                status.id,
+                "thread.status",
+                json!({
+                    "thread": {
+                        "authority": server_authority,
+                        "live": {"loaded": true, "current_turn_id": null}
+                    }
+                }),
+            );
+        });
+
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        assert!(matches!(
+            client
+                .thread_spawn_start(
+                    None,
+                    "/tmp/work".into(),
+                    "gpt-5.6-sol".into(),
+                    plato_protocol::ReasoningEffort::Xhigh,
+                    ThreadApprovalPolicy::Prompt,
+                )
+                .unwrap(),
+            ThreadSpawnResult::ApprovalRequired { .. }
+        ));
+        let spawned = client
+            .thread_spawn_decide(
+                "spawn_1".into(),
+                ThreadSpawnDecision::Grant {
+                    actor: "stdin".into(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(spawned, ThreadSpawnResult::Spawned { .. }));
+        assert_eq!(client.thread_list().unwrap().threads.len(), 1);
+        assert_eq!(
+            serde_json::to_value(
+                client
+                    .thread_status("thread_1".into())
+                    .unwrap()
+                    .thread
+                    .authority
+            )
+            .unwrap(),
+            authority
+        );
+        handle.join().unwrap();
     }
 
     #[test]
