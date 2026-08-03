@@ -54,6 +54,13 @@ pub enum EventRecorder {
     Sqlite(SqliteEventRecorder),
 }
 
+pub(crate) trait RunEventRecorder {
+    fn record(&mut self, event: HarnessEvent) -> AppResult<RecordedEvent>;
+    fn finish_run(&mut self, run_id: &RunId, final_answer: &str) -> AppResult<RecordedEvent>;
+    fn fail_run(&mut self, run_id: &RunId, error: &str, canceled: bool)
+    -> AppResult<RecordedEvent>;
+}
+
 impl EventRecorder {
     pub fn create_jsonl(path: &Path) -> AppResult<Self> {
         Ok(Self::Jsonl(JsonlEventRecorder::create(path)?))
@@ -106,6 +113,25 @@ impl EventRecorder {
             }),
             Self::Sqlite(recorder) => recorder.fail_run(error, canceled),
         }
+    }
+}
+
+impl RunEventRecorder for EventRecorder {
+    fn record(&mut self, event: HarnessEvent) -> AppResult<RecordedEvent> {
+        EventRecorder::record(self, event)
+    }
+
+    fn finish_run(&mut self, run_id: &RunId, final_answer: &str) -> AppResult<RecordedEvent> {
+        EventRecorder::finish_run(self, run_id, final_answer)
+    }
+
+    fn fail_run(
+        &mut self,
+        run_id: &RunId,
+        error: &str,
+        canceled: bool,
+    ) -> AppResult<RecordedEvent> {
+        EventRecorder::fail_run(self, run_id, error, canceled)
     }
 }
 

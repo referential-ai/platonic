@@ -70,6 +70,12 @@ pub enum AppError {
     #[error("run did not finish: {0}")]
     RunFailed(String),
 
+    #[error("{0}")]
+    SupervisedRun(String),
+
+    #[error("run child exceeded its {0}-millisecond deadline")]
+    RunChildTimedOut(u64),
+
     #[error("issue-prep artifact conflict: {0}")]
     IssuePrepArtifactConflict(PathBuf),
 

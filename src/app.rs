@@ -1,7 +1,7 @@
 use crate::{
     AppError, AppResult,
-    config::{Config, ProviderKind},
-    ledger::{EventRecorder, RUN_CANCELED_REASON, SessionTurn, SqliteLedger},
+    config::{Config, LimitsConfig, ProviderConfig, ProviderKind, ToolsConfig},
+    ledger::{EventRecorder, RUN_CANCELED_REASON, RunEventRecorder, SessionTurn, SqliteLedger},
     model::{
         ModelBlock, ModelMessage, ModelRequest, ModelResponse, ModelStop, RunOverrides,
         system_prompt,
@@ -20,6 +20,7 @@ use platonic_core::{
     HarnessEvent, Message, MessageRole, ModelName, PolicyDecision, RecordedEvent, RunId, ToolCall,
     ToolCallId, ToolName, ToolProposal, TurnId,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashSet,
@@ -69,7 +70,7 @@ impl RunSession {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RunOutcome {
     pub run_id: RunId,
     pub final_answer: String,
@@ -81,7 +82,7 @@ pub enum RunEvent {
     AssistantDelta(AssistantDeltaEvent),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AssistantDeltaEvent {
     pub run_id: RunId,
     pub turn_id: TurnId,
@@ -146,7 +147,7 @@ impl fmt::Debug for ApprovalHandler {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub run_id: RunId,
     pub call_id: ToolCallId,
@@ -212,6 +213,18 @@ impl ApprovalMode {
             decide: Arc::new(decide),
         })
     }
+
+    pub(crate) fn decide_external(
+        &self,
+        request: ApprovalRequest,
+    ) -> AppResult<ExternalApprovalOutcome> {
+        match self {
+            Self::External(handler) => (handler.decide)(request),
+            _ => Err(AppError::Config(
+                "supervised daemon runs require external approval handling".into(),
+            )),
+        }
+    }
 }
 
 const SESSION_TRUNCATION_MARKER: &str = "[older session turns omitted to fit the context budget]";
@@ -225,11 +238,42 @@ const TOOL_OUTPUT_TRUNCATION_MARKER: &str = "\n... output truncated";
 const TOOL_OUTPUT_CLOSE: &str = "\n</tool_output>";
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct SessionHydration {
     retained_messages: Vec<ModelMessage>,
     dropped_turns: u64,
     estimated_tokens_before: u32,
     estimated_tokens_after: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparedRun {
+    question: String,
+    overrides: RunOverrides,
+    workspace_root: PathBuf,
+    voice_interruption_context: Option<String>,
+    config: RunConfigSnapshot,
+    run_id: RunId,
+    session_hydration: Option<SessionHydration>,
+    messages: Vec<ModelMessage>,
+    platonic_memory: Option<String>,
+    system_context: String,
+    first_system_context: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunConfigSnapshot {
+    provider: ProviderConfig,
+    limits: LimitsConfig,
+    tools: ToolsConfig,
+}
+
+impl PreparedRun {
+    pub(crate) fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
 }
 
 fn begin_session_recorder(
@@ -408,6 +452,18 @@ fn estimated_context_tokens(
 }
 
 pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
+    let (prepared, mut recorder) = prepare_run(&options)?;
+    run_prepared_question(
+        prepared,
+        &mut recorder,
+        options.approval_mode,
+        options.event_sender,
+        options.stream_to_stderr,
+        options.cancel,
+    )
+}
+
+pub(crate) fn prepare_run(options: &RunOptions) -> AppResult<(PreparedRun, EventRecorder)> {
     if options.question.trim().is_empty() {
         return Err(AppError::EmptyQuestion);
     }
@@ -426,7 +482,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         Some(run_id) => run_id,
         None => new_run_id()?,
     };
-    let client = OpenAiCompatibleClient::from_config(
+    let _provider_preflight = OpenAiCompatibleClient::from_config(
         &config.provider.api_key_env,
         config.provider.base_url.clone(),
         config.provider.connect_timeout_ms,
@@ -436,7 +492,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         token_limit_field(&config.provider.kind),
     )?;
     let tools = tool_specs(&config.tools.enabled);
-    let (mut recorder, mut session_hydration) = match (&options.ledger, &options.session) {
+    let (recorder, mut session_hydration) = match (&options.ledger, &options.session) {
         (RunLedger::Sqlite(path), Some(session)) => {
             let (recorder, hydration) = begin_session_recorder(
                 SqliteLedger::open_or_create(path)?,
@@ -470,16 +526,89 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             (EventRecorder::create_default_sqlite(path, &run_id)?, None)
         }
     };
-    let mut messages = session_hydration
+    let messages = session_hydration
         .as_mut()
         .map(|hydration| std::mem::take(&mut hydration.retained_messages))
         .unwrap_or_else(|| vec![ModelMessage::user_text(options.question.clone())]);
+    Ok((
+        PreparedRun {
+            question: options.question.clone(),
+            overrides: options.overrides.clone(),
+            workspace_root: options.workspace_root.clone(),
+            voice_interruption_context: options.voice_interruption_context.clone(),
+            config: RunConfigSnapshot {
+                provider: config.provider,
+                limits: config.limits,
+                tools: config.tools,
+            },
+            run_id,
+            session_hydration,
+            messages,
+            platonic_memory,
+            system_context,
+            first_system_context,
+        },
+        recorder,
+    ))
+}
+
+pub(crate) fn run_prepared_question(
+    prepared: PreparedRun,
+    recorder: &mut dyn RunEventRecorder,
+    approval_mode: ApprovalMode,
+    event_sender: Option<Sender<RunEvent>>,
+    stream_to_stderr: bool,
+    cancel: Option<Arc<AtomicBool>>,
+) -> AppResult<RunOutcome> {
+    let PreparedRun {
+        question,
+        overrides,
+        workspace_root,
+        voice_interruption_context,
+        config,
+        run_id,
+        session_hydration,
+        mut messages,
+        platonic_memory,
+        system_context,
+        first_system_context,
+    } = prepared;
+    let config = Config {
+        provider: config.provider,
+        limits: config.limits,
+        tools: config.tools,
+        gateway: None,
+    };
+    let options = RunOptions {
+        question,
+        config_path: None,
+        overrides,
+        ledger: RunLedger::Jsonl(PathBuf::new()),
+        workspace_root,
+        approval_mode,
+        run_id: Some(run_id.clone()),
+        session: None,
+        event_sender,
+        stream_to_stderr,
+        cancel,
+        voice_interruption_context,
+    };
+    let client = OpenAiCompatibleClient::from_config(
+        &config.provider.api_key_env,
+        config.provider.base_url.clone(),
+        config.provider.connect_timeout_ms,
+        config.provider.stream_idle_timeout_ms,
+        config.provider.http_referer.clone(),
+        config.provider.app_title.clone(),
+        token_limit_field(&config.provider.kind),
+    )?;
+    let tools = tool_specs(&config.tools.enabled);
     let agent_id = AgentId::new("plato")?;
     let model = ModelName::new(config.provider.model.clone())?;
     let stdin_actor_id = ActorId::new("stdin")?;
 
     record_event(
-        &mut recorder,
+        recorder,
         &options,
         HarnessEvent::RunStarted {
             run_id: run_id.clone(),
@@ -512,13 +641,13 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             platonic_memory.as_deref(),
             voice_interruption,
         )?;
-        check_cancel(&mut recorder, &options, &run_id)?;
+        check_cancel(recorder, &options, &run_id)?;
         if turn_index == 0
             && let Some(hydration) = &session_hydration
             && hydration.dropped_turns > 0
         {
             record_event(
-                &mut recorder,
+                recorder,
                 &options,
                 HarnessEvent::ContextCompacted {
                     run_id: run_id.clone(),
@@ -530,9 +659,9 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 },
             )?;
         }
-        record_context_built(&mut recorder, &options, &run_id, turn_id.clone(), context)?;
+        record_context_built(recorder, &options, &run_id, turn_id.clone(), context)?;
         record_event(
-            &mut recorder,
+            recorder,
             &options,
             HarnessEvent::ModelRequested {
                 run_id: run_id.clone(),
@@ -580,9 +709,9 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             completion_retry_delay(error).map(|delay| (delay, error.to_string()))
         });
         if let Some((delay, reason)) = retry {
-            check_cancel(&mut recorder, &options, &run_id)?;
+            check_cancel(recorder, &options, &run_id)?;
             record_event(
-                &mut recorder,
+                recorder,
                 &options,
                 HarnessEvent::ModelFailed {
                     run_id: run_id.clone(),
@@ -601,12 +730,12 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 let remaining = retry_deadline - now;
                 std::thread::sleep(remaining.min(retry_poll_interval));
                 if remaining > retry_poll_interval {
-                    check_cancel(&mut recorder, &options, &run_id)?;
+                    check_cancel(recorder, &options, &run_id)?;
                 }
             }
-            check_cancel(&mut recorder, &options, &run_id)?;
+            check_cancel(recorder, &options, &run_id)?;
             record_event(
-                &mut recorder,
+                recorder,
                 &options,
                 HarnessEvent::ModelRequested {
                     run_id: run_id.clone(),
@@ -630,7 +759,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 } else {
                     error.to_string()
                 };
-                record_terminal_failure(&mut recorder, &options, &run_id, &reason, canceled)?;
+                record_terminal_failure(recorder, &options, &run_id, &reason, canceled)?;
                 if canceled {
                     return Err(AppError::RunCanceled);
                 }
@@ -640,7 +769,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
 
         let proposals = proposals_from_response(&response)?;
         record_event(
-            &mut recorder,
+            recorder,
             &options,
             HarnessEvent::ModelResponded {
                 run_id: run_id.clone(),
@@ -659,7 +788,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         match response.stop {
             ModelStop::MaxOutput => {
                 return fail_run(
-                    &mut recorder,
+                    recorder,
                     &options,
                     &run_id,
                     "model reached max output tokens",
@@ -668,7 +797,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             }
             ModelStop::ContentFilter => {
                 return fail_run(
-                    &mut recorder,
+                    recorder,
                     &options,
                     &run_id,
                     "model response was stopped by content filter",
@@ -678,11 +807,11 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             ModelStop::EndTurn | ModelStop::ToolUse => {}
         }
 
-        check_cancel(&mut recorder, &options, &run_id)?;
+        check_cancel(recorder, &options, &run_id)?;
         let tool_uses = response.tool_uses();
         if response.stop == ModelStop::ToolUse && tool_uses.is_empty() {
             return fail_run(
-                &mut recorder,
+                recorder,
                 &options,
                 &run_id,
                 "provider reported tool use without tool calls",
@@ -691,7 +820,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         }
         if tool_uses.is_empty() {
             let final_answer = response.text();
-            record_terminal_success(&mut recorder, &options, &run_id, &final_answer)?;
+            record_terminal_success(recorder, &options, &run_id, &final_answer)?;
             return Ok(RunOutcome {
                 run_id,
                 final_answer,
@@ -701,7 +830,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         let mut seen_ids = HashSet::new();
         if tool_uses.iter().any(|(id, ..)| !seen_ids.insert(id)) {
             return fail_run(
-                &mut recorder,
+                recorder,
                 &options,
                 &run_id,
                 "provider returned duplicate tool call ids",
@@ -721,7 +850,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         let call_id = mint_tool_call_id(turn_index)?;
         let call = tool_call(call_id.clone(), &tool_name, input)?;
         record_event(
-            &mut recorder,
+            recorder,
             &options,
             HarnessEvent::ToolCallProposed {
                 run_id: run_id.clone(),
@@ -732,7 +861,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
 
         let policy = evaluate_policy(&config.tools.enabled, &call);
         record_event(
-            &mut recorder,
+            recorder,
             &options,
             HarnessEvent::PolicyEvaluated {
                 run_id: run_id.clone(),
@@ -743,7 +872,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
 
         let tool_message = match policy {
             PolicyDecision::Allow => {
-                execute_and_record_tool(&mut recorder, &options, &config, &run_id, call.clone())?
+                execute_and_record_tool(recorder, &options, &config, &run_id, call.clone())?
             }
             PolicyDecision::RequireApproval { ref reason } => {
                 if let Some(actor) =
@@ -753,7 +882,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 {
                     let actor_id = ActorId::new(actor)?;
                     record_event(
-                        &mut recorder,
+                        recorder,
                         &options,
                         HarnessEvent::ApprovalGranted {
                             run_id: run_id.clone(),
@@ -761,18 +890,12 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                             actor_id,
                         },
                     )?;
-                    execute_and_record_tool(
-                        &mut recorder,
-                        &options,
-                        &config,
-                        &run_id,
-                        call.clone(),
-                    )?
+                    execute_and_record_tool(recorder, &options, &config, &run_id, call.clone())?
                 } else if let Some(actor) = options.approval_mode.deny_actor(&policy) {
                     let reason =
                         format!("approval required but no approval channel is available: {reason}");
                     record_event(
-                        &mut recorder,
+                        recorder,
                         &options,
                         HarnessEvent::ApprovalDenied {
                             run_id: run_id.clone(),
@@ -810,7 +933,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                             match (handler.decide)(request)? {
                                 ExternalApprovalOutcome::Granted { actor } => {
                                     record_event(
-                                        &mut recorder,
+                                        recorder,
                                         &options,
                                         HarnessEvent::ApprovalGranted {
                                             run_id: run_id.clone(),
@@ -819,7 +942,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                                         },
                                     )?;
                                     execute_and_record_tool(
-                                        &mut recorder,
+                                        recorder,
                                         &options,
                                         &config,
                                         &run_id,
@@ -828,7 +951,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                                 }
                                 ExternalApprovalOutcome::Denied { actor, reason } => {
                                     record_event(
-                                        &mut recorder,
+                                        recorder,
                                         &options,
                                         HarnessEvent::ApprovalDenied {
                                             run_id: run_id.clone(),
@@ -845,11 +968,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                             }
                         }
                         Err(error) => record_approval_preview_denial(
-                            &mut recorder,
-                            &options,
-                            &run_id,
-                            &call_id,
-                            error,
+                            recorder, &options, &run_id, &call_id, error,
                         )?,
                     }
                 } else {
@@ -867,7 +986,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                             )? {
                                 ApprovalOutcome::Granted => {
                                     record_event(
-                                        &mut recorder,
+                                        recorder,
                                         &options,
                                         HarnessEvent::ApprovalGranted {
                                             run_id: run_id.clone(),
@@ -876,7 +995,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                                         },
                                     )?;
                                     execute_and_record_tool(
-                                        &mut recorder,
+                                        recorder,
                                         &options,
                                         &config,
                                         &run_id,
@@ -885,7 +1004,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                                 }
                                 ApprovalOutcome::Denied { reason } => {
                                     record_event(
-                                        &mut recorder,
+                                        recorder,
                                         &options,
                                         HarnessEvent::ApprovalDenied {
                                             run_id: run_id.clone(),
@@ -902,11 +1021,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                             }
                         }
                         Err(error) => record_approval_preview_denial(
-                            &mut recorder,
-                            &options,
-                            &run_id,
-                            &call_id,
-                            error,
+                            recorder, &options, &run_id, &call_id, error,
                         )?,
                     }
                 }
@@ -932,7 +1047,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
     }
 
     fail_run(
-        &mut recorder,
+        recorder,
         &options,
         &run_id,
         format!("exceeded maximum turn count of {}", config.limits.max_turns),
@@ -947,7 +1062,7 @@ struct ToolMessage {
 }
 
 fn record_approval_preview_denial(
-    recorder: &mut EventRecorder,
+    recorder: &mut dyn RunEventRecorder,
     options: &RunOptions,
     run_id: &RunId,
     call_id: &ToolCallId,
@@ -1021,7 +1136,7 @@ fn neutralize_tool_output_closers(body: &str) -> String {
 }
 
 fn record_event(
-    recorder: &mut EventRecorder,
+    recorder: &mut dyn RunEventRecorder,
     options: &RunOptions,
     event: HarnessEvent,
 ) -> AppResult<RecordedEvent> {
@@ -1037,7 +1152,7 @@ fn emit_ledger_record(options: &RunOptions, record: &RecordedEvent) {
 }
 
 fn record_terminal_success(
-    recorder: &mut EventRecorder,
+    recorder: &mut dyn RunEventRecorder,
     options: &RunOptions,
     run_id: &RunId,
     final_answer: &str,
@@ -1048,7 +1163,7 @@ fn record_terminal_success(
 }
 
 fn record_terminal_failure(
-    recorder: &mut EventRecorder,
+    recorder: &mut dyn RunEventRecorder,
     options: &RunOptions,
     run_id: &RunId,
     reason: &str,
@@ -1060,7 +1175,7 @@ fn record_terminal_failure(
 }
 
 fn fail_run<T>(
-    recorder: &mut EventRecorder,
+    recorder: &mut dyn RunEventRecorder,
     options: &RunOptions,
     run_id: &RunId,
     reason: impl Into<String>,
@@ -1108,7 +1223,7 @@ fn emit_assistant_delta(options: &RunOptions, delta: AssistantDeltaEvent) {
 }
 
 fn record_context_built(
-    recorder: &mut EventRecorder,
+    recorder: &mut dyn RunEventRecorder,
     options: &RunOptions,
     run_id: &RunId,
     turn_id: TurnId,
@@ -1134,7 +1249,7 @@ fn record_context_built(
 }
 
 fn check_cancel(
-    recorder: &mut EventRecorder,
+    recorder: &mut dyn RunEventRecorder,
     options: &RunOptions,
     run_id: &RunId,
 ) -> AppResult<()> {
@@ -1152,7 +1267,7 @@ fn cancel_requested(options: &RunOptions) -> bool {
 }
 
 fn execute_and_record_tool(
-    recorder: &mut EventRecorder,
+    recorder: &mut dyn RunEventRecorder,
     options: &RunOptions,
     config: &Config,
     run_id: &RunId,

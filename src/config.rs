@@ -2,7 +2,7 @@ use crate::{
     AppError, AppResult,
     tool_catalog::{default_enabled_tools, is_known_tool},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
@@ -63,7 +63,7 @@ pub struct DiscordGatewayConfig {
     pub channel_configs: HashMap<u64, PathBuf>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub kind: ProviderKind,
     pub model: String,
@@ -75,21 +75,21 @@ pub struct ProviderConfig {
     pub app_title: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     OpenAi,
     OpenRouter,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LimitsConfig {
     pub token_budget: u32,
     pub max_output_tokens: u32,
     pub max_turns: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ToolsConfig {
     pub enabled: Vec<String>,
 }

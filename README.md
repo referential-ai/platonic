@@ -320,6 +320,14 @@ before `finished`, `failed`, or `canceled` can be observed.
 An accepted `run.cancel` stores `cancel_requested` before replying. Repeated
 requests return that state without another cancellation event, while terminal
 runs reject cancellation.
+Each daemon run executes in a supervised child process while `plato-agentd`
+stays alive and authoritative. The daemon is the only SQLite writer; the child
+receives a prepared run snapshot without a ledger path and returns typed ledger
+operations, live deltas, approval requests, and its result over private stdio.
+Every child has an explicit 30-minute deadline. Cancellation or deadline expiry
+first sends the child cancellation token, then terminates its complete process
+tree after a bounded grace period, escalates to a kill when necessary, drains
+output for a bounded interval, and verifies that no child processes remain.
 The daemon retains event buffers for the newest 32 terminal runs in completion
 order. Older runs return `not_found` from `events.stream`; `transcript.read` and
 `sessions.list` remain ledger-backed.
