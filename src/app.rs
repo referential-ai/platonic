@@ -1397,6 +1397,9 @@ mod tests {
     const LOADED_RUNNER_EVENT_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(10);
     const LOADED_RUNNER_REQUEST_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(10);
     const NATIVE_WINDOWS_FIXTURE_TRIALS: usize = 50;
+    const STALLED_STREAM_TRIALS: usize = 25;
+    const CANCEL_OBSERVATION_LIMIT: std::time::Duration = std::time::Duration::from_millis(100);
+    const TERMINAL_READBACK_LIMIT: std::time::Duration = std::time::Duration::from_millis(500);
 
     fn run_native_windows_fixture_trials(name: &str, fixture: fn()) {
         for trial in 1..=NATIVE_WINDOWS_FIXTURE_TRIALS {
@@ -5143,151 +5146,31 @@ enabled = ["file.read"]
 
     #[test]
     fn stalled_stream_cancel_reaches_canceled_session_within_500_ms_for_25_trials() {
-        const TRIALS: usize = 25;
-        const CANCEL_OBSERVATION_LIMIT: std::time::Duration = std::time::Duration::from_millis(100);
-        const TERMINAL_READBACK_LIMIT: std::time::Duration = std::time::Duration::from_millis(500);
-        let mut cancel_to_observation = Vec::with_capacity(TRIALS);
-        let mut observation_to_terminal_commit = Vec::with_capacity(TRIALS);
-        let mut observation_to_run_return = Vec::with_capacity(TRIALS);
-        let mut terminal_commit_to_readback = Vec::with_capacity(TRIALS);
-        let mut cancel_to_readback = Vec::with_capacity(TRIALS);
+        let mut cancel_to_observation = Vec::with_capacity(STALLED_STREAM_TRIALS);
+        let mut observation_to_terminal_commit = Vec::with_capacity(STALLED_STREAM_TRIALS);
+        let mut observation_to_run_return = Vec::with_capacity(STALLED_STREAM_TRIALS);
+        let mut terminal_commit_to_readback = Vec::with_capacity(STALLED_STREAM_TRIALS);
+        let mut cancel_to_readback = Vec::with_capacity(STALLED_STREAM_TRIALS);
 
-        for trial in 0..TRIALS {
-            let (continue_sender, continue_receiver) = std::sync::mpsc::channel();
-            let server = spawn_cancelable_streaming_provider(continue_receiver);
-            let dir = tempfile::tempdir().unwrap();
-            let config_path = dir.path().join("plato.toml");
-            std::fs::write(
-                &config_path,
-                format!(
-                    r#"
-[provider]
-kind = "open_ai"
-model = "test-model"
-api_key_env = "PATH"
-base_url = "{}"
-timeout_ms = 5000
-
-[limits]
-token_budget = 4000
-max_output_tokens = 32
-max_turns = 1
-
-[tools]
-enabled = ["file.read"]
-"#,
-                    server.base_url
-                ),
-            )
-            .unwrap();
-            let ledger_path = dir.path().join("events.db");
-            let run_id = format!("run_stream_cancel_{trial}");
-            let session_id = format!("session_stream_cancel_{trial}");
-            let cancel = Arc::new(AtomicBool::new(false));
-            let (event_sender, event_receiver) = std::sync::mpsc::channel();
-            let options = retry_session_test_options(
-                config_path,
-                ledger_path.clone(),
-                dir.path().to_path_buf(),
-                &run_id,
-                &session_id,
-                Some(event_sender),
-                Arc::clone(&cancel),
-            );
-            let (observation_sender, observation_receiver) = std::sync::mpsc::channel();
-            let (return_sender, return_receiver) = std::sync::mpsc::channel();
-            let handle = thread::spawn(move || {
-                let result = crate::provider::openai_compat::with_response_read_cancel_observer(
-                    observation_sender,
-                    || run_question(options),
-                );
-                return_sender.send(std::time::Instant::now()).unwrap();
-                result
-            });
-
-            let first_delta = loop {
-                match event_receiver
-                    .recv_timeout(std::time::Duration::from_secs(2))
-                    .expect("run should emit first streamed delta before cancel")
-                {
-                    RunEvent::AssistantDelta(delta) => break delta,
-                    RunEvent::Ledger(_) => {}
-                }
-            };
-            assert_eq!(first_delta.text, "Hel");
-
-            let canceled_at = std::time::Instant::now();
-            cancel.store(true, Ordering::SeqCst);
-            let proof_deadline = canceled_at + TERMINAL_READBACK_LIMIT;
-            let observed_at = observation_receiver
-                .recv_timeout(proof_deadline.saturating_duration_since(std::time::Instant::now()))
-                .expect("response-body read should observe cancellation before the proof deadline");
-            let observation_elapsed = observed_at.duration_since(canceled_at);
-            assert!(
-                observation_elapsed < CANCEL_OBSERVATION_LIMIT,
-                "trial {trial} response-body cancellation observation took \
-                 {observation_elapsed:?}"
-            );
-
-            let terminal_commit_at = loop {
-                let event = event_receiver
-                    .recv_timeout(
-                        proof_deadline.saturating_duration_since(std::time::Instant::now()),
-                    )
-                    .expect("canceled terminal should commit before the proof deadline");
-                if matches!(
-                    event,
-                    RunEvent::Ledger(RecordedEvent {
-                        event: HarnessEvent::RunFailed { ref reason, .. },
-                        ..
-                    }) if reason == RUN_CANCELED_REASON
-                ) {
-                    break std::time::Instant::now();
-                }
-            };
-            let returned_at = return_receiver
-                .recv_timeout(proof_deadline.saturating_duration_since(std::time::Instant::now()))
-                .expect("run should return before the proof deadline");
-            let error = handle.join().unwrap().unwrap_err();
-            assert!(matches!(error, AppError::RunCanceled));
-            let summaries = SqliteLedger::open_readonly(&ledger_path)
-                .unwrap()
-                .session_summaries()
-                .unwrap();
-            let readback_at = std::time::Instant::now();
-            assert_eq!(summaries.len(), 1);
-            assert_eq!(
-                summaries[0].status,
-                crate::daemon::protocol::RunStateName::Canceled
-            );
-            let elapsed = readback_at.duration_since(canceled_at);
-            assert!(
-                elapsed < TERMINAL_READBACK_LIMIT,
-                "trial {trial} stalled-stream terminal readback took {elapsed:?}"
-            );
-            cancel_to_observation.push(observation_elapsed);
-            observation_to_terminal_commit.push(terminal_commit_at.duration_since(observed_at));
-            observation_to_run_return.push(returned_at.duration_since(observed_at));
-            terminal_commit_to_readback.push(readback_at.duration_since(terminal_commit_at));
-            cancel_to_readback.push(elapsed);
-
-            assert_canceled_retry_session(
-                &ledger_path,
-                &run_id,
-                &session_id,
-                vec![("requested", "turn_1".into(), 0)],
-            );
-            continue_sender.send(()).unwrap();
-            let provider_request = server.handle.join().unwrap();
-            assert!(provider_request.starts_with("POST /chat/completions "));
+        for trial in 0..STALLED_STREAM_TRIALS {
+            let trial_result =
+                run_stalled_stream_cancel_trial(trial, StalledStreamPhaseDelays::default());
+            trial_result.assert_canceled_session();
+            trial_result.timings.assert_within_limits(trial);
+            cancel_to_observation.push(trial_result.timings.cancel_to_observation());
+            observation_to_terminal_commit
+                .push(trial_result.timings.observation_to_terminal_commit());
+            observation_to_run_return.push(trial_result.timings.observation_to_run_return());
+            terminal_commit_to_readback.push(trial_result.timings.terminal_commit_to_readback());
+            cancel_to_readback.push(trial_result.timings.cancel_to_readback());
         }
 
         let percentiles = |latencies: &mut Vec<std::time::Duration>| {
             latencies.sort_unstable();
             (
-                latencies[TRIALS / 2].as_secs_f64() * 1_000.0,
+                latencies[STALLED_STREAM_TRIALS / 2].as_secs_f64() * 1_000.0,
                 latencies[23].as_secs_f64() * 1_000.0,
-                latencies[TRIALS - 1].as_secs_f64() * 1_000.0,
+                latencies[STALLED_STREAM_TRIALS - 1].as_secs_f64() * 1_000.0,
             )
         };
         let observation = percentiles(&mut cancel_to_observation);
@@ -5297,7 +5180,7 @@ enabled = ["file.read"]
         let end_to_end = percentiles(&mut cancel_to_readback);
         let print_phase = |phase: &str, (p50, p95, max): (f64, f64, f64)| {
             eprintln!(
-                "STALLED_STREAM_CANCEL_METRICS trials={TRIALS} phase={phase} \
+                "STALLED_STREAM_CANCEL_METRICS trials={STALLED_STREAM_TRIALS} phase={phase} \
                  p50_ms={p50:.3} p95_ms={p95:.3} max_ms={max:.3}"
             );
         };
@@ -5306,6 +5189,468 @@ enabled = ["file.read"]
         print_phase("observation_to_run_return", run_return);
         print_phase("terminal_commit_to_readback", readback);
         print_phase("cancel_to_readback", end_to_end);
+    }
+
+    #[test]
+    fn stalled_stream_phase_bounds_name_each_delayed_phase() {
+        for (phase, delays) in [
+            (
+                StalledStreamPhase::ResponseReadCancellation,
+                StalledStreamPhaseDelays {
+                    response_read_cancellation: std::time::Duration::from_millis(125),
+                    ..Default::default()
+                },
+            ),
+            (
+                StalledStreamPhase::TerminalLedgerCommit,
+                StalledStreamPhaseDelays {
+                    terminal_ledger_commit: std::time::Duration::from_millis(600),
+                    ..Default::default()
+                },
+            ),
+            (
+                StalledStreamPhase::RunReturn,
+                StalledStreamPhaseDelays {
+                    run_return: std::time::Duration::from_millis(600),
+                    ..Default::default()
+                },
+            ),
+            (
+                StalledStreamPhase::SessionReadyReadback,
+                StalledStreamPhaseDelays {
+                    session_ready_readback: std::time::Duration::from_millis(600),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let trial_result = run_stalled_stream_cancel_trial(0, delays);
+            trial_result.assert_canceled_session();
+            let failure = trial_result.timings.first_failure().unwrap();
+            eprintln!(
+                "STALLED_STREAM_CANCEL_MUTATION phase={} elapsed_ms={:.3} limit_ms={:.3}",
+                failure.phase.name(),
+                failure.elapsed.as_secs_f64() * 1_000.0,
+                failure.limit.as_secs_f64() * 1_000.0
+            );
+            assert_eq!(failure.phase, phase);
+            assert!(
+                failure.elapsed >= failure.limit,
+                "{} mutation measured {:?} below {:?}",
+                phase.name(),
+                failure.elapsed,
+                failure.limit
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_stalled_stream_observers_do_not_accuse_source_phases() {
+        let trial_result = run_stalled_stream_cancel_trial(
+            0,
+            StalledStreamPhaseDelays {
+                terminal_event_observer: std::time::Duration::from_millis(600),
+                observing_test_thread: std::time::Duration::from_millis(600),
+                ..Default::default()
+            },
+        );
+        trial_result.assert_canceled_session();
+        trial_result.timings.assert_within_limits(0);
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct StalledStreamPhaseDelays {
+        response_read_cancellation: std::time::Duration,
+        terminal_ledger_commit: std::time::Duration,
+        run_return: std::time::Duration,
+        session_ready_readback: std::time::Duration,
+        terminal_event_observer: std::time::Duration,
+        observing_test_thread: std::time::Duration,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum StalledStreamPhase {
+        ResponseReadCancellation,
+        TerminalLedgerCommit,
+        RunReturn,
+        SessionReadyReadback,
+    }
+
+    impl StalledStreamPhase {
+        fn name(self) -> &'static str {
+            match self {
+                Self::ResponseReadCancellation => "response-read cancellation observation",
+                Self::TerminalLedgerCommit => "terminal ledger commit",
+                Self::RunReturn => "run return",
+                Self::SessionReadyReadback => "session-ready SQLite readback",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct StalledStreamTimingFailure {
+        phase: StalledStreamPhase,
+        elapsed: std::time::Duration,
+        limit: std::time::Duration,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct StalledStreamTimings {
+        canceled_at: std::time::Instant,
+        cancellation_observed_at: std::time::Instant,
+        terminal_event_observed_at: std::time::Instant,
+        run_returned_at: std::time::Instant,
+        session_ready_at: std::time::Instant,
+    }
+
+    impl StalledStreamTimings {
+        fn terminal_committed_at(self) -> std::time::Instant {
+            // Both observations occur only after the atomic commit. The earlier
+            // upper bound prevents a delayed event observer from inflating it.
+            self.terminal_event_observed_at.min(self.run_returned_at)
+        }
+
+        fn cancel_to_observation(self) -> std::time::Duration {
+            self.cancellation_observed_at
+                .saturating_duration_since(self.canceled_at)
+        }
+
+        fn observation_to_terminal_commit(self) -> std::time::Duration {
+            self.terminal_committed_at()
+                .saturating_duration_since(self.cancellation_observed_at)
+        }
+
+        fn observation_to_run_return(self) -> std::time::Duration {
+            self.run_returned_at
+                .saturating_duration_since(self.cancellation_observed_at)
+        }
+
+        fn terminal_commit_to_readback(self) -> std::time::Duration {
+            self.session_ready_at
+                .saturating_duration_since(self.terminal_committed_at())
+        }
+
+        fn cancel_to_readback(self) -> std::time::Duration {
+            self.session_ready_at
+                .saturating_duration_since(self.canceled_at)
+        }
+
+        fn first_failure(self) -> Option<StalledStreamTimingFailure> {
+            let phases = [
+                (
+                    StalledStreamPhase::ResponseReadCancellation,
+                    self.cancel_to_observation(),
+                    CANCEL_OBSERVATION_LIMIT,
+                ),
+                (
+                    StalledStreamPhase::TerminalLedgerCommit,
+                    self.terminal_committed_at()
+                        .saturating_duration_since(self.canceled_at),
+                    TERMINAL_READBACK_LIMIT,
+                ),
+                (
+                    StalledStreamPhase::RunReturn,
+                    self.run_returned_at
+                        .saturating_duration_since(self.canceled_at),
+                    TERMINAL_READBACK_LIMIT,
+                ),
+                (
+                    StalledStreamPhase::SessionReadyReadback,
+                    self.cancel_to_readback(),
+                    TERMINAL_READBACK_LIMIT,
+                ),
+            ];
+            phases
+                .into_iter()
+                .find(|(_, elapsed, limit)| elapsed >= limit)
+                .map(|(phase, elapsed, limit)| StalledStreamTimingFailure {
+                    phase,
+                    elapsed,
+                    limit,
+                })
+        }
+
+        fn assert_within_limits(self, trial: usize) {
+            if let Some(failure) = self.first_failure() {
+                panic!(
+                    "trial {trial} phase={} elapsed={:?} limit={:?}",
+                    failure.phase.name(),
+                    failure.elapsed,
+                    failure.limit
+                );
+            }
+        }
+    }
+
+    struct StalledStreamRunObservation {
+        result: AppResult<RunOutcome>,
+        returned_at: std::time::Instant,
+        summaries: AppResult<Vec<crate::ledger::PersistedSessionSummary>>,
+        session_ready_at: std::time::Instant,
+    }
+
+    struct StalledStreamTrialResult {
+        _dir: tempfile::TempDir,
+        ledger_path: PathBuf,
+        run_id: String,
+        session_id: String,
+        first_delta: String,
+        provider_request: String,
+        run: StalledStreamRunObservation,
+        timings: StalledStreamTimings,
+    }
+
+    impl StalledStreamTrialResult {
+        fn assert_canceled_session(&self) {
+            assert_eq!(self.first_delta, "Hel");
+            assert!(self.provider_request.starts_with("POST /chat/completions "));
+            assert!(matches!(self.run.result, Err(AppError::RunCanceled)));
+            let summaries = self.run.summaries.as_ref().unwrap();
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(
+                summaries[0].status,
+                crate::daemon::protocol::RunStateName::Canceled
+            );
+            assert_canceled_retry_session(
+                &self.ledger_path,
+                &self.run_id,
+                &self.session_id,
+                vec![("requested", "turn_1".into(), 0)],
+            );
+        }
+    }
+
+    struct TerminalEventObserver {
+        first_delta_receiver: std::sync::mpsc::Receiver<String>,
+        completion_receiver: std::sync::mpsc::Receiver<Result<std::time::Instant, String>>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    impl TerminalEventObserver {
+        fn spawn(events: std::sync::mpsc::Receiver<RunEvent>, delay: std::time::Duration) -> Self {
+            let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(0);
+            let (first_delta_sender, first_delta_receiver) = std::sync::mpsc::channel();
+            let (completion_sender, completion_receiver) = std::sync::mpsc::channel();
+            let handle = thread::spawn(move || {
+                let _ = ready_sender.send(());
+                let deadline = std::time::Instant::now() + LOADED_RUNNER_EVENT_ALLOWANCE;
+                let result = loop {
+                    let event = match events
+                        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    {
+                        Ok(event) => event,
+                        Err(error) => {
+                            break Err(format!("terminal event observer failed: {error}"));
+                        }
+                    };
+                    match event {
+                        RunEvent::AssistantDelta(delta) => {
+                            let _ = first_delta_sender.send(delta.text);
+                        }
+                        RunEvent::Ledger(RecordedEvent {
+                            event: HarnessEvent::RunFailed { reason, .. },
+                            ..
+                        }) if reason == RUN_CANCELED_REASON => {
+                            thread::sleep(delay);
+                            break Ok(std::time::Instant::now());
+                        }
+                        RunEvent::Ledger(_) => {}
+                    }
+                };
+                let _ = completion_sender.send(result);
+            });
+            ready_receiver
+                .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
+                .expect("terminal event observer should become ready");
+            Self {
+                first_delta_receiver,
+                completion_receiver,
+                handle,
+            }
+        }
+
+        fn first_delta(&self) -> Result<String, String> {
+            self.first_delta_receiver
+                .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
+                .map_err(|error| format!("first streamed delta was not observed: {error}"))
+        }
+
+        fn finish(self) -> Result<std::time::Instant, String> {
+            let result = self
+                .completion_receiver
+                .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
+                .map_err(|error| format!("terminal event observer did not finish: {error}"));
+            let joined = self
+                .handle
+                .join()
+                .map_err(|_| "terminal event observer panicked".to_owned());
+            joined?;
+            result?
+        }
+    }
+
+    struct TerminalCommitBlocker {
+        start_sender: std::sync::mpsc::Sender<()>,
+        completion_receiver: std::sync::mpsc::Receiver<Result<(), String>>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    impl TerminalCommitBlocker {
+        fn spawn(path: PathBuf, delay: std::time::Duration) -> Self {
+            let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(0);
+            let (start_sender, start_receiver) = std::sync::mpsc::channel();
+            let (completion_sender, completion_receiver) = std::sync::mpsc::channel();
+            let handle = thread::spawn(move || {
+                let result = (|| -> Result<(), String> {
+                    let connection = rusqlite::Connection::open(path)
+                        .map_err(|error| format!("terminal blocker open failed: {error}"))?;
+                    connection
+                        .execute_batch("BEGIN IMMEDIATE")
+                        .map_err(|error| format!("terminal blocker lock failed: {error}"))?;
+                    ready_sender
+                        .send(())
+                        .map_err(|error| format!("terminal blocker ready failed: {error}"))?;
+                    start_receiver
+                        .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
+                        .map_err(|error| format!("terminal blocker start failed: {error}"))?;
+                    thread::sleep(delay);
+                    connection
+                        .execute_batch("COMMIT")
+                        .map_err(|error| format!("terminal blocker release failed: {error}"))?;
+                    Ok(())
+                })();
+                let _ = completion_sender.send(result);
+            });
+            ready_receiver
+                .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
+                .expect("terminal commit blocker should become ready");
+            Self {
+                start_sender,
+                completion_receiver,
+                handle,
+            }
+        }
+
+        fn start(&self) {
+            self.start_sender.send(()).unwrap();
+        }
+
+        fn finish(self) -> Result<(), String> {
+            let result = self
+                .completion_receiver
+                .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
+                .map_err(|error| format!("terminal blocker did not finish: {error}"));
+            let joined = self
+                .handle
+                .join()
+                .map_err(|_| "terminal blocker panicked".to_owned());
+            joined?;
+            result?
+        }
+    }
+
+    fn run_stalled_stream_cancel_trial(
+        trial: usize,
+        delays: StalledStreamPhaseDelays,
+    ) -> StalledStreamTrialResult {
+        let server = spawn_cancelable_streaming_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        write_retry_test_config(&config_path, &server.base_url, 5_000, 5_000);
+        let ledger_path = dir.path().join("events.db");
+        let run_id = format!("run_stream_cancel_{trial}");
+        let session_id = format!("session_stream_cancel_{trial}");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let terminal_observer =
+            TerminalEventObserver::spawn(event_receiver, delays.terminal_event_observer);
+        let options = retry_session_test_options(
+            config_path,
+            ledger_path.clone(),
+            dir.path().to_path_buf(),
+            &run_id,
+            &session_id,
+            Some(event_sender),
+            Arc::clone(&cancel),
+        );
+        let (observation_sender, observation_receiver) = std::sync::mpsc::channel();
+        let (run_ready_sender, run_ready_receiver) = std::sync::mpsc::sync_channel(0);
+        let (run_done_sender, run_done_receiver) = std::sync::mpsc::channel();
+        let run_ledger_path = ledger_path.clone();
+        let handle = thread::spawn(move || {
+            let _ = run_ready_sender.send(());
+            let result = crate::provider::openai_compat::with_response_read_cancel_observer(
+                observation_sender,
+                delays.response_read_cancellation,
+                || run_question(options),
+            );
+            thread::sleep(delays.run_return);
+            let returned_at = std::time::Instant::now();
+            thread::sleep(delays.session_ready_readback);
+            let summaries = SqliteLedger::open_readonly(&run_ledger_path)
+                .and_then(|ledger| ledger.session_summaries());
+            let session_ready_at = std::time::Instant::now();
+            let _ = run_done_sender.send(());
+            StalledStreamRunObservation {
+                result,
+                returned_at,
+                summaries,
+                session_ready_at,
+            }
+        });
+        run_ready_receiver
+            .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
+            .expect("stalled-stream run helper should become ready");
+        let first_delta = terminal_observer.first_delta();
+        let terminal_blocker =
+            (delays.terminal_ledger_commit > std::time::Duration::ZERO).then(|| {
+                TerminalCommitBlocker::spawn(ledger_path.clone(), delays.terminal_ledger_commit)
+            });
+
+        let canceled_at = std::time::Instant::now();
+        cancel.store(true, Ordering::SeqCst);
+        if let Some(blocker) = &terminal_blocker {
+            blocker.start();
+        }
+        thread::sleep(delays.observing_test_thread);
+
+        let cancellation_observed_at = observation_receiver
+            .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
+            .map_err(|error| format!("cancellation observer did not finish: {error}"));
+        let run_done = run_done_receiver
+            .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
+            .map_err(|error| format!("run helper did not finish: {error}"));
+        let provider_request = server.finish();
+        let terminal_blocker_result = terminal_blocker.map(TerminalCommitBlocker::finish);
+        let terminal_event_observed_at = terminal_observer.finish();
+        let run = handle
+            .join()
+            .map_err(|_| "stalled-stream run helper panicked".to_owned());
+
+        run_done.expect("stalled-stream run helper should finish within its teardown bound");
+        if let Some(result) = terminal_blocker_result {
+            result.expect("terminal commit blocker should finish within its teardown bound");
+        }
+        let run = run.expect("stalled-stream run helper should join");
+        let timings = StalledStreamTimings {
+            canceled_at,
+            cancellation_observed_at: cancellation_observed_at
+                .expect("response-read cancellation observation should be source-timestamped"),
+            terminal_event_observed_at: terminal_event_observed_at
+                .expect("terminal ledger event should be source-timestamped"),
+            run_returned_at: run.returned_at,
+            session_ready_at: run.session_ready_at,
+        };
+        StalledStreamTrialResult {
+            _dir: dir,
+            ledger_path,
+            run_id,
+            session_id,
+            first_delta: first_delta.expect("run should emit first streamed delta before cancel"),
+            provider_request: provider_request
+                .expect("provider listener should finish within its teardown bound"),
+            run,
+            timings,
+        }
     }
 
     fn seed_finished_session(path: &Path, session_id: &str, turns: &[SessionTurn]) {
@@ -5531,9 +5876,29 @@ enabled = ["file.read"]
         }
     }
 
-    struct StreamingProvider {
+    struct CancelableStreamingProvider {
         base_url: String,
-        handle: thread::JoinHandle<String>,
+        release_sender: std::sync::mpsc::Sender<()>,
+        abort_sender: std::sync::mpsc::Sender<()>,
+        completion_receiver: std::sync::mpsc::Receiver<Result<String, String>>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    impl CancelableStreamingProvider {
+        fn finish(self) -> Result<String, String> {
+            let _ = self.release_sender.send(());
+            let _ = self.abort_sender.send(());
+            let result = self
+                .completion_receiver
+                .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
+                .map_err(|error| format!("cancelable provider did not finish: {error}"));
+            let joined = self
+                .handle
+                .join()
+                .map_err(|_| "cancelable provider panicked".to_owned());
+            joined?;
+            result?
+        }
     }
 
     struct SequenceProvider {
@@ -6059,35 +6424,77 @@ enabled = ["file.read"]
         assert!(replay.contains("final_phase: Failed"));
     }
 
-    fn spawn_cancelable_streaming_provider(
-        continue_receiver: std::sync::mpsc::Receiver<()>,
-    ) -> StreamingProvider {
+    fn spawn_cancelable_streaming_provider() -> CancelableStreamingProvider {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let (abort_sender, abort_receiver) = std::sync::mpsc::channel();
+        let (completion_sender, completion_receiver) = std::sync::mpsc::channel();
         let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = read_http_request(&mut stream);
-            let first = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n";
-            let tail = concat!(
-                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
-                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-                "data: [DONE]\n\n",
-            );
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
-                first.len() + tail.len(),
-                first
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-            stream.flush().unwrap();
-            continue_receiver
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .unwrap();
-            let _ = stream.write_all(tail.as_bytes());
-            let _ = stream.flush();
-            request
+            let result = (|| -> Result<String, String> {
+                listener
+                    .set_nonblocking(true)
+                    .map_err(|error| format!("cancelable provider setup failed: {error}"))?;
+                ready_sender
+                    .send(())
+                    .map_err(|error| format!("cancelable provider ready failed: {error}"))?;
+                let accept_deadline = std::time::Instant::now() + LOADED_RUNNER_REQUEST_ALLOWANCE;
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(accepted) => break accepted,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            match abort_receiver.recv_timeout(std::time::Duration::from_millis(1)) {
+                                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    return Err("cancelable provider aborted before accept".into());
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                                    if std::time::Instant::now() < accept_deadline => {}
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                    return Err("cancelable provider accept timed out".into());
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            return Err(format!("cancelable provider accept failed: {error}"));
+                        }
+                    }
+                };
+                let request = read_http_request(&mut stream);
+                let first = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n";
+                let tail = concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n",
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                    first.len() + tail.len(),
+                    first
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .and_then(|()| stream.flush())
+                    .map_err(|error| format!("cancelable provider first delta failed: {error}"))?;
+                release_receiver
+                    .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
+                    .map_err(|error| format!("cancelable provider release failed: {error}"))?;
+                let _ = stream.write_all(tail.as_bytes());
+                let _ = stream.flush();
+                Ok(request)
+            })();
+            let _ = completion_sender.send(result);
         });
-        StreamingProvider { base_url, handle }
+        ready_receiver
+            .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
+            .expect("cancelable provider should become ready");
+        CancelableStreamingProvider {
+            base_url,
+            release_sender,
+            abort_sender,
+            completion_receiver,
+            handle,
+        }
     }
 
     fn read_http_request(stream: &mut std::net::TcpStream) -> String {
