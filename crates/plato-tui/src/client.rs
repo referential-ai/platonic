@@ -284,6 +284,10 @@ pub(super) enum ClientCommand {
         run_id: String,
         tool_call_id: String,
     },
+    ApprovalGrantSession {
+        run_id: String,
+        tool_call_id: String,
+    },
     ApprovalDeny {
         run_id: String,
         tool_call_id: String,
@@ -446,6 +450,21 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
                 }
             })
         }
+        ClientCommand::ApprovalGrantSession {
+            run_id,
+            tool_call_id,
+        } => {
+            let result = with_client(config, |client| {
+                client.approval_grant_session(&run_id, &tool_call_id)
+            });
+            result.map_or_else(failed_event(ClientOperation::ApprovalDecide), |result| {
+                ClientEvent::ApprovalDecided {
+                    result,
+                    tool_call_id,
+                    decision: ApprovalDecisionName::Granted,
+                }
+            })
+        }
         ClientCommand::ApprovalDeny {
             run_id,
             tool_call_id,
@@ -570,6 +589,7 @@ pub(super) fn apply_client_event(
         } => {
             state.status_message = Some(format!("approval decision sent for {}", result.run_id));
             state.approval = None;
+            state.approval_scroll_offset = 0;
             state.active_run = Some(ActiveRunView::new(result.run_id.clone(), result.status));
             let decision = match decision {
                 ApprovalDecisionName::Granted => "granted",
@@ -585,6 +605,7 @@ pub(super) fn apply_client_event(
             state.status_message = Some(format!("cancel requested for {}", result.run_id));
             state.cancel_requested = true;
             state.approval = None;
+            state.approval_scroll_offset = 0;
             state.active_run = Some(ActiveRunView::new(result.run_id.clone(), result.status));
             push_live_event(
                 state,
@@ -693,6 +714,9 @@ pub(super) fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
         if loaded.approval.is_none() {
             loaded.approval = state.approval.clone();
         }
+        if loaded.approval == state.approval {
+            loaded.approval_scroll_offset = state.approval_scroll_offset;
+        }
         loaded.cancel_requested = state.cancel_requested;
     }
     *state = loaded;
@@ -731,6 +755,7 @@ pub(super) fn apply_run_response(
     state.stream_warning = None;
     state.cancel_requested = false;
     state.approval = None;
+    state.approval_scroll_offset = 0;
     state.active_run = Some(ActiveRunView::new(run_id.clone(), status));
     state.bind_latest_user_to_run(&run_id);
     push_live_event(
@@ -792,6 +817,7 @@ pub(super) fn apply_events_result(
             },
         ) {
             state.approval = Some(approval);
+            state.approval_scroll_offset = 0;
         }
         let line = crate::live_event_line(&buffered);
         let line = if line.run_id.is_some() {

@@ -1,16 +1,20 @@
 use crate::{
     AppError, AppResult, ApprovalRequest, AssistantDeltaEvent,
+    app::ExternalApprovalOutcome,
     daemon::{
         DaemonPaths,
-        protocol::{BufferedStreamEvent, PendingApprovalSnapshot, RunStateName, StreamEvent},
+        protocol::{
+            ApprovalDecision, BufferedStreamEvent, PendingApprovalSnapshot, RunStateName,
+            StreamEvent,
+        },
     },
-    tools::ApprovalOutcome,
+    tool_catalog::SHELL_EXEC,
 };
-use platonic_core::RecordedEvent;
+use platonic_core::{EffectClass, RecordedEvent};
 #[cfg(test)]
 use std::sync::Barrier;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
         Arc, Condvar, Mutex,
@@ -22,12 +26,18 @@ use std::{
 pub(super) const MAX_EVENT_BUFFER: usize = 256;
 pub(super) const MAX_TERMINAL_RUNS: usize = 32;
 
+#[cfg(test)]
+type SessionGrantInstallBarriers = Option<(Arc<Barrier>, Arc<Barrier>)>;
+
 #[derive(Clone, Debug)]
 pub(super) struct DaemonRuntime {
     pub(super) paths: DaemonPaths,
     started_at: Instant,
     pub(super) state: Arc<Mutex<RuntimeState>>,
+    session_tool_grants: Arc<Mutex<HashSet<(String, String)>>>,
     pub(super) stop_requested: Arc<AtomicBool>,
+    #[cfg(test)]
+    session_grant_install_barriers: Arc<Mutex<SessionGrantInstallBarriers>>,
     #[cfg(all(test, unix))]
     shutdown_flush_barrier: Arc<Mutex<Option<Arc<Barrier>>>>,
 }
@@ -71,7 +81,10 @@ impl DaemonRuntime {
             paths,
             started_at: Instant::now(),
             state: Arc::new(Mutex::new(RuntimeState::default())),
+            session_tool_grants: Arc::new(Mutex::new(HashSet::new())),
             stop_requested: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            session_grant_install_barriers: Arc::new(Mutex::new(None)),
             #[cfg(all(test, unix))]
             shutdown_flush_barrier: Arc::new(Mutex::new(None)),
         }
@@ -134,8 +147,13 @@ impl DaemonRuntime {
     }
 
     fn complete_run(&self, record: &RunRecord, status: RunStatus) {
-        let mut state = self.state.lock().expect("runtime state lock poisoned");
+        let mut approvals = record.approvals.lock().expect("approvals lock poisoned");
         *record.status.lock().expect("run status lock poisoned") = status;
+        approvals.retain(|_, pending| pending.decision.is_some());
+        record.approval_changed.notify_all();
+        drop(approvals);
+
+        let mut state = self.state.lock().expect("runtime state lock poisoned");
         state.terminal_runs.push_back(record.run_id.clone());
         while state.terminal_runs.len() > MAX_TERMINAL_RUNS {
             if let Some(run_id) = state.terminal_runs.pop_front() {
@@ -184,6 +202,54 @@ impl DaemonRuntime {
             .lock()
             .expect("runtime state lock poisoned")
             .shutdown_accepted
+    }
+
+    pub(super) fn has_shell_session_grant(&self, session_id: &str) -> bool {
+        self.session_tool_grants
+            .lock()
+            .expect("session tool grants lock poisoned")
+            .contains(&(session_id.to_owned(), SHELL_EXEC.to_owned()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn session_tool_grant_count(&self) -> usize {
+        self.session_tool_grants
+            .lock()
+            .expect("session tool grants lock poisoned")
+            .len()
+    }
+
+    pub(super) fn install_shell_session_grant(&self, session_id: &str) -> bool {
+        let installed = self
+            .session_tool_grants
+            .lock()
+            .expect("session tool grants lock poisoned")
+            .insert((session_id.to_owned(), SHELL_EXEC.to_owned()));
+        #[cfg(test)]
+        if installed {
+            let barriers = self
+                .session_grant_install_barriers
+                .lock()
+                .expect("session grant barrier lock poisoned")
+                .take();
+            if let Some((reached, release)) = barriers {
+                reached.wait();
+                release.wait();
+            }
+        }
+        installed
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_session_grant_install_barriers(
+        &self,
+        reached: Arc<Barrier>,
+        release: Arc<Barrier>,
+    ) {
+        *self
+            .session_grant_install_barriers
+            .lock()
+            .expect("session grant barrier lock poisoned") = Some((reached, release));
     }
 
     #[cfg(all(test, unix))]
@@ -239,13 +305,21 @@ pub(super) struct EventBuffer {
 
 #[derive(Clone, Debug)]
 pub(super) struct PendingApproval {
+    pub(super) session_id: String,
     pub(super) request: ApprovalRequest,
-    pub(super) decision: Option<ApprovalOutcome>,
+    pub(super) decision: Option<PendingApprovalDecision>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PendingApprovalDecision {
+    pub(super) decision: ApprovalDecision,
+    pub(super) outcome: ExternalApprovalOutcome,
 }
 
 impl PendingApproval {
-    pub(super) fn new(request: ApprovalRequest) -> Self {
+    pub(super) fn new(session_id: String, request: ApprovalRequest) -> Self {
         Self {
+            session_id,
             request,
             decision: None,
         }
@@ -350,30 +424,61 @@ impl RunRecord {
 }
 
 pub(super) fn approval_handler(
+    runtime: DaemonRuntime,
     record: Arc<RunRecord>,
-) -> impl Fn(ApprovalRequest) -> AppResult<ApprovalOutcome> + Send + Sync + 'static {
+) -> impl Fn(ApprovalRequest) -> AppResult<ExternalApprovalOutcome> + Send + Sync + 'static {
     move |request| {
         let call_id = request.call_id.to_string();
         let mut approvals = record.approvals.lock().expect("approvals lock poisoned");
+        if request.run_id.as_str() != record.run_id {
+            return Err(AppError::RunFailed(
+                "approval request does not match daemon run".into(),
+            ));
+        }
         if record.cancel.load(Ordering::SeqCst) {
-            return Ok(ApprovalOutcome::Denied {
+            return Ok(ExternalApprovalOutcome::Denied {
+                actor: "daemon",
                 reason: "run canceled".into(),
             });
         }
-        approvals.insert(call_id.clone(), PendingApproval::new(request.clone()));
+        if record.status().state != RunStateName::Running {
+            return Ok(ExternalApprovalOutcome::Denied {
+                actor: "daemon",
+                reason: "run is no longer active".into(),
+            });
+        }
+        if request.tool_name == SHELL_EXEC
+            && request.effect == EffectClass::ExternalSideEffect
+            && runtime.has_shell_session_grant(&record.session_id)
+        {
+            return Ok(ExternalApprovalOutcome::Granted {
+                actor: "session_grant",
+            });
+        }
+        approvals.insert(
+            call_id.clone(),
+            PendingApproval::new(record.session_id.clone(), request.clone()),
+        );
         record.push_event(approval_requested_event(&request));
         loop {
+            if let Some(pending) = approvals.get(&call_id)
+                && let Some(decision) = &pending.decision
+            {
+                return Ok(decision.outcome.clone());
+            }
             if record.cancel.load(Ordering::SeqCst) {
                 approvals.remove(&call_id);
-                return Ok(ApprovalOutcome::Denied {
+                return Ok(ExternalApprovalOutcome::Denied {
+                    actor: "daemon",
                     reason: "run canceled".into(),
                 });
             }
-            if let Some(pending) = approvals.get_mut(&call_id)
-                && let Some(decision) = pending.decision.take()
-            {
+            if record.status().state != RunStateName::Running {
                 approvals.remove(&call_id);
-                return Ok(decision);
+                return Ok(ExternalApprovalOutcome::Denied {
+                    actor: "daemon",
+                    reason: "run is no longer active".into(),
+                });
             }
             approvals = record
                 .approval_changed
@@ -459,16 +564,19 @@ mod tests {
         let approval_paused = run_record(100);
         approval_paused.approvals.lock().unwrap().insert(
             "call_1".into(),
-            PendingApproval::new(ApprovalRequest {
-                run_id: RunId::new("run_100").unwrap(),
-                call_id: ToolCallId::new("call_1").unwrap(),
-                tool_name: "file.write".into(),
-                effect: EffectClass::WorkspaceWrite,
-                reason: "file.write requires approval".into(),
-                input_preview: None,
-                approval_preview: None,
-                diff_preview: None,
-            }),
+            PendingApproval::new(
+                "session_100".into(),
+                ApprovalRequest {
+                    run_id: RunId::new("run_100").unwrap(),
+                    call_id: ToolCallId::new("call_1").unwrap(),
+                    tool_name: "file.write".into(),
+                    effect: EffectClass::WorkspaceWrite,
+                    reason: "file.write requires approval".into(),
+                    input_preview: None,
+                    approval_preview: None,
+                    diff_preview: None,
+                },
+            ),
         );
         runtime.reserve_run(approval_paused.clone()).unwrap();
         let cancel_requested = run_record(101);
@@ -623,16 +731,19 @@ mod tests {
         let record = run_record(1);
         record.approvals.lock().unwrap().insert(
             "call_1".into(),
-            PendingApproval::new(ApprovalRequest {
-                run_id: RunId::new("run_1").unwrap(),
-                call_id: ToolCallId::new("call_1").unwrap(),
-                tool_name: "file.write".into(),
-                effect: EffectClass::WorkspaceWrite,
-                reason: "file.write requires approval".into(),
-                input_preview: None,
-                approval_preview: None,
-                diff_preview: None,
-            }),
+            PendingApproval::new(
+                "session_1".into(),
+                ApprovalRequest {
+                    run_id: RunId::new("run_1").unwrap(),
+                    call_id: ToolCallId::new("call_1").unwrap(),
+                    tool_name: "file.write".into(),
+                    effect: EffectClass::WorkspaceWrite,
+                    reason: "file.write requires approval".into(),
+                    input_preview: None,
+                    approval_preview: None,
+                    diff_preview: None,
+                },
+            ),
         );
         runtime.reserve_run(record.clone()).unwrap();
 
@@ -719,7 +830,7 @@ mod tests {
             PathBuf::from("/tmp/agent.db"),
         ));
         record.cancel.store(true, Ordering::SeqCst);
-        let decide = approval_handler(record.clone());
+        let decide = approval_handler(runtime(), record.clone());
 
         let outcome = decide(ApprovalRequest {
             run_id: RunId::new("run_1").unwrap(),
@@ -735,7 +846,8 @@ mod tests {
 
         assert_eq!(
             outcome,
-            ApprovalOutcome::Denied {
+            ExternalApprovalOutcome::Denied {
+                actor: "daemon",
                 reason: "run canceled".into()
             }
         );
@@ -750,7 +862,7 @@ mod tests {
             "session_1".into(),
             PathBuf::from("/tmp/agent.db"),
         ));
-        let decide = approval_handler(record.clone());
+        let decide = approval_handler(runtime(), record.clone());
         let worker = thread::spawn(move || {
             decide(ApprovalRequest {
                 run_id: RunId::new("run_1").unwrap(),
@@ -781,15 +893,20 @@ mod tests {
             Some(r#"{"path":"out.txt"}"#)
         );
         let mut approvals = record.approvals.lock().unwrap();
-        approvals.get_mut("call_1").unwrap().decision = Some(ApprovalOutcome::Denied {
-            reason: "test complete".into(),
+        approvals.get_mut("call_1").unwrap().decision = Some(PendingApprovalDecision {
+            decision: ApprovalDecision::Deny,
+            outcome: ExternalApprovalOutcome::Denied {
+                actor: "daemon",
+                reason: "test complete".into(),
+            },
         });
         record.approval_changed.notify_all();
         drop(approvals);
 
         assert_eq!(
             worker.join().unwrap(),
-            ApprovalOutcome::Denied {
+            ExternalApprovalOutcome::Denied {
+                actor: "daemon",
                 reason: "test complete".into()
             }
         );

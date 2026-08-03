@@ -458,6 +458,9 @@ pub struct DaemonStatusTrust {
     pub approval_granted_count: u64,
     /// Number of persisted `approval_denied` events.
     pub approval_denied_count: u64,
+    /// Whether the selected session has a live daemon-lifetime `shell.exec` grant.
+    #[serde(default)]
+    pub shell_session_grant: bool,
 }
 
 /// Parameters for starting a fresh run.
@@ -781,6 +784,8 @@ pub struct EventsStreamResult {
 pub enum ApprovalDecision {
     /// Permit the requested tool call.
     Grant,
+    /// Permit this `shell.exec` call and later calls in the same daemon session.
+    GrantSession,
     /// Refuse the requested tool call.
     Deny,
 }
@@ -1195,8 +1200,8 @@ mod tests {
     #[test]
     fn daemon_status_known_and_unknown_fixtures_keep_exact_v1_bytes() {
         const STATUS_REQUEST: &str = r#"{"v":1,"id":"status_1","kind":"request","method":"daemon.status","params":{"config_path":"config/plato.toml","session_id":"session_1"}}"#;
-        const STATUS_KNOWN_RESPONSE: &str = r#"{"v":1,"id":"status_1","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":"0123456789abcdef0123456789abcdef01234567","build_date_utc":"2026-08-01","endpoint_path":"/tmp/agent.sock","package_version":"0.1.0","uptime_ms":42,"workspace_id":"work-1234"},"model":{"key_present":true,"provider_kind":"open_router","requested_alias":"~openai/gpt-latest","served_model":"openai/gpt-5.5-2026-08-01"},"session":{"core_event_count":17,"human_turn_count":2,"latest_run_id":"run_2","ledger_path":"/tmp/agent.db","session_id":"session_1"},"trust":{"approval_denied_count":1,"approval_granted_count":2},"usage":{"last_run":{"input_tokens":7,"output_tokens":3,"unknown_response_count":1},"session":{"input_tokens":17,"output_tokens":8,"unknown_response_count":2}}}}"#;
-        const STATUS_UNKNOWN_RESPONSE: &str = r#"{"v":1,"id":"status_2","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":null,"build_date_utc":null,"endpoint_path":"/tmp/agent.sock","package_version":"0.1.0","uptime_ms":0,"workspace_id":"work-1234"},"model":{"key_present":false,"provider_kind":"open_ai","requested_alias":"gpt-5.5","served_model":null},"session":{"core_event_count":0,"human_turn_count":0,"latest_run_id":null,"ledger_path":"/tmp/agent.db","session_id":null},"trust":{"approval_denied_count":0,"approval_granted_count":0},"usage":{"last_run":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0},"session":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0}}}}"#;
+        const STATUS_KNOWN_RESPONSE: &str = r#"{"v":1,"id":"status_1","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":"0123456789abcdef0123456789abcdef01234567","build_date_utc":"2026-08-01","endpoint_path":"/tmp/agent.sock","package_version":"0.1.0","uptime_ms":42,"workspace_id":"work-1234"},"model":{"key_present":true,"provider_kind":"open_router","requested_alias":"~openai/gpt-latest","served_model":"openai/gpt-5.5-2026-08-01"},"session":{"core_event_count":17,"human_turn_count":2,"latest_run_id":"run_2","ledger_path":"/tmp/agent.db","session_id":"session_1"},"trust":{"approval_denied_count":1,"approval_granted_count":2,"shell_session_grant":true},"usage":{"last_run":{"input_tokens":7,"output_tokens":3,"unknown_response_count":1},"session":{"input_tokens":17,"output_tokens":8,"unknown_response_count":2}}}}"#;
+        const STATUS_UNKNOWN_RESPONSE: &str = r#"{"v":1,"id":"status_2","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":null,"build_date_utc":null,"endpoint_path":"/tmp/agent.sock","package_version":"0.1.0","uptime_ms":0,"workspace_id":"work-1234"},"model":{"key_present":false,"provider_kind":"open_ai","requested_alias":"gpt-5.5","served_model":null},"session":{"core_event_count":0,"human_turn_count":0,"latest_run_id":null,"ledger_path":"/tmp/agent.db","session_id":null},"trust":{"approval_denied_count":0,"approval_granted_count":0,"shell_session_grant":false},"usage":{"last_run":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0},"session":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0}}}}"#;
 
         let request = decode_request(STATUS_REQUEST).unwrap();
         let params: DaemonStatusParams =
@@ -1212,6 +1217,11 @@ mod tests {
             let rebuilt = Envelope::response_from(envelope.id, envelope.method, result);
             assert_eq!(serde_json::to_string(&rebuilt).unwrap(), fixture);
         }
+
+        let legacy: DaemonStatusTrust =
+            serde_json::from_str(r#"{"approval_granted_count":2,"approval_denied_count":1}"#)
+                .unwrap();
+        assert!(!legacy.shell_session_grant);
     }
 
     #[test]
@@ -1342,7 +1352,8 @@ mod tests {
             },
             "trust": {
                 "approval_granted_count": 0,
-                "approval_denied_count": 0
+                "approval_denied_count": 0,
+                "shell_session_grant": false
             },
             "future": true
         }));
@@ -1374,6 +1385,7 @@ mod tests {
     fn approval_decisions_keep_exact_v1_wire_values() {
         let cases = [
             (ApprovalDecision::Grant, "grant"),
+            (ApprovalDecision::GrantSession, "grant_session"),
             (ApprovalDecision::Deny, "deny"),
         ];
 
@@ -1385,6 +1397,35 @@ mod tests {
             );
         }
         assert!(serde_json::from_value::<ApprovalDecision>(json!("granted")).is_err());
+        assert!(serde_json::from_value::<ApprovalDecision>(json!("grant_workspace")).is_err());
+    }
+
+    #[test]
+    fn approval_decide_params_keep_literal_v1_compatible_fixtures() {
+        for (fixture, expected) in [
+            (
+                r#"{"run_id":"run_1","tool_call_id":"call_1","decision":"grant","reason":null}"#,
+                ApprovalDecision::Grant,
+            ),
+            (
+                r#"{"run_id":"run_1","tool_call_id":"call_1","decision":"grant_session","reason":null}"#,
+                ApprovalDecision::GrantSession,
+            ),
+            (
+                r#"{"run_id":"run_1","tool_call_id":"call_1","decision":"deny","reason":"not now"}"#,
+                ApprovalDecision::Deny,
+            ),
+        ] {
+            let params: ApprovalDecideParams = serde_json::from_str(fixture).unwrap();
+            assert_eq!(params.decision, expected);
+            assert_eq!(serde_json::to_string(&params).unwrap(), fixture);
+        }
+        for unknown in ["allow", "grant_network", "grant_tool"] {
+            assert!(
+                serde_json::from_value::<ApprovalDecision>(json!(unknown)).is_err(),
+                "accepted unknown approval decision {unknown}"
+            );
+        }
     }
 
     #[test]

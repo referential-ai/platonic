@@ -269,6 +269,23 @@ impl DaemonClient {
         )
     }
 
+    /// Grants a pending `shell.exec` request and later calls in its daemon session.
+    pub fn approval_grant_session(
+        &mut self,
+        run_id: &str,
+        tool_call_id: &str,
+    ) -> ClientResult<CommandAcceptedResult> {
+        self.request(
+            "approval.decide",
+            ApprovalDecideParams {
+                run_id: run_id.into(),
+                tool_call_id: tool_call_id.into(),
+                decision: ApprovalDecision::GrantSession,
+                reason: None,
+            },
+        )
+    }
+
     /// Denies a pending daemon approval request with a reason.
     pub fn approval_deny(
         &mut self,
@@ -895,7 +912,8 @@ mod tests {
                     },
                     "trust": {
                         "approval_granted_count": 2,
-                        "approval_denied_count": 1
+                        "approval_denied_count": 1,
+                        "shell_session_grant": true
                     }
                 }),
             );
@@ -921,6 +939,7 @@ mod tests {
         assert_eq!(status.usage.session.input_tokens, 17);
         assert_eq!(status.trust.approval_granted_count, 2);
         assert_eq!(status.trust.approval_denied_count, 1);
+        assert!(status.trust.shell_session_grant);
     }
 
     #[test]
@@ -1273,6 +1292,28 @@ mod tests {
                 json!({"run_id": "run_1", "status": "running"}),
             );
 
+            let grant_session = read_request(&mut reader);
+            assert_eq!(grant_session.method.as_deref(), Some("approval.decide"));
+            assert_eq!(
+                grant_session.params.as_ref().unwrap()["run_id"],
+                "run_session"
+            );
+            assert_eq!(
+                grant_session.params.as_ref().unwrap()["tool_call_id"],
+                "call_session"
+            );
+            assert_eq!(
+                grant_session.params.as_ref().unwrap()["decision"],
+                "grant_session"
+            );
+            assert!(grant_session.params.as_ref().unwrap()["reason"].is_null());
+            write_response(
+                &mut writer,
+                grant_session.id,
+                "approval.decide",
+                json!({"run_id": "run_session", "status": "running"}),
+            );
+
             let deny = read_request(&mut reader);
             assert_eq!(deny.method.as_deref(), Some("approval.decide"));
             assert_eq!(deny.params.as_ref().unwrap()["run_id"], "run_2");
@@ -1302,6 +1343,9 @@ mod tests {
 
         let mut client = DaemonClient::connect(&socket_path).unwrap();
         let granted = client.approval_grant("run_1", "call_1").unwrap();
+        let session_granted = client
+            .approval_grant_session("run_session", "call_session")
+            .unwrap();
         let denied = client
             .approval_deny("run_2", "call_2", "denied by plato-tui".into())
             .unwrap();
@@ -1309,6 +1353,7 @@ mod tests {
         handle.join().unwrap();
 
         assert_eq!(granted.status, RunStateName::Running);
+        assert_eq!(session_granted.status, RunStateName::Running);
         assert_eq!(denied.status, RunStateName::Running);
         assert_eq!(canceled.status, RunStateName::CancelRequested);
     }

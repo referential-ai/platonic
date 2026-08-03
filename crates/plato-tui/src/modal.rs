@@ -25,6 +25,12 @@ pub struct ApprovalModalView {
     pub diff_preview: Option<String>,
 }
 
+impl ApprovalModalView {
+    pub(super) fn can_grant_shell_session(&self) -> bool {
+        self.tool_name == "shell.exec" && self.effect == "external_side_effect"
+    }
+}
+
 /// Converts an approval stream event into its modal view.
 pub fn approval_from_event(
     event: &StreamEvent,

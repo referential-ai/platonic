@@ -79,6 +79,8 @@ pub struct TuiState {
     pub stream_warning: Option<String>,
     /// Approval request currently awaiting a decision.
     pub approval: Option<ApprovalModalView>,
+    /// Top-relative scroll offset for the bounded approval pane.
+    pub approval_scroll_offset: usize,
     /// Whether the help overlay is open.
     pub help_visible: bool,
     /// Authoritative daemon status currently shown in its read-only modal.
@@ -117,6 +119,7 @@ impl PartialEq for TuiState {
             && self.status_message == other.status_message
             && self.stream_warning == other.stream_warning
             && self.approval == other.approval
+            && self.approval_scroll_offset == other.approval_scroll_offset
             && self.help_visible == other.help_visible
             && self.status_modal == other.status_modal
             && self.cancel_requested == other.cancel_requested
@@ -226,6 +229,7 @@ impl TuiState {
             status_message: None,
             stream_warning: None,
             approval: None,
+            approval_scroll_offset: 0,
             help_visible: false,
             status_modal: None,
             cancel_requested: false,
@@ -301,6 +305,14 @@ impl TuiState {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let modified = self.composer.insert_str(text);
         self.finish_composer_edit(modified);
+    }
+
+    pub(super) fn scroll_approval_up(&mut self, lines: usize) {
+        self.approval_scroll_offset = self.approval_scroll_offset.saturating_sub(lines);
+    }
+
+    pub(super) fn scroll_approval_down(&mut self, lines: usize) {
+        self.approval_scroll_offset = self.approval_scroll_offset.saturating_add(lines);
     }
 
     pub(super) fn handle_composer_key(&mut self, key: crossterm::event::KeyEvent) {

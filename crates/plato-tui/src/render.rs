@@ -36,8 +36,11 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
 }
 
 fn render_at(frame: &mut Frame<'_>, state: &TuiState, now_ms: u64) {
-    let [history, composer, status] = vertical(frame.area(), state);
+    let [history, approval, composer, status] = vertical(frame.area(), state);
     render_history(frame, history, state);
+    if let Some(approval_view) = &state.approval {
+        render_approval_pane(frame, approval, approval_view, state.approval_scroll_offset);
+    }
     render_composer(frame, composer, state);
     render_status_line(frame, status, state);
     if state.help_visible {
@@ -45,9 +48,6 @@ fn render_at(frame: &mut Frame<'_>, state: &TuiState, now_ms: u64) {
     }
     if state.session_picker.is_some() {
         render_session_picker(frame, frame.area(), state, now_ms);
-    }
-    if let Some(approval) = &state.approval {
-        render_approval_modal(frame, frame.area(), approval);
     }
     if let Some(status) = &state.status_modal {
         render_status_modal(frame, frame.area(), status);
@@ -1565,6 +1565,14 @@ fn render_status_modal(frame: &mut Frame<'_>, area: Rect, status: &DaemonStatusR
             "granted         {}    denied {}",
             status.trust.approval_granted_count, status.trust.approval_denied_count
         )),
+        Line::from(format!(
+            "shell session   {}",
+            if status.trust.shell_session_grant {
+                "granted"
+            } else {
+                "not granted"
+            }
+        )),
         Line::from("Esc close"),
     ];
     frame.render_widget(Clear, area);
@@ -1576,7 +1584,7 @@ fn render_status_modal(frame: &mut Frame<'_>, area: Rect, status: &DaemonStatusR
 
 fn status_modal_rect(area: Rect) -> Rect {
     let width = (area.width.saturating_mul(92) / 100).max(1);
-    let height = area.height.clamp(1, 22);
+    let height = area.height.clamp(1, 23);
     Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 2,
@@ -1735,9 +1743,20 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn render_approval_modal(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalModalView) {
-    let area = centered_rect(74, 64, area);
+fn render_approval_pane(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    approval: &ApprovalModalView,
+    scroll_offset: usize,
+) {
+    let controls = if approval.can_grant_shell_session() {
+        "g allow once    s allow shell.exec for session    d deny    Ctrl-C cancel    q quit"
+    } else {
+        "g allow once    d deny    Ctrl-C cancel run    q quit TUI"
+    };
     let mut lines = vec![
+        Line::from(controls),
+        Line::from(""),
         Line::from(vec![
             Span::styled("run ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(approval.run_id.clone()),
@@ -1755,33 +1774,34 @@ fn render_approval_modal(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalM
             Span::raw(approval.reason.clone()),
         ]),
         Line::from(""),
-        Line::from("g grant    d deny    Ctrl-C cancel run    q quit TUI"),
-        Line::from(""),
+        Line::from("input preview:"),
     ];
-    let preview = approval
-        .diff_preview
-        .as_deref()
-        .map(|preview| ("diff preview:", preview))
-        .or_else(|| {
-            approval
-                .approval_preview
-                .as_deref()
-                .map(|preview| ("approval preview:", preview))
-        });
-    if let Some((title, preview)) = preview {
-        lines.push(Line::from(title));
-        lines.extend(preview.lines().map(|line| Line::from(line.to_owned())));
-    } else {
-        lines.push(Line::from("input preview:"));
-        lines.push(Line::from(approval.input_preview.clone()));
-    }
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title("Approval"))
-            .wrap(Wrap { trim: false }),
-        area,
+    lines.extend(
+        approval
+            .input_preview
+            .lines()
+            .map(|line| Line::from(line.to_owned())),
     );
+    if let Some(preview) = approval.approval_preview.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from("approval preview:"));
+        lines.extend(preview.lines().map(|line| Line::from(line.to_owned())));
+    }
+    if let Some(preview) = approval.diff_preview.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from("diff preview:"));
+        lines.extend(preview.lines().map(|line| Line::from(line.to_owned())));
+    }
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Approval"))
+        .wrap(Wrap { trim: false });
+    let content_width = area.width.saturating_sub(2).max(1);
+    let content_height = usize::from(area.height.saturating_sub(2));
+    let max_scroll = paragraph
+        .line_count(content_width)
+        .saturating_sub(content_height);
+    let scroll = u16::try_from(scroll_offset.min(max_scroll)).unwrap_or(u16::MAX);
+    frame.render_widget(paragraph.scroll((scroll, 0)), area);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -1803,12 +1823,18 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn vertical(area: Rect, state: &TuiState) -> [Rect; 3] {
+fn vertical(area: Rect, state: &TuiState) -> [Rect; 4] {
     let composer_height = composer_height(state, area.width);
+    let approval_height = state.approval.as_ref().map_or(0, |_| {
+        area.height
+            .saturating_sub(composer_height.saturating_add(2))
+            .min(14)
+    });
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
+            Constraint::Length(approval_height),
             Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
@@ -1929,8 +1955,9 @@ mod tests {
             assert!(!line.to_string().contains("v toggle"));
         }
 
-        let [history, composer, status] = vertical(Rect::new(0, 0, 48, 12), &state);
+        let [history, approval, composer, status] = vertical(Rect::new(0, 0, 48, 12), &state);
         assert_eq!(history.height, 10);
+        assert_eq!(approval.height, 0);
         assert_eq!(composer.height, 1);
         assert_eq!(status.height, 1);
     }
@@ -2875,6 +2902,7 @@ mod tests {
         assert!(normal.contains("last run  input 7    output 3    unknown 1"));
         assert!(normal.contains("session   input 17    output 8    unknown 2"));
         assert!(normal.contains("granted         2    denied 1"));
+        assert!(normal.contains("shell session   granted"));
     }
 
     #[test]
@@ -3124,8 +3152,9 @@ mod tests {
         assert!(output.contains("file.write"));
         assert!(output.contains("workspace_write"));
         assert!(output.contains("scratch.txt"));
-        assert!(output.contains("g grant"));
+        assert!(output.contains("g allow once"));
         assert!(output.contains("d deny"));
+        assert!(!output.contains("s allow shell.exec for session"));
     }
 
     #[test]
@@ -3153,13 +3182,17 @@ mod tests {
             diff_preview: Some("--- a/scratch.txt\n+++ b/scratch.txt\n-old\n+new\n".into()),
         });
 
-        let output = render_to_text(&state);
+        let initial = render_to_text(&state);
+        state.approval_scroll_offset = usize::MAX;
+        let scrolled = render_to_text(&state);
+        let output = format!("{initial}\n{scrolled}");
 
+        assert!(output.contains("input preview:"));
+        assert!(output.contains("scratch.txt"));
         assert!(output.contains("diff preview"));
         assert!(output.contains("--- a/scratch.txt"));
         assert!(output.contains("-old"));
         assert!(output.contains("+new"));
-        assert!(!output.contains("input preview:"));
     }
 
     #[test]
@@ -3190,12 +3223,19 @@ mod tests {
             diff_preview: Some(format!("--- a/scratch.txt\n+++ b/scratch.txt\n{body}")),
         });
 
-        let output = render_to_text(&state);
+        let initial = render_to_text(&state);
+        state.approval_scroll_offset = usize::MAX;
+        let scrolled = render_to_text(&state);
+        let output = format!("{initial}\n{scrolled}");
 
-        assert!(output.contains("g grant"));
+        assert!(output.contains("g allow once"));
         assert!(output.contains("d deny"));
+        assert!(output.contains("input preview:"));
+        assert!(output.contains("scratch.txt"));
         assert!(output.contains("diff preview"));
         assert!(output.contains("--- a/scratch.txt"));
+        assert!(output.contains("-old-39"));
+        assert!(output.contains("+new-39"));
     }
 
     #[test]
@@ -3216,19 +3256,121 @@ mod tests {
             run_id: "run_1".into(),
             tool_call_id: "call_1".into(),
             tool_name: "shell.exec".into(),
-            effect: "ExternalSideEffect".into(),
+            effect: "external_side_effect".into(),
             reason: "shell.exec requires approval".into(),
             input_preview: r#"{"command":"cargo test"}"#.into(),
             approval_preview: Some("command: cargo test\ncwd: /tmp/work".into()),
             diff_preview: None,
         });
 
-        let output = render_to_text(&state);
+        let initial = render_to_text(&state);
+        state.approval_scroll_offset = usize::MAX;
+        let scrolled = render_to_text(&state);
+        let output = format!("{initial}\n{scrolled}");
 
+        assert!(output.contains("g allow once"));
+        assert!(output.contains("s allow shell.exec for session"));
+        assert!(output.contains("d deny"));
+        assert!(output.contains("input preview:"));
+        assert!(output.contains(r#"{"command":"cargo test"}"#));
         assert!(output.contains("approval preview"));
         assert!(output.contains("command: cargo test"));
         assert!(output.contains("cwd: /tmp/work"));
-        assert!(!output.contains("input preview:"));
+    }
+
+    #[test]
+    fn approval_pane_scroll_keeps_transcript_and_composer_visible_at_normal_and_narrow_sizes() {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            Vec::new(),
+            TranscriptState::Loaded(
+                TranscriptReadResult {
+                    run_id: "run_1".into(),
+                    status: RunStateName::Running,
+                    final_answer: None,
+                    transcript: "[turn_1] user: TRANSCRIPT_VISIBLE\n".into(),
+                    typed: Some(TypedTranscript {
+                        runs: vec![TypedRun {
+                            run_id: "run_1".into(),
+                            session_index: 0,
+                            status: RunStateName::Running,
+                            model_status: None,
+                            entries: vec![TypedTranscriptEntry::User {
+                                text: "TRANSCRIPT_VISIBLE".into(),
+                            }],
+                        }],
+                    }),
+                    pending_approval: None,
+                }
+                .into(),
+            ),
+        );
+        state.set_composer_text("COMPOSER_VISIBLE");
+        state.approval = Some(ApprovalModalView {
+            run_id: "run_scroll".into(),
+            tool_call_id: "call_scroll".into(),
+            tool_name: "shell.exec".into(),
+            effect: "external_side_effect".into(),
+            reason: "shell.exec requires approval".into(),
+            input_preview: "{\n  \"command\": \"printf proof\",\n  \"cwd\": \"/tmp/work\",\n  \"timeout_seconds\": 600,\n  \"env\": {\"VISIBLE\": \"yes\"}\n}"
+                .into(),
+            approval_preview: Some(
+                "command: printf proof\ncwd: /tmp/work\ntimeout: 600s\neffect: ExternalSideEffect\nenv: scrubbed allowlist"
+                    .into(),
+            ),
+            diff_preview: Some(
+                "--- a/scratch.txt\n+++ b/scratch.txt\n-old value\n+new value\n".into(),
+            ),
+        });
+
+        for (width, height) in [(100, 24), (48, 24)] {
+            let mut all_scroll_positions = String::new();
+            for offset in 0..=64 {
+                state.approval_scroll_offset = offset;
+                let snapshot = render_snapshot(&state, width, height).unwrap();
+                assert!(snapshot.contains("TRANSCRIPT_VISIBLE"), "{snapshot}");
+                assert!(snapshot.contains("COMPOSER_VISIBLE"), "{snapshot}");
+                all_scroll_positions.push_str(&snapshot);
+            }
+
+            for expected in [
+                "g allow once",
+                "s allow shell.exec for session",
+                "d deny",
+                "run_scroll",
+                "call_scroll",
+                "shell.exec (external_side_effect)",
+                "shell.exec requires approval",
+                "input preview:",
+                "\"command\": \"printf proof\"",
+                "\"cwd\": \"/tmp/work\"",
+                "\"timeout_seconds\": 600",
+                "\"env\": {\"VISIBLE\": \"yes\"}",
+                "approval preview:",
+                "command: printf proof",
+                "cwd: /tmp/work",
+                "timeout: 600s",
+                "effect: ExternalSideEffect",
+                "env: scrubbed allowlist",
+                "diff preview:",
+                "--- a/scratch.txt",
+                "+++ b/scratch.txt",
+                "-old value",
+                "+new value",
+            ] {
+                assert!(
+                    all_scroll_positions.contains(expected),
+                    "missing {expected}"
+                );
+            }
+        }
     }
 
     fn history_cache_state(transcript: &str, live_event: LiveEventLine) -> TuiState {
@@ -3378,7 +3520,8 @@ mod tests {
             },
             "trust": {
                 "approval_granted_count": 2,
-                "approval_denied_count": 1
+                "approval_denied_count": 1,
+                "shell_session_grant": true
             }
         }))
         .unwrap()
