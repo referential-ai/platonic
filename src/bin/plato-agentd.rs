@@ -26,6 +26,9 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
+    #[arg(long, hide = true)]
+    run_child: bool,
+
     #[arg(
         long,
         help = "Serve multiple workspaces on the stable host endpoint",
@@ -93,6 +96,10 @@ fn run() -> plato_agent::AppResult<()> {
                 }
             }
         };
+    }
+
+    if cli.run_child {
+        return plato_agent::daemon::run_stdio_child();
     }
 
     #[cfg(windows)]

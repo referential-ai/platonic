@@ -1,4 +1,5 @@
 use plato_agent::{
+    ApprovalMode, RunLedger, RunOptions, RunSession,
     daemon::{
         client::{ClientError, DaemonClient},
         protocol::{
@@ -8,7 +9,7 @@ use plato_agent::{
         },
     },
     ledger::SqliteLedger,
-    paths,
+    paths, run_question,
 };
 use platonic_core::{
     ActorId, AgentId, ContextPack, EffectClass, HarnessEvent, Message, MessageRole, ModelName,
@@ -17,13 +18,13 @@ use platonic_core::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -39,21 +40,262 @@ const REQUESTS_PER_LEG: usize = 2;
 static SCENARIO_SERIAL: Mutex<()> = Mutex::new(());
 
 #[test]
-fn read_only_success_is_semantically_conformant() {
+fn child_and_embedded_read_only_success_have_identical_ordered_events() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     run_scenario(Scenario::ReadOnly);
 }
 
 #[test]
-fn approved_workspace_write_is_semantically_conformant() {
+fn child_and_embedded_approved_tool_run_have_identical_ordered_events() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     run_scenario(Scenario::ApprovedWrite);
 }
 
 #[test]
-fn denied_workspace_write_is_semantically_conformant() {
+fn child_and_embedded_denied_approval_have_identical_ordered_events() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     run_scenario(Scenario::DeniedWrite);
+}
+
+#[test]
+fn child_and_embedded_provider_failure_have_identical_ordered_events() {
+    temp_env::with_var(API_KEY_ENV, Some("test-key"), || {
+        let _serial = SCENARIO_SERIAL.lock().unwrap();
+        let root = Arc::new(tempfile::tempdir().unwrap());
+        let embedded = ProofContext::in_root(Arc::clone(&root), "embedded-failure");
+        let child = ProofContext::in_root(root, "child-failure");
+        let provider = FailureProvider::start();
+        write_provider_config(&embedded.config_path, &provider.base_url);
+        write_provider_config(&child.config_path, &provider.base_url);
+
+        let embedded_run_id = RunId::new("run_embedded_failure").unwrap();
+        let result = run_question(RunOptions {
+            question: "fail this run".into(),
+            config_path: Some(PathBuf::from("plato.toml")),
+            overrides: Default::default(),
+            ledger: RunLedger::Sqlite(embedded.ledger_path.clone()),
+            workspace_root: embedded.workspace.clone(),
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(embedded_run_id.clone()),
+            session: Some(RunSession::Fresh {
+                session_id: "session_embedded_failure".into(),
+            }),
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: None,
+            voice_interruption_context: None,
+        });
+        assert!(result.is_err());
+        let embedded_records = SqliteLedger::open_readonly(&embedded.ledger_path)
+            .unwrap()
+            .read_run(embedded_run_id.as_str())
+            .unwrap();
+
+        let daemon = ProofDaemon::start(&child);
+        let mut client = daemon.connect();
+        let child_run = client
+            .run_start("fail this run".into(), Some("plato.toml".into()), false)
+            .unwrap();
+        assert_eq!(
+            wait_for_terminal_status(&mut client, &child_run.run_id),
+            RunStateName::Failed
+        );
+        let child_records = SqliteLedger::open_readonly(&child.ledger_path)
+            .unwrap()
+            .read_run(&child_run.run_id)
+            .unwrap();
+
+        assert_eq!(
+            normalize_records(&embedded_records),
+            normalize_records(&child_records)
+        );
+        assert_eq!(
+            RunReadback::from_events(&embedded_records)
+                .unwrap()
+                .final_phase,
+            RunReadback::from_events(&child_records)
+                .unwrap()
+                .final_phase
+        );
+        assert_eq!(provider.join(), 2);
+        daemon.stop(client);
+    });
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn killed_wedged_child_has_no_ledger_handle_and_other_run_stays_healthy() {
+    let _serial = SCENARIO_SERIAL.lock().unwrap();
+    let proof = ProofContext::new();
+    proof.restore_fixture();
+    let provider = KillIsolationProvider::start();
+    write_provider_config(&proof.config_path, &provider.base_url);
+    let daemon = ProofDaemon::start(&proof);
+    let daemon_pid = daemon.pid();
+    let mut first_client = daemon.connect();
+    let first = first_client
+        .run_start(
+            "wedge the first child".into(),
+            Some("plato.toml".into()),
+            false,
+        )
+        .unwrap();
+    provider
+        .first_requested
+        .recv_timeout(PROOF_TIMEOUT)
+        .unwrap();
+    let first_children = platform_direct_children(daemon_pid);
+    assert_eq!(
+        first_children.len(),
+        1,
+        "first supervised child was not unique"
+    );
+    let first_child = *first_children.iter().next().unwrap();
+
+    let mut second_client = daemon.connect();
+    let second = second_client
+        .run_start(
+            "keep the second child healthy".into(),
+            Some("plato.toml".into()),
+            false,
+        )
+        .unwrap();
+    provider
+        .second_requested
+        .recv_timeout(PROOF_TIMEOUT)
+        .unwrap();
+    let all_children = platform_direct_children(daemon_pid);
+    let second_child = *all_children
+        .difference(&first_children)
+        .next()
+        .expect("second supervised child did not appear");
+    assert_eq!(all_children.len(), 2);
+
+    #[cfg(target_os = "linux")]
+    {
+        assert!(linux_process_has_fd(daemon_pid, &proof.ledger_path));
+        assert!(!linux_process_has_fd(first_child, &proof.ledger_path));
+        assert!(!linux_process_has_fd(second_child, &proof.ledger_path));
+    }
+
+    kill_process_exact(first_child);
+    provider.release_second.send(()).unwrap();
+
+    assert_eq!(
+        wait_for_terminal_status(&mut first_client, &first.run_id),
+        RunStateName::Failed
+    );
+    assert_eq!(
+        wait_for_terminal_status(&mut second_client, &second.run_id),
+        RunStateName::Finished
+    );
+    assert_eq!(
+        second_client
+            .transcript_read(&second.run_id)
+            .unwrap()
+            .final_answer
+            .as_deref(),
+        Some("the second child stayed healthy")
+    );
+    assert_eq!(daemon.pid(), daemon_pid);
+    second_client.hello(&proof.workspace).unwrap();
+    wait_for_platform_process_absence(first_child);
+    wait_for_platform_process_absence(second_child);
+
+    drop(second_client);
+    provider.join();
+    daemon.stop(first_client);
+}
+
+#[test]
+fn child_and_embedded_cancellation_have_identical_ordered_events() {
+    temp_env::with_var(API_KEY_ENV, Some("test-key"), || {
+        child_and_embedded_cancellation_with_key()
+    });
+}
+
+fn child_and_embedded_cancellation_with_key() {
+    let _serial = SCENARIO_SERIAL.lock().unwrap();
+    let root = Arc::new(tempfile::tempdir().unwrap());
+    let embedded = ProofContext::in_root(Arc::clone(&root), "embedded-cancel");
+    let child = ProofContext::in_root(root, "child-cancel");
+    let provider = CancelableProvider::start();
+    write_provider_config(&embedded.config_path, &provider.base_url);
+    write_provider_config(&child.config_path, &provider.base_url);
+
+    let embedded_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let embedded_run_id = RunId::new("run_embedded_cancel").unwrap();
+    let embedded_run_id_for_worker = embedded_run_id.clone();
+    let embedded_cancel_for_worker = embedded_cancel.clone();
+    let embedded_workspace = embedded.workspace.clone();
+    let embedded_ledger = embedded.ledger_path.clone();
+    let (outcome_sender, outcome_receiver) = mpsc::channel();
+    let embedded_worker = thread::spawn(move || {
+        let outcome = run_question(RunOptions {
+            question: "cancel this run".into(),
+            config_path: Some(PathBuf::from("plato.toml")),
+            overrides: Default::default(),
+            ledger: RunLedger::Sqlite(embedded_ledger),
+            workspace_root: embedded_workspace,
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(embedded_run_id_for_worker),
+            session: Some(RunSession::Fresh {
+                session_id: "session_embedded_cancel".into(),
+            }),
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: Some(embedded_cancel_for_worker),
+            voice_interruption_context: None,
+        });
+        outcome_sender.send(outcome).unwrap();
+    });
+    assert_eq!(provider.requested.recv_timeout(PROOF_TIMEOUT).unwrap(), 0);
+    embedded_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(
+        outcome_receiver.recv_timeout(PROOF_TIMEOUT).unwrap(),
+        Err(plato_agent::AppError::RunCanceled)
+    ));
+    provider.release.send(()).unwrap();
+    embedded_worker.join().unwrap();
+    let embedded_records = SqliteLedger::open_readonly(&embedded.ledger_path)
+        .unwrap()
+        .read_run(embedded_run_id.as_str())
+        .unwrap();
+
+    let daemon = ProofDaemon::start(&child);
+    let mut client = daemon.connect();
+    let child_run = client
+        .run_start("cancel this run".into(), Some("plato.toml".into()), false)
+        .unwrap();
+    assert_eq!(provider.requested.recv_timeout(PROOF_TIMEOUT).unwrap(), 1);
+    assert_eq!(
+        client.run_cancel(&child_run.run_id).unwrap().status,
+        RunStateName::CancelRequested
+    );
+    assert_eq!(
+        wait_for_terminal_status(&mut client, &child_run.run_id),
+        RunStateName::Canceled
+    );
+    provider.release.send(()).unwrap();
+    let child_records = SqliteLedger::open_readonly(&child.ledger_path)
+        .unwrap()
+        .read_run(&child_run.run_id)
+        .unwrap();
+
+    assert_eq!(
+        normalize_records(&embedded_records),
+        normalize_records(&child_records)
+    );
+    assert_eq!(
+        RunReadback::from_events(&embedded_records)
+            .unwrap()
+            .final_phase,
+        RunReadback::from_events(&child_records)
+            .unwrap()
+            .final_phase
+    );
+    provider.join();
+    daemon.stop(client);
 }
 
 #[test]
@@ -266,6 +508,27 @@ fn normalizer_accepts_only_host_variance_and_keeps_ids_bijective() {
     let mut non_transport_actor = daemon;
     set_approval_actor(&mut non_transport_actor.records, "automation");
     assert_difference(&direct, &non_transport_actor, "persisted event semantics");
+}
+
+#[test]
+fn accepted_provider_stream_blocks_until_delayed_request_bytes_arrive() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted_sender, accepted_receiver) = mpsc::sync_channel(0);
+    let server = thread::spawn(move || {
+        let mut stream = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+        accepted_sender.send(()).unwrap();
+        read_http_request(&mut stream)
+    });
+
+    let mut client = TcpStream::connect(address).unwrap();
+    accepted_receiver.recv_timeout(PROOF_TIMEOUT).unwrap();
+    client
+        .write_all(b"POST / HTTP/1.1\r\ncontent-length: 16\r\n\r\n{\"delayed\":true}")
+        .unwrap();
+
+    assert_eq!(server.join().unwrap(), json!({"delayed": true}));
 }
 
 #[test]
@@ -1201,6 +1464,171 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> ExitStatus {
     }
 }
 
+fn wait_for_terminal_status(client: &mut DaemonClient, run_id: &str) -> RunStateName {
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    loop {
+        let status = client.events_stream(run_id, None, 1).unwrap().status;
+        if !matches!(
+            status,
+            RunStateName::Running | RunStateName::CancelRequested
+        ) {
+            return status;
+        }
+        assert!(Instant::now() < deadline, "run {run_id} did not terminate");
+        thread::yield_now();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn platform_direct_children(parent: u32) -> HashSet<u32> {
+    fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            stat.rsplit_once(") ")
+                .and_then(|(_, tail)| tail.split_ascii_whitespace().nth(1))
+                .and_then(|value| value.parse::<u32>().ok())
+                == Some(parent)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn kill_process_exact(pid: u32) {
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(pid as i32).unwrap(),
+        rustix::process::Signal::KILL,
+    )
+    .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_has_fd(pid: u32, path: &Path) -> bool {
+    let expected = path.canonicalize().unwrap();
+    fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::read_link(entry.path()).ok())
+        .any(|target| target == expected)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_platform_process_absence(pid: u32) {
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    while Path::new(&format!("/proc/{pid}")).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "run child process {pid} remained after lifecycle cleanup"
+        );
+        thread::yield_now();
+    }
+}
+
+#[cfg(windows)]
+fn platform_direct_children(parent: u32) -> HashSet<u32> {
+    windows_processes()
+        .into_iter()
+        .filter_map(|(pid, process_parent)| (process_parent == parent).then_some(pid))
+        .collect()
+}
+
+#[cfg(windows)]
+fn kill_process_exact(pid: u32) {
+    windows_process_proof::kill(pid).unwrap();
+}
+
+#[cfg(windows)]
+fn wait_for_platform_process_absence(pid: u32) {
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    while windows_processes()
+        .into_iter()
+        .any(|(current, _)| current == pid)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "run child process {pid} remained after lifecycle cleanup"
+        );
+        thread::yield_now();
+    }
+}
+
+#[cfg(windows)]
+fn windows_processes() -> Vec<(u32, u32)> {
+    windows_process_proof::list().unwrap()
+}
+
+#[cfg(windows)]
+mod windows_process_proof {
+    #![allow(unsafe_code)]
+
+    use std::{
+        io, mem,
+        os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    };
+    use windows_sys::Win32::{
+        Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+                TH32CS_SNAPPROCESS,
+            },
+            Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess},
+        },
+    };
+
+    pub(super) fn list() -> io::Result<Vec<(u32, u32)>> {
+        // SAFETY: the snapshot handle is checked before ownership is assumed.
+        let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateToolhelp32Snapshot returned a new owned handle.
+        let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: mem::size_of::<PROCESSENTRY32W>()
+                .try_into()
+                .expect("PROCESSENTRY32W size fits u32"),
+            ..Default::default()
+        };
+        // SAFETY: snapshot is live and entry is initialized writable storage.
+        if unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut processes = Vec::new();
+        loop {
+            processes.push((entry.th32ProcessID, entry.th32ParentProcessID));
+            // SAFETY: snapshot and entry remain live for enumeration.
+            if unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) } == 0 {
+                let error = io::Error::last_os_error();
+                return if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                    Ok(processes)
+                } else {
+                    Err(error)
+                };
+            }
+        }
+    }
+
+    pub(super) fn kill(pid: u32) -> io::Result<()> {
+        // SAFETY: the returned process handle is checked before ownership is assumed.
+        let raw = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if raw.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: OpenProcess returned a new owned handle.
+        let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+        // SAFETY: process is live and was opened with PROCESS_TERMINATE.
+        if unsafe { TerminateProcess(process.as_raw_handle(), 137) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
 fn read_pipe(pipe: Option<impl Read>) -> String {
     let mut output = String::new();
     if let Some(mut pipe) = pipe {
@@ -1349,6 +1777,125 @@ impl ScriptedProvider {
     }
 }
 
+#[cfg(any(target_os = "linux", windows))]
+struct KillIsolationProvider {
+    base_url: String,
+    first_requested: mpsc::Receiver<()>,
+    second_requested: mpsc::Receiver<()>,
+    release_second: mpsc::Sender<()>,
+    handle: thread::JoinHandle<()>,
+}
+
+#[cfg(any(target_os = "linux", windows))]
+impl KillIsolationProvider {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (first_sender, first_requested) = mpsc::channel();
+        let (second_sender, second_requested) = mpsc::channel();
+        let (release_second, release_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut first = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let _ = read_http_request(&mut first);
+            first_sender.send(()).unwrap();
+
+            let mut second = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let _ = read_http_request(&mut second);
+            second_sender.send(()).unwrap();
+            release_receiver.recv_timeout(PROOF_TIMEOUT).unwrap();
+            write_http_response(
+                &mut second,
+                &ProviderReply::answer("the second child stayed healthy", UsageFixture::Unknown)
+                    .body,
+            );
+            drop(first);
+        });
+        Self {
+            base_url,
+            first_requested,
+            second_requested,
+            release_second,
+            handle,
+        }
+    }
+
+    fn join(self) {
+        self.handle.join().unwrap();
+    }
+}
+
+struct CancelableProvider {
+    base_url: String,
+    requested: mpsc::Receiver<usize>,
+    release: mpsc::Sender<()>,
+    handle: thread::JoinHandle<()>,
+}
+
+struct FailureProvider {
+    base_url: String,
+    handle: thread::JoinHandle<usize>,
+}
+
+impl FailureProvider {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            for _ in 0..2 {
+                let mut stream = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+                let _ = read_http_request(&mut stream);
+                write!(
+                    stream,
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain\r\ncontent-length: 16\r\nconnection: close\r\n\r\nscripted failure"
+                )
+                .unwrap();
+            }
+            2
+        });
+        Self { base_url, handle }
+    }
+
+    fn join(self) -> usize {
+        self.handle.join().unwrap()
+    }
+}
+
+impl CancelableProvider {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (requested_sender, requested) = mpsc::channel();
+        let (release, release_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            for index in 0..2 {
+                let mut stream = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+                let _ = read_http_request(&mut stream);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 1048576\r\nconnection: close\r\n\r\n"
+                )
+                .unwrap();
+                stream.flush().unwrap();
+                requested_sender.send(index).unwrap();
+                release_receiver.recv_timeout(PROOF_TIMEOUT).unwrap();
+            }
+        });
+        Self {
+            base_url,
+            requested,
+            release,
+            handle,
+        }
+    }
+
+    fn join(self) {
+        self.handle.join().unwrap();
+    }
+}
+
 impl Drop for ScriptedProvider {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
@@ -1360,7 +1907,12 @@ impl Drop for ScriptedProvider {
 fn accept_before(listener: &TcpListener, deadline: Instant) -> TcpStream {
     loop {
         match listener.accept() {
-            Ok((stream, _)) => return stream,
+            Ok((stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("accepted provider stream should become blocking");
+                return stream;
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 assert!(Instant::now() < deadline, "provider was not called");
                 thread::sleep(POLL_INTERVAL);

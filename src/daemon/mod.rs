@@ -2,6 +2,7 @@ use crate::{AppResult, paths};
 use std::path::{Path, PathBuf};
 
 pub use plato_daemon_client::{client, transport};
+mod child_process;
 #[cfg(windows)]
 pub mod control;
 mod handlers;
@@ -9,8 +10,11 @@ mod handlers;
 pub use plato_daemon_client::installer_gate;
 pub mod lock;
 pub use plato_protocol as protocol;
+mod run_child;
 mod runtime;
 pub mod server;
+
+pub use run_child::run_stdio_child;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonPaths {

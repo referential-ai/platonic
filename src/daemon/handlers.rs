@@ -33,7 +33,6 @@ use crate::{
     new_run_id, new_session_id,
     paths::DefaultSqlitePath,
     replay::{format_readback, format_session_readback},
-    run_question,
     thread_authority::{
         THREAD_SPAWN_APPROVAL_REASON, ThreadAuthorityDraft, ThreadAuthorityError,
         ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, new_spawn_id, now_ms,
@@ -879,19 +878,79 @@ fn run_to_completion(
     options: RunOptions,
     event_collector: thread::JoinHandle<()>,
 ) -> AppResult<RunOutcome> {
-    let outcome = run_question(options);
-    finish_run_after_event_collection(runtime, record, outcome, event_collector)
+    #[cfg(test)]
+    let completion = RunCompletion::Published(crate::run_question(options));
+    #[cfg(not(test))]
+    let completion = match crate::app::prepare_run(&options) {
+        Ok((prepared, recorder)) => {
+            let approval_mode = options.approval_mode;
+            match (options.event_sender, options.cancel) {
+                (Some(event_sender), Some(cancel)) => {
+                    RunCompletion::Supervised(Box::new(crate::daemon::run_child::run_supervised(
+                        prepared,
+                        recorder,
+                        approval_mode,
+                        event_sender,
+                        cancel,
+                    )))
+                }
+                (None, _) => RunCompletion::Published(Err(AppError::SupervisedRun(
+                    "daemon run omitted its event transport".into(),
+                ))),
+                (_, None) => RunCompletion::Published(Err(AppError::SupervisedRun(
+                    "daemon run omitted its cancellation token".into(),
+                ))),
+            }
+        }
+        Err(error) => RunCompletion::Published(Err(error)),
+    };
+    finish_run_after_event_collection(runtime, record, completion, event_collector)
+}
+
+enum RunCompletion {
+    Published(AppResult<RunOutcome>),
+    Supervised(Box<crate::daemon::run_child::SupervisedRunCompletion>),
+}
+
+impl From<AppResult<RunOutcome>> for RunCompletion {
+    fn from(outcome: AppResult<RunOutcome>) -> Self {
+        Self::Published(outcome)
+    }
+}
+
+impl From<crate::daemon::run_child::SupervisedRunCompletion> for RunCompletion {
+    fn from(completion: crate::daemon::run_child::SupervisedRunCompletion) -> Self {
+        Self::Supervised(Box::new(completion))
+    }
 }
 
 fn finish_run_after_event_collection(
     runtime: &DaemonRuntime,
     record: &RunRecord,
-    outcome: AppResult<RunOutcome>,
+    completion: impl Into<RunCompletion>,
     event_collector: thread::JoinHandle<()>,
 ) -> AppResult<RunOutcome> {
-    let outcome = match event_collector.join() {
-        Ok(()) => outcome,
-        Err(_) => Err(AppError::RunFailed(EVENT_COLLECTOR_PANIC.into())),
+    let completion = match (completion.into(), event_collector.join()) {
+        (completion, Ok(())) => completion,
+        (RunCompletion::Published(_), Err(_)) => {
+            RunCompletion::Published(Err(AppError::RunFailed(EVENT_COLLECTOR_PANIC.into())))
+        }
+        (RunCompletion::Supervised(completion), Err(_)) => RunCompletion::Supervised(Box::new(
+            (*completion).override_failure(AppError::RunFailed(EVENT_COLLECTOR_PANIC.into())),
+        )),
+    };
+    let outcome = match completion {
+        RunCompletion::Published(outcome) => outcome,
+        RunCompletion::Supervised(completion) => {
+            let (outcome, terminal) = (*completion).publish();
+            match terminal {
+                Ok(recorded) => {
+                    collect_run_event(record, RunEvent::Ledger(recorded));
+                    outcome
+                }
+                Err(error) => Err(error),
+            }
+        }
     };
     match &outcome {
         Ok(outcome) => runtime.finish_run(record, outcome.final_answer.clone()),
@@ -1534,7 +1593,11 @@ mod tests {
         ModelName, RecordedEvent, ResultVisibility, RunId, ToolCall, ToolCallId, ToolName,
         ToolResult, TurnId,
     };
+    #[cfg(target_os = "linux")]
+    use platonic_core::{AgentId, ContextPack};
     use serde_json::json;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt;
     use std::{sync::Barrier, time::Duration};
 
     fn thread_test_runtime() -> (tempfile::TempDir, DaemonRuntime) {
@@ -2047,6 +2110,18 @@ mod tests {
                 error: Some(format!("run did not finish: {EVENT_COLLECTOR_PANIC}")),
             }
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervised_terminal_intent_stays_nonterminal_until_cleanup_completes() {
+        assert_supervised_terminal_publication(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervised_cleanup_failure_replaces_staged_success_before_publication() {
+        assert_supervised_terminal_publication(true);
     }
 
     #[test]
@@ -2776,6 +2851,312 @@ mod tests {
             );
             thread::yield_now();
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_supervised_terminal_publication(cleanup_failure: bool) {
+        use crate::{
+            app::prepare_run,
+            daemon::run_child::{
+                SupervisedTestLaunch, TerminalStageBarriers, run_supervised_for_test,
+            },
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let workspace = root.path().join("w");
+        std::fs::create_dir(&workspace).unwrap();
+        let config_path = workspace.join("plato.toml");
+        std::fs::write(
+            &config_path,
+            r#"[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "http://127.0.0.1:1"
+
+[limits]
+token_budget = 4000
+max_output_tokens = 64
+max_turns = 1
+
+[tools]
+enabled = ["file.read"]
+"#,
+        )
+        .unwrap();
+        let runtime = DaemonRuntime::new(crate::daemon::server::DaemonPaths {
+            workspace_root: workspace.canonicalize().unwrap(),
+            workspace_id: "terminal-order".into(),
+            socket_path: root.path().join("a.sock"),
+            lock_path: root.path().join("a.lock"),
+            ledger_path: root
+                .path()
+                .join("state/plato-agent/workspaces/terminal-order/agent.db"),
+        });
+        let case = if cleanup_failure {
+            "cleanup"
+        } else {
+            "success"
+        };
+        let run_id = RunId::new(format!("run_terminal_{case}")).unwrap();
+        let record = Arc::new(RunRecord::new(
+            run_id.to_string(),
+            format!("session_terminal_{case}"),
+            runtime.paths.ledger_path.clone(),
+        ));
+        runtime.reserve_run(record.clone()).unwrap();
+        let (prepared, recorder) = prepare_run(&RunOptions {
+            question: "prove terminal publication ordering".into(),
+            config_path: Some(config_path),
+            overrides: Default::default(),
+            ledger: RunLedger::DefaultSqlite(runtime.paths.default_ledger()),
+            workspace_root: runtime.paths.workspace_root.clone(),
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(run_id.clone()),
+            session: Some(RunSession::Fresh {
+                session_id: record.session_id.clone(),
+            }),
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: None,
+            voice_interruption_context: None,
+        })
+        .unwrap();
+
+        let turn_id = TurnId::new("turn_terminal").unwrap();
+        let nonterminal_events = vec![
+            HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: AgentId::new("plato").unwrap(),
+            },
+            HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                context: ContextPack {
+                    token_budget: 4000,
+                    fragments: vec![],
+                },
+            },
+            HarnessEvent::ModelRequested {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 0,
+                model: ModelName::new("test-model").unwrap(),
+            },
+            HarnessEvent::ModelResponded {
+                run_id: run_id.clone(),
+                turn_id,
+                step: 0,
+                output: Message {
+                    role: MessageRole::Assistant,
+                    content: "done".into(),
+                },
+                proposed_calls: vec![],
+                served_model: None,
+                usage: None,
+            },
+        ];
+        let nonterminal = nonterminal_events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| {
+                json!({
+                    "kind": "record",
+                    "request_id": index + 1,
+                    "operation": {"operation": "event", "event": event}
+                })
+            })
+            .map(|message| format!("printf '%s\\n' '{message}'\nIFS= read -r _\n"))
+            .collect::<String>();
+        let terminal = json!({
+            "kind": "record",
+            "request_id": 5,
+            "operation": {
+                "operation": "finish",
+                "run_id": run_id,
+                "final_answer": "done"
+            }
+        });
+        let result = json!({
+            "kind": "result",
+            "request_id": 6,
+            "result": {
+                "status": "finished",
+                "outcome": {"run_id": run_id, "final_answer": "done"}
+            }
+        });
+        let fifo = root.path().join("r");
+        let descendant_pid_path = root.path().join("d.pid");
+        let fixture = root.path().join("child");
+        let stderr = if cleanup_failure {
+            "printf 'cleanup drain failure\\n' >&2"
+        } else {
+            ":"
+        };
+        std::fs::write(
+            &fixture,
+            format!(
+                r#"#!/bin/sh
+mkfifo '{fifo}'
+/bin/sh -c 'IFS= read -r _ < "$1"' sh '{fifo}' &
+printf '%s\n' "$!" > '{descendant_pid_path}'
+IFS= read -r _
+printf '{{"kind":"ready","request_id":0,"pid":%s}}\n' "$$"
+IFS= read -r _
+{nonterminal}
+printf '%s\n' '{terminal}'
+IFS= read -r _
+printf 'release\n' > '{fifo}'
+wait
+rm -f '{fifo}'
+printf '%s\n' '{result}'
+IFS= read -r _
+{stderr}
+"#,
+                fifo = fifo.display(),
+                descendant_pid_path = descendant_pid_path.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (event_sender, event_receiver) = mpsc::channel();
+        let event_collector = spawn_event_collector(record.clone(), event_receiver);
+        let terminal_reached = Arc::new(Barrier::new(2));
+        let terminal_release = Arc::new(Barrier::new(2));
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let worker_runtime = runtime.clone();
+        let worker_record = record.clone();
+        let reached = terminal_reached.clone();
+        let release = terminal_release.clone();
+        let worker = thread::spawn(move || {
+            let completion = run_supervised_for_test(
+                prepared,
+                recorder,
+                ApprovalMode::Deny { actor: "test" },
+                event_sender,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                SupervisedTestLaunch {
+                    executable: fixture,
+                    ready_child: ready_sender,
+                    terminal_stage_barriers: TerminalStageBarriers { reached, release },
+                },
+            );
+            let outcome = finish_run_after_event_collection(
+                &worker_runtime,
+                &worker_record,
+                completion,
+                event_collector,
+            );
+            finished_sender.send(outcome).unwrap();
+        });
+
+        let child_pid = ready_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        terminal_reached.wait();
+        let descendant_pid = std::fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let before = read_run_transcript(&runtime.paths.default_ledger(), run_id.as_str()).unwrap();
+        assert_eq!(before.status, RunStateName::Running);
+        assert_eq!(before.final_answer, None);
+        assert_eq!(record.status().state, RunStateName::Running);
+        assert_eq!(
+            runtime.shutdown_if_idle(),
+            ShutdownIfIdleDecision::RefusedActive
+        );
+        let before_records = SqliteLedger::open_default_readonly(&runtime.paths.default_ledger())
+            .unwrap()
+            .read_session_run(run_id.as_str())
+            .unwrap();
+        assert_eq!(terminal_count(&before_records.records), 0);
+
+        terminal_release.wait();
+        let outcome = finished_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        worker.join().unwrap();
+        assert!(!Path::new(&format!("/proc/{child_pid}")).exists());
+        assert!(!Path::new(&format!("/proc/{descendant_pid}")).exists());
+        assert!(!fifo.exists());
+
+        let after = read_run_transcript(&runtime.paths.default_ledger(), run_id.as_str()).unwrap();
+        let after_records = SqliteLedger::open_default_readonly(&runtime.paths.default_ledger())
+            .unwrap()
+            .read_session_run(run_id.as_str())
+            .unwrap();
+        assert_eq!(
+            terminal_count(&after_records.records),
+            1,
+            "outcome={outcome:?} transcript={after:?} records={:?}",
+            after_records.records
+        );
+        let buffered_terminals = record
+            .events
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.event,
+                    StreamEvent::Ledger {
+                        record: RecordedEvent {
+                            event: HarnessEvent::RunFinished { .. }
+                                | HarnessEvent::RunFailed { .. },
+                            ..
+                        }
+                    }
+                )
+            })
+            .count();
+        assert_eq!(buffered_terminals, 1);
+
+        if cleanup_failure {
+            let reason = match outcome {
+                Err(AppError::SupervisedRun(reason)) => reason,
+                unexpected => panic!("unexpected cleanup outcome: {unexpected:?}"),
+            };
+            assert!(reason.contains("cleanup drain failure"));
+            assert_eq!(after.status, RunStateName::Failed);
+            assert_eq!(after.final_answer, None);
+            assert!(matches!(
+                after_records.records.last().map(|record| &record.event),
+                Some(HarnessEvent::RunFailed { reason: recorded, .. }) if recorded == &reason
+            ));
+        } else {
+            assert_eq!(outcome.unwrap().final_answer, "done");
+            assert_eq!(after.status, RunStateName::Finished);
+            assert_eq!(after.final_answer.as_deref(), Some("done"));
+            assert!(matches!(
+                after_records.records.last().map(|record| &record.event),
+                Some(HarnessEvent::RunFinished { .. })
+            ));
+        }
+        assert_eq!(runtime.shutdown_if_idle(), ShutdownIfIdleDecision::Shutdown);
+
+        drop(before_records);
+        drop(after_records);
+        drop(record);
+        drop(runtime);
+        drop(root);
+        assert!(!root_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn terminal_count(records: &[RecordedEvent]) -> usize {
+        records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.event,
+                    HarnessEvent::RunFinished { .. } | HarnessEvent::RunFailed { .. }
+                )
+            })
+            .count()
     }
 
     fn stream_run(runtime: &DaemonRuntime, request_id: &str, run_id: &str) -> EventsStreamResult {
