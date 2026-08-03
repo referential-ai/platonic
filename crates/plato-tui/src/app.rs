@@ -1,4 +1,8 @@
-use crate::{ApprovalModalView, TranscriptState, TuiState, render, render_snapshot};
+use crate::{
+    ApprovalModalView, TranscriptState, TuiState,
+    color::{self, TerminalColors},
+    render, render_snapshot,
+};
 use crossterm::{
     SynchronizedUpdate,
     event::{
@@ -118,7 +122,9 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
     let config = DaemonConnectionConfig::resolve(&options.workspace, options.socket)?;
     let mut state = load_state(&config, options.run.as_deref());
     state.set_reduced_motion(options.reduced_motion || reduced_motion_from_env());
+    let detected_colors = TerminalColors::detect(None);
     if options.snapshot {
+        color::install(detected_colors);
         print!("{}", render_snapshot(&state, 100, 24)?);
         return Ok(());
     }
@@ -130,6 +136,8 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
     let commands = spawn_client_worker_to(config.clone(), event_sender.clone());
     let mut runtime = UiRuntime::from_state(&state, config_path.clone());
     let mut terminal = TerminalSession::enter()?;
+    let background = startup_terminal_background(detected_colors);
+    color::install(TerminalColors::detect(background));
     let mut terminal_events = TerminalEventReader::spawn(event_sender);
     let mut frames = FrameScheduler::default();
     frames.schedule_frame();
@@ -185,6 +193,18 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
         }
     }
     Ok(())
+}
+
+fn startup_terminal_background(colors: TerminalColors) -> Option<color::Rgb> {
+    if !colors.should_probe_background() {
+        return None;
+    }
+    // Crossterm retains a pending event for the normal reader. Never consume the tty for an
+    // optional color response when ordinary input is already waiting.
+    if event::poll(Duration::ZERO).unwrap_or(true) {
+        return None;
+    }
+    color::probe_background()
 }
 
 fn reduced_motion_from_env() -> bool {
