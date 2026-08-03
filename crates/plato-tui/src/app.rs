@@ -1420,6 +1420,7 @@ mod tests {
             None,
         ));
         assert!(state.help_visible);
+        assert_eq!(state.footer_mode(), crate::state::FooterMode::Shortcuts);
 
         assert!(handle_key_press(
             KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
@@ -1430,6 +1431,7 @@ mod tests {
             None,
         ));
         assert!(!state.help_visible);
+        assert_eq!(state.footer_mode(), crate::state::FooterMode::Contextual);
         assert!(receiver.try_recv().is_err());
     }
 
@@ -1775,6 +1777,7 @@ mod tests {
         state.connection = crate::ConnectionState::Disconnected {
             error: "connection closed".into(),
         };
+        assert_eq!(state.footer_mode(), crate::state::FooterMode::Offline);
         state.set_composer_text("/reconnect");
         assert!(submit_composer(
             &sender,
@@ -1785,6 +1788,7 @@ mod tests {
         ));
 
         assert_eq!(state.status_message.as_deref(), Some("reconnecting"));
+        assert_eq!(state.footer_mode(), crate::state::FooterMode::Offline);
         match receiver.try_recv().unwrap() {
             ClientCommand::Load { run_id } => assert_eq!(run_id.as_deref(), Some("run_1")),
             other => panic!("unexpected command: {other:?}"),
@@ -3413,6 +3417,7 @@ mod tests {
 
         assert!(request_cancel(&sender, &mut state));
         assert!(state.cancel_requested);
+        assert_eq!(state.footer_mode(), crate::state::FooterMode::QuitConfirm);
         match receiver.try_recv().unwrap() {
             ClientCommand::RunCancel { run_id } => assert_eq!(run_id, "run_1"),
             other => panic!("unexpected command: {other:?}"),
@@ -3439,6 +3444,7 @@ mod tests {
         ));
 
         assert!(state.cancel_requested);
+        assert_eq!(state.footer_mode(), crate::state::FooterMode::QuitConfirm);
         assert!(matches!(
             receiver.try_recv().unwrap(),
             ClientCommand::RunCancel { run_id } if run_id == "run_escape"

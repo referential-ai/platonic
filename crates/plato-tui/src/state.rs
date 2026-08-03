@@ -27,6 +27,15 @@ pub(super) enum MotionMode {
     Reduced,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum FooterMode {
+    #[default]
+    Contextual,
+    Shortcuts,
+    QuitConfirm,
+    Offline,
+}
+
 #[derive(Clone, Debug)]
 /// Complete render and interaction state for the terminal client.
 pub struct TuiState {
@@ -242,6 +251,18 @@ impl TuiState {
         } else {
             MotionMode::Animated
         };
+    }
+
+    pub(super) fn footer_mode(&self) -> FooterMode {
+        if self.help_visible {
+            FooterMode::Shortcuts
+        } else if matches!(self.connection, ConnectionState::Disconnected { .. }) {
+            FooterMode::Offline
+        } else if self.cancel_requested {
+            FooterMode::QuitConfirm
+        } else {
+            FooterMode::Contextual
+        }
     }
 
     pub(super) fn move_slash_popup_selection(&mut self, delta: isize) {

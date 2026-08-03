@@ -120,12 +120,23 @@ failures start no connector and point to `plato daemon`; the gateway never
 starts a daemon with its Discord environment. The direct
 `plato-gateway-discord --workspace "$PWD"` technical command remains supported.
 
+The TUI footer is contextual by default and moves model and workspace context
+out of the transcript. Press `?` for the shared shortcut overlay. The footer
+switches to a second-press quit hint after cancel and to
+`daemon unavailable — r to reconnect` while offline. At 120 columns it includes
+model and workspace context; below 120 columns that right-side context drops,
+below 80 the queue hint drops, and below 40 the remaining `?` hint truncates
+without wrapping.
+
 | Key | Does |
 | --- | --- |
 | type + Enter | start a run when idle |
+| `?` | open shortcuts; `?`, Esc, or `q` closes the overlay |
+| Tab | complete a slash command, submit, or queue behind an active run |
+| Alt-Enter | insert a newline (`⌥ Enter` on macOS, `alt + enter` elsewhere) |
 | `g` / `d` | grant / deny in the approval modal |
 | Esc | interrupt an active run; otherwise close or quit |
-| Ctrl-C | first press cancels the active run; second quits the TUI |
+| Ctrl-C | first press cancels the active run; the footer prompts for a second press to quit |
 | `r` | reconnect (only when the screen shows daemon unavailable) |
 | `q` | quit when the composer is empty |
 | Ctrl-U | clear the composer |

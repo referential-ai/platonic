@@ -75,6 +75,15 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
         INITIAL_ROWS - 2,
         "Try \"read README.md and summarize it\"",
     );
+    let footer = shell.wait_for_screen_row(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        None,
+        INITIAL_ROWS - 1,
+        "? shortcuts",
+    );
+    assert!(footer.contains("Tab queue 0"));
+    assert!(!footer.contains("workspace"));
 
     let idle_output_len = shell.output_len();
     thread::sleep(Duration::from_secs(5));
@@ -85,13 +94,15 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
     );
     let keypress_at = Instant::now();
     shell.write(b"?");
-    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Commands");
+    let shortcuts = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Shortcuts");
+    assert!(shortcuts.contains("alt + enter"));
+    assert!(shortcuts.contains("? shortcuts · Esc close"));
     assert!(
         keypress_at.elapsed() < Duration::from_secs(1),
         "terminal input did not trigger a prompt redraw"
     );
     shell.write(b"\x1b");
-    shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "Commands");
+    shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "Shortcuts");
 
     shell.write(b"ask hllo");
     shell.write(b"\x1b[D\x1b[D\x1b[D");
@@ -153,9 +164,14 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
     shell.resize(28, 90);
     let streamed = shell.wait_for_screen_text_after(28, 90, stream_resize_at, "Working");
     assert!(streamed.contains("Esc to interrupt"));
+    assert!(streamed.contains("Esc interrupt"));
     assert_synchronized_frames(&shell.output_since(stream_resize_at));
 
-    shell.write(b"q");
+    shell.write(b"\x03");
+    let cancel = fake.wait_for_request("run.cancel");
+    assert_eq!(cancel.params.as_ref().unwrap()["run_id"], "run_tui_pty");
+    shell.wait_for_screen_text_after(28, 90, stream_resize_at, "press Ctrl+C again to quit");
+    shell.write(b"\x03");
     let after_termios = shell.wait_for_marker("POST");
     assert_eq!(after_termios, before_termios);
     assert_eq!(shell.wait_for_marker("STATUS"), "0");
@@ -174,6 +190,13 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
         .filter(|request| request.method.as_deref() == Some("run.start"))
         .collect();
     assert_eq!(run_starts.len(), 1);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method.as_deref() == Some("run.cancel"))
+            .count(),
+        1
+    );
     assert!(
         !requests
             .iter()
@@ -526,7 +549,7 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
     shell.write(b"v");
     let audit = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "approval denied");
     assert!(audit.contains(PENDING_CALL_ID));
-    assert!(audit.contains("audit"));
+    assert!(audit.contains("? shortcuts · Tab queue 0"));
     shell.write(b"q");
 
     let after_termios = shell.wait_for_marker("POST");
@@ -622,7 +645,8 @@ enabled = ["shell.exec"]
     shell.write(b"repeat shell\r");
     let repeated = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "done-repeat");
     assert!(!repeated.contains("Approval"));
-    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "online | ready");
+    let ready = shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "Esc interrupt");
+    assert!(ready.contains("? shortcuts · Tab queue 0"));
 
     shell.write(b"/new\r");
     shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Plato Agent");
@@ -768,7 +792,7 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
         shell.write(b"v");
         let audit = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, CONVERSATION_RUN_ID);
         assert!(audit.contains("#7 model_stage"));
-        assert!(audit.contains("audit"));
+        assert!(audit.contains("? shortcuts · Tab queue 0"));
         assert!(audit.contains("**Conversation-first PTY question**"));
         assert!(audit.contains("## Conversation-first PTY answer"));
         assert!(audit.contains("**rendered Markdown**"));
@@ -806,7 +830,7 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
         );
         assert!(!conversation.contains(CONVERSATION_RUN_ID));
         assert!(!conversation.contains("#7"));
-        assert!(conversation.contains("conversation"));
+        assert!(conversation.contains("? shortcuts · Tab queue 0"));
     }
     assert_eq!(fake.requests_for("transcript.read").len(), 1);
 
@@ -1755,6 +1779,7 @@ fn fake_response(
                 "capabilities": [
                     "hello",
                     "run.start",
+                    "run.cancel",
                     "events.stream",
                     "sessions.list",
                     "transcript.read",
@@ -1853,6 +1878,10 @@ fn fake_response(
             "ledger_path": ledger.to_string_lossy(),
             "status": "running",
             "final_answer": null
+        }),
+        "run.cancel" => json!({
+            "run_id": "run_tui_pty",
+            "status": "cancel_requested"
         }),
         "daemon.status" => json!({
             "model": {
