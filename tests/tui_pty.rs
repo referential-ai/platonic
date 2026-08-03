@@ -571,6 +571,8 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
 #[test]
 fn bare_plato_shell_session_grant_flow_is_scoped_and_expires_on_daemon_restart() {
     let root = tempfile::tempdir().unwrap();
+    let root_path = root.path().to_path_buf();
+    eprintln!("session-grant fixture root={}", root_path.display());
     let workspace = root.path().join("workspace");
     let runtime = root.path().join("runtime");
     let state = root.path().join("state");
@@ -617,6 +619,16 @@ enabled = ["shell.exec"]
         .join(&workspace_id)
         .join("agent.sock");
     let config = DaemonConnectionConfig::resolve(&workspace, Some(endpoint.clone())).unwrap();
+    let lock_path = endpoint.with_file_name("agent.lock");
+    let mut daemon = SessionGrantWorkspaceDaemon::start(
+        &workspace,
+        &runtime,
+        &state,
+        &home,
+        &config,
+        root.path().join("workspace-daemon-1.stderr"),
+    );
+    let first_daemon_pid = daemon.pid();
     let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
 
     shell.write(
@@ -645,10 +657,14 @@ enabled = ["shell.exec"]
     shell.write(b"repeat shell\r");
     let repeated = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "done-repeat");
     assert!(!repeated.contains("Approval"));
+    let mut client = connect_pty_daemon(&config);
+    let session_id = wait_for_finished_session(&mut client, "allow once");
     let ready = shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "Esc interrupt");
     assert!(ready.contains("? shortcuts · Tab queue 0"));
 
-    shell.write(b"/new\r");
+    shell.write(b"/new");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "> /new");
+    shell.write(b"\r");
     shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Plato Agent");
     shell.write(b"different session\r");
     let different = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "printf other");
@@ -656,8 +672,6 @@ enabled = ["shell.exec"]
     shell.write(b"d");
     shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "done-other");
 
-    let mut client = connect_pty_daemon(&config);
-    let session_id = wait_for_finished_session(&mut client, "allow once");
     let other_session_id = wait_for_finished_session(&mut client, "different session");
     assert_ne!(session_id, other_session_id);
     assert!(
@@ -688,6 +702,30 @@ enabled = ["shell.exec"]
         ShutdownIfIdleResultName::Shutdown
     );
     wait_for_endpoint_removal(&endpoint);
+    let first_daemon_exit = daemon.join_after_shutdown();
+    assert_eq!(first_daemon_exit.pid, first_daemon_pid);
+    if !first_daemon_exit.forced_cleanup {
+        assert!(
+            first_daemon_exit.status.success(),
+            "workspace daemon {} failed ({})\n{}",
+            first_daemon_exit.pid,
+            first_daemon_exit.status,
+            first_daemon_exit.stderr
+        );
+    }
+    remove_session_grant_owned_file(&endpoint).unwrap();
+    remove_session_grant_owned_file(&lock_path).unwrap();
+    assert_session_grant_lifecycle_absent(first_daemon_pid, &endpoint, &lock_path);
+
+    daemon = SessionGrantWorkspaceDaemon::start(
+        &workspace,
+        &runtime,
+        &state,
+        &home,
+        &config,
+        root.path().join("workspace-daemon-2.stderr"),
+    );
+    let second_daemon_pid = daemon.pid();
 
     shell.write(
         format!(
@@ -728,6 +766,20 @@ enabled = ["shell.exec"]
         ShutdownIfIdleResultName::Shutdown
     );
     wait_for_endpoint_removal(&endpoint);
+    let second_daemon_exit = daemon.join_after_shutdown();
+    assert_eq!(second_daemon_exit.pid, second_daemon_pid);
+    if !second_daemon_exit.forced_cleanup {
+        assert!(
+            second_daemon_exit.status.success(),
+            "workspace daemon {} failed ({})\n{}",
+            second_daemon_exit.pid,
+            second_daemon_exit.status,
+            second_daemon_exit.stderr
+        );
+    }
+    remove_session_grant_owned_file(&endpoint).unwrap();
+    remove_session_grant_owned_file(&lock_path).unwrap();
+    assert_session_grant_lifecycle_absent(second_daemon_pid, &endpoint, &lock_path);
     shell.write(b"exit\r");
     assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
 
@@ -738,6 +790,12 @@ enabled = ["shell.exec"]
     assert!(!workspace.join("pty-other.txt").exists());
     assert!(!workspace.join("pty-restart.txt").exists());
     assert_eq!(provider.handle.join().unwrap(), 10);
+    drop(client);
+    drop(restarted_client);
+    drop(shell);
+    drop(daemon);
+    root.close().unwrap();
+    assert!(!root_path.exists());
 }
 
 #[test]
@@ -981,6 +1039,174 @@ struct PtyShell {
     child: Child,
     output: Arc<Mutex<Vec<u8>>>,
     reader: Option<JoinHandle<()>>,
+}
+
+struct SessionGrantWorkspaceDaemon {
+    child: Option<Child>,
+    pid: u32,
+    stderr_path: PathBuf,
+    endpoint: PathBuf,
+    lock_path: PathBuf,
+}
+
+struct SessionGrantDaemonExit {
+    pid: u32,
+    status: ExitStatus,
+    stderr: String,
+    forced_cleanup: bool,
+}
+
+impl SessionGrantWorkspaceDaemon {
+    fn start(
+        workspace: &Path,
+        runtime: &Path,
+        state: &Path,
+        home: &Path,
+        config: &DaemonConnectionConfig,
+        stderr_path: PathBuf,
+    ) -> Self {
+        let stderr = File::create(&stderr_path).unwrap();
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_plato-agentd"))
+            .arg("--workspace")
+            .arg(workspace)
+            .current_dir(workspace)
+            .env("HOME", home)
+            .env("XDG_RUNTIME_DIR", runtime)
+            .env("XDG_STATE_HOME", state)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let endpoint = config.socket_path.clone();
+        let lock_path = endpoint.with_file_name("agent.lock");
+        eprintln!(
+            "session-grant fixture daemon pid={pid} endpoint={} lock={}",
+            endpoint.display(),
+            lock_path.display()
+        );
+        let mut daemon = Self {
+            child: Some(child),
+            pid,
+            stderr_path,
+            endpoint,
+            lock_path,
+        };
+        daemon.wait_until_ready(config);
+        daemon
+    }
+
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn wait_until_ready(&mut self, config: &DaemonConnectionConfig) {
+        let deadline = Instant::now() + PROOF_TIMEOUT;
+        loop {
+            if let Ok(mut client) = DaemonClient::connect(&config.socket_path)
+                && client.hello(&config.workspace_root).is_ok()
+            {
+                return;
+            }
+            if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
+                let stderr = fs::read_to_string(&self.stderr_path).unwrap_or_default();
+                panic!(
+                    "workspace daemon {} exited before readiness ({status})\n{stderr}",
+                    self.pid
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "workspace daemon {} did not create ready endpoint {}",
+                self.pid,
+                self.endpoint.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn join_after_shutdown(&mut self) -> SessionGrantDaemonExit {
+        let deadline = Instant::now() + PROOF_TIMEOUT;
+        let (status, forced_cleanup) = loop {
+            if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
+                break (status, false);
+            }
+            if Instant::now() >= deadline {
+                break self
+                    .terminate_and_join()
+                    .expect("workspace daemon could not be joined after shutdown");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        drop(self.child.take());
+        SessionGrantDaemonExit {
+            pid: self.pid,
+            status,
+            stderr: fs::read_to_string(&self.stderr_path).unwrap(),
+            forced_cleanup,
+        }
+    }
+
+    fn terminate_and_join(&mut self) -> Option<(ExitStatus, bool)> {
+        let child = self.child.as_mut()?;
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some((status, false));
+        }
+        let mut forced_cleanup = false;
+        if let Some(pid) = rustix::process::Pid::from_raw(self.pid as i32) {
+            forced_cleanup = true;
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        }
+        let deadline = Instant::now() + PROOF_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some((status, forced_cleanup)),
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
+        forced_cleanup = true;
+        let _ = child.kill();
+        child.wait().ok().map(|status| (status, forced_cleanup))
+    }
+}
+
+impl Drop for SessionGrantWorkspaceDaemon {
+    fn drop(&mut self) {
+        let _ = self.terminate_and_join();
+        drop(self.child.take());
+        let _ = remove_session_grant_owned_file(&self.endpoint);
+        let _ = remove_session_grant_owned_file(&self.lock_path);
+    }
+}
+
+fn remove_session_grant_owned_file(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn assert_session_grant_lifecycle_absent(pid: u32, endpoint: &Path, lock_path: &Path) {
+    #[cfg(target_os = "linux")]
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "workspace daemon {pid} remained after bounded join"
+    );
+    assert!(
+        !endpoint.exists(),
+        "workspace daemon socket remained: {}",
+        endpoint.display()
+    );
+    assert!(
+        !lock_path.exists(),
+        "workspace daemon lock remained: {}",
+        lock_path.display()
+    );
 }
 
 impl PtyShell {
