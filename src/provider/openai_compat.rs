@@ -303,16 +303,23 @@ fn response_body_worker_error(worker: thread::JoinHandle<()>) -> AppError {
 
 #[cfg(test)]
 std::thread_local! {
-    static RESPONSE_READ_CANCEL_OBSERVER: std::cell::RefCell<Option<mpsc::Sender<std::time::Instant>>> =
+    static RESPONSE_READ_CANCEL_OBSERVER: std::cell::RefCell<Option<ResponseReadCancelObserver>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct ResponseReadCancelObserver {
+    sender: mpsc::Sender<std::time::Instant>,
+    delay: std::time::Duration,
 }
 
 #[cfg(test)]
 pub(crate) fn with_response_read_cancel_observer<T>(
     observer: mpsc::Sender<std::time::Instant>,
+    delay: std::time::Duration,
     run: impl FnOnce() -> T,
 ) -> T {
-    struct ObserverGuard(Option<mpsc::Sender<std::time::Instant>>);
+    struct ObserverGuard(Option<ResponseReadCancelObserver>);
 
     impl Drop for ObserverGuard {
         fn drop(&mut self) {
@@ -322,7 +329,12 @@ pub(crate) fn with_response_read_cancel_observer<T>(
         }
     }
 
-    let previous = RESPONSE_READ_CANCEL_OBSERVER.with(|slot| slot.replace(Some(observer)));
+    let previous = RESPONSE_READ_CANCEL_OBSERVER.with(|slot| {
+        slot.replace(Some(ResponseReadCancelObserver {
+            sender: observer,
+            delay,
+        }))
+    });
     let _guard = ObserverGuard(previous);
     run()
 }
@@ -331,7 +343,8 @@ pub(crate) fn with_response_read_cancel_observer<T>(
 fn record_response_read_cancel_observation() {
     RESPONSE_READ_CANCEL_OBSERVER.with(|slot| {
         if let Some(observer) = slot.borrow_mut().take() {
-            let _ = observer.send(std::time::Instant::now());
+            std::thread::sleep(observer.delay);
+            let _ = observer.sender.send(std::time::Instant::now());
         }
     });
 }
