@@ -183,10 +183,10 @@ fn audit_history_lines(
             }
             lines.push(Line::from(""));
             lines.push(Line::from(
-                "Start plato-agentd manually, then press r to reconnect.",
+                "Quit and run plato --tui to ensure the host daemon.",
             ));
             lines.push(Line::from(format!(
-                "cargo run --bin plato-agentd -- --workspace {}",
+                "Or start plato-agentd --workspace {}, then press r to reconnect.",
                 state.workspace_root
             )));
         }
@@ -239,10 +239,10 @@ fn conversation_history_lines(
             }
             lines.push(Line::from(""));
             lines.push(Line::from(
-                "Start plato-agentd manually, then press r to reconnect.",
+                "Quit and run plato --tui to ensure the host daemon.",
             ));
             lines.push(Line::from(format!(
-                "cargo run --bin plato-agentd -- --workspace {}",
+                "Or start plato-agentd --workspace {}, then press r to reconnect.",
                 state.workspace_root
             )));
         }
@@ -742,7 +742,8 @@ fn conversation_live_event_lines(
                 if event.offset.is_none()
                     && ((event.kind == LiveEventKind::Warning
                         && (event.text.starts_with("issue prep")
-                            || event.text.starts_with("issue-prep")))
+                            || event.text.starts_with("issue-prep")
+                            || event.text.starts_with("thread send rejected:")))
                         || (event.kind == LiveEventKind::Status
                             && event.text.starts_with("issue-prep artifacts:"))) =>
             {
@@ -2617,7 +2618,9 @@ mod tests {
         let output = render_to_text(&state);
 
         assert!(output.contains("daemon unavailable"));
-        assert!(output.contains("cargo run --bin plato-agentd"));
+        assert!(output.contains("plato --tui to ensure the host daemon"));
+        assert!(output.contains("plato-agentd --workspace /tmp/work"));
+        assert!(!output.contains("cargo run"));
         assert!(output.contains("press r to reconnect"));
         assert!(output.contains("daemon unavailable — r to reconnect"));
     }
@@ -2908,6 +2911,37 @@ mod tests {
         assert!(!output.contains("file.read finished"));
         assert!(output.contains("warning"));
         assert!(!output.contains("approval pending shell.exec"));
+    }
+
+    #[test]
+    fn conversation_renders_only_unoffset_thread_send_rejection_warnings() {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            Vec::new(),
+            TranscriptState::None,
+        );
+        state.live_events = vec![
+            LiveEventLine::warning(None, "thread send rejected: controller_owned"),
+            LiveEventLine::warning(None, "generic warning remains hidden"),
+            LiveEventLine::warning(
+                Some(7),
+                "thread send rejected: offset warning remains hidden",
+            ),
+        ];
+
+        let output = render_to_text(&state);
+
+        assert!(output.contains("Notice"));
+        assert!(output.contains("thread send rejected: controller_owned"));
+        assert!(!output.contains("generic warning remains hidden"));
+        assert!(!output.contains("offset warning remains hidden"));
     }
 
     #[test]

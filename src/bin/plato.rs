@@ -19,7 +19,7 @@ use plato_agent::{
     new_session_id,
     paths::{self, default_sqlite},
     replay_default_sqlite, replay_file, replay_sqlite, run_issue_prep, run_question,
-    tui::{TuiOptions, run_tui},
+    tui::{ThreadAttachment, TuiOptions, run_tui},
 };
 use platonic_core::{HarnessEvent, RunId};
 use std::{
@@ -27,7 +27,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const DAEMON_CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -71,6 +71,14 @@ struct Cli {
 
     #[arg(long, global = true, help = "Start the interactive terminal UI")]
     tui: bool,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "THREAD_ID",
+        help = "Attach the terminal UI to an existing host-daemon thread"
+    )]
+    remote: Option<String>,
 
     #[arg(long, global = true, help = "Use a static TUI working indicator")]
     reduced_motion: bool,
@@ -192,7 +200,7 @@ fn run(workspace_lock: &mut Option<WorkspaceLock>) -> plato_agent::AppResult<()>
     let workspace_root = std::env::current_dir()?;
     let implicit_tui =
         implicit_tui_requested(&cli, io::stdin().is_terminal(), io::stdout().is_terminal());
-    if cli.tui || implicit_tui {
+    if cli.tui || cli.remote.is_some() || implicit_tui {
         return run_tui_mode(cli, workspace_root);
     }
     if matches!(&cli.command, Some(Command::IssuePrep { .. })) {
@@ -400,40 +408,7 @@ fn run_thread_cli_with_io(
                 reasoning_effort,
                 approval_policy,
             )?;
-            let result = match result {
-                ThreadSpawnResult::ApprovalRequired {
-                    spawn_id,
-                    thread_id,
-                    effect,
-                    reason,
-                } => {
-                    let effect = serde_json::to_value(effect)?
-                        .as_str()
-                        .ok_or_else(|| {
-                            AppError::DaemonProtocol("thread.spawn returned invalid effect".into())
-                        })?
-                        .to_owned();
-                    writeln!(errors, "thread.spawn {thread_id} ({effect}): {reason}")?;
-                    write!(errors, "Approve thread.spawn? [y/N/c] ")?;
-                    errors.flush()?;
-                    let mut line = String::new();
-                    input.read_line(&mut line)?;
-                    let approval = match line.trim().to_ascii_lowercase().as_str() {
-                        "y" | "yes" => ThreadSpawnDecision::Grant {
-                            actor: "stdin".into(),
-                        },
-                        "c" | "cancel" => ThreadSpawnDecision::Cancel {
-                            actor: "stdin".into(),
-                        },
-                        _ => ThreadSpawnDecision::Deny {
-                            actor: "stdin".into(),
-                            reason: "approval denied by stdin".into(),
-                        },
-                    };
-                    client.thread_spawn_decide(spawn_id, approval)?
-                }
-                result => result,
-            };
+            let result = resolve_thread_spawn(result, client, input, errors, "stdin")?;
             match result {
                 ThreadSpawnResult::Spawned { thread } => write_thread_status(output, &thread),
                 ThreadSpawnResult::Denied { reason, .. } => {
@@ -483,6 +458,46 @@ fn run_thread_cli_with_io(
             }
         }
     }
+}
+
+fn resolve_thread_spawn(
+    result: ThreadSpawnResult,
+    client: &mut DaemonClient,
+    input: &mut dyn BufRead,
+    errors: &mut dyn Write,
+    actor: &str,
+) -> plato_agent::AppResult<ThreadSpawnResult> {
+    let ThreadSpawnResult::ApprovalRequired {
+        spawn_id,
+        thread_id,
+        effect,
+        reason,
+    } = result
+    else {
+        return Ok(result);
+    };
+    let effect = serde_json::to_value(effect)?
+        .as_str()
+        .ok_or_else(|| AppError::DaemonProtocol("thread.spawn returned invalid effect".into()))?
+        .to_owned();
+    writeln!(errors, "thread.spawn {thread_id} ({effect}): {reason}")?;
+    write!(errors, "Approve thread.spawn? [y/N/c] ")?;
+    errors.flush()?;
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    let approval = match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => ThreadSpawnDecision::Grant {
+            actor: actor.into(),
+        },
+        "c" | "cancel" => ThreadSpawnDecision::Cancel {
+            actor: actor.into(),
+        },
+        _ => ThreadSpawnDecision::Deny {
+            actor: actor.into(),
+            reason: format!("approval denied by {actor}"),
+        },
+    };
+    Ok(client.thread_spawn_decide(spawn_id, approval)?)
 }
 
 fn write_thread_status(
@@ -632,8 +647,29 @@ fn write_issue_prep_output(
 }
 
 fn run_tui_mode(cli: Cli, workspace_root: PathBuf) -> plato_agent::AppResult<()> {
-    let options = tui_options_from_cli(&cli, &workspace_root)?;
-    ensure_tui_daemon(&workspace_root)?;
+    let mut options = tui_options_from_cli(&cli, &workspace_root)?;
+    let mut client = ensure_host_thread_daemon(&workspace_root)?;
+    let thread_id = match cli.remote {
+        Some(thread_id) => {
+            client
+                .thread_status(thread_id.clone())?
+                .thread
+                .authority
+                .thread_id
+        }
+        None => spawn_local_tui_thread(
+            &mut client,
+            &workspace_root,
+            cli.config.as_deref(),
+            &mut io::stdin().lock(),
+            &mut io::stderr(),
+        )?,
+    };
+    options.socket = Some(paths::host_socket_path()?);
+    options.thread = Some(ThreadAttachment {
+        thread_id,
+        controller_id: new_tui_controller_id(),
+    });
     run_tui(options)
 }
 
@@ -664,13 +700,50 @@ fn validate_tui_cli(cli: &Cli) -> plato_agent::AppResult<()> {
     Ok(())
 }
 
-fn ensure_tui_daemon(workspace_root: &Path) -> plato_agent::AppResult<()> {
-    let config = DaemonConnectionConfig::resolve(workspace_root, None)?;
-    if connect_serving_daemon(&config).is_some() {
-        return Ok(());
+fn new_tui_controller_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    format!("tui_{millis}_{}", std::process::id())
+}
+
+fn spawn_local_tui_thread(
+    client: &mut DaemonClient,
+    workspace_root: &Path,
+    config_path: Option<&Path>,
+    input: &mut dyn BufRead,
+    errors: &mut dyn Write,
+) -> plato_agent::AppResult<String> {
+    let config = Config::load(workspace_root, config_path)?;
+    let result = client.thread_spawn_start(
+        None,
+        workspace_root
+            .canonicalize()?
+            .to_string_lossy()
+            .into_owned(),
+        config.provider.model,
+        ReasoningEffort::None,
+        ThreadApprovalPolicy::Prompt,
+    )?;
+    match resolve_thread_spawn(result, client, input, errors, "local_tui")? {
+        ThreadSpawnResult::Spawned { thread } => Ok(thread.authority.thread_id),
+        ThreadSpawnResult::Denied { reason, .. } => {
+            Err(AppError::Config(format!("thread spawn denied: {reason}")))
+        }
+        ThreadSpawnResult::Canceled { .. } => Err(AppError::Config("thread spawn canceled".into())),
+        ThreadSpawnResult::ApprovalRequired { .. } => Err(AppError::DaemonProtocol(
+            "thread spawn remained pending after a decision".into(),
+        )),
     }
-    let mut daemon = spawn_detached_daemon(workspace_root)?;
-    wait_for_persistent_daemon(&config, &mut daemon)
+}
+
+fn ensure_host_thread_daemon(workspace_root: &Path) -> plato_agent::AppResult<DaemonClient> {
+    if let Ok(client) = connect_host_thread_daemon(workspace_root) {
+        return Ok(client);
+    }
+    let mut daemon = spawn_detached_host_daemon(workspace_root)?;
+    wait_for_persistent_host_daemon(workspace_root, &mut daemon)
 }
 
 fn connect_serving_daemon(config: &DaemonConnectionConfig) -> Option<DaemonClient> {
@@ -695,12 +768,11 @@ fn connect_workspace_daemon_with_timeout(
     Ok((client, hello))
 }
 
-fn spawn_detached_daemon(workspace_root: &Path) -> plato_agent::AppResult<Child> {
+fn spawn_detached_host_daemon(workspace_root: &Path) -> plato_agent::AppResult<Child> {
     let binary = sibling_binary("plato-agentd")?;
     let mut command = ProcessCommand::new(&binary);
     command
-        .arg("--workspace")
-        .arg(workspace_root)
+        .arg("--host")
         .current_dir(workspace_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -738,26 +810,26 @@ fn detach_command(command: &mut ProcessCommand) {
     command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
 }
 
-fn wait_for_persistent_daemon(
-    config: &DaemonConnectionConfig,
+fn wait_for_persistent_host_daemon(
+    workspace_root: &Path,
     daemon: &mut Child,
-) -> plato_agent::AppResult<()> {
+) -> plato_agent::AppResult<DaemonClient> {
     let deadline = Instant::now() + DAEMON_CLIENT_TIMEOUT;
     loop {
-        if connect_serving_daemon(config).is_some() {
-            return Ok(());
+        if let Ok(client) = connect_host_thread_daemon(workspace_root) {
+            return Ok(client);
         }
         if let Some(status) = daemon.try_wait()? {
             return Err(AppError::Config(format!(
-                "persistent plato-agentd exited before accepting connections: {status}"
+                "persistent host plato-agentd exited before accepting connections: {status}"
             )));
         }
         if Instant::now() >= deadline {
             let _ = daemon.kill();
             let _ = daemon.wait();
             return Err(AppError::Config(format!(
-                "timed out waiting for persistent plato-agentd at {}",
-                config.socket_path.display()
+                "timed out waiting for persistent host plato-agentd at {}",
+                paths::host_socket_path()?.display()
             )));
         }
         thread::sleep(DAEMON_POLL);
@@ -1453,6 +1525,17 @@ mod tests {
         let options = tui_options_from_cli(&cli, dir.path()).unwrap();
 
         assert!(options.reduced_motion);
+    }
+
+    #[test]
+    fn remote_selects_an_existing_thread_tui() {
+        let cli = Cli::try_parse_from(["plato", "--remote", "thread_selected"]).unwrap();
+        assert_eq!(cli.remote.as_deref(), Some("thread_selected"));
+        assert!(cli.command.is_none());
+        assert!(cli.question.is_empty());
+
+        let cli = Cli::try_parse_from(["plato", "--tui", "--remote", "thread_selected"]).unwrap();
+        assert_eq!(cli.remote.as_deref(), Some("thread_selected"));
     }
 
     #[test]

@@ -1,12 +1,15 @@
-use crate::{ActiveRunView, ApprovalModalView, TranscriptState, TranscriptView, TuiState};
+use crate::{
+    ActiveRunView, ApprovalModalView, ThreadAttachment, TranscriptState, TranscriptView, TuiState,
+};
 use plato_daemon_client::{
     ClientError, ClientResult,
     client::{DaemonClient, DaemonConnectionConfig},
 };
 use plato_protocol::{
-    ApprovalDecisionName, CommandAcceptedResult, DaemonStatusResult, ERROR_LAGGED, ERROR_OVERLOAD,
-    ERROR_UNSUPPORTED_VERSION, ERROR_WORKSPACE_MISMATCH, EventsStreamResult, IssuePrepResult,
-    IssuePrepStartResult, RunStartResult, RunStateName, StreamEvent,
+    ApprovalDecisionName, BufferedStreamEvent, CommandAcceptedResult, DaemonStatusResult,
+    ERROR_LAGGED, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION, ERROR_WORKSPACE_MISMATCH,
+    EventsStreamResult, HarnessEvent, IssuePrepResult, IssuePrepStartResult, RunStartResult,
+    RunStateName, StreamEvent, ThreadEventsResult, ThreadSendResult,
 };
 use std::{
     collections::HashMap,
@@ -36,6 +39,67 @@ pub(super) fn load_state(config: &DaemonConnectionConfig, run_id: Option<&str>) 
             error.to_string(),
         ),
     }
+}
+
+pub(super) fn load_thread_state(
+    config: &DaemonConnectionConfig,
+    attachment: &ThreadAttachment,
+) -> TuiState {
+    match load_connected_thread_state(config, attachment) {
+        Ok(state) => state,
+        Err(error) => TuiState::disconnected(
+            config.workspace_root.to_string_lossy().into_owned(),
+            config.socket_path.to_string_lossy().into_owned(),
+            error.to_string(),
+        ),
+    }
+}
+
+fn load_connected_thread_state(
+    config: &DaemonConnectionConfig,
+    attachment: &ThreadAttachment,
+) -> ClientResult<TuiState> {
+    let mut client = connect_daemon(config, DAEMON_CLIENT_TIMEOUT)?;
+    let hello = client.hello(&config.workspace_root)?;
+    let status = client.thread_status(attachment.thread_id.clone())?;
+    let sessions = client.sessions_list()?;
+    let session_id = format!("session_{}", attachment.thread_id);
+    let (transcript, approval) = if sessions
+        .iter()
+        .any(|session| session.session_id == session_id)
+    {
+        match client.transcript_read_session(&session_id) {
+            Ok(transcript) => loaded_transcript_state(transcript),
+            Err(error) => (
+                TranscriptState::Unavailable {
+                    run_id: session_id.clone(),
+                    error: error.to_string(),
+                },
+                None,
+            ),
+        }
+    } else {
+        (TranscriptState::None, None)
+    };
+    let mut state = TuiState::connected(
+        config.workspace_root.to_string_lossy().into_owned(),
+        config.socket_path.to_string_lossy().into_owned(),
+        hello,
+        sessions,
+        transcript,
+    );
+    state.selected_session_id = Some(session_id.clone());
+    state.approval = approval;
+    state.status_message = Some(format!("attached to thread {}", attachment.thread_id));
+    if status.thread.live.current_turn_id.is_some()
+        && let Some(session) = state
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+    {
+        state.active_run = Some(ActiveRunView::new(session.run_id.clone(), session.status));
+    }
+    Ok(state)
 }
 
 fn load_connected_state(
@@ -142,6 +206,9 @@ pub(super) struct UiRuntime {
     pub(super) last_poll: Instant,
     pub(super) tool_inputs: HashMap<String, String>,
     pub(super) active_timer: ActiveTimer,
+    pub(super) thread: Option<ThreadAttachment>,
+    pub(super) thread_next_offset: Option<u64>,
+    pub(super) thread_turn_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -226,18 +293,34 @@ impl UiRuntime {
             last_poll: now,
             tool_inputs: HashMap::new(),
             active_timer: ActiveTimer::from_state_at(state, now),
+            thread: None,
+            thread_next_offset: None,
+            thread_turn_id: None,
+        }
+    }
+
+    pub(super) fn attach_thread(&mut self, attachment: Option<ThreadAttachment>) {
+        self.thread = attachment;
+        self.thread_next_offset = None;
+        self.thread_turn_id = None;
+        if self.thread.is_some() {
+            self.polling = true;
+            self.last_poll = Instant::now() - ACTIVE_POLL_INTERVAL;
         }
     }
 
     fn sync_from_state(&mut self, state: &TuiState) {
         self.active_run_id = state.active_run.as_ref().map(|run| run.run_id.clone());
-        self.polling = state.active_run.as_ref().is_some_and(|run| {
-            matches!(
-                run.status,
-                RunStateName::Running | RunStateName::CancelRequested
-            )
-        });
+        self.polling = self.thread.is_some()
+            || state.active_run.as_ref().is_some_and(|run| {
+                matches!(
+                    run.status,
+                    RunStateName::Running | RunStateName::CancelRequested
+                )
+            });
         self.next_offset = 0;
+        self.thread_next_offset = None;
+        self.thread_turn_id = None;
         self.poll_in_flight = false;
         let now = Instant::now();
         self.last_poll = now;
@@ -246,8 +329,24 @@ impl UiRuntime {
     }
 
     pub(super) fn poll_deadline(&self) -> Option<Instant> {
-        (self.polling && !self.poll_in_flight && self.active_run_id.is_some())
-            .then_some(self.last_poll + ACTIVE_POLL_INTERVAL)
+        (self.polling
+            && !self.poll_in_flight
+            && (self.active_run_id.is_some() || self.thread.is_some()))
+        .then_some(self.last_poll + ACTIVE_POLL_INTERVAL)
+    }
+
+    pub(super) fn is_thread_attached(&self) -> bool {
+        self.thread.is_some()
+    }
+
+    pub(super) fn thread_send_command(&self, message: String) -> Option<ClientCommand> {
+        let thread = self.thread.as_ref()?;
+        Some(ClientCommand::ThreadSend {
+            thread_id: thread.thread_id.clone(),
+            controller_id: thread.controller_id.clone(),
+            turn_id: self.thread_turn_id.clone(),
+            message,
+        })
     }
 }
 
@@ -272,12 +371,22 @@ pub(super) enum ClientCommand {
         session_id: String,
         config_path: Option<String>,
     },
+    ThreadSend {
+        thread_id: String,
+        controller_id: String,
+        turn_id: Option<String>,
+        message: String,
+    },
     IssuePrepStart {
         input: String,
         config_path: Option<String>,
     },
     PollEvents {
         run_id: String,
+        from_offset: Option<u64>,
+    },
+    PollThreadEvents {
+        thread_id: String,
         from_offset: Option<u64>,
     },
     ApprovalGrant {
@@ -303,8 +412,10 @@ pub(super) enum ClientEvent {
     Loaded(Box<TuiState>),
     StatusLoaded(Box<DaemonStatusResult>),
     RunStarted(RunStartResult),
+    ThreadSent(ThreadSendResult),
     IssuePrepFinished(IssuePrepStartResult),
     EventsPolled(EventsStreamResult),
+    ThreadEventsPolled(ThreadEventsResult),
     ApprovalDecided {
         result: CommandAcceptedResult,
         tool_call_id: String,
@@ -322,8 +433,10 @@ pub(super) enum ClientOperation {
     DaemonStatus,
     RunStart,
     MessageAppend,
+    ThreadSend,
     IssuePrepStart,
     EventsStream,
+    ThreadEvents,
     ApprovalDecide,
     RunCancel,
 }
@@ -334,8 +447,10 @@ impl ClientOperation {
             Self::DaemonStatus => "daemon.status",
             Self::RunStart => "run.start",
             Self::MessageAppend => "message.append",
+            Self::ThreadSend => "thread.send",
             Self::IssuePrepStart => "issue-prep.start",
             Self::EventsStream => "events.stream",
+            Self::ThreadEvents => "thread.events",
             Self::ApprovalDecide => "approval.decide",
             Self::RunCancel => "run.cancel",
         }
@@ -350,7 +465,7 @@ pub(super) fn spawn_client_worker(
     let (event_sender, event_receiver) = mpsc::channel();
     thread::spawn(move || {
         for command in command_receiver {
-            let event = handle_client_command(&config, command);
+            let event = handle_client_command(&config, None, command);
             if event_sender.send(event).is_err() {
                 break;
             }
@@ -361,12 +476,13 @@ pub(super) fn spawn_client_worker(
 
 pub(super) fn spawn_client_worker_to(
     config: DaemonConnectionConfig,
+    attachment: Option<ThreadAttachment>,
     event_sender: Sender<UiEvent>,
 ) -> Sender<ClientCommand> {
     let (command_sender, command_receiver) = mpsc::channel();
     thread::spawn(move || {
         for command in command_receiver {
-            let event = handle_client_command(&config, command);
+            let event = handle_client_command(&config, attachment.as_ref(), command);
             if event_sender.send(UiEvent::Daemon(event)).is_err() {
                 break;
             }
@@ -375,11 +491,16 @@ pub(super) fn spawn_client_worker_to(
     command_sender
 }
 
-fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand) -> ClientEvent {
+fn handle_client_command(
+    config: &DaemonConnectionConfig,
+    attachment: Option<&ThreadAttachment>,
+    command: ClientCommand,
+) -> ClientEvent {
     match command {
-        ClientCommand::Load { run_id } => {
-            ClientEvent::Loaded(Box::new(load_state(config, run_id.as_deref())))
-        }
+        ClientCommand::Load { run_id } => ClientEvent::Loaded(Box::new(match attachment {
+            Some(attachment) => load_thread_state(config, attachment),
+            None => load_state(config, run_id.as_deref()),
+        })),
         ClientCommand::LoadSession { session_id } => {
             ClientEvent::Loaded(Box::new(load_selected_session_state(config, &session_id)))
         }
@@ -413,6 +534,18 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             failed_event(ClientOperation::MessageAppend),
             ClientEvent::RunStarted,
         ),
+        ClientCommand::ThreadSend {
+            thread_id,
+            controller_id,
+            turn_id,
+            message,
+        } => with_client(config, |client| {
+            client.thread_send(thread_id, controller_id, turn_id, message)
+        })
+        .map_or_else(
+            failed_event(ClientOperation::ThreadSend),
+            ClientEvent::ThreadSent,
+        ),
         ClientCommand::IssuePrepStart { input, config_path } => {
             let result = (|| {
                 let mut client = connect_daemon(config, DAEMON_CLIENT_TIMEOUT)?;
@@ -434,6 +567,16 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
         .map_or_else(
             failed_event(ClientOperation::EventsStream),
             ClientEvent::EventsPolled,
+        ),
+        ClientCommand::PollThreadEvents {
+            thread_id,
+            from_offset,
+        } => with_client(config, |client| {
+            client.thread_events(thread_id, from_offset, EVENT_LIMIT, 0)
+        })
+        .map_or_else(
+            failed_event(ClientOperation::ThreadEvents),
+            ClientEvent::ThreadEventsPolled,
         ),
         ClientCommand::ApprovalGrant {
             run_id,
@@ -540,6 +683,7 @@ pub(super) fn apply_client_event(
         ClientEvent::RunStarted(result) => {
             apply_run_response(state, runtime, result, "run started")
         }
+        ClientEvent::ThreadSent(result) => apply_thread_send_result(state, runtime, result),
         ClientEvent::IssuePrepFinished(result) => {
             state.issue_prep_started_at = None;
             state.issue_prep_elapsed_secs = None;
@@ -582,6 +726,9 @@ pub(super) fn apply_client_event(
             start_next_queued(commands, state, runtime);
         }
         ClientEvent::EventsPolled(result) => apply_events_result(state, runtime, commands, result),
+        ClientEvent::ThreadEventsPolled(result) => {
+            apply_thread_events_result(state, runtime, result)
+        }
         ClientEvent::ApprovalDecided {
             result,
             tool_call_id,
@@ -625,12 +772,22 @@ pub(super) fn apply_client_event(
                 ClientError::DaemonResponse(error) if error.code == ERROR_OVERLOAD
             );
             let message = error.to_string();
-            if operation == ClientOperation::EventsStream && lagged {
+            if matches!(
+                operation,
+                ClientOperation::EventsStream | ClientOperation::ThreadEvents
+            ) && lagged
+            {
                 state.stream_warning = Some(format!("{message}; resuming at current tip"));
-                if let Some(run_id) = runtime.active_run_id.clone() {
+                if operation == ClientOperation::ThreadEvents {
+                    poll_thread_events_from(runtime, commands, None);
+                } else if let Some(run_id) = runtime.active_run_id.clone() {
                     poll_events_from(runtime, commands, run_id, None);
                 }
-            } else if operation == ClientOperation::EventsStream && overloaded {
+            } else if matches!(
+                operation,
+                ClientOperation::EventsStream | ClientOperation::ThreadEvents
+            ) && overloaded
+            {
                 state.stream_warning = Some(message);
             } else {
                 if connection_error {
@@ -655,7 +812,9 @@ pub(super) fn apply_client_event(
                     }
                     ClientOperation::RunStart
                     | ClientOperation::MessageAppend
+                    | ClientOperation::ThreadSend
                     | ClientOperation::EventsStream
+                    | ClientOperation::ThreadEvents
                     | ClientOperation::ApprovalDecide
                     | ClientOperation::DaemonStatus => {}
                 }
@@ -775,6 +934,40 @@ pub(super) fn apply_run_response(
         .start_at(Instant::now(), Duration::ZERO);
 }
 
+fn apply_thread_send_result(
+    state: &mut TuiState,
+    runtime: &mut UiRuntime,
+    result: ThreadSendResult,
+) {
+    match result {
+        ThreadSendResult::Started { turn_id, .. } => {
+            runtime.thread_turn_id = Some(turn_id.clone());
+            runtime.polling = true;
+            runtime.last_poll = Instant::now() - ACTIVE_POLL_INTERVAL;
+            runtime
+                .active_timer
+                .start_at(Instant::now(), Duration::ZERO);
+            state.status_message = Some(format!("thread turn started: {turn_id}"));
+        }
+        ThreadSendResult::Steered { turn_id, .. } => {
+            runtime.thread_turn_id = Some(turn_id.clone());
+            state.status_message = Some(format!("thread turn steered: {turn_id}"));
+        }
+        ThreadSendResult::Rejected {
+            turn_id, reason, ..
+        } => {
+            runtime.thread_turn_id = turn_id;
+            let reason = serde_json::to_value(reason)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "rejected".into());
+            let message = format!("thread send rejected: {reason}");
+            state.status_message = Some(message.clone());
+            push_live_event(state, crate::LiveEventLine::warning(None, message));
+        }
+    }
+}
+
 pub(super) fn apply_events_result(
     state: &mut TuiState,
     runtime: &mut UiRuntime,
@@ -792,8 +985,77 @@ pub(super) fn apply_events_result(
     runtime.polling = active || needs_catch_up;
     state.stream_warning = None;
     state.active_run = Some(ActiveRunView::new(result.run_id.clone(), result.status));
-    for buffered in result.events {
+    apply_buffered_stream_events(state, runtime, result.events, Some(&result.run_id));
+    if needs_catch_up {
+        maybe_poll_events_now(runtime, commands);
+    } else if !active {
+        state.active_run_elapsed_secs = runtime
+            .active_timer
+            .elapsed_at(Instant::now())
+            .map(|elapsed| elapsed.as_secs());
+        runtime.active_timer.stop();
+        send_command(
+            commands,
+            ClientCommand::Load {
+                run_id: Some(result.run_id),
+            },
+            state,
+        );
+        start_next_queued(commands, state, runtime);
+    }
+}
+
+fn apply_thread_events_result(
+    state: &mut TuiState,
+    runtime: &mut UiRuntime,
+    result: ThreadEventsResult,
+) {
+    runtime.poll_in_flight = false;
+    runtime.thread_next_offset = Some(result.next_offset);
+    runtime.thread_turn_id = result.current_turn_id;
+    runtime.polling = true;
+    state.stream_warning = None;
+    let events = result
+        .events
+        .into_iter()
+        .map(|event| BufferedStreamEvent {
+            offset: event.offset,
+            event: event.event,
+        })
+        .collect();
+    if let Some((run_id, status)) = apply_buffered_stream_events(state, runtime, events, None) {
+        runtime.active_run_id = Some(run_id.clone());
+        state.active_run = Some(ActiveRunView::new(run_id.clone(), status));
+        state.bind_latest_user_to_run(&run_id);
+        if matches!(
+            status,
+            RunStateName::Finished | RunStateName::Failed | RunStateName::Canceled
+        ) {
+            state.active_run_elapsed_secs = runtime
+                .active_timer
+                .elapsed_at(Instant::now())
+                .map(|elapsed| elapsed.as_secs());
+            runtime.active_timer.stop();
+        } else if !runtime.active_timer.is_active() {
+            runtime
+                .active_timer
+                .start_at(Instant::now(), Duration::ZERO);
+        }
+    }
+}
+
+fn apply_buffered_stream_events(
+    state: &mut TuiState,
+    runtime: &mut UiRuntime,
+    events: Vec<BufferedStreamEvent>,
+    fallback_run_id: Option<&str>,
+) -> Option<(String, RunStateName)> {
+    let mut observed_run = None;
+    for buffered in events {
         let event = &buffered.event;
+        if let Some(run) = run_state_from_event(event) {
+            observed_run = Some(run);
+        }
         if let Some(model) = crate::model_from_event(event) {
             state.active_model = Some(model);
         }
@@ -820,29 +1082,31 @@ pub(super) fn apply_events_result(
             state.approval_scroll_offset = 0;
         }
         let line = crate::live_event_line(&buffered);
-        let line = if line.run_id.is_some() {
-            line
-        } else {
-            line.with_run_id(result.run_id.clone())
+        let line = match fallback_run_id {
+            Some(run_id) if line.run_id.is_none() => line.with_run_id(run_id),
+            _ => line,
         };
         push_live_event(state, line);
     }
-    if needs_catch_up {
-        maybe_poll_events_now(runtime, commands);
-    } else if !active {
-        state.active_run_elapsed_secs = runtime
-            .active_timer
-            .elapsed_at(Instant::now())
-            .map(|elapsed| elapsed.as_secs());
-        runtime.active_timer.stop();
-        send_command(
-            commands,
-            ClientCommand::Load {
-                run_id: Some(result.run_id),
-            },
-            state,
-        );
-        start_next_queued(commands, state, runtime);
+    observed_run
+}
+
+fn run_state_from_event(event: &StreamEvent) -> Option<(String, RunStateName)> {
+    match event {
+        StreamEvent::Ledger { record } => {
+            let status = match &record.event {
+                HarnessEvent::RunFinished { .. } => RunStateName::Finished,
+                HarnessEvent::RunFailed { .. } => RunStateName::Failed,
+                _ => RunStateName::Running,
+            };
+            Some((record.event.run_id().to_string(), status))
+        }
+        StreamEvent::AssistantDelta { run_id, .. }
+        | StreamEvent::ApprovalRequested { run_id, .. } => {
+            Some((run_id.clone(), RunStateName::Running))
+        }
+        StreamEvent::Canceled { run_id } => Some((run_id.clone(), RunStateName::Canceled)),
+        StreamEvent::Unknown(_) => None,
     }
 }
 
@@ -874,10 +1138,45 @@ fn maybe_poll_events_now_at(
     commands: &Sender<ClientCommand>,
     now: Instant,
 ) {
+    if runtime.thread.is_some() {
+        poll_thread_events_from_at(runtime, commands, runtime.thread_next_offset, now);
+        return;
+    }
     let Some(run_id) = runtime.active_run_id.clone() else {
         return;
     };
     poll_events_from_at(runtime, commands, run_id, Some(runtime.next_offset), now);
+}
+
+fn poll_thread_events_from(
+    runtime: &mut UiRuntime,
+    commands: &Sender<ClientCommand>,
+    from_offset: Option<u64>,
+) {
+    poll_thread_events_from_at(runtime, commands, from_offset, Instant::now());
+}
+
+fn poll_thread_events_from_at(
+    runtime: &mut UiRuntime,
+    commands: &Sender<ClientCommand>,
+    from_offset: Option<u64>,
+    now: Instant,
+) {
+    let Some(thread) = runtime.thread.as_ref() else {
+        return;
+    };
+    if commands
+        .send(ClientCommand::PollThreadEvents {
+            thread_id: thread.thread_id.clone(),
+            from_offset,
+        })
+        .is_ok()
+    {
+        runtime.poll_in_flight = true;
+        runtime.last_poll = now;
+    } else {
+        runtime.polling = false;
+    }
 }
 
 fn poll_events_from(
@@ -944,6 +1243,140 @@ mod tests {
 
     const OUTER_WATCHDOG: Duration = Duration::from_secs(10);
     const DEADLINE_MARGIN: Duration = Duration::from_millis(100);
+
+    #[test]
+    fn thread_attachment_loads_exact_session_and_polls_from_live_tip() {
+        let harness = ScriptedDaemon::start("thread-attachment", |workspace_id| {
+            vec![
+                hello_reply(workspace_id),
+                ScriptedReply::result(
+                    "thread.status",
+                    json!({
+                        "thread": {
+                            "authority": {
+                                "thread_id": "thread_selected",
+                                "parent_thread_id": null,
+                                "spawning_actor": "local_tui",
+                                "cwd": "/work",
+                                "model": "test-model",
+                                "reasoning_effort": "none",
+                                "approval_policy": "prompt",
+                                "created_at_ms": 42
+                            },
+                            "live": {
+                                "loaded": true,
+                                "current_turn_id": "thread_turn_active"
+                            }
+                        }
+                    }),
+                ),
+                ScriptedReply::result(
+                    "sessions.list",
+                    json!({
+                        "sessions": [{
+                            "session_id": "session_thread_selected",
+                            "run_id": "run_selected",
+                            "status": "running",
+                            "first_question": "inspect the workspace",
+                            "latest_question": "inspect the workspace",
+                            "created_at_ms": 42,
+                            "updated_at_ms": 43,
+                            "ledger_path": "/work/agent.db"
+                        }]
+                    }),
+                ),
+                ScriptedReply::result(
+                    "transcript.read",
+                    json!({
+                        "run_id": "run_selected",
+                        "status": "running",
+                        "final_answer": null,
+                        "transcript": "[turn_selected] user: inspect the workspace\n"
+                    }),
+                ),
+            ]
+        });
+        let attachment = ThreadAttachment {
+            thread_id: "thread_selected".into(),
+            controller_id: "controller_remote".into(),
+        };
+
+        let state = load_connected_thread_state(&harness.config, &attachment).unwrap();
+        assert_eq!(
+            state.selected_session_id.as_deref(),
+            Some("session_thread_selected")
+        );
+        assert_eq!(
+            state.active_run.as_ref().map(|run| run.run_id.as_str()),
+            Some("run_selected")
+        );
+
+        let (commands, received) = mpsc::channel();
+        let mut runtime = UiRuntime::from_state(&state, None);
+        runtime.attach_thread(Some(attachment));
+        maybe_poll_events(&mut runtime, &commands);
+        assert!(matches!(
+            received.recv().unwrap(),
+            ClientCommand::PollThreadEvents {
+                thread_id,
+                from_offset: None,
+            } if thread_id == "thread_selected"
+        ));
+        let requests = harness.finish();
+        assert_eq!(requests[1].method.as_deref(), Some("thread.status"));
+        assert_eq!(
+            requests[1].params.as_ref().unwrap()["thread_id"],
+            "thread_selected"
+        );
+    }
+
+    #[test]
+    fn thread_attachment_uses_controller_turn_and_surfaces_refusal() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = DaemonConnectionConfig {
+            workspace_root: workspace.path().to_owned(),
+            socket_path: workspace.path().join("agent.sock"),
+        };
+        let mut state = connected_state(&config);
+        let mut runtime = UiRuntime::from_state(&state, None);
+        runtime.attach_thread(Some(ThreadAttachment {
+            thread_id: "thread_selected".into(),
+            controller_id: "controller_remote".into(),
+        }));
+        runtime.thread_turn_id = Some("thread_turn_active".into());
+        assert!(matches!(
+            runtime.thread_send_command("observe this".into()).unwrap(),
+            ClientCommand::ThreadSend {
+                thread_id,
+                controller_id,
+                turn_id: Some(turn_id),
+                message,
+            } if thread_id == "thread_selected"
+                && controller_id == "controller_remote"
+                && turn_id == "thread_turn_active"
+                && message == "observe this"
+        ));
+
+        apply_thread_send_result(
+            &mut state,
+            &mut runtime,
+            ThreadSendResult::Rejected {
+                thread_id: "thread_selected".into(),
+                turn_id: Some("thread_turn_active".into()),
+                reason: plato_protocol::ThreadSendRejectedReason::ControllerOwned,
+            },
+        );
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("thread send rejected: controller_owned")
+        );
+        assert!(
+            state
+                .live_events
+                .iter()
+                .any(|event| event.text.contains("controller_owned"))
+        );
+    }
 
     #[test]
     fn two_session_identity_matrix_polls_only_the_selected_running_session() {
@@ -1153,8 +1586,10 @@ mod tests {
         for operation in [
             ClientOperation::RunStart,
             ClientOperation::MessageAppend,
+            ClientOperation::ThreadSend,
             ClientOperation::IssuePrepStart,
             ClientOperation::EventsStream,
+            ClientOperation::ThreadEvents,
             ClientOperation::ApprovalDecide,
             ClientOperation::RunCancel,
         ] {

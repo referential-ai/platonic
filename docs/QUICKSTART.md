@@ -88,15 +88,28 @@ One terminal, same workspace:
 plato
 ```
 
-This attaches to the workspace daemon if one is already running. Otherwise it
-starts the sibling `plato-agentd` detached. Quitting the TUI leaves that daemon
-running. `plato --tui --config plato.toml` is the explicit form when selecting
-a config. During a run, one working row shows elapsed active time and the
-interrupt key. Use `plato --reduced-motion` or set `PLATO_REDUCED_MOTION=1` to
-replace its animated braille marker with a static bullet.
+This ensures the host-scoped `plato-agentd`, asks for the root thread spawn
+decision, and attaches the TUI to that durable thread. Quitting the TUI leaves
+the daemon and thread authority available. `plato --tui --config plato.toml`
+is the explicit form when selecting a config. During a run, one working row
+shows elapsed active time and the interrupt key. Use `plato --reduced-motion`
+or set `PLATO_REDUCED_MOTION=1` to replace its animated braille marker with a
+static bullet.
 The screen is a chat-first transcript with a bottom status rule and composer.
 
-Manual two-terminal mode still works:
+From another terminal in the same workspace, list the durable thread and
+attach another interactive client:
+
+```bash
+plato thread list
+plato --remote <thread-id>
+```
+
+Both clients observe the same live output. Exactly one controller owns an
+active turn; another client is refused until that turn is idle, then can drive
+the next turn. Remote attachment does not create a duplicate thread.
+
+The explicit legacy workspace-daemon mode still works:
 
 ```bash
 plato daemon                                          # terminal A
