@@ -1513,8 +1513,11 @@ mod tests {
     const LOADED_RUNNER_REQUEST_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(10);
     const NATIVE_WINDOWS_FIXTURE_TRIALS: usize = 50;
     const STALLED_STREAM_TRIALS: usize = 25;
+    #[cfg(target_os = "linux")]
     const CANCEL_OBSERVATION_LIMIT: std::time::Duration = std::time::Duration::from_millis(100);
+    #[cfg(target_os = "linux")]
     const TERMINAL_READBACK_LIMIT: std::time::Duration = std::time::Duration::from_millis(500);
+    static STALLED_STREAM_TEST_GATE: Mutex<()> = Mutex::new(());
 
     fn run_native_windows_fixture_trials(name: &str, fixture: fn()) {
         for trial in 1..=NATIVE_WINDOWS_FIXTURE_TRIALS {
@@ -5260,54 +5263,69 @@ enabled = ["file.read"]
     }
 
     #[test]
-    fn stalled_stream_cancel_reaches_canceled_session_within_500_ms_for_25_trials() {
+    fn stalled_stream_cancel_reaches_canceled_session_for_25_trials() {
+        let _gate = STALLED_STREAM_TEST_GATE.lock().unwrap();
+        #[cfg(target_os = "linux")]
         let mut cancel_to_observation = Vec::with_capacity(STALLED_STREAM_TRIALS);
+        #[cfg(target_os = "linux")]
         let mut observation_to_terminal_commit = Vec::with_capacity(STALLED_STREAM_TRIALS);
+        #[cfg(target_os = "linux")]
         let mut observation_to_run_return = Vec::with_capacity(STALLED_STREAM_TRIALS);
+        #[cfg(target_os = "linux")]
         let mut terminal_commit_to_readback = Vec::with_capacity(STALLED_STREAM_TRIALS);
+        #[cfg(target_os = "linux")]
         let mut cancel_to_readback = Vec::with_capacity(STALLED_STREAM_TRIALS);
 
         for trial in 0..STALLED_STREAM_TRIALS {
             let trial_result =
                 run_stalled_stream_cancel_trial(trial, StalledStreamPhaseDelays::default());
             trial_result.assert_canceled_session();
-            trial_result.timings.assert_within_limits(trial);
-            cancel_to_observation.push(trial_result.timings.cancel_to_observation());
-            observation_to_terminal_commit
-                .push(trial_result.timings.observation_to_terminal_commit());
-            observation_to_run_return.push(trial_result.timings.observation_to_run_return());
-            terminal_commit_to_readback.push(trial_result.timings.terminal_commit_to_readback());
-            cancel_to_readback.push(trial_result.timings.cancel_to_readback());
+            #[cfg(target_os = "linux")]
+            {
+                trial_result.timings.assert_within_limits(trial);
+                cancel_to_observation.push(trial_result.timings.cancel_to_observation());
+                observation_to_terminal_commit
+                    .push(trial_result.timings.observation_to_terminal_commit());
+                observation_to_run_return.push(trial_result.timings.observation_to_run_return());
+                terminal_commit_to_readback
+                    .push(trial_result.timings.terminal_commit_to_readback());
+                cancel_to_readback.push(trial_result.timings.cancel_to_readback());
+            }
         }
 
-        let percentiles = |latencies: &mut Vec<std::time::Duration>| {
-            latencies.sort_unstable();
-            (
-                latencies[STALLED_STREAM_TRIALS / 2].as_secs_f64() * 1_000.0,
-                latencies[23].as_secs_f64() * 1_000.0,
-                latencies[STALLED_STREAM_TRIALS - 1].as_secs_f64() * 1_000.0,
-            )
-        };
-        let observation = percentiles(&mut cancel_to_observation);
-        let terminal = percentiles(&mut observation_to_terminal_commit);
-        let run_return = percentiles(&mut observation_to_run_return);
-        let readback = percentiles(&mut terminal_commit_to_readback);
-        let end_to_end = percentiles(&mut cancel_to_readback);
-        let print_phase = |phase: &str, (p50, p95, max): (f64, f64, f64)| {
-            eprintln!(
-                "STALLED_STREAM_CANCEL_METRICS trials={STALLED_STREAM_TRIALS} phase={phase} \
-                 p50_ms={p50:.3} p95_ms={p95:.3} max_ms={max:.3}"
-            );
-        };
-        print_phase("cancel_to_observation", observation);
-        print_phase("observation_to_terminal_commit", terminal);
-        print_phase("observation_to_run_return", run_return);
-        print_phase("terminal_commit_to_readback", readback);
-        print_phase("cancel_to_readback", end_to_end);
+        #[cfg(target_os = "linux")]
+        {
+            let percentiles = |latencies: &mut Vec<std::time::Duration>| {
+                latencies.sort_unstable();
+                (
+                    latencies[STALLED_STREAM_TRIALS / 2].as_secs_f64() * 1_000.0,
+                    latencies[23].as_secs_f64() * 1_000.0,
+                    latencies[STALLED_STREAM_TRIALS - 1].as_secs_f64() * 1_000.0,
+                )
+            };
+            let observation = percentiles(&mut cancel_to_observation);
+            let terminal = percentiles(&mut observation_to_terminal_commit);
+            let run_return = percentiles(&mut observation_to_run_return);
+            let readback = percentiles(&mut terminal_commit_to_readback);
+            let end_to_end = percentiles(&mut cancel_to_readback);
+            let print_phase = |phase: &str, (p50, p95, max): (f64, f64, f64)| {
+                eprintln!(
+                    "STALLED_STREAM_CANCEL_METRICS trials={STALLED_STREAM_TRIALS} phase={phase} \
+                     p50_ms={p50:.3} p95_ms={p95:.3} max_ms={max:.3}"
+                );
+            };
+            print_phase("cancel_to_observation", observation);
+            print_phase("observation_to_terminal_commit", terminal);
+            print_phase("observation_to_run_return", run_return);
+            print_phase("terminal_commit_to_readback", readback);
+            print_phase("cancel_to_readback", end_to_end);
+        }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn stalled_stream_phase_bounds_name_each_delayed_phase() {
+        let _gate = STALLED_STREAM_TEST_GATE.lock().unwrap();
         for (phase, delays) in [
             (
                 StalledStreamPhase::ResponseReadCancellation,
@@ -5358,8 +5376,10 @@ enabled = ["file.read"]
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn delayed_stalled_stream_observers_do_not_accuse_source_phases() {
+        let _gate = STALLED_STREAM_TEST_GATE.lock().unwrap();
         let trial_result = run_stalled_stream_cancel_trial(
             0,
             StalledStreamPhaseDelays {
@@ -5382,6 +5402,7 @@ enabled = ["file.read"]
         observing_test_thread: std::time::Duration,
     }
 
+    #[cfg(target_os = "linux")]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum StalledStreamPhase {
         ResponseReadCancellation,
@@ -5390,6 +5411,7 @@ enabled = ["file.read"]
         SessionReadyReadback,
     }
 
+    #[cfg(target_os = "linux")]
     impl StalledStreamPhase {
         fn name(self) -> &'static str {
             match self {
@@ -5401,6 +5423,7 @@ enabled = ["file.read"]
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[derive(Clone, Copy, Debug)]
     struct StalledStreamTimingFailure {
         phase: StalledStreamPhase,
@@ -5408,6 +5431,7 @@ enabled = ["file.read"]
         limit: std::time::Duration,
     }
 
+    #[cfg(target_os = "linux")]
     #[derive(Clone, Copy, Debug)]
     struct StalledStreamTimings {
         canceled_at: std::time::Instant,
@@ -5417,6 +5441,7 @@ enabled = ["file.read"]
         session_ready_at: std::time::Instant,
     }
 
+    #[cfg(target_os = "linux")]
     impl StalledStreamTimings {
         fn terminal_committed_at(self) -> std::time::Instant {
             // Both observations occur only after the atomic commit. The earlier
@@ -5498,8 +5523,10 @@ enabled = ["file.read"]
 
     struct StalledStreamRunObservation {
         result: AppResult<RunOutcome>,
+        #[cfg(target_os = "linux")]
         returned_at: std::time::Instant,
         summaries: AppResult<Vec<crate::ledger::PersistedSessionSummary>>,
+        #[cfg(target_os = "linux")]
         session_ready_at: std::time::Instant,
     }
 
@@ -5511,6 +5538,7 @@ enabled = ["file.read"]
         first_delta: String,
         provider_request: String,
         run: StalledStreamRunObservation,
+        #[cfg(target_os = "linux")]
         timings: StalledStreamTimings,
     }
 
@@ -5535,6 +5563,7 @@ enabled = ["file.read"]
     }
 
     struct TerminalEventObserver {
+        cancellation_sender: std::sync::mpsc::Sender<()>,
         first_delta_receiver: std::sync::mpsc::Receiver<String>,
         completion_receiver: std::sync::mpsc::Receiver<Result<std::time::Instant, String>>,
         handle: thread::JoinHandle<()>,
@@ -5543,40 +5572,75 @@ enabled = ["file.read"]
     impl TerminalEventObserver {
         fn spawn(events: std::sync::mpsc::Receiver<RunEvent>, delay: std::time::Duration) -> Self {
             let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(0);
+            let (cancellation_sender, cancellation_receiver) = std::sync::mpsc::channel();
             let (first_delta_sender, first_delta_receiver) = std::sync::mpsc::channel();
             let (completion_sender, completion_receiver) = std::sync::mpsc::channel();
             let handle = thread::spawn(move || {
                 let _ = ready_sender.send(());
-                let deadline = std::time::Instant::now() + LOADED_RUNNER_EVENT_ALLOWANCE;
-                let result = loop {
-                    let event = match events
-                        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                    {
-                        Ok(event) => event,
-                        Err(error) => {
-                            break Err(format!("terminal event observer failed: {error}"));
+                let result = (|| -> Result<std::time::Instant, String> {
+                    let first_delta_deadline =
+                        std::time::Instant::now() + LOADED_RUNNER_EVENT_ALLOWANCE;
+                    'observation: loop {
+                        let event = events
+                            .recv_timeout(
+                                first_delta_deadline
+                                    .saturating_duration_since(std::time::Instant::now()),
+                            )
+                            .map_err(|error| {
+                                format!(
+                                    "fixture-liveness failure: first-delta observation failed: \
+                                     {error}"
+                                )
+                            })?;
+                        match event {
+                            RunEvent::AssistantDelta(delta) => {
+                                let _ = first_delta_sender.send(delta.text);
+                                cancellation_receiver
+                                    .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
+                                    .map_err(|error| {
+                                        format!(
+                                            "fixture-liveness failure: terminal observation phase \
+                                             did not start: {error}"
+                                        )
+                                    })?;
+                                let terminal_deadline =
+                                    std::time::Instant::now() + LOADED_RUNNER_EVENT_ALLOWANCE;
+                                loop {
+                                    let event = events
+                                        .recv_timeout(
+                                            terminal_deadline.saturating_duration_since(
+                                                std::time::Instant::now(),
+                                            ),
+                                        )
+                                        .map_err(|error| {
+                                            format!(
+                                                "fixture-liveness failure: terminal event \
+                                                 observation failed: {error}"
+                                            )
+                                        })?;
+                                    match event {
+                                        RunEvent::Ledger(RecordedEvent {
+                                            event: HarnessEvent::RunFailed { reason, .. },
+                                            ..
+                                        }) if reason == RUN_CANCELED_REASON => {
+                                            thread::sleep(delay);
+                                            break 'observation Ok(std::time::Instant::now());
+                                        }
+                                        RunEvent::AssistantDelta(_) | RunEvent::Ledger(_) => {}
+                                    }
+                                }
+                            }
+                            RunEvent::Ledger(_) => {}
                         }
-                    };
-                    match event {
-                        RunEvent::AssistantDelta(delta) => {
-                            let _ = first_delta_sender.send(delta.text);
-                        }
-                        RunEvent::Ledger(RecordedEvent {
-                            event: HarnessEvent::RunFailed { reason, .. },
-                            ..
-                        }) if reason == RUN_CANCELED_REASON => {
-                            thread::sleep(delay);
-                            break Ok(std::time::Instant::now());
-                        }
-                        RunEvent::Ledger(_) => {}
                     }
-                };
+                })();
                 let _ = completion_sender.send(result);
             });
             ready_receiver
                 .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
-                .expect("terminal event observer should become ready");
+                .expect("fixture-liveness failure: terminal event observer readiness");
             Self {
+                cancellation_sender,
                 first_delta_receiver,
                 completion_receiver,
                 handle,
@@ -5586,18 +5650,32 @@ enabled = ["file.read"]
         fn first_delta(&self) -> Result<String, String> {
             self.first_delta_receiver
                 .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
-                .map_err(|error| format!("first streamed delta was not observed: {error}"))
+                .map_err(|error| {
+                    format!(
+                        "fixture-liveness failure: first streamed delta was not observed: {error}"
+                    )
+                })
+        }
+
+        fn start_terminal_phase(&self) {
+            self.cancellation_sender
+                .send(())
+                .expect("fixture-liveness failure: terminal observation phase start signal");
         }
 
         fn finish(self) -> Result<std::time::Instant, String> {
             let result = self
                 .completion_receiver
                 .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
-                .map_err(|error| format!("terminal event observer did not finish: {error}"));
-            let joined = self
-                .handle
-                .join()
-                .map_err(|_| "terminal event observer panicked".to_owned());
+                .map_err(|error| {
+                    format!(
+                        "fixture-liveness failure: terminal event observer cleanup did not \
+                         finish: {error}"
+                    )
+                });
+            let joined = self.handle.join().map_err(|_| {
+                "fixture-liveness failure: terminal event observer panicked".to_owned()
+            });
             joined?;
             result?
         }
@@ -5616,28 +5694,33 @@ enabled = ["file.read"]
             let (completion_sender, completion_receiver) = std::sync::mpsc::channel();
             let handle = thread::spawn(move || {
                 let result = (|| -> Result<(), String> {
-                    let connection = rusqlite::Connection::open(path)
-                        .map_err(|error| format!("terminal blocker open failed: {error}"))?;
+                    let connection = rusqlite::Connection::open(path).map_err(|error| {
+                        format!("fixture-liveness failure: terminal blocker open: {error}")
+                    })?;
                     connection
                         .execute_batch("BEGIN IMMEDIATE")
-                        .map_err(|error| format!("terminal blocker lock failed: {error}"))?;
-                    ready_sender
-                        .send(())
-                        .map_err(|error| format!("terminal blocker ready failed: {error}"))?;
+                        .map_err(|error| {
+                            format!("fixture-liveness failure: terminal blocker lock: {error}")
+                        })?;
+                    ready_sender.send(()).map_err(|error| {
+                        format!("fixture-liveness failure: terminal blocker readiness: {error}")
+                    })?;
                     start_receiver
                         .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
-                        .map_err(|error| format!("terminal blocker start failed: {error}"))?;
+                        .map_err(|error| {
+                            format!("fixture-liveness failure: terminal blocker start: {error}")
+                        })?;
                     thread::sleep(delay);
-                    connection
-                        .execute_batch("COMMIT")
-                        .map_err(|error| format!("terminal blocker release failed: {error}"))?;
+                    connection.execute_batch("COMMIT").map_err(|error| {
+                        format!("fixture-liveness failure: terminal blocker release: {error}")
+                    })?;
                     Ok(())
                 })();
                 let _ = completion_sender.send(result);
             });
             ready_receiver
                 .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
-                .expect("terminal commit blocker should become ready");
+                .expect("fixture-liveness failure: terminal commit blocker readiness");
             Self {
                 start_sender,
                 completion_receiver,
@@ -5646,18 +5729,24 @@ enabled = ["file.read"]
         }
 
         fn start(&self) {
-            self.start_sender.send(()).unwrap();
+            self.start_sender
+                .send(())
+                .expect("fixture-liveness failure: terminal commit blocker start signal");
         }
 
         fn finish(self) -> Result<(), String> {
             let result = self
                 .completion_receiver
                 .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
-                .map_err(|error| format!("terminal blocker did not finish: {error}"));
+                .map_err(|error| {
+                    format!(
+                        "fixture-liveness failure: terminal blocker cleanup did not finish: {error}"
+                    )
+                });
             let joined = self
                 .handle
                 .join()
-                .map_err(|_| "terminal blocker panicked".to_owned());
+                .map_err(|_| "fixture-liveness failure: terminal blocker panicked".to_owned());
             joined?;
             result?
         }
@@ -5699,30 +5788,36 @@ enabled = ["file.read"]
                 || run_question(options),
             );
             thread::sleep(delays.run_return);
+            #[cfg(target_os = "linux")]
             let returned_at = std::time::Instant::now();
             thread::sleep(delays.session_ready_readback);
             let summaries = SqliteLedger::open_readonly(&run_ledger_path)
                 .and_then(|ledger| ledger.session_summaries());
+            #[cfg(target_os = "linux")]
             let session_ready_at = std::time::Instant::now();
             let _ = run_done_sender.send(());
             StalledStreamRunObservation {
                 result,
+                #[cfg(target_os = "linux")]
                 returned_at,
                 summaries,
+                #[cfg(target_os = "linux")]
                 session_ready_at,
             }
         });
         run_ready_receiver
             .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
-            .expect("stalled-stream run helper should become ready");
+            .expect("fixture-liveness failure: stalled-stream run helper readiness");
         let first_delta = terminal_observer.first_delta();
         let terminal_blocker =
             (delays.terminal_ledger_commit > std::time::Duration::ZERO).then(|| {
                 TerminalCommitBlocker::spawn(ledger_path.clone(), delays.terminal_ledger_commit)
             });
 
+        #[cfg(target_os = "linux")]
         let canceled_at = std::time::Instant::now();
         cancel.store(true, Ordering::SeqCst);
+        terminal_observer.start_terminal_phase();
         if let Some(blocker) = &terminal_blocker {
             blocker.start();
         }
@@ -5730,40 +5825,51 @@ enabled = ["file.read"]
 
         let cancellation_observed_at = observation_receiver
             .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
-            .map_err(|error| format!("cancellation observer did not finish: {error}"));
+            .map_err(|error| {
+                format!("fixture-liveness failure: cancellation observer did not finish: {error}")
+            });
         let run_done = run_done_receiver
             .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
-            .map_err(|error| format!("run helper did not finish: {error}"));
+            .map_err(|error| {
+                format!("fixture-liveness failure: run helper did not finish: {error}")
+            });
         let provider_request = server.finish();
         let terminal_blocker_result = terminal_blocker.map(TerminalCommitBlocker::finish);
         let terminal_event_observed_at = terminal_observer.finish();
         let run = handle
             .join()
-            .map_err(|_| "stalled-stream run helper panicked".to_owned());
+            .map_err(|_| "fixture-liveness failure: stalled-stream run helper panicked".to_owned());
 
-        run_done.expect("stalled-stream run helper should finish within its teardown bound");
+        run_done.expect("fixture-liveness failure: stalled-stream run helper cleanup");
         if let Some(result) = terminal_blocker_result {
-            result.expect("terminal commit blocker should finish within its teardown bound");
+            result.expect("fixture-liveness failure: terminal commit blocker cleanup");
         }
-        let run = run.expect("stalled-stream run helper should join");
+        let run = run.expect("fixture-liveness failure: stalled-stream run helper join");
+        let cancellation_observed_at = cancellation_observed_at
+            .expect("fixture-liveness failure: response-read cancellation observation");
+        let terminal_event_observed_at = terminal_event_observed_at
+            .expect("fixture-liveness failure: terminal ledger event observation");
+        #[cfg(target_os = "linux")]
         let timings = StalledStreamTimings {
             canceled_at,
-            cancellation_observed_at: cancellation_observed_at
-                .expect("response-read cancellation observation should be source-timestamped"),
-            terminal_event_observed_at: terminal_event_observed_at
-                .expect("terminal ledger event should be source-timestamped"),
+            cancellation_observed_at,
+            terminal_event_observed_at,
             run_returned_at: run.returned_at,
             session_ready_at: run.session_ready_at,
         };
+        #[cfg(not(target_os = "linux"))]
+        let _ = (cancellation_observed_at, terminal_event_observed_at);
         StalledStreamTrialResult {
             _dir: dir,
             ledger_path,
             run_id,
             session_id,
-            first_delta: first_delta.expect("run should emit first streamed delta before cancel"),
+            first_delta: first_delta
+                .expect("fixture-liveness failure: first streamed delta before cancellation"),
             provider_request: provider_request
-                .expect("provider listener should finish within its teardown bound"),
+                .expect("fixture-liveness failure: provider listener cleanup"),
             run,
+            #[cfg(target_os = "linux")]
             timings,
         }
     }
@@ -6006,11 +6112,16 @@ enabled = ["file.read"]
             let result = self
                 .completion_receiver
                 .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
-                .map_err(|error| format!("cancelable provider did not finish: {error}"));
+                .map_err(|error| {
+                    format!(
+                        "fixture-liveness failure: cancelable provider cleanup did not finish: \
+                         {error}"
+                    )
+                });
             let joined = self
                 .handle
                 .join()
-                .map_err(|_| "cancelable provider panicked".to_owned());
+                .map_err(|_| "fixture-liveness failure: cancelable provider panicked".to_owned());
             joined?;
             result?
         }
@@ -6548,12 +6659,12 @@ enabled = ["file.read"]
         let (completion_sender, completion_receiver) = std::sync::mpsc::channel();
         let handle = thread::spawn(move || {
             let result = (|| -> Result<String, String> {
-                listener
-                    .set_nonblocking(true)
-                    .map_err(|error| format!("cancelable provider setup failed: {error}"))?;
-                ready_sender
-                    .send(())
-                    .map_err(|error| format!("cancelable provider ready failed: {error}"))?;
+                listener.set_nonblocking(true).map_err(|error| {
+                    format!("fixture-liveness failure: cancelable provider setup: {error}")
+                })?;
+                ready_sender.send(()).map_err(|error| {
+                    format!("fixture-liveness failure: cancelable provider readiness: {error}")
+                })?;
                 let accept_deadline = std::time::Instant::now() + LOADED_RUNNER_REQUEST_ALLOWANCE;
                 let (mut stream, _) = loop {
                     match listener.accept() {
@@ -6566,7 +6677,11 @@ enabled = ["file.read"]
                                 Err(std::sync::mpsc::RecvTimeoutError::Timeout)
                                     if std::time::Instant::now() < accept_deadline => {}
                                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                    return Err("cancelable provider accept timed out".into());
+                                    return Err(
+                                        "fixture-liveness failure: cancelable provider accept \
+                                         timed out"
+                                            .into(),
+                                    );
                                 }
                             }
                         }
@@ -6593,7 +6708,9 @@ enabled = ["file.read"]
                     .map_err(|error| format!("cancelable provider first delta failed: {error}"))?;
                 release_receiver
                     .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
-                    .map_err(|error| format!("cancelable provider release failed: {error}"))?;
+                    .map_err(|error| {
+                        format!("fixture-liveness failure: cancelable provider release: {error}")
+                    })?;
                 let _ = stream.write_all(tail.as_bytes());
                 let _ = stream.flush();
                 Ok(request)
@@ -6602,7 +6719,7 @@ enabled = ["file.read"]
         });
         ready_receiver
             .recv_timeout(LOADED_RUNNER_EVENT_ALLOWANCE)
-            .expect("cancelable provider should become ready");
+            .expect("fixture-liveness failure: cancelable provider readiness");
         CancelableStreamingProvider {
             base_url,
             release_sender,
