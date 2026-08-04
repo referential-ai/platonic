@@ -386,7 +386,7 @@ jobs:
           $upgradeConfig = Join-Path $env:RUNNER_TEMP "tauri-upgrade.json"
           [IO.File]::WriteAllText(
             $upgradeConfig,
-            '{"version":"0.1.1"}',
+            '{"version":"0.2.1"}',
             [Text.UTF8Encoding]::new($false)
           )
           npx tauri build --target x86_64-pc-windows-msvc --bundles nsis `
