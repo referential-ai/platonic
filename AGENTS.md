@@ -32,6 +32,8 @@ technical identities remain unchanged.
 
 ## Verification
 
+- Unix external-daemon proofs use a pre-absent, issue-named short `/tmp/p<issue>` root with mode `0700`; derive and print the final socket path before spawn and require its byte length to be below 100; readiness uses `-S` followed by the existing bounded client/status/hello readback, never `-s`; preserve the original timeouts and assertions; clean up only the exact owned tmux session, process/group, socket, state, and root, never a broad `/tmp` scan.
+
 ```bash
 cargo fmt --check
 cargo test --locked
