@@ -6,10 +6,40 @@ Everything below is copy-pasteable. Companion docs: [`../README.md`](../README.m
 
 ```bash
 cd ~/projects/platonic-workspace/plato-agent
-cargo build --locked                      # builds all binaries
+
+head=$(git rev-parse --verify 'HEAD^{commit}')
+proof_root=$(mktemp -d)
+artifact="$proof_root/plato-agent-$head.tar.gz"
+source_root="$proof_root/source"
+prefix="$proof_root/install"
+
+git archive --format=tar.gz --prefix="plato-agent-$head/" \
+  --output "$artifact" "$head"
+sha256sum "$artifact"
+
+mkdir "$source_root"
+tar -xzf "$artifact" -C "$source_root"
+test ! -e "$prefix"
+PLATO_BUILD_IDENTITY="0.2.0 $head $(date -u +%Y-%m-%d)" \
+  CARGO_TARGET_DIR="$proof_root/target" \
+  cargo install --locked --root "$prefix" \
+    --path "$source_root/plato-agent-$head"
+
+export PATH="$prefix/bin:$PATH"
+for binary in plato plato-agentd plato-tui; do
+  "$binary" --version
+done
+for binary in plato plato-agentd plato-tui plato-gateway-discord; do
+  "$binary" --help >/dev/null
+done
+
 export OPENROUTER_API_KEY="$(cat /path/to/your/openrouter-key)"
-export PATH="$PWD/target/debug:$PATH"     # so the binaries just work in this shell
 ```
+
+The tarball is a complete source snapshot of the exact commit printed in its
+name. Installation builds only from its extracted workspace and writes the
+four binaries to the fresh prefix under `$proof_root`; it does not use
+`cargo run`, publish crates, or change an existing installation.
 
 `plato` works without a local config when `OPENROUTER_API_KEY` is exported.
 Config is discovered in this order: `--config`, `PLATO_CONFIG`, `./plato.toml`,

@@ -2165,7 +2165,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plato-daemon-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "interprocess",
  "plato-protocol",
@@ -2180,7 +2180,7 @@ dependencies = [
 
 [[package]]
 name = "plato-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "interprocess",
  "plato-daemon-client",
@@ -2198,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "plato-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "platonic-core",
  "serde",
