@@ -1672,7 +1672,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plato-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "ctrlc",
@@ -1705,7 +1705,7 @@ dependencies = [
 
 [[package]]
 name = "plato-audio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cpal",
  "hound",
@@ -1722,7 +1722,7 @@ dependencies = [
 
 [[package]]
 name = "plato-daemon-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "interprocess",
  "plato-protocol",
@@ -1739,7 +1739,7 @@ dependencies = [
 
 [[package]]
 name = "plato-gateway-discord"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "plato-daemon-client",
  "plato-protocol",
@@ -1754,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "plato-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "platonic-core",
  "serde",
@@ -1764,7 +1764,7 @@ dependencies = [
 
 [[package]]
 name = "plato-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossterm",
  "plato-daemon-client",

@@ -11,7 +11,7 @@ resolver = "3"
 
 [package]
 name = "plato-agent"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 publish = ["crates-io"]
@@ -46,11 +46,11 @@ doc = false
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 html2text = "0.17.1"
-plato-audio = { version = "0.1.0", path = "crates/plato-audio" }
-plato-daemon-client = { version = "0.1.0", path = "crates/plato-daemon-client" }
-plato-gateway-discord = { version = "0.1.0", path = "crates/plato-gateway-discord" }
-plato-protocol = { version = "0.1.0", path = "crates/plato-protocol" }
-plato-tui = { version = "0.1.0", path = "crates/plato-tui" }
+plato-audio = { version = "0.2.0", path = "crates/plato-audio" }
+plato-daemon-client = { version = "0.2.0", path = "crates/plato-daemon-client" }
+plato-gateway-discord = { version = "0.2.0", path = "crates/plato-gateway-discord" }
+plato-protocol = { version = "0.2.0", path = "crates/plato-protocol" }
+plato-tui = { version = "0.2.0", path = "crates/plato-tui" }
 platonic-core = "0.3.1"
 rusqlite = { version = "0.39", features = ["bundled"] }
 rustix = { version = "1", features = ["event", "fs", "net", "process", "time"] }

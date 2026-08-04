@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - Unreleased
 
 - Align current copy with the workspace [naming authority](https://github.com/referential-ai/platonic-workspace/blob/main/product/branding.md),
   preserving all technical identifiers.
