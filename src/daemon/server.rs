@@ -1382,7 +1382,8 @@ mod tests {
                 "thread.list",
                 "thread.status",
                 "thread.send",
-                "thread.events"
+                "thread.events",
+                "thread.stop"
             ])
         );
     }

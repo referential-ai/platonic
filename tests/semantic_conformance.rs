@@ -5,9 +5,9 @@ use plato_agent::{
         protocol::{
             BufferedThreadEvent, CAPABILITY_THREAD_EVENTS, CAPABILITY_THREAD_LIST,
             CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_SPAWN, CAPABILITY_THREAD_STATUS,
-            ERROR_NOT_FOUND, ReasoningEffort, RunStateName, ShutdownIfIdleResultName, StreamEvent,
-            ThreadApprovalPolicy, ThreadSendRejectedReason, ThreadSendResult, ThreadSpawnDecision,
-            ThreadSpawnResult,
+            CAPABILITY_THREAD_STOP, ERROR_NOT_FOUND, ReasoningEffort, RunStateName,
+            ShutdownIfIdleResultName, StreamEvent, ThreadApprovalPolicy, ThreadSendRejectedReason,
+            ThreadSendResult, ThreadSpawnDecision, ThreadSpawnResult, ThreadStopResult,
         },
     },
     ledger::SqliteLedger,
@@ -366,6 +366,7 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
         CAPABILITY_THREAD_SPAWN,
         CAPABILITY_THREAD_LIST,
         CAPABILITY_THREAD_STATUS,
+        CAPABILITY_THREAD_STOP,
     ] {
         assert!(hello.capabilities.iter().any(|served| served == capability));
     }
@@ -421,6 +422,10 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     assert!(root.authority.created_at_ms > 0);
     assert!(root.live.loaded);
     assert_eq!(root.live.current_turn_id, None);
+    assert_eq!(
+        root.live.last_activity_at_ms,
+        Some(root.authority.created_at_ms)
+    );
 
     let child = match client
         .thread_spawn_start(
@@ -445,6 +450,10 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     );
     assert_eq!(child.authority.spawning_actor, "yolo");
     assert!(child.live.loaded);
+    assert_eq!(
+        child.live.last_activity_at_ms,
+        Some(child.authority.created_at_ms)
+    );
 
     let listed = client.thread_list().unwrap().threads;
     assert_eq!(listed.len(), 2);
@@ -456,6 +465,50 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
             .thread,
         child
     );
+    let root_stop = client
+        .thread_stop(root_thread_id.clone(), "semantic_fixture".into())
+        .unwrap();
+    let root_stopped_at_ms = match root_stop {
+        ThreadStopResult::Stopped {
+            thread_id,
+            stopped_turn_id,
+            stopped_at_ms,
+        } => {
+            assert_eq!(thread_id, root_thread_id);
+            assert_eq!(stopped_turn_id, None);
+            stopped_at_ms
+        }
+        unexpected => panic!("expected stopped root, got {unexpected:?}"),
+    };
+    let listed = client.thread_list().unwrap().threads;
+    let stopped_root = listed
+        .iter()
+        .find(|thread| thread.authority.thread_id == root_thread_id)
+        .unwrap();
+    let orphaned_child = listed
+        .iter()
+        .find(|thread| thread.authority.thread_id == child.authority.thread_id)
+        .unwrap();
+    assert!(!stopped_root.live.loaded);
+    assert_eq!(stopped_root.live.last_activity_at_ms, None);
+    assert!(orphaned_child.live.loaded);
+    assert_eq!(orphaned_child.authority, child.authority);
+    let connection = rusqlite::Connection::open(&proof.ledger_path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT actor, stopped_turn_id, occurred_at_ms FROM thread_stops WHERE thread_id = ?1",
+                [&root_thread_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)?))
+            )
+            .unwrap(),
+        (
+            "semantic_fixture".into(),
+            None,
+            i64::try_from(root_stopped_at_ms).unwrap()
+        )
+    );
+    drop(connection);
     host.stop(client);
 
     let restarted = ProofDaemon::start_host(&proof);
@@ -463,12 +516,38 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     let listed = restarted_client.thread_list().unwrap().threads;
     assert_eq!(listed.len(), 2);
     assert!(listed.iter().all(|thread| !thread.live.loaded));
+    assert!(
+        listed
+            .iter()
+            .all(|thread| thread.live.last_activity_at_ms.is_none())
+    );
     let readback = restarted_client
         .thread_status(child.authority.thread_id.clone())
         .unwrap()
         .thread;
     assert_eq!(readback.authority, child.authority);
     assert!(!readback.live.loaded);
+    let child_stop = restarted_client
+        .thread_stop(child.authority.thread_id.clone(), "restart_fixture".into())
+        .unwrap();
+    let child_stopped_at_ms = match child_stop {
+        ThreadStopResult::Stopped {
+            stopped_at_ms,
+            stopped_turn_id: None,
+            ..
+        } => stopped_at_ms,
+        unexpected => panic!("expected stopped unloaded child, got {unexpected:?}"),
+    };
+    assert_eq!(
+        restarted_client
+            .thread_stop(child.authority.thread_id.clone(), "retry_fixture".into())
+            .unwrap(),
+        ThreadStopResult::AlreadyStopped {
+            thread_id: child.authority.thread_id.clone(),
+            stopped_turn_id: None,
+            stopped_at_ms: child_stopped_at_ms,
+        }
+    );
     let stale_parent = restarted_client
         .thread_spawn_start(
             Some(root_thread_id),

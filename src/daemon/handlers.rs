@@ -12,21 +12,22 @@ use crate::{
             ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
             ERROR_SESSIONS_LIST_FAILED, ERROR_THREAD_AUTHORITY_EXCEEDED,
             ERROR_THREAD_EVENTS_FAILED, ERROR_THREAD_LIST_FAILED, ERROR_THREAD_SEND_FAILED,
-            ERROR_THREAD_SPAWN_FAILED, ERROR_THREAD_STATUS_FAILED, ERROR_UNSUPPORTED_METHOD,
-            ERROR_WORKSPACE_MISMATCH, Envelope, EventsStreamParams, EventsStreamResult,
-            HelloParams, HelloResult, IssuePrepResult, IssuePrepStartParams, IssuePrepStartResult,
-            MessageAppendParams, ModelIdentityStatus, RunCancelParams, RunStartParams,
-            RunStartResult, RunStateName, SessionSummary, SessionsListResult, ShutdownIfIdleResult,
-            ShutdownIfIdleResultName, StreamEvent, ThreadApprovalPolicy, ThreadEventsParams,
-            ThreadListResult, ThreadSendParams, ThreadSpawnDecision, ThreadSpawnParams,
-            ThreadSpawnResult, ThreadStatus, ThreadStatusParams, ThreadStatusResult,
-            TranscriptReadParams, TranscriptReadResult, TypedRun, TypedTranscript,
-            TypedTranscriptEntry, decode_request,
+            ERROR_THREAD_SPAWN_FAILED, ERROR_THREAD_STATUS_FAILED, ERROR_THREAD_STOP_FAILED,
+            ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH, Envelope, EventsStreamParams,
+            EventsStreamResult, HelloParams, HelloResult, IssuePrepResult, IssuePrepStartParams,
+            IssuePrepStartResult, MessageAppendParams, ModelIdentityStatus, RunCancelParams,
+            RunStartParams, RunStartResult, RunStateName, SessionSummary, SessionsListResult,
+            ShutdownIfIdleResult, ShutdownIfIdleResultName, ThreadApprovalPolicy,
+            ThreadEventsParams, ThreadListResult, ThreadSendParams, ThreadSpawnDecision,
+            ThreadSpawnParams, ThreadSpawnResult, ThreadStatus, ThreadStatusParams,
+            ThreadStatusResult, ThreadStopParams, ThreadStopResult, TranscriptReadParams,
+            TranscriptReadResult, TypedRun, TypedTranscript, TypedTranscriptEntry, decode_request,
         },
         runtime::{
             DaemonRuntime, IssuePrepAdmissionError, RunAdmissionError, RunRecord,
-            ShutdownIfIdleDecision, ThreadEventsError, ThreadSendAdmission,
-            ThreadSpawnAdmissionError, ThreadSpawnClaimError, ThreadTurnBinding, approval_handler,
+            ShutdownIfIdleDecision, ThreadEventsError, ThreadRunBindError, ThreadSendAdmission,
+            ThreadSpawnAdmissionError, ThreadSpawnClaimError, ThreadStopError, ThreadTurnBinding,
+            approval_handler,
         },
     },
     issue_prep::{IssuePrepOptions, IssuePrepOutcome, run_issue_prep},
@@ -37,8 +38,8 @@ use crate::{
     replay::{format_readback, format_session_readback},
     thread_authority::{
         THREAD_SPAWN_APPROVAL_REASON, ThreadAuthorityDraft, ThreadAuthorityError,
-        ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, new_spawn_id, new_thread_turn_id,
-        now_ms, thread_spawn_effect, validate_child_authority,
+        ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, ThreadStopRecord, new_spawn_id,
+        new_thread_turn_id, now_ms, thread_spawn_effect, validate_child_authority,
     },
     tool_catalog::SHELL_EXEC,
 };
@@ -49,6 +50,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering, mpsc},
     thread,
+    time::Duration,
 };
 
 const DEFAULT_EVENT_LIMIT: usize = 64;
@@ -56,6 +58,7 @@ const MAX_EVENT_LIMIT: usize = 128;
 const MAX_THREAD_EVENT_WAIT_MS: u64 = 1_000;
 const LATEST_QUESTION_MAX_CHARS: usize = 120;
 const EVENT_COLLECTOR_PANIC: &str = "daemon event collector panicked";
+const THREAD_STOP_WAIT: Duration = Duration::from_secs(10);
 
 pub(super) fn handle_line(runtime: &DaemonRuntime, line: &str) -> Envelope {
     match decode_request(line) {
@@ -97,6 +100,9 @@ pub(super) fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Enve
         }
         Some("thread.events") => {
             handle_with_params(runtime, request, "thread.events", handle_thread_events)
+        }
+        Some("thread.stop") => {
+            handle_with_params(runtime, request, "thread.stop", handle_thread_stop)
         }
         Some("daemon.status") => {
             handle_with_params(runtime, request, "daemon.status", handle_daemon_status)
@@ -695,6 +701,25 @@ fn handle_thread_send(
             );
         }
     };
+    match crate::ledger::default_thread_stop(&runtime.paths.default_ledger(), &params.thread_id) {
+        Ok(Some(_)) => {
+            return Envelope::error(
+                request.id,
+                Some("thread.send".into()),
+                ERROR_NOT_FOUND,
+                format!("thread not found: {}", params.thread_id),
+            );
+        }
+        Ok(None) => {}
+        Err(_) => {
+            return Envelope::error(
+                request.id,
+                Some("thread.send".into()),
+                ERROR_THREAD_SEND_FAILED,
+                "thread stop readback failed",
+            );
+        }
+    }
     let admission = runtime.send_thread(
         &params.thread_id,
         params.controller_id,
@@ -705,6 +730,14 @@ fn handle_thread_send(
     let (receipt, turn) = match admission {
         ThreadSendAdmission::ShuttingDown => {
             return shutting_down_response(request.id, "thread.send");
+        }
+        ThreadSendAdmission::Stopped => {
+            return Envelope::error(
+                request.id,
+                Some("thread.send".into()),
+                ERROR_NOT_FOUND,
+                format!("thread not found: {}", params.thread_id),
+            );
         }
         ThreadSendAdmission::Started { receipt, turn } => (receipt, turn),
         ThreadSendAdmission::Steered { receipt } | ThreadSendAdmission::Rejected { receipt } => {
@@ -824,6 +857,25 @@ fn handle_thread_events(
             );
         }
     }
+    match crate::ledger::default_thread_stop(&runtime.paths.default_ledger(), &thread_id) {
+        Ok(Some(_)) => {
+            return Envelope::error(
+                request.id,
+                Some("thread.events".into()),
+                ERROR_NOT_FOUND,
+                format!("thread not found: {thread_id}"),
+            );
+        }
+        Ok(None) => {}
+        Err(_) => {
+            return Envelope::error(
+                request.id,
+                Some("thread.events".into()),
+                ERROR_THREAD_EVENTS_FAILED,
+                "thread stop readback failed",
+            );
+        }
+    }
     match runtime.thread_events(
         &thread_id,
         from_offset,
@@ -839,6 +891,167 @@ fn handle_thread_events(
                 "requested thread events were evicted; first available offset is {first_offset}"
             ),
         ),
+        Err(ThreadEventsError::Stopped) => Envelope::error(
+            request.id,
+            Some("thread.events".into()),
+            ERROR_NOT_FOUND,
+            format!("thread not found: {thread_id}"),
+        ),
+    }
+}
+
+fn handle_thread_stop(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: ThreadStopParams,
+) -> Envelope {
+    let mut ledger = match SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()) {
+        Ok(ledger) => ledger,
+        Err(_) => {
+            return Envelope::error(
+                request.id,
+                Some("thread.stop".into()),
+                ERROR_THREAD_STOP_FAILED,
+                "thread stop ledger could not be opened",
+            );
+        }
+    };
+    let authority = match ledger.thread_authority(&params.thread_id) {
+        Ok(Some(authority)) => authority,
+        Ok(None) => {
+            return Envelope::error(
+                request.id,
+                Some("thread.stop".into()),
+                ERROR_NOT_FOUND,
+                format!("thread not found: {}", params.thread_id),
+            );
+        }
+        Err(_) => {
+            return Envelope::error(
+                request.id,
+                Some("thread.stop".into()),
+                ERROR_THREAD_STOP_FAILED,
+                "thread stop authority readback failed",
+            );
+        }
+    };
+    let validated =
+        match ThreadStopRecord::new(authority.thread_id.clone(), params.actor, None, now_ms()) {
+            Ok(record) => record,
+            Err(error) => {
+                return Envelope::error(
+                    request.id,
+                    Some("thread.stop".into()),
+                    ERROR_MALFORMED_REQUEST,
+                    error.to_string(),
+                );
+            }
+        };
+    match ledger.thread_stop(&authority.thread_id) {
+        Ok(Some(stop)) => {
+            return Envelope::response_from(
+                request.id,
+                Some("thread.stop".into()),
+                thread_stop_result(stop, true),
+            );
+        }
+        Ok(None) => {}
+        Err(_) => {
+            return Envelope::error(
+                request.id,
+                Some("thread.stop".into()),
+                ERROR_THREAD_STOP_FAILED,
+                "thread stop readback failed",
+            );
+        }
+    }
+
+    let target = match runtime.begin_thread_stop(&authority.thread_id) {
+        Ok(target) => target,
+        Err(ThreadStopError::InProgress) => {
+            return Envelope::error(
+                request.id,
+                Some("thread.stop".into()),
+                ERROR_OVERLOAD,
+                format!(
+                    "thread stop is already in progress: {}",
+                    authority.thread_id
+                ),
+            );
+        }
+        Err(ThreadStopError::AlreadyStopped) => {
+            return match ledger.thread_stop(&authority.thread_id) {
+                Ok(Some(stop)) => Envelope::response_from(
+                    request.id,
+                    Some("thread.stop".into()),
+                    thread_stop_result(stop, true),
+                ),
+                _ => Envelope::error(
+                    request.id,
+                    Some("thread.stop".into()),
+                    ERROR_THREAD_STOP_FAILED,
+                    "thread stopped without a durable stop record",
+                ),
+            };
+        }
+    };
+
+    if let Some(run) = target.run.as_ref() {
+        let _ = run.request_cancel();
+        if !run.wait_for_terminal(THREAD_STOP_WAIT) {
+            runtime.abort_thread_stop(&authority.thread_id);
+            return Envelope::error(
+                request.id,
+                Some("thread.stop".into()),
+                ERROR_THREAD_STOP_FAILED,
+                format!(
+                    "thread child did not reach zero residual within the stop bound: {}",
+                    authority.thread_id
+                ),
+            );
+        }
+    }
+
+    let stop = ThreadStopRecord::new(
+        authority.thread_id.clone(),
+        validated.actor,
+        target.turn_id,
+        now_ms(),
+    )
+    .expect("thread stop inputs were validated before lifecycle execution");
+    let (stop, inserted) = match ledger.persist_thread_stop(&stop) {
+        Ok(result) => result,
+        Err(_) => {
+            runtime.abort_thread_stop(&authority.thread_id);
+            return Envelope::error(
+                request.id,
+                Some("thread.stop".into()),
+                ERROR_THREAD_STOP_FAILED,
+                "thread stop could not be persisted",
+            );
+        }
+    };
+    runtime.complete_thread_stop(&authority.thread_id);
+    Envelope::response_from(
+        request.id,
+        Some("thread.stop".into()),
+        thread_stop_result(stop, !inserted),
+    )
+}
+
+fn thread_stop_result(stop: ThreadStopRecord, already_stopped: bool) -> ThreadStopResult {
+    if already_stopped {
+        ThreadStopResult::AlreadyStopped {
+            thread_id: stop.thread_id,
+            stopped_turn_id: stop.stopped_turn_id,
+            stopped_at_ms: stop.occurred_at_ms,
+        }
+    } else {
+        ThreadStopResult::Stopped {
+            thread_id: stop.thread_id,
+            stopped_turn_id: stop.stopped_turn_id,
+            stopped_at_ms: stop.occurred_at_ms,
+        }
     }
 }
 
@@ -1075,6 +1288,29 @@ fn start_run(runtime: &DaemonRuntime, request: StartRunRequest) -> Envelope {
                 ),
             );
         }
+    }
+    if let Some(context) = thread_context.as_ref()
+        && let Err(error) = runtime.bind_thread_run(&context.turn, record.clone())
+    {
+        runtime.release_run_reservation(&record);
+        runtime.abort_thread_turn(&context.turn);
+        return match error {
+            ThreadRunBindError::Stopping | ThreadRunBindError::NotLoaded => Envelope::error(
+                request_id,
+                Some(method.into()),
+                ERROR_NOT_FOUND,
+                format!("thread not found: {}", context.turn.thread_id),
+            ),
+            ThreadRunBindError::RunActive => Envelope::error(
+                request_id,
+                Some(method.into()),
+                ERROR_OVERLOAD,
+                format!(
+                    "thread already has an active run: {}",
+                    context.turn.thread_id
+                ),
+            ),
+        };
     }
 
     let (event_sender, event_receiver) = mpsc::channel::<RunEvent>();
@@ -1492,40 +1728,19 @@ fn handle_run_cancel(
         Ok(record) => record,
         Err(error) => return error_response(request.id, "run.cancel", error),
     };
-    let mut approvals = record.approvals.lock().expect("approvals lock poisoned");
-    let status = {
-        let mut status = record.status.lock().expect("run status lock poisoned");
-        match status.state {
-            RunStateName::Running => {
-                status.state = RunStateName::CancelRequested;
-                record.cancel.store(true, Ordering::SeqCst);
-                record.push_event(StreamEvent::Canceled {
-                    run_id: record.run_id.clone(),
-                });
-                approvals.retain(|_, pending| pending.decision.is_some());
-                record.approval_changed.notify_all();
-            }
-            RunStateName::CancelRequested => {}
-            RunStateName::Finished
-            | RunStateName::Failed
-            | RunStateName::Canceled
-            | RunStateName::Interrupted => {
-                return error_response(
-                    request.id,
-                    "run.cancel",
-                    format!("run is not active: {}", record.run_id),
-                );
-            }
-        }
-        status.clone()
+    let Some(status) = record.request_cancel() else {
+        return error_response(
+            request.id,
+            "run.cancel",
+            format!("run is not active: {}", record.run_id),
+        );
     };
-    drop(approvals);
     Envelope::response_from(
         request.id,
         Some("run.cancel".into()),
         CommandAcceptedResult {
             run_id: record.run_id.clone(),
-            status: status.state,
+            status,
         },
     )
 }
@@ -1894,6 +2109,7 @@ mod tests {
     use super::*;
     use crate::{
         ApprovalRequest, AssistantDeltaEvent,
+        daemon::protocol::StreamEvent,
         daemon::runtime::{PendingApproval, PendingApprovalDecision},
     };
     use platonic_core::{
@@ -1992,6 +2208,15 @@ mod tests {
         }
     }
 
+    fn stop_thread(runtime: &DaemonRuntime, thread_id: &str, actor: &str) -> Envelope {
+        handle_line(
+            runtime,
+            &format!(
+                r#"{{"v":1,"id":"stop","kind":"request","method":"thread.stop","params":{{"thread_id":"{thread_id}","actor":"{actor}"}}}}"#
+            ),
+        )
+    }
+
     #[test]
     fn thread_spawn_becomes_live_only_after_complete_authority_is_durable() {
         let (_root, runtime) = thread_test_runtime();
@@ -2032,6 +2257,7 @@ mod tests {
             crate::daemon::protocol::ThreadLiveState {
                 loaded: true,
                 current_turn_id: None,
+                last_activity_at_ms: Some(status.authority.created_at_ms),
             }
         );
         let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
@@ -2086,6 +2312,443 @@ mod tests {
             assert!(ledger.thread_authority(&thread_id).unwrap().is_none());
             assert!(!runtime.thread_is_loaded(&thread_id));
         }
+    }
+
+    fn admit_test_thread_turn(
+        runtime: &DaemonRuntime,
+        thread_id: &str,
+        controller_id: &str,
+        turn_id: &str,
+    ) -> ThreadTurnBinding {
+        match runtime.send_thread(
+            thread_id,
+            controller_id.into(),
+            None,
+            "test turn".into(),
+            turn_id.into(),
+        ) {
+            ThreadSendAdmission::Started { turn, .. } => turn,
+            admission => panic!("test thread turn was not admitted: {admission:?}"),
+        }
+    }
+
+    #[test]
+    fn idle_thread_stop_is_durable_idempotent_and_leaves_sibling_untouched() {
+        let (_root, runtime) = thread_test_runtime();
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let (spawn_id, _) = pending_spawn(
+                start_thread(
+                    &runtime,
+                    None,
+                    &runtime.paths.workspace_root,
+                    crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+                )
+                .unwrap(),
+            );
+            threads.push(grant_thread(&runtime, &spawn_id, "stdin"));
+        }
+        let target_id = threads[0].authority.thread_id.clone();
+        let sibling_id = threads[1].authority.thread_id.clone();
+        let sibling_before = runtime.thread_live_state(&sibling_id);
+
+        let stopped = stop_thread(&runtime, &target_id, "operator");
+        let stopped: ThreadStopResult = serde_json::from_value(stopped.result.unwrap()).unwrap();
+        let stopped_at_ms = match stopped {
+            ThreadStopResult::Stopped {
+                thread_id,
+                stopped_turn_id,
+                stopped_at_ms,
+            } => {
+                assert_eq!(thread_id, target_id);
+                assert_eq!(stopped_turn_id, None);
+                stopped_at_ms
+            }
+            unexpected => panic!("expected stopped result, got {unexpected:?}"),
+        };
+        assert_eq!(
+            runtime.thread_live_state(&target_id),
+            crate::daemon::protocol::ThreadLiveState {
+                loaded: false,
+                current_turn_id: None,
+                last_activity_at_ms: None,
+            }
+        );
+        assert_eq!(runtime.thread_live_state(&sibling_id), sibling_before);
+        let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
+        let durable = ledger.thread_stop(&target_id).unwrap().unwrap();
+        assert_eq!(durable.actor, "operator");
+        assert_eq!(durable.stopped_turn_id, None);
+        assert_eq!(durable.occurred_at_ms, stopped_at_ms);
+        drop(ledger);
+
+        let repeated = stop_thread(&runtime, &target_id, "other_operator");
+        assert_eq!(
+            serde_json::from_value::<ThreadStopResult>(repeated.result.unwrap()).unwrap(),
+            ThreadStopResult::AlreadyStopped {
+                thread_id: target_id.clone(),
+                stopped_turn_id: None,
+                stopped_at_ms,
+            }
+        );
+        assert!(runtime.thread_is_stopped(&target_id));
+        assert_eq!(runtime.thread_live_state(&sibling_id), sibling_before);
+    }
+
+    #[test]
+    fn active_thread_stop_cancels_bound_run_before_unloading_only_that_thread() {
+        let (_root, runtime) = thread_test_runtime();
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let (spawn_id, _) = pending_spawn(
+                start_thread(
+                    &runtime,
+                    None,
+                    &runtime.paths.workspace_root,
+                    crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+                )
+                .unwrap(),
+            );
+            threads.push(grant_thread(&runtime, &spawn_id, "stdin"));
+        }
+        let target_id = threads[0].authority.thread_id.clone();
+        let sibling_id = threads[1].authority.thread_id.clone();
+        let sibling_before = runtime.thread_live_state(&sibling_id);
+        let turn = admit_test_thread_turn(&runtime, &target_id, "controller", "turn_active");
+        let record = Arc::new(RunRecord::new_for_thread(
+            "run_thread_stop".into(),
+            "session_thread_stop".into(),
+            runtime.paths.ledger_path.clone(),
+            turn.clone(),
+        ));
+        runtime.reserve_run(record.clone()).unwrap();
+        runtime.bind_thread_run(&turn, record.clone()).unwrap();
+        let worker_runtime = runtime.clone();
+        let worker_record = record.clone();
+        let worker = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !worker_record.cancel.load(Ordering::SeqCst) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "thread stop did not request child cancellation"
+                );
+                thread::yield_now();
+            }
+            worker_runtime.finish_run_with_error(&worker_record, &AppError::RunCanceled);
+        });
+
+        let stopped = stop_thread(&runtime, &target_id, "operator");
+        worker.join().unwrap();
+        assert_eq!(
+            serde_json::from_value::<ThreadStopResult>(stopped.result.unwrap()).unwrap(),
+            ThreadStopResult::Stopped {
+                thread_id: target_id.clone(),
+                stopped_turn_id: Some("turn_active".into()),
+                stopped_at_ms: SqliteLedger::open_or_create_default(
+                    &runtime.paths.default_ledger()
+                )
+                .unwrap()
+                .thread_stop(&target_id)
+                .unwrap()
+                .unwrap()
+                .occurred_at_ms,
+            }
+        );
+        assert_eq!(record.status().state, RunStateName::Canceled);
+        assert!(!runtime.thread_is_loaded(&target_id));
+        assert_eq!(runtime.thread_live_state(&sibling_id), sibling_before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn thread_stop_supervised_child_matrix_reaches_zero_residual() {
+        for wedged in [false, true] {
+            assert_thread_stop_supervised_child(wedged);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_thread_stop_supervised_child(wedged: bool) {
+        use crate::{
+            app::prepare_run,
+            daemon::run_child::{
+                SupervisedTestLaunch, TerminalStageBarriers, run_supervised_for_test,
+            },
+        };
+
+        let (_root, runtime) = thread_test_runtime();
+        std::fs::write(
+            runtime.paths.workspace_root.join("plato.toml"),
+            r#"[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "http://127.0.0.1:1"
+
+[limits]
+token_budget = 4000
+max_output_tokens = 64
+max_turns = 1
+
+[tools]
+enabled = ["file.read"]
+"#,
+        )
+        .unwrap();
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let (spawn_id, _) = pending_spawn(
+                start_thread(
+                    &runtime,
+                    None,
+                    &runtime.paths.workspace_root,
+                    crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+                )
+                .unwrap(),
+            );
+            threads.push(grant_thread(&runtime, &spawn_id, "stdin"));
+        }
+        let target_id = threads[0].authority.thread_id.clone();
+        let sibling_id = threads[1].authority.thread_id.clone();
+        let case = if wedged { "wedged" } else { "active" };
+        let run_id = RunId::new(format!("run_thread_stop_{case}")).unwrap();
+        let turn =
+            admit_test_thread_turn(&runtime, &target_id, "controller", &format!("turn_{case}"));
+        let record = Arc::new(RunRecord::new_for_thread(
+            run_id.to_string(),
+            format!("session_thread_stop_{case}"),
+            runtime.paths.ledger_path.clone(),
+            turn.clone(),
+        ));
+        runtime.reserve_run(record.clone()).unwrap();
+        runtime.bind_thread_run(&turn, record.clone()).unwrap();
+        let sibling_turn = admit_test_thread_turn(
+            &runtime,
+            &sibling_id,
+            "sibling_controller",
+            &format!("turn_sibling_{case}"),
+        );
+        let sibling = Arc::new(RunRecord::new_for_thread(
+            format!("run_sibling_{case}"),
+            format!("session_sibling_{case}"),
+            runtime.paths.ledger_path.clone(),
+            sibling_turn.clone(),
+        ));
+        runtime.reserve_run(sibling.clone()).unwrap();
+        runtime
+            .bind_thread_run(&sibling_turn, sibling.clone())
+            .unwrap();
+
+        let (prepared, recorder) = prepare_run(&RunOptions {
+            question: "exercise thread.stop child ownership".into(),
+            config_path: Some(runtime.paths.workspace_root.join("plato.toml")),
+            overrides: Default::default(),
+            ledger: RunLedger::DefaultSqlite(runtime.paths.default_ledger()),
+            workspace_root: runtime.paths.workspace_root.clone(),
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(run_id.clone()),
+            session: Some(RunSession::Fresh {
+                session_id: record.session_id.clone(),
+            }),
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: None,
+            voice_interruption_context: None,
+        })
+        .unwrap();
+        let run_started = json!({
+            "kind": "record",
+            "request_id": 1,
+            "operation": {
+                "operation": "event",
+                "event": {"event": "run_started", "run_id": run_id, "agent_id": "plato"}
+            }
+        });
+        let terminal = json!({
+            "kind": "record",
+            "request_id": 2,
+            "operation": {
+                "operation": "fail",
+                "run_id": run_id,
+                "error": crate::ledger::RUN_CANCELED_REASON,
+                "canceled": true
+            }
+        });
+        let canceled = json!({
+            "kind": "result",
+            "request_id": 3,
+            "result": {"status": "canceled"}
+        });
+        let descendant_pid_path = runtime.paths.workspace_root.join(format!("{case}.pid"));
+        let fixture = runtime.paths.workspace_root.join(format!("{case}-child"));
+        let body = if wedged {
+            format!(
+                r#"trap '' TERM
+IFS= read -r _
+printf '{{"kind":"ready","request_id":0,"pid":%s}}\n' "$$"
+IFS= read -r _
+printf '%s\n' '{run_started}'
+IFS= read -r _
+/bin/sh -c 'trap "" TERM; while :; do :; done' &
+printf '%s\n' "$!" > '{descendant_pid_path}.tmp'
+mv '{descendant_pid_path}.tmp' '{descendant_pid_path}'
+IFS= read -r _
+while :; do :; done
+"#,
+                descendant_pid_path = descendant_pid_path.display(),
+            )
+        } else {
+            format!(
+                r#"IFS= read -r _
+printf '{{"kind":"ready","request_id":0,"pid":%s}}\n' "$$"
+IFS= read -r _
+printf '%s\n' '{run_started}'
+IFS= read -r _
+IFS= read -r _
+printf '%s\n' '{terminal}'
+IFS= read -r _
+printf '%s\n' '{canceled}'
+IFS= read -r _
+"#,
+            )
+        };
+        std::fs::write(&fixture, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (event_sender, event_receiver) = mpsc::channel();
+        let event_collector = spawn_event_collector(record.clone(), event_receiver);
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let terminal_reached = Arc::new(Barrier::new(2));
+        let terminal_release = Arc::new(Barrier::new(2));
+        let terminal_driver = (!wedged).then(|| {
+            let reached = terminal_reached.clone();
+            let release = terminal_release.clone();
+            thread::spawn(move || {
+                reached.wait();
+                release.wait();
+            })
+        });
+        let worker_runtime = runtime.clone();
+        let worker_record = record.clone();
+        let worker_cancel = record.cancel.clone();
+        let (outcome_sender, outcome_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let completion = run_supervised_for_test(
+                prepared,
+                recorder,
+                ApprovalMode::Deny { actor: "test" },
+                event_sender,
+                worker_cancel,
+                SupervisedTestLaunch {
+                    executable: fixture,
+                    ready_child: ready_sender,
+                    terminal_stage_barriers: TerminalStageBarriers {
+                        reached: terminal_reached,
+                        release: terminal_release,
+                    },
+                },
+            );
+            let outcome = finish_run_after_event_collection(
+                &worker_runtime,
+                &worker_record,
+                completion,
+                event_collector,
+            );
+            outcome_sender.send(outcome).unwrap();
+        });
+        let child_pid = ready_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        let descendant_pid = wedged.then(|| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !descendant_pid_path.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "wedged descendant pid was not published"
+                );
+                thread::yield_now();
+            }
+            std::fs::read_to_string(&descendant_pid_path)
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap()
+        });
+
+        let stopped = stop_thread(&runtime, &target_id, "operator");
+        assert!(matches!(
+            serde_json::from_value::<ThreadStopResult>(stopped.result.unwrap()).unwrap(),
+            ThreadStopResult::Stopped {
+                stopped_turn_id: Some(ref turn_id),
+                ..
+            } if turn_id == &format!("turn_{case}")
+        ));
+        assert!(matches!(
+            outcome_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+            Err(AppError::RunCanceled)
+        ));
+        worker.join().unwrap();
+        if let Some(driver) = terminal_driver {
+            driver.join().unwrap();
+        }
+        assert!(!Path::new(&format!("/proc/{child_pid}")).exists());
+        if let Some(descendant_pid) = descendant_pid {
+            assert!(!Path::new(&format!("/proc/{descendant_pid}")).exists());
+        }
+        assert!(!runtime.thread_is_loaded(&target_id));
+        assert_eq!(
+            runtime
+                .thread_live_state(&sibling_id)
+                .current_turn_id
+                .as_deref(),
+            Some(format!("turn_sibling_{case}").as_str())
+        );
+        assert!(!sibling.cancel.load(Ordering::SeqCst));
+        assert_eq!(sibling.status().state, RunStateName::Running);
+        runtime.finish_run_with_error(&sibling, &AppError::RunCanceled);
+    }
+
+    #[test]
+    fn thread_activity_is_live_monotone_and_absent_after_restart() {
+        let (_root, runtime) = thread_test_runtime();
+        let (spawn_id, _) = pending_spawn(
+            start_thread(
+                &runtime,
+                None,
+                &runtime.paths.workspace_root,
+                crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+            )
+            .unwrap(),
+        );
+        let thread = grant_thread(&runtime, &spawn_id, "stdin");
+        let thread_id = thread.authority.thread_id.clone();
+        let later = thread.authority.created_at_ms.saturating_add(1_000);
+        runtime.note_thread_activity_at(&thread_id, later);
+        runtime.note_thread_activity_at(&thread_id, later.saturating_sub(500));
+        assert_eq!(
+            runtime.thread_live_state(&thread_id).last_activity_at_ms,
+            Some(later)
+        );
+
+        let restarted = DaemonRuntime::new(runtime.paths.clone());
+        assert_eq!(
+            restarted.thread_live_state(&thread_id),
+            crate::daemon::protocol::ThreadLiveState {
+                loaded: false,
+                current_turn_id: None,
+                last_activity_at_ms: None,
+            }
+        );
+        let columns = rusqlite::Connection::open(&runtime.paths.ledger_path)
+            .unwrap()
+            .prepare("PRAGMA table_info(thread_authorities)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(columns.len(), 8);
+        assert!(!columns.iter().any(|column| column.contains("activity")));
     }
 
     #[test]
