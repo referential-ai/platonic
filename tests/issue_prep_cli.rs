@@ -229,6 +229,7 @@ impl FakeProvider {
                         Err(error) => panic!("fake provider accept failed: {error}"),
                     }
                 };
+                stream.set_nonblocking(false).unwrap();
                 let request = read_request(&stream);
                 requests.push(serde_json::from_str(&request).unwrap());
                 write_response(&mut stream, &content);
