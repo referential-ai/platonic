@@ -1,16 +1,29 @@
+pub use super::DaemonPaths;
+#[cfg(any(test, unix))]
+use crate::paths;
 use crate::{
     AppResult,
-    daemon::{handlers::handle_line, lock::WorkspaceLock, runtime::DaemonRuntime, transport},
-    paths,
+    daemon::{
+        handlers::{handle_line, handle_request},
+        lock::WorkspaceLock,
+        protocol::{
+            ERROR_MALFORMED_REQUEST, ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind, HelloParams,
+            decode_request,
+        },
+        runtime::{DaemonRuntime, RuntimeState},
+        transport,
+    },
 };
 use std::{
+    collections::HashMap,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
+    time::{Duration, Instant},
 };
 
 #[cfg(windows)]
@@ -26,39 +39,86 @@ use std::{
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 #[cfg(unix)]
 const SOCKET_MODE: u32 = 0o600;
+const MAX_CONNECTION_HANDLERS: usize = 64;
+const HOST_DAEMON_SCOPE: &str = "host";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DaemonPaths {
-    pub workspace_root: PathBuf,
-    pub workspace_id: String,
-    pub socket_path: PathBuf,
-    pub lock_path: PathBuf,
-    pub ledger_path: PathBuf,
+#[derive(Debug, Default)]
+struct HandlerCapacity {
+    live: AtomicUsize,
 }
 
-impl DaemonPaths {
-    pub fn resolve(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<Self> {
-        let workspace_root = workspace_root.canonicalize()?;
-        let workspace_id = paths::workspace_id(&workspace_root)?;
-        let socket_path = socket_path.unwrap_or(paths::default_socket_path(&workspace_root)?);
-        Ok(Self {
-            lock_path: paths::default_lock_path(&workspace_root)?,
-            ledger_path: paths::default_sqlite_path(&workspace_root)?,
-            workspace_root,
-            workspace_id,
-            socket_path,
+impl HandlerCapacity {
+    fn try_acquire(self: &Arc<Self>) -> Option<HandlerPermit> {
+        self.live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                (live < MAX_CONNECTION_HANDLERS).then_some(live + 1)
+            })
+            .ok()?;
+        Some(HandlerPermit {
+            capacity: Arc::clone(self),
         })
     }
+}
 
-    pub(crate) fn default_ledger(&self) -> paths::DefaultSqlitePath {
-        paths::DefaultSqlitePath::from_path(self.ledger_path.clone())
+struct HandlerPermit {
+    capacity: Arc<HandlerCapacity>,
+}
+
+impl Drop for HandlerPermit {
+    fn drop(&mut self) {
+        let previous = self.capacity.live.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+}
+
+#[derive(Debug)]
+struct BoundEndpoint {
+    listener: transport::Listener,
+    socket_path: PathBuf,
+    #[cfg(unix)]
+    socket_device: u64,
+    #[cfg(unix)]
+    socket_inode: u64,
+}
+
+impl BoundEndpoint {
+    fn bind(socket_path: PathBuf, reclaim_default_socket: bool) -> AppResult<Self> {
+        #[cfg(unix)]
+        prepare_socket_for_bind(&socket_path, reclaim_default_socket)?;
+        #[cfg(windows)]
+        let _ = reclaim_default_socket;
+        let listener = transport::bind(&socket_path)?;
+        #[cfg(unix)]
+        let (socket_device, socket_inode) = bound_socket_identity(&socket_path)?;
+        #[cfg(unix)]
+        if let Err(error) = restrict_socket(&socket_path) {
+            drop(listener);
+            let _ = remove_socket_if_matches(&socket_path, socket_device, socket_inode);
+            return Err(error.into());
+        }
+        Ok(Self {
+            listener,
+            socket_path,
+            #[cfg(unix)]
+            socket_device,
+            #[cfg(unix)]
+            socket_inode,
+        })
+    }
+}
+
+impl Drop for BoundEndpoint {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ = remove_socket_if_matches(&self.socket_path, self.socket_device, self.socket_inode);
     }
 }
 
 #[derive(Debug)]
 pub struct DaemonServer {
-    listener: transport::Listener,
+    endpoint: BoundEndpoint,
     runtime: DaemonRuntime,
+    handlers: Arc<HandlerCapacity>,
     _lock: WorkspaceLock,
 }
 
@@ -77,38 +137,21 @@ impl DaemonServer {
     fn bind_inner(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<Self> {
         let paths = DaemonPaths::resolve(workspace_root, socket_path)?;
         #[cfg(unix)]
-        {
-            let (runtime_home, is_fallback) = paths::runtime_home_and_fallback();
-            if is_fallback {
-                prepare_temp_runtime_home(&runtime_home)?;
-            }
-            prepare_runtime_path(&runtime_home, &paths.lock_path)?;
-            prepare_socket_parent(&runtime_home, &paths.socket_path)?;
-        }
+        let reclaim_default_socket =
+            paths.socket_path == crate::paths::default_socket_path(&paths.workspace_root)?;
         #[cfg(windows)]
-        fs::create_dir_all(
-            paths
-                .lock_path
-                .parent()
-                .expect("default Windows lock path has a parent"),
-        )?;
+        let reclaim_default_socket = false;
+        prepare_workspace_lock_parent(&paths)?;
+        #[cfg(unix)]
+        prepare_socket_parent(&paths::runtime_home_and_fallback().0, &paths.socket_path)?;
         let lock = WorkspaceLock::acquire_for_workspace(&paths.workspace_root, &paths.socket_path)?;
         crate::ledger::interrupt_orphaned_default_sqlite_runs(&paths.default_ledger())?;
-        #[cfg(unix)]
-        if paths.socket_path.exists() {
-            fs::remove_file(&paths.socket_path)?;
-        }
-        let listener = transport::bind(&paths.socket_path)?;
-        #[cfg(unix)]
-        if let Err(error) = restrict_socket(&paths.socket_path) {
-            drop(listener);
-            let _ = fs::remove_file(&paths.socket_path);
-            return Err(error.into());
-        }
+        let endpoint = BoundEndpoint::bind(paths.socket_path.clone(), reclaim_default_socket)?;
         let runtime = DaemonRuntime::new(paths);
         Ok(Self {
-            listener,
+            endpoint,
             runtime,
+            handlers: Arc::new(HandlerCapacity::default()),
             _lock: lock,
         })
     }
@@ -118,24 +161,19 @@ impl DaemonServer {
     }
 
     pub fn serve_forever(&self, shutdown: Arc<AtomicBool>) -> AppResult<()> {
-        loop {
-            let stream = transport::accept(&self.listener)?;
-            if shutdown.load(Ordering::SeqCst) || self.runtime.stop_requested.load(Ordering::SeqCst)
-            {
-                break;
-            }
-            let runtime = self.runtime.clone();
-            thread::spawn(move || {
-                if let Err(error) = handle_stream(runtime, stream) {
-                    eprintln!("daemon connection error: {error}");
-                }
-            });
-        }
-        Ok(())
+        let runtime = self.runtime.clone();
+        serve_connections(
+            &shutdown,
+            &self.runtime.stop_requested,
+            Arc::clone(&self.handlers),
+            || transport::accept(&self.endpoint.listener),
+            move |stream| handle_stream(runtime.clone(), stream),
+            thread::sleep,
+        )
     }
 
     pub fn serve_next(&self) -> AppResult<()> {
-        let stream = transport::accept(&self.listener)?;
+        let stream = transport::accept(&self.endpoint.listener)?;
         handle_stream(self.runtime.clone(), stream)
     }
 
@@ -143,6 +181,277 @@ impl DaemonServer {
     fn handle_line(&self, line: &str) -> crate::daemon::protocol::Envelope {
         handle_line(&self.runtime, line)
     }
+}
+
+#[derive(Debug)]
+struct HostWorkspaceRuntime {
+    runtime: DaemonRuntime,
+    _lock: WorkspaceLock,
+}
+
+#[derive(Clone, Debug)]
+struct HostRuntime {
+    socket_path: PathBuf,
+    started_at: Instant,
+    state: Arc<Mutex<RuntimeState>>,
+    stop_requested: Arc<AtomicBool>,
+    workspaces: Arc<Mutex<HashMap<PathBuf, HostWorkspaceRuntime>>>,
+}
+
+impl HostRuntime {
+    fn new(socket_path: PathBuf) -> Self {
+        Self {
+            socket_path,
+            started_at: Instant::now(),
+            state: Arc::new(Mutex::new(RuntimeState::default())),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            workspaces: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn workspace_runtime(&self, params: &HelloParams) -> Result<DaemonRuntime, String> {
+        let workspace_root = PathBuf::from(&params.workspace_root)
+            .canonicalize()
+            .map_err(|error| format!("workspace_root cannot be resolved: {error}"))?;
+        let workspace_id = crate::paths::workspace_id(&workspace_root)
+            .map_err(|error| format!("workspace_id cannot be derived: {error}"))?;
+        if params.workspace_id != workspace_id {
+            return Err(format!(
+                "workspace_id mismatch: expected {workspace_id}, got {}",
+                params.workspace_id
+            ));
+        }
+
+        let mut workspaces = self
+            .workspaces
+            .lock()
+            .expect("host workspace runtime lock poisoned");
+        if let Some(workspace) = workspaces.get(&workspace_root) {
+            return Ok(workspace.runtime.clone());
+        }
+
+        let paths = DaemonPaths::resolve(&workspace_root, Some(self.socket_path.clone()))
+            .map_err(|error| error.to_string())?;
+        prepare_workspace_lock_parent(&paths).map_err(|error| error.to_string())?;
+        let workspace_lock =
+            WorkspaceLock::acquire_for_workspace(&paths.workspace_root, &paths.socket_path)
+                .map_err(|error| error.to_string())?;
+        crate::ledger::interrupt_orphaned_default_sqlite_runs(&paths.default_ledger())
+            .map_err(|error| error.to_string())?;
+        let runtime = DaemonRuntime::new_shared(
+            paths,
+            self.started_at,
+            Arc::clone(&self.state),
+            Arc::clone(&self.stop_requested),
+        );
+        workspaces.insert(
+            workspace_root,
+            HostWorkspaceRuntime {
+                runtime: runtime.clone(),
+                _lock: workspace_lock,
+            },
+        );
+        Ok(runtime)
+    }
+}
+
+#[derive(Debug)]
+pub struct HostDaemonServer {
+    endpoint: BoundEndpoint,
+    runtime: HostRuntime,
+    handlers: Arc<HandlerCapacity>,
+    _lock: WorkspaceLock,
+}
+
+impl HostDaemonServer {
+    pub fn bind() -> AppResult<Self> {
+        let socket_path = crate::paths::host_socket_path()?;
+        let lock_path = crate::paths::host_lock_path()?;
+        #[cfg(unix)]
+        {
+            let (runtime_home, is_fallback) = paths::runtime_home_and_fallback();
+            if is_fallback {
+                prepare_temp_runtime_home(&runtime_home)?;
+            }
+            prepare_runtime_path(&runtime_home, &lock_path)?;
+            prepare_socket_parent(&runtime_home, &socket_path)?;
+        }
+        #[cfg(windows)]
+        fs::create_dir_all(
+            lock_path
+                .parent()
+                .expect("default Windows host lock path has a parent"),
+        )?;
+        let lock = WorkspaceLock::acquire_for_host(lock_path, &socket_path)?;
+        let endpoint = BoundEndpoint::bind(socket_path.clone(), true)?;
+        Ok(Self {
+            endpoint,
+            runtime: HostRuntime::new(socket_path),
+            handlers: Arc::new(HandlerCapacity::default()),
+            _lock: lock,
+        })
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.endpoint.socket_path
+    }
+
+    pub fn serve_forever(&self, shutdown: Arc<AtomicBool>) -> AppResult<()> {
+        let runtime = self.runtime.clone();
+        serve_connections(
+            &shutdown,
+            &self.runtime.stop_requested,
+            Arc::clone(&self.handlers),
+            || transport::accept(&self.endpoint.listener),
+            move |stream| handle_host_stream(runtime.clone(), stream),
+            thread::sleep,
+        )
+    }
+
+    pub fn serve_next(&self) -> AppResult<()> {
+        let stream = transport::accept(&self.endpoint.listener)?;
+        handle_host_stream(self.runtime.clone(), stream)
+    }
+}
+
+fn prepare_workspace_lock_parent(paths: &DaemonPaths) -> AppResult<()> {
+    #[cfg(unix)]
+    {
+        let (runtime_home, is_fallback) = paths::runtime_home_and_fallback();
+        if is_fallback {
+            prepare_temp_runtime_home(&runtime_home)?;
+        }
+        prepare_runtime_path(&runtime_home, &paths.lock_path)?;
+    }
+    #[cfg(windows)]
+    fs::create_dir_all(
+        paths
+            .lock_path
+            .parent()
+            .expect("default Windows lock path has a parent"),
+    )?;
+    Ok(())
+}
+
+fn serve_connections<S, A, H, B>(
+    shutdown: &AtomicBool,
+    stop_requested: &AtomicBool,
+    handlers: Arc<HandlerCapacity>,
+    mut accept: A,
+    handle: H,
+    mut backoff: B,
+) -> AppResult<()>
+where
+    S: Send + 'static,
+    A: FnMut() -> std::io::Result<S>,
+    H: Fn(S) -> AppResult<()> + Send + Sync + 'static,
+    B: FnMut(Duration),
+{
+    let handle = Arc::new(handle);
+    loop {
+        let stream = match accept() {
+            Ok(stream) => stream,
+            Err(error) => match transport::accept_retry_delay(&error) {
+                Some(delay) => {
+                    if !delay.is_zero() {
+                        backoff(delay);
+                    }
+                    continue;
+                }
+                None => return Err(error.into()),
+            },
+        };
+        if shutdown.load(Ordering::SeqCst) || stop_requested.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let Some(permit) = handlers.try_acquire() else {
+            drop(stream);
+            continue;
+        };
+        drop(spawn_connection_handler(
+            permit,
+            stream,
+            Arc::clone(&handle),
+        ));
+    }
+}
+
+fn spawn_connection_handler<S, H>(
+    permit: HandlerPermit,
+    stream: S,
+    handle: Arc<H>,
+) -> thread::JoinHandle<()>
+where
+    S: Send + 'static,
+    H: Fn(S) -> AppResult<()> + Send + Sync + 'static,
+{
+    thread::spawn(move || {
+        let _permit = permit;
+        if let Err(error) = handle(stream) {
+            eprintln!("daemon connection error: {error}");
+        }
+    })
+}
+
+#[cfg(unix)]
+fn prepare_socket_for_bind(path: &Path, reclaim_default_socket: bool) -> std::io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let path_in_use = || {
+        Error::new(
+            ErrorKind::AddrInUse,
+            format!("daemon socket path already exists: {}", path.display()),
+        )
+    };
+    if !reclaim_default_socket
+        || !metadata.file_type().is_socket()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+    {
+        return Err(path_in_use());
+    }
+
+    remove_socket_if_matches(path, metadata.dev(), metadata.ino())?;
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(path_in_use()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn bound_socket_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    let metadata = fs::symlink_metadata(path)?;
+    let expected_uid = rustix::process::geteuid().as_raw();
+    if !metadata.file_type().is_socket() || metadata.uid() != expected_uid {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "daemon socket path is not a current-user socket: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(unix)]
+fn remove_socket_if_matches(
+    path: &Path,
+    expected_device: u64,
+    expected_inode: u64,
+) -> std::io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.dev() == expected_device && metadata.ino() == expected_inode {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -282,6 +591,123 @@ fn verify_mode(path: &Path, expected: u32) -> std::io::Result<()> {
 }
 
 fn handle_stream(runtime: DaemonRuntime, stream: transport::Stream) -> AppResult<()> {
+    let stop_requested = Arc::clone(&runtime.stop_requested);
+    let socket_path = runtime.paths.socket_path.clone();
+    #[cfg(all(test, unix))]
+    let shutdown_runtime = runtime.clone();
+    handle_stream_lines(
+        stream,
+        stop_requested,
+        socket_path,
+        move |line| handle_line(&runtime, line),
+        move || {
+            #[cfg(all(test, unix))]
+            shutdown_runtime.wait_after_shutdown_flush();
+        },
+    )
+}
+
+fn handle_host_stream(runtime: HostRuntime, stream: transport::Stream) -> AppResult<()> {
+    let stop_requested = Arc::clone(&runtime.stop_requested);
+    let socket_path = runtime.socket_path.clone();
+    let mut workspace_runtime = None;
+    handle_stream_lines(
+        stream,
+        stop_requested,
+        socket_path,
+        move |line| handle_host_line(&runtime, &mut workspace_runtime, line),
+        || {},
+    )
+}
+
+fn handle_host_line(
+    host: &HostRuntime,
+    workspace_runtime: &mut Option<DaemonRuntime>,
+    line: &str,
+) -> Envelope {
+    if let Some(runtime) = workspace_runtime {
+        return add_host_scope(handle_line(runtime, line));
+    }
+
+    let request = match decode_request(line) {
+        Ok(request) => request,
+        Err(error) => return *error,
+    };
+    if request.method.as_deref() != Some("hello") {
+        let method = request.method.clone();
+        return Envelope::error(
+            request.id,
+            method.clone(),
+            ERROR_MALFORMED_REQUEST,
+            format!(
+                "host daemon requires hello before {}",
+                method.as_deref().unwrap_or("request")
+            ),
+        );
+    }
+    let params = match request.params.as_ref() {
+        Some(params) => match serde_json::from_value::<HelloParams>(params.clone()) {
+            Ok(params) => params,
+            Err(error) => {
+                return Envelope::error(
+                    request.id,
+                    Some("hello".into()),
+                    ERROR_MALFORMED_REQUEST,
+                    format!("hello params are invalid: {error}"),
+                );
+            }
+        },
+        None => {
+            return Envelope::error(
+                request.id,
+                Some("hello".into()),
+                ERROR_MALFORMED_REQUEST,
+                "hello params are required",
+            );
+        }
+    };
+    let runtime = match host.workspace_runtime(&params) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return Envelope::error(
+                request.id,
+                Some("hello".into()),
+                ERROR_WORKSPACE_MISMATCH,
+                error,
+            );
+        }
+    };
+    let response = add_host_scope(handle_request(&runtime, request));
+    if response.kind == EnvelopeKind::Response {
+        *workspace_runtime = Some(runtime);
+    }
+    response
+}
+
+fn add_host_scope(mut response: Envelope) -> Envelope {
+    if response.kind == EnvelopeKind::Response
+        && response.method.as_deref() == Some("hello")
+        && let Some(result) = response
+            .result
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        result.insert("daemon_scope".into(), HOST_DAEMON_SCOPE.into());
+    }
+    response
+}
+
+fn handle_stream_lines<H, F>(
+    stream: transport::Stream,
+    stop_requested: Arc<AtomicBool>,
+    socket_path: PathBuf,
+    mut handle: H,
+    after_shutdown_flush: F,
+) -> AppResult<()>
+where
+    H: FnMut(&str) -> Envelope,
+    F: FnOnce(),
+{
     let mut writer = transport::try_clone(&stream)?;
     let reader = BufReader::new(stream);
     for line in reader.lines() {
@@ -289,7 +715,7 @@ fn handle_stream(runtime: DaemonRuntime, stream: transport::Stream) -> AppResult
         if line.trim().is_empty() {
             continue;
         }
-        let response = handle_line(&runtime, &line);
+        let response = handle(&line);
         let stop_after_response = response.method.as_deref() == Some("daemon.shutdown_if_idle")
             && response.kind == crate::daemon::protocol::EnvelopeKind::Response
             && response
@@ -305,10 +731,9 @@ fn handle_stream(runtime: DaemonRuntime, stream: transport::Stream) -> AppResult
             Ok(())
         })();
         if stop_after_response {
-            #[cfg(all(test, unix))]
-            runtime.wait_after_shutdown_flush();
-            runtime.stop_requested.store(true, Ordering::SeqCst);
-            transport::wake(&runtime.paths.socket_path);
+            after_shutdown_flush();
+            stop_requested.store(true, Ordering::SeqCst);
+            transport::wake(&socket_path);
             return write_result;
         }
         write_result?;
@@ -316,10 +741,263 @@ fn handle_stream(runtime: DaemonRuntime, stream: transport::Stream) -> AppResult
     Ok(())
 }
 
-impl Drop for DaemonServer {
-    fn drop(&mut self) {
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use crate::AppError;
+    use std::{
+        collections::VecDeque,
+        io,
+        sync::{Barrier, Mutex, mpsc},
+    };
+
+    const FATAL_ACCEPT_CODE: i32 = 12_345;
+
+    struct InjectedStream {
+        id: usize,
+        rejected: Arc<AtomicBool>,
+    }
+
+    impl Drop for InjectedStream {
+        fn drop(&mut self) {
+            if self.id == MAX_CONNECTION_HANDLERS {
+                self.rejected.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[test]
+    fn sixty_fifth_connection_closes_without_a_handler() {
+        let shutdown = AtomicBool::new(false);
+        let stop_requested = AtomicBool::new(false);
+        let handlers = Arc::new(HandlerCapacity::default());
+        let rejected = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(Barrier::new(MAX_CONNECTION_HANDLERS + 1));
+        let handled = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut next_id = 0;
+
+        let handler_barrier = Arc::clone(&barrier);
+        let handled_streams = Arc::clone(&handled);
+        let result = serve_connections(
+            &shutdown,
+            &stop_requested,
+            Arc::clone(&handlers),
+            || {
+                if next_id <= MAX_CONNECTION_HANDLERS {
+                    let stream = InjectedStream {
+                        id: next_id,
+                        rejected: Arc::clone(&rejected),
+                    };
+                    next_id += 1;
+                    Ok(stream)
+                } else {
+                    Err(io::Error::from_raw_os_error(FATAL_ACCEPT_CODE))
+                }
+            },
+            move |stream: InjectedStream| {
+                handled_streams.lock().unwrap().push(stream.id);
+                handler_barrier.wait();
+                done_tx.send(()).unwrap();
+                Ok(())
+            },
+            |_| panic!("fatal accept errors must not back off"),
+        );
+
+        assert!(matches!(
+            result,
+            Err(AppError::Io(error)) if error.raw_os_error() == Some(FATAL_ACCEPT_CODE)
+        ));
+        assert!(rejected.load(Ordering::SeqCst));
+        assert_eq!(
+            handlers.live.load(Ordering::SeqCst),
+            MAX_CONNECTION_HANDLERS
+        );
+
+        barrier.wait();
+        for _ in 0..MAX_CONNECTION_HANDLERS {
+            done_rx.recv().unwrap();
+        }
+        let mut handled = handled.lock().unwrap().clone();
+        handled.sort_unstable();
+        assert_eq!(handled, (0..MAX_CONNECTION_HANDLERS).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn handler_error_and_panic_release_capacity() {
+        let handlers = Arc::new(HandlerCapacity::default());
+        let permit = handlers.try_acquire().unwrap();
+        let error_handler = spawn_connection_handler(
+            permit,
+            (),
+            Arc::new(|()| -> AppResult<()> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected handler error").into())
+            }),
+        );
+        error_handler.join().unwrap();
+        assert_eq!(handlers.live.load(Ordering::SeqCst), 0);
+
+        let permit = handlers.try_acquire().unwrap();
+        let panic_handler = spawn_connection_handler(
+            permit,
+            (),
+            Arc::new(|()| -> AppResult<()> {
+                panic!("injected handler panic");
+            }),
+        );
+        assert!(panic_handler.join().is_err());
+        assert_eq!(handlers.live.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn listed_accept_errors_retry_and_serve_a_later_connection() {
+        let errors = retryable_accept_errors();
+        let retry_count = errors.len();
+        let mut outcomes = errors.into_iter().map(Err).collect::<VecDeque<_>>();
+        outcomes.push_back(Ok(7_u8));
+
+        let shutdown = AtomicBool::new(false);
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let handler_stop = Arc::clone(&stop_requested);
+        let served = Arc::new(AtomicBool::new(false));
+        let handler_served = Arc::clone(&served);
+        let (served_tx, served_rx) = mpsc::channel();
+        let mut backoffs = Vec::new();
+
+        serve_connections(
+            &shutdown,
+            &stop_requested,
+            Arc::new(HandlerCapacity::default()),
+            move || match outcomes.pop_front() {
+                Some(outcome) => outcome,
+                None => {
+                    served_rx.recv().unwrap();
+                    Ok(8)
+                }
+            },
+            move |stream| {
+                assert_eq!(stream, 7);
+                handler_served.store(true, Ordering::SeqCst);
+                handler_stop.store(true, Ordering::SeqCst);
+                served_tx.send(()).unwrap();
+                Ok(())
+            },
+            |delay| backoffs.push(delay),
+        )
+        .unwrap();
+
+        assert!(served.load(Ordering::SeqCst));
+        assert_eq!(backoffs, vec![Duration::from_millis(50); retry_count - 1]);
+    }
+
+    #[test]
+    fn unlisted_accept_error_is_returned_unchanged() {
+        let shutdown = AtomicBool::new(false);
+        let stop_requested = AtomicBool::new(false);
+        let mut error = Some(io::Error::from_raw_os_error(FATAL_ACCEPT_CODE));
+
+        let result = serve_connections(
+            &shutdown,
+            &stop_requested,
+            Arc::new(HandlerCapacity::default()),
+            || Err::<(), _>(error.take().unwrap()),
+            |()| panic!("fatal accept errors must not spawn handlers"),
+            |_| panic!("fatal accept errors must not back off"),
+        );
+
+        assert!(matches!(
+            result,
+            Err(AppError::Io(error)) if error.raw_os_error() == Some(FATAL_ACCEPT_CODE)
+        ));
+    }
+
+    #[test]
+    fn shutdown_flags_close_the_accepted_wake_connection() {
+        for (shutdown_set, stop_set) in [(true, false), (false, true)] {
+            let shutdown = AtomicBool::new(shutdown_set);
+            let stop_requested = AtomicBool::new(stop_set);
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let handled = Arc::new(AtomicUsize::new(0));
+            let accepted_count = Arc::clone(&accepted);
+            let dropped_count = Arc::clone(&dropped);
+            let handled_count = Arc::clone(&handled);
+
+            serve_connections(
+                &shutdown,
+                &stop_requested,
+                Arc::new(HandlerCapacity::default()),
+                move || {
+                    assert_eq!(accepted_count.fetch_add(1, Ordering::SeqCst), 0);
+                    Ok(DroppedStream(Arc::clone(&dropped_count)))
+                },
+                move |_stream| {
+                    handled_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                |_| panic!("shutdown must not back off"),
+            )
+            .unwrap();
+
+            assert_eq!(accepted.load(Ordering::SeqCst), 1);
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(handled.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    struct DroppedStream(Arc<AtomicUsize>);
+
+    impl Drop for DroppedStream {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn retryable_accept_errors() -> Vec<io::Error> {
+        let mut errors = vec![
+            io::Error::new(io::ErrorKind::Interrupted, "interrupted"),
+            io::Error::new(io::ErrorKind::WouldBlock, "would block"),
+            io::Error::new(io::ErrorKind::ConnectionAborted, "connection aborted"),
+        ];
+
         #[cfg(unix)]
-        let _ = fs::remove_file(&self.runtime.paths.socket_path);
+        errors.extend(
+            [
+                rustix::io::Errno::MFILE,
+                rustix::io::Errno::NFILE,
+                rustix::io::Errno::NOBUFS,
+                rustix::io::Errno::NOMEM,
+            ]
+            .into_iter()
+            .map(|errno| io::Error::from_raw_os_error(errno.raw_os_error())),
+        );
+
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{
+                ERROR_COMMITMENT_LIMIT, ERROR_NO_SYSTEM_RESOURCES, ERROR_NONPAGED_SYSTEM_RESOURCES,
+                ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY,
+                ERROR_PAGED_SYSTEM_RESOURCES, ERROR_TOO_MANY_OPEN_FILES, ERROR_WORKING_SET_QUOTA,
+            };
+
+            errors.extend(
+                [
+                    ERROR_TOO_MANY_OPEN_FILES,
+                    ERROR_NOT_ENOUGH_MEMORY,
+                    ERROR_OUTOFMEMORY,
+                    ERROR_NO_SYSTEM_RESOURCES,
+                    ERROR_NONPAGED_SYSTEM_RESOURCES,
+                    ERROR_PAGED_SYSTEM_RESOURCES,
+                    ERROR_WORKING_SET_QUOTA,
+                    ERROR_COMMITMENT_LIMIT,
+                    ERROR_NOT_ENOUGH_QUOTA,
+                ]
+                .into_iter()
+                .map(|code| io::Error::from_raw_os_error(code as i32)),
+            );
+        }
+
+        errors
     }
 }
 
@@ -331,15 +1009,17 @@ mod tests {
         daemon::{
             client::DaemonClient,
             protocol::{
-                ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
-                ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
-                ERROR_SESSIONS_LIST_FAILED, ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind,
-                ProtocolError, RunStateName, ShutdownIfIdleResultName,
+                DaemonStatusProviderKind, DaemonStatusResult, ERROR_DAEMON_SHUTTING_DOWN,
+                ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
+                ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED,
+                ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind, ProtocolError, RunStartResult,
+                RunStateName, ShutdownIfIdleResultName, StreamEvent, TypedTranscript,
+                TypedTranscriptEntry,
             },
-            runtime::{MAX_EVENT_BUFFER, PendingApproval, RunRecord},
+            runtime::{MAX_EVENT_BUFFER, MAX_TERMINAL_RUNS, PendingApproval, RunRecord},
         },
         ledger::SqliteLedger,
-        tools::ApprovalOutcome,
+        tool_catalog::SHELL_EXEC,
     };
     use platonic_core::{
         AgentId, ContextPack, EffectClass, HarnessEvent, Message, MessageRole, ModelName,
@@ -349,8 +1029,10 @@ mod tests {
     use std::{
         io::{BufRead, Read},
         net::TcpListener,
-        os::unix::fs::PermissionsExt,
-        os::unix::net::UnixStream,
+        os::unix::{
+            fs::{PermissionsExt, symlink},
+            net::{UnixListener, UnixStream},
+        },
         sync::{Arc, Barrier, mpsc},
         thread,
         time::{Duration, Instant},
@@ -467,6 +1149,187 @@ mod tests {
         fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    fn test_default_socket_path(workspace: &Path) -> PathBuf {
+        crate::paths::with_test_xdg(workspace, || {
+            crate::paths::default_socket_path(workspace).unwrap()
+        })
+    }
+
+    fn socket_identity(path: &Path) -> (u64, u64) {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        (metadata.dev(), metadata.ino())
+    }
+
+    fn assert_addr_in_use(error: AppError) {
+        match error {
+            AppError::Io(error) => assert_eq!(error.kind(), ErrorKind::AddrInUse),
+            error => panic!("expected AddrInUse, got {error}"),
+        }
+    }
+
+    #[test]
+    fn regular_files_survive_failed_default_and_custom_bind_attempts() {
+        for custom_socket in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            let socket_root = tempfile::tempdir().unwrap();
+            let socket_path = if custom_socket {
+                socket_root.path().join("agent.sock")
+            } else {
+                test_default_socket_path(workspace.path())
+            };
+            fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+            fs::write(&socket_path, b"rightful owner").unwrap();
+
+            let error =
+                DaemonServer::bind(workspace.path(), custom_socket.then(|| socket_path.clone()))
+                    .unwrap_err();
+
+            assert_addr_in_use(error);
+            assert_eq!(fs::read(&socket_path).unwrap(), b"rightful owner");
+            assert!(fs::symlink_metadata(&socket_path).unwrap().is_file());
+        }
+    }
+
+    #[test]
+    fn symlinks_survive_failed_default_and_custom_bind_attempts() {
+        for custom_socket in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            let socket_root = tempfile::tempdir().unwrap();
+            let socket_path = if custom_socket {
+                socket_root.path().join("agent.sock")
+            } else {
+                test_default_socket_path(workspace.path())
+            };
+            let target = workspace.path().join("rightful-owner");
+            fs::write(&target, b"rightful owner").unwrap();
+            fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+            symlink(&target, &socket_path).unwrap();
+
+            let error =
+                DaemonServer::bind(workspace.path(), custom_socket.then(|| socket_path.clone()))
+                    .unwrap_err();
+
+            assert_addr_in_use(error);
+            assert_eq!(fs::read_link(&socket_path).unwrap(), target);
+            assert_eq!(fs::read(&target).unwrap(), b"rightful owner");
+        }
+    }
+
+    #[test]
+    fn custom_bind_preserves_a_stale_socket() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_root = tempfile::tempdir().unwrap();
+        let socket_path = socket_root.path().join("agent.sock");
+        let stale_listener = UnixListener::bind(&socket_path).unwrap();
+        let stale_identity = socket_identity(&socket_path);
+        drop(stale_listener);
+
+        let error = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap_err();
+
+        assert_addr_in_use(error);
+        assert_eq!(socket_identity(&socket_path), stale_identity);
+    }
+
+    #[test]
+    fn custom_socket_collision_preserves_the_first_workspace_server() {
+        let first_workspace = tempfile::tempdir().unwrap();
+        let second_workspace = tempfile::tempdir().unwrap();
+        let socket_root = tempfile::tempdir().unwrap();
+        let socket_path = socket_root.path().join("agent.sock");
+        let first_server =
+            DaemonServer::bind(first_workspace.path(), Some(socket_path.clone())).unwrap();
+        let first_identity = socket_identity(&socket_path);
+
+        let error =
+            DaemonServer::bind(second_workspace.path(), Some(socket_path.clone())).unwrap_err();
+
+        assert_addr_in_use(error);
+        assert_eq!(socket_identity(&socket_path), first_identity);
+
+        let first_workspace_id = first_server.paths().workspace_id.clone();
+        let handle = thread::spawn(move || first_server.serve_next().unwrap());
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        let hello = client.hello(first_workspace.path()).unwrap();
+        assert_eq!(hello.workspace_id, first_workspace_id);
+        drop(client);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn default_bind_recovers_a_stale_current_user_socket() {
+        assert_stale_default_socket_recovers(false);
+    }
+
+    #[test]
+    fn explicit_default_bind_recovers_a_stale_current_user_socket() {
+        assert_stale_default_socket_recovers(true);
+    }
+
+    fn assert_stale_default_socket_recovers(explicit_default: bool) {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_path = test_default_socket_path(workspace.path());
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        let stale_listener = UnixListener::bind(&socket_path).unwrap();
+        drop(stale_listener);
+
+        let server = DaemonServer::bind(
+            workspace.path(),
+            explicit_default.then(|| socket_path.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(server.paths().socket_path, socket_path);
+        assert_eq!(mode(&socket_path), SOCKET_MODE);
+        let handle = thread::spawn(move || server.serve_next().unwrap());
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        client.hello(workspace.path()).unwrap();
+        drop(client);
+        handle.join().unwrap();
+        assert!(matches!(
+            fs::symlink_metadata(&socket_path),
+            Err(error) if error.kind() == ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn drop_preserves_a_replacement_socket() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_root = tempfile::tempdir().unwrap();
+        let socket_path = socket_root.path().join("agent.sock");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let bound_identity = socket_identity(&socket_path);
+        fs::remove_file(&socket_path).unwrap();
+        let replacement = UnixListener::bind(&socket_path).unwrap();
+        let replacement_identity = socket_identity(&socket_path);
+        assert_ne!(replacement_identity, bound_identity);
+
+        drop(server);
+
+        assert_eq!(socket_identity(&socket_path), replacement_identity);
+        let stream = UnixStream::connect(&socket_path).unwrap();
+        drop(stream);
+        drop(replacement);
+    }
+
+    #[test]
+    fn drop_removes_the_unchanged_bound_socket() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_root = tempfile::tempdir().unwrap();
+        let socket_path = socket_root.path().join("agent.sock");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        assert_eq!(
+            (server.endpoint.socket_device, server.endpoint.socket_inode),
+            socket_identity(&socket_path)
+        );
+
+        drop(server);
+
+        assert!(matches!(
+            fs::symlink_metadata(&socket_path),
+            Err(error) if error.kind() == ErrorKind::NotFound
+        ));
+    }
+
     #[test]
     fn hello_round_trip_over_unix_socket() {
         let workspace = tempfile::tempdir().unwrap();
@@ -496,7 +1359,9 @@ mod tests {
         assert_eq!(response.id.as_deref(), Some("req_1"));
         assert_eq!(response.method.as_deref(), Some("hello"));
         let result = response.result.unwrap();
+        assert_eq!(result["daemon_version"], plato_protocol::BUILD_IDENTITY);
         assert_eq!(result["workspace_id"], paths.workspace_id);
+        assert!(result.get("daemon_scope").is_none());
         assert_eq!(
             result["capabilities"],
             serde_json::json!([
@@ -511,9 +1376,168 @@ mod tests {
                 "transcript.read",
                 "transcript.read.typed",
                 "transcript.read.pending_approval",
-                "daemon.shutdown_if_idle"
+                "daemon.status",
+                "daemon.shutdown_if_idle",
+                "thread.spawn",
+                "thread.list",
+                "thread.status",
+                "thread.send",
+                "thread.events"
             ])
         );
+    }
+
+    #[test]
+    fn host_hello_reports_scope_and_existing_build_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        paths::with_test_xdg(root.path(), || {
+            let server = HostDaemonServer::bind().unwrap();
+            let socket_path = server.socket_path().to_path_buf();
+            let workspace_id = paths::workspace_id(&workspace).unwrap();
+            assert_eq!(socket_path, paths::host_socket_path().unwrap());
+            assert_ne!(socket_path, paths::default_socket_path(&workspace).unwrap());
+
+            let handle = thread::spawn(move || server.serve_next().unwrap());
+            let mut stream = UnixStream::connect(&socket_path).unwrap();
+            writeln!(
+                stream,
+                r#"{{"v":1,"id":"host_hello","kind":"request","method":"hello","params":{{"workspace_root":"{}","workspace_id":"{}"}}}}"#,
+                workspace.display(),
+                workspace_id
+            )
+            .unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+
+            let mut raw = String::new();
+            stream.read_to_string(&mut raw).unwrap();
+            handle.join().unwrap();
+            let response: Envelope = serde_json::from_str(raw.trim()).unwrap();
+            let result = response.result.unwrap();
+
+            assert_eq!(response.kind, EnvelopeKind::Response);
+            assert_eq!(result["daemon_scope"], "host");
+            assert_eq!(result["daemon_version"], plato_protocol::BUILD_IDENTITY);
+            assert_eq!(result["workspace_id"], workspace_id);
+            assert_eq!(
+                Path::new(result["ledger_path"].as_str().unwrap()),
+                paths::default_sqlite_path(&workspace).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn daemon_status_uses_authorized_config_and_keeps_secrets_out_of_every_response() {
+        const KEY_ENV: &str = "PLATO_STATUS_TEST_SECRET_NAME";
+        const SECRET: &str = "plato-status-secret-sentinel-355";
+
+        temp_env::with_var(KEY_ENV, Some(SECRET), || {
+            let workspace = tempfile::tempdir().unwrap();
+            let socket_dir = tempfile::tempdir().unwrap();
+            let config_path = workspace.path().join("status.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+[provider]
+kind = "open_ai"
+model = "requested-status-alias"
+api_key_env = "{KEY_ENV}"
+base_url = "https://example.invalid/v1"
+"#,
+                ),
+            )
+            .unwrap();
+            let server = DaemonServer::bind(
+                workspace.path(),
+                Some(socket_dir.path().join("status.sock")),
+            )
+            .unwrap();
+            let paths = server.paths().clone();
+            let request = |id: &str, session_id: Option<&str>, config_path: &Path| {
+                json!({
+                    "v": 1,
+                    "id": id,
+                    "kind": "request",
+                    "method": "daemon.status",
+                    "params": {
+                        "session_id": session_id,
+                        "config_path": config_path
+                    }
+                })
+                .to_string()
+            };
+
+            let first = server.handle_line(&request("status_1", None, &config_path));
+            let first_wire = serde_json::to_string(&first).unwrap();
+            let first: DaemonStatusResult = serde_json::from_value(first.result.unwrap()).unwrap();
+            thread::sleep(Duration::from_millis(5));
+            let second = server.handle_line(&request("status_2", None, &config_path));
+            let second_wire = serde_json::to_string(&second).unwrap();
+            let second: DaemonStatusResult =
+                serde_json::from_value(second.result.unwrap()).unwrap();
+
+            assert_eq!(first.model.requested_alias, "requested-status-alias");
+            assert_eq!(first.model.served_model, None);
+            assert_eq!(first.model.provider_kind, DaemonStatusProviderKind::OpenAi);
+            assert!(first.model.key_present);
+            assert_eq!(
+                first.daemon.endpoint_path,
+                paths.socket_path.to_string_lossy()
+            );
+            assert_eq!(first.daemon.workspace_id, paths.workspace_id);
+            let mut build_identity = plato_protocol::BUILD_IDENTITY.split_whitespace();
+            assert_eq!(first.daemon.package_version, build_identity.next().unwrap());
+            assert_eq!(
+                first.daemon.build_commit.as_deref(),
+                build_identity.next().filter(|part| *part != "unknown")
+            );
+            assert_eq!(
+                first.daemon.build_date_utc.as_deref(),
+                build_identity.next().filter(|part| *part != "unknown")
+            );
+            assert!(second.daemon.uptime_ms > first.daemon.uptime_ms);
+            assert_eq!(first.session.session_id, None);
+            assert_eq!(first.session.latest_run_id, None);
+            assert_eq!(first.session.human_turn_count, 0);
+            assert_eq!(first.session.core_event_count, 0);
+            assert_eq!(first.usage.last_run.unknown_response_count, 0);
+            assert_eq!(first.usage.session.unknown_response_count, 0);
+            assert_eq!(first.trust.approval_granted_count, 0);
+            assert_eq!(first.trust.approval_denied_count, 0);
+            assert!(!paths.ledger_path.exists());
+            for wire in [&first_wire, &second_wire] {
+                assert!(!wire.contains(KEY_ENV));
+                assert!(!wire.contains(SECRET));
+            }
+
+            let missing = server.handle_line(&request(
+                "status_missing",
+                Some("missing-session"),
+                &config_path,
+            ));
+            assert_eq!(missing.kind, EnvelopeKind::Error);
+            assert_eq!(missing.error.as_ref().unwrap().code, ERROR_NOT_FOUND);
+            let missing_wire = serde_json::to_string(&missing).unwrap();
+            assert!(!missing_wire.contains(KEY_ENV));
+            assert!(!missing_wire.contains(SECRET));
+
+            let invalid_config = workspace.path().join("invalid-status.toml");
+            fs::write(
+                &invalid_config,
+                format!(
+                    "[provider]\nkind = \"open_ai\"\napi_key_env = \"{KEY_ENV}\"\nfuture = \"{SECRET}\"\n"
+                ),
+            )
+            .unwrap();
+            let invalid = server.handle_line(&request("status_invalid", None, &invalid_config));
+            assert_eq!(invalid.kind, EnvelopeKind::Error);
+            assert_eq!(invalid.error.as_ref().unwrap().code, ERROR_INTERNAL);
+            let invalid_wire = serde_json::to_string(&invalid).unwrap();
+            assert!(!invalid_wire.contains(KEY_ENV));
+            assert!(!invalid_wire.contains(SECRET));
+        });
     }
 
     #[test]
@@ -637,11 +1661,11 @@ mod tests {
             outcome => panic!("post-ack connection did not close: {outcome:?}"),
         }
         assert!(!socket_path.exists());
-        assert!(!lock_path.exists());
+        assert!(lock_path.exists());
     }
 
     #[test]
-    fn two_workspaces_flush_shutdown_responses_then_remove_their_paths() {
+    fn two_workspaces_flush_shutdown_responses_and_leave_persistent_locks() {
         let first_workspace = tempfile::tempdir().unwrap();
         let second_workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
@@ -677,8 +1701,11 @@ mod tests {
         first_handle.join().unwrap();
         second_handle.join().unwrap();
 
-        for path in [first_socket, first_lock, second_socket, second_lock] {
+        for path in [first_socket, second_socket] {
             assert!(!path.exists(), "shutdown left {}", path.display());
+        }
+        for path in [first_lock, second_lock] {
+            assert!(path.exists(), "shutdown removed {}", path.display());
         }
     }
 
@@ -689,6 +1716,7 @@ mod tests {
         let socket_path = socket_dir.path().join("agent.sock");
         let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
         let paths = server.paths().clone();
+        let runtime = server.runtime.clone();
         let record = Arc::new(RunRecord::new(
             "run_1".into(),
             "session_1".into(),
@@ -696,7 +1724,7 @@ mod tests {
         ));
         record.approvals.lock().unwrap().insert(
             "call_1".into(),
-            PendingApproval::new(pending_request("run_1", "call_1")),
+            PendingApproval::new("session_1".into(), pending_request("run_1", "call_1")),
         );
         server.runtime.reserve_run(record.clone()).unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -731,7 +1759,7 @@ mod tests {
         .unwrap();
         assert_eq!(read_envelope(&mut reader).kind, EnvelopeKind::Response);
         record.approvals.lock().unwrap().clear();
-        record.set_finished("done".into());
+        runtime.finish_run(&record, "done".into());
         writeln!(
             stream,
             r#"{{"v":1,"id":"shutdown_2","kind":"request","method":"daemon.shutdown_if_idle","params":{{}}}}"#
@@ -743,7 +1771,7 @@ mod tests {
 
         handle.join().unwrap();
         assert!(!socket_path.exists());
-        assert!(!paths.lock_path.exists());
+        assert!(paths.lock_path.exists());
     }
 
     #[test]
@@ -805,6 +1833,65 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
     }
 
     #[test]
+    fn daemon_run_start_uses_shared_platonic_memory_context() {
+        let provider = spawn_text_provider("done");
+        let workspace = tempfile::tempdir().unwrap();
+        let memory = "daemon workspace memory";
+        std::fs::write(workspace.path().join("PLATONIC.md"), memory).unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let config_path = workspace.path().join("plato.toml");
+        write_provider_config(&config_path, &provider.base_url, "file.read");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+
+        let response = server.handle_line(&format!(
+            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"hello","config_path":"{}","wait":true}}}}"#,
+            config_path.display()
+        ));
+        let result = response.result.unwrap();
+        let request = http_request_json(&provider.handle.join().unwrap());
+        let ledger = SqliteLedger::open_readonly(&server.paths().ledger_path).unwrap();
+        let (_, records) = ledger.read_latest_run().unwrap();
+        let context = records
+            .iter()
+            .find_map(|record| match &record.event {
+                HarnessEvent::ContextBuilt { context, .. } => Some(context),
+                _ => None,
+            })
+            .unwrap();
+        let retrieved = context
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.lane == platonic_core::ContextLane::RetrievedContext)
+            .collect::<Vec<_>>();
+
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        assert_eq!(result["status"], "finished");
+        assert_eq!(
+            request["messages"][0]["content"],
+            format!("{}\n\n{memory}", crate::model::system_prompt())
+        );
+        assert_eq!(
+            request["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .matches(memory)
+                .count(),
+            1
+        );
+        assert_eq!(retrieved.len(), 1);
+        assert_eq!(retrieved[0].source, "PLATONIC.md");
+        assert_eq!(retrieved[0].content, memory);
+        assert!(
+            context
+                .fragments
+                .iter()
+                .find(|fragment| { fragment.lane == platonic_core::ContextLane::RecentTurns })
+                .is_some_and(|fragment| !fragment.content.contains(memory))
+        );
+    }
+
+    #[test]
     fn run_start_without_wait_exposes_and_clears_approval_on_same_connection() {
         let provider = spawn_tool_call_provider();
         let workspace = tempfile::tempdir().unwrap();
@@ -835,8 +1922,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         for attempt in 0..100 {
             writeln!(
                 stream,
-                r#"{{"v":1,"id":"events_{attempt}","kind":"request","method":"events.stream","params":{{"run_id":"{}","from_offset":0,"limit":32}}}}"#,
-                run_id
+                r#"{{"v":1,"id":"events_{attempt}","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":32}}}}"#
             )
             .unwrap();
             let response = read_envelope(&mut reader);
@@ -856,8 +1942,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         writeln!(
             stream,
-            r#"{{"v":1,"id":"transcript_pending","kind":"request","method":"transcript.read","params":{{"run_id":"{}"}}}}"#,
-            run_id
+            r#"{{"v":1,"id":"transcript_pending","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
         )
         .unwrap();
         let response = read_envelope(&mut reader);
@@ -876,8 +1961,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         writeln!(
             stream,
-            r#"{{"v":1,"id":"grant_1","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"grant"}}}}"#,
-            run_id
+            r#"{{"v":1,"id":"grant_1","kind":"request","method":"approval.decide","params":{{"run_id":"{run_id}","tool_call_id":"call_1","decision":"grant"}}}}"#
         )
         .unwrap();
         let response = read_envelope(&mut reader);
@@ -886,8 +1970,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         writeln!(
             stream,
-            r#"{{"v":1,"id":"transcript_resolved","kind":"request","method":"transcript.read","params":{{"run_id":"{}"}}}}"#,
-            run_id
+            r#"{{"v":1,"id":"transcript_resolved","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
         )
         .unwrap();
         let response = read_envelope(&mut reader);
@@ -897,6 +1980,140 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         stream.shutdown(std::net::Shutdown::Write).unwrap();
         handle.join().unwrap();
         let _provider_request = provider.handle.join().unwrap();
+    }
+
+    #[test]
+    fn shell_session_grant_is_session_scoped_daemon_lifetime_and_records_exact_actors() {
+        let provider = spawn_shell_run_sequence_provider(&[
+            "printf once > session-shell.txt",
+            "printf session >> session-shell.txt",
+            "printf repeat >> session-shell.txt",
+            "printf other >> other-shell.txt",
+            "printf restart >> restart-shell.txt",
+        ]);
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let config_path = workspace.path().join("plato.toml");
+        write_provider_config(&config_path, &provider.base_url, SHELL_EXEC);
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+
+        let first = start_test_run(&server, &config_path, "allow once");
+        let session_id = first.session_id.clone();
+        wait_for_pending_call(&server, &first.run_id, "call_1");
+        let allowed_once = server.handle_line(&format!(
+            r#"{{"v":1,"id":"allow_once","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"grant"}}}}"#,
+            first.run_id
+        ));
+        assert_eq!(allowed_once.kind, EnvelopeKind::Response);
+        wait_for_finished_run(&server, &first.run_id);
+
+        let establishing = append_test_run(&server, &config_path, &session_id, "grant session");
+        wait_for_pending_call(&server, &establishing.run_id, "call_1");
+        let granted_session = server.handle_line(&format!(
+            r#"{{"v":1,"id":"grant_session","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"grant_session"}}}}"#,
+            establishing.run_id
+        ));
+        assert_eq!(granted_session.kind, EnvelopeKind::Response);
+        wait_for_finished_run(&server, &establishing.run_id);
+
+        let status = server.handle_line(&format!(
+            r#"{{"v":1,"id":"status_granted","kind":"request","method":"daemon.status","params":{{"session_id":"{session_id}","config_path":"{}"}}}}"#,
+            config_path.display()
+        ));
+        assert_eq!(status.kind, EnvelopeKind::Response);
+        assert_eq!(status.result.unwrap()["trust"]["shell_session_grant"], true);
+
+        let repeated = append_test_run(&server, &config_path, &session_id, "repeat shell");
+        assert_run_finishes_without_pending_approval(&server, &repeated.run_id);
+
+        let different = start_test_run(&server, &config_path, "different session");
+        assert_ne!(different.session_id, session_id);
+        wait_for_pending_call(&server, &different.run_id, "call_1");
+        let other_status = server.handle_line(&format!(
+            r#"{{"v":1,"id":"status_other","kind":"request","method":"daemon.status","params":{{"session_id":"{}","config_path":"{}"}}}}"#,
+            different.session_id,
+            config_path.display()
+        ));
+        assert_eq!(other_status.kind, EnvelopeKind::Response);
+        assert_eq!(
+            other_status.result.unwrap()["trust"]["shell_session_grant"],
+            false
+        );
+        let denied = server.handle_line(&format!(
+            r#"{{"v":1,"id":"deny_other","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"deny","reason":"not this session"}}}}"#,
+            different.run_id
+        ));
+        assert_eq!(denied.kind, EnvelopeKind::Response);
+        wait_for_finished_run(&server, &different.run_id);
+        assert_run_denial_facts(
+            &server.paths().ledger_path,
+            &different.run_id,
+            "daemon",
+            "not this session",
+        );
+
+        let transcript = server.handle_line(&format!(
+            r#"{{"v":1,"id":"transcript_actors","kind":"request","method":"transcript.read","params":{{"session_id":"{session_id}"}}}}"#
+        ));
+        let typed: TypedTranscript =
+            serde_json::from_value(transcript.result.unwrap()["typed"].clone()).unwrap();
+        let actors = typed
+            .runs
+            .iter()
+            .flat_map(|run| &run.entries)
+            .filter_map(|entry| match entry {
+                TypedTranscriptEntry::Approval { actor_id, .. } => Some(actor_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actors, vec!["daemon", "tui_session_grant", "session_grant"]);
+
+        let ledger_path = server.paths().ledger_path.clone();
+        assert_run_approval_facts(&ledger_path, &first.run_id, "daemon");
+        assert_run_approval_facts(&ledger_path, &establishing.run_id, "tui_session_grant");
+        assert_run_approval_facts(&ledger_path, &repeated.run_id, "session_grant");
+        let replay = crate::replay::replay_sqlite(&ledger_path, Some(&repeated.run_id)).unwrap();
+        assert!(replay.contains("approval_granted call_1 by session_grant"));
+
+        drop(server);
+        let restarted = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let after_restart = append_test_run(
+            &restarted,
+            &config_path,
+            &session_id,
+            "restart expires grant",
+        );
+        wait_for_pending_call(&restarted, &after_restart.run_id, "call_1");
+        let restarted_status = restarted.handle_line(&format!(
+            r#"{{"v":1,"id":"status_restarted","kind":"request","method":"daemon.status","params":{{"session_id":"{session_id}","config_path":"{}"}}}}"#,
+            config_path.display()
+        ));
+        assert_eq!(restarted_status.kind, EnvelopeKind::Response);
+        assert_eq!(
+            restarted_status.result.unwrap()["trust"]["shell_session_grant"],
+            false
+        );
+        let denied = restarted.handle_line(&format!(
+            r#"{{"v":1,"id":"deny_restarted","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"deny"}}}}"#,
+            after_restart.run_id
+        ));
+        assert_eq!(denied.kind, EnvelopeKind::Response);
+        wait_for_finished_run(&restarted, &after_restart.run_id);
+        assert_run_denial_facts(
+            &restarted.paths().ledger_path,
+            &after_restart.run_id,
+            "daemon",
+            "approval denied by daemon client",
+        );
+
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("session-shell.txt")).unwrap(),
+            "oncesessionrepeat"
+        );
+        assert!(!workspace.path().join("other-shell.txt").exists());
+        assert!(!workspace.path().join("restart-shell.txt").exists());
+        assert_eq!(provider.handle.join().unwrap().len(), 10);
     }
 
     #[test]
@@ -928,6 +2145,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
         ));
         assert_eq!(response.kind, EnvelopeKind::Response);
+        assert_eq!(
+            response.result.as_ref().unwrap()["status"],
+            "cancel_requested"
+        );
         assert!(record.approvals.lock().unwrap().is_empty());
         assert_eq!(record.pending_approval(), None);
         let transcript = server.handle_line(&format!(
@@ -941,7 +2162,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(stale.kind, EnvelopeKind::Error);
         assert_eq!(stale.error.unwrap().code, ERROR_NOT_FOUND);
         let deadline = Instant::now() + Duration::from_secs(2);
-        while record.status().state == RunStateName::Running {
+        while matches!(
+            record.status().state,
+            RunStateName::Running | RunStateName::CancelRequested
+        ) {
             assert!(
                 Instant::now() < deadline,
                 "canceled approval worker did not exit"
@@ -1002,6 +2226,113 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(error.message, "run did not finish: run canceled");
         assert_canceled_terminal(&server, &record);
         provider.handle.join().unwrap();
+    }
+
+    #[test]
+    fn stalled_provider_cancel_reaches_terminal_daemon_readback_within_500_ms() {
+        let provider = spawn_stalled_text_provider();
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let config_path = workspace.path().join("plato.toml");
+        write_provider_config(&config_path, &provider.base_url, "file.read");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+
+        let started = server.handle_line(&format!(
+            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"wait for an answer","config_path":"{}"}}}}"#,
+            config_path.display()
+        ));
+        assert_eq!(started.kind, EnvelopeKind::Response);
+        let started = started.result.unwrap();
+        let run_id = started["run_id"].as_str().unwrap().to_owned();
+        let session_id = started["session_id"].as_str().unwrap().to_owned();
+        let record = server.runtime.state.lock().unwrap().runs[&run_id].clone();
+
+        provider
+            .ready_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let cancel = server.handle_line(&format!(
+            r#"{{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
+        ));
+        assert_eq!(cancel.kind, EnvelopeKind::Response);
+        assert_eq!(cancel.result.unwrap()["status"], "cancel_requested");
+
+        let accepted_at = Instant::now();
+        while matches!(
+            record.status().state,
+            RunStateName::Running | RunStateName::CancelRequested
+        ) {
+            assert!(
+                accepted_at.elapsed() < Duration::from_millis(500),
+                "stalled provider remained cancel_requested"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_canceled_terminal(&server, &record);
+
+        let events = server.handle_line(&format!(
+            r#"{{"v":1,"id":"events_1","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0}}}}"#
+        ));
+        assert_eq!(events.kind, EnvelopeKind::Response);
+        assert_eq!(events.result.unwrap()["status"], "canceled");
+        let sessions = server
+            .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
+        assert_eq!(sessions.kind, EnvelopeKind::Response);
+        let sessions = sessions.result.unwrap();
+        assert_eq!(sessions["sessions"][0]["session_id"], session_id);
+        assert_eq!(sessions["sessions"][0]["status"], "canceled");
+        let transcript = server.handle_line(&format!(
+            r#"{{"v":1,"id":"transcript_1","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
+        ));
+        assert_eq!(transcript.kind, EnvelopeKind::Response);
+        assert_eq!(transcript.result.as_ref().unwrap()["status"], "canceled");
+        assert!(
+            transcript.result.unwrap()["transcript"]
+                .as_str()
+                .unwrap()
+                .contains("run canceled")
+        );
+        let replay =
+            crate::replay::replay_sqlite_session(&server.paths().ledger_path, &session_id).unwrap();
+        assert!(replay.contains("final_phase: Failed"));
+        assert!(replay.contains("run canceled"));
+        let elapsed = accepted_at.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "daemon terminal/session readback took {elapsed:?}"
+        );
+
+        provider.release_sender.send(()).unwrap();
+        let request = provider.handle.join().unwrap();
+        assert!(request.starts_with("POST /chat/completions "));
+        let ledger = SqliteLedger::open_readonly(&server.paths().ledger_path).unwrap();
+        let run = ledger
+            .read_session(&session_id)
+            .unwrap()
+            .runs
+            .into_iter()
+            .find(|run| run.run_id == run_id)
+            .unwrap();
+        assert_eq!(
+            run.records
+                .iter()
+                .filter(|record| matches!(record.event, HarnessEvent::ModelRequested { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            run.records
+                .iter()
+                .filter(|record| matches!(record.event, HarnessEvent::RunFailed { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !run.records
+                .iter()
+                .any(|record| matches!(record.event, HarnessEvent::ModelResponded { .. }))
+        );
     }
 
     #[test]
@@ -1213,7 +2544,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             "session_1".into(),
             server.paths().ledger_path.clone(),
         ));
-        record.push_event(json!({"kind": "test"}));
+        record.push_event(StreamEvent::Unknown(json!({"kind": "test"})));
         server
             .runtime
             .state
@@ -1244,8 +2575,8 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             "session_1".into(),
             server.paths().ledger_path.clone(),
         ));
-        record.push_event(json!({"kind": "first"}));
-        record.push_event(json!({"kind": "second"}));
+        record.push_event(StreamEvent::Unknown(json!({"kind": "first"})));
+        record.push_event(StreamEvent::Unknown(json!({"kind": "second"})));
         server
             .runtime
             .state
@@ -1281,7 +2612,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             server.paths().ledger_path.clone(),
         ));
         for index in 0..(MAX_EVENT_BUFFER + 1) {
-            record.push_event(json!({"index": index}));
+            record.push_event(StreamEvent::Unknown(json!({
+                "kind": "fixture",
+                "index": index
+            })));
         }
         server
             .runtime
@@ -1312,24 +2646,22 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             "session_1".into(),
             server.paths().ledger_path.clone(),
         ));
-        record.set_finished("done".into());
         for index in 0..(MAX_EVENT_BUFFER + 1) {
-            record.push_event(json!({"index": index}));
+            record.push_event(StreamEvent::Unknown(json!({
+                "kind": "fixture",
+                "index": index
+            })));
         }
-        server
-            .runtime
-            .state
-            .lock()
-            .unwrap()
-            .runs
-            .insert("run_1".into(), record);
+        server.runtime.reserve_run(record.clone()).unwrap();
+        server.runtime.finish_run(&record, "done".into());
         let handle = thread::spawn(move || server.serve_next().unwrap());
         let mut client = DaemonClient::connect(&socket_path).unwrap();
 
         let error = client.events_stream("run_1", Some(0), 16).unwrap_err();
         assert!(matches!(
             error,
-            AppError::DaemonResponse(ProtocolError { code, .. }) if code == ERROR_LAGGED
+            crate::daemon::client::ClientError::DaemonResponse(ProtocolError { code, .. })
+                if code == ERROR_LAGGED
         ));
 
         let tail = client.events_stream("run_1", None, 16).unwrap();
@@ -1344,6 +2676,65 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         drop(client);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn evicted_terminal_run_loses_only_transient_event_readback() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let server =
+            DaemonServer::bind(workspace.path(), Some(socket_dir.path().join("agent.sock")))
+                .unwrap();
+        seed_finished_session(
+            &server.paths().ledger_path,
+            "run_0",
+            "session_0",
+            "persisted answer",
+        );
+        for index in 0..=MAX_TERMINAL_RUNS {
+            let record = Arc::new(RunRecord::new(
+                format!("run_{index}"),
+                format!("session_{index}"),
+                server.paths().ledger_path.clone(),
+            ));
+            record.push_event(StreamEvent::Unknown(json!({
+                "kind": "fixture",
+                "index": index
+            })));
+            server.runtime.reserve_run(record.clone()).unwrap();
+            server
+                .runtime
+                .finish_run(&record, format!("answer {index}"));
+        }
+
+        let evicted = server.handle_line(
+            r#"{"v":1,"id":"events_old","kind":"request","method":"events.stream","params":{"run_id":"run_0"}}"#,
+        );
+        assert_eq!(evicted.kind, EnvelopeKind::Error);
+        assert_eq!(evicted.error.unwrap().code, ERROR_NOT_FOUND);
+
+        let retained = server.handle_line(&format!(
+            r#"{{"v":1,"id":"events_new","kind":"request","method":"events.stream","params":{{"run_id":"run_{MAX_TERMINAL_RUNS}"}}}}"#
+        ));
+        assert_eq!(retained.kind, EnvelopeKind::Response);
+        let retained = retained.result.unwrap();
+        assert_eq!(retained["from_offset"], 1);
+        assert_eq!(retained["next_offset"], 1);
+        assert_eq!(retained["events"], json!([]));
+        assert_eq!(retained["status"], "finished");
+
+        let transcript = server.handle_line(
+            r#"{"v":1,"id":"transcript","kind":"request","method":"transcript.read","params":{"run_id":"run_0"}}"#,
+        );
+        assert_eq!(transcript.kind, EnvelopeKind::Response);
+        let transcript = transcript.result.unwrap();
+        assert_eq!(transcript["status"], "finished");
+        assert_eq!(transcript["final_answer"], "persisted answer");
+
+        let sessions = server
+            .handle_line(r#"{"v":1,"id":"sessions","kind":"request","method":"sessions.list"}"#);
+        assert_eq!(sessions.kind, EnvelopeKind::Response);
+        assert_eq!(sessions.result.unwrap()["sessions"][0]["run_id"], "run_0");
     }
 
     #[test]
@@ -1401,14 +2792,17 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         let record = runtime.state.lock().unwrap().runs[&started.run_id].clone();
         for index in 0..(MAX_EVENT_BUFFER + 1) {
-            record.push_event(json!({"kind": "filler", "index": index}));
+            record.push_event(StreamEvent::Unknown(
+                json!({"kind": "filler", "index": index}),
+            ));
         }
         let error = client
             .events_stream(&started.run_id, Some(0), 16)
             .unwrap_err();
         assert!(matches!(
             error,
-            AppError::DaemonResponse(ProtocolError { code, .. }) if code == ERROR_LAGGED
+            crate::daemon::client::ClientError::DaemonResponse(ProtocolError { code, .. })
+                if code == ERROR_LAGGED
         ));
         drop(client);
 
@@ -1436,7 +2830,8 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             .unwrap_err();
         assert!(matches!(
             stale,
-            AppError::DaemonResponse(ProtocolError { code, .. }) if code == ERROR_NOT_FOUND
+            crate::daemon::client::ClientError::DaemonResponse(ProtocolError { code, .. })
+                if code == ERROR_NOT_FOUND
         ));
         assert_eq!(
             client
@@ -1526,6 +2921,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
                         "run_id": "run_2",
                         "session_index": 1,
                         "status": "finished",
+                        "model_status": {"state": "responded"},
                         "entries": [
                             {"kind": "user", "text": "second question"},
                             {"kind": "assistant", "text": "second answer"}
@@ -1562,6 +2958,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
                             "run_id": "run_1",
                             "session_index": 0,
                             "status": "finished",
+                            "model_status": {"state": "responded"},
                             "entries": [
                                 {"kind": "user", "text": "first question"},
                                 {"kind": "assistant", "text": "first answer"}
@@ -1571,6 +2968,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
                             "run_id": "run_2",
                             "session_index": 1,
                             "status": "finished",
+                            "model_status": {"state": "responded"},
                             "entries": [
                                 {"kind": "user", "text": "second question"},
                                 {"kind": "assistant", "text": "second answer"}
@@ -1618,7 +3016,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         ));
         record.approvals.lock().unwrap().insert(
             "call_1".into(),
-            PendingApproval::new(pending_request("run_1", "call_1")),
+            PendingApproval::new("session_1".into(), pending_request("run_1", "call_1")),
         );
         server
             .runtime
@@ -1629,16 +3027,39 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             .insert("run_1".into(), record.clone());
         assert!(record.pending_approval().is_some());
 
+        for invalid_params in [
+            r#"{"run_id":"run_1","tool_call_id":"call_1","decision":"granted"}"#,
+            r#"{"run_id":"run_1","tool_call_id":"call_1","decision":"grant","extra":true}"#,
+        ] {
+            let response = server.handle_line(&format!(
+                r#"{{"v":1,"id":"invalid","kind":"request","method":"approval.decide","params":{invalid_params}}}"#
+            ));
+
+            assert_eq!(response.kind, EnvelopeKind::Error);
+            assert_eq!(response.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+            assert_eq!(record.approvals.lock().unwrap()["call_1"].decision, None);
+            assert!(record.pending_approval().is_some());
+        }
+
         let response = server.handle_line(
             r#"{"v":1,"id":"approval_1","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"grant"}}"#,
         );
 
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(
-            record.approvals.lock().unwrap()["call_1"].decision,
-            Some(ApprovalOutcome::Granted)
+            record.approvals.lock().unwrap()["call_1"]
+                .decision
+                .as_ref()
+                .map(|decision| decision.decision),
+            Some(crate::daemon::protocol::ApprovalDecision::Grant)
         );
         assert_eq!(record.pending_approval(), None);
+
+        let duplicate = server.handle_line(
+            r#"{"v":1,"id":"approval_duplicate","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"grant"}}"#,
+        );
+        assert_eq!(duplicate.kind, EnvelopeKind::Response);
+        assert_eq!(server.runtime.session_tool_grant_count(), 0);
 
         let stale = server.handle_line(
             r#"{"v":1,"id":"approval_2","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"deny","reason":"too late"}}"#,
@@ -1646,10 +3067,36 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(stale.kind, EnvelopeKind::Error);
         assert_eq!(stale.error.unwrap().code, ERROR_NOT_FOUND);
         assert_eq!(
-            record.approvals.lock().unwrap()["call_1"].decision,
-            Some(ApprovalOutcome::Granted)
+            record.approvals.lock().unwrap()["call_1"]
+                .decision
+                .as_ref()
+                .map(|decision| decision.decision),
+            Some(crate::daemon::protocol::ApprovalDecision::Grant)
         );
         assert_eq!(record.pending_approval(), None);
+
+        record.approvals.lock().unwrap().insert(
+            "call_2".into(),
+            PendingApproval::new("session_1".into(), pending_request("run_1", "call_2")),
+        );
+        let denied = server.handle_line(
+            r#"{"v":1,"id":"approval_3","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_2","decision":"deny"}}"#,
+        );
+        assert_eq!(denied.kind, EnvelopeKind::Response);
+        assert_eq!(
+            record.approvals.lock().unwrap()["call_2"]
+                .decision
+                .as_ref()
+                .map(|decision| decision.decision),
+            Some(crate::daemon::protocol::ApprovalDecision::Deny)
+        );
+        assert_eq!(record.pending_approval(), None);
+
+        let duplicate = server.handle_line(
+            r#"{"v":1,"id":"approval_4","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_2","decision":"deny"}}"#,
+        );
+        assert_eq!(duplicate.kind, EnvelopeKind::Response);
+        assert_eq!(server.runtime.session_tool_grant_count(), 0);
     }
 
     #[test]
@@ -1673,7 +3120,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let mut approvals = record.approvals.lock().unwrap();
         approvals.insert(
             "call_1".into(),
-            PendingApproval::new(pending_request("run_1", "call_1")),
+            PendingApproval::new("session_1".into(), pending_request("run_1", "call_1")),
         );
         let (sender, receiver) = mpsc::channel();
         let (started_sender, started_receiver) = mpsc::channel();
@@ -1727,6 +3174,21 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(result["sessions"][0]["session_id"], "session_1");
         assert_eq!(result["sessions"][0]["run_id"], "run_1");
         assert_eq!(result["sessions"][0]["status"], "running");
+        assert_eq!(result["sessions"][0]["first_question"], "");
+        assert_eq!(result["sessions"][0]["updated_at_ms"], 0);
+
+        let cancel = server.handle_line(
+            r#"{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"run_id":"run_1"}}"#,
+        );
+        assert_eq!(cancel.kind, EnvelopeKind::Response);
+        assert_eq!(cancel.result.unwrap()["status"], "cancel_requested");
+
+        let response = server
+            .handle_line(r#"{"v":1,"id":"sessions_2","kind":"request","method":"sessions.list"}"#);
+        let result = response.result.unwrap();
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        assert_eq!(result["sessions"][0]["run_id"], "run_1");
+        assert_eq!(result["sessions"][0]["status"], "cancel_requested");
     }
 
     #[test]
@@ -1736,13 +3198,22 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let first_socket = socket_dir.path().join("agent-1.sock");
         let first_server = DaemonServer::bind(workspace.path(), Some(first_socket)).unwrap();
         let ledger_path = first_server.paths().ledger_path.clone();
-        let mut ledger = SqliteLedger::open_or_create(&ledger_path).unwrap();
-        let run_id = RunId::new("run_1").unwrap();
-        ledger
-            .begin_session_run("session_1", &run_id, "first question", true)
-            .unwrap();
-        ledger.finish_session_run(&run_id, "first answer").unwrap();
-        drop(ledger);
+        seed_finished_session_run(
+            &ledger_path,
+            "run_1",
+            "session_1",
+            "first question",
+            "first answer",
+            true,
+        );
+        seed_finished_session_run(
+            &ledger_path,
+            "run_2",
+            "session_1",
+            "approved, go ahead",
+            "second answer",
+            false,
+        );
         drop(first_server);
 
         let second_socket = socket_dir.path().join("agent-2.sock");
@@ -1753,9 +3224,14 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(result["sessions"][0]["session_id"], "session_1");
-        assert_eq!(result["sessions"][0]["run_id"], "run_1");
+        assert_eq!(result["sessions"][0]["run_id"], "run_2");
         assert_eq!(result["sessions"][0]["status"], "finished");
-        assert_eq!(result["sessions"][0]["latest_question"], "first question");
+        assert_eq!(
+            result["sessions"][0]["latest_question"],
+            "approved, go ahead"
+        );
+        assert_eq!(result["sessions"][0]["first_question"], "first question");
+        assert!(result["sessions"][0]["updated_at_ms"].as_u64().unwrap() > 0);
     }
 
     #[test]
@@ -1802,12 +3278,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let first_socket = socket_dir.path().join("agent-1.sock");
         let first_server = DaemonServer::bind(workspace.path(), Some(first_socket)).unwrap();
         let ledger_path = first_server.paths().ledger_path.clone();
-        let mut ledger = SqliteLedger::open_or_create(&ledger_path).unwrap();
-        let run_id = RunId::new("run_1").unwrap();
-        ledger
-            .begin_session_run("session_1", &run_id, "first question", true)
-            .unwrap();
-        drop(ledger);
+        seed_running_session(&ledger_path, "run_1", "session_1", "first question");
         drop(first_server);
 
         let second_socket = socket_dir.path().join("agent-2.sock");
@@ -1829,16 +3300,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let first_socket = socket_dir.path().join("agent-1.sock");
         let first_server = DaemonServer::bind(workspace.path(), Some(first_socket)).unwrap();
         let ledger_path = first_server.paths().ledger_path.clone();
-        let mut ledger = SqliteLedger::open_or_create(&ledger_path).unwrap();
-        ledger
-            .begin_session_run(
-                "session_1",
-                &RunId::new("run_1").unwrap(),
-                "first question",
-                true,
-            )
-            .unwrap();
-        drop(ledger);
+        seed_running_session(&ledger_path, "run_1", "session_1", "first question");
         drop(first_server);
 
         let second_socket = socket_dir.path().join("agent-2.sock");
@@ -1865,14 +3327,15 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
         let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
-        let mut ledger = SqliteLedger::open_or_create(&server.paths().ledger_path).unwrap();
-        let run_id = RunId::new("run_1").unwrap();
         let long_question = format!("{}\nsecond line", "x".repeat(130));
-        ledger
-            .begin_session_run("session_1", &run_id, &long_question, true)
-            .unwrap();
-        ledger.finish_session_run(&run_id, "first answer").unwrap();
-        drop(ledger);
+        seed_finished_session_run(
+            &server.paths().ledger_path,
+            "run_1",
+            "session_1",
+            &long_question,
+            "first answer",
+            true,
+        );
 
         let response = server
             .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
@@ -1883,6 +3346,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             result["sessions"][0]["latest_question"],
             format!("{}...", "x".repeat(120))
         );
+        assert_eq!(result["sessions"][0]["first_question"], long_question);
     }
 
     #[test]
@@ -1923,15 +3387,14 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let config_path = workspace.path().join("plato.toml");
         write_provider_config(&config_path, &provider.base_url, "file.write");
         let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
-        let mut ledger = SqliteLedger::open_or_create(&server.paths().ledger_path).unwrap();
-        let prior_run = RunId::new("run_prior").unwrap();
-        ledger
-            .begin_session_run("session_1", &prior_run, "first question", true)
-            .unwrap();
-        ledger
-            .finish_session_run(&prior_run, "first answer")
-            .unwrap();
-        drop(ledger);
+        seed_finished_session_run(
+            &server.paths().ledger_path,
+            "run_prior",
+            "session_1",
+            "first question",
+            "first answer",
+            true,
+        );
 
         let response = server.handle_line(&format!(
             r#"{{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{{"session_id":"session_1","message":"follow up","config_path":"{}"}}}}"#,
@@ -1945,8 +3408,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let mut approval_seen = false;
         for attempt in 0..100 {
             let response = server.handle_line(&format!(
-                r#"{{"v":1,"id":"events_{attempt}","kind":"request","method":"events.stream","params":{{"run_id":"{}","from_offset":0,"limit":32}}}}"#,
-                run_id
+                r#"{{"v":1,"id":"events_{attempt}","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":32}}}}"#
             ));
             assert_eq!(response.kind, EnvelopeKind::Response);
             let events = response.result.unwrap()["events"].clone();
@@ -1959,8 +3421,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert!(approval_seen);
 
         let response = server.handle_line(&format!(
-            r#"{{"v":1,"id":"deny_1","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"deny","reason":"test done"}}}}"#,
-            run_id
+            r#"{{"v":1,"id":"deny_1","kind":"request","method":"approval.decide","params":{{"run_id":"{run_id}","tool_call_id":"call_1","decision":"deny","reason":"test done"}}}}"#
         ));
         assert_eq!(response.kind, EnvelopeKind::Response);
         let _provider_request = provider.handle.join().unwrap();
@@ -1990,15 +3451,14 @@ enabled = ["file.read"]
         )
         .unwrap();
         let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
-        let mut ledger = SqliteLedger::open_or_create(&server.paths().ledger_path).unwrap();
-        let prior_run = RunId::new("run_prior").unwrap();
-        ledger
-            .begin_session_run("session_1", &prior_run, "first question", true)
-            .unwrap();
-        ledger
-            .finish_session_run(&prior_run, "first answer")
-            .unwrap();
-        drop(ledger);
+        seed_finished_session_run(
+            &server.paths().ledger_path,
+            "run_prior",
+            "session_1",
+            "first question",
+            "first answer",
+            true,
+        );
 
         let response = server.handle_line(&format!(
             r#"{{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{{"session_id":"session_1","message":"follow up","config_path":"{}","wait":true}}}}"#,
@@ -2030,9 +3490,26 @@ enabled = ["file.read"]
         handle: thread::JoinHandle<String>,
     }
 
+    struct TextProvider {
+        base_url: String,
+        handle: thread::JoinHandle<String>,
+    }
+
     struct ConcurrentTextProvider {
         base_url: String,
         handle: thread::JoinHandle<Vec<String>>,
+    }
+
+    struct ShellRunSequenceProvider {
+        base_url: String,
+        handle: thread::JoinHandle<Vec<String>>,
+    }
+
+    struct StalledTextProvider {
+        base_url: String,
+        ready_receiver: mpsc::Receiver<()>,
+        release_sender: mpsc::Sender<()>,
+        handle: thread::JoinHandle<String>,
     }
 
     fn write_provider_config(path: &Path, base_url: &str, enabled_tool: &str) {
@@ -2081,6 +3558,149 @@ enabled = ["{enabled_tool}"]
             request
         });
         ToolCallProvider { base_url, handle }
+    }
+
+    fn spawn_shell_run_sequence_provider(commands: &[&str]) -> ShellRunSequenceProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let commands = commands
+            .iter()
+            .map(|command| command.to_string())
+            .collect::<Vec<_>>();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (index, command) in commands.into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().unwrap();
+                requests.push(read_http_request(&mut stream));
+                let tool_delta = json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": format!("provider_shell_{index}"),
+                                "function": {
+                                    "name": "shell_exec",
+                                    "arguments": json!({"command": command}).to_string()
+                                }
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                });
+                let tool_finish = json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "tool_calls"
+                    }]
+                });
+                let body = format!("data: {tool_delta}\n\ndata: {tool_finish}\n\ndata: [DONE]\n\n");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+
+                let (mut stream, _) = listener.accept().unwrap();
+                requests.push(read_http_request(&mut stream));
+                let content = json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": "done"},
+                        "finish_reason": null
+                    }]
+                });
+                let finish = json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                });
+                let body = format!("data: {content}\n\ndata: {finish}\n\ndata: [DONE]\n\n");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+            requests
+        });
+        ShellRunSequenceProvider { base_url, handle }
+    }
+
+    fn spawn_text_provider(answer: &str) -> TextProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let answer = answer.to_string();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            let content = json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": answer},
+                    "finish_reason": null
+                }]
+            });
+            let finish = json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            });
+            let body = format!("data: {content}\n\ndata: {finish}\n\ndata: [DONE]\n\n");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            request
+        });
+        TextProvider { base_url, handle }
+    }
+
+    fn spawn_stalled_text_provider() -> StalledTextProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 4096\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            ready_sender.send(()).unwrap();
+            release_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+
+            listener.set_nonblocking(true).unwrap();
+            match listener.accept() {
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Ok(_) => panic!("canceled daemon run issued an extra provider request"),
+                Err(error) => panic!("extra-request probe failed: {error}"),
+            }
+            request
+        });
+        StalledTextProvider {
+            base_url,
+            ready_receiver,
+            release_sender,
+            handle,
+        }
     }
 
     fn spawn_concurrent_text_provider() -> ConcurrentTextProvider {
@@ -2173,6 +3793,125 @@ enabled = ["{enabled_tool}"]
         }
     }
 
+    fn start_test_run(server: &DaemonServer, config_path: &Path, question: &str) -> RunStartResult {
+        let response = server.handle_line(&format!(
+            r#"{{"v":1,"id":"start","kind":"request","method":"run.start","params":{{"question":"{question}","config_path":"{}"}}}}"#,
+            config_path.display()
+        ));
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        serde_json::from_value(response.result.unwrap()).unwrap()
+    }
+
+    fn append_test_run(
+        server: &DaemonServer,
+        config_path: &Path,
+        session_id: &str,
+        message: &str,
+    ) -> RunStartResult {
+        let response = server.handle_line(&format!(
+            r#"{{"v":1,"id":"append","kind":"request","method":"message.append","params":{{"session_id":"{session_id}","message":"{message}","config_path":"{}"}}}}"#,
+            config_path.display()
+        ));
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        serde_json::from_value(response.result.unwrap()).unwrap()
+    }
+
+    fn wait_for_pending_call(server: &DaemonServer, run_id: &str, call_id: &str) {
+        let record = server.runtime.state.lock().unwrap().runs[run_id].clone();
+        let deadline = Instant::now() + FAKE_PROVIDER_TIMEOUT;
+        loop {
+            if record
+                .pending_approval()
+                .is_some_and(|pending| pending.tool_call_id == call_id)
+            {
+                return;
+            }
+            assert_eq!(record.status().state, RunStateName::Running);
+            assert!(
+                Instant::now() < deadline,
+                "run {run_id} did not publish pending approval {call_id}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn assert_run_finishes_without_pending_approval(server: &DaemonServer, run_id: &str) {
+        let record = server.runtime.state.lock().unwrap().runs[run_id].clone();
+        let deadline = Instant::now() + FAKE_PROVIDER_TIMEOUT;
+        loop {
+            assert_eq!(record.pending_approval(), None, "run {run_id} prompted");
+            match record.status().state {
+                RunStateName::Finished => return,
+                RunStateName::Running => {}
+                status => panic!("run {run_id} ended as {status}"),
+            }
+            assert!(Instant::now() < deadline, "run {run_id} did not finish");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn assert_run_approval_facts(ledger_path: &Path, run_id: &str, actor: &str) {
+        let records = crate::ledger::read_sqlite_records(ledger_path, Some(run_id)).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    HarnessEvent::PolicyEvaluated {
+                        call_id,
+                        decision: platonic_core::PolicyDecision::RequireApproval { reason },
+                        ..
+                    } => Some((call_id.as_str(), reason.as_str())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![("call_1", "shell.exec requires explicit local approval")]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    HarnessEvent::ApprovalGranted {
+                        call_id, actor_id, ..
+                    } => Some((call_id.as_str(), actor_id.as_str())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![("call_1", actor)]
+        );
+    }
+
+    fn assert_run_denial_facts(ledger_path: &Path, run_id: &str, actor: &str, reason: &str) {
+        let records = crate::ledger::read_sqlite_records(ledger_path, Some(run_id)).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(
+                    record.event,
+                    HarnessEvent::PolicyEvaluated {
+                        decision: platonic_core::PolicyDecision::RequireApproval { .. },
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    HarnessEvent::ApprovalDenied {
+                        call_id,
+                        actor_id,
+                        reason,
+                        ..
+                    } => Some((call_id.as_str(), actor_id.as_str(), reason.as_str())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![("call_1", actor, reason)]
+        );
+    }
+
     fn assert_canceled_terminal(server: &DaemonServer, record: &RunRecord) {
         let status = record.status();
         assert_eq!(status.state, RunStateName::Canceled);
@@ -2197,6 +3936,27 @@ enabled = ["{enabled_tool}"]
 
     fn seed_finished_session(path: &Path, run_id: &str, session_id: &str, answer: &str) {
         seed_finished_session_run(path, run_id, session_id, "question", answer, true);
+    }
+
+    fn seed_running_session(path: &Path, run_id: &str, session_id: &str, question: &str) {
+        let run_id = RunId::new(run_id).unwrap();
+        let mut ledger = SqliteLedger::open_or_create(path).unwrap();
+        ledger
+            .begin_session_run(session_id, &run_id, question, true)
+            .unwrap();
+        ledger
+            .append(
+                run_id.as_str(),
+                &RecordedEvent {
+                    seq: 0,
+                    occurred_at_ms: 0,
+                    event: HarnessEvent::RunStarted {
+                        run_id: run_id.clone(),
+                        agent_id: AgentId::new("agent_1").unwrap(),
+                    },
+                },
+            )
+            .unwrap();
     }
 
     fn seed_finished_session_run(
@@ -2241,10 +4001,11 @@ enabled = ["{enabled_tool}"]
                     content: answer.into(),
                 },
                 proposed_calls: vec![],
-                usage: ModelUsage {
+                served_model: None,
+                usage: Some(ModelUsage {
                     input_tokens: 0,
                     output_tokens: 0,
-                },
+                }),
             },
             HarnessEvent::RunFinished {
                 run_id: run_id.clone(),
@@ -2304,6 +4065,10 @@ enabled = ["{enabled_tool}"]
             bytes.extend_from_slice(&buffer[..read]);
         }
         String::from_utf8(bytes).unwrap()
+    }
+
+    fn http_request_json(request: &str) -> serde_json::Value {
+        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
     }
 
     fn find_header_end(bytes: &[u8]) -> Option<usize> {

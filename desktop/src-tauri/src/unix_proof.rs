@@ -1,12 +1,11 @@
 use super::*;
-use plato_agent::daemon::{
-    lock::LockMetadata,
-    protocol::{RunStateName, ShutdownIfIdleResultName},
-};
+use plato_daemon_client::lock::LockMetadata;
+use plato_protocol::{RunStateName, ShutdownIfIdleResultName};
 use serde_json::json;
 use std::{
     env, fs,
     io::{BufRead, BufReader, Read, Write},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Barrier, Mutex, mpsc},
@@ -28,7 +27,7 @@ fn provisioned_unix_sidecar_lifecycle() {
     assert_eq!(proof_key, PROOF_KEY_VALUE);
 
     shell_exit_detaches_active_daemon(&daemon, &cli);
-    crash_requires_explicit_reconnect(&daemon);
+    crash_reconnect_recovers_lock_in_place(&daemon);
     concurrent_starters_attach_to_one_winner(&daemon);
 }
 
@@ -84,7 +83,10 @@ fn shell_exit_detaches_active_daemon(daemon: &Path, cli: &Path) {
 
     let one_shot = Command::new(cli)
         .current_dir(&workspace_root)
-        .arg("--db")
+        .arg(format!(
+            "--db={}",
+            workspace_root.join("direct-proof.db").display()
+        ))
         .arg("this must fail before provider access")
         .output()
         .unwrap();
@@ -110,10 +112,10 @@ fn shell_exit_detaches_active_daemon(daemon: &Path, cli: &Path) {
         ShutdownIfIdleResultName::Shutdown
     );
     drop(fresh_client);
-    wait_for_runtime_removal(&socket_path, &lock_path);
+    wait_for_socket_removal_with_persistent_lock(&socket_path, &lock_path);
 }
 
-fn crash_requires_explicit_reconnect(daemon: &Path) {
+fn crash_reconnect_recovers_lock_in_place(daemon: &Path) {
     let workspace = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let workspace_root = canonical_workspace(workspace.path()).unwrap();
@@ -128,6 +130,7 @@ fn crash_requires_explicit_reconnect(daemon: &Path) {
     assert!(lifecycle.get_mut().unwrap().spawned_daemon.is_none());
     let metadata: LockMetadata = serde_json::from_slice(&fs::read(&lock_path).unwrap()).unwrap();
     let child_id = metadata.pid;
+    let lock_identity = file_identity(&lock_path);
     let pid = rustix::process::Pid::from_raw(child_id as i32).unwrap();
     rustix::process::kill_process(pid, rustix::process::Signal::KILL).unwrap();
     wait_for_endpoint_close(&socket_path);
@@ -143,27 +146,26 @@ fn crash_requires_explicit_reconnect(daemon: &Path) {
     assert!(lifecycle.get_mut().unwrap().spawned_daemon.is_none());
     assert_eq!(fs::read(&lock_path).unwrap(), stale_lock);
 
-    let started = Instant::now();
-    let reconnect_error =
-        bootstrap_with_lifecycle(&workspace_file, &lifecycle, &launch, None).unwrap_err();
-    assert_eq!(reconnect_error.code, "daemon_start_failed");
-    assert!(
-        reconnect_error
-            .message
-            .contains(socket_path.to_string_lossy().as_ref())
+    let view = bootstrap_with_lifecycle(&workspace_file, &lifecycle, &launch, None).unwrap();
+    assert!(matches!(view, BootstrapView::Ready { .. }));
+    assert!(lifecycle.get_mut().unwrap().spawned_daemon.is_none());
+    let recovered: LockMetadata = serde_json::from_slice(&fs::read(&lock_path).unwrap()).unwrap();
+    assert_ne!(recovered.pid, child_id);
+    assert!(process_is_running(recovered.pid));
+    assert_eq!(file_identity(&lock_path), lock_identity);
+    let mut client = connect_hello_bounded(&socket_path, &workspace_root);
+    assert_eq!(
+        {
+            client.set_timeout(PROOF_TIMEOUT).unwrap();
+            client.shutdown_if_idle().unwrap().result
+        },
+        ShutdownIfIdleResultName::Shutdown
     );
-    assert!(
-        reconnect_error
-            .message
-            .contains(lock_path.to_string_lossy().as_ref())
-    );
-    assert!(started.elapsed() < Duration::from_secs(6));
-    assert!(DaemonClient::connect(&socket_path).is_err());
-    assert_eq!(fs::read(&lock_path).unwrap(), stale_lock);
-
+    drop(client);
     drop(lifecycle);
-    fs::remove_file(&socket_path).unwrap();
-    fs::remove_file(&lock_path).unwrap();
+    wait_for_socket_removal_with_persistent_lock(&socket_path, &lock_path);
+    assert_eq!(file_identity(&lock_path), lock_identity);
+    wait_for_process_exit(recovered.pid);
 }
 
 fn concurrent_starters_attach_to_one_winner(daemon: &Path) {
@@ -216,7 +218,7 @@ fn concurrent_starters_attach_to_one_winner(daemon: &Path) {
         ShutdownIfIdleResultName::Shutdown
     );
     drop(client);
-    wait_for_runtime_removal(&socket_path, &lock_path);
+    wait_for_socket_removal_with_persistent_lock(&socket_path, &lock_path);
     wait_for_process_exit(winner.pid);
 }
 
@@ -261,7 +263,7 @@ fn connect_hello_bounded(socket_path: &Path, workspace_root: &Path) -> DaemonCli
 fn wait_for_terminal_transcript(
     client: &mut DaemonClient,
     run_id: &str,
-) -> plato_agent::daemon::protocol::TranscriptReadResult {
+) -> plato_protocol::TranscriptReadResult {
     let deadline = Instant::now() + PROOF_TIMEOUT;
     loop {
         client.set_timeout(PROOF_TIMEOUT).unwrap();
@@ -285,17 +287,23 @@ fn wait_for_endpoint_close(socket_path: &Path) {
     }
 }
 
-fn wait_for_runtime_removal(socket_path: &Path, lock_path: &Path) {
+fn wait_for_socket_removal_with_persistent_lock(socket_path: &Path, lock_path: &Path) {
     let deadline = Instant::now() + PROOF_TIMEOUT;
-    while socket_path.exists() || lock_path.exists() {
+    while socket_path.exists() {
+        assert!(lock_path.exists(), "daemon removed {}", lock_path.display());
         assert!(
             Instant::now() < deadline,
-            "daemon did not remove {} and {}",
-            socket_path.display(),
-            lock_path.display()
+            "daemon did not remove {}",
+            socket_path.display()
         );
         thread::sleep(Duration::from_millis(20));
     }
+    assert!(lock_path.exists(), "daemon removed {}", lock_path.display());
+}
+
+fn file_identity(path: &Path) -> (u64, u64) {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    (metadata.dev(), metadata.ino())
 }
 
 fn wait_for_process_exit(pid: u32) {

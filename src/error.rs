@@ -1,4 +1,6 @@
-use crate::daemon::protocol::ProtocolError;
+use plato_daemon_client::ClientError;
+use plato_gateway_discord::GatewayError;
+use plato_protocol::ProtocolError;
 use std::path::PathBuf;
 
 pub type AppResult<T> = Result<T, AppError>;
@@ -14,11 +16,17 @@ pub enum AppError {
     #[error("provider error: {0}")]
     Provider(String),
 
+    #[error("provider completion POST returned http 429 before response body")]
+    ProviderCompletionRateLimited { retry_after_seconds: Option<f64> },
+
     #[error("tool error: {0}")]
     Tool(String),
 
     #[error("ledger version mismatch: expected {expected}, actual {actual}")]
     LedgerVersion { expected: u32, actual: u32 },
+
+    #[error("sqlite schema version mismatch: expected {expected}, actual {actual}")]
+    SqliteSchemaVersion { expected: u32, actual: u32 },
 
     #[error("ledger path is empty")]
     EmptyLedger,
@@ -28,6 +36,15 @@ pub enum AppError {
 
     #[error("ledger conflict for run {run_id} seq {seq}")]
     LedgerConflict { run_id: String, seq: u64 },
+
+    #[error("voice event version mismatch: expected {expected}, actual {actual}")]
+    VoiceEventVersion { expected: u32, actual: u32 },
+
+    #[error("voice ledger conflict for run {run_id} sequence {sequence}")]
+    VoiceLedgerConflict { run_id: String, sequence: u64 },
+
+    #[error("voice event contract failed: {0}")]
+    VoiceEventContract(String),
 
     #[error("sqlite ledger has no runs")]
     NoSqliteRuns,
@@ -52,6 +69,12 @@ pub enum AppError {
 
     #[error("run did not finish: {0}")]
     RunFailed(String),
+
+    #[error("{0}")]
+    SupervisedRun(String),
+
+    #[error("run child exceeded its {0}-millisecond deadline")]
+    RunChildTimedOut(u64),
 
     #[error("issue-prep artifact conflict: {0}")]
     IssuePrepArtifactConflict(PathBuf),
@@ -78,6 +101,15 @@ pub enum AppError {
     #[error("path escapes workspace: {0}")]
     PathEscapesWorkspace(PathBuf),
 
+    #[error("workspace memory exceeds the {max_bytes}-byte limit: {path}")]
+    PlatonicMemoryTooLarge { path: PathBuf, max_bytes: usize },
+
+    #[error("workspace memory is not valid UTF-8: {0}")]
+    PlatonicMemoryInvalidUtf8(PathBuf),
+
+    #[error("workspace memory target is not a regular file: {0}")]
+    PlatonicMemoryNotRegular(PathBuf),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -92,4 +124,74 @@ pub enum AppError {
 
     #[error("core error: {0}")]
     Core(#[from] platonic_core::Error),
+}
+
+impl From<ClientError> for AppError {
+    fn from(error: ClientError) -> Self {
+        match error {
+            ClientError::Config(message) => Self::Config(message),
+            ClientError::DaemonProtocol(message) => Self::DaemonProtocol(message),
+            ClientError::DaemonResponse(error) => Self::DaemonResponse(error),
+            ClientError::DaemonControl(message) => Self::DaemonControl(message),
+            ClientError::Io(error) => Self::Io(error),
+            ClientError::Json(error) => Self::Json(error),
+        }
+    }
+}
+
+impl From<GatewayError> for AppError {
+    fn from(error: GatewayError) -> Self {
+        match error {
+            GatewayError::Discord(message) => Self::Provider(message),
+            GatewayError::RunFailed(message) => Self::RunFailed(message),
+            GatewayError::DaemonProtocol(message) => Self::DaemonProtocol(message),
+            GatewayError::EmptyModelName => {
+                Self::Core(platonic_core::Error::EmptyIdentifier("ModelName"))
+            }
+            GatewayError::Client(error) => error.into(),
+            GatewayError::Io(error) => Self::Io(error),
+            GatewayError::Json(error) => Self::Json(error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_errors_preserve_root_variants_and_display() {
+        let cases = [
+            (
+                GatewayError::Discord("discord failed".into()),
+                "provider error: discord failed",
+            ),
+            (
+                GatewayError::RunFailed("missing answer".into()),
+                "run did not finish: missing answer",
+            ),
+            (
+                GatewayError::DaemonProtocol("bad response".into()),
+                "daemon protocol error: bad response",
+            ),
+            (
+                GatewayError::EmptyModelName,
+                "core error: ModelName cannot be empty",
+            ),
+        ];
+
+        for (gateway, expected) in cases {
+            let root = AppError::from(gateway);
+            assert_eq!(root.to_string(), expected);
+        }
+
+        assert!(matches!(
+            AppError::from(GatewayError::Discord("failed".into())),
+            AppError::Provider(message) if message == "failed"
+        ));
+        assert!(matches!(
+            AppError::from(GatewayError::EmptyModelName),
+            AppError::Core(platonic_core::Error::EmptyIdentifier("ModelName"))
+        ));
+    }
 }

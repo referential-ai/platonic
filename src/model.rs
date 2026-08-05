@@ -1,5 +1,6 @@
 use crate::tool_catalog::ToolSpec;
-use platonic_core::ModelUsage;
+pub use plato_protocol::{ReasoningEffort, RunOverrides};
+use platonic_core::{ModelName, ModelUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -9,6 +10,8 @@ pub struct ModelRequest {
     pub model: String,
     pub system: String,
     pub max_output_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub messages: Vec<ModelMessage>,
     pub tools: Vec<ToolSpec>,
 }
@@ -60,7 +63,9 @@ pub enum ModelStop {
 pub struct ModelResponse {
     pub content: Vec<ModelBlock>,
     pub stop: ModelStop,
-    pub usage: ModelUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<ModelName>,
+    pub usage: Option<ModelUsage>,
 }
 
 impl ModelMessage {
@@ -151,6 +156,13 @@ mod tests {
 
         assert_eq!(response.text(), "I will read it.");
         assert_eq!(response.tool_uses().len(), 1);
+        assert_eq!(
+            response.usage,
+            Some(ModelUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+            })
+        );
     }
 
     #[test]

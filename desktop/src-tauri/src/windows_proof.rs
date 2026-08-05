@@ -1,5 +1,5 @@
 use super::*;
-use plato_agent::daemon::protocol::{RunStateName, ShutdownIfIdleResultName};
+use plato_protocol::{RunStateName, ShutdownIfIdleResultName};
 use serde_json::json;
 use std::{
     env, fs,
@@ -117,7 +117,10 @@ fn provisioned_shell_exit_detaches_active_daemon_and_cli_stays_locked() {
 
     let one_shot = Command::new(cli)
         .current_dir(&workspace_root)
-        .arg("--db")
+        .arg(format!(
+            "--db={}",
+            workspace_root.join("direct-proof.db").display()
+        ))
         .arg("this must fail before provider access")
         .output()
         .unwrap();
@@ -147,7 +150,7 @@ fn provisioned_shell_exit_detaches_active_daemon_and_cli_stays_locked() {
 
 #[test]
 #[ignore = "requires provisioned PLATO_DESKTOP_TEST_DAEMON"]
-fn provisioned_crash_requires_explicit_bounded_reconnect_and_fails_closed() {
+fn provisioned_crash_removes_lock_and_explicit_reconnect_restarts_workspace() {
     let daemon = proof_executable("PLATO_DESKTOP_TEST_DAEMON");
     let workspace = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -173,11 +176,7 @@ fn provisioned_crash_requires_explicit_bounded_reconnect_and_fails_closed() {
         child_id
     };
     wait_for_endpoint_close(&socket_path);
-    assert!(
-        lock_path.exists(),
-        "abrupt crash unexpectedly removed the lock"
-    );
-    let stale_lock = fs::read(&lock_path).unwrap();
+    wait_for_lock_removal(&lock_path);
 
     let attach_error = with_saved_client(&workspace_file, None, |_| Ok(())).unwrap_err();
     assert_eq!(attach_error.code, "daemon_unavailable");
@@ -190,37 +189,27 @@ fn provisioned_crash_requires_explicit_bounded_reconnect_and_fails_closed() {
     assert_eq!(spawned.child.id(), child_id);
     assert!(spawned.child.try_wait().unwrap().is_some());
     assert!(DaemonClient::connect(&socket_path).is_err());
-    assert_eq!(fs::read(&lock_path).unwrap(), stale_lock);
 
-    let started = Instant::now();
-    let reconnect_error =
-        bootstrap_with_lifecycle(&workspace_file, &lifecycle, &launch, None).unwrap_err();
-    let elapsed = started.elapsed();
-    assert_eq!(reconnect_error.code, "daemon_start_failed");
-    assert!(
-        reconnect_error
-            .message
-            .contains(socket_path.to_string_lossy().as_ref())
-    );
-    assert!(
-        reconnect_error
-            .message
-            .contains(lock_path.to_string_lossy().as_ref())
-    );
-    assert!(
-        elapsed < Duration::from_secs(6),
-        "reconnect took {elapsed:?}"
-    );
-    assert!(DaemonClient::connect(&socket_path).is_err());
-    assert_eq!(fs::read(&lock_path).unwrap(), stale_lock);
+    let view = bootstrap_with_lifecycle(&workspace_file, &lifecycle, &launch, None).unwrap();
+    assert!(matches!(view, BootstrapView::Ready { .. }));
+    let restarted = lifecycle
+        .get_mut()
+        .unwrap()
+        .spawned_daemon
+        .as_mut()
+        .expect("explicit reconnect must record the restarted daemon");
+    assert!(restarted.child.try_wait().unwrap().is_none());
+    assert!(lock_path.exists());
 
-    // start_and_attach_workspace has one spawn call before its bounded attach loop. The
-    // observations above prove that attach-only did not reach it and explicit reconnect did.
-    if let Some(spawned) = lifecycle.get_mut().unwrap().spawned_daemon.as_mut() {
-        wait_for_child_exit(&mut spawned.child);
-    }
+    let mut client = connect_hello_bounded(&socket_path, &workspace_root);
+    assert_eq!(
+        client.shutdown_if_idle().unwrap().result,
+        ShutdownIfIdleResultName::Shutdown
+    );
+    drop(client);
+    wait_for_child_exit(&mut restarted.child);
     drop(lifecycle);
-    fs::remove_file(&lock_path).unwrap();
+    wait_for_lock_removal(&lock_path);
 }
 
 #[test]
@@ -348,7 +337,7 @@ fn connect_hello_bounded(socket_path: &Path, workspace_root: &Path) -> DaemonCli
 fn wait_for_terminal_transcript(
     client: &mut DaemonClient,
     run_id: &str,
-) -> plato_agent::daemon::protocol::TranscriptReadResult {
+) -> plato_protocol::TranscriptReadResult {
     let deadline = Instant::now() + PROOF_TIMEOUT;
     loop {
         let transcript = client.transcript_read(run_id).unwrap();

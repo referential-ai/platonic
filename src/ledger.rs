@@ -1,5 +1,14 @@
-use crate::{AppError, AppResult, daemon::protocol::RunStateName, paths::DefaultSqlitePath};
-use platonic_core::{HarnessEvent, RecordedEvent, RunId, RunState};
+use crate::{
+    AppError, AppResult,
+    paths::DefaultSqlitePath,
+    thread_authority::{
+        ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, validate_child_authority,
+        validate_complete_authority,
+    },
+    voice_session::{VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope},
+};
+use plato_protocol::{ReasoningEffort, RunStateName, ThreadApprovalPolicy, ThreadAuthorityRecord};
+use platonic_core::{HarnessEvent, MessageRole, RecordedEvent, RunId, RunPhase, RunState};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -16,9 +25,16 @@ use std::{
     path::PathBuf,
 };
 
-pub const LEDGER_VERSION: u32 = 1;
+const LEGACY_LEDGER_VERSION: u32 = 1;
+pub const LEDGER_VERSION: u32 = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const SQLITE_SCHEMA_VERSION: u32 = 2;
+const LEGACY_SQLITE_SCHEMA_VERSION: u32 = 1;
+const SESSION_SQLITE_SCHEMA_VERSION: u32 = 2;
+const VOICE_EVENT_SQLITE_SCHEMA_VERSION: u32 = 3;
+const THREAD_AUTHORITY_SQLITE_SCHEMA_VERSION: u32 = 4;
+const SQLITE_SCHEMA_VERSION: u32 = THREAD_AUTHORITY_SQLITE_SCHEMA_VERSION;
+pub(crate) const RUN_CANCELED_REASON: &str = "run canceled";
+const ORPHANED_RUN_ERROR: &str = "daemon restarted before run completed";
 #[cfg(unix)]
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 #[cfg(unix)]
@@ -38,6 +54,13 @@ pub enum EventRecorder {
     Sqlite(SqliteEventRecorder),
 }
 
+pub(crate) trait RunEventRecorder {
+    fn record(&mut self, event: HarnessEvent) -> AppResult<RecordedEvent>;
+    fn finish_run(&mut self, run_id: &RunId, final_answer: &str) -> AppResult<RecordedEvent>;
+    fn fail_run(&mut self, run_id: &RunId, error: &str, canceled: bool)
+    -> AppResult<RecordedEvent>;
+}
+
 impl EventRecorder {
     pub fn create_jsonl(path: &Path) -> AppResult<Self> {
         Ok(Self::Jsonl(JsonlEventRecorder::create(path)?))
@@ -53,11 +76,62 @@ impl EventRecorder {
         )?))
     }
 
+    pub(crate) fn from_session_sqlite(ledger: SqliteLedger, run_id: &RunId) -> Self {
+        Self::Sqlite(SqliteEventRecorder::from_session(ledger, run_id))
+    }
+
     pub fn record(&mut self, event: HarnessEvent) -> AppResult<RecordedEvent> {
         match self {
             Self::Jsonl(recorder) => recorder.record(event),
             Self::Sqlite(recorder) => recorder.record(event),
         }
+    }
+
+    pub(crate) fn finish_run(
+        &mut self,
+        run_id: &RunId,
+        final_answer: &str,
+    ) -> AppResult<RecordedEvent> {
+        match self {
+            Self::Jsonl(recorder) => recorder.record(HarnessEvent::RunFinished {
+                run_id: run_id.clone(),
+            }),
+            Self::Sqlite(recorder) => recorder.finish_run(final_answer),
+        }
+    }
+
+    pub(crate) fn fail_run(
+        &mut self,
+        run_id: &RunId,
+        error: &str,
+        canceled: bool,
+    ) -> AppResult<RecordedEvent> {
+        match self {
+            Self::Jsonl(recorder) => recorder.record(HarnessEvent::RunFailed {
+                run_id: run_id.clone(),
+                reason: error.into(),
+            }),
+            Self::Sqlite(recorder) => recorder.fail_run(error, canceled),
+        }
+    }
+}
+
+impl RunEventRecorder for EventRecorder {
+    fn record(&mut self, event: HarnessEvent) -> AppResult<RecordedEvent> {
+        EventRecorder::record(self, event)
+    }
+
+    fn finish_run(&mut self, run_id: &RunId, final_answer: &str) -> AppResult<RecordedEvent> {
+        EventRecorder::finish_run(self, run_id, final_answer)
+    }
+
+    fn fail_run(
+        &mut self,
+        run_id: &RunId,
+        error: &str,
+        canceled: bool,
+    ) -> AppResult<RecordedEvent> {
+        EventRecorder::fail_run(self, run_id, error, canceled)
     }
 }
 
@@ -104,36 +178,126 @@ impl JsonlEventRecorder {
 
 pub struct SqliteEventRecorder {
     ledger: SqliteLedger,
-    run_id: String,
+    run_id: RunId,
     state: RunState,
+    session_run_open: bool,
+    terminal_attempted: bool,
 }
 
 impl SqliteEventRecorder {
     pub fn create(path: &Path, run_id: &RunId) -> AppResult<Self> {
         Ok(Self {
             ledger: SqliteLedger::open_or_create(path)?,
-            run_id: run_id.to_string(),
+            run_id: run_id.clone(),
             state: RunState::new(),
+            session_run_open: false,
+            terminal_attempted: false,
         })
     }
 
     pub fn create_default(path: &DefaultSqlitePath, run_id: &RunId) -> AppResult<Self> {
         Ok(Self {
             ledger: SqliteLedger::open_or_create_default(path)?,
-            run_id: run_id.to_string(),
+            run_id: run_id.clone(),
             state: RunState::new(),
+            session_run_open: false,
+            terminal_attempted: false,
         })
     }
 
+    fn from_session(ledger: SqliteLedger, run_id: &RunId) -> Self {
+        Self {
+            ledger,
+            run_id: run_id.clone(),
+            state: RunState::new(),
+            session_run_open: true,
+            terminal_attempted: false,
+        }
+    }
+
     pub fn record(&mut self, event: HarnessEvent) -> AppResult<RecordedEvent> {
-        let record = next_record(&mut self.state, event)?;
-        self.ledger.append(&self.run_id, &record)?;
+        if self.session_run_open
+            && matches!(
+                event,
+                HarnessEvent::RunFinished { .. } | HarnessEvent::RunFailed { .. }
+            )
+        {
+            return Err(AppError::Config(
+                "SQLite session terminal events require an atomic session outcome".into(),
+            ));
+        }
+        let mut next_state = self.state.clone();
+        let record = next_record(&mut next_state, event)?;
+        self.ledger.append(self.run_id.as_str(), &record)?;
+        self.state = next_state;
         Ok(record)
+    }
+
+    fn finish_run(&mut self, final_answer: &str) -> AppResult<RecordedEvent> {
+        self.record_terminal(
+            HarnessEvent::RunFinished {
+                run_id: self.run_id.clone(),
+            },
+            RunStateName::Finished,
+            Some(final_answer),
+            None,
+        )
+    }
+
+    fn fail_run(&mut self, error: &str, canceled: bool) -> AppResult<RecordedEvent> {
+        let status = if canceled {
+            RunStateName::Canceled
+        } else {
+            RunStateName::Failed
+        };
+        self.record_terminal(
+            HarnessEvent::RunFailed {
+                run_id: self.run_id.clone(),
+                reason: error.into(),
+            },
+            status,
+            None,
+            Some(error),
+        )
+    }
+
+    fn record_terminal(
+        &mut self,
+        event: HarnessEvent,
+        status: RunStateName,
+        final_answer: Option<&str>,
+        error: Option<&str>,
+    ) -> AppResult<RecordedEvent> {
+        if !self.session_run_open {
+            return self.record(event);
+        }
+
+        self.terminal_attempted = true;
+        let mut next_state = self.state.clone();
+        let record = next_record(&mut next_state, event)?;
+        self.ledger
+            .commit_session_terminal(&self.run_id, &record, status, final_answer, error)?;
+        self.state = next_state;
+        self.session_run_open = false;
+        Ok(record)
+    }
+}
+
+impl Drop for SqliteEventRecorder {
+    fn drop(&mut self) {
+        if self.session_run_open && !self.terminal_attempted {
+            let _ = self.fail_run("run ended before session status was closed", false);
+        }
     }
 }
 
 pub struct SqliteLedger {
     connection: Connection,
+    schema_version: u32,
+    #[cfg(test)]
+    terminal_fault: Option<TerminalFaultBoundary>,
+    #[cfg(test)]
+    voice_fault: Option<VoiceFaultBoundary>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,6 +328,37 @@ pub struct PersistedSessionSummary {
     pub run_id: String,
     pub status: RunStateName,
     pub latest_question: String,
+    pub first_question: String,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DurableThreadAuthority(ThreadAuthorityRecord);
+
+impl DurableThreadAuthority {
+    pub(crate) fn record(&self) -> &ThreadAuthorityRecord {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PersistedTokenUsage {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) unknown_response_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PersistedSessionStatus {
+    pub(crate) session_id: String,
+    pub(crate) latest_run_id: String,
+    pub(crate) human_turn_count: u64,
+    pub(crate) core_event_count: u64,
+    pub(crate) served_model: Option<String>,
+    pub(crate) last_run_usage: PersistedTokenUsage,
+    pub(crate) session_usage: PersistedTokenUsage,
+    pub(crate) approval_granted_count: u64,
+    pub(crate) approval_denied_count: u64,
 }
 
 impl SqliteLedger {
@@ -177,7 +372,14 @@ impl SqliteLedger {
         let mut connection = Connection::open(path)?;
         configure_sqlite_connection(&connection)?;
         migrate_sqlite(&mut connection)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            schema_version: SQLITE_SCHEMA_VERSION,
+            #[cfg(test)]
+            terminal_fault: None,
+            #[cfg(test)]
+            voice_fault: None,
+        })
     }
 
     pub fn open_or_create_default(path: &DefaultSqlitePath) -> AppResult<Self> {
@@ -195,7 +397,15 @@ impl SqliteLedger {
         let connection =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         configure_sqlite_connection(&connection)?;
-        Ok(Self { connection })
+        let schema_version = read_sqlite_schema_version(&connection)?;
+        Ok(Self {
+            connection,
+            schema_version,
+            #[cfg(test)]
+            terminal_fault: None,
+            #[cfg(test)]
+            voice_fault: None,
+        })
     }
 
     pub fn open_default_readonly(path: &DefaultSqlitePath) -> AppResult<Self> {
@@ -210,44 +420,255 @@ impl SqliteLedger {
     }
 
     pub fn append(&mut self, run_id: &str, record: &RecordedEvent) -> AppResult<()> {
-        let event_json = serde_json::to_string(&record.event)?;
-        let seq = sqlite_i64(record.seq, "seq")?;
-        let occurred_at_ms = sqlite_i64(record.occurred_at_ms, "occurred_at_ms")?;
-        let inserted = self.connection.execute(
-            "INSERT OR IGNORE INTO ledger_events (run_id, seq, occurred_at_ms, v, event_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![run_id, seq, occurred_at_ms, LEDGER_VERSION, event_json],
-        )?;
-        if inserted == 1 {
-            return Ok(());
-        }
-
-        let existing = self.connection.query_row(
-            "SELECT occurred_at_ms, v, event_json FROM ledger_events WHERE run_id = ?1 AND seq = ?2",
-            params![run_id, seq],
-            |row| {
-                Ok(ExistingEvent {
-                    occurred_at_ms: row_u64(row, 0, "occurred_at_ms")?,
-                    version: row.get(1)?,
-                    event_json: row.get(2)?,
-                })
-            },
-        )?;
-        if existing.occurred_at_ms == record.occurred_at_ms
-            && existing.version == LEDGER_VERSION
-            && existing.event_json == event_json
-        {
-            Ok(())
-        } else {
-            Err(AppError::LedgerConflict {
-                run_id: run_id.into(),
-                seq: record.seq,
-            })
-        }
+        append_record_in(&self.connection, run_id, record)
     }
 
     pub fn read_run(&self, run_id: &str) -> AppResult<Vec<RecordedEvent>> {
         read_run_from(&self.connection, run_id)
+    }
+
+    /// Atomically persists one complete, immutable per-run voice companion stream.
+    pub fn append_voice_events(
+        &mut self,
+        events: &[VoiceEvent],
+    ) -> AppResult<Vec<VoiceEventEnvelope>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let run_id = events[0].run_id().as_str().to_owned();
+        for event in events {
+            event.validate().map_err(AppError::VoiceEventContract)?;
+            if event.run_id().as_str() != run_id {
+                return Err(AppError::VoiceEventContract(
+                    "one companion commit contained multiple run IDs".into(),
+                ));
+            }
+        }
+        validate_voice_event_stream(events)?;
+        let envelopes = events
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(sequence, event)| {
+                let sequence = u64::try_from(sequence).map_err(|_| {
+                    AppError::VoiceEventContract("voice event sequence overflowed u64".into())
+                })?;
+                Ok(VoiceEventEnvelope::revision_one(sequence, event))
+            })
+            .collect::<AppResult<Vec<_>>>()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_voice_event_keys(&transaction, &run_id, &envelopes)?;
+        let existing = read_voice_events_from(&transaction, &run_id)?;
+        if !existing.is_empty() {
+            if existing == envelopes {
+                transaction.commit()?;
+                return Ok(envelopes);
+            }
+            let sequence = first_voice_difference(&existing, &envelopes);
+            return Err(AppError::VoiceLedgerConflict { run_id, sequence });
+        }
+
+        for envelope in &envelopes {
+            let event_json = serde_json::to_string(&envelope.event)?;
+            transaction.execute(
+                "INSERT INTO voice_events (run_id, turn_id, sequence, v, event_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    envelope.event.run_id().as_str(),
+                    envelope.event.turn_id().as_str(),
+                    sqlite_i64(envelope.sequence, "voice sequence")?,
+                    envelope.v,
+                    event_json
+                ],
+            )?;
+            #[cfg(test)]
+            inject_voice_fault(
+                &mut self.voice_fault,
+                VoiceFaultBoundary::AfterFirstInsert,
+                envelope.sequence == 0,
+            )?;
+        }
+        #[cfg(test)]
+        inject_voice_fault(
+            &mut self.voice_fault,
+            VoiceFaultBoundary::BeforeCommit,
+            true,
+        )?;
+        transaction.commit()?;
+        Ok(envelopes)
+    }
+
+    /// Reads and validates one selected run's ordered voice companion stream.
+    pub fn read_voice_events(&self, run_id: &str) -> AppResult<Vec<VoiceEventEnvelope>> {
+        if self.schema_version < VOICE_EVENT_SQLITE_SCHEMA_VERSION {
+            return Ok(Vec::new());
+        }
+        let envelopes = read_voice_events_from(&self.connection, run_id)?;
+        let events = envelopes
+            .iter()
+            .map(|envelope| envelope.event.clone())
+            .collect::<Vec<_>>();
+        validate_voice_event_stream(&events)?;
+        if !envelopes.is_empty() {
+            validate_voice_event_keys(&self.connection, run_id, &envelopes)?;
+        }
+        Ok(envelopes)
+    }
+
+    pub(crate) fn persist_thread_spawn(
+        &mut self,
+        approval: &ThreadSpawnApprovalRecord,
+        authority: Option<&ThreadAuthorityRecord>,
+    ) -> AppResult<Option<DurableThreadAuthority>> {
+        if let Some(authority) = authority {
+            validate_complete_authority(authority)?;
+            if authority.spawning_actor != approval.actor {
+                return Err(AppError::Config(
+                    "thread.spawn approval actor must match spawning actor".into(),
+                ));
+            }
+        }
+        match (approval.decision, authority) {
+            (ThreadSpawnDecisionName::Granted, Some(authority))
+                if authority.thread_id == approval.thread_id => {}
+            (ThreadSpawnDecisionName::Granted, Some(_)) => {
+                return Err(AppError::Config(
+                    "thread.spawn approval and authority thread ids differ".into(),
+                ));
+            }
+            (ThreadSpawnDecisionName::Granted, None) => {
+                return Err(AppError::Config(
+                    "granted thread.spawn approval requires an authority record".into(),
+                ));
+            }
+            (ThreadSpawnDecisionName::Denied | ThreadSpawnDecisionName::Canceled, None) => {}
+            (ThreadSpawnDecisionName::Denied | ThreadSpawnDecisionName::Canceled, Some(_)) => {
+                return Err(AppError::Config(
+                    "denied or canceled thread.spawn cannot create authority".into(),
+                ));
+            }
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = thread_spawn_approval_from(&transaction, &approval.spawn_id)? {
+            if existing != *approval {
+                return Err(AppError::Config(format!(
+                    "thread.spawn decision conflicts with durable spawn {}",
+                    approval.spawn_id
+                )));
+            }
+            if let Some(authority) = authority {
+                let existing_authority = thread_authority_from(&transaction, &authority.thread_id)?
+                    .ok_or_else(|| {
+                        AppError::Config(format!(
+                            "granted spawn {} has no authority record",
+                            approval.spawn_id
+                        ))
+                    })?;
+                if existing_authority != *authority {
+                    return Err(AppError::Config(format!(
+                        "thread authority conflicts with durable thread {}",
+                        authority.thread_id
+                    )));
+                }
+            }
+            transaction.commit()?;
+            return Ok(authority.cloned().map(DurableThreadAuthority));
+        }
+
+        if let Some(authority) = authority
+            && let Some(parent_thread_id) = authority.parent_thread_id.as_deref()
+        {
+            let parent =
+                thread_authority_from(&transaction, parent_thread_id)?.ok_or_else(|| {
+                    AppError::Config(format!(
+                        "parent thread is no longer durable: {parent_thread_id}"
+                    ))
+                })?;
+            let draft = crate::thread_authority::ThreadAuthorityDraft {
+                thread_id: authority.thread_id.clone(),
+                parent_thread_id: authority.parent_thread_id.clone(),
+                cwd: authority.cwd.clone(),
+                model: authority.model.clone(),
+                reasoning_effort: authority.reasoning_effort,
+                approval_policy: authority.approval_policy,
+            };
+            validate_child_authority(&parent, &draft)
+                .map_err(|error| AppError::Config(error.to_string()))?;
+        }
+
+        transaction.execute(
+            "INSERT INTO thread_spawn_approvals
+               (spawn_id, thread_id, decision, actor, reason, occurred_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                approval.spawn_id,
+                approval.thread_id,
+                approval.decision.as_str(),
+                approval.actor,
+                approval.reason,
+                sqlite_i64(approval.occurred_at_ms, "thread approval occurred_at_ms")?
+            ],
+        )?;
+        if let Some(authority) = authority {
+            transaction.execute(
+                "INSERT INTO thread_authorities
+                   (thread_id, parent_thread_id, spawning_actor, cwd, model,
+                    reasoning_effort, approval_policy, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    authority.thread_id,
+                    authority.parent_thread_id,
+                    authority.spawning_actor,
+                    authority.cwd,
+                    authority.model,
+                    authority.reasoning_effort.as_str(),
+                    authority.approval_policy.as_str(),
+                    sqlite_i64(authority.created_at_ms, "thread created_at_ms")?
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(authority.cloned().map(DurableThreadAuthority))
+    }
+
+    pub(crate) fn thread_authority(
+        &self,
+        thread_id: &str,
+    ) -> AppResult<Option<ThreadAuthorityRecord>> {
+        if self.schema_version < THREAD_AUTHORITY_SQLITE_SCHEMA_VERSION {
+            return Ok(None);
+        }
+        thread_authority_from(&self.connection, thread_id)
+    }
+
+    pub(crate) fn thread_authorities(&self) -> AppResult<Vec<ThreadAuthorityRecord>> {
+        if self.schema_version < THREAD_AUTHORITY_SQLITE_SCHEMA_VERSION {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT thread_id, parent_thread_id, spawning_actor, cwd, model,
+                    reasoning_effort, approval_policy, created_at_ms
+             FROM thread_authorities
+             ORDER BY created_at_ms ASC, thread_id ASC",
+        )?;
+        Ok(statement
+            .query_map([], thread_authority_from_row)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn thread_spawn_approval(
+        &self,
+        spawn_id: &str,
+    ) -> AppResult<Option<ThreadSpawnApprovalRecord>> {
+        if self.schema_version < THREAD_AUTHORITY_SQLITE_SCHEMA_VERSION {
+            return Ok(None);
+        }
+        thread_spawn_approval_from(&self.connection, spawn_id)
     }
 
     pub fn read_latest_run(&self) -> AppResult<(String, Vec<RecordedEvent>)> {
@@ -266,6 +687,10 @@ impl SqliteLedger {
             .ok_or(AppError::NoSqliteRuns)?;
         let records = self.read_run(&run_id)?;
         Ok((run_id, records))
+    }
+
+    pub(crate) fn is_legacy_schema(&self) -> bool {
+        self.schema_version == LEGACY_SQLITE_SCHEMA_VERSION
     }
 
     pub fn latest_session_id(&self) -> AppResult<String> {
@@ -360,7 +785,34 @@ impl SqliteLedger {
     }
 
     pub fn finish_session_run(&mut self, run_id: &RunId, final_answer: &str) -> AppResult<()> {
-        self.update_session_run(run_id, RunStateName::Finished, Some(final_answer), None)
+        let (records, mut state) = self.replay_run_state(run_id)?;
+        let record = match state.phase() {
+            RunPhase::Finished => {
+                let durable_answer = final_answer_from_records(run_id, &records)?;
+                if durable_answer != final_answer {
+                    return Err(AppError::Config(format!(
+                        "finished session run {run_id} answer does not match its ledger"
+                    )));
+                }
+                records
+                    .last()
+                    .expect("replayed run contains a terminal event")
+                    .clone()
+            }
+            _ => next_record(
+                &mut state,
+                HarnessEvent::RunFinished {
+                    run_id: run_id.clone(),
+                },
+            )?,
+        };
+        self.commit_session_terminal(
+            run_id,
+            &record,
+            RunStateName::Finished,
+            Some(final_answer),
+            None,
+        )
     }
 
     pub fn fail_session_run(
@@ -374,42 +826,93 @@ impl SqliteLedger {
         } else {
             RunStateName::Failed
         };
-        self.update_session_run(run_id, status, None, Some(error))
+        let (records, mut state) = self.replay_run_state(run_id)?;
+        let record = match state.phase() {
+            RunPhase::Failed { reason } => {
+                if reason != error {
+                    return Err(AppError::Config(format!(
+                        "failed session run {run_id} error does not match its ledger"
+                    )));
+                }
+                records
+                    .last()
+                    .expect("replayed run contains a terminal event")
+                    .clone()
+            }
+            _ => next_record(
+                &mut state,
+                HarnessEvent::RunFailed {
+                    run_id: run_id.clone(),
+                    reason: error.into(),
+                },
+            )?,
+        };
+        self.commit_session_terminal(run_id, &record, status, None, Some(error))
     }
 
     pub fn interrupt_running_session_runs(&mut self, error: &str) -> AppResult<usize> {
+        self.recover_running_session_runs(error)
+    }
+
+    fn recover_running_session_runs(&mut self, error: &str) -> AppResult<usize> {
         let now = sqlite_i64(now_ms(), "occurred_at_ms")?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let session_ids = {
+        let running_runs = {
             let mut statement = transaction.prepare(
-                "SELECT DISTINCT session_id
+                "SELECT session_id, run_id
                  FROM session_runs
-                 WHERE status = ?1",
+                 WHERE status = ?1
+                 ORDER BY session_id, session_index",
             )?;
             statement
                 .query_map(params![RunStateName::Running.as_str()], |row| {
-                    row.get::<_, String>(0)
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let updated = transaction.execute(
-            "UPDATE session_runs
-             SET status = ?2, error = ?3, updated_at_ms = ?4
-             WHERE status = ?1",
-            params![
-                RunStateName::Running.as_str(),
-                RunStateName::Interrupted.as_str(),
-                error,
-                now
-            ],
-        )?;
-        for session_id in session_ids {
-            touch_session(&transaction, &session_id, now)?;
+        for (session_id, run_id) in &running_runs {
+            let records = read_run_records_from(&transaction, run_id)?;
+            if records.is_empty() {
+                return Err(AppError::Config(format!(
+                    "running session run {run_id} has no ledger events"
+                )));
+            }
+            let mut state = replay_records(&records)?;
+            let (status, final_answer, stored_error) = match state.phase() {
+                RunPhase::Finished => (
+                    RunStateName::Finished,
+                    Some(final_answer_from_records_str(run_id, &records)?),
+                    None,
+                ),
+                RunPhase::Failed { reason } => {
+                    (failure_status(reason), None, Some(reason.as_str()))
+                }
+                _ => {
+                    let record = next_record(
+                        &mut state,
+                        HarnessEvent::RunFailed {
+                            run_id: RunId::new(run_id.clone())?,
+                            reason: error.into(),
+                        },
+                    )?;
+                    append_record_in(&transaction, run_id, &record)?;
+                    (RunStateName::Interrupted, None, Some(error))
+                }
+            };
+            update_running_session_outcome(
+                &transaction,
+                run_id,
+                status,
+                final_answer,
+                stored_error,
+                now,
+            )?;
+            touch_session(&transaction, session_id, now)?;
         }
         transaction.commit()?;
-        Ok(updated)
+        Ok(running_runs.len())
     }
 
     pub fn read_session(&self, session_id: &str) -> AppResult<SessionRecords> {
@@ -479,7 +982,15 @@ impl SqliteLedger {
 
     pub fn session_summaries(&self) -> AppResult<Vec<PersistedSessionSummary>> {
         let mut statement = self.connection.prepare(
-            "SELECT s.session_id, sr.run_id, sr.status, sr.question
+            "SELECT s.session_id, sr.run_id, sr.status, sr.question,
+                    (
+                      SELECT first_run.question
+                      FROM session_runs first_run
+                      WHERE first_run.session_id = s.session_id
+                      ORDER BY first_run.session_index ASC
+                      LIMIT 1
+                    ),
+                    s.updated_at_ms
              FROM sessions s
              JOIN session_runs sr ON sr.session_id = s.session_id
              WHERE sr.session_index = (
@@ -496,47 +1007,112 @@ impl SqliteLedger {
                     run_id: row.get(1)?,
                     status: status_from_row(row, 2)?,
                     latest_question: row.get(3)?,
+                    first_question: row.get(4)?,
+                    updated_at_ms: row_u64(row, 5, "updated_at_ms")?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn session_status(
+        &self,
+        session_id: Option<&str>,
+    ) -> AppResult<Option<PersistedSessionStatus>> {
+        let session = match session_id {
+            Some(session_id) => self.read_session(session_id)?,
+            None => match self.read_latest_session() {
+                Ok(session) => session,
+                Err(AppError::NoSqliteSessions) => return Ok(None),
+                Err(error) => return Err(error),
+            },
+        };
+        Ok(Some(project_session_status(&session)?))
     }
 
     fn session_exists(&self, session_id: &str) -> AppResult<bool> {
         session_exists_in(&self.connection, session_id)
     }
 
-    fn update_session_run(
+    fn replay_run_state(&self, run_id: &RunId) -> AppResult<(Vec<RecordedEvent>, RunState)> {
+        let records = self.read_run(run_id.as_str())?;
+        let state = replay_records(&records)?;
+        Ok((records, state))
+    }
+
+    fn commit_session_terminal(
         &mut self,
         run_id: &RunId,
+        record: &RecordedEvent,
         status: RunStateName,
         final_answer: Option<&str>,
         error: Option<&str>,
     ) -> AppResult<()> {
         let now = sqlite_i64(now_ms(), "occurred_at_ms")?;
-        let transaction = self.connection.transaction()?;
-        let updated = transaction.execute(
-            "UPDATE session_runs
-             SET status = ?2, final_answer = ?3, error = ?4, updated_at_ms = ?5
-             WHERE run_id = ?1",
-            params![
-                run_id.to_string(),
-                status.as_str(),
-                final_answer,
-                error,
-                now
-            ],
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session_id: String = transaction
+            .query_row(
+                "SELECT session_id
+             FROM session_runs
+             WHERE run_id = ?1 AND status = ?2",
+                params![run_id.as_str(), RunStateName::Running.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| AppError::RunNotFound(run_id.to_string()))?;
+        #[cfg(test)]
+        inject_terminal_fault(
+            &mut self.terminal_fault,
+            TerminalFaultBoundary::BeforeEventInsert,
         )?;
-        if updated == 0 {
-            return Err(AppError::RunNotFound(run_id.to_string()));
-        }
-        let session_id: String = transaction.query_row(
-            "SELECT session_id FROM session_runs WHERE run_id = ?1",
-            params![run_id.to_string()],
-            |row| row.get(0),
+        append_record_in(&transaction, run_id.as_str(), record)?;
+        #[cfg(test)]
+        inject_terminal_fault(
+            &mut self.terminal_fault,
+            TerminalFaultBoundary::AfterEventInsert,
+        )?;
+        #[cfg(test)]
+        inject_terminal_fault(
+            &mut self.terminal_fault,
+            TerminalFaultBoundary::BeforeOutcomeUpdate,
+        )?;
+        update_running_session_outcome(
+            &transaction,
+            run_id.as_str(),
+            status,
+            final_answer,
+            error,
+            now,
+        )?;
+        #[cfg(test)]
+        inject_terminal_fault(
+            &mut self.terminal_fault,
+            TerminalFaultBoundary::AfterOutcomeUpdate,
+        )?;
+        #[cfg(test)]
+        inject_terminal_fault(
+            &mut self.terminal_fault,
+            TerminalFaultBoundary::BeforeSessionTouch,
         )?;
         touch_session(&transaction, &session_id, now)?;
+        #[cfg(test)]
+        inject_terminal_fault(
+            &mut self.terminal_fault,
+            TerminalFaultBoundary::AfterSessionTouch,
+        )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn inject_terminal_fault_at(&mut self, boundary: TerminalFaultBoundary) {
+        self.terminal_fault = Some(boundary);
+    }
+
+    #[cfg(test)]
+    fn inject_voice_fault_at(&mut self, boundary: VoiceFaultBoundary) {
+        self.voice_fault = Some(boundary);
     }
 
     #[cfg(test)]
@@ -548,16 +1124,103 @@ impl SqliteLedger {
     }
 }
 
-fn read_run_from(connection: &Connection, run_id: &str) -> AppResult<Vec<RecordedEvent>> {
-    let mut statement = connection.prepare(
-        "SELECT seq, occurred_at_ms, v, event_json
-             FROM ledger_events
-             WHERE run_id = ?1
-             ORDER BY seq ASC",
+fn project_session_status(session: &SessionRecords) -> AppResult<PersistedSessionStatus> {
+    let latest_run = session
+        .runs
+        .last()
+        .ok_or_else(|| AppError::SessionNotFound(session.session_id.clone()))?;
+    let mut status = PersistedSessionStatus {
+        session_id: session.session_id.clone(),
+        latest_run_id: latest_run.run_id.clone(),
+        human_turn_count: session.runs.len() as u64,
+        core_event_count: 0,
+        served_model: None,
+        last_run_usage: PersistedTokenUsage::default(),
+        session_usage: PersistedTokenUsage::default(),
+        approval_granted_count: 0,
+        approval_denied_count: 0,
+    };
+
+    for run in &session.runs {
+        let is_latest_run = run.run_id == latest_run.run_id;
+        status.core_event_count += run.records.len() as u64;
+        for record in &run.records {
+            match &record.event {
+                HarnessEvent::ModelResponded {
+                    served_model,
+                    usage,
+                    ..
+                } => {
+                    status.served_model = served_model.as_ref().map(ToString::to_string);
+                    observe_usage(&mut status.session_usage, usage.as_ref());
+                    if is_latest_run {
+                        observe_usage(&mut status.last_run_usage, usage.as_ref());
+                    }
+                }
+                HarnessEvent::ApprovalGranted { .. } => status.approval_granted_count += 1,
+                HarnessEvent::ApprovalDenied { .. } => status.approval_denied_count += 1,
+                _ => {}
+            }
+        }
+    }
+    Ok(status)
+}
+
+fn observe_usage(aggregate: &mut PersistedTokenUsage, usage: Option<&platonic_core::ModelUsage>) {
+    match usage {
+        Some(usage) => {
+            aggregate.input_tokens += u64::from(usage.input_tokens);
+            aggregate.output_tokens += u64::from(usage.output_tokens);
+        }
+        None => aggregate.unknown_response_count += 1,
+    }
+}
+
+fn append_record_in(
+    connection: &Connection,
+    run_id: &str,
+    record: &RecordedEvent,
+) -> AppResult<()> {
+    let event_json = serde_json::to_string(&record.event)?;
+    let seq = sqlite_i64(record.seq, "seq")?;
+    let occurred_at_ms = sqlite_i64(record.occurred_at_ms, "occurred_at_ms")?;
+    let inserted = connection.execute(
+        "INSERT OR IGNORE INTO ledger_events (run_id, seq, occurred_at_ms, v, event_json)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![run_id, seq, occurred_at_ms, LEDGER_VERSION, event_json],
     )?;
-    let records = statement
-        .query_map(params![run_id], sqlite_record_from_row)?
-        .collect::<Result<Vec<_>, _>>()?;
+    if inserted == 1 {
+        return Ok(());
+    }
+
+    let existing = connection.query_row(
+        "SELECT occurred_at_ms, v, event_json
+         FROM ledger_events
+         WHERE run_id = ?1 AND seq = ?2",
+        params![run_id, seq],
+        |row| {
+            Ok(ExistingEvent {
+                occurred_at_ms: row_u64(row, 0, "occurred_at_ms")?,
+                version: row.get(1)?,
+                event_json: row.get(2)?,
+            })
+        },
+    )?;
+    if existing.occurred_at_ms == record.occurred_at_ms
+        && existing.version == LEDGER_VERSION
+        && existing.event_json == event_json
+    {
+        Ok(())
+    } else {
+        Err(AppError::LedgerConflict {
+            run_id: run_id.into(),
+            seq: record.seq,
+        })
+    }
+}
+
+fn read_run_from(connection: &Connection, run_id: &str) -> AppResult<Vec<RecordedEvent>> {
+    let records = read_run_records_from(connection, run_id)?;
     if records.is_empty() {
         Err(AppError::RunNotFound(run_id.into()))
     } else {
@@ -565,11 +1228,393 @@ fn read_run_from(connection: &Connection, run_id: &str) -> AppResult<Vec<Recorde
     }
 }
 
+fn read_run_records_from(connection: &Connection, run_id: &str) -> AppResult<Vec<RecordedEvent>> {
+    let mut statement = connection.prepare(
+        "SELECT seq, occurred_at_ms, v, event_json
+             FROM ledger_events
+             WHERE run_id = ?1
+             ORDER BY seq ASC",
+    )?;
+    let mut rows = statement.query(params![run_id])?;
+    let mut records = Vec::new();
+    while let Some(row) = rows.next()? {
+        records.push(sqlite_record_from_row(row)?);
+    }
+    Ok(records)
+}
+
+fn read_voice_events_from(
+    connection: &Connection,
+    selected_run_id: &str,
+) -> AppResult<Vec<VoiceEventEnvelope>> {
+    let mut statement = connection.prepare(
+        "SELECT run_id, turn_id, sequence, v, event_json
+         FROM voice_events
+         WHERE run_id = ?1
+         ORDER BY sequence ASC",
+    )?;
+    let mut rows = statement.query(params![selected_run_id])?;
+    let mut envelopes = Vec::new();
+    while let Some(row) = rows.next()? {
+        let run_id = row.get::<_, String>(0)?;
+        let turn_id = row.get::<_, String>(1)?;
+        let sequence = row_u64(row, 2, "voice sequence")?;
+        let version = row.get::<_, u32>(3)?;
+        if version != VOICE_EVENT_VERSION {
+            return Err(AppError::VoiceEventVersion {
+                expected: VOICE_EVENT_VERSION,
+                actual: version,
+            });
+        }
+        let event = serde_json::from_str::<VoiceEvent>(&row.get::<_, String>(4)?)?;
+        event.validate().map_err(AppError::VoiceEventContract)?;
+        if event.run_id().as_str() != run_id || event.turn_id().as_str() != turn_id {
+            return Err(AppError::VoiceEventContract(format!(
+                "voice event columns disagree with payload at run {selected_run_id} sequence {sequence}"
+            )));
+        }
+        let expected_sequence = u64::try_from(envelopes.len()).map_err(|_| {
+            AppError::VoiceEventContract("voice event sequence overflowed u64".into())
+        })?;
+        if sequence != expected_sequence {
+            return Err(AppError::VoiceEventContract(format!(
+                "voice event sequence was {sequence}, expected {expected_sequence} for run {selected_run_id}"
+            )));
+        }
+        envelopes.push(VoiceEventEnvelope {
+            v: version,
+            sequence,
+            event,
+        });
+    }
+    Ok(envelopes)
+}
+
+fn first_voice_difference(existing: &[VoiceEventEnvelope], proposed: &[VoiceEventEnvelope]) -> u64 {
+    existing
+        .iter()
+        .zip(proposed)
+        .position(|(left, right)| left != right)
+        .or_else(|| {
+            (existing.len() != proposed.len()).then_some(existing.len().min(proposed.len()))
+        })
+        .and_then(|index| u64::try_from(index).ok())
+        .unwrap_or(u64::MAX)
+}
+
+fn validate_voice_event_stream(events: &[VoiceEvent]) -> AppResult<()> {
+    let mut capture_seen = false;
+    let mut interruption_seen = false;
+    for (index, event) in events.iter().enumerate() {
+        match event {
+            VoiceEvent::VoiceCaptured { .. } => {
+                if capture_seen || index != 0 {
+                    return Err(AppError::VoiceEventContract(
+                        "voice capture must appear at most once and first".into(),
+                    ));
+                }
+                capture_seen = true;
+            }
+            VoiceEvent::VoiceSpoken {
+                run_id,
+                turn_id,
+                interrupted_at,
+                ..
+            } => {
+                if interruption_seen {
+                    return Err(AppError::VoiceEventContract(
+                        "voice interruption must terminate its companion stream".into(),
+                    ));
+                }
+                if interrupted_at.is_some()
+                    && !matches!(
+                        events.get(index + 1),
+                        Some(VoiceEvent::VoiceInterrupted {
+                            run_id: interrupted_run,
+                            turn_id: interrupted_turn,
+                            ..
+                        }) if interrupted_run == run_id && interrupted_turn == turn_id
+                    )
+                {
+                    return Err(AppError::VoiceEventContract(
+                        "interrupted voice speech must be followed by its exact interruption fact"
+                            .into(),
+                    ));
+                }
+            }
+            VoiceEvent::VoiceInterrupted {
+                run_id, turn_id, ..
+            } => {
+                let paired = matches!(
+                    index.checked_sub(1).and_then(|previous| events.get(previous)),
+                    Some(VoiceEvent::VoiceSpoken {
+                        run_id: spoken_run,
+                        turn_id: spoken_turn,
+                        interrupted_at: Some(_),
+                        ..
+                    }) if spoken_run == run_id && spoken_turn == turn_id
+                );
+                if interruption_seen || !paired || index + 1 != events.len() {
+                    return Err(AppError::VoiceEventContract(
+                        "voice interruption must be paired with the preceding spoken fact and terminate the stream"
+                            .into(),
+                    ));
+                }
+                interruption_seen = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_voice_event_keys(
+    connection: &Connection,
+    run_id: &str,
+    envelopes: &[VoiceEventEnvelope],
+) -> AppResult<()> {
+    let records = read_run_records_from(connection, run_id)?;
+    if records.is_empty() {
+        return Err(AppError::RunNotFound(run_id.into()));
+    }
+    for envelope in envelopes {
+        let turn_id = envelope.event.turn_id();
+        if !records
+            .iter()
+            .any(|record| harness_event_turn_id(&record.event) == Some(turn_id))
+        {
+            return Err(AppError::VoiceEventContract(format!(
+                "voice event turn {turn_id} is absent from core run {run_id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn harness_event_turn_id(event: &HarnessEvent) -> Option<&platonic_core::TurnId> {
+    match event {
+        HarnessEvent::ContextBuilt { turn_id, .. }
+        | HarnessEvent::ContextCompacted { turn_id, .. }
+        | HarnessEvent::ModelRequested { turn_id, .. }
+        | HarnessEvent::ModelFailed { turn_id, .. }
+        | HarnessEvent::ModelResponded { turn_id, .. }
+        | HarnessEvent::ToolProposalsRejected { turn_id, .. }
+        | HarnessEvent::ToolCallProposed { turn_id, .. } => Some(turn_id),
+        HarnessEvent::RunStarted { .. }
+        | HarnessEvent::PolicyEvaluated { .. }
+        | HarnessEvent::ApprovalGranted { .. }
+        | HarnessEvent::ApprovalDenied { .. }
+        | HarnessEvent::ToolStarted { .. }
+        | HarnessEvent::ToolFinished { .. }
+        | HarnessEvent::ToolFailed { .. }
+        | HarnessEvent::RunFinished { .. }
+        | HarnessEvent::RunFailed { .. } => None,
+    }
+}
+
+fn replay_records(records: &[RecordedEvent]) -> AppResult<RunState> {
+    let mut state = RunState::new();
+    for record in records {
+        state.apply(record)?;
+    }
+    Ok(state)
+}
+
+fn final_answer_from_records<'a>(
+    run_id: &RunId,
+    records: &'a [RecordedEvent],
+) -> AppResult<&'a str> {
+    final_answer_from_records_str(run_id.as_str(), records)
+}
+
+fn final_answer_from_records_str<'a>(
+    run_id: &str,
+    records: &'a [RecordedEvent],
+) -> AppResult<&'a str> {
+    records
+        .iter()
+        .rev()
+        .find_map(|record| match &record.event {
+            HarnessEvent::ModelResponded { output, .. }
+                if output.role == MessageRole::Assistant =>
+            {
+                Some(output.content.as_str())
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            AppError::Config(format!(
+                "finished session run {run_id} has no final assistant answer"
+            ))
+        })
+}
+
+fn failure_status(reason: &str) -> RunStateName {
+    if reason == RUN_CANCELED_REASON {
+        RunStateName::Canceled
+    } else {
+        RunStateName::Failed
+    }
+}
+
+fn update_running_session_outcome(
+    connection: &Connection,
+    run_id: &str,
+    status: RunStateName,
+    final_answer: Option<&str>,
+    error: Option<&str>,
+    now: i64,
+) -> AppResult<()> {
+    let updated = connection.execute(
+        "UPDATE session_runs
+         SET status = ?2, final_answer = ?3, error = ?4, updated_at_ms = ?5
+         WHERE run_id = ?1 AND status = ?6",
+        params![
+            run_id,
+            status.as_str(),
+            final_answer,
+            error,
+            now,
+            RunStateName::Running.as_str()
+        ],
+    )?;
+    if updated == 0 {
+        return Err(AppError::RunNotFound(run_id.into()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalFaultBoundary {
+    BeforeEventInsert,
+    AfterEventInsert,
+    BeforeOutcomeUpdate,
+    AfterOutcomeUpdate,
+    BeforeSessionTouch,
+    AfterSessionTouch,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VoiceFaultBoundary {
+    AfterFirstInsert,
+    BeforeCommit,
+}
+
+#[cfg(test)]
+fn inject_terminal_fault(
+    configured: &mut Option<TerminalFaultBoundary>,
+    boundary: TerminalFaultBoundary,
+) -> AppResult<()> {
+    if *configured == Some(boundary) {
+        *configured = None;
+        return Err(AppError::Config(format!(
+            "injected terminal fault at {boundary:?}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn inject_voice_fault(
+    configured: &mut Option<VoiceFaultBoundary>,
+    boundary: VoiceFaultBoundary,
+    reached: bool,
+) -> AppResult<()> {
+    if reached && *configured == Some(boundary) {
+        *configured = None;
+        return Err(AppError::Config(format!(
+            "injected voice transaction fault at {boundary:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn status_from_row(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<RunStateName> {
     let value: String = row.get(index)?;
     serde_json::from_value(serde_json::Value::String(value)).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
     })
+}
+
+fn thread_authority_from(
+    connection: &Connection,
+    thread_id: &str,
+) -> AppResult<Option<ThreadAuthorityRecord>> {
+    Ok(connection
+        .query_row(
+            "SELECT thread_id, parent_thread_id, spawning_actor, cwd, model,
+                    reasoning_effort, approval_policy, created_at_ms
+             FROM thread_authorities
+             WHERE thread_id = ?1",
+            params![thread_id],
+            thread_authority_from_row,
+        )
+        .optional()?)
+}
+
+fn thread_authority_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadAuthorityRecord> {
+    let reasoning_value: String = row.get(5)?;
+    let reasoning_effort = ReasoningEffort::parse(&reasoning_value).ok_or_else(|| {
+        invalid_thread_column(5, format!("unknown reasoning effort: {reasoning_value}"))
+    })?;
+    let policy_value: String = row.get(6)?;
+    let approval_policy = ThreadApprovalPolicy::parse(&policy_value).ok_or_else(|| {
+        invalid_thread_column(6, format!("unknown approval policy: {policy_value}"))
+    })?;
+    Ok(ThreadAuthorityRecord {
+        thread_id: row.get(0)?,
+        parent_thread_id: row.get(1)?,
+        spawning_actor: row.get(2)?,
+        cwd: row.get(3)?,
+        model: row.get(4)?,
+        reasoning_effort,
+        approval_policy,
+        created_at_ms: row_u64(row, 7, "thread created_at_ms")?,
+    })
+}
+
+fn thread_spawn_approval_from(
+    connection: &Connection,
+    spawn_id: &str,
+) -> AppResult<Option<ThreadSpawnApprovalRecord>> {
+    Ok(connection
+        .query_row(
+            "SELECT spawn_id, thread_id, decision, actor, reason, occurred_at_ms
+             FROM thread_spawn_approvals
+             WHERE spawn_id = ?1",
+            params![spawn_id],
+            |row| {
+                let decision_value: String = row.get(2)?;
+                let decision =
+                    ThreadSpawnDecisionName::parse(&decision_value).ok_or_else(|| {
+                        invalid_thread_column(
+                            2,
+                            format!("unknown thread spawn decision: {decision_value}"),
+                        )
+                    })?;
+                Ok(ThreadSpawnApprovalRecord {
+                    spawn_id: row.get(0)?,
+                    thread_id: row.get(1)?,
+                    decision,
+                    actor: row.get(3)?,
+                    reason: row.get(4)?,
+                    occurred_at_ms: row_u64(row, 5, "thread approval occurred_at_ms")?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn invalid_thread_column(index: usize, message: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        index,
+        Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        )),
+    )
 }
 
 struct ExistingEvent {
@@ -596,14 +1641,21 @@ fn session_run_metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Se
     })
 }
 
-fn sqlite_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordedEvent> {
+fn sqlite_record_from_row(row: &rusqlite::Row<'_>) -> AppResult<RecordedEvent> {
     let version: u32 = row.get(2)?;
-    if version != LEDGER_VERSION {
-        return Err(rusqlite::Error::InvalidQuery);
+    if !supported_ledger_version(version) {
+        return Err(AppError::LedgerVersion {
+            expected: LEDGER_VERSION,
+            actual: version,
+        });
     }
     let event_json: String = row.get(3)?;
     let event = serde_json::from_str(&event_json).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(error))
+        AppError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+            3,
+            Type::Text,
+            Box::new(error),
+        ))
     })?;
     Ok(RecordedEvent {
         seq: row_u64(row, 0, "seq")?,
@@ -690,10 +1742,14 @@ fn open_private_default_sqlite(
         PRIVATE_FILE_MODE,
         current_uid(),
     )?;
-    configure_sqlite_connection(&connection)?;
-    if create {
+    let schema_version = if create {
+        configure_sqlite_connection(&connection)?;
         migrate_sqlite(&mut connection)?;
-    }
+        SQLITE_SCHEMA_VERSION
+    } else {
+        configure_sqlite_connection(&connection)?;
+        read_sqlite_schema_version(&connection)?
+    };
     restrict_existing_sidecars(location.as_path())?;
     verify_open_file(
         location.as_path(),
@@ -701,7 +1757,14 @@ fn open_private_default_sqlite(
         PRIVATE_FILE_MODE,
         current_uid(),
     )?;
-    Ok(SqliteLedger { connection })
+    Ok(SqliteLedger {
+        connection,
+        schema_version,
+        #[cfg(test)]
+        terminal_fault: None,
+        #[cfg(test)]
+        voice_fault: None,
+    })
 }
 
 #[cfg(unix)]
@@ -916,6 +1979,17 @@ fn configure_sqlite_connection(connection: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+fn read_sqlite_schema_version(connection: &Connection) -> AppResult<u32> {
+    let actual: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if actual > SQLITE_SCHEMA_VERSION {
+        return Err(AppError::SqliteSchemaVersion {
+            expected: SQLITE_SCHEMA_VERSION,
+            actual,
+        });
+    }
+    Ok(actual)
+}
+
 fn migrate_sqlite(connection: &mut Connection) -> AppResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: u32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -924,7 +1998,7 @@ fn migrate_sqlite(connection: &mut Connection) -> AppResult<()> {
             "unsupported sqlite schema version: {version}"
         )));
     }
-    if version < 1 {
+    if version < LEGACY_SQLITE_SCHEMA_VERSION {
         transaction.execute_batch(
             r#"
             CREATE TABLE ledger_events (
@@ -938,8 +2012,14 @@ fn migrate_sqlite(connection: &mut Connection) -> AppResult<()> {
             "#,
         )?;
     }
-    if version < 2 {
+    if version < SESSION_SQLITE_SCHEMA_VERSION {
         create_session_tables(&transaction)?;
+    }
+    if version < VOICE_EVENT_SQLITE_SCHEMA_VERSION {
+        create_voice_event_table(&transaction)?;
+    }
+    if version < THREAD_AUTHORITY_SQLITE_SCHEMA_VERSION {
+        create_thread_authority_tables(&transaction)?;
     }
     if version < SQLITE_SCHEMA_VERSION {
         transaction.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)?;
@@ -977,6 +2057,73 @@ fn create_session_tables(connection: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+fn create_voice_event_table(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS voice_events (
+          run_id TEXT NOT NULL,
+          turn_id TEXT NOT NULL,
+          sequence INTEGER NOT NULL,
+          v INTEGER NOT NULL,
+          event_json TEXT NOT NULL,
+          PRIMARY KEY (run_id, sequence)
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn create_thread_authority_tables(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS thread_authorities (
+          thread_id TEXT PRIMARY KEY,
+          parent_thread_id TEXT,
+          spawning_actor TEXT NOT NULL,
+          cwd TEXT NOT NULL,
+          model TEXT NOT NULL,
+          reasoning_effort TEXT NOT NULL,
+          approval_policy TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS thread_spawn_approvals (
+          spawn_id TEXT PRIMARY KEY,
+          thread_id TEXT NOT NULL,
+          decision TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          reason TEXT,
+          occurred_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TRIGGER IF NOT EXISTS thread_authorities_no_update
+        BEFORE UPDATE ON thread_authorities
+        BEGIN
+          SELECT RAISE(ABORT, 'thread authority records are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS thread_authorities_no_delete
+        BEFORE DELETE ON thread_authorities
+        BEGIN
+          SELECT RAISE(ABORT, 'thread authority records are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS thread_spawn_approvals_no_update
+        BEFORE UPDATE ON thread_spawn_approvals
+        BEGIN
+          SELECT RAISE(ABORT, 'thread spawn approvals are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS thread_spawn_approvals_no_delete
+        BEFORE DELETE ON thread_spawn_approvals
+        BEGIN
+          SELECT RAISE(ABORT, 'thread spawn approvals are immutable');
+        END;
+        "#,
+    )?;
+    Ok(())
+}
+
 fn next_record(state: &mut RunState, event: HarnessEvent) -> AppResult<RecordedEvent> {
     let record = RecordedEvent {
         seq: state.next_seq(),
@@ -985,6 +2132,10 @@ fn next_record(state: &mut RunState, event: HarnessEvent) -> AppResult<RecordedE
     };
     state.apply(&record)?;
     Ok(record)
+}
+
+fn supported_ledger_version(version: u32) -> bool {
+    matches!(version, LEGACY_LEDGER_VERSION | LEDGER_VERSION)
 }
 
 pub fn read_records(path: &Path) -> AppResult<Vec<RecordedEvent>> {
@@ -998,7 +2149,7 @@ pub fn read_records(path: &Path) -> AppResult<Vec<RecordedEvent>> {
             continue;
         }
         let line: LedgerLine = serde_json::from_str(&line)?;
-        if line.v != LEDGER_VERSION {
+        if !supported_ledger_version(line.v) {
             return Err(AppError::LedgerVersion {
                 expected: LEDGER_VERSION,
                 actual: line.v,
@@ -1060,12 +2211,49 @@ pub fn default_sqlite_session_summaries(
     SqliteLedger::open_default_readonly(path)?.session_summaries()
 }
 
+pub(crate) fn default_thread_authorities(
+    path: &DefaultSqlitePath,
+) -> AppResult<Vec<ThreadAuthorityRecord>> {
+    if fs::symlink_metadata(path.as_path())
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(Vec::new());
+    }
+    SqliteLedger::open_default_readonly(path)?.thread_authorities()
+}
+
+pub(crate) fn default_thread_authority(
+    path: &DefaultSqlitePath,
+    thread_id: &str,
+) -> AppResult<Option<ThreadAuthorityRecord>> {
+    if fs::symlink_metadata(path.as_path())
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(None);
+    }
+    SqliteLedger::open_default_readonly(path)?.thread_authority(thread_id)
+}
+
+pub(crate) fn default_sqlite_session_status(
+    path: &DefaultSqlitePath,
+    session_id: Option<&str>,
+) -> AppResult<Option<PersistedSessionStatus>> {
+    if fs::symlink_metadata(path.as_path())
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return match session_id {
+            Some(session_id) => Err(AppError::SessionNotFound(session_id.into())),
+            None => Ok(None),
+        };
+    }
+    SqliteLedger::open_default_readonly(path)?.session_status(session_id)
+}
+
 pub fn interrupt_orphaned_sqlite_runs(path: &Path) -> AppResult<usize> {
     if !path.exists() {
         return Ok(0);
     }
-    SqliteLedger::open_or_create(path)?
-        .interrupt_running_session_runs("daemon restarted before run completed")
+    SqliteLedger::open_or_create(path)?.interrupt_running_session_runs(ORPHANED_RUN_ERROR)
 }
 
 pub fn interrupt_orphaned_default_sqlite_runs(path: &DefaultSqlitePath) -> AppResult<usize> {
@@ -1074,8 +2262,7 @@ pub fn interrupt_orphaned_default_sqlite_runs(path: &DefaultSqlitePath) -> AppRe
     {
         return Ok(0);
     }
-    SqliteLedger::open_or_create_default(path)?
-        .interrupt_running_session_runs("daemon restarted before run completed")
+    SqliteLedger::open_or_create_default(path)?.interrupt_running_session_runs(ORPHANED_RUN_ERROR)
 }
 
 fn now_ms() -> u64 {
@@ -1088,7 +2275,11 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use platonic_core::{AgentId, HarnessEvent, RunId};
+    use platonic_core::{
+        ActorId, AgentId, ContextPack, HarnessEvent, Message, MessageRole, ModelName, ModelUsage,
+        PolicyDecision, RunId, RunReadback, ToolCallId, TurnId,
+    };
+    use serde_json::Value;
     use std::{
         sync::atomic::{AtomicBool, Ordering},
         thread,
@@ -1117,6 +2308,103 @@ mod tests {
     #[cfg(unix)]
     fn set_mode(path: &Path, mode: u32) {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn captured_voice_event(run_id: &str, turn_id: &str) -> VoiceEvent {
+        VoiceEvent::VoiceCaptured {
+            run_id: RunId::new(run_id).unwrap(),
+            turn_id: TurnId::new(turn_id).unwrap(),
+            transcript_sha256: "a".repeat(64),
+            transcript_bytes: 14,
+            transcript_span_ms: 800,
+            input_frames: 38_400,
+            output_frames: 12_800,
+            vad_start_sample: 320,
+            vad_speech_end_sample: 11_200,
+            vad_close_sample: 12_800,
+            vad_close_to_final_us: 105_000,
+            normalization_resampling_us: 900,
+        }
+    }
+
+    fn completed_voice_events(run_id: &str) -> Vec<VoiceEvent> {
+        vec![
+            captured_voice_event(run_id, "turn_1"),
+            VoiceEvent::VoiceSpoken {
+                run_id: RunId::new(run_id).unwrap(),
+                turn_id: TurnId::new("turn_1").unwrap(),
+                ttfa_ms: 289,
+                sentence_count: 2,
+                interrupted_at: Some(1),
+            },
+            VoiceEvent::VoiceInterrupted {
+                run_id: RunId::new(run_id).unwrap(),
+                turn_id: TurnId::new("turn_1").unwrap(),
+                spoken_prefix: "This prefix was audible".into(),
+                delta_index: 7,
+            },
+        ]
+    }
+
+    fn thread_authority(
+        thread_id: &str,
+        parent_thread_id: Option<&str>,
+        actor: &str,
+        cwd: &Path,
+        policy: ThreadApprovalPolicy,
+        created_at_ms: u64,
+    ) -> ThreadAuthorityRecord {
+        ThreadAuthorityRecord {
+            thread_id: thread_id.into(),
+            parent_thread_id: parent_thread_id.map(str::to_owned),
+            spawning_actor: actor.into(),
+            cwd: cwd.canonicalize().unwrap().to_string_lossy().into_owned(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: ReasoningEffort::Xhigh,
+            approval_policy: policy,
+            created_at_ms,
+        }
+    }
+
+    fn thread_approval(
+        spawn_id: &str,
+        thread_id: &str,
+        decision: ThreadSpawnDecisionName,
+        actor: &str,
+        reason: Option<&str>,
+        occurred_at_ms: u64,
+    ) -> ThreadSpawnApprovalRecord {
+        ThreadSpawnApprovalRecord {
+            spawn_id: spawn_id.into(),
+            thread_id: thread_id.into(),
+            decision,
+            actor: actor.into(),
+            reason: reason.map(str::to_owned),
+            occurred_at_ms,
+        }
+    }
+
+    fn append_voice_core_keys(ledger: &mut SqliteLedger, run_id: &str, turn_id: &str) {
+        ledger
+            .append(run_id, &started_record(run_id, 0, 0))
+            .unwrap();
+        ledger
+            .append(
+                run_id,
+                &RecordedEvent {
+                    seq: 1,
+                    occurred_at_ms: 1,
+                    event: HarnessEvent::ContextBuilt {
+                        run_id: RunId::new(run_id).unwrap(),
+                        turn_id: TurnId::new(turn_id).unwrap(),
+                        context: ContextPack {
+                            fragments: vec![],
+                            token_budget: 4_000,
+                        },
+                    },
+                },
+            )
+            .unwrap();
     }
 
     #[cfg(unix)]
@@ -1357,21 +2645,73 @@ mod tests {
         let records = read_records(&path).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].seq, 0);
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["v"], LEDGER_VERSION);
     }
 
     #[test]
     fn rejects_wrong_ledger_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
-        std::fs::write(&path, r#"{"v":2,"record":{"seq":0,"occurred_at_ms":0,"event":{"event":"run_started","run_id":"run_1","agent_id":"plato"}}}"#).unwrap();
+        std::fs::write(&path, r#"{"v":3,"record":{"seq":0,"occurred_at_ms":0,"event":{"event":"run_started","run_id":"run_1","agent_id":"plato"}}}"#).unwrap();
 
         assert!(matches!(
             read_records(&path),
             Err(AppError::LedgerVersion {
                 expected: LEDGER_VERSION,
-                actual: 2
+                actual: 3
             })
         ));
+    }
+
+    #[test]
+    fn new_jsonl_and_sqlite_ledgers_write_v2_with_null_unknown_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl_path = dir.path().join("events.jsonl");
+        let sqlite_path = dir.path().join("events.db");
+        let run_id = RunId::new("run_unknown_usage").unwrap();
+        let mut jsonl = JsonlEventRecorder::create(&jsonl_path).unwrap();
+        let mut sqlite = SqliteEventRecorder::create(&sqlite_path, &run_id).unwrap();
+
+        for event in response_run_events(&run_id, None) {
+            jsonl.record(event.clone()).unwrap();
+            sqlite.record(event).unwrap();
+        }
+        drop(jsonl);
+        drop(sqlite);
+
+        let jsonl_lines = std::fs::read_to_string(&jsonl_path).unwrap();
+        let jsonl_response = jsonl_lines
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|line| line["record"]["event"]["event"] == "model_responded")
+            .unwrap();
+        assert_eq!(jsonl_response["v"], LEDGER_VERSION);
+        assert!(jsonl_response["record"]["event"]["usage"].is_null());
+
+        let connection = Connection::open(&sqlite_path).unwrap();
+        let (version, event_json): (u32, String) = connection
+            .query_row(
+                "SELECT v, event_json
+                 FROM ledger_events
+                 WHERE run_id = ?1 AND seq = 3",
+                params![run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(version, LEDGER_VERSION);
+        let sqlite_response: Value = serde_json::from_str(&event_json).unwrap();
+        assert!(sqlite_response["usage"].is_null());
+
+        for records in [
+            read_records(&jsonl_path).unwrap(),
+            read_sqlite_records(&sqlite_path, Some(run_id.as_str())).unwrap(),
+        ] {
+            assert!(matches!(
+                &records[3].event,
+                HarnessEvent::ModelResponded { usage: None, .. }
+            ));
+        }
     }
 
     #[test]
@@ -1393,6 +2733,455 @@ mod tests {
         let ledger = SqliteLedger::open_or_create(&path).unwrap();
 
         assert_eq!(ledger.user_version().unwrap(), SQLITE_SCHEMA_VERSION);
+        let voice_schema = ledger
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'voice_events'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            voice_schema,
+            "CREATE TABLE voice_events (\n          run_id TEXT NOT NULL,\n          turn_id TEXT NOT NULL,\n          sequence INTEGER NOT NULL,\n          v INTEGER NOT NULL,\n          event_json TEXT NOT NULL,\n          PRIMARY KEY (run_id, sequence)\n        )"
+        );
+    }
+
+    #[test]
+    fn authority_migration_is_additive_idempotent_and_readonly_v2_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2-events.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE ledger_events (
+                  run_id TEXT NOT NULL,
+                  seq INTEGER NOT NULL,
+                  occurred_at_ms INTEGER NOT NULL,
+                  v INTEGER NOT NULL,
+                  event_json TEXT NOT NULL,
+                  PRIMARY KEY (run_id, seq)
+                );
+                PRAGMA user_version = 2;
+                "#,
+            )
+            .unwrap();
+        create_session_tables(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (session_id, created_at_ms, updated_at_ms) VALUES ('kept', 1, 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let bytes_before_read = fs::read(&path).unwrap();
+        let readonly = SqliteLedger::open_readonly(&path).unwrap();
+        assert!(readonly.read_voice_events("run_absent").unwrap().is_empty());
+        drop(readonly);
+        assert_eq!(fs::read(&path).unwrap(), bytes_before_read);
+
+        let migrated = SqliteLedger::open_or_create(&path).unwrap();
+        assert_eq!(migrated.user_version().unwrap(), SQLITE_SCHEMA_VERSION);
+        let kept: String = migrated
+            .connection
+            .query_row("SELECT session_id FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, "kept");
+        assert!(migrated.read_voice_events("run_absent").unwrap().is_empty());
+        assert!(migrated.thread_authorities().unwrap().is_empty());
+        drop(migrated);
+
+        let bytes_after_migration = fs::read(&path).unwrap();
+        drop(SqliteLedger::open_or_create(&path).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), bytes_after_migration);
+    }
+
+    #[test]
+    fn thread_authority_persists_all_eight_fields_and_is_immutable_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let columns = ledger
+            .connection
+            .prepare("PRAGMA table_info(thread_authorities)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            [
+                "thread_id",
+                "parent_thread_id",
+                "spawning_actor",
+                "cwd",
+                "model",
+                "reasoning_effort",
+                "approval_policy",
+                "created_at_ms",
+            ]
+        );
+
+        let authority = thread_authority(
+            "thread_root",
+            None,
+            "stdin",
+            dir.path(),
+            ThreadApprovalPolicy::Prompt,
+            42,
+        );
+        let approval = thread_approval(
+            "spawn_root",
+            "thread_root",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            42,
+        );
+        let durable = ledger
+            .persist_thread_spawn(&approval, Some(&authority))
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.record(), &authority);
+        assert_eq!(
+            ledger.thread_spawn_approval("spawn_root").unwrap(),
+            Some(approval.clone())
+        );
+
+        for statement in [
+            "UPDATE thread_authorities SET model = 'changed' WHERE thread_id = 'thread_root'",
+            "DELETE FROM thread_authorities WHERE thread_id = 'thread_root'",
+            "UPDATE thread_spawn_approvals SET actor = 'changed' WHERE spawn_id = 'spawn_root'",
+            "DELETE FROM thread_spawn_approvals WHERE spawn_id = 'spawn_root'",
+        ] {
+            let error = ledger.connection.execute(statement, []).unwrap_err();
+            assert!(error.to_string().contains("immutable"));
+        }
+        drop(ledger);
+
+        let reopened = SqliteLedger::open_readonly(&path).unwrap();
+        assert_eq!(
+            reopened.thread_authorities().unwrap(),
+            vec![authority.clone()]
+        );
+        assert_eq!(
+            reopened.thread_authority("thread_root").unwrap(),
+            Some(authority)
+        );
+        assert_eq!(
+            reopened.thread_spawn_approval("spawn_root").unwrap(),
+            Some(approval)
+        );
+    }
+
+    #[test]
+    fn literal_v4_thread_authority_fixture_reads_exactly_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("literal-v4.db");
+        let cwd = dir.path().canonicalize().unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE thread_authorities (
+                  thread_id TEXT PRIMARY KEY,
+                  parent_thread_id TEXT,
+                  spawning_actor TEXT NOT NULL,
+                  cwd TEXT NOT NULL,
+                  model TEXT NOT NULL,
+                  reasoning_effort TEXT NOT NULL,
+                  approval_policy TEXT NOT NULL,
+                  created_at_ms INTEGER NOT NULL
+                );
+                PRAGMA user_version = 4;
+                "#,
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO thread_authorities
+                   (thread_id, parent_thread_id, spawning_actor, cwd, model,
+                    reasoning_effort, approval_policy, created_at_ms)
+                 VALUES ('thread_literal', 'thread_parent', 'fixture_actor', ?1,
+                         'gpt-5.6-sol', 'xhigh', 'prompt', 42)",
+                params![cwd.to_string_lossy()],
+            )
+            .unwrap();
+        drop(connection);
+        let bytes_before = fs::read(&path).unwrap();
+
+        let ledger = SqliteLedger::open_readonly(&path).unwrap();
+        assert_eq!(
+            ledger.thread_authority("thread_literal").unwrap(),
+            Some(ThreadAuthorityRecord {
+                thread_id: "thread_literal".into(),
+                parent_thread_id: Some("thread_parent".into()),
+                spawning_actor: "fixture_actor".into(),
+                cwd: cwd.to_string_lossy().into_owned(),
+                model: "gpt-5.6-sol".into(),
+                reasoning_effort: ReasoningEffort::Xhigh,
+                approval_policy: ThreadApprovalPolicy::Prompt,
+                created_at_ms: 42,
+            })
+        );
+        drop(ledger);
+        assert_eq!(fs::read(&path).unwrap(), bytes_before);
+    }
+
+    #[test]
+    fn malformed_durable_thread_authority_fails_closed_on_readback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("malformed-v4.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE thread_authorities (
+                  thread_id TEXT PRIMARY KEY,
+                  parent_thread_id TEXT,
+                  spawning_actor TEXT NOT NULL,
+                  cwd TEXT NOT NULL,
+                  model TEXT NOT NULL,
+                  reasoning_effort TEXT NOT NULL,
+                  approval_policy TEXT NOT NULL,
+                  created_at_ms INTEGER NOT NULL
+                );
+                INSERT INTO thread_authorities VALUES
+                  ('thread_bad', NULL, 'fixture_actor', '/tmp', 'gpt-5.6-sol',
+                   'xhigh', 'expanded', 42);
+                PRAGMA user_version = 4;
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let ledger = SqliteLedger::open_readonly(&path).unwrap();
+        let error = ledger.thread_authority("thread_bad").unwrap_err();
+        assert!(error.to_string().contains("unknown approval policy"));
+    }
+
+    #[test]
+    fn denied_and_canceled_thread_spawns_record_actor_without_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        for approval in [
+            thread_approval(
+                "spawn_denied",
+                "thread_denied",
+                ThreadSpawnDecisionName::Denied,
+                "reviewer",
+                Some("not admitted"),
+                10,
+            ),
+            thread_approval(
+                "spawn_canceled",
+                "thread_canceled",
+                ThreadSpawnDecisionName::Canceled,
+                "stdin",
+                None,
+                11,
+            ),
+        ] {
+            assert!(
+                ledger
+                    .persist_thread_spawn(&approval, None)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                ledger.thread_spawn_approval(&approval.spawn_id).unwrap(),
+                Some(approval.clone())
+            );
+            assert!(
+                ledger
+                    .thread_authority(&approval.thread_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(ledger.thread_authorities().unwrap().is_empty());
+    }
+
+    #[test]
+    fn thread_spawn_persistence_failure_rolls_back_decision_and_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        ledger
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_thread_authority_insert
+                 BEFORE INSERT ON thread_authorities
+                 BEGIN SELECT RAISE(ABORT, 'injected authority failure'); END;",
+            )
+            .unwrap();
+        let authority = thread_authority(
+            "thread_failed",
+            None,
+            "stdin",
+            dir.path(),
+            ThreadApprovalPolicy::Prompt,
+            20,
+        );
+        let approval = thread_approval(
+            "spawn_failed",
+            "thread_failed",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            20,
+        );
+
+        assert!(
+            ledger
+                .persist_thread_spawn(&approval, Some(&authority))
+                .is_err()
+        );
+        assert!(
+            ledger
+                .thread_spawn_approval("spawn_failed")
+                .unwrap()
+                .is_none()
+        );
+        assert!(ledger.thread_authority("thread_failed").unwrap().is_none());
+    }
+
+    #[test]
+    fn duplicate_thread_spawn_is_idempotent_only_for_identical_durable_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let authority = thread_authority(
+            "thread_root",
+            None,
+            "stdin",
+            dir.path(),
+            ThreadApprovalPolicy::Yolo,
+            30,
+        );
+        let approval = thread_approval(
+            "spawn_root",
+            "thread_root",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            30,
+        );
+        ledger
+            .persist_thread_spawn(&approval, Some(&authority))
+            .unwrap();
+        assert_eq!(
+            ledger
+                .persist_thread_spawn(&approval, Some(&authority))
+                .unwrap()
+                .unwrap()
+                .record(),
+            &authority
+        );
+
+        let conflicting_approval = thread_approval(
+            "spawn_root",
+            "thread_root",
+            ThreadSpawnDecisionName::Granted,
+            "different_actor",
+            None,
+            30,
+        );
+        let conflicting_authority = ThreadAuthorityRecord {
+            spawning_actor: "different_actor".into(),
+            ..authority.clone()
+        };
+        assert!(matches!(
+            ledger.persist_thread_spawn(
+                &conflicting_approval,
+                Some(&conflicting_authority)
+            ),
+            Err(AppError::Config(message)) if message.contains("conflicts")
+        ));
+
+        let mismatched_actor = ThreadAuthorityRecord {
+            spawning_actor: "reviewer".into(),
+            thread_id: "thread_other".into(),
+            ..authority
+        };
+        let other_approval = thread_approval(
+            "spawn_other",
+            "thread_other",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            31,
+        );
+        assert!(matches!(
+            ledger.persist_thread_spawn(&other_approval, Some(&mismatched_actor)),
+            Err(AppError::Config(message)) if message.contains("actor")
+        ));
+    }
+
+    #[test]
+    fn durable_parent_gate_rejects_policy_and_cwd_expansion_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let child_dir = root.path().join("child");
+        fs::create_dir(&child_dir).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = root.path().join("threads.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let parent = thread_authority(
+            "thread_parent",
+            None,
+            "stdin",
+            root.path(),
+            ThreadApprovalPolicy::Prompt,
+            1,
+        );
+        let parent_approval = thread_approval(
+            "spawn_parent",
+            "thread_parent",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            1,
+        );
+        ledger
+            .persist_thread_spawn(&parent_approval, Some(&parent))
+            .unwrap();
+
+        for (spawn_id, thread_id, cwd, policy) in [
+            (
+                "spawn_policy_expansion",
+                "thread_policy_expansion",
+                child_dir.as_path(),
+                ThreadApprovalPolicy::Yolo,
+            ),
+            (
+                "spawn_cwd_expansion",
+                "thread_cwd_expansion",
+                outside.path(),
+                ThreadApprovalPolicy::Prompt,
+            ),
+        ] {
+            let authority =
+                thread_authority(thread_id, Some("thread_parent"), "stdin", cwd, policy, 2);
+            let approval = thread_approval(
+                spawn_id,
+                thread_id,
+                ThreadSpawnDecisionName::Granted,
+                "stdin",
+                None,
+                2,
+            );
+            assert!(
+                ledger
+                    .persist_thread_spawn(&approval, Some(&authority))
+                    .is_err()
+            );
+            assert!(ledger.thread_spawn_approval(spawn_id).unwrap().is_none());
+            assert!(ledger.thread_authority(thread_id).unwrap().is_none());
+        }
     }
 
     #[test]
@@ -1411,6 +3200,191 @@ mod tests {
             ledger.append("run_1", &changed),
             Err(AppError::LedgerConflict { .. })
         ));
+    }
+
+    #[test]
+    fn voice_companion_commit_is_ordered_idempotent_and_conflict_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let events = completed_voice_events("run_voice");
+        append_voice_core_keys(&mut ledger, "run_voice", "turn_1");
+
+        let committed = ledger.append_voice_events(&events).unwrap();
+        assert_eq!(
+            committed
+                .iter()
+                .map(|envelope| envelope.sequence)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(ledger.read_voice_events("run_voice").unwrap(), committed);
+        let bytes_after_commit = fs::read(&path).unwrap();
+        assert_eq!(ledger.append_voice_events(&events).unwrap(), committed);
+        assert_eq!(fs::read(&path).unwrap(), bytes_after_commit);
+
+        let mut changed = events.clone();
+        let VoiceEvent::VoiceSpoken { ttfa_ms, .. } = &mut changed[1] else {
+            unreachable!()
+        };
+        *ttfa_ms += 1;
+        assert!(matches!(
+            ledger.append_voice_events(&changed),
+            Err(AppError::VoiceLedgerConflict {
+                run_id,
+                sequence: 1
+            }) if run_id == "run_voice"
+        ));
+        assert_eq!(ledger.read_voice_events("run_voice").unwrap(), committed);
+    }
+
+    #[test]
+    fn voice_companion_rejects_orphan_and_misordered_interruption_facts() {
+        let run_id = RunId::new("run_voice").unwrap();
+        let turn_id = TurnId::new("turn_1").unwrap();
+        let spoken = VoiceEvent::VoiceSpoken {
+            run_id: run_id.clone(),
+            turn_id: turn_id.clone(),
+            ttfa_ms: 280,
+            sentence_count: 1,
+            interrupted_at: Some(0),
+        };
+        let interrupted = VoiceEvent::VoiceInterrupted {
+            run_id,
+            turn_id,
+            spoken_prefix: "audible".into(),
+            delta_index: 2,
+        };
+
+        assert!(validate_voice_event_stream(std::slice::from_ref(&spoken)).is_err());
+        assert!(validate_voice_event_stream(std::slice::from_ref(&interrupted)).is_err());
+        assert!(validate_voice_event_stream(&[interrupted, spoken]).is_err());
+    }
+
+    #[test]
+    fn voice_companion_faults_roll_back_the_entire_stream_before_reopen() {
+        for boundary in [
+            VoiceFaultBoundary::AfterFirstInsert,
+            VoiceFaultBoundary::BeforeCommit,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("voice-{boundary:?}.db"));
+            let events = completed_voice_events("run_fault");
+            let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+            append_voice_core_keys(&mut ledger, "run_fault", "turn_1");
+            ledger.inject_voice_fault_at(boundary);
+
+            assert!(matches!(
+                ledger.append_voice_events(&events),
+                Err(AppError::Config(message)) if message.contains("injected voice transaction fault")
+            ));
+            let rows: i64 = ledger
+                .connection
+                .query_row("SELECT COUNT(*) FROM voice_events", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(rows, 0);
+            drop(ledger);
+
+            let mut reopened = SqliteLedger::open_or_create(&path).unwrap();
+            assert!(reopened.read_voice_events("run_fault").unwrap().is_empty());
+            let committed = reopened.append_voice_events(&events).unwrap();
+            drop(reopened);
+            assert_eq!(
+                SqliteLedger::open_readonly(&path)
+                    .unwrap()
+                    .read_voice_events("run_fault")
+                    .unwrap(),
+                committed
+            );
+        }
+    }
+
+    #[test]
+    fn voice_companion_read_rejects_version_sequence_and_key_corruption() {
+        let corruptions = [
+            (
+                "UPDATE voice_events SET v = 2 WHERE sequence = 0",
+                "voice event version mismatch",
+            ),
+            (
+                "UPDATE voice_events SET sequence = 4 WHERE sequence = 2",
+                "voice event sequence was 4, expected 2",
+            ),
+            (
+                "UPDATE voice_events SET turn_id = 'turn_wrong' WHERE sequence = 1",
+                "voice event columns disagree with payload",
+            ),
+        ];
+        for (sql, expected) in corruptions {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("events.db");
+            let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+            append_voice_core_keys(&mut ledger, "run_corrupt", "turn_1");
+            ledger
+                .append_voice_events(&completed_voice_events("run_corrupt"))
+                .unwrap();
+            ledger.connection.execute(sql, []).unwrap();
+            assert!(
+                ledger
+                    .read_voice_events("run_corrupt")
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn voice_companion_read_rejects_durable_cross_row_contract_corruption_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let unpaired_path = dir.path().join("unpaired-interruption.db");
+        let mut ledger = SqliteLedger::open_or_create(&unpaired_path).unwrap();
+        append_voice_core_keys(&mut ledger, "run_unpaired", "turn_1");
+        ledger
+            .append_voice_events(&completed_voice_events("run_unpaired"))
+            .unwrap();
+        ledger
+            .connection
+            .execute("DELETE FROM voice_events WHERE sequence = 2", [])
+            .unwrap();
+        drop(ledger);
+
+        let error = SqliteLedger::open_readonly(&unpaired_path)
+            .unwrap()
+            .read_voice_events("run_unpaired")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted voice speech must be followed")
+        );
+
+        let capture_path = dir.path().join("repeated-capture.db");
+        let mut ledger = SqliteLedger::open_or_create(&capture_path).unwrap();
+        append_voice_core_keys(&mut ledger, "run_capture", "turn_1");
+        ledger
+            .append_voice_events(&completed_voice_events("run_capture"))
+            .unwrap();
+        let repeated_capture =
+            serde_json::to_string(&captured_voice_event("run_capture", "turn_1")).unwrap();
+        ledger
+            .connection
+            .execute(
+                "UPDATE voice_events SET event_json = ?1 WHERE sequence = 1",
+                params![repeated_capture],
+            )
+            .unwrap();
+        drop(ledger);
+
+        let error = SqliteLedger::open_readonly(&capture_path)
+            .unwrap()
+            .read_voice_events("run_capture")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("voice capture must appear at most once and first")
+        );
     }
 
     #[test]
@@ -1442,6 +3416,7 @@ mod tests {
             .begin_session_run("session_1", &run_id, "hello", true)
             .unwrap();
         assert!(turns.is_empty());
+        append_response_prefix(&mut ledger, &run_id, "hi", 0);
         ledger.finish_session_run(&run_id, "hi").unwrap();
 
         assert_eq!(ledger.latest_session_id().unwrap(), "session_1");
@@ -1452,6 +3427,130 @@ mod tests {
                 final_answer: "hi".into(),
             }]
         );
+    }
+
+    #[test]
+    fn sqlite_status_projects_exact_multi_run_usage_trust_and_session_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        ledger
+            .connection
+            .execute_batch(
+                r#"
+                INSERT INTO sessions (session_id, created_at_ms, updated_at_ms)
+                VALUES ('session_1', 10, 20);
+                INSERT INTO session_runs
+                  (session_id, run_id, session_index, question, final_answer, status, error, created_at_ms, updated_at_ms)
+                VALUES
+                  ('session_1', 'run_1', 0, 'first question', 'first answer', 'finished', NULL, 10, 10),
+                  ('session_1', 'run_2', 1, 'second question', 'second answer', 'finished', NULL, 20, 20);
+                "#,
+            )
+            .unwrap();
+
+        append_status_records(
+            &mut ledger,
+            "run_1",
+            vec![
+                status_started_event("run_1"),
+                status_response_event(
+                    "run_1",
+                    "turn_1",
+                    0,
+                    Some("served-old"),
+                    Some(ModelUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    }),
+                ),
+                status_response_event("run_1", "turn_1", 1, Some("served-older"), None),
+                HarnessEvent::ApprovalGranted {
+                    run_id: RunId::new("run_1").unwrap(),
+                    call_id: ToolCallId::new("call_granted_1").unwrap(),
+                    actor_id: ActorId::new("human").unwrap(),
+                },
+                HarnessEvent::PolicyEvaluated {
+                    run_id: RunId::new("run_1").unwrap(),
+                    call_id: ToolCallId::new("call_pending_only").unwrap(),
+                    decision: PolicyDecision::RequireApproval {
+                        reason: "approval required".into(),
+                    },
+                },
+            ],
+        );
+        append_status_records(
+            &mut ledger,
+            "run_2",
+            vec![
+                status_started_event("run_2"),
+                status_response_event(
+                    "run_2",
+                    "turn_2",
+                    0,
+                    None,
+                    Some(ModelUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    }),
+                ),
+                status_response_event("run_2", "turn_2", 1, Some("served-candidate"), None),
+                status_response_event(
+                    "run_2",
+                    "turn_2",
+                    2,
+                    Some("served-latest"),
+                    Some(ModelUsage {
+                        input_tokens: 7,
+                        output_tokens: 3,
+                    }),
+                ),
+                HarnessEvent::ApprovalGranted {
+                    run_id: RunId::new("run_2").unwrap(),
+                    call_id: ToolCallId::new("call_granted_2").unwrap(),
+                    actor_id: ActorId::new("human").unwrap(),
+                },
+                HarnessEvent::ApprovalDenied {
+                    run_id: RunId::new("run_2").unwrap(),
+                    call_id: ToolCallId::new("call_denied_1").unwrap(),
+                    actor_id: ActorId::new("human").unwrap(),
+                    reason: "not now".into(),
+                },
+                HarnessEvent::ApprovalDenied {
+                    run_id: RunId::new("run_2").unwrap(),
+                    call_id: ToolCallId::new("call_denied_2").unwrap(),
+                    actor_id: ActorId::new("human").unwrap(),
+                    reason: "still no".into(),
+                },
+            ],
+        );
+
+        assert_eq!(
+            ledger.session_status(None).unwrap(),
+            Some(PersistedSessionStatus {
+                session_id: "session_1".into(),
+                latest_run_id: "run_2".into(),
+                human_turn_count: 2,
+                core_event_count: 12,
+                served_model: Some("served-latest".into()),
+                last_run_usage: PersistedTokenUsage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    unknown_response_count: 1,
+                },
+                session_usage: PersistedTokenUsage {
+                    input_tokens: 17,
+                    output_tokens: 8,
+                    unknown_response_count: 2,
+                },
+                approval_granted_count: 2,
+                approval_denied_count: 2,
+            })
+        );
+        assert!(matches!(
+            ledger.session_status(Some("missing-session")),
+            Err(AppError::SessionNotFound(session_id)) if session_id == "missing-session"
+        ));
     }
 
     #[test]
@@ -1520,12 +3619,9 @@ mod tests {
             (&mut first_ledger, "run_1", 10, "answer one"),
             (&mut second_ledger, "run_2", 20, "answer two"),
         ] {
-            ledger
-                .append(run_id, &started_record(run_id, 0, occurred_at_ms))
-                .unwrap();
-            ledger
-                .finish_session_run(&RunId::new(run_id).unwrap(), answer)
-                .unwrap();
+            let run_id = RunId::new(run_id).unwrap();
+            append_response_prefix(ledger, &run_id, answer, occurred_at_ms);
+            ledger.finish_session_run(&run_id, answer).unwrap();
         }
         drop(first_ledger);
         drop(second_ledger);
@@ -1541,8 +3637,13 @@ mod tests {
             assert_eq!(session.runs[0].question, question);
             assert_eq!(session.runs[0].status, RunStateName::Finished);
             assert_eq!(session.runs[0].final_answer.as_deref(), Some(answer));
-            assert_eq!(session.runs[0].records.len(), 1);
-            assert_eq!(session.runs[0].records[0].event.run_id().as_str(), run_id);
+            assert_eq!(session.runs[0].records.len(), 5);
+            assert!(
+                session.runs[0]
+                    .records
+                    .iter()
+                    .all(|record| record.event.run_id().as_str() == run_id)
+            );
         }
     }
 
@@ -1557,9 +3658,7 @@ mod tests {
         ledger
             .begin_session_run("session_1", &first, "first question", true)
             .unwrap();
-        ledger
-            .append("run_1", &started_record("run_1", 0, 10))
-            .unwrap();
+        append_response_prefix(&mut ledger, &first, "first answer", 10);
         ledger.finish_session_run(&first, "first answer").unwrap();
         ledger
             .begin_session_run("session_1", &second, "second question", false)
@@ -1591,7 +3690,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_session_summaries_report_latest_session_run() {
+    fn sqlite_session_summaries_report_first_and_latest_session_questions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.db");
         let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
@@ -1601,11 +3700,20 @@ mod tests {
         ledger
             .begin_session_run("session_1", &first_run, "first question", true)
             .unwrap();
+        append_response_prefix(&mut ledger, &first_run, "first answer", 0);
         ledger
             .finish_session_run(&first_run, "first answer")
             .unwrap();
         ledger
             .begin_session_run("session_1", &second_run, "second question", false)
+            .unwrap();
+        let updated_at_ms = ledger
+            .connection
+            .query_row(
+                "SELECT updated_at_ms FROM sessions WHERE session_id = 'session_1'",
+                [],
+                |row| row_u64(row, 0, "updated_at_ms"),
+            )
             .unwrap();
 
         assert_eq!(
@@ -1615,7 +3723,94 @@ mod tests {
                 run_id: "run_2".into(),
                 status: RunStateName::Running,
                 latest_question: "second question".into(),
+                first_question: "first question".into(),
+                updated_at_ms,
             }]
+        );
+    }
+
+    #[test]
+    fn sqlite_session_summaries_preserve_newest_first_lifecycle_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let ledger = SqliteLedger::open_or_create(&path).unwrap();
+        ledger
+            .connection
+            .execute_batch(
+                r#"
+                INSERT INTO sessions (session_id, created_at_ms, updated_at_ms) VALUES
+                  ('session_new', 40, 400),
+                  ('session_continued', 30, 300),
+                  ('session_interrupted', 20, 200),
+                  ('session_failed', 10, 100);
+                INSERT INTO session_runs
+                  (session_id, run_id, session_index, question, final_answer, status, error, created_at_ms, updated_at_ms)
+                VALUES
+                  ('session_new', 'run_new', 0, 'new question', NULL, 'running', NULL, 40, 400),
+                  ('session_continued', 'run_continued_1', 0, 'continued first question', 'first answer', 'finished', NULL, 30, 30),
+                  ('session_continued', 'run_continued_2', 1, 'approved, go ahead', 'second answer', 'finished', NULL, 300, 300),
+                  ('session_interrupted', 'run_interrupted', 0, 'interrupted question', NULL, 'interrupted', 'daemon restarted', 20, 200),
+                  ('session_failed', 'run_failed', 0, 'failed question', NULL, 'failed', 'provider failed', 10, 100);
+                "#,
+            )
+            .unwrap();
+
+        let summaries = ledger.session_summaries().unwrap();
+
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| (summary.session_id.as_str(), summary.status))
+                .collect::<Vec<_>>(),
+            vec![
+                ("session_new", RunStateName::Running),
+                ("session_continued", RunStateName::Finished),
+                ("session_interrupted", RunStateName::Interrupted),
+                ("session_failed", RunStateName::Failed),
+            ]
+        );
+        assert_eq!(summaries[1].first_question, "continued first question");
+        assert_eq!(summaries[1].latest_question, "approved, go ahead");
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.updated_at_ms)
+                .collect::<Vec<_>>(),
+            vec![400, 300, 200, 100]
+        );
+    }
+
+    #[test]
+    fn sqlite_session_summary_read_is_readonly_and_never_creates_a_missing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.db");
+        assert!(sqlite_session_summaries(&missing).unwrap().is_empty());
+        assert!(!missing.exists());
+
+        let path = dir.path().join("events.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        ledger
+            .begin_session_run(
+                "session_1",
+                &RunId::new("run_1").unwrap(),
+                "first question",
+                true,
+            )
+            .unwrap();
+        let schema_version = ledger.user_version().unwrap();
+        drop(ledger);
+        let bytes_before = fs::read(&path).unwrap();
+
+        let summaries = sqlite_session_summaries(&path).unwrap();
+
+        assert_eq!(summaries[0].first_question, "first question");
+        assert_eq!(fs::read(&path).unwrap(), bytes_before);
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            schema_version
         );
     }
 
@@ -1631,34 +3826,326 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_interrupts_running_session_runs() {
+    fn sqlite_terminal_outcomes_and_orphan_recovery_preserve_continuation_truth() {
+        const RECOVERY_ERROR: &str = "daemon restarted";
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.db");
         let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
-        let run_id = RunId::new("run_1").unwrap();
+        let finished = RunId::new("run_finished").unwrap();
+        let failed = RunId::new("run_failed").unwrap();
+        let canceled = RunId::new("run_canceled").unwrap();
+        let interrupted = RunId::new("run_interrupted").unwrap();
 
         ledger
-            .begin_session_run("session_1", &run_id, "first question", true)
+            .begin_session_run("session_1", &finished, "finished question", true)
+            .unwrap();
+        append_response_prefix(&mut ledger, &finished, "finished answer", 0);
+        ledger
+            .finish_session_run(&finished, "finished answer")
             .unwrap();
 
+        ledger
+            .begin_session_run("session_1", &failed, "failed question", false)
+            .unwrap();
+        ledger
+            .append(failed.as_str(), &started_record(failed.as_str(), 0, 10))
+            .unwrap();
+        ledger
+            .fail_session_run(&failed, "synthetic failure", false)
+            .unwrap();
+
+        ledger
+            .begin_session_run("session_1", &canceled, "canceled question", false)
+            .unwrap();
+        ledger
+            .append(canceled.as_str(), &started_record(canceled.as_str(), 0, 20))
+            .unwrap();
+        ledger
+            .fail_session_run(&canceled, RUN_CANCELED_REASON, true)
+            .unwrap();
+
+        ledger
+            .begin_session_run("session_1", &interrupted, "interrupted question", false)
+            .unwrap();
+        ledger
+            .append(
+                interrupted.as_str(),
+                &started_record(interrupted.as_str(), 0, 30),
+            )
+            .unwrap();
+        drop(ledger);
+
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
         assert_eq!(
-            ledger
-                .interrupt_running_session_runs("daemon restarted")
-                .unwrap(),
+            ledger.recover_running_session_runs(RECOVERY_ERROR).unwrap(),
             1
         );
         assert_eq!(
-            ledger.session_summaries().unwrap()[0].status,
-            RunStateName::Interrupted
+            session_outcome(&ledger, finished.as_str()),
+            (RunStateName::Finished, Some("finished answer".into()), None)
+        );
+        assert_eq!(
+            session_outcome(&ledger, failed.as_str()),
+            (RunStateName::Failed, None, Some("synthetic failure".into()))
+        );
+        assert_eq!(
+            session_outcome(&ledger, canceled.as_str()),
+            (
+                RunStateName::Canceled,
+                None,
+                Some(RUN_CANCELED_REASON.into())
+            )
+        );
+        assert_eq!(
+            session_outcome(&ledger, interrupted.as_str()),
+            (RunStateName::Interrupted, None, Some(RECOVERY_ERROR.into()))
+        );
+
+        for (run_id, expected_reason) in [
+            (&failed, "synthetic failure"),
+            (&canceled, RUN_CANCELED_REASON),
+            (&interrupted, RECOVERY_ERROR),
+        ] {
+            let records = ledger.read_run(run_id.as_str()).unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| matches!(record.event, HarnessEvent::RunFailed { .. }))
+                    .count(),
+                1
+            );
+            assert!(matches!(
+                RunReadback::from_events(&records).unwrap().final_phase,
+                RunPhase::Failed { reason } if reason == expected_reason
+            ));
+        }
+        assert!(matches!(
+            RunReadback::from_events(&ledger.read_run(finished.as_str()).unwrap())
+                .unwrap()
+                .final_phase,
+            RunPhase::Finished
+        ));
+        assert_eq!(
+            ledger.session_turns("session_1").unwrap(),
+            vec![SessionTurn {
+                question: "finished question".into(),
+                final_answer: "finished answer".into(),
+            }]
+        );
+
+        let interrupted_records = ledger.read_run(interrupted.as_str()).unwrap();
+        assert_eq!(
+            ledger.recover_running_session_runs(RECOVERY_ERROR).unwrap(),
+            0
+        );
+        assert_eq!(
+            ledger.read_run(interrupted.as_str()).unwrap(),
+            interrupted_records
+        );
+
+        let follow_up = RunId::new("run_follow_up").unwrap();
+        assert_eq!(
+            ledger
+                .begin_session_run("session_1", &follow_up, "follow up", false)
+                .unwrap(),
+            vec![SessionTurn {
+                question: "finished question".into(),
+                final_answer: "finished answer".into(),
+            }]
         );
         ledger
-            .begin_session_run(
-                "session_1",
-                &RunId::new("run_2").unwrap(),
-                "follow up",
-                false,
+            .append(
+                follow_up.as_str(),
+                &started_record(follow_up.as_str(), 0, 40),
             )
             .unwrap();
+        ledger
+            .fail_session_run(&follow_up, "follow up stopped", false)
+            .unwrap();
+    }
+
+    #[test]
+    fn sqlite_recovery_reconciles_existing_terminal_events_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let finished = RunId::new("run_existing_finished").unwrap();
+        let failed = RunId::new("run_existing_failed").unwrap();
+        let canceled = RunId::new("run_existing_canceled").unwrap();
+
+        ledger
+            .begin_session_run("session_finished", &finished, "question", true)
+            .unwrap();
+        append_response_prefix(&mut ledger, &finished, "durable answer", 0);
+        ledger
+            .append(
+                finished.as_str(),
+                &RecordedEvent {
+                    seq: 4,
+                    occurred_at_ms: 4,
+                    event: HarnessEvent::RunFinished {
+                        run_id: finished.clone(),
+                    },
+                },
+            )
+            .unwrap();
+
+        for (session_id, run_id, reason) in [
+            ("session_failed", &failed, "durable failure"),
+            ("session_canceled", &canceled, RUN_CANCELED_REASON),
+        ] {
+            ledger
+                .begin_session_run(session_id, run_id, "question", true)
+                .unwrap();
+            ledger
+                .append(run_id.as_str(), &started_record(run_id.as_str(), 0, 10))
+                .unwrap();
+            ledger
+                .append(
+                    run_id.as_str(),
+                    &RecordedEvent {
+                        seq: 1,
+                        occurred_at_ms: 11,
+                        event: HarnessEvent::RunFailed {
+                            run_id: run_id.clone(),
+                            reason: reason.into(),
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        drop(ledger);
+
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        assert_eq!(
+            ledger
+                .recover_running_session_runs("unused recovery error")
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            session_outcome(&ledger, finished.as_str()),
+            (RunStateName::Finished, Some("durable answer".into()), None)
+        );
+        assert_eq!(
+            session_outcome(&ledger, failed.as_str()),
+            (RunStateName::Failed, None, Some("durable failure".into()))
+        );
+        assert_eq!(
+            session_outcome(&ledger, canceled.as_str()),
+            (
+                RunStateName::Canceled,
+                None,
+                Some(RUN_CANCELED_REASON.into())
+            )
+        );
+        for run_id in [&finished, &failed, &canceled] {
+            let records = ledger.read_run(run_id.as_str()).unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| matches!(
+                        record.event,
+                        HarnessEvent::RunFinished { .. } | HarnessEvent::RunFailed { .. }
+                    ))
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            ledger
+                .recover_running_session_runs("unused recovery error")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn sqlite_terminal_statement_faults_roll_back_both_truths_before_recovery() {
+        const RECOVERY_ERROR: &str = "recovered after injected terminal fault";
+        let boundaries = [
+            TerminalFaultBoundary::BeforeEventInsert,
+            TerminalFaultBoundary::AfterEventInsert,
+            TerminalFaultBoundary::BeforeOutcomeUpdate,
+            TerminalFaultBoundary::AfterOutcomeUpdate,
+            TerminalFaultBoundary::BeforeSessionTouch,
+            TerminalFaultBoundary::AfterSessionTouch,
+        ];
+
+        for (boundary_index, boundary) in boundaries.into_iter().enumerate() {
+            for (outcome_index, outcome) in
+                ["finished", "failed", "canceled"].into_iter().enumerate()
+            {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir
+                    .path()
+                    .join(format!("terminal-{boundary_index}-{outcome_index}.db"));
+                let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+                let run_id = RunId::new(format!("run_{boundary_index}_{outcome_index}")).unwrap();
+                ledger
+                    .begin_session_run("session_1", &run_id, "question", true)
+                    .unwrap();
+                let prefix_len = if outcome == "finished" {
+                    append_response_prefix(&mut ledger, &run_id, "answer", 0);
+                    4
+                } else {
+                    ledger
+                        .append(run_id.as_str(), &started_record(run_id.as_str(), 0, 0))
+                        .unwrap();
+                    1
+                };
+                ledger.inject_terminal_fault_at(boundary);
+
+                let result = match outcome {
+                    "finished" => ledger.finish_session_run(&run_id, "answer"),
+                    "failed" => ledger.fail_session_run(&run_id, "terminal failure", false),
+                    "canceled" => ledger.fail_session_run(&run_id, RUN_CANCELED_REASON, true),
+                    _ => unreachable!(),
+                };
+                assert!(
+                    result.is_err(),
+                    "{outcome} unexpectedly crossed {boundary:?}"
+                );
+                assert_eq!(ledger.read_run(run_id.as_str()).unwrap().len(), prefix_len);
+                assert_eq!(
+                    session_outcome(&ledger, run_id.as_str()),
+                    (RunStateName::Running, None, None)
+                );
+                drop(ledger);
+
+                let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+                assert_eq!(
+                    ledger.recover_running_session_runs(RECOVERY_ERROR).unwrap(),
+                    1
+                );
+                let records = ledger.read_run(run_id.as_str()).unwrap();
+                assert_eq!(records.len(), prefix_len + 1);
+                assert_eq!(
+                    records
+                        .iter()
+                        .filter(|record| matches!(
+                            record.event,
+                            HarnessEvent::RunFinished { .. } | HarnessEvent::RunFailed { .. }
+                        ))
+                        .count(),
+                    1
+                );
+                assert!(matches!(
+                    RunReadback::from_events(&records).unwrap().final_phase,
+                    RunPhase::Failed { reason } if reason == RECOVERY_ERROR
+                ));
+                assert_eq!(
+                    session_outcome(&ledger, run_id.as_str()),
+                    (RunStateName::Interrupted, None, Some(RECOVERY_ERROR.into()))
+                );
+                assert_eq!(
+                    ledger.recover_running_session_runs(RECOVERY_ERROR).unwrap(),
+                    0
+                );
+                assert_eq!(ledger.read_run(run_id.as_str()).unwrap(), records);
+            }
+        }
     }
 
     #[test]
@@ -1729,5 +4216,141 @@ mod tests {
                 agent_id: AgentId::new("plato").unwrap(),
             },
         }
+    }
+
+    fn append_status_records(ledger: &mut SqliteLedger, run_id: &str, events: Vec<HarnessEvent>) {
+        for (seq, event) in events.into_iter().enumerate() {
+            ledger
+                .append(
+                    run_id,
+                    &RecordedEvent {
+                        seq: seq as u64,
+                        occurred_at_ms: 100 + seq as u64,
+                        event,
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    fn status_started_event(run_id: &str) -> HarnessEvent {
+        HarnessEvent::RunStarted {
+            run_id: RunId::new(run_id).unwrap(),
+            agent_id: AgentId::new("plato").unwrap(),
+        }
+    }
+
+    fn status_response_event(
+        run_id: &str,
+        turn_id: &str,
+        step: u32,
+        served_model: Option<&str>,
+        usage: Option<ModelUsage>,
+    ) -> HarnessEvent {
+        HarnessEvent::ModelResponded {
+            run_id: RunId::new(run_id).unwrap(),
+            turn_id: TurnId::new(turn_id).unwrap(),
+            step,
+            output: Message {
+                role: MessageRole::Assistant,
+                content: format!("response {step}"),
+            },
+            proposed_calls: vec![],
+            served_model: served_model.map(|model| ModelName::new(model).unwrap()),
+            usage,
+        }
+    }
+
+    fn session_outcome(
+        ledger: &SqliteLedger,
+        run_id: &str,
+    ) -> (RunStateName, Option<String>, Option<String>) {
+        ledger
+            .connection
+            .query_row(
+                "SELECT status, final_answer, error
+                 FROM session_runs
+                 WHERE run_id = ?1",
+                params![run_id],
+                |row| {
+                    Ok((
+                        status_from_row(row, 0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+    }
+
+    fn append_response_prefix(
+        ledger: &mut SqliteLedger,
+        run_id: &RunId,
+        answer: &str,
+        occurred_at_ms: u64,
+    ) {
+        for (seq, event) in response_run_prefix(run_id, answer, None)
+            .into_iter()
+            .enumerate()
+        {
+            ledger
+                .append(
+                    run_id.as_str(),
+                    &RecordedEvent {
+                        seq: seq as u64,
+                        occurred_at_ms: occurred_at_ms + seq as u64,
+                        event,
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    fn response_run_prefix(
+        run_id: &RunId,
+        answer: &str,
+        usage: Option<ModelUsage>,
+    ) -> Vec<HarnessEvent> {
+        let turn_id = TurnId::new("turn_1").unwrap();
+        vec![
+            HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: AgentId::new("plato").unwrap(),
+            },
+            HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                context: ContextPack {
+                    token_budget: 4_000,
+                    fragments: vec![],
+                },
+            },
+            HarnessEvent::ModelRequested {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 0,
+                model: ModelName::new("test-model").unwrap(),
+            },
+            HarnessEvent::ModelResponded {
+                run_id: run_id.clone(),
+                turn_id,
+                step: 0,
+                output: Message {
+                    role: MessageRole::Assistant,
+                    content: answer.into(),
+                },
+                proposed_calls: vec![],
+                served_model: None,
+                usage,
+            },
+        ]
+    }
+
+    fn response_run_events(run_id: &RunId, usage: Option<ModelUsage>) -> Vec<HarnessEvent> {
+        let mut events = response_run_prefix(run_id, "answer", usage);
+        events.push(HarnessEvent::RunFinished {
+            run_id: run_id.clone(),
+        });
+        events
     }
 }

@@ -1,14 +1,13 @@
-use plato_agent::{
-    AppError,
-    daemon::{
-        client::{DaemonClient, DaemonConnectionConfig},
-        protocol::{
-            ApprovalDecisionName, CommandAcceptedResult, EventsStreamResult, HelloResult,
-            PendingApprovalSnapshot, RunStartResult, RunStateName, SessionSummary,
-            TranscriptReadResult, TypedRun, TypedTranscriptEntry,
-        },
-    },
+use plato_daemon_client::{
+    ClientError,
+    client::{DaemonClient, DaemonConnectionConfig},
     paths,
+};
+use plato_protocol::{
+    ApprovalDecisionName, BufferedStreamEvent, CommandAcceptedResult, EventsStreamResult,
+    HarnessEvent, HelloResult, PendingApprovalSnapshot, PolicyDecision, RunStartResult,
+    RunStateName, SessionSummary, StreamEvent, TranscriptReadResult, TypedRun,
+    TypedTranscriptEntry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -124,17 +123,19 @@ impl DesktopError {
         }
     }
 
-    fn daemon(context: &str, error: AppError) -> Self {
-        match error {
-            AppError::DaemonResponse(error) => Self::new(error.code, error.message),
-            AppError::DaemonProtocol(message) => {
+    fn daemon(context: &str, error: impl Into<ClientError>) -> Self {
+        match error.into() {
+            ClientError::DaemonResponse(error) => Self::new(error.code, error.message),
+            ClientError::DaemonProtocol(message) => {
                 Self::new("incompatible_daemon", format!("{context}: {message}"))
             }
-            AppError::Json(error) => Self::new(
+            ClientError::Json(error) => Self::new(
                 "incompatible_daemon",
                 format!("{context}: invalid daemon response: {error}"),
             ),
-            AppError::Io(error) => Self::new("daemon_unavailable", format!("{context}: {error}")),
+            ClientError::Io(error) => {
+                Self::new("daemon_unavailable", format!("{context}: {error}"))
+            }
             error => Self::new("desktop_error", format!("{context}: {error}")),
         }
     }
@@ -1177,7 +1178,7 @@ fn extract_typed_run(
 }
 
 fn connect_client(config: &DaemonConnectionConfig) -> Result<DaemonClient, DesktopError> {
-    DaemonClient::connect(&config.socket_path)
+    DaemonClient::connect_with_timeout(&config.socket_path, DAEMON_ATTACH_TIMEOUT)
         .map_err(|error| DesktopError::daemon("Unable to connect to plato-agentd", error))
 }
 
@@ -1519,13 +1520,7 @@ fn normalize_event_page(
         ));
     }
     let mut events = Vec::new();
-    for (index, value) in page.events.into_iter().enumerate() {
-        let buffered = serde_json::from_value::<BufferedDaemonEvent>(value).map_err(|error| {
-            DesktopError::new(
-                "incompatible_daemon",
-                format!("Incompatible daemon: malformed run event: {error}"),
-            )
-        })?;
+    for (index, buffered) in page.events.into_iter().enumerate() {
         let expected_offset = page.from_offset + index as u64;
         if buffered.offset != expected_offset {
             return Err(DesktopError::new(
@@ -1536,7 +1531,7 @@ fn normalize_event_page(
                 ),
             ));
         }
-        if let Some(event) = buffered.into_desktop()? {
+        if let Some(event) = buffered_event_into_desktop(buffered) {
             events.push(event);
         }
     }
@@ -1565,183 +1560,103 @@ fn validate_stream_run(
     ))
 }
 
-#[derive(Debug, Deserialize)]
-struct BufferedDaemonEvent {
-    offset: u64,
-    event: DaemonEvent,
-}
-
-impl BufferedDaemonEvent {
-    fn into_desktop(self) -> Result<Option<DesktopEvent>, DesktopError> {
-        let offset = self.offset;
-        let event = match self.event {
-            DaemonEvent::AssistantDelta {
-                step,
-                delta_index,
-                text,
-            } => Some(DesktopEvent::AssistantDelta {
+fn buffered_event_into_desktop(buffered: BufferedStreamEvent) -> Option<DesktopEvent> {
+    let offset = buffered.offset;
+    match buffered.event {
+        StreamEvent::AssistantDelta {
+            step,
+            delta_index,
+            text,
+            ..
+        } => Some(DesktopEvent::AssistantDelta {
+            offset,
+            step,
+            delta_index,
+            text,
+        }),
+        StreamEvent::ApprovalRequested { tool_call_id, .. } => {
+            Some(DesktopEvent::ApprovalRequested {
                 offset,
-                step,
-                delta_index,
-                text,
-            }),
-            DaemonEvent::ApprovalRequested { tool_call_id } => {
-                Some(DesktopEvent::ApprovalRequested {
-                    offset,
-                    tool_call_id,
-                })
-            }
-            DaemonEvent::Canceled => Some(DesktopEvent::CancelRequested { offset }),
-            DaemonEvent::Ledger { record } => record.event.into_desktop(offset),
-            DaemonEvent::Ignored => None,
-        };
-        Ok(event)
+                tool_call_id,
+            })
+        }
+        StreamEvent::Canceled { .. } => Some(DesktopEvent::CancelRequested { offset }),
+        StreamEvent::Ledger { record } => ledger_event_into_desktop(record.event, offset),
+        StreamEvent::Unknown(_) => None,
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum DaemonEvent {
-    AssistantDelta {
-        step: u32,
-        delta_index: u64,
-        text: String,
-    },
-    ApprovalRequested {
-        tool_call_id: String,
-    },
-    Canceled,
-    Ledger {
-        record: DaemonRecordedEvent,
-    },
-    #[serde(other)]
-    Ignored,
-}
-
-#[derive(Debug, Deserialize)]
-struct DaemonRecordedEvent {
-    event: DaemonLedgerEvent,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
-enum DaemonLedgerEvent {
-    ModelResponded {
-        step: u32,
-        output: DaemonMessage,
-    },
-    ToolCallProposed {
-        call: DaemonToolCall,
-    },
-    PolicyEvaluated {
-        call_id: String,
-        decision: DaemonPolicyDecision,
-    },
-    ApprovalGranted {
-        call_id: String,
-        actor_id: String,
-    },
-    ApprovalDenied {
-        call_id: String,
-        actor_id: String,
-        reason: String,
-    },
-    ToolFinished {
-        result: DaemonToolResult,
-    },
-    ToolFailed {
-        call_id: String,
-        reason: String,
-    },
-    #[serde(other)]
-    Ignored,
-}
-
-impl DaemonLedgerEvent {
-    fn into_desktop(self, offset: u64) -> Option<DesktopEvent> {
-        match self {
-            Self::ModelResponded { step, output } => Some(DesktopEvent::AssistantCommitted {
+fn ledger_event_into_desktop(event: HarnessEvent, offset: u64) -> Option<DesktopEvent> {
+    match event {
+        HarnessEvent::ModelResponded { step, output, .. } => {
+            Some(DesktopEvent::AssistantCommitted {
                 offset,
                 step,
                 text: output.content,
-            }),
-            Self::ToolCallProposed { call } => Some(DesktopEvent::ToolCall {
-                offset,
-                call_id: call.id,
-                tool: call.tool,
-                input_preview: json_preview(&call.input),
-            }),
-            Self::PolicyEvaluated {
-                call_id,
-                decision: DaemonPolicyDecision::Deny { reason },
-            } => Some(DesktopEvent::PolicyDenied {
-                offset,
-                call_id,
-                reason,
-            }),
-            Self::PolicyEvaluated { .. } => None,
-            Self::ApprovalGranted { call_id, actor_id } => Some(DesktopEvent::Approval {
-                offset,
-                call_id,
-                decision: ApprovalDecisionName::Granted,
-                actor_id,
-                reason: None,
-            }),
-            Self::ApprovalDenied {
-                call_id,
-                actor_id,
-                reason,
-            } => Some(DesktopEvent::Approval {
-                offset,
-                call_id,
-                decision: ApprovalDecisionName::Denied,
-                actor_id,
-                reason: Some(reason),
-            }),
-            Self::ToolFinished { result } => Some(DesktopEvent::ToolResult {
-                offset,
-                call_id: result.call_id,
-                summary: result.summary,
-            }),
-            Self::ToolFailed { call_id, reason } => Some(DesktopEvent::ToolFailed {
-                offset,
-                call_id,
-                error: reason,
-            }),
-            Self::Ignored => None,
+            })
         }
+        HarnessEvent::ToolCallProposed { call, .. } => Some(DesktopEvent::ToolCall {
+            offset,
+            call_id: call.id.to_string(),
+            tool: call.tool.to_string(),
+            input_preview: json_preview(&call.input),
+        }),
+        HarnessEvent::PolicyEvaluated {
+            call_id,
+            decision: PolicyDecision::Deny { reason },
+            ..
+        } => Some(DesktopEvent::PolicyDenied {
+            offset,
+            call_id: call_id.to_string(),
+            reason,
+        }),
+        HarnessEvent::PolicyEvaluated {
+            decision: PolicyDecision::Allow | PolicyDecision::RequireApproval { .. },
+            ..
+        } => None,
+        HarnessEvent::ApprovalGranted {
+            call_id, actor_id, ..
+        } => Some(DesktopEvent::Approval {
+            offset,
+            call_id: call_id.to_string(),
+            decision: ApprovalDecisionName::Granted,
+            actor_id: actor_id.to_string(),
+            reason: None,
+        }),
+        HarnessEvent::ApprovalDenied {
+            call_id,
+            actor_id,
+            reason,
+            ..
+        } => Some(DesktopEvent::Approval {
+            offset,
+            call_id: call_id.to_string(),
+            decision: ApprovalDecisionName::Denied,
+            actor_id: actor_id.to_string(),
+            reason: Some(reason),
+        }),
+        HarnessEvent::ToolFinished { result, .. } => Some(DesktopEvent::ToolResult {
+            offset,
+            call_id: result.call_id.to_string(),
+            summary: result.summary,
+        }),
+        HarnessEvent::ToolFailed {
+            call_id, reason, ..
+        } => Some(DesktopEvent::ToolFailed {
+            offset,
+            call_id: call_id.to_string(),
+            error: reason,
+        }),
+        HarnessEvent::RunStarted { .. }
+        | HarnessEvent::ContextBuilt { .. }
+        | HarnessEvent::ContextCompacted { .. }
+        | HarnessEvent::ModelRequested { .. }
+        | HarnessEvent::ModelFailed { .. }
+        | HarnessEvent::ToolProposalsRejected { .. }
+        | HarnessEvent::ToolStarted { .. }
+        | HarnessEvent::RunFinished { .. }
+        | HarnessEvent::RunFailed { .. } => None,
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct DaemonMessage {
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct DaemonToolCall {
-    id: String,
-    tool: String,
-    input: Value,
-}
-
-#[derive(Debug, Deserialize)]
-struct DaemonToolResult {
-    call_id: String,
-    summary: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "decision", rename_all = "snake_case")]
-enum DaemonPolicyDecision {
-    Allow,
-    RequireApproval {
-        #[serde(rename = "reason")]
-        _reason: String,
-    },
-    Deny {
-        reason: String,
-    },
 }
 
 fn json_preview(value: &Value) -> String {
@@ -1852,7 +1767,7 @@ fn replace_workspace_file(from: &Path, to: &Path) -> std::io::Result<()> {
 pub fn run() {
     #[cfg(windows)]
     drop(
-        plato_agent::daemon::installer_gate::InstallerStartupGate::acquire()
+        plato_daemon_client::installer_gate::InstallerStartupGate::acquire()
             .expect("Plato Agent installation or update is in progress"),
     );
     tauri::Builder::default()
@@ -1882,10 +1797,370 @@ pub fn run() {
         .expect("error while running Plato Agent desktop");
 }
 
+#[cfg(all(test, any(unix, windows)))]
+mod daemon_deadline_tests {
+    use super::*;
+    use plato_protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION};
+    use serde_json::json;
+    use std::{
+        io::{BufRead, BufReader, Write},
+        path::{Path, PathBuf},
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const DEADLINE_EARLY_TOLERANCE: Duration = Duration::from_millis(250);
+    const DEADLINE_LATE_TOLERANCE: Duration = Duration::from_secs(1);
+    const NEAR_DEADLINE_DELAY: Duration = Duration::from_millis(2_500);
+    const OUTER_WATCHDOG: Duration = Duration::from_secs(8);
+
+    #[test]
+    fn normal_desktop_hello_byte_drip_cannot_extend_the_deadline() {
+        let fixture = DeadlineFixture::new("hello-byte-drip");
+        let listener = bind_endpoint(&fixture.endpoint.path);
+        let server = thread::spawn(move || {
+            let mut stream = accept_endpoint(&listener);
+            let mut reader = BufReader::new(clone_stream(&stream));
+            let hello = read_request(&mut reader);
+            assert_eq!(hello.method.as_deref(), Some("hello"));
+            for _ in 0..20 {
+                if stream.write_all(b" ").is_err() || stream.flush().is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let workspace_root = fixture.workspace_root.clone();
+        let socket_path = fixture.endpoint.path.clone();
+
+        let (result, elapsed) = run_with_watchdog(move || {
+            with_workspace_client(&workspace_root, Some(socket_path), |_| Ok(()))
+        });
+
+        assert_bounded_daemon_unavailable(result, elapsed);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn normal_desktop_read_stalled_newline_releases_its_worker() {
+        let fixture = DeadlineFixture::new("read-stalled-newline");
+        let listener = bind_endpoint(&fixture.endpoint.path);
+        let workspace_id = fixture.workspace_id.clone();
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut stream = accept_endpoint(&listener);
+            let mut reader = BufReader::new(clone_stream(&stream));
+            answer_hello(&mut reader, &mut stream, &workspace_id, Duration::ZERO);
+            let request = read_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some("transcript.read"));
+            stream.write_all(b"{\"v\":1").unwrap();
+            stream.flush().unwrap();
+            released.recv_timeout(OUTER_WATCHDOG).unwrap();
+        });
+        let workspace_root = fixture.workspace_root.clone();
+        let socket_path = fixture.endpoint.path.clone();
+
+        let (result, elapsed) = run_with_watchdog(move || {
+            read_run_from_workspace(&workspace_root, "run_read", Some(socket_path))
+        });
+
+        assert_bounded_daemon_unavailable(result, elapsed);
+        release.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn normal_desktop_mutation_stalled_newline_has_no_false_success_or_retry() {
+        let fixture = DeadlineFixture::new("mutation-stalled-newline");
+        let listener = bind_endpoint(&fixture.endpoint.path);
+        let workspace_id = fixture.workspace_id.clone();
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut stream = accept_endpoint(&listener);
+            let mut reader = BufReader::new(clone_stream(&stream));
+            answer_hello(&mut reader, &mut stream, &workspace_id, Duration::ZERO);
+            let request = read_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some("run.start"));
+            assert_eq!(request.params.as_ref().unwrap()["question"], "mutate once");
+            stream.write_all(b"{").unwrap();
+            stream.flush().unwrap();
+            released.recv_timeout(OUTER_WATCHDOG).unwrap();
+
+            let mut unexpected_retry = String::new();
+            let retry_read = reader.read_line(&mut unexpected_retry);
+            assert!(
+                !matches!(retry_read, Ok(bytes) if bytes > 0),
+                "desktop retried a mutation after its response timed out"
+            );
+        });
+        let workspace_root = fixture.workspace_root.clone();
+        let socket_path = fixture.endpoint.path.clone();
+
+        let (result, elapsed) = run_with_watchdog(move || {
+            submit_message_from_workspace(
+                &workspace_root,
+                "mutate once".into(),
+                None,
+                Some(socket_path),
+            )
+        });
+
+        assert_bounded_daemon_unavailable(result, elapsed);
+        release.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn normal_desktop_mutation_stalled_write_releases_its_worker() {
+        let fixture = DeadlineFixture::new("mutation-stalled-write");
+        let listener = bind_endpoint(&fixture.endpoint.path);
+        let workspace_id = fixture.workspace_id.clone();
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut stream = accept_endpoint(&listener);
+            let mut reader = BufReader::new(clone_stream(&stream));
+            answer_hello(&mut reader, &mut stream, &workspace_id, Duration::ZERO);
+            released.recv_timeout(OUTER_WATCHDOG).unwrap();
+        });
+        let workspace_root = fixture.workspace_root.clone();
+        let socket_path = fixture.endpoint.path.clone();
+        let message = "x".repeat(8 * 1024 * 1024);
+
+        let (result, elapsed) = run_with_watchdog(move || {
+            submit_message_from_workspace(&workspace_root, message, None, Some(socket_path))
+        });
+
+        assert_bounded_daemon_unavailable(result, elapsed);
+        release.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn normal_desktop_read_accepts_near_deadline_hello_and_command_responses() {
+        let fixture = DeadlineFixture::new("near-deadline-success");
+        let listener = bind_endpoint(&fixture.endpoint.path);
+        let workspace_id = fixture.workspace_id.clone();
+        let server = thread::spawn(move || {
+            let mut stream = accept_endpoint(&listener);
+            let mut reader = BufReader::new(clone_stream(&stream));
+            answer_hello(&mut reader, &mut stream, &workspace_id, NEAR_DEADLINE_DELAY);
+            let request = read_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some("transcript.read"));
+            thread::sleep(NEAR_DEADLINE_DELAY);
+            write_response(
+                &mut stream,
+                request.id,
+                "transcript.read",
+                json!({
+                    "run_id": "run_read",
+                    "status": "finished",
+                    "final_answer": "near deadline",
+                    "transcript": "near deadline",
+                    "typed": {"runs": [{
+                        "run_id": "run_read",
+                        "session_index": 0,
+                        "status": "finished",
+                        "entries": []
+                    }]},
+                    "pending_approval": null
+                }),
+            );
+        });
+        let workspace_root = fixture.workspace_root.clone();
+        let socket_path = fixture.endpoint.path.clone();
+
+        let (result, elapsed) = run_with_watchdog(move || {
+            read_run_from_workspace(&workspace_root, "run_read", Some(socket_path))
+        });
+
+        let run = result.unwrap();
+        assert_eq!(run.run_id, "run_read");
+        assert!(
+            elapsed > DAEMON_ATTACH_TIMEOUT,
+            "fresh hello and command budgets shared one deadline: {elapsed:?}"
+        );
+        server.join().unwrap();
+    }
+
+    fn assert_bounded_daemon_unavailable<T: std::fmt::Debug>(
+        result: Result<T, DesktopError>,
+        elapsed: Duration,
+    ) {
+        let error = result.expect_err("stalled daemon request reported success");
+        assert_eq!(error.code, "daemon_unavailable", "{error:?}");
+        assert!(
+            elapsed >= DAEMON_ATTACH_TIMEOUT - DEADLINE_EARLY_TOLERANCE,
+            "daemon request timed out before its budget: {elapsed:?}"
+        );
+        assert!(
+            elapsed < DAEMON_ATTACH_TIMEOUT + DEADLINE_LATE_TOLERANCE,
+            "daemon request exceeded its budget plus scheduler tolerance: {elapsed:?}"
+        );
+    }
+
+    fn run_with_watchdog<T, F>(run: F) -> (T, Duration)
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let started = Instant::now();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || sender.send(run()).unwrap());
+        let result = receiver
+            .recv_timeout(OUTER_WATCHDOG)
+            .expect("desktop blocking worker outlived the outer watchdog");
+        let elapsed = started.elapsed();
+        worker.join().unwrap();
+        (result, elapsed)
+    }
+
+    fn answer_hello<R: BufRead, W: Write>(
+        reader: &mut R,
+        writer: &mut W,
+        workspace_id: &str,
+        delay: Duration,
+    ) {
+        let hello = read_request(reader);
+        assert_eq!(hello.method.as_deref(), Some("hello"));
+        thread::sleep(delay);
+        write_response(
+            writer,
+            hello.id,
+            "hello",
+            json!({
+                "daemon_version": "0.1.0",
+                "workspace_id": workspace_id,
+                "ledger_path": "/work/agent.db",
+                "capabilities": REQUIRED_CAPABILITIES
+            }),
+        );
+    }
+
+    fn read_request<R: BufRead>(reader: &mut R) -> Envelope {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        let envelope: Envelope = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(envelope.kind, EnvelopeKind::Request);
+        envelope
+    }
+
+    fn write_response<W: Write>(writer: &mut W, id: Option<String>, method: &str, result: Value) {
+        let response = Envelope {
+            v: PROTOCOL_VERSION,
+            id,
+            kind: EnvelopeKind::Response,
+            method: Some(method.into()),
+            params: None,
+            result: Some(result),
+            error: None,
+        };
+        serde_json::to_writer(writer.by_ref(), &response).unwrap();
+        writer.write_all(b"\n").unwrap();
+        writer.flush().unwrap();
+    }
+
+    struct DeadlineFixture {
+        _workspace: tempfile::TempDir,
+        endpoint: TestEndpoint,
+        workspace_root: PathBuf,
+        workspace_id: String,
+    }
+
+    impl DeadlineFixture {
+        fn new(name: &str) -> Self {
+            let workspace = tempfile::tempdir().unwrap();
+            let workspace_root = workspace.path().canonicalize().unwrap();
+            let workspace_id = paths::workspace_id(&workspace_root).unwrap();
+            Self {
+                _workspace: workspace,
+                endpoint: TestEndpoint::new(name),
+                workspace_root,
+                workspace_id,
+            }
+        }
+    }
+
+    struct TestEndpoint {
+        path: PathBuf,
+        _directory: Option<tempfile::TempDir>,
+    }
+
+    impl TestEndpoint {
+        fn new(name: &str) -> Self {
+            #[cfg(unix)]
+            {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join(format!("{name}.sock"));
+                Self {
+                    path,
+                    _directory: Some(directory),
+                }
+            }
+            #[cfg(windows)]
+            {
+                Self {
+                    path: PathBuf::from(format!(
+                        r"\\.\pipe\plato-agent-desktop-{name}-{}",
+                        std::process::id()
+                    )),
+                    _directory: None,
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    type TestListener = std::os::unix::net::UnixListener;
+    #[cfg(unix)]
+    type TestStream = std::os::unix::net::UnixStream;
+    #[cfg(windows)]
+    type TestListener = interprocess::local_socket::Listener;
+    #[cfg(windows)]
+    type TestStream = interprocess::local_socket::Stream;
+
+    #[cfg(unix)]
+    fn bind_endpoint(path: &Path) -> TestListener {
+        TestListener::bind(path).unwrap()
+    }
+
+    #[cfg(windows)]
+    fn bind_endpoint(path: &Path) -> TestListener {
+        use interprocess::local_socket::{GenericFilePath, ListenerOptions, prelude::*};
+
+        ListenerOptions::new()
+            .name(path.as_os_str().to_fs_name::<GenericFilePath>().unwrap())
+            .create_sync()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn accept_endpoint(listener: &TestListener) -> TestStream {
+        listener.accept().unwrap().0
+    }
+
+    #[cfg(windows)]
+    fn accept_endpoint(listener: &TestListener) -> TestStream {
+        use interprocess::local_socket::prelude::*;
+
+        listener.accept().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn clone_stream(stream: &TestStream) -> TestStream {
+        stream.try_clone().unwrap()
+    }
+
+    #[cfg(windows)]
+    fn clone_stream(stream: &TestStream) -> TestStream {
+        interprocess::TryClone::try_clone(stream).unwrap()
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use plato_agent::daemon::protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION};
+    use plato_protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION};
     use serde_json::json;
     use std::{
         io::{BufRead, BufReader, Write},
@@ -2399,7 +2674,7 @@ mod tests {
         );
 
         let mut multiple = base.clone();
-        multiple.typed = Some(plato_agent::daemon::protocol::TypedTranscript {
+        multiple.typed = Some(plato_protocol::TypedTranscript {
             runs: vec![typed_run("run_1"), typed_run("run_2")],
         });
         assert_eq!(
@@ -2408,7 +2683,7 @@ mod tests {
         );
 
         let mut wrong = base;
-        wrong.typed = Some(plato_agent::daemon::protocol::TypedTranscript {
+        wrong.typed = Some(plato_protocol::TypedTranscript {
             runs: vec![typed_run("run_2")],
         });
         assert_eq!(
@@ -2423,6 +2698,7 @@ mod tests {
             run_id: "run_1".into(),
             session_index: 2,
             status: RunStateName::Finished,
+            model_status: None,
             entries: vec![
                 TypedTranscriptEntry::User {
                     text: "question".into(),
@@ -2460,38 +2736,145 @@ mod tests {
     }
 
     #[test]
-    fn presentation_events_cover_deltas_commits_calls_approvals_and_cancel() {
-        let page = EventsStreamResult {
-            run_id: "run_1".into(),
-            from_offset: 0,
-            next_offset: 10,
-            status: RunStateName::CancelRequested,
-            events: vec![
+    fn presentation_event_fixtures_preserve_every_mapped_and_ignored_variant() {
+        const OFFSET: u64 = 41;
+        let fixtures = vec![
+            (
+                "assistant_delta",
                 buffered_event(
-                    0,
+                    OFFSET,
                     json!({
                         "kind": "assistant_delta",
                         "run_id": "run_1",
                         "turn_id": "turn_1",
-                        "step": 0,
-                        "delta_index": 0,
+                        "step": 2,
+                        "delta_index": 7,
                         "text": "hel"
                     }),
                 ),
+                Some(json!({
+                    "kind": "assistant_delta",
+                    "offset": OFFSET,
+                    "step": 2,
+                    "deltaIndex": 7,
+                    "text": "hel"
+                })),
+            ),
+            (
+                "run_started",
                 ledger_event(
-                    1,
+                    OFFSET,
+                    json!({
+                        "event": "run_started",
+                        "run_id": "run_1",
+                        "agent_id": "agent_1"
+                    }),
+                ),
+                None,
+            ),
+            (
+                "context_built",
+                ledger_event(
+                    OFFSET,
+                    json!({
+                        "event": "context_built",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "context": {
+                            "token_budget": 8,
+                            "fragments": [{
+                                "lane": "current_task",
+                                "source": "user",
+                                "content": "question",
+                                "estimated_tokens": 2
+                            }]
+                        }
+                    }),
+                ),
+                None,
+            ),
+            (
+                "context_compacted",
+                ledger_event(
+                    OFFSET,
+                    json!({
+                        "event": "context_compacted",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "estimated_tokens_before": 12,
+                        "estimated_tokens_after": 8,
+                        "dropped_turn_start": 0,
+                        "dropped_turn_end_exclusive": 1
+                    }),
+                ),
+                None,
+            ),
+            (
+                "model_requested",
+                ledger_event(
+                    OFFSET,
+                    json!({
+                        "event": "model_requested",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 2,
+                        "model": "model_1"
+                    }),
+                ),
+                None,
+            ),
+            (
+                "model_failed",
+                ledger_event(
+                    OFFSET,
+                    json!({
+                        "event": "model_failed",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 2,
+                        "reason": "retryable failure"
+                    }),
+                ),
+                None,
+            ),
+            (
+                "model_responded",
+                ledger_event(
+                    OFFSET,
                     json!({
                         "event": "model_responded",
                         "run_id": "run_1",
                         "turn_id": "turn_1",
-                        "step": 0,
+                        "step": 2,
                         "output": {"role": "assistant", "content": "hello"},
                         "proposed_calls": [],
-                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                        "usage": {"input_tokens": 3, "output_tokens": 1}
                     }),
                 ),
+                Some(json!({
+                    "kind": "assistant_committed",
+                    "offset": OFFSET,
+                    "step": 2,
+                    "text": "hello"
+                })),
+            ),
+            (
+                "tool_proposals_rejected",
                 ledger_event(
-                    2,
+                    OFFSET,
+                    json!({
+                        "event": "tool_proposals_rejected",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "reason": "invalid proposal"
+                    }),
+                ),
+                None,
+            ),
+            (
+                "tool_call_proposed",
+                ledger_event(
+                    OFFSET,
                     json!({
                         "event": "tool_call_proposed",
                         "run_id": "run_1",
@@ -2504,17 +2887,65 @@ mod tests {
                         }
                     }),
                 ),
+                Some(json!({
+                    "kind": "tool_call",
+                    "offset": OFFSET,
+                    "callId": "call_1",
+                    "tool": "file.read",
+                    "inputPreview": r#"{"path":"README.md"}"#
+                })),
+            ),
+            (
+                "policy_allow",
                 ledger_event(
-                    3,
+                    OFFSET,
+                    json!({
+                        "event": "policy_evaluated",
+                        "run_id": "run_1",
+                        "call_id": "call_1",
+                        "decision": {"decision": "allow"}
+                    }),
+                ),
+                None,
+            ),
+            (
+                "policy_require_approval",
+                ledger_event(
+                    OFFSET,
                     json!({
                         "event": "policy_evaluated",
                         "run_id": "run_1",
                         "call_id": "call_2",
-                        "decision": {"decision": "deny", "reason": "no"}
+                        "decision": {
+                            "decision": "require_approval",
+                            "reason": "operator confirmation required"
+                        }
                     }),
                 ),
+                None,
+            ),
+            (
+                "policy_deny",
                 ledger_event(
-                    4,
+                    OFFSET,
+                    json!({
+                        "event": "policy_evaluated",
+                        "run_id": "run_1",
+                        "call_id": "call_3",
+                        "decision": {"decision": "deny", "reason": "not permitted"}
+                    }),
+                ),
+                Some(json!({
+                    "kind": "policy_denied",
+                    "offset": OFFSET,
+                    "callId": "call_3",
+                    "reason": "not permitted"
+                })),
+            ),
+            (
+                "approval_granted",
+                ledger_event(
+                    OFFSET,
                     json!({
                         "event": "approval_granted",
                         "run_id": "run_1",
@@ -2522,18 +2953,52 @@ mod tests {
                         "actor_id": "human_1"
                     }),
                 ),
+                Some(json!({
+                    "kind": "approval",
+                    "offset": OFFSET,
+                    "callId": "call_1",
+                    "decision": "granted",
+                    "actorId": "human_1",
+                    "reason": null
+                })),
+            ),
+            (
+                "approval_denied",
                 ledger_event(
-                    5,
+                    OFFSET,
                     json!({
                         "event": "approval_denied",
                         "run_id": "run_1",
                         "call_id": "call_2",
-                        "actor_id": "human_1",
+                        "actor_id": "human_2",
                         "reason": "not now"
                     }),
                 ),
+                Some(json!({
+                    "kind": "approval",
+                    "offset": OFFSET,
+                    "callId": "call_2",
+                    "decision": "denied",
+                    "actorId": "human_2",
+                    "reason": "not now"
+                })),
+            ),
+            (
+                "tool_started",
                 ledger_event(
-                    6,
+                    OFFSET,
+                    json!({
+                        "event": "tool_started",
+                        "run_id": "run_1",
+                        "call_id": "call_1"
+                    }),
+                ),
+                None,
+            ),
+            (
+                "tool_finished",
+                ledger_event(
+                    OFFSET,
                     json!({
                         "event": "tool_finished",
                         "run_id": "run_1",
@@ -2541,22 +3006,57 @@ mod tests {
                             "call_id": "call_1",
                             "summary": "read file",
                             "data": {"secret_raw": true},
-                            "artifacts": [],
+                            "artifacts": ["artifact_1"],
                             "visibility": "both"
                         }
                     }),
                 ),
+                Some(json!({
+                    "kind": "tool_result",
+                    "offset": OFFSET,
+                    "callId": "call_1",
+                    "summary": "read file"
+                })),
+            ),
+            (
+                "tool_failed",
                 ledger_event(
-                    7,
+                    OFFSET,
                     json!({
                         "event": "tool_failed",
                         "run_id": "run_1",
                         "call_id": "call_3",
-                        "reason": "failed"
+                        "reason": "execution failed"
                     }),
                 ),
+                Some(json!({
+                    "kind": "tool_failed",
+                    "offset": OFFSET,
+                    "callId": "call_3",
+                    "error": "execution failed"
+                })),
+            ),
+            (
+                "run_finished",
+                ledger_event(OFFSET, json!({"event": "run_finished", "run_id": "run_1"})),
+                None,
+            ),
+            (
+                "run_failed",
+                ledger_event(
+                    OFFSET,
+                    json!({
+                        "event": "run_failed",
+                        "run_id": "run_1",
+                        "reason": "terminal failure"
+                    }),
+                ),
+                None,
+            ),
+            (
+                "approval_requested",
                 buffered_event(
-                    8,
+                    OFFSET,
                     json!({
                         "kind": "approval_requested",
                         "run_id": "run_1",
@@ -2566,46 +3066,128 @@ mod tests {
                         "reason": "approval needed"
                     }),
                 ),
-                buffered_event(9, json!({"kind": "canceled", "run_id": "run_1"})),
-            ],
+                Some(json!({
+                    "kind": "approval_requested",
+                    "offset": OFFSET,
+                    "toolCallId": "call_4"
+                })),
+            ),
+            (
+                "canceled",
+                buffered_event(OFFSET, json!({"kind": "canceled", "run_id": "run_1"})),
+                Some(json!({"kind": "cancel_requested", "offset": OFFSET})),
+            ),
+            (
+                "unknown_stream_event",
+                buffered_event(
+                    OFFSET,
+                    json!({
+                        "kind": "future_event",
+                        "run_id": "run_1",
+                        "payload": {"answer": 42}
+                    }),
+                ),
+                None,
+            ),
+        ];
+
+        for (name, before, after) in fixtures {
+            let actual = buffered_event_into_desktop(before)
+                .map(|event| serde_json::to_value(event).unwrap());
+            assert_eq!(actual, after, "fixture {name}");
+        }
+    }
+
+    #[test]
+    fn unknown_event_is_ignored_without_stalling_the_page_offset() {
+        let page = EventsStreamResult {
+            run_id: "run_1".into(),
+            from_offset: 4,
+            next_offset: 5,
+            status: RunStateName::Running,
+            events: vec![buffered_event(
+                4,
+                json!({
+                    "kind": "future_event",
+                    "run_id": "run_1",
+                    "payload": {"answer": 42}
+                }),
+            )],
         };
 
         let page = normalize_event_page("run_1", page).unwrap();
 
-        assert_eq!(page.events.len(), 10);
-        assert!(matches!(
-            page.events[0],
-            DesktopEvent::AssistantDelta {
-                offset: 0,
-                step: 0,
-                delta_index: 0,
-                ..
-            }
-        ));
-        assert!(matches!(
-            page.events[1],
-            DesktopEvent::AssistantCommitted {
-                offset: 1,
-                step: 0,
-                ..
-            }
-        ));
-        assert!(matches!(
-            page.events[3],
-            DesktopEvent::PolicyDenied { ref call_id, .. } if call_id == "call_2"
-        ));
-        assert!(matches!(
-            page.events[8],
-            DesktopEvent::ApprovalRequested { ref tool_call_id, .. }
-                if tool_call_id == "call_4"
-        ));
-        assert!(matches!(
-            page.events[9],
-            DesktopEvent::CancelRequested { offset: 9 }
-        ));
-        let serialized = serde_json::to_string(&page).unwrap();
-        for forbidden in ["secret_raw", "occurred_at_ms", "record", "turn_id"] {
-            assert!(!serialized.contains(forbidden), "found {forbidden}");
+        assert_eq!(page.from_offset, 4);
+        assert_eq!(page.next_offset, 5);
+        assert!(page.events.is_empty());
+    }
+
+    #[test]
+    fn event_page_boundaries_keep_exact_typed_errors() {
+        let fixtures = vec![
+            (
+                "wrong run",
+                EventsStreamResult {
+                    run_id: "run_other".into(),
+                    from_offset: 4,
+                    next_offset: 4,
+                    status: RunStateName::Running,
+                    events: vec![],
+                },
+                "Incompatible daemon: requested events for run_1, got run_other",
+            ),
+            (
+                "reversed offsets",
+                EventsStreamResult {
+                    run_id: "run_1".into(),
+                    from_offset: 5,
+                    next_offset: 4,
+                    status: RunStateName::Running,
+                    events: vec![],
+                },
+                "Incompatible daemon: events.stream next_offset precedes from_offset",
+            ),
+            (
+                "page length mismatch",
+                EventsStreamResult {
+                    run_id: "run_1".into(),
+                    from_offset: 4,
+                    next_offset: 5,
+                    status: RunStateName::Running,
+                    events: vec![],
+                },
+                "Incompatible daemon: events.stream offsets do not match its page length",
+            ),
+            (
+                "offset overflow",
+                EventsStreamResult {
+                    run_id: "run_1".into(),
+                    from_offset: u64::MAX,
+                    next_offset: u64::MAX,
+                    status: RunStateName::Running,
+                    events: vec![buffered_event(u64::MAX, json!({"kind": "future_event"}))],
+                },
+                "Incompatible daemon: events.stream offsets do not match its page length",
+            ),
+            (
+                "noncontiguous event offset",
+                EventsStreamResult {
+                    run_id: "run_1".into(),
+                    from_offset: 5,
+                    next_offset: 6,
+                    status: RunStateName::Running,
+                    events: vec![buffered_event(6, json!({"kind": "future_event"}))],
+                },
+                "Incompatible daemon: event offset 6 is not expected offset 5",
+            ),
+        ];
+
+        for (name, page, message) in fixtures {
+            assert_eq!(
+                normalize_event_page("run_1", page).unwrap_err(),
+                DesktopError::new("incompatible_daemon", message),
+                "fixture {name}"
+            );
         }
     }
 
@@ -2968,7 +3550,7 @@ mod tests {
     fn protocol_errors_keep_typed_code_and_message() {
         let error = DesktopError::daemon(
             "Unable to decide approval",
-            AppError::DaemonResponse(plato_agent::daemon::protocol::ProtocolError {
+            ClientError::DaemonResponse(plato_protocol::ProtocolError {
                 code: "not_found".into(),
                 message: "pending approval not found: call_1".into(),
             }),
@@ -3068,6 +3650,7 @@ mod tests {
             run_id: run_id.into(),
             session_index: 0,
             status: RunStateName::Finished,
+            model_status: None,
             entries: vec![],
         }
     }
@@ -3129,11 +3712,11 @@ mod tests {
         })
     }
 
-    fn buffered_event(offset: u64, event: Value) -> Value {
-        json!({"offset": offset, "event": event})
+    fn buffered_event(offset: u64, event: Value) -> BufferedStreamEvent {
+        serde_json::from_value(json!({"offset": offset, "event": event})).unwrap()
     }
 
-    fn ledger_event(offset: u64, event: Value) -> Value {
+    fn ledger_event(offset: u64, event: Value) -> BufferedStreamEvent {
         buffered_event(
             offset,
             json!({

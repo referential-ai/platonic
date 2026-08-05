@@ -2,8 +2,9 @@ use crate::{
     AppError, AppResult,
     tool_catalog::{default_enabled_tools, is_known_tool},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -13,11 +14,14 @@ const DEFAULT_OPENROUTER_MODEL: &str = "~openai/gpt-latest";
 const DEFAULT_TOKEN_BUDGET: u32 = 4_000;
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 1_024;
 const DEFAULT_MAX_TURNS: u32 = 8;
-const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 120_000;
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const PLATO_CONFIG_ENV: &str = "PLATO_CONFIG";
 const WORKSPACE_PROVIDER_OVERRIDE_ERROR: &str = "workspace plato.toml cannot set provider.api_key_env or provider.base_url; use --config, PLATO_CONFIG, or user config";
+const WORKSPACE_GATEWAY_ERROR: &str =
+    "workspace plato.toml cannot set [gateway]; use --config, PLATO_CONFIG, or user config";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ResolvedConfigPath {
@@ -35,13 +39,6 @@ impl ResolvedConfigPath {
     fn into_path(self) -> PathBuf {
         match self {
             Self::Authorized(path) | Self::Workspace(path) => path,
-        }
-    }
-
-    pub(crate) fn forwarded_path(&self) -> Option<&Path> {
-        match self {
-            Self::Authorized(path) => Some(path),
-            Self::Workspace(_) => None,
         }
     }
 }
@@ -63,34 +60,36 @@ pub struct GatewayConfig {
 pub struct DiscordGatewayConfig {
     pub api_key_env: String,
     pub owner_user_ids: Vec<u64>,
+    pub channel_configs: HashMap<u64, PathBuf>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub kind: ProviderKind,
     pub model: String,
     pub api_key_env: String,
     pub base_url: String,
-    pub timeout_ms: u64,
+    pub connect_timeout_ms: u64,
+    pub stream_idle_timeout_ms: u64,
     pub http_referer: Option<String>,
     pub app_title: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     OpenAi,
     OpenRouter,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LimitsConfig {
     pub token_budget: u32,
     pub max_output_tokens: u32,
     pub max_turns: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ToolsConfig {
     pub enabled: Vec<String>,
 }
@@ -115,6 +114,8 @@ struct RawGatewayConfig {
 struct RawDiscordGatewayConfig {
     api_key_env: String,
     owner_user_ids: Vec<u64>,
+    #[serde(default)]
+    channel_configs: HashMap<String, PathBuf>,
 }
 
 #[derive(Default, Debug, Deserialize)]
@@ -124,6 +125,8 @@ struct RawProviderConfig {
     model: Option<String>,
     api_key_env: Option<String>,
     base_url: Option<String>,
+    connect_timeout_ms: Option<u64>,
+    stream_idle_timeout_ms: Option<u64>,
     timeout_ms: Option<u64>,
     http_referer: Option<String>,
     app_title: Option<String>,
@@ -154,6 +157,9 @@ impl Config {
             return Ok(Self::default());
         };
         let raw = Self::read_raw(resolved.path())?;
+        if matches!(resolved, ResolvedConfigPath::Workspace(_)) && raw.gateway.is_some() {
+            return Err(AppError::Config(WORKSPACE_GATEWAY_ERROR.into()));
+        }
         if matches!(resolved, ResolvedConfigPath::Workspace(_))
             && raw.provider.as_ref().is_some_and(|provider| {
                 provider.api_key_env.is_some() || provider.base_url.is_some()
@@ -188,10 +194,23 @@ impl Config {
             limits.max_turns.unwrap_or(DEFAULT_MAX_TURNS),
             "limits.max_turns",
         )?;
-        let timeout_ms = positive(
-            provider.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
-            "provider.timeout_ms",
+        let connect_timeout_ms = positive(
+            provider
+                .connect_timeout_ms
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS),
+            "provider.connect_timeout_ms",
         )?;
+        let stream_idle_timeout_ms = match (provider.stream_idle_timeout_ms, provider.timeout_ms) {
+            (Some(_), Some(_)) => {
+                return Err(AppError::Config(
+                    "provider.timeout_ms and provider.stream_idle_timeout_ms cannot both be set"
+                        .into(),
+                ));
+            }
+            (Some(value), None) => positive(value, "provider.stream_idle_timeout_ms")?,
+            (None, Some(value)) => positive(value, "provider.timeout_ms")?,
+            (None, None) => DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+        };
         let kind = provider.kind.unwrap_or(ProviderKind::OpenRouter);
 
         let enabled = tools.enabled.unwrap_or_else(default_enabled_tools);
@@ -215,7 +234,8 @@ impl Config {
                 base_url: provider
                     .base_url
                     .unwrap_or_else(|| default_base_url(&kind).into()),
-                timeout_ms,
+                connect_timeout_ms,
+                stream_idle_timeout_ms,
                 http_referer: provider.http_referer,
                 app_title: provider.app_title,
                 kind,
@@ -239,7 +259,8 @@ impl Default for Config {
                 model: default_model(&kind).into(),
                 api_key_env: default_api_key_env(&kind).into(),
                 base_url: default_base_url(&kind).into(),
-                timeout_ms: DEFAULT_TIMEOUT_MS,
+                connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
+                stream_idle_timeout_ms: DEFAULT_STREAM_IDLE_TIMEOUT_MS,
                 http_referer: None,
                 app_title: None,
                 kind,
@@ -281,10 +302,43 @@ impl GatewayConfig {
                 "gateway.discord.owner_user_ids must contain positive integers".into(),
             ));
         }
+        if raw.discord.channel_configs.is_empty() {
+            return Err(AppError::Config(
+                "gateway.discord.channel_configs must not be empty".into(),
+            ));
+        }
+        let mut channel_configs = HashMap::new();
+        for (channel_id, path) in raw.discord.channel_configs {
+            if !channel_id.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(AppError::Config(
+                    "gateway.discord.channel_configs keys must be positive numeric Discord channel IDs"
+                        .into(),
+                ));
+            }
+            let channel_id = channel_id.parse::<u64>().map_err(|_| {
+                AppError::Config(
+                    "gateway.discord.channel_configs keys must be positive numeric Discord channel IDs"
+                        .into(),
+                )
+            })?;
+            if channel_id == 0 {
+                return Err(AppError::Config(
+                    "gateway.discord.channel_configs keys must be positive numeric Discord channel IDs"
+                        .into(),
+                ));
+            }
+            if channel_configs.insert(channel_id, path).is_some() {
+                return Err(AppError::Config(
+                    "gateway.discord.channel_configs contains a duplicate numeric Discord channel ID"
+                        .into(),
+                ));
+            }
+        }
         Ok(Self {
             discord: DiscordGatewayConfig {
                 api_key_env: raw.discord.api_key_env,
                 owner_user_ids: raw.discord.owner_user_ids,
+                channel_configs,
             },
         })
     }
@@ -453,6 +507,14 @@ mod tests {
         assert_eq!(config.provider.model, "~openai/gpt-latest");
         assert_eq!(config.provider.api_key_env, "OPENROUTER_API_KEY");
         assert_eq!(config.provider.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(
+            config.provider.connect_timeout_ms,
+            DEFAULT_CONNECT_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.provider.stream_idle_timeout_ms,
+            DEFAULT_STREAM_IDLE_TIMEOUT_MS
+        );
         assert_eq!(config.limits.max_turns, 8);
         assert!(config.gateway.is_none());
         assert_eq!(
@@ -462,7 +524,8 @@ mod tests {
                 "file.list",
                 "file.write",
                 "file.edit",
-                "shell.exec"
+                "shell.exec",
+                "web.fetch"
             ]
         );
     }
@@ -477,6 +540,9 @@ mod tests {
 [gateway.discord]
 api_key_env = "DISCORD_BOT_TOKEN"
 owner_user_ids = [123456789]
+
+[gateway.discord.channel_configs]
+"111111111111111111" = "~/.config/plato/channels/news.toml"
 "#,
         )
         .unwrap();
@@ -487,6 +553,122 @@ owner_user_ids = [123456789]
 
         assert_eq!(discord.api_key_env, "DISCORD_BOT_TOKEN");
         assert_eq!(discord.owner_user_ids, vec![123456789]);
+        assert_eq!(
+            discord.channel_configs,
+            HashMap::from([(
+                111111111111111111,
+                PathBuf::from("~/.config/plato/channels/news.toml")
+            )])
+        );
+    }
+
+    #[test]
+    fn rejects_empty_discord_channel_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gateway.toml");
+        std::fs::write(
+            &path,
+            r#"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [123456789]
+"#,
+        )
+        .unwrap();
+
+        let resolved = ResolvedConfigPath::Authorized(path);
+        let error = Config::load_resolved(Some(&resolved)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Config(message)
+                if message == "gateway.discord.channel_configs must not be empty"
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_and_nonnumeric_discord_channel_config_keys() {
+        for channel_id in ["0", "+1", "not-a-channel"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("plato.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    r#"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [123456789]
+
+[gateway.discord.channel_configs]
+"{channel_id}" = "channel.toml"
+"#
+                ),
+            )
+            .unwrap();
+
+            let resolved = ResolvedConfigPath::Authorized(path);
+            let error = Config::load_resolved(Some(&resolved)).unwrap_err();
+
+            assert!(matches!(
+                error,
+                AppError::Config(message)
+                    if message
+                        == "gateway.discord.channel_configs keys must be positive numeric Discord channel IDs"
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_discord_channel_config_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plato.toml");
+        std::fs::write(
+            &path,
+            r#"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [123456789]
+
+[gateway.discord.channel_configs]
+"111111111111111111" = "news.toml"
+"111111111111111111" = "dev.toml"
+"#,
+        )
+        .unwrap();
+
+        let resolved = ResolvedConfigPath::Authorized(path);
+        let error = Config::load_resolved(Some(&resolved)).unwrap_err();
+
+        assert!(matches!(error, AppError::Toml(_)));
+    }
+
+    #[test]
+    fn rejects_discord_channel_config_keys_with_duplicate_numeric_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plato.toml");
+        std::fs::write(
+            &path,
+            r#"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [123456789]
+
+[gateway.discord.channel_configs]
+"1" = "news.toml"
+"01" = "dev.toml"
+"#,
+        )
+        .unwrap();
+
+        let resolved = ResolvedConfigPath::Authorized(path);
+        let error = Config::load_resolved(Some(&resolved)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Config(message)
+                if message
+                    == "gateway.discord.channel_configs contains a duplicate numeric Discord channel ID"
+        ));
     }
 
     #[test]
@@ -506,13 +688,39 @@ owner_user_ids = [123456789]
                 .unwrap();
 
             assert!(matches!(&resolved, ResolvedConfigPath::Workspace(_)));
-            assert_eq!(resolved.forwarded_path(), None);
             let error = Config::load_resolved(Some(&resolved)).unwrap_err();
             assert!(matches!(
                 error,
                 AppError::Config(message) if message == WORKSPACE_PROVIDER_OVERRIDE_ERROR
             ));
         }
+    }
+
+    #[test]
+    fn auto_workspace_config_rejects_the_gateway_table() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("plato.toml"),
+            r#"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [42]
+
+[gateway.discord.channel_configs]
+"200" = "channel.toml"
+"#,
+        )
+        .unwrap();
+        let resolved = resolve_config_with(workspace.path(), None, None, None, None)
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(&resolved, ResolvedConfigPath::Workspace(_)));
+        let error = Config::load_resolved(Some(&resolved)).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Config(message) if message == WORKSPACE_GATEWAY_ERROR
+        ));
     }
 
     #[test]
@@ -531,10 +739,6 @@ max_turns = 2
 
 [tools]
 enabled = ["file.read"]
-
-[gateway.discord]
-api_key_env = "DISCORD_BOT_TOKEN"
-owner_user_ids = [42]
 "#,
         )
         .unwrap();
@@ -548,14 +752,18 @@ owner_user_ids = [42]
         assert_eq!(config.provider.model, "gpt-test");
         assert_eq!(config.provider.api_key_env, "OPENAI_API_KEY");
         assert_eq!(config.provider.base_url, OPENAI_BASE_URL);
-        assert_eq!(config.provider.timeout_ms, 3000);
+        assert_eq!(
+            config.provider.connect_timeout_ms,
+            DEFAULT_CONNECT_TIMEOUT_MS
+        );
+        assert_eq!(config.provider.stream_idle_timeout_ms, 3000);
         assert_eq!(config.limits.max_turns, 2);
         assert_eq!(config.tools.enabled, vec!["file.read"]);
-        assert_eq!(config.gateway.unwrap().discord.owner_user_ids, vec![42]);
+        assert!(config.gateway.is_none());
     }
 
     #[test]
-    fn explicit_environment_and_user_configs_allow_sensitive_provider_fields() {
+    fn explicit_environment_and_user_configs_allow_trusted_fields() {
         for source in ["explicit", "environment", "user"] {
             let workspace = tempfile::tempdir().unwrap();
             let name = if source == "explicit" {
@@ -570,6 +778,13 @@ owner_user_ids = [42]
 [provider]
 api_key_env = "AUTHORIZED_SECRET"
 base_url = "https://provider.example/v1"
+
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [42]
+
+[gateway.discord.channel_configs]
+"200" = "channel.toml"
 "#,
             )
             .unwrap();
@@ -593,10 +808,18 @@ base_url = "https://provider.example/v1"
 
             let config = Config::load_resolved(Some(&resolved)).unwrap();
 
-            assert!(matches!(&resolved, ResolvedConfigPath::Authorized(_)));
-            assert_eq!(resolved.forwarded_path(), Some(path.as_path()));
+            assert!(matches!(
+                &resolved,
+                ResolvedConfigPath::Authorized(resolved_path) if resolved_path == &path
+            ));
             assert_eq!(config.provider.api_key_env, "AUTHORIZED_SECRET");
             assert_eq!(config.provider.base_url, "https://provider.example/v1");
+            let discord = config.gateway.unwrap().discord;
+            assert_eq!(discord.owner_user_ids, vec![42]);
+            assert_eq!(
+                discord.channel_configs,
+                HashMap::from([(200, PathBuf::from("channel.toml"))])
+            );
         }
     }
 
@@ -684,6 +907,84 @@ base_url = "https://provider.example/v1"
     }
 
     #[test]
+    fn parses_explicit_provider_timeouts() {
+        let raw = toml::from_str(
+            r#"
+[provider]
+connect_timeout_ms = 2500
+stream_idle_timeout_ms = 9000
+"#,
+        )
+        .unwrap();
+
+        let config = Config::from_raw(raw).unwrap();
+
+        assert_eq!(config.provider.connect_timeout_ms, 2500);
+        assert_eq!(config.provider.stream_idle_timeout_ms, 9000);
+    }
+
+    #[test]
+    fn legacy_provider_timeout_maps_to_stream_idle_budget() {
+        let raw = toml::from_str(
+            r#"
+[provider]
+connect_timeout_ms = 2500
+timeout_ms = 9000
+"#,
+        )
+        .unwrap();
+
+        let config = Config::from_raw(raw).unwrap();
+
+        assert_eq!(config.provider.connect_timeout_ms, 2500);
+        assert_eq!(config.provider.stream_idle_timeout_ms, 9000);
+    }
+
+    #[test]
+    fn rejects_legacy_and_explicit_stream_idle_timeouts_together() {
+        let raw = toml::from_str(
+            r#"
+[provider]
+timeout_ms = 9000
+stream_idle_timeout_ms = 9000
+"#,
+        )
+        .unwrap();
+
+        let error = Config::from_raw(raw).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Config(message)
+                if message
+                    == "provider.timeout_ms and provider.stream_idle_timeout_ms cannot both be set"
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_provider_timeouts() {
+        for (field, source) in [
+            (
+                "provider.connect_timeout_ms",
+                "[provider]\nconnect_timeout_ms = 0\n",
+            ),
+            (
+                "provider.stream_idle_timeout_ms",
+                "[provider]\nstream_idle_timeout_ms = 0\n",
+            ),
+            ("provider.timeout_ms", "[provider]\ntimeout_ms = 0\n"),
+        ] {
+            let raw = toml::from_str(source).unwrap();
+            let error = Config::from_raw(raw).unwrap_err();
+
+            assert!(matches!(
+                error,
+                AppError::Config(message) if message == format!("{field} must be positive")
+            ));
+        }
+    }
+
+    #[test]
     fn openrouter_defaults_to_openrouter_endpoint_and_key() {
         let raw = RawConfig {
             provider: Some(RawProviderConfig {
@@ -691,6 +992,8 @@ base_url = "https://provider.example/v1"
                 model: None,
                 api_key_env: None,
                 base_url: None,
+                connect_timeout_ms: None,
+                stream_idle_timeout_ms: None,
                 timeout_ms: None,
                 http_referer: None,
                 app_title: None,

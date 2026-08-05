@@ -18,6 +18,7 @@ technical identities remain unchanged.
 - Link every PR to its issue and include verification commands or manual proof.
 - A PR changing user-visible behavior must update `README.md` or `docs/QUICKSTART.md` in the same PR.
 - Merge authority follows the workspace-root `AGENTS.md`; CI must be green and every issue- or PR-specific review and proof gate must be satisfied.
+- The workspace-root [Simplicity Directive](https://github.com/referential-ai/platonic-workspace/blob/main/AGENTS.md#simplicity-directive) is binding: every changed line must serve named acceptance; stop before scope widens.
 - Do not use local TODOs, wiki pages, tmux pane names, or chat history as active-work authority.
 - Do not start implementation unless a GitHub issue or direct human task has clear scope, non-goals, acceptance, target surface, and proof.
 
@@ -30,6 +31,8 @@ technical identities remain unchanged.
 - Connectors must not own sessions, policy, approvals, provider fallback, or run semantics.
 
 ## Verification
+
+- Unix external-daemon proofs use a pre-absent, issue-named short `/tmp/p<issue>` root with mode `0700`; derive and print the final socket path before spawn and require its byte length to be below 100; readiness uses `-S` followed by the existing bounded client/status/hello readback, never `-s`; preserve the original timeouts and assertions; clean up only the exact owned tmux session, process/group, socket, state, and root, never a broad `/tmp` scan.
 
 ```bash
 cargo fmt --check

@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - release/**
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
@@ -13,7 +14,28 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  RUSTUP_TOOLCHAIN: 1.88.0
+
 jobs:
+  rustsec:
+    name: Desktop RustSec
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out plato-agent
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.0
+
+      - name: Audit desktop Rust dependencies
+        run: cargo audit --file desktop/src-tauri/Cargo.lock
+
   web:
     name: Web
     runs-on: ubuntu-24.04
@@ -73,6 +95,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -85,13 +110,30 @@ jobs:
         run: |
           cargo fetch --manifest-path ../Cargo.toml --locked
           cargo fetch --manifest-path src-tauri/Cargo.toml --locked
-          echo 'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
+          ort_cache_dir="$RUNNER_TEMP/plato-ort-cache"
+          ort_prime_target="$RUNNER_TEMP/plato-ort-prime-target"
+          test ! -e "$ort_cache_dir"
+          test ! -e "$ort_prime_target"
+          mkdir -p "$ort_cache_dir" "$ort_prime_target"
+          ORT_CACHE_DIR="$ort_cache_dir" \
+            CARGO_TARGET_DIR="$ort_prime_target" \
+            cargo check --manifest-path ../Cargo.toml --locked -p ort-sys
+          mapfile -t ort_lib_dirs < <(
+            find "$ort_cache_dir/dfbin" -type f -name 'libonnxruntime.a' \
+              -printf '%h\n' | LC_ALL=C sort -u
+          )
+          test "${#ort_lib_dirs[@]}" -eq 1
+          printf '%s\n' \
+            "ORT_CACHE_DIR=$ort_cache_dir" \
+            "ORT_LIB_PATH=${ort_lib_dirs[0]}" \
+            'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
 
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libayatana-appindicator3-dev \
+            libasound2-dev \
             librsvg2-dev \
             libssl-dev \
             libwebkit2gtk-4.1-dev \
@@ -103,9 +145,6 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: desktop/package-lock.json
-
-      - name: Install Rust components
-        run: rustup component add rustfmt clippy
 
       - name: Install web dependencies
         run: npm ci
@@ -192,6 +231,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -204,12 +246,33 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo fetch --locked
           cargo fetch --manifest-path desktop/src-tauri/Cargo.toml --locked
+          $ortCacheDir = Join-Path $env:RUNNER_TEMP "plato-ort-cache"
+          $ortPrimeTarget = Join-Path $env:RUNNER_TEMP "plato-ort-prime-target"
+          if ((Test-Path $ortCacheDir) -or (Test-Path $ortPrimeTarget)) {
+            throw "ORT prime cache and target must start empty"
+          }
+          New-Item -ItemType Directory -Path $ortCacheDir, $ortPrimeTarget | Out-Null
+          $normalTargetDir = $env:CARGO_TARGET_DIR
+          $env:ORT_CACHE_DIR = $ortCacheDir
+          $env:CARGO_TARGET_DIR = $ortPrimeTarget
+          cargo check --locked -p ort-sys
+          $env:CARGO_TARGET_DIR = $normalTargetDir
+          $ortLibDirs = @(
+            Get-ChildItem -Path (Join-Path $ortCacheDir "dfbin") -Recurse -File -Filter "onnxruntime.lib" |
+              ForEach-Object { $_.Directory.FullName } |
+              Sort-Object -Unique
+          )
+          if ($ortLibDirs.Count -ne 1) {
+            throw "expected exactly one ONNX Runtime library directory; found $($ortLibDirs.Count)"
+          }
+          "ORT_CACHE_DIR=$ortCacheDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_LIB_PATH=$($ortLibDirs[0])" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=-l dxguid -l DXCORE -l DXGI -l D3D12 -l DirectML" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
           "CARGO_NET_OFFLINE=true" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Install Rust components
-        run: rustup component add rustfmt clippy
 
       - name: Build sidecars
         run: cargo build --locked --bin plato-agentd --bin plato
@@ -233,6 +296,10 @@ jobs:
 
   windows-installer:
     name: Windows unsigned installer
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/heads/release/'))
     runs-on: windows-2025
     timeout-minutes: 60
     defaults:
@@ -247,6 +314,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal
+
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -259,8 +329,32 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo fetch --manifest-path ../Cargo.toml --locked
           cargo fetch --manifest-path src-tauri/Cargo.toml --locked
+          $ortCacheDir = Join-Path $env:RUNNER_TEMP "plato-ort-cache"
+          $ortPrimeTarget = Join-Path $env:RUNNER_TEMP "plato-ort-prime-target"
+          if ((Test-Path $ortCacheDir) -or (Test-Path $ortPrimeTarget)) {
+            throw "ORT prime cache and target must start empty"
+          }
+          New-Item -ItemType Directory -Path $ortCacheDir, $ortPrimeTarget | Out-Null
+          $normalTargetDir = $env:CARGO_TARGET_DIR
+          $env:ORT_CACHE_DIR = $ortCacheDir
+          $env:CARGO_TARGET_DIR = $ortPrimeTarget
+          cargo check --manifest-path ../Cargo.toml --locked -p ort-sys
+          $env:CARGO_TARGET_DIR = $normalTargetDir
+          $ortLibDirs = @(
+            Get-ChildItem -Path (Join-Path $ortCacheDir "dfbin") -Recurse -File -Filter "onnxruntime.lib" |
+              ForEach-Object { $_.Directory.FullName } |
+              Sort-Object -Unique
+          )
+          if ($ortLibDirs.Count -ne 1) {
+            throw "expected exactly one ONNX Runtime library directory; found $($ortLibDirs.Count)"
+          }
+          "ORT_CACHE_DIR=$ortCacheDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_LIB_PATH=$($ortLibDirs[0])" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=-l dxguid -l DXCORE -l DXGI -l D3D12 -l DirectML" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
           "CARGO_NET_OFFLINE=true" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Set up Node.js
@@ -292,7 +386,7 @@ jobs:
           $upgradeConfig = Join-Path $env:RUNNER_TEMP "tauri-upgrade.json"
           [IO.File]::WriteAllText(
             $upgradeConfig,
-            '{"version":"0.1.1"}',
+            '{"version":"0.2.1"}',
             [Text.UTF8Encoding]::new($false)
           )
           npx tauri build --target x86_64-pc-windows-msvc --bundles nsis `

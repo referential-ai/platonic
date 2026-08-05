@@ -1,10 +1,10 @@
 [package]
 name = "plato-desktop"
-version = "0.1.0"
+version = "0.2.0"
 description = "Plato Agent desktop shell"
 license = "MIT OR Apache-2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 publish = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -17,7 +17,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
-plato-agent = { path = "../.." }
+plato-daemon-client = { version = "0.2.0", path = "../../crates/plato-daemon-client" }
+plato-protocol = { version = "0.2.0", path = "../../crates/plato-protocol" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tauri = { version = "2.11.3", features = [] }

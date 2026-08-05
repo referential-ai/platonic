@@ -5,6 +5,9 @@ on:
     tags:
       - plato-desktop-v*
 
+env:
+  RUSTUP_TOOLCHAIN: 1.88.0
+
 jobs:
   build:
     name: Build Linux AppImage
@@ -24,6 +27,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal
+
       - name: Require the release tag to match the desktop version and main
         run: |
           set -euo pipefail
@@ -35,13 +41,30 @@ jobs:
         run: |
           cargo fetch --manifest-path ../Cargo.toml --locked
           cargo fetch --manifest-path src-tauri/Cargo.toml --locked
-          echo 'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
+          ort_cache_dir="$RUNNER_TEMP/plato-ort-cache"
+          ort_prime_target="$RUNNER_TEMP/plato-ort-prime-target"
+          test ! -e "$ort_cache_dir"
+          test ! -e "$ort_prime_target"
+          mkdir -p "$ort_cache_dir" "$ort_prime_target"
+          ORT_CACHE_DIR="$ort_cache_dir" \
+            CARGO_TARGET_DIR="$ort_prime_target" \
+            cargo check --manifest-path ../Cargo.toml --locked -p ort-sys
+          mapfile -t ort_lib_dirs < <(
+            find "$ort_cache_dir/dfbin" -type f -name 'libonnxruntime.a' \
+              -printf '%h\n' | LC_ALL=C sort -u
+          )
+          test "${#ort_lib_dirs[@]}" -eq 1
+          printf '%s\n' \
+            "ORT_CACHE_DIR=$ort_cache_dir" \
+            "ORT_LIB_PATH=${ort_lib_dirs[0]}" \
+            'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
 
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libayatana-appindicator3-dev \
+            libasound2-dev \
             librsvg2-dev \
             libssl-dev \
             libwebkit2gtk-4.1-dev \

@@ -1,9 +1,7 @@
 #![allow(unsafe_code)]
 
-use plato_agent::{
-    daemon::{client::DaemonClient, installer_gate::InstallerStartupGate, protocol::RunStateName},
-    paths,
-};
+use plato_daemon_client::{client::DaemonClient, installer_gate::InstallerStartupGate, paths};
+use plato_protocol::RunStateName;
 use serde_json::json;
 use std::{
     env, fs,
@@ -53,7 +51,7 @@ fn unsigned_installer_cold_launch_upgrade_and_uninstall_matrix() {
     write_saved_workspace(&workspace_file, first_workspace.path());
 
     assert!(run_installer(&base_installer).success());
-    let base = InstalledSnapshot::capture("0.1.0");
+    let base = InstalledSnapshot::capture("0.2.0");
     let gate = InstallerStartupGate::acquire().unwrap();
     let mut blocked_app = spawn_app(&base.main, None);
     let blocked_status = wait_for_status(&mut blocked_app, PROOF_TIMEOUT, &base.main);
@@ -113,7 +111,7 @@ fn unsigned_installer_cold_launch_upgrade_and_uninstall_matrix() {
     wait_for_child_exit(&mut second_daemon);
     wait_for_path_absent(&second_lock);
 
-    let upgraded = InstalledSnapshot::capture("0.1.1");
+    let upgraded = InstalledSnapshot::capture("0.2.1");
     assert!(
         base.main_bytes != upgraded.main_bytes,
         "upgrade did not replace the versioned desktop executable"

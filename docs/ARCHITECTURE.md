@@ -16,7 +16,8 @@ This document copies the topology decision from the Platonic workspace issue tha
 - Daemon noun: `plato-agentd` is the persistent runtime. Gateways are future ingress adapters and never own agent semantics.
 - TUI decision: `plato-tui` is a separate binary in this crate once it exists.
 - Daemon ownership: `plato-agentd` owns the local endpoint, event database, and process lock. Unix uses a private UDS plus XDG runtime/state paths; Windows uses a current-user named pipe plus `LocalAppData` runtime/state paths. Durable paths are keyed by `workspace-id` = sanitized root basename + first 16 SHA-256 hex chars of the canonical root path; the Windows pipe name uses the full bounded workspace id.
-- Single-writer invariant: one live writer owns a workspace store. Before daemon and CLI coexist on SQLite, decide whether CLI writes directly, delegates to the daemon, or refuses while the daemon is active.
+- Single-writer invariant: one live writer owns a workspace store. A daemon-run child never opens the ledger or receives its path; it streams typed record operations to `plato-agentd`, which remains the sole SQLite writer.
+- Run-child boundary: every daemon run executes in its own supervised child while the daemon remains authoritative. The parent supplies an explicit deadline and cancellation token, supervises the complete descendant tree, applies bounded grace and kill phases, drains child output with a bound, and asserts zero residual processes after every terminal path. One-shot execution stays embedded and uses the same run-driving implementation.
 - Daemon API sketch: start run, append message, stream events, approve/deny, cancel, list sessions, read transcript. `run.start` and `message.append` default to async `wait: false`; explicit `wait: true` blocks until terminal result.
 - Live assistant text deltas are transient daemon/app events; final `model_responded` ledger messages remain the replay source of truth.
 - Connector rule: connectors and gateways never own sessions, policy, approvals, provider fallback, or run semantics. Process placement is host mechanics; the semantic boundary is binding.
@@ -28,7 +29,9 @@ Default to a clear module with a narrow surface.
 Promote to a Cargo feature only when a real build wants exclusion.
 Promote to a crate only on a trigger: second consumer, independent process/deployable, or compile/dependency isolation.
 `sqlite` as a feature is a later discussion candidate only; the current SQLite path stays concrete.
-Connectors and gateways are future crate/process candidates when real ingress adapters exist; provider adapters come next.
+The Discord runtime is the `plato-gateway-discord` leaf crate; root retains
+configuration admission, startup composition, and the installed compatibility
+binary. Other connectors remain unadmitted.
 The store becomes a crate only with out-of-crate consumers; scheduler, cron, and memory are daemon-era modules/features if they ever become real.
 Crate-per-function upfront is rejected.
 
