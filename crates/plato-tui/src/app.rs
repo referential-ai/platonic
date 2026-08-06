@@ -41,7 +41,7 @@ const REDUCED_MOTION_ENV: &str = "PLATO_REDUCED_MOTION";
 
 pub(super) enum UiEvent {
     Terminal(io::Result<Event>),
-    Daemon(ClientEvent),
+    Daemon(Box<ClientEvent>),
 }
 
 #[derive(Debug, Default)]
@@ -204,7 +204,7 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
                 frames.schedule_frame();
             }
             UiEvent::Daemon(event) => {
-                apply_client_event(&mut state, &mut runtime, event, &commands);
+                apply_client_event(&mut state, &mut runtime, *event, &commands);
                 frames.schedule_frame();
             }
         }
@@ -2813,6 +2813,7 @@ mod tests {
                 ledger_path: "/tmp/agent.db".into(),
                 status: RunStateName::Running,
                 final_answer: None,
+                completion_claim: None,
             },
             "run started",
         );
@@ -3931,6 +3932,7 @@ mod tests {
                 transcript: transcript.into(),
                 typed: None,
                 pending_approval: None,
+                completion_claim: None,
             }
             .into(),
         )
