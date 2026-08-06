@@ -1106,6 +1106,9 @@ fn run_state_from_event(event: &StreamEvent) -> Option<(String, RunStateName)> {
             Some((run_id.clone(), RunStateName::Running))
         }
         StreamEvent::Canceled { run_id } => Some((run_id.clone(), RunStateName::Canceled)),
+        StreamEvent::CompletionClaimed { run_id, .. } => {
+            Some((run_id.clone(), RunStateName::Running))
+        }
         StreamEvent::Unknown(_) => None,
     }
 }

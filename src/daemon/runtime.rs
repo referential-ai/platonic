@@ -529,13 +529,19 @@ impl DaemonRuntime {
         }
     }
 
-    pub(super) fn finish_run(&self, record: &RunRecord, final_answer: String) {
+    pub(super) fn finish_run(
+        &self,
+        record: &RunRecord,
+        final_answer: String,
+        completion_claim: Option<plato_protocol::CompletionClaim>,
+    ) {
         self.complete_run(
             record,
             RunStatus {
                 state: RunStateName::Finished,
                 final_answer: Some(final_answer),
                 error: None,
+                completion_claim,
             },
         );
     }
@@ -550,6 +556,7 @@ impl DaemonRuntime {
                 },
                 final_answer: None,
                 error: Some(error.to_string()),
+                completion_claim: None,
             },
         );
     }
@@ -1051,6 +1058,7 @@ pub(super) struct RunStatus {
     pub(super) state: RunStateName,
     pub(super) final_answer: Option<String>,
     pub(super) error: Option<String>,
+    pub(super) completion_claim: Option<plato_protocol::CompletionClaim>,
 }
 
 #[derive(Debug)]
@@ -1125,6 +1133,7 @@ impl RunRecord {
                 state: RunStateName::Running,
                 final_answer: None,
                 error: None,
+                completion_claim: None,
             }),
             events: Mutex::new(EventBuffer {
                 first_offset: 0,
@@ -1836,10 +1845,10 @@ mod tests {
         cancel_requested.status.lock().unwrap().state = RunStateName::CancelRequested;
         runtime.reserve_run(cancel_requested.clone()).unwrap();
 
-        runtime.finish_run(&terminal_records[1], "done 1".into());
-        runtime.finish_run(&terminal_records[0], "done 0".into());
+        runtime.finish_run(&terminal_records[1], "done 1".into(), None);
+        runtime.finish_run(&terminal_records[0], "done 0".into(), None);
         for (index, record) in terminal_records.iter().enumerate().skip(2) {
-            runtime.finish_run(record, format!("done {index}"));
+            runtime.finish_run(record, format!("done {index}"), None);
         }
 
         let state = runtime.state.lock().unwrap();
@@ -2052,7 +2061,7 @@ mod tests {
             ShutdownIfIdleDecision::RefusedActive
         );
 
-        runtime.finish_run(&record, "done".into());
+        runtime.finish_run(&record, "done".into(), None);
         assert_eq!(runtime.shutdown_if_idle(), ShutdownIfIdleDecision::Shutdown);
         assert_eq!(
             runtime.shutdown_if_idle(),

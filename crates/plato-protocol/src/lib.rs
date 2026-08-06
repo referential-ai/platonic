@@ -850,6 +850,46 @@ pub struct RunStartParams {
     pub wait: Option<bool>,
 }
 
+/// Claimed outcome for a worker thread's completion claim.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionOutcome {
+    /// The worker claims to have completed the assigned work.
+    Done,
+    /// The worker claims the assigned work is blocked.
+    Blocked {
+        /// Reason the worker claims to be blocked.
+        reason: String,
+    },
+}
+
+/// A worker thread's self-reported completion claim.
+///
+/// This is an additive-optional protocol result: absent for non-worker runs
+/// or when the worker makes no claim. The type makes the claim parseable,
+/// never true — a claim is distinct from coordinator-verified completion.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionClaim {
+    /// Claimed outcome.
+    pub outcome: CompletionOutcome,
+    /// Base commit the work started from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// Head commit the work produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    /// Repository paths changed by the work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_paths: Vec<String>,
+    /// Pull request identifier for the work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<String>,
+    /// CI check run identifiers for the work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
+}
+
 /// Result returned after a fresh run is admitted or completed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RunStartResult {
@@ -863,6 +903,9 @@ pub struct RunStartResult {
     pub status: RunStateName,
     /// Final assistant answer when the run finished successfully.
     pub final_answer: Option<String>,
+    /// Additive-optional completion claim from the worker thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_claim: Option<CompletionClaim>,
 }
 
 /// Parameters for appending a user message to a session.
@@ -989,6 +1032,13 @@ pub enum StreamEvent {
         /// Canceled run identifier.
         run_id: String,
     },
+    /// Completion claim produced by a worker thread at turn end.
+    CompletionClaimed {
+        /// Run whose worker produced the claim.
+        run_id: String,
+        /// The claim itself.
+        claim: CompletionClaim,
+    },
     /// Unrecognized future event preserved without modification.
     Unknown(Value),
 }
@@ -1019,6 +1069,12 @@ enum KnownStreamEvent {
     },
     Canceled {
         run_id: String,
+    },
+    CompletionClaimed {
+        /// Run whose worker produced the claim.
+        run_id: String,
+        /// The claim itself.
+        claim: CompletionClaim,
     },
 }
 
@@ -1068,6 +1124,11 @@ impl Serialize for StreamEvent {
                 run_id: run_id.clone(),
             }
             .serialize(serializer),
+            Self::CompletionClaimed { run_id, claim } => KnownStreamEvent::CompletionClaimed {
+                run_id: run_id.clone(),
+                claim: claim.clone(),
+            }
+            .serialize(serializer),
             Self::Unknown(value) => value.serialize(serializer),
         }
     }
@@ -1084,11 +1145,10 @@ impl<'de> Deserialize<'de> for StreamEvent {
             .and_then(Value::as_str)
             .ok_or_else(|| D::Error::custom("stream event kind must be a string"))?;
         match kind {
-            "ledger" | "assistant_delta" | "approval_requested" | "canceled" => {
-                serde_json::from_value::<KnownStreamEvent>(value)
-                    .map(StreamEvent::from)
-                    .map_err(D::Error::custom)
-            }
+            "ledger" | "assistant_delta" | "approval_requested" | "canceled"
+            | "completion_claimed" => serde_json::from_value::<KnownStreamEvent>(value)
+                .map(StreamEvent::from)
+                .map_err(D::Error::custom),
             _ => Ok(Self::Unknown(value)),
         }
     }
@@ -1129,6 +1189,9 @@ impl From<KnownStreamEvent> for StreamEvent {
                 approval_preview,
             },
             KnownStreamEvent::Canceled { run_id } => Self::Canceled { run_id },
+            KnownStreamEvent::CompletionClaimed { run_id, claim } => {
+                Self::CompletionClaimed { run_id, claim }
+            }
         }
     }
 }
@@ -1266,6 +1329,9 @@ pub struct TranscriptReadResult {
     /// Additive snapshot of an approval currently awaiting a decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_approval: Option<PendingApprovalSnapshot>,
+    /// Additive-optional completion claim from the run's worker thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_claim: Option<CompletionClaim>,
 }
 
 /// Complete readback of an approval currently awaiting a decision.
@@ -2190,6 +2256,7 @@ mod tests {
                 }],
             }),
             pending_approval: None,
+            completion_claim: None,
         };
 
         let wire = serde_json::to_value(&current).unwrap();
@@ -2275,6 +2342,83 @@ mod tests {
     }
 
     #[test]
+    fn completion_claim_roundtrips_and_absent_stays_compatible() {
+        let full = CompletionClaim {
+            outcome: CompletionOutcome::Done,
+            base: Some("abc123".into()),
+            head: Some("def456".into()),
+            changed_paths: vec!["src/main.rs".into()],
+            pr: Some("#42".into()),
+            checks: vec!["ci-789".into()],
+        };
+        let wire = serde_json::to_value(&full).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "outcome": "done",
+                "base": "abc123",
+                "head": "def456",
+                "changed_paths": ["src/main.rs"],
+                "pr": "#42",
+                "checks": ["ci-789"]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CompletionClaim>(wire).unwrap(),
+            full
+        );
+
+        let minimal = CompletionClaim {
+            outcome: CompletionOutcome::Done,
+            base: None,
+            head: None,
+            changed_paths: vec![],
+            pr: None,
+            checks: vec![],
+        };
+        let wire = serde_json::to_value(&minimal).unwrap();
+        assert_eq!(wire, json!({"outcome": "done"}));
+        assert_eq!(
+            serde_json::from_value::<CompletionClaim>(wire).unwrap(),
+            minimal
+        );
+
+        let blocked = CompletionClaim {
+            outcome: CompletionOutcome::Blocked {
+                reason: "waiting for review".into(),
+            },
+            base: None,
+            head: None,
+            changed_paths: vec![],
+            pr: None,
+            checks: vec![],
+        };
+        let wire = serde_json::to_value(&blocked).unwrap();
+        assert_eq!(wire, json!({"outcome": {"blocked": "waiting for review"}}));
+
+        // Absent claim in RunStartResult: legacy wire decodes cleanly.
+        let legacy: RunStartResult = serde_json::from_value(json!({
+            "run_id": "run_1",
+            "session_id": "s1",
+            "ledger_path": "/tmp/db",
+            "status": "finished",
+            "final_answer": "done"
+        }))
+        .unwrap();
+        assert_eq!(legacy.completion_claim, None);
+
+        // Absent claim in TranscriptReadResult
+        let legacy_transcript: TranscriptReadResult = serde_json::from_value(json!({
+            "run_id": "run_1",
+            "status": "finished",
+            "final_answer": "done",
+            "transcript": "text"
+        }))
+        .unwrap();
+        assert_eq!(legacy_transcript.completion_claim, None);
+    }
+
+    #[test]
     fn model_identity_status_keeps_exact_known_unknown_and_requested_wire_shapes() {
         let fixtures = [
             (
@@ -2337,6 +2481,7 @@ mod tests {
                 approval_preview: Some("write out.txt".into()),
                 diff_preview: Some("--- a/out.txt\n+++ b/out.txt\n".into()),
             }),
+            completion_claim: None,
         };
 
         let wire = serde_json::to_value(&current).unwrap();
@@ -2441,6 +2586,25 @@ mod tests {
                 "kind": "canceled",
                 "run_id": "run_1"
             }),
+            json!({
+                "kind": "completion_claimed",
+                "run_id": "run_1",
+                "claim": {
+                    "outcome": "done",
+                    "base": "abc123",
+                    "head": "def456",
+                    "changed_paths": ["src/main.rs"],
+                    "pr": "#42",
+                    "checks": ["ci-789"]
+                }
+            }),
+            json!({
+                "kind": "completion_claimed",
+                "run_id": "run_2",
+                "claim": {
+                    "outcome": {"blocked": "waiting for review"}
+                }
+            }),
         ];
 
         for fixture in fixtures {
@@ -2488,6 +2652,7 @@ mod tests {
                 "effect": "workspace_write"
             }),
             json!({"kind": "canceled"}),
+            json!({"kind": "completion_claimed", "run_id": "run_1"}),
             json!({"payload": "missing kind"}),
         ];
 
