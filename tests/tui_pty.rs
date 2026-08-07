@@ -833,7 +833,7 @@ enabled = ["shell.exec"]
     shell.write(b"q");
     assert_eq!(shell.wait_for_marker("STATUS2"), "0");
     assert_eq!(
-        restarted_client.shutdown_if_idle().unwrap().result,
+        shutdown_when_idle(&mut restarted_client),
         ShutdownIfIdleResultName::Shutdown
     );
     wait_for_endpoint_removal(&endpoint);
@@ -1295,6 +1295,24 @@ impl Drop for HostDaemonCleanup {
         while self.endpoint.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
+    }
+}
+
+/// Polls `shutdown_if_idle` until the daemon is idle enough to accept it.
+///
+/// A run outlives the client that started it: clients attach, detach, and
+/// reattach, and detaching must not stop an in-flight turn. So a daemon can
+/// legitimately refuse shutdown for a moment after a client process exits,
+/// while the run it left behind reaches a terminal state. Asserting on a
+/// single call races that window.
+fn shutdown_when_idle(client: &mut DaemonClient) -> ShutdownIfIdleResultName {
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    loop {
+        let result = client.shutdown_if_idle().unwrap().result;
+        if result != ShutdownIfIdleResultName::RefusedActive || Instant::now() >= deadline {
+            return result;
+        }
+        thread::sleep(Duration::from_millis(25));
     }
 }
 
