@@ -1,8 +1,14 @@
 # Agent Instructions for platonic-core
 
-This repo is the small Rust harness kernel for the Platonic framework. The
-workspace [naming authority](https://github.com/referential-ai/platonic-workspace/blob/main/product/branding.md)
+This repo is the small Rust harness kernel of **Platonic**, the agent server.
+The workspace [naming authority](https://github.com/referential-ai/platonic-workspace/blob/main/product/branding.md)
 owns the hierarchy and exact forms.
+
+The server instantiates this kernel once per thread and performs every effect it
+asks for. This crate never does. That separation is enforced by the crate
+boundary — three dependencies, `#![forbid(unsafe_code)]`, no IO — and the
+enforcement is the point: merging it into the server would turn a compiler
+guarantee into a habit, and replay determinism depends on it.
 
 ## Rules
 
