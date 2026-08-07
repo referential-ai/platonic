@@ -2394,7 +2394,10 @@ mod tests {
             checks: vec![],
         };
         let wire = serde_json::to_value(&blocked).unwrap();
-        assert_eq!(wire, json!({"outcome": {"kind": "blocked", "reason": "waiting for review"}}));
+        assert_eq!(
+            wire,
+            json!({"outcome": {"kind": "blocked", "reason": "waiting for review"}})
+        );
 
         // Absent claim in RunStartResult: legacy wire decodes cleanly.
         let legacy: RunStartResult = serde_json::from_value(json!({
