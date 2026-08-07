@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/plato-audio",
+  "crates/platonic-server",
   "crates/platonic-client",
   "crates/plato-gateway-discord",
   "crates/platonic-protocol",
@@ -54,6 +55,7 @@ plato-audio = { version = "0.2.0", path = "crates/plato-audio" }
 platonic-client = { version = "0.2.0", path = "crates/platonic-client" }
 plato-gateway-discord = { version = "0.2.0", path = "crates/plato-gateway-discord" }
 platonic-protocol = { version = "0.2.0", path = "crates/platonic-protocol" }
+platonic-server = { version = "0.2.0", path = "crates/platonic-server" }
 plato-tui = { version = "0.2.0", path = "crates/plato-tui" }
 platonic-core = "0.3.1"
 rusqlite = { version = "0.39", features = ["bundled"] }

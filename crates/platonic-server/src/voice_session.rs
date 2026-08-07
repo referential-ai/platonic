@@ -89,7 +89,7 @@ pub enum VoiceEvent {
 }
 
 impl VoiceEvent {
-    pub(crate) fn captured(run_id: RunId, turn_id: TurnId, report: &CaptureReport) -> Self {
+    pub fn captured(run_id: RunId, turn_id: TurnId, report: &CaptureReport) -> Self {
         let (transcript_sha256, transcript_bytes) = transcript_identity(&report.transcript.text);
         Self::VoiceCaptured {
             run_id,

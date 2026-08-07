@@ -1043,6 +1043,41 @@ mod tests {
     use super::*;
     use platonic_core::{Message, MessageRole, RecordedEvent};
 
+    #[test]
+    fn options_for_transcript_replaces_only_the_question_and_requires_a_final_transcript() {
+        use crate::{ApprovalMode, RunLedger, RunOptions, RunOverrides};
+        use std::path::PathBuf;
+
+        let base = RunOptions {
+            question: "typed placeholder".to_owned(),
+            config_path: None,
+            overrides: RunOverrides::default(),
+            ledger: RunLedger::Jsonl(PathBuf::from("unused.jsonl")),
+            workspace_root: PathBuf::from("/tmp"),
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: None,
+            session: None,
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: None,
+            voice_interruption_context: None,
+        };
+
+        let final_transcript = Transcript::new("spoken parity question", true, 700).unwrap();
+        let voiced = options_for_transcript(base.clone(), &final_transcript).unwrap();
+
+        assert_eq!(voiced.question, "spoken parity question");
+        assert_eq!(voiced.workspace_root, base.workspace_root);
+        assert_eq!(voiced.stream_to_stderr, base.stream_to_stderr);
+        assert!(voiced.voice_interruption_context.is_none());
+
+        let partial = Transcript::new("still speaking", false, 700).unwrap();
+        assert!(matches!(
+            options_for_transcript(base, &partial),
+            Err(VoiceError::EventContract { .. })
+        ));
+    }
+
     fn playback_report(sequence: u64, ttfa_us: u64) -> PlaybackReport {
         PlaybackReport {
             sequence,
