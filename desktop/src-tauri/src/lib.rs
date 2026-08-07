@@ -1583,6 +1583,7 @@ fn buffered_event_into_desktop(buffered: BufferedStreamEvent) -> Option<DesktopE
         StreamEvent::Canceled { .. } => Some(DesktopEvent::CancelRequested { offset }),
         StreamEvent::Ledger { record } => ledger_event_into_desktop(record.event, offset),
         StreamEvent::Unknown(_) => None,
+        StreamEvent::CompletionClaimed { .. } => None,
     }
 }
 
