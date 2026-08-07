@@ -923,7 +923,9 @@ fn run_daemon_prompt(
                     }
                     _ => {}
                 },
-                StreamEvent::Canceled { .. } | StreamEvent::Unknown(_) => {}
+                StreamEvent::Canceled { .. }
+                | StreamEvent::CompletionClaimed { .. }
+                | StreamEvent::Unknown(_) => {}
             }
         }
 
@@ -1090,6 +1092,9 @@ fn write_run_success_output(
     ledger: &RunLedger,
 ) -> plato_agent::AppResult<()> {
     writeln!(stdout, "{}", outcome.final_answer)?;
+    if let Some(ref claim) = outcome.completion_claim {
+        write_claim(stderr, claim)?;
+    }
     if let RunLedger::Sqlite(path) = ledger {
         write_sqlite_replay_hint(stderr, &outcome.run_id, path)?;
     }
@@ -1097,6 +1102,35 @@ fn write_run_success_output(
         write_sqlite_replay_hint(stderr, &outcome.run_id, path.as_path())?;
     }
     Ok(())
+}
+
+fn write_claim(
+    stderr: &mut impl Write,
+    claim: &plato_protocol::CompletionClaim,
+) -> std::io::Result<()> {
+    let outcome_label = match &claim.outcome {
+        plato_protocol::CompletionOutcome::Done => "done",
+        plato_protocol::CompletionOutcome::Blocked { reason } => {
+            return writeln!(stderr, "claim: blocked — {reason}");
+        }
+    };
+    let mut parts = vec![format!("claim: {outcome_label}")];
+    if let Some(ref base) = claim.base {
+        parts.push(format!("base={base}"));
+    }
+    if let Some(ref head) = claim.head {
+        parts.push(format!("head={head}"));
+    }
+    if !claim.changed_paths.is_empty() {
+        parts.push(format!("changed={}", claim.changed_paths.join(",")));
+    }
+    if let Some(ref pr) = claim.pr {
+        parts.push(format!("pr={pr}"));
+    }
+    if !claim.checks.is_empty() {
+        parts.push(format!("checks={}", claim.checks.join(",")));
+    }
+    writeln!(stderr, "{}", parts.join(" | "))
 }
 
 fn write_replay_output(
@@ -1195,6 +1229,7 @@ mod tests {
         let outcome = RunOutcome {
             run_id: RunId::new("run_1").unwrap(),
             final_answer: "done".into(),
+            completion_claim: None,
         };
         let ledger = RunLedger::Sqlite(PathBuf::from("/tmp/plato proof/agent.db"));
         let mut stdout = Vec::new();
@@ -1221,6 +1256,7 @@ mod tests {
         let outcome = RunOutcome {
             run_id: RunId::new("run_1").unwrap(),
             final_answer: "done".into(),
+            completion_claim: None,
         };
         let ledger = RunLedger::Jsonl(PathBuf::from("events.jsonl"));
         let mut stdout = Vec::new();

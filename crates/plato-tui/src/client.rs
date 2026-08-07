@@ -483,7 +483,7 @@ pub(super) fn spawn_client_worker_to(
     thread::spawn(move || {
         for command in command_receiver {
             let event = handle_client_command(&config, attachment.as_ref(), command);
-            if event_sender.send(UiEvent::Daemon(event)).is_err() {
+            if event_sender.send(UiEvent::Daemon(Box::new(event))).is_err() {
                 break;
             }
         }
@@ -1106,6 +1106,9 @@ fn run_state_from_event(event: &StreamEvent) -> Option<(String, RunStateName)> {
             Some((run_id.clone(), RunStateName::Running))
         }
         StreamEvent::Canceled { run_id } => Some((run_id.clone(), RunStateName::Canceled)),
+        StreamEvent::CompletionClaimed { run_id, .. } => {
+            Some((run_id.clone(), RunStateName::Running))
+        }
         StreamEvent::Unknown(_) => None,
     }
 }

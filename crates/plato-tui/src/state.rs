@@ -957,6 +957,7 @@ mod tests {
                         }],
                     }),
                     pending_approval: None,
+                    completion_claim: None,
                 }
                 .into(),
             );

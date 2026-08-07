@@ -1583,6 +1583,7 @@ fn buffered_event_into_desktop(buffered: BufferedStreamEvent) -> Option<DesktopE
         StreamEvent::Canceled { .. } => Some(DesktopEvent::CancelRequested { offset }),
         StreamEvent::Ledger { record } => ledger_event_into_desktop(record.event, offset),
         StreamEvent::Unknown(_) => None,
+        StreamEvent::CompletionClaimed { .. } => None,
     }
 }
 
@@ -2665,6 +2666,7 @@ mod tests {
             transcript: "legacy".into(),
             typed: None,
             pending_approval: None,
+            completion_claim: None,
         };
         assert_eq!(
             extract_typed_run("run_1", base.clone())

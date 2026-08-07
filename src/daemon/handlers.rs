@@ -1497,7 +1497,11 @@ fn finish_run_after_event_collection(
         }
     };
     match &outcome {
-        Ok(outcome) => runtime.finish_run(record, outcome.final_answer.clone()),
+        Ok(outcome) => runtime.finish_run(
+            record,
+            outcome.final_answer.clone(),
+            outcome.completion_claim.clone(),
+        ),
         Err(error) => runtime.finish_run_with_error(record, error),
     }
     outcome
@@ -1558,6 +1562,7 @@ fn run_start_response(request_id: Option<String>, method: &str, record: &RunReco
             ledger_path: record.ledger_path.to_string_lossy().into_owned(),
             status: status.state,
             final_answer: status.final_answer,
+            completion_claim: status.completion_claim,
         },
     )
 }
@@ -1904,6 +1909,7 @@ fn read_run_transcript(path: &DefaultSqlitePath, run_id: &str) -> AppResult<Tran
             runs: vec![typed_run(&run, readback.entries)],
         }),
         pending_approval: None,
+        completion_claim: None,
     })
 }
 
@@ -1937,6 +1943,7 @@ fn read_session_transcript(
         transcript,
         typed: Some(TypedTranscript { runs: typed_runs }),
         pending_approval: None,
+        completion_claim: None,
     })
 }
 
@@ -3071,6 +3078,7 @@ IFS= read -r _
             Ok(RunOutcome {
                 run_id: RunId::new("run_success").unwrap(),
                 final_answer: "done".into(),
+                completion_claim: None,
             }),
             RunStateName::Finished,
         );
@@ -3127,6 +3135,7 @@ IFS= read -r _
             Ok(RunOutcome {
                 run_id: RunId::new("run_collector_panic").unwrap(),
                 final_answer: "must not publish".into(),
+                completion_claim: None,
             }),
             event_collector,
         )
@@ -3142,6 +3151,7 @@ IFS= read -r _
                 state: RunStateName::Failed,
                 final_answer: None,
                 error: Some(format!("run did not finish: {EVENT_COLLECTOR_PANIC}")),
+                completion_claim: None,
             }
         );
     }
@@ -3195,7 +3205,7 @@ IFS= read -r _
         let finisher = thread::spawn(move || {
             started.wait();
             event_collector.join().unwrap();
-            finisher_runtime.finish_run(&finisher_record, "done".into());
+            finisher_runtime.finish_run(&finisher_record, "done".into(), None);
             finished_sender.send(()).unwrap();
         });
         finish_started.wait();
@@ -3575,7 +3585,7 @@ IFS= read -r _
         let finish_record = record.clone();
         let (finish_sender, finish_receiver) = mpsc::channel();
         let finisher = thread::spawn(move || {
-            finish_runtime.finish_run(&finish_record, "done".into());
+            finish_runtime.finish_run(&finish_record, "done".into(), None);
             finish_sender.send(()).unwrap();
         });
         assert!(matches!(
@@ -3642,6 +3652,7 @@ IFS= read -r _
                 Ok(RunOutcome {
                     run_id: RunId::new("run_cancel_first").unwrap(),
                     final_answer: "done".into(),
+                    completion_claim: None,
                 }),
                 event_collector,
             );
@@ -3689,7 +3700,7 @@ IFS= read -r _
         let (finished_sender, finished_receiver) = mpsc::channel();
         let finisher = thread::spawn(move || {
             started.wait();
-            finisher_runtime.finish_run(&finisher_record, "done".into());
+            finisher_runtime.finish_run(&finisher_record, "done".into(), None);
             finished_sender.send(()).unwrap();
         });
         finish_started.wait();

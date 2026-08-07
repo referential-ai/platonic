@@ -90,7 +90,8 @@ pub fn live_event_line(buffered: &BufferedStreamEvent) -> LiveEventLine {
         StreamEvent::Ledger { record } => Some(record.event.run_id().to_string()),
         StreamEvent::AssistantDelta { run_id, .. }
         | StreamEvent::ApprovalRequested { run_id, .. }
-        | StreamEvent::Canceled { run_id } => Some(run_id.clone()),
+        | StreamEvent::Canceled { run_id }
+        | StreamEvent::CompletionClaimed { run_id, .. } => Some(run_id.clone()),
         StreamEvent::Unknown(event) => event
             .get("run_id")
             .and_then(Value::as_str)
@@ -109,6 +110,13 @@ pub fn live_event_line(buffered: &BufferedStreamEvent) -> LiveEventLine {
         }
         StreamEvent::AssistantDelta { text, .. } => LiveEventLine::assistant_delta(offset, text),
         StreamEvent::Canceled { .. } => LiveEventLine::status(offset, "canceled"),
+        StreamEvent::CompletionClaimed { claim, .. } => {
+            let label = match claim.outcome {
+                plato_protocol::CompletionOutcome::Done => "claim done",
+                plato_protocol::CompletionOutcome::Blocked { .. } => "claim blocked",
+            };
+            LiveEventLine::status(offset, label)
+        }
         StreamEvent::Unknown(event) => match event.get("kind").and_then(Value::as_str) {
             Some(kind) => LiveEventLine::status(offset, kind),
             None => LiveEventLine::status(

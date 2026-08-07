@@ -1760,7 +1760,7 @@ base_url = "https://example.invalid/v1"
         .unwrap();
         assert_eq!(read_envelope(&mut reader).kind, EnvelopeKind::Response);
         record.approvals.lock().unwrap().clear();
-        runtime.finish_run(&record, "done".into());
+        runtime.finish_run(&record, "done".into(), None);
         writeln!(
             stream,
             r#"{{"v":1,"id":"shutdown_2","kind":"request","method":"daemon.shutdown_if_idle","params":{{}}}}"#
@@ -2654,7 +2654,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             })));
         }
         server.runtime.reserve_run(record.clone()).unwrap();
-        server.runtime.finish_run(&record, "done".into());
+        server.runtime.finish_run(&record, "done".into(), None);
         let handle = thread::spawn(move || server.serve_next().unwrap());
         let mut client = DaemonClient::connect(&socket_path).unwrap();
 
@@ -2705,7 +2705,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             server.runtime.reserve_run(record.clone()).unwrap();
             server
                 .runtime
-                .finish_run(&record, format!("answer {index}"));
+                .finish_run(&record, format!("answer {index}"), None);
         }
 
         let evicted = server.handle_line(

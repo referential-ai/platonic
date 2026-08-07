@@ -2158,6 +2158,7 @@ mod tests {
                             .into(),
                     typed: None,
                     pending_approval: None,
+                completion_claim: None,
                 }
                 .into(),
             ),
@@ -3681,6 +3682,7 @@ mod tests {
                         }],
                     }),
                     pending_approval: None,
+                    completion_claim: None,
                 }
                 .into(),
             ),
@@ -3765,6 +3767,7 @@ mod tests {
                     transcript: transcript.into(),
                     typed: None,
                     pending_approval: None,
+                    completion_claim: None,
                 }
                 .into(),
             ),
@@ -3840,6 +3843,7 @@ mod tests {
                         ],
                     }),
                     pending_approval: None,
+                completion_claim: None,
                 }
                 .into(),
             ),
@@ -3929,6 +3933,7 @@ mod tests {
                         }],
                     }),
                     pending_approval: None,
+                    completion_claim: None,
                 }
                 .into(),
             ),

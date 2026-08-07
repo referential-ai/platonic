@@ -74,6 +74,9 @@ impl RunSession {
 pub struct RunOutcome {
     pub run_id: RunId,
     pub final_answer: String,
+    /// Additive-optional completion claim from a worker thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_claim: Option<plato_protocol::CompletionClaim>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -824,6 +827,7 @@ pub(crate) fn run_prepared_question(
             return Ok(RunOutcome {
                 run_id,
                 final_answer,
+                completion_claim: None,
             });
         }
 
