@@ -1,5 +1,5 @@
 [package]
-name = "plato-daemon-client"
+name = "platonic-client"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
@@ -7,12 +7,12 @@ publish = ["crates-io"]
 description = "Bounded daemon client and local IPC transport for Plato Agent."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/referential-ai/plato-agent"
-documentation = "https://docs.rs/plato-daemon-client"
+documentation = "https://docs.rs/platonic-client"
 readme = "README.md"
 include = ["src/**", "README.md"]
 
 [dependencies]
-plato-protocol = { version = "0.2.0", path = "../plato-protocol" }
+platonic-protocol = { version = "0.2.0", path = "../platonic-protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

@@ -7,7 +7,7 @@ use plato_agent::{
     },
     paths,
 };
-use plato_daemon_client::client::{DaemonClient, DaemonConnectionConfig};
+use platonic_client::client::{DaemonClient, DaemonConnectionConfig};
 use pty_process::{
     Size,
     blocking::{Command, Pty, open},

@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 
 use interprocess::os::windows::security_descriptor::{AsSecurityDescriptorExt, SecurityDescriptor};
-pub(crate) use plato_daemon_client::CurrentUserProcess;
+pub(crate) use platonic_client::CurrentUserProcess;
 use std::{
     fs::File,
     io, mem,
@@ -175,7 +175,7 @@ pub(crate) fn system_cmd_path() -> io::Result<PathBuf> {
 }
 
 fn current_user_descriptor(rights: &str) -> io::Result<SecurityDescriptor> {
-    let sid = plato_daemon_client::current_user_sid_string()?;
+    let sid = platonic_client::current_user_sid_string()?;
     let descriptor = U16CString::from_str(format!("O:{sid}D:P(A;;{rights};;;{sid})"))
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     SecurityDescriptor::deserialize(&descriptor)

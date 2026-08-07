@@ -1,11 +1,11 @@
 use super::{DiscordGateway, DiscordPlatform, rest::DISCORD_MESSAGE_LIMIT};
 use crate::{GatewayError, GatewayResult};
-use plato_daemon_client::{
+use platonic_client::{
     ClientError,
     client::{DaemonClient, DaemonConnectionConfig},
     paths,
 };
-use plato_protocol::{
+use platonic_protocol::{
     BufferedStreamEvent, HarnessEvent, HelloResult, RunStateName, StreamEvent, TranscriptReadResult,
 };
 use std::{
@@ -519,9 +519,9 @@ impl MessagePresentation {
 mod tests {
     use super::*;
     use crate::test_support::*;
-    use plato_protocol::TranscriptReadResult;
+    use platonic_protocol::TranscriptReadResult;
     #[cfg(unix)]
-    use plato_protocol::{ReasoningEffort, RunOverrides};
+    use platonic_protocol::{ReasoningEffort, RunOverrides};
     #[cfg(unix)]
     use serde_json::Value;
     use serde_json::json;

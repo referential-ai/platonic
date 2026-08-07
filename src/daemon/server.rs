@@ -1359,7 +1359,7 @@ mod tests {
         assert_eq!(response.id.as_deref(), Some("req_1"));
         assert_eq!(response.method.as_deref(), Some("hello"));
         let result = response.result.unwrap();
-        assert_eq!(result["daemon_version"], plato_protocol::BUILD_IDENTITY);
+        assert_eq!(result["daemon_version"], platonic_protocol::BUILD_IDENTITY);
         assert_eq!(result["workspace_id"], paths.workspace_id);
         assert!(result.get("daemon_scope").is_none());
         assert_eq!(
@@ -1419,7 +1419,7 @@ mod tests {
 
             assert_eq!(response.kind, EnvelopeKind::Response);
             assert_eq!(result["daemon_scope"], "host");
-            assert_eq!(result["daemon_version"], plato_protocol::BUILD_IDENTITY);
+            assert_eq!(result["daemon_version"], platonic_protocol::BUILD_IDENTITY);
             assert_eq!(result["workspace_id"], workspace_id);
             assert_eq!(
                 Path::new(result["ledger_path"].as_str().unwrap()),
@@ -1488,7 +1488,7 @@ base_url = "https://example.invalid/v1"
                 paths.socket_path.to_string_lossy()
             );
             assert_eq!(first.daemon.workspace_id, paths.workspace_id);
-            let mut build_identity = plato_protocol::BUILD_IDENTITY.split_whitespace();
+            let mut build_identity = platonic_protocol::BUILD_IDENTITY.split_whitespace();
             assert_eq!(first.daemon.package_version, build_identity.next().unwrap());
             assert_eq!(
                 first.daemon.build_commit.as_deref(),

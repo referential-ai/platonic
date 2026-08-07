@@ -167,7 +167,7 @@ fn handle_hello(runtime: &DaemonRuntime, request: Envelope, params: HelloParams)
         request.id,
         Some("hello".into()),
         HelloResult {
-            daemon_version: plato_protocol::BUILD_IDENTITY.into(),
+            daemon_version: platonic_protocol::BUILD_IDENTITY.into(),
             workspace_id: runtime.paths.workspace_id.clone(),
             ledger_path: runtime.paths.ledger_path.to_string_lossy().into_owned(),
             capabilities: CAPABILITIES.into_iter().map(str::to_owned).collect(),
@@ -284,7 +284,7 @@ fn protocol_usage(usage: PersistedTokenUsage) -> DaemonStatusTokenUsage {
 }
 
 fn build_identity_parts() -> (String, Option<String>, Option<String>) {
-    let mut parts = plato_protocol::BUILD_IDENTITY.split_whitespace();
+    let mut parts = platonic_protocol::BUILD_IDENTITY.split_whitespace();
     let package_version = parts.next().unwrap_or("unknown").into();
     let build_commit = known_build_part(parts.next());
     let build_date_utc = known_build_part(parts.next());

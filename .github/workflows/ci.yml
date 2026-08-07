@@ -65,28 +65,28 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Prove plato-protocol on Rust 1.85.0
+      - name: Prove platonic-protocol on Rust 1.85.0
         run: |
-          cargo +1.85.0 check --locked -p plato-protocol --all-targets
-          cargo +1.85.0 test --locked -p plato-protocol
-          cargo +1.85.0 clippy --locked -p plato-protocol --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo +1.85.0 doc --locked -p plato-protocol --no-deps
-          cargo +1.85.0 package --locked -p plato-protocol
-          cargo +1.85.0 package --locked --list -p plato-protocol
+          cargo +1.85.0 check --locked -p platonic-protocol --all-targets
+          cargo +1.85.0 test --locked -p platonic-protocol
+          cargo +1.85.0 clippy --locked -p platonic-protocol --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo +1.85.0 doc --locked -p platonic-protocol --no-deps
+          cargo +1.85.0 package --locked -p platonic-protocol
+          cargo +1.85.0 package --locked --list -p platonic-protocol
 
-      - name: Prove plato-daemon-client on Rust 1.85.0
+      - name: Prove platonic-client on Rust 1.85.0
         run: |
-          cargo +1.85.0 check --locked -p plato-daemon-client --all-targets
-          cargo +1.85.0 test --locked -p plato-daemon-client
-          cargo +1.85.0 clippy --locked -p plato-daemon-client --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo +1.85.0 doc --locked -p plato-daemon-client --no-deps
-          cargo +1.85.0 package --locked --list -p plato-daemon-client
+          cargo +1.85.0 check --locked -p platonic-client --all-targets
+          cargo +1.85.0 test --locked -p platonic-client
+          cargo +1.85.0 clippy --locked -p platonic-client --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo +1.85.0 doc --locked -p platonic-client --no-deps
+          cargo +1.85.0 package --locked --list -p platonic-client
           package_log=$(mktemp)
-          if cargo +1.85.0 package --locked --no-verify -p plato-daemon-client >"$package_log" 2>&1; then
+          if cargo +1.85.0 package --locked --no-verify -p platonic-client >"$package_log" 2>&1; then
             cat "$package_log"
           else
             cat "$package_log"
-            grep -F 'no matching package named `plato-protocol` found' "$package_log"
+            grep -F 'no matching package named `platonic-protocol` found' "$package_log"
           fi
 
       - name: Prove plato-tui on Rust 1.88.0
@@ -101,7 +101,7 @@ jobs:
             cat "$package_log"
           else
             cat "$package_log"
-            grep -F 'no matching package named `plato-daemon-client` found' "$package_log"
+            grep -F 'no matching package named `platonic-client` found' "$package_log"
           fi
 
       - name: Prove plato-gateway-discord on Rust 1.88.0
@@ -116,7 +116,7 @@ jobs:
             cat "$package_log"
           else
             cat "$package_log"
-            grep -F 'no matching package named `plato-daemon-client` found' "$package_log"
+            grep -F 'no matching package named `platonic-client` found' "$package_log"
           fi
 
       - name: Prove plato-audio on Rust 1.88.0

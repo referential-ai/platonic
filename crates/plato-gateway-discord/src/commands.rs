@@ -3,8 +3,8 @@ use super::{
     rest::{AllowedMentions, CreateMessage, DiscordRestClient, discord_http_error},
 };
 use crate::{GatewayError, GatewayResult};
-use plato_daemon_client::client::{DaemonClient, DaemonConnectionConfig};
-use plato_protocol::{ReasoningEffort, RunOverrides, RunStateName};
+use platonic_client::client::{DaemonClient, DaemonConnectionConfig};
+use platonic_protocol::{ReasoningEffort, RunOverrides, RunStateName};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{

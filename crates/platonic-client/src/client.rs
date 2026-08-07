@@ -5,7 +5,7 @@ use crate::{
     paths,
     transport::{self, Stream},
 };
-use plato_protocol::{
+use platonic_protocol::{
     ApprovalDecideParams, ApprovalDecision, CommandAcceptedResult, DaemonStatusParams,
     DaemonStatusResult, Envelope, EnvelopeKind, EventsStreamParams, EventsStreamResult,
     HelloParams, HelloResult, IssuePrepStartParams, IssuePrepStartResult, MessageAppendParams,
@@ -110,7 +110,7 @@ impl DaemonClient {
         parent_thread_id: Option<String>,
         cwd: String,
         model: String,
-        reasoning_effort: plato_protocol::ReasoningEffort,
+        reasoning_effort: platonic_protocol::ReasoningEffort,
         approval_policy: ThreadApprovalPolicy,
     ) -> ClientResult<ThreadSpawnResult> {
         self.request(
@@ -657,7 +657,7 @@ impl DaemonConnectionConfig {
 mod timeout_tests {
     use super::*;
     use crate::transport;
-    use plato_protocol::Envelope;
+    use platonic_protocol::Envelope;
     use serde_json::json;
     use std::{
         io::{BufRead, BufReader, Write},
@@ -861,7 +861,7 @@ mod timeout_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use plato_protocol::{
+    use platonic_protocol::{
         DaemonStatusProviderKind, ProtocolError, RunStateName, SessionSummary,
         ShutdownIfIdleResultName,
     };
@@ -1140,7 +1140,7 @@ mod tests {
                     None,
                     "/tmp/work".into(),
                     "gpt-5.6-sol".into(),
-                    plato_protocol::ReasoningEffort::Xhigh,
+                    platonic_protocol::ReasoningEffort::Xhigh,
                     ThreadApprovalPolicy::Prompt,
                 )
                 .unwrap(),
@@ -1549,7 +1549,7 @@ mod tests {
             result,
             IssuePrepStartResult {
                 run_dir: "/work/.plato/issue-prep/run_1".into(),
-                outcome: plato_protocol::IssuePrepResult::Candidate {
+                outcome: platonic_protocol::IssuePrepResult::Candidate {
                     markdown: "# Prepared issue".into()
                 }
             }

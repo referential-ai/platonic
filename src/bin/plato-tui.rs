@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(name = "plato-tui")]
 #[command(about = "Plato Agent terminal client")]
-#[command(version = plato_protocol::BUILD_IDENTITY)]
+#[command(version = platonic_protocol::BUILD_IDENTITY)]
 struct Cli {
     #[arg(long, default_value = ".", help = "Workspace served by plato-agentd")]
     workspace: PathBuf,

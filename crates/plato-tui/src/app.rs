@@ -12,8 +12,8 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use plato_daemon_client::{ClientResult, client::DaemonConnectionConfig};
-use plato_protocol::RunStateName;
+use platonic_client::{ClientResult, client::DaemonConnectionConfig};
+use platonic_protocol::RunStateName;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     env,
@@ -1232,8 +1232,8 @@ mod tests {
     use super::super::state::DisplayMode;
     use super::*;
     use crate::TranscriptState;
-    use plato_daemon_client::ClientError;
-    use plato_protocol::{
+    use platonic_client::ClientError;
+    use platonic_protocol::{
         BufferedStreamEvent, DaemonStatusResult, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
         ERROR_WORKSPACE_MISMATCH, EventsStreamResult, HelloResult, IssuePrepResult,
         IssuePrepStartResult, ModelIdentityStatus, ProtocolError, RunStartResult, SessionSummary,
@@ -3499,15 +3499,15 @@ mod tests {
 
         event_sender
             .send(ClientEvent::ApprovalDecided {
-                result: plato_protocol::CommandAcceptedResult {
+                result: platonic_protocol::CommandAcceptedResult {
                     run_id: "run_retry".into(),
                     status: RunStateName::Running,
                 },
                 tool_call_id: approval.tool_call_id.clone(),
                 decision: if grant {
-                    plato_protocol::ApprovalDecisionName::Granted
+                    platonic_protocol::ApprovalDecisionName::Granted
                 } else {
-                    plato_protocol::ApprovalDecisionName::Denied
+                    platonic_protocol::ApprovalDecisionName::Denied
                 },
             })
             .unwrap();

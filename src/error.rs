@@ -1,6 +1,6 @@
-use plato_daemon_client::ClientError;
 use plato_gateway_discord::GatewayError;
-use plato_protocol::ProtocolError;
+use platonic_client::ClientError;
+use platonic_protocol::ProtocolError;
 use std::path::PathBuf;
 
 pub type AppResult<T> = Result<T, AppError>;

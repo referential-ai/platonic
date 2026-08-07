@@ -37,7 +37,7 @@ const DAEMON_EVENT_PAGE: usize = 128;
 #[derive(Debug, Parser)]
 #[command(name = "plato")]
 #[command(about = "Plato Agent CLI")]
-#[command(version = plato_protocol::BUILD_IDENTITY)]
+#[command(version = platonic_protocol::BUILD_IDENTITY)]
 struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
@@ -1106,11 +1106,11 @@ fn write_run_success_output(
 
 fn write_claim(
     stderr: &mut impl Write,
-    claim: &plato_protocol::CompletionClaim,
+    claim: &platonic_protocol::CompletionClaim,
 ) -> std::io::Result<()> {
     let outcome_label = match &claim.outcome {
-        plato_protocol::CompletionOutcome::Done => "done",
-        plato_protocol::CompletionOutcome::Blocked { reason } => {
+        platonic_protocol::CompletionOutcome::Done => "done",
+        platonic_protocol::CompletionOutcome::Blocked { reason } => {
             return writeln!(stderr, "claim: blocked — {reason}");
         }
     };

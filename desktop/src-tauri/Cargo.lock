@@ -2164,11 +2164,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
-name = "plato-daemon-client"
+name = "platonic-client"
 version = "0.2.0"
 dependencies = [
  "interprocess",
- "plato-protocol",
+ "platonic-protocol",
  "rustix",
  "serde",
  "serde_json",
@@ -2183,8 +2183,8 @@ name = "plato-desktop"
 version = "0.2.0"
 dependencies = [
  "interprocess",
- "plato-daemon-client",
- "plato-protocol",
+ "platonic-client",
+ "platonic-protocol",
  "rustix",
  "serde",
  "serde_json",
@@ -2197,7 +2197,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "plato-protocol"
+name = "platonic-protocol"
 version = "0.2.0"
 dependencies = [
  "platonic-core",

@@ -1,4 +1,4 @@
-use plato_daemon_client::ClientError;
+use platonic_client::ClientError;
 
 /// Result type returned by Discord gateway operations.
 pub type GatewayResult<T> = Result<T, GatewayError>;
@@ -38,7 +38,7 @@ pub enum GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plato_protocol::ProtocolError;
+    use platonic_protocol::ProtocolError;
 
     #[test]
     fn display_matches_the_historical_root_errors() {

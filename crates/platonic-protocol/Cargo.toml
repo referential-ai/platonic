@@ -1,5 +1,5 @@
 [package]
-name = "plato-protocol"
+name = "platonic-protocol"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
@@ -7,7 +7,7 @@ publish = ["crates-io"]
 description = "Sans-IO daemon wire protocol types for Plato Agent."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/referential-ai/plato-agent"
-documentation = "https://docs.rs/plato-protocol"
+documentation = "https://docs.rs/platonic-protocol"
 readme = "README.md"
 include = ["src/**", "README.md"]
 

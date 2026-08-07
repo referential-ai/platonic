@@ -1,15 +1,15 @@
 use crate::{AppResult, paths};
 use std::path::{Path, PathBuf};
 
-pub use plato_daemon_client::{client, transport};
+pub use platonic_client::{client, transport};
 mod child_process;
 #[cfg(windows)]
 pub mod control;
 mod handlers;
 #[cfg(windows)]
-pub use plato_daemon_client::installer_gate;
+pub use platonic_client::installer_gate;
 pub mod lock;
-pub use plato_protocol as protocol;
+pub use platonic_protocol as protocol;
 mod run_child;
 mod runtime;
 pub mod server;

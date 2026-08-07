@@ -1,11 +1,11 @@
 use crate::{
     ActiveRunView, ApprovalModalView, ThreadAttachment, TranscriptState, TranscriptView, TuiState,
 };
-use plato_daemon_client::{
+use platonic_client::{
     ClientError, ClientResult,
     client::{DaemonClient, DaemonConnectionConfig},
 };
-use plato_protocol::{
+use platonic_protocol::{
     ApprovalDecisionName, BufferedStreamEvent, CommandAcceptedResult, DaemonStatusResult,
     ERROR_LAGGED, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION, ERROR_WORKSPACE_MISMATCH,
     EventsStreamResult, HarnessEvent, IssuePrepResult, IssuePrepStartResult, RunStartResult,
@@ -173,7 +173,7 @@ fn load_connected_state(
 }
 
 fn loaded_transcript_state(
-    transcript: plato_protocol::TranscriptReadResult,
+    transcript: platonic_protocol::TranscriptReadResult,
 ) -> (TranscriptState, Option<ApprovalModalView>) {
     let approval = transcript
         .pending_approval
@@ -1227,8 +1227,8 @@ pub(super) fn is_connection_error(error: &ClientError) -> bool {
 mod tests {
     use super::*;
     use crate::{ConnectionState, TranscriptState, render_snapshot};
-    use plato_daemon_client::transport;
-    use plato_protocol::{
+    use platonic_client::transport;
+    use platonic_protocol::{
         ERROR_ISSUE_PREP_FAILED, Envelope, EnvelopeKind, HelloResult, PROTOCOL_VERSION,
         ProtocolError,
     };
@@ -1366,7 +1366,7 @@ mod tests {
             ThreadSendResult::Rejected {
                 thread_id: "thread_selected".into(),
                 turn_id: Some("thread_turn_active".into()),
-                reason: plato_protocol::ThreadSendRejectedReason::ControllerOwned,
+                reason: platonic_protocol::ThreadSendRejectedReason::ControllerOwned,
             },
         );
         assert_eq!(
@@ -1946,8 +1946,7 @@ mod tests {
             config.socket_path.to_string_lossy().into_owned(),
             HelloResult {
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
-                workspace_id: plato_daemon_client::paths::workspace_id(&config.workspace_root)
-                    .unwrap(),
+                workspace_id: platonic_client::paths::workspace_id(&config.workspace_root).unwrap(),
                 ledger_path: "/work/agent.db".into(),
                 capabilities: vec!["hello".into(), "issue-prep.start".into()],
             },
@@ -2037,7 +2036,7 @@ mod tests {
                 DaemonConnectionConfig::resolve(workspace.path(), Some(endpoint.path.clone()))
                     .unwrap();
             let workspace_id =
-                plato_daemon_client::paths::workspace_id(&config.workspace_root).unwrap();
+                platonic_client::paths::workspace_id(&config.workspace_root).unwrap();
             let replies = VecDeque::from(replies(&workspace_id));
             let requests = Arc::new(Mutex::new(Vec::new()));
             let server_requests = Arc::clone(&requests);
@@ -2110,7 +2109,7 @@ mod tests {
                 DaemonConnectionConfig::resolve(workspace.path(), Some(endpoint.path.clone()))
                     .unwrap();
             let workspace_id =
-                plato_daemon_client::paths::workspace_id(&config.workspace_root).unwrap();
+                platonic_client::paths::workspace_id(&config.workspace_root).unwrap();
             let (request_seen_sender, request_seen) = mpsc::channel();
             let (release, release_receiver) = mpsc::channel();
             let server = thread::spawn(move || {

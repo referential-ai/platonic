@@ -13,10 +13,10 @@ use super::{
     websocket::{DISCORD_INTENTS, DiscordGatewayReceiver, DiscordMessage},
 };
 use crate::{DiscordGatewayTimings, GatewayResult};
-use plato_daemon_client::client::DaemonConnectionConfig;
-use plato_protocol::{BufferedStreamEvent, RunOverrides};
+use platonic_client::client::DaemonConnectionConfig;
+use platonic_protocol::{BufferedStreamEvent, RunOverrides};
 #[cfg(unix)]
-use plato_protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION, RunStateName};
+use platonic_protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION, RunStateName};
 use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
