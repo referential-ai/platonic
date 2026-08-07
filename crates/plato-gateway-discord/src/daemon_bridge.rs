@@ -1062,6 +1062,7 @@ mod tests {
                     transcript: String::new(),
                     typed: None,
                     pending_approval: None,
+                    completion_claim: None,
                 })
                 .unwrap(),
                 None

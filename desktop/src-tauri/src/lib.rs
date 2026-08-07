@@ -2665,6 +2665,7 @@ mod tests {
             transcript: "legacy".into(),
             typed: None,
             pending_approval: None,
+            completion_claim: None,
         };
         assert_eq!(
             extract_typed_run("run_1", base.clone())
