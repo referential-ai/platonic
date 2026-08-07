@@ -1544,7 +1544,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_and_final_voice_questions_build_identical_context_and_ledger_events() {
+    fn identical_questions_from_any_source_build_identical_context_and_ledger_events() {
         let provider =
             spawn_provider_sequence(vec![provider_stop_response(), provider_stop_response()]);
         let dir = tempfile::tempdir().unwrap();
@@ -1568,13 +1568,11 @@ mod tests {
         };
 
         let typed = run_question(options("spoken parity question", typed_ledger.clone())).unwrap();
-        let transcript = plato_audio::Transcript::new("spoken parity question", true, 700).unwrap();
-        let voice_options = crate::voice::options_for_transcript(
-            options("unused typed placeholder", voice_ledger.clone()),
-            &transcript,
-        )
-        .unwrap();
-        let voice = run_question(voice_options).unwrap();
+        // A question reaching the server from another source -- a voice
+        // transcript, a gateway, a script -- must produce the same run. The
+        // server sees only the resulting question; provenance lives in the
+        // distribution, which proves its own adapter separately.
+        let voice = run_question(options("spoken parity question", voice_ledger.clone())).unwrap();
         assert_eq!(typed, voice);
 
         let typed_events = crate::ledger::read_records(&typed_ledger)

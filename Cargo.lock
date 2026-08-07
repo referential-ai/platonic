@@ -1685,6 +1685,7 @@ dependencies = [
  "platonic-client",
  "platonic-core",
  "platonic-protocol",
+ "platonic-server",
  "pty-process",
  "rusqlite",
  "rustix 1.1.4",
@@ -1789,6 +1790,29 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "platonic-server"
+version = "0.2.0"
+dependencies = [
+ "html2text",
+ "plato-audio",
+ "plato-gateway-discord",
+ "platonic-client",
+ "platonic-core",
+ "platonic-protocol",
+ "rusqlite",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+ "ureq 2.12.1",
+ "url",
 ]
 
 [[package]]

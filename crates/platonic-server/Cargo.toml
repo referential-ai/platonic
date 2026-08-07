@@ -1,0 +1,32 @@
+[package]
+name = "platonic-server"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+publish = ["crates-io"]
+description = "Platonic agent server: workspaces, agents, threads, tools, providers, ledger, policy, approvals, and protocol."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/referential-ai/plato-agent"
+documentation = "https://docs.rs/platonic-server"
+readme = "README.md"
+
+[dependencies]
+html2text = "0.17.1"
+plato-audio = { version = "0.2.0", path = "../plato-audio" }
+plato-gateway-discord = { version = "0.2.0", path = "../plato-gateway-discord" }
+platonic-client = { version = "0.2.0", path = "../platonic-client" }
+platonic-core = "0.3.1"
+platonic-protocol = { version = "0.2.0", path = "../platonic-protocol" }
+rusqlite = { version = "0.39", features = ["bundled"] }
+rustix = { version = "1", features = ["event", "fs", "net", "process", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+toml = "0.9"
+ureq = { version = "2", features = ["json"] }
+url = "2.5.8"
+
+[dev-dependencies]
+temp-env = "0.3"
+tempfile = "3"

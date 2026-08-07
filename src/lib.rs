@@ -1,37 +1,24 @@
 #![deny(unsafe_code)]
 
-pub mod app;
-pub mod config;
-pub mod daemon;
+//! Plato Agent: the client distribution built on Platonic.
+//!
+//! Clients, curated agent configuration, and the voice subsystem. The server
+//! itself lives in `platonic-server`, which this crate depends on so the
+//! one-shot and replay paths keep working without a running daemon.
+
 pub mod discord_gateway;
-pub mod error;
-pub mod ledger;
-pub mod model;
-pub mod paths;
-pub mod provider;
-pub mod replay;
-mod thread_authority;
-pub mod tool_catalog;
-pub mod tools;
 pub mod tui;
 pub mod voice;
-pub mod voice_session;
 
-pub use tools::github::issues as issue_prep;
-
-#[cfg(windows)]
-mod windows_security;
-
-pub use app::{
-    ApprovalMode, ApprovalRequest, AssistantDeltaEvent, RunEvent, RunLedger, RunOptions,
-    RunOutcome, RunSession, new_run_id, new_session_id, run_question,
+pub use platonic_server::{
+    AppError, AppResult, ApprovalMode, ApprovalRequest, AssistantDeltaEvent, IssuePrepOptions,
+    IssuePrepOutcome, ReasoningEffort, RunEvent, RunLedger, RunOptions, RunOutcome, RunOverrides,
+    RunSession, VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope, app, config, daemon, error,
+    issue_prep, ledger, model, new_run_id, new_session_id, paths, provider, replay,
+    replay_default_sqlite, replay_file, replay_sqlite, replay_sqlite_session, run_issue_prep,
+    run_question, tool_catalog, tools, voice_session,
 };
-pub use error::{AppError, AppResult};
-pub use issue_prep::{IssuePrepOptions, IssuePrepOutcome, run_issue_prep};
-pub use model::{ReasoningEffort, RunOverrides};
-pub use replay::{replay_default_sqlite, replay_file, replay_sqlite, replay_sqlite_session};
 pub use voice::{
     CapturedRunOutcome, NarratedRunOutcome, NarratedSentenceReport, NarrationReport, VoiceError,
     VoiceRunError, VoiceSession, VoiceSessionShutdown,
 };
-pub use voice_session::{VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope};

@@ -36,13 +36,17 @@ technical identities remain unchanged.
 
 ```bash
 cargo fmt --check
-cargo test --locked
+cargo test --workspace --locked
 cargo clippy --workspace --locked --all-targets -- -D warnings
 cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
 ```
 
+`cargo test` takes `--workspace` because most of the code lives in
+`platonic-server` rather than the root package; without it the battery runs
+only the distribution and reports a fraction of the suite.
+
 `desktop/src-tauri` is excluded from the Cargo workspace because it needs GTK
-and webkit system libraries. `cargo test --locked` therefore does **not** cover
+and webkit system libraries. Even `--workspace` therefore does **not** cover
 it, and the fourth command is required: CI proves the desktop crate in the
 `Linux shell` job, so a change that builds locally can still break CI without
 it. Clippy takes `--workspace` to match CI exactly.

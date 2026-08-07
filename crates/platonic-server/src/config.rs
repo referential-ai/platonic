@@ -24,7 +24,7 @@ const WORKSPACE_GATEWAY_ERROR: &str =
     "workspace plato.toml cannot set [gateway]; use --config, PLATO_CONFIG, or user config";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ResolvedConfigPath {
+pub enum ResolvedConfigPath {
     Authorized(PathBuf),
     Workspace(PathBuf),
 }
@@ -152,7 +152,7 @@ impl Config {
         Self::load_resolved(resolved.as_ref())
     }
 
-    pub(crate) fn load_resolved(resolved: Option<&ResolvedConfigPath>) -> AppResult<Self> {
+    pub fn load_resolved(resolved: Option<&ResolvedConfigPath>) -> AppResult<Self> {
         let Some(resolved) = resolved else {
             return Ok(Self::default());
         };
@@ -372,7 +372,7 @@ pub fn resolve_config_path(
     Ok(resolve_config(workspace_root, explicit_path)?.map(ResolvedConfigPath::into_path))
 }
 
-pub(crate) fn resolve_config(
+pub fn resolve_config(
     workspace_root: &Path,
     explicit_path: Option<&Path>,
 ) -> AppResult<Option<ResolvedConfigPath>> {
