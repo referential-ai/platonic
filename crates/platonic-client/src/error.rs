@@ -1,4 +1,4 @@
-use plato_protocol::ProtocolError;
+use platonic_protocol::ProtocolError;
 
 /// Result type returned by daemon client operations.
 pub type ClientResult<T> = Result<T, ClientError>;

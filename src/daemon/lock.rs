@@ -1,5 +1,5 @@
 use crate::{AppError, AppResult, paths};
-pub use plato_daemon_client::lock::{LOCK_VERSION, LockMetadata};
+pub use platonic_client::lock::{LOCK_VERSION, LockMetadata};
 #[cfg(unix)]
 use std::io::{Error, Read};
 #[cfg(unix)]

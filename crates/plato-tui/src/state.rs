@@ -1,8 +1,8 @@
-use plato_protocol::{
+use platonic_core::EffectClass;
+use platonic_protocol::{
     DaemonStatusResult, HelloResult, ModelIdentityStatus, PendingApprovalSnapshot, RunStateName,
     SessionSummary, TranscriptReadResult, TypedTranscript,
 };
-use platonic_core::EffectClass;
 use ratatui::text::Line;
 use std::{fmt, sync::RwLock, time::Instant};
 use tui_textarea::{CursorMove, TextArea};
@@ -948,7 +948,7 @@ mod tests {
                     final_answer: Some("done".into()),
                     transcript: "[turn_1] assistant: done\n".into(),
                     typed: Some(TypedTranscript {
-                        runs: vec![plato_protocol::TypedRun {
+                        runs: vec![platonic_protocol::TypedRun {
                             run_id: "run_1".into(),
                             session_index: 0,
                             status: RunStateName::Finished,

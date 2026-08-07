@@ -24,7 +24,7 @@ use crate::{
         KeyMap, matching_slash_commands,
     },
 };
-use plato_protocol::{
+use platonic_protocol::{
     DaemonStatusResult, DaemonStatusTokenUsage, ModelIdentityStatus, RunStateName, TypedRun,
     TypedTranscriptEntry,
 };
@@ -1797,7 +1797,7 @@ fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState, no
 
 fn session_picker_row(
     state: &TuiState,
-    session: &plato_protocol::SessionSummary,
+    session: &platonic_protocol::SessionSummary,
     focused: bool,
     now_ms: u64,
     row_width: u16,
@@ -2016,11 +2016,11 @@ fn composer_height(state: &TuiState, width: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plato_protocol::{
+    use platonic_core::EffectClass;
+    use platonic_protocol::{
         ApprovalDecisionName, HelloResult, PendingApprovalSnapshot, SessionSummary,
         TranscriptReadResult, TypedRun, TypedTranscript, TypedTranscriptEntry,
     };
-    use platonic_core::EffectClass;
     use ratatui::backend::Backend;
 
     use super::super::state::approval_from_snapshot;

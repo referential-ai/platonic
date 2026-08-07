@@ -7,8 +7,10 @@ use crate::{
     },
     voice_session::{VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope},
 };
-use plato_protocol::{ReasoningEffort, RunStateName, ThreadApprovalPolicy, ThreadAuthorityRecord};
 use platonic_core::{HarnessEvent, MessageRole, RecordedEvent, RunId, RunPhase, RunState};
+use platonic_protocol::{
+    ReasoningEffort, RunStateName, ThreadApprovalPolicy, ThreadAuthorityRecord,
+};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use serde::{Deserialize, Serialize};
 use std::{

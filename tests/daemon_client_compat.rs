@@ -1,6 +1,6 @@
 use plato_agent::{AppError, daemon, paths};
-use plato_daemon_client::{ClientError, client::DaemonConnectionConfig};
-use plato_protocol::ProtocolError;
+use platonic_client::{ClientError, client::DaemonConnectionConfig};
+use platonic_protocol::ProtocolError;
 use std::path::Path;
 
 #[test]
@@ -10,28 +10,28 @@ fn historical_client_transport_lock_and_path_imports_share_extracted_owners() {
         daemon::client::DaemonConnectionConfig::resolve(workspace.path(), None).unwrap();
     assert_eq!(
         paths::workspace_id(&config.workspace_root).unwrap(),
-        plato_daemon_client::paths::workspace_id(&config.workspace_root).unwrap()
+        platonic_client::paths::workspace_id(&config.workspace_root).unwrap()
     );
     assert_eq!(
         paths::default_socket_path(&config.workspace_root).unwrap(),
-        plato_daemon_client::paths::default_socket_path(&config.workspace_root).unwrap()
+        platonic_client::paths::default_socket_path(&config.workspace_root).unwrap()
     );
     assert_eq!(
         paths::default_lock_path(&config.workspace_root).unwrap(),
-        plato_daemon_client::paths::default_lock_path(&config.workspace_root).unwrap()
+        platonic_client::paths::default_lock_path(&config.workspace_root).unwrap()
     );
 
     let _: fn(&Path) -> std::io::Result<daemon::transport::Listener> = daemon::transport::bind;
-    let metadata: plato_daemon_client::lock::LockMetadata =
+    let metadata: platonic_client::lock::LockMetadata =
         daemon::lock::LockMetadata::for_workspace(&config.workspace_root, &config.socket_path)
             .unwrap();
-    assert_eq!(metadata.v, plato_daemon_client::lock::LOCK_VERSION);
+    assert_eq!(metadata.v, platonic_client::lock::LOCK_VERSION);
 }
 
 #[cfg(windows)]
 #[test]
 fn historical_installer_gate_path_shares_the_extracted_owner() {
-    let _: fn() -> std::io::Result<plato_daemon_client::installer_gate::InstallerStartupGate> =
+    let _: fn() -> std::io::Result<platonic_client::installer_gate::InstallerStartupGate> =
         daemon::installer_gate::InstallerStartupGate::acquire;
 }
 

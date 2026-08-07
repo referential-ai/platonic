@@ -533,7 +533,7 @@ impl DaemonRuntime {
         &self,
         record: &RunRecord,
         final_answer: String,
-        completion_claim: Option<plato_protocol::CompletionClaim>,
+        completion_claim: Option<platonic_protocol::CompletionClaim>,
     ) {
         self.complete_run(
             record,
@@ -1058,7 +1058,7 @@ pub(super) struct RunStatus {
     pub(super) state: RunStateName,
     pub(super) final_answer: Option<String>,
     pub(super) error: Option<String>,
-    pub(super) completion_claim: Option<plato_protocol::CompletionClaim>,
+    pub(super) completion_claim: Option<platonic_protocol::CompletionClaim>,
 }
 
 #[derive(Debug)]

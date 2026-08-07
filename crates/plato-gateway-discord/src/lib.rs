@@ -24,8 +24,8 @@ use self::{
     rest::{DiscordRestClient, ReactionAction},
     websocket::{DiscordGatewayReceiver, DiscordMessage},
 };
-use plato_daemon_client::client::DaemonConnectionConfig;
-use plato_protocol::RunOverrides;
+use platonic_client::client::DaemonConnectionConfig;
+use platonic_protocol::RunOverrides;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -353,7 +353,7 @@ mod tests {
     use super::test_support::*;
     use super::*;
     #[cfg(unix)]
-    use plato_daemon_client::paths;
+    use platonic_client::paths;
     #[cfg(unix)]
     use std::{os::unix::net::UnixListener, path::PathBuf};
 

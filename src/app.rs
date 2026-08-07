@@ -76,7 +76,7 @@ pub struct RunOutcome {
     pub final_answer: String,
     /// Additive-optional completion claim from a worker thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completion_claim: Option<plato_protocol::CompletionClaim>,
+    pub completion_claim: Option<platonic_protocol::CompletionClaim>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

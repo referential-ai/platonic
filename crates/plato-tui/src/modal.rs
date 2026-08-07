@@ -1,5 +1,5 @@
-use plato_protocol::{BufferedStreamEvent, ModelIdentityStatus, StreamEvent};
 use platonic_core::HarnessEvent;
+use platonic_protocol::{BufferedStreamEvent, ModelIdentityStatus, StreamEvent};
 use serde_json::Value;
 
 use super::LiveEventLine;
@@ -112,8 +112,8 @@ pub fn live_event_line(buffered: &BufferedStreamEvent) -> LiveEventLine {
         StreamEvent::Canceled { .. } => LiveEventLine::status(offset, "canceled"),
         StreamEvent::CompletionClaimed { claim, .. } => {
             let label = match claim.outcome {
-                plato_protocol::CompletionOutcome::Done => "claim done",
-                plato_protocol::CompletionOutcome::Blocked { .. } => "claim blocked",
+                platonic_protocol::CompletionOutcome::Done => "claim done",
+                platonic_protocol::CompletionOutcome::Blocked { .. } => "claim blocked",
             };
             LiveEventLine::status(offset, label)
         }

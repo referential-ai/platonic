@@ -1,8 +1,8 @@
 use crate::{AppError, AppResult};
-use plato_protocol::{
+use platonic_core::{ActorId, EffectClass, ModelName};
+use platonic_protocol::{
     ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadSpawnDecision,
 };
-use platonic_core::{ActorId, EffectClass, ModelName};
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},

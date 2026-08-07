@@ -13,8 +13,8 @@ include = ["src/**", "README.md"]
 
 [dependencies]
 crossterm = "0.28.1"
-plato-daemon-client = { version = "0.2.0", path = "../plato-daemon-client" }
-plato-protocol = { version = "0.2.0", path = "../plato-protocol" }
+platonic-client = { version = "0.2.0", path = "../platonic-client" }
+platonic-protocol = { version = "0.2.0", path = "../platonic-protocol" }
 platonic-core = "0.3.1"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = { version = "0.29.0", features = ["unstable-backend-writer", "unstable-rendered-line-info"] }

@@ -1,11 +1,15 @@
 [workspace]
 members = [
   "crates/plato-audio",
-  "crates/plato-daemon-client",
+  "crates/platonic-client",
   "crates/plato-gateway-discord",
-  "crates/plato-protocol",
+  "crates/platonic-protocol",
   "crates/plato-tui",
 ]
+# desktop/src-tauri stays out of the workspace: it needs GTK/webkit system
+# libraries that the fast `Rust` job deliberately does not install. CI covers
+# it in the `Linux shell` job, which does install them. The gap it appears to
+# leave is documentation only -- see AGENTS.md Verification.
 exclude = ["desktop/src-tauri"]
 resolver = "3"
 
@@ -47,9 +51,9 @@ doc = false
 clap = { version = "4", features = ["derive"] }
 html2text = "0.17.1"
 plato-audio = { version = "0.2.0", path = "crates/plato-audio" }
-plato-daemon-client = { version = "0.2.0", path = "crates/plato-daemon-client" }
+platonic-client = { version = "0.2.0", path = "crates/platonic-client" }
 plato-gateway-discord = { version = "0.2.0", path = "crates/plato-gateway-discord" }
-plato-protocol = { version = "0.2.0", path = "crates/plato-protocol" }
+platonic-protocol = { version = "0.2.0", path = "crates/platonic-protocol" }
 plato-tui = { version = "0.2.0", path = "crates/plato-tui" }
 platonic-core = "0.3.1"
 rusqlite = { version = "0.39", features = ["bundled"] }

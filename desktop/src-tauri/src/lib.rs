@@ -1,9 +1,9 @@
-use plato_daemon_client::{
+use platonic_client::{
     ClientError,
     client::{DaemonClient, DaemonConnectionConfig},
     paths,
 };
-use plato_protocol::{
+use platonic_protocol::{
     ApprovalDecisionName, BufferedStreamEvent, CommandAcceptedResult, EventsStreamResult,
     HarnessEvent, HelloResult, PendingApprovalSnapshot, PolicyDecision, RunStartResult,
     RunStateName, SessionSummary, StreamEvent, TranscriptReadResult, TypedRun,
@@ -1768,7 +1768,7 @@ fn replace_workspace_file(from: &Path, to: &Path) -> std::io::Result<()> {
 pub fn run() {
     #[cfg(windows)]
     drop(
-        plato_daemon_client::installer_gate::InstallerStartupGate::acquire()
+        platonic_client::installer_gate::InstallerStartupGate::acquire()
             .expect("Plato Agent installation or update is in progress"),
     );
     tauri::Builder::default()
@@ -1801,7 +1801,7 @@ pub fn run() {
 #[cfg(all(test, any(unix, windows)))]
 mod daemon_deadline_tests {
     use super::*;
-    use plato_protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION};
+    use platonic_protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION};
     use serde_json::json;
     use std::{
         io::{BufRead, BufReader, Write},
@@ -2161,7 +2161,7 @@ mod daemon_deadline_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use plato_protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION};
+    use platonic_protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION};
     use serde_json::json;
     use std::{
         io::{BufRead, BufReader, Write},
@@ -2676,7 +2676,7 @@ mod tests {
         );
 
         let mut multiple = base.clone();
-        multiple.typed = Some(plato_protocol::TypedTranscript {
+        multiple.typed = Some(platonic_protocol::TypedTranscript {
             runs: vec![typed_run("run_1"), typed_run("run_2")],
         });
         assert_eq!(
@@ -2685,7 +2685,7 @@ mod tests {
         );
 
         let mut wrong = base;
-        wrong.typed = Some(plato_protocol::TypedTranscript {
+        wrong.typed = Some(platonic_protocol::TypedTranscript {
             runs: vec![typed_run("run_2")],
         });
         assert_eq!(
@@ -3552,7 +3552,7 @@ mod tests {
     fn protocol_errors_keep_typed_code_and_message() {
         let error = DesktopError::daemon(
             "Unable to decide approval",
-            ClientError::DaemonResponse(plato_protocol::ProtocolError {
+            ClientError::DaemonResponse(platonic_protocol::ProtocolError {
                 code: "not_found".into(),
                 message: "pending approval not found: call_1".into(),
             }),

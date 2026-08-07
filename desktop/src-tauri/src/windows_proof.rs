@@ -1,5 +1,5 @@
 use super::*;
-use plato_protocol::{RunStateName, ShutdownIfIdleResultName};
+use platonic_protocol::{RunStateName, ShutdownIfIdleResultName};
 use serde_json::json;
 use std::{
     env, fs,
@@ -337,7 +337,7 @@ fn connect_hello_bounded(socket_path: &Path, workspace_root: &Path) -> DaemonCli
 fn wait_for_terminal_transcript(
     client: &mut DaemonClient,
     run_id: &str,
-) -> plato_protocol::TranscriptReadResult {
+) -> platonic_protocol::TranscriptReadResult {
     let deadline = Instant::now() + PROOF_TIMEOUT;
     loop {
         let transcript = client.transcript_read(run_id).unwrap();
