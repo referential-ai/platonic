@@ -384,7 +384,7 @@ fn parse_tokenizer(path: &Path, bytes: &[u8]) -> Result<HashMap<char, i64>, Synt
 
 fn parse_voice(path: &Path, bytes: &[u8]) -> Result<(Box<[f32]>, usize), SynthError> {
     let row_bytes = VOICE_WIDTH * size_of::<f32>();
-    if bytes.is_empty() || bytes.len() % row_bytes != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(row_bytes) {
         return Err(SynthError::Voice {
             path: path.to_owned(),
             reason: format!(
