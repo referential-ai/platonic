@@ -852,7 +852,7 @@ pub struct RunStartParams {
 
 /// Claimed outcome for a worker thread's completion claim.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", tag = "kind")]
 pub enum CompletionOutcome {
     /// The worker claims to have completed the assigned work.
     Done,
@@ -2355,7 +2355,7 @@ mod tests {
         assert_eq!(
             wire,
             json!({
-                "outcome": "done",
+                "outcome": {"kind": "done"},
                 "base": "abc123",
                 "head": "def456",
                 "changed_paths": ["src/main.rs"],
@@ -2377,7 +2377,7 @@ mod tests {
             checks: vec![],
         };
         let wire = serde_json::to_value(&minimal).unwrap();
-        assert_eq!(wire, json!({"outcome": "done"}));
+        assert_eq!(wire, json!({"outcome": {"kind": "done"}}));
         assert_eq!(
             serde_json::from_value::<CompletionClaim>(wire).unwrap(),
             minimal
@@ -2394,7 +2394,7 @@ mod tests {
             checks: vec![],
         };
         let wire = serde_json::to_value(&blocked).unwrap();
-        assert_eq!(wire, json!({"outcome": {"blocked": "waiting for review"}}));
+        assert_eq!(wire, json!({"outcome": {"kind": "blocked", "reason": "waiting for review"}}));
 
         // Absent claim in RunStartResult: legacy wire decodes cleanly.
         let legacy: RunStartResult = serde_json::from_value(json!({
@@ -2590,7 +2590,7 @@ mod tests {
                 "kind": "completion_claimed",
                 "run_id": "run_1",
                 "claim": {
-                    "outcome": "done",
+                    "outcome": {"kind": "done"},
                     "base": "abc123",
                     "head": "def456",
                     "changed_paths": ["src/main.rs"],
@@ -2602,7 +2602,7 @@ mod tests {
                 "kind": "completion_claimed",
                 "run_id": "run_2",
                 "claim": {
-                    "outcome": {"blocked": "waiting for review"}
+                    "outcome": {"kind": "blocked", "reason": "waiting for review"}
                 }
             }),
         ];
