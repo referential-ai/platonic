@@ -5,8 +5,12 @@ members = [
   "crates/plato-gateway-discord",
   "crates/platonic-protocol",
   "crates/plato-tui",
-  "desktop/src-tauri",
 ]
+# desktop/src-tauri stays out of the workspace: it needs GTK/webkit system
+# libraries that the fast `Rust` job deliberately does not install. CI covers
+# it in the `Linux shell` job, which does install them. The gap it appears to
+# leave is documentation only -- see AGENTS.md Verification.
+exclude = ["desktop/src-tauri"]
 resolver = "3"
 
 [package]

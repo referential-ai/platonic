@@ -37,8 +37,15 @@ technical identities remain unchanged.
 ```bash
 cargo fmt --check
 cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --workspace --locked --all-targets -- -D warnings
+cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
 ```
+
+`desktop/src-tauri` is excluded from the Cargo workspace because it needs GTK
+and webkit system libraries. `cargo test --locked` therefore does **not** cover
+it, and the fourth command is required: CI proves the desktop crate in the
+`Linux shell` job, so a change that builds locally can still break CI without
+it. Clippy takes `--workspace` to match CI exactly.
 
 ## GitHub-Native Workflow
 
