@@ -1,20 +1,28 @@
 use crate::{
-    ApprovalModalView, TranscriptState, TuiState,
+    ApprovalModalView, TranscriptState, TranscriptView, TuiState,
     color::{self, TerminalColors},
-    render, render_snapshot,
+    render::{committed_transcript_lines, render_main, render_overlay},
+    render_snapshot,
 };
 use crossterm::{
     SynchronizedUpdate,
+    cursor::MoveTo,
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    },
 };
 use platonic_client::{ClientResult, client::DaemonConnectionConfig};
 use platonic_protocol::RunStateName;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{
+    Terminal, TerminalOptions, Viewport,
+    backend::CrosstermBackend,
+    widgets::{Paragraph, Widget, Wrap},
+};
 use std::{
     env,
     io::{self, Stdout, Write},
@@ -31,10 +39,13 @@ use super::{
         maybe_poll_events_at, spawn_client_worker_to,
     },
     commands::{SlashCommandAction, find_slash_command},
-    state::{MotionMode, SessionPickerView},
+    state::{DisplayMode, MotionMode, SessionPickerView},
 };
 
 const SCROLL_PAGE_LINES: usize = 10;
+const INLINE_VIEWPORT_HEIGHT: u16 = 12;
+const ENABLE_ALTERNATE_SCROLL: &[u8] = b"\x1b[?1007h";
+const DISABLE_ALTERNATE_SCROLL: &[u8] = b"\x1b[?1007l";
 const MIN_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000_u64.div_ceil(120));
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 const REDUCED_MOTION_ENV: &str = "PLATO_REDUCED_MOTION";
@@ -83,6 +94,11 @@ impl FrameScheduler {
 
     fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+
+    fn frame_drawn_at(&mut self, now: Instant) {
+        self.deadline = None;
+        self.last_frame = Some(now);
     }
 }
 
@@ -152,7 +168,7 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
         spawn_client_worker_to(config.clone(), options.thread.clone(), event_sender.clone());
     let mut runtime = UiRuntime::from_state(&state, config_path.clone());
     runtime.attach_thread(options.thread.clone());
-    let mut terminal = TerminalSession::enter()?;
+    let mut terminal = TerminalSession::enter(&state)?;
     let background = startup_terminal_background(detected_colors);
     color::install(TerminalColors::detect(background));
     let mut terminal_events = TerminalEventReader::spawn(event_sender);
@@ -178,18 +194,24 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
         match event {
             UiEvent::Terminal(event) => {
                 let event = event?;
+                let resized = matches!(event, Event::Resize(_, _));
+                let overlay_was_open = terminal.overlay.is_some();
                 let keep_running = match event {
                     Event::Key(key)
                         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                     {
-                        handle_key_press(
-                            key,
-                            &mut state,
-                            &runtime,
-                            &commands,
-                            options.run.clone(),
-                            config_path.clone(),
-                        )
+                        if handle_audit_scroll_key(key, &state, &mut terminal.audit_scroll.offset) {
+                            true
+                        } else {
+                            handle_key_press(
+                                key,
+                                &mut state,
+                                &runtime,
+                                &commands,
+                                options.run.clone(),
+                                config_path.clone(),
+                            )
+                        }
                     }
                     Event::Paste(text) => {
                         state.handle_paste_text(&text);
@@ -197,14 +219,32 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
                     }
                     _ => true,
                 };
+                terminal.sync_audit_scroll(&state);
+                let draw_while_reader_is_paused =
+                    keep_running && (resized || overlay_was_open && !uses_alternate_screen(&state));
+                if draw_while_reader_is_paused {
+                    if resized {
+                        terminal.draw_after_resize(&state)?;
+                    } else {
+                        terminal.draw(&state)?;
+                    }
+                    let now = Instant::now();
+                    frames.frame_drawn_at(now);
+                    if let Some(delay) = next_animation_frame_in(&state) {
+                        frames.schedule_frame_at(now, delay);
+                    }
+                }
                 terminal_events.acknowledge(keep_running);
                 if !keep_running {
                     break;
                 }
-                frames.schedule_frame();
+                if !draw_while_reader_is_paused {
+                    frames.schedule_frame();
+                }
             }
             UiEvent::Daemon(event) => {
                 apply_client_event(&mut state, &mut runtime, *event, &commands);
+                terminal.sync_audit_scroll(&state);
                 frames.schedule_frame();
             }
         }
@@ -498,14 +538,6 @@ fn handle_key_press(
             }
             true
         }
-        KeyCode::PageUp => {
-            scroll_history_up(state);
-            true
-        }
-        KeyCode::PageDown => {
-            scroll_history_down(state);
-            true
-        }
         KeyCode::Char(_)
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
@@ -515,6 +547,25 @@ fn handle_key_press(
         }
         _ => true,
     }
+}
+
+fn handle_audit_scroll_key(key: KeyEvent, state: &TuiState, scroll_offset: &mut usize) -> bool {
+    let audit_has_focus = state.display_mode == DisplayMode::Audit
+        && state.status_modal.is_none()
+        && !state.help_visible
+        && state.approval.is_none()
+        && state.session_picker.is_none();
+    if !audit_has_focus {
+        return false;
+    }
+    match key.code {
+        KeyCode::Up => *scroll_offset = scroll_offset.saturating_add(1),
+        KeyCode::Down => *scroll_offset = scroll_offset.saturating_sub(1),
+        KeyCode::PageUp => *scroll_offset = scroll_offset.saturating_add(SCROLL_PAGE_LINES),
+        KeyCode::PageDown => *scroll_offset = scroll_offset.saturating_sub(SCROLL_PAGE_LINES),
+        _ => return false,
+    }
+    true
 }
 
 fn reconnect(commands: &Sender<ClientCommand>, state: &mut TuiState, run_id: Option<String>) {
@@ -745,14 +796,6 @@ fn dispatch_selected_slash_command(
     )
 }
 
-fn scroll_history_up(state: &mut TuiState) {
-    state.scroll_history_up(SCROLL_PAGE_LINES);
-}
-
-fn scroll_history_down(state: &mut TuiState) {
-    state.scroll_history_down(SCROLL_PAGE_LINES);
-}
-
 enum ApprovalAction {
     Grant,
     GrantSession,
@@ -961,7 +1004,6 @@ fn clear_visible_transcript(state: &mut TuiState) {
     state.replace_transcript(TranscriptState::None);
     state.clear_live_events();
     state.stream_warning = None;
-    state.reset_all_scroll();
 }
 
 fn start_fresh_session(state: &mut TuiState) {
@@ -970,7 +1012,6 @@ fn start_fresh_session(state: &mut TuiState) {
     state.clear_live_events();
     state.stream_warning = None;
     state.session_picker = None;
-    state.reset_all_scroll();
     state.status_message = Some("new session selected".into());
 }
 
@@ -1104,7 +1145,6 @@ pub(super) fn push_live_event(state: &mut TuiState, mut line: crate::LiveEventLi
         })
     {
         *immediate = line;
-        state.reset_scroll();
         return;
     }
     if line.kind == LiveEventKind::AssistantDelta {
@@ -1114,7 +1154,6 @@ pub(super) fn push_live_event(state: &mut TuiState, mut line: crate::LiveEventLi
         {
             last.text.push_str(&line.text);
             last.offset = line.offset;
-            state.reset_scroll();
             return;
         }
         line.kind = LiveEventKind::Assistant;
@@ -1125,11 +1164,9 @@ pub(super) fn push_live_event(state: &mut TuiState, mut line: crate::LiveEventLi
     {
         last.text = line.text;
         last.offset = line.offset;
-        state.reset_scroll();
         return;
     }
     state.live_events.push(line);
-    state.reset_scroll();
 }
 
 enum TerminalReaderControl {
@@ -1182,26 +1219,219 @@ impl Drop for TerminalEventReader {
     }
 }
 
+type BufferedTerminal = Terminal<CrosstermBackend<Vec<u8>>>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuditScrollBoundary {
+    session_id: Option<String>,
+    run_id: Option<String>,
+    transcript_selected: bool,
+}
+
+impl AuditScrollBoundary {
+    fn from_state(state: &TuiState) -> Self {
+        let run_id = state
+            .active_run
+            .as_ref()
+            .map(|run| run.run_id.clone())
+            .or_else(|| {
+                let selected_session_id = state.selected_session_id.as_deref()?;
+                state
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == selected_session_id)
+                    .map(|session| session.run_id.clone())
+            })
+            .or_else(|| match &state.transcript {
+                TranscriptState::Loaded(transcript) => Some(transcript.run_id.clone()),
+                TranscriptState::Unavailable { run_id, .. } => Some(run_id.clone()),
+                TranscriptState::None => None,
+            });
+        Self {
+            session_id: state.selected_session_id.clone(),
+            run_id,
+            transcript_selected: !matches!(state.transcript, TranscriptState::None),
+        }
+    }
+}
+
+struct AuditScrollState {
+    offset: usize,
+    boundary: AuditScrollBoundary,
+}
+
+impl AuditScrollState {
+    fn new(state: &TuiState) -> Self {
+        Self {
+            offset: 0,
+            boundary: AuditScrollBoundary::from_state(state),
+        }
+    }
+
+    fn sync(&mut self, state: &TuiState) {
+        let boundary = AuditScrollBoundary::from_state(state);
+        if self.boundary != boundary {
+            self.offset = 0;
+            self.boundary = boundary;
+        }
+    }
+}
+
 struct TerminalSession {
-    terminal: Terminal<CrosstermBackend<Vec<u8>>>,
+    inline: BufferedTerminal,
+    overlay: Option<BufferedTerminal>,
     stdout: Stdout,
+    committed_transcript: Option<TranscriptView>,
+    audit_scroll: AuditScrollState,
 }
 
 impl TerminalSession {
-    fn enter() -> ClientResult<Self> {
+    fn enter(state: &TuiState) -> ClientResult<Self> {
         enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-        let terminal = Terminal::new(CrosstermBackend::new(Vec::new()))?;
-        Ok(Self { terminal, stdout })
+        let session: ClientResult<Self> = (|| {
+            let mut stdout = io::stdout();
+            let (_, height) = terminal::size()?;
+            execute!(
+                stdout,
+                EnableBracketedPaste,
+                MoveTo(0, height.saturating_sub(1))
+            )?;
+            let inline = Terminal::with_options(
+                CrosstermBackend::new(Vec::new()),
+                TerminalOptions {
+                    viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
+                },
+            )?;
+            Ok(Self {
+                inline,
+                overlay: None,
+                stdout,
+                committed_transcript: None,
+                audit_scroll: AuditScrollState::new(state),
+            })
+        })();
+        if session.is_err() {
+            let _ = execute!(io::stdout(), DisableBracketedPaste);
+            let _ = disable_raw_mode();
+        }
+        session
     }
 
     fn draw(&mut self, state: &TuiState) -> ClientResult<()> {
-        self.terminal.draw(|frame| render(frame, state))?;
-        let output = std::mem::take(self.terminal.backend_mut().writer_mut());
-        write_synchronized(&mut self.stdout, &output)?;
+        self.sync_audit_scroll(state);
+        if uses_alternate_screen(state) {
+            self.enter_overlay()?;
+            let overlay = self.overlay.as_mut().expect("overlay terminal entered");
+            let scroll_offset = if state.display_mode == DisplayMode::Audit {
+                self.audit_scroll.offset
+            } else {
+                0
+            };
+            overlay.draw(|frame| render_overlay(frame, state, scroll_offset))?;
+            write_terminal_output(overlay, &mut self.stdout)?;
+            return Ok(());
+        }
+
+        if self.leave_overlay()? {
+            self.anchor_inline_to_bottom()?;
+        }
+        self.commit_transcript(state)?;
+        self.inline.draw(|frame| render_main(frame, state))?;
+        write_terminal_output(&mut self.inline, &mut self.stdout)?;
         Ok(())
     }
+
+    fn draw_after_resize(&mut self, state: &TuiState) -> ClientResult<()> {
+        if self.overlay.is_some() {
+            self.leave_overlay()?;
+        }
+        self.anchor_inline_to_bottom()?;
+        self.inline.autoresize()?;
+        if uses_alternate_screen(state) {
+            self.enter_overlay()?;
+        }
+        self.draw(state)
+    }
+
+    fn sync_audit_scroll(&mut self, state: &TuiState) {
+        self.audit_scroll.sync(state);
+    }
+
+    fn anchor_inline_to_bottom(&mut self) -> io::Result<()> {
+        let (_, height) = terminal::size()?;
+        execute!(self.stdout, MoveTo(0, height.saturating_sub(1)))
+    }
+
+    fn commit_transcript(&mut self, state: &TuiState) -> ClientResult<()> {
+        self.inline.autoresize()?;
+        let TranscriptState::Loaded(current) = &state.transcript else {
+            return Ok(());
+        };
+        if self.committed_transcript.as_ref() == Some(current) {
+            return Ok(());
+        }
+
+        let width = self.inline.size()?.width.max(1);
+        let current_lines = committed_transcript_lines(state, current, width);
+        let first_new_line = self
+            .committed_transcript
+            .as_ref()
+            .map(|previous| committed_transcript_lines(state, previous, width))
+            .filter(|previous_lines| current_lines.starts_with(previous_lines))
+            .map_or(0, |previous_lines| previous_lines.len());
+        let new_lines = current_lines[first_new_line..].to_vec();
+        if !new_lines.is_empty() {
+            let paragraph = Paragraph::new(new_lines).wrap(Wrap { trim: false });
+            let height = u16::try_from(paragraph.line_count(width)).unwrap_or(u16::MAX);
+            self.inline.insert_before(height, move |buffer| {
+                paragraph.render(buffer.area, buffer);
+            })?;
+        }
+        self.committed_transcript = Some(current.clone());
+        Ok(())
+    }
+
+    fn enter_overlay(&mut self) -> ClientResult<()> {
+        if self.overlay.is_some() {
+            return Ok(());
+        }
+        let overlay = Terminal::new(CrosstermBackend::new(Vec::new()))?;
+        execute!(self.stdout, EnterAlternateScreen)?;
+        self.stdout.write_all(ENABLE_ALTERNATE_SCROLL)?;
+        self.stdout.flush()?;
+        self.overlay = Some(overlay);
+        Ok(())
+    }
+
+    fn leave_overlay(&mut self) -> ClientResult<bool> {
+        if self.overlay.is_none() {
+            return Ok(false);
+        }
+        self.stdout.write_all(DISABLE_ALTERNATE_SCROLL)?;
+        execute!(self.stdout, LeaveAlternateScreen)?;
+        self.stdout.flush()?;
+        self.overlay = None;
+        Ok(true)
+    }
+}
+
+fn uses_alternate_screen(state: &TuiState) -> bool {
+    state.display_mode == DisplayMode::Audit
+        || state.help_visible
+        || state.approval.is_some()
+        || state.session_picker.is_some()
+        || state.status_modal.is_some()
+}
+
+fn write_terminal_output(
+    terminal: &mut BufferedTerminal,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
+    let output = std::mem::take(terminal.backend_mut().writer_mut());
+    if output.is_empty() {
+        return Ok(());
+    }
+    write_synchronized(stdout, &output)
 }
 
 fn write_synchronized(output: &mut impl Write, frame: &[u8]) -> io::Result<()> {
@@ -1210,12 +1440,13 @@ fn write_synchronized(output: &mut impl Write, frame: &[u8]) -> io::Result<()> {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(self.stdout, DisableBracketedPaste, LeaveAlternateScreen);
-        self.terminal.backend_mut().writer_mut().clear();
-        let _ = self.terminal.show_cursor();
-        let output = std::mem::take(self.terminal.backend_mut().writer_mut());
+        let _ = self.leave_overlay();
+        let _ = self.inline.clear();
+        let _ = self.inline.show_cursor();
+        let output = std::mem::take(self.inline.backend_mut().writer_mut());
         let _ = self.stdout.write_all(&output);
+        let _ = execute!(self.stdout, DisableBracketedPaste);
+        let _ = disable_raw_mode();
         let _ = self.stdout.flush();
     }
 }
@@ -1504,7 +1735,6 @@ mod tests {
             "[turn_1] user: question\n[turn_1] assistant: answer\n",
         ));
         state.live_events = vec![crate::LiveEventLine::status(Some(7), "run finished")];
-        state.scroll_history_up(20);
         let transcript = state.transcript.clone();
         let live_events = state.live_events.clone();
         let runtime = UiRuntime::from_state(&state, None);
@@ -1519,13 +1749,11 @@ mod tests {
         ));
 
         assert_eq!(state.display_mode, DisplayMode::Audit);
-        assert_eq!(state.scroll_offset, 0);
         assert_cached_rows(&state, false, false);
         assert_eq!(state.transcript, transcript);
         assert_eq!(state.live_events, live_events);
         assert!(receiver.try_recv().is_err());
 
-        state.scroll_history_up(10);
         render_snapshot(&state, 100, 24).unwrap();
         assert_cached_rows(&state, true, true);
         assert!(press_key(
@@ -1536,9 +1764,7 @@ mod tests {
         ));
 
         assert_eq!(state.display_mode, DisplayMode::Conversation);
-        assert_eq!(state.scroll_offset, 20);
         assert_cached_rows(&state, false, false);
-        assert_eq!(state.audit_scroll_offset, 10);
         assert!(receiver.try_recv().is_err());
     }
 
@@ -1787,7 +2013,6 @@ mod tests {
         state.replace_transcript(loaded_transcript("run_1", "[turn_1] user: hello\n"));
         state.live_events = vec![crate::LiveEventLine::assistant(Some(1), "hello")];
         state.stream_warning = Some("lagged".into());
-        state.scroll_offset = 10;
         state.set_composer_text("/clear");
         let runtime = UiRuntime::from_state(&state, None);
         render_snapshot(&state, 100, 24).unwrap();
@@ -1803,7 +2028,6 @@ mod tests {
         assert!(state.live_events.is_empty());
         assert_cached_rows(&state, false, false);
         assert!(state.stream_warning.is_none());
-        assert_eq!(state.scroll_offset, 0);
         assert_eq!(
             state.status_message.as_deref(),
             Some("visible transcript cleared")
@@ -2850,31 +3074,100 @@ mod tests {
     }
 
     #[test]
-    fn page_keys_adjust_scroll_offset() {
-        let (sender, receiver) = mpsc::channel();
+    fn page_and_arrow_keys_scroll_only_the_focused_audit_overlay() {
         let mut state = test_state();
-        let runtime = UiRuntime::from_state(&state, None);
+        let mut offset = 0;
 
-        assert!(handle_key_press(
+        assert!(!handle_audit_scroll_key(
             KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
-            &mut state,
-            &runtime,
-            &sender,
-            None,
-            None,
+            &state,
+            &mut offset,
         ));
-        assert_eq!(state.scroll_offset, SCROLL_PAGE_LINES);
+        assert_eq!(offset, 0);
 
-        assert!(handle_key_press(
-            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
-            &mut state,
-            &runtime,
-            &sender,
-            None,
-            None,
+        state.toggle_display_mode();
+        assert!(handle_audit_scroll_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+            &state,
+            &mut offset,
         ));
-        assert_eq!(state.scroll_offset, 0);
-        assert!(receiver.try_recv().is_err());
+        assert_eq!(offset, SCROLL_PAGE_LINES);
+        assert!(handle_audit_scroll_key(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            &state,
+            &mut offset,
+        ));
+        assert_eq!(offset, SCROLL_PAGE_LINES + 1);
+        assert!(handle_audit_scroll_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            &state,
+            &mut offset,
+        ));
+        assert_eq!(offset, SCROLL_PAGE_LINES);
+        assert!(handle_audit_scroll_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+            &state,
+            &mut offset,
+        ));
+        assert_eq!(offset, 0);
+
+        state.approval = Some(test_approval("run_1", "call_1"));
+        assert!(!handle_audit_scroll_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+            &state,
+            &mut offset,
+        ));
+    }
+
+    #[test]
+    fn terminal_audit_scroll_resets_only_at_selected_transcript_boundaries() {
+        let mut state = selected_state("session_1", "run_1", "first transcript");
+        state.approval_scroll_offset = 7;
+        let mut audit_scroll = AuditScrollState::new(&state);
+        audit_scroll.offset = SCROLL_PAGE_LINES;
+
+        state.toggle_display_mode();
+        audit_scroll.sync(&state);
+        state.toggle_display_mode();
+        audit_scroll.sync(&state);
+        assert_eq!(audit_scroll.offset, SCROLL_PAGE_LINES);
+
+        apply_loaded_state(
+            &mut state,
+            selected_state("session_1", "run_1", "updated same transcript"),
+        );
+        audit_scroll.sync(&state);
+        assert_eq!(audit_scroll.offset, SCROLL_PAGE_LINES);
+
+        clear_visible_transcript(&mut state);
+        audit_scroll.sync(&state);
+        assert_eq!(audit_scroll.offset, 0);
+        assert_eq!(state.approval_scroll_offset, 7);
+
+        state = selected_state("session_1", "run_1", "restored transcript");
+        audit_scroll.sync(&state);
+        audit_scroll.offset = SCROLL_PAGE_LINES;
+        start_fresh_session(&mut state);
+        audit_scroll.sync(&state);
+        assert_eq!(audit_scroll.offset, 0);
+
+        state = selected_state("session_1", "run_1", "first transcript");
+        audit_scroll.sync(&state);
+        audit_scroll.offset = SCROLL_PAGE_LINES;
+        apply_loaded_state(
+            &mut state,
+            selected_state("session_2", "run_2", "different session"),
+        );
+        audit_scroll.sync(&state);
+        assert_eq!(audit_scroll.offset, 0);
+
+        audit_scroll.offset = SCROLL_PAGE_LINES;
+        apply_loaded_state(
+            &mut state,
+            selected_state("session_2", "run_3", "different run"),
+        );
+        audit_scroll.sync(&state);
+        assert_eq!(audit_scroll.offset, 0);
     }
 
     #[test]
@@ -3722,7 +4015,6 @@ mod tests {
         });
         state.active_run_elapsed_secs = Some(17);
         state.toggle_display_mode();
-        state.scroll_history_up(10);
         state.cancel_requested = true;
         state.approval = Some(test_approval("run_1", "call_1"));
         render_snapshot(&state, 100, 24).unwrap();
@@ -3752,8 +4044,6 @@ mod tests {
         );
         assert_eq!(state.active_run_elapsed_secs, Some(17));
         assert_eq!(state.display_mode, DisplayMode::Audit);
-        assert_eq!(state.scroll_offset, 10);
-        assert_eq!(state.audit_scroll_offset, 10);
         assert!(state.cancel_requested);
         assert_eq!(
             state
@@ -3793,7 +4083,6 @@ mod tests {
             });
             state.active_run_elapsed_secs = Some(91);
             state.approval = Some(test_approval(&previous_run, "old-call"));
-            state.scroll_history_up(10);
             render_snapshot(&state, 100, 24).unwrap();
             assert_cached_rows(&state, true, true);
 
@@ -3808,9 +4097,6 @@ mod tests {
             assert!(state.active_run_elapsed_secs.is_none());
             assert!(state.approval.is_none());
             assert_eq!(state.display_mode, DisplayMode::Audit);
-            assert_eq!(state.scroll_offset, 0);
-            assert_eq!(state.conversation_scroll_offset, 0);
-            assert_eq!(state.audit_scroll_offset, 0);
             assert_cached_rows(&state, false, false);
             let output = render_snapshot(&state, 100, 24).unwrap();
             assert!(output.contains(next_transcript.split(": ").last().unwrap().trim()));

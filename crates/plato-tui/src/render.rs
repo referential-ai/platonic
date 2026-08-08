@@ -43,12 +43,32 @@ const FOOTER_CONTEXT_WIDTH: u16 = 120;
 
 /// Renders the current client state into a terminal frame.
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
-    render_at(frame, state, unix_now_ms());
+    render_overlay_at(frame, state, 0, unix_now_ms());
 }
 
-fn render_at(frame: &mut Frame<'_>, state: &TuiState, now_ms: u64) {
+pub(crate) fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
+    let [history, _, composer, footer] = vertical(frame.area(), state);
+    render_live_history(frame, history, state);
+    render_composer(frame, composer, state);
+    render_footer(frame, footer, state);
+}
+
+pub(crate) fn render_overlay(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    history_scroll_offset: usize,
+) {
+    render_overlay_at(frame, state, history_scroll_offset, unix_now_ms());
+}
+
+fn render_overlay_at(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    history_scroll_offset: usize,
+    now_ms: u64,
+) {
     let [history, approval, composer, footer] = vertical(frame.area(), state);
-    render_history(frame, history, state);
+    render_history(frame, history, state, history_scroll_offset);
     if let Some(approval_view) = &state.approval {
         render_approval_pane(frame, approval, approval_view, state.approval_scroll_offset);
     }
@@ -94,7 +114,7 @@ fn render_snapshot_at(
 ) -> std::io::Result<String> {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend)?;
-    terminal.draw(|frame| render_at(frame, state, now_ms))?;
+    terminal.draw(|frame| render_overlay_at(frame, state, 0, now_ms))?;
     let buffer = terminal.backend().buffer();
     let area = buffer.area;
     let mut output = String::new();
@@ -107,7 +127,7 @@ fn render_snapshot_at(
     Ok(output)
 }
 
-fn render_history(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+fn render_history(frame: &mut Frame<'_>, area: Rect, state: &TuiState, scroll_offset: usize) {
     let mut lines = history_lines(state, area.width);
     if lines.is_empty() {
         lines.push(Line::from(""));
@@ -116,11 +136,55 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let bottom = paragraph
         .line_count(area.width.max(1))
         .saturating_sub(area.height as usize);
-    let scroll = bottom.saturating_sub(state.scroll_offset);
+    let scroll = bottom.saturating_sub(scroll_offset);
     frame.render_widget(
         paragraph.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
         area,
     );
+}
+
+fn render_live_history(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let mut lines = main_history_lines(state, area.width);
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let scroll = paragraph
+        .line_count(area.width.max(1))
+        .saturating_sub(area.height as usize);
+    frame.render_widget(
+        paragraph.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+        area,
+    );
+}
+
+fn main_history_lines(state: &TuiState, width: u16) -> Vec<Line<'static>> {
+    let TranscriptState::Loaded(transcript) = &state.transcript else {
+        return conversation_history_lines(state, width, DEFAULT_SYNTAX_THEME);
+    };
+    let mut lines = Vec::new();
+    append_conversation_activity(
+        &mut lines,
+        state,
+        Some(transcript),
+        width,
+        DEFAULT_SYNTAX_THEME,
+    );
+    append_queue_preview(&mut lines, state);
+    lines
+}
+
+pub(crate) fn committed_transcript_lines(
+    state: &TuiState,
+    transcript: &super::TranscriptView,
+    width: u16,
+) -> Vec<Line<'static>> {
+    conversation_transcript_lines(
+        transcript,
+        width,
+        DEFAULT_SYNTAX_THEME,
+        &state.history_rows.markdown,
+    )
 }
 
 fn history_lines(state: &TuiState, width: u16) -> Vec<Line<'static>> {
@@ -3068,7 +3132,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_scrolled_transcript_window() {
+    fn audit_overlay_renders_a_scrolled_transcript_window() {
         let mut state = TuiState::connected(
             "/tmp/work".into(),
             "/tmp/agent.sock".into(),
@@ -3085,12 +3149,35 @@ mod tests {
             .map(|index| LiveEventLine::status(Some(index), format!("line {index}")))
             .collect();
         state.toggle_display_mode();
-        state.scroll_history_up(10);
 
-        let output = render_snapshot(&state, 100, 12).unwrap();
+        let output = render_overlay_snapshot(&state, 100, 12, 10);
 
         assert!(output.contains("line 15"));
         assert!(!output.contains("line 29"));
+    }
+
+    #[test]
+    fn inline_main_screen_keeps_committed_rows_out_of_the_live_viewport() {
+        let state = conversation_fixture();
+        let TranscriptState::Loaded(transcript) = &state.transcript else {
+            panic!("conversation fixture must have a transcript");
+        };
+
+        for width in [40, 80, 120] {
+            let committed = committed_transcript_lines(&state, transcript, width);
+            assert!(
+                committed
+                    .iter()
+                    .any(|line| line.to_string().contains("First question"))
+            );
+
+            let main = render_main_snapshot(&state, width, 12);
+            assert!(!main.contains("First question"), "width {width}: {main}");
+            assert!(!main.contains("Second answer"), "width {width}: {main}");
+            assert!(main.contains("Trace"), "width {width}: {main}");
+            assert!(main.contains("> "), "width {width}: {main}");
+            assert!(main.contains("? shortcuts"), "width {width}: {main}");
+        }
     }
 
     #[test]
@@ -3977,6 +4064,40 @@ mod tests {
         lines.join("\n")
     }
 
+    fn render_main_snapshot(state: &TuiState, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render_main(frame, state)).unwrap();
+        terminal_buffer_text(&terminal)
+    }
+
+    fn render_overlay_snapshot(
+        state: &TuiState,
+        width: u16,
+        height: u16,
+        scroll_offset: usize,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_overlay_at(frame, state, scroll_offset, 0))
+            .unwrap();
+        terminal_buffer_text(&terminal)
+    }
+
+    fn terminal_buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let mut output = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                output.push_str(buffer[(x, y)].symbol());
+            }
+            output.push('\n');
+        }
+        output
+    }
+
     fn cached_row_ptrs(state: &TuiState) -> (*const Line<'static>, *const Line<'static>) {
         let transcript = state.history_rows.transcript.read().unwrap();
         let live_events = state.history_rows.live_events.read().unwrap();
@@ -4009,7 +4130,9 @@ mod tests {
     fn render_cursor_position(state: &TuiState, width: u16, height: u16) -> (u16, u16) {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render_at(frame, state, 0)).unwrap();
+        terminal
+            .draw(|frame| render_overlay_at(frame, state, 0, 0))
+            .unwrap();
         let position = terminal.backend_mut().get_cursor_position().unwrap();
         (position.x, position.y)
     }
