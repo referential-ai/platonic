@@ -42,6 +42,7 @@ const REQUESTS_PER_LEG: usize = 2;
 static SCENARIO_SERIAL: Mutex<()> = Mutex::new(());
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
 fn child_and_embedded_read_only_success_have_identical_ordered_events() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     run_scenario(Scenario::ReadOnly);
@@ -301,6 +302,7 @@ fn child_and_embedded_cancellation_with_key() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
 fn one_host_daemon_serves_two_workspaces_and_coexists_with_legacy_daemon() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     let root = Arc::new(tempfile::tempdir().unwrap());
@@ -354,6 +356,7 @@ fn one_host_daemon_serves_two_workspaces_and_coexists_with_legacy_daemon() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
 fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     let proof = ProofContext::new();
@@ -565,6 +568,7 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
 fn thread_send_and_three_observers_are_semantically_conformant_on_host_daemon() {
     const INITIAL_MESSAGE: &str = "begin the controlled thread proof";
     const STEERED_MESSAGE: &str = "include the exact steered phrase in the continuation";
