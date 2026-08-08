@@ -1423,6 +1423,7 @@ mod tests {
                 "thread.spawn",
                 "thread.list",
                 "thread.status",
+                "thread.authority",
                 "thread.send",
                 "thread.events",
                 "thread.stop"

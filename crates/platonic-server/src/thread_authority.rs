@@ -1,7 +1,8 @@
 use crate::{AppError, AppResult};
-use platonic_core::{ActorId, EffectClass, ModelName};
+use platonic_core::{ActorId, AgentId, EffectClass, ModelName, ToolName};
 use platonic_protocol::{
-    ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadSpawnDecision,
+    ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadGrantedPath,
+    ThreadSpawnDecision, ThreadStatusAuthority, ThreadWorktree,
 };
 use std::{
     path::{Path, PathBuf},
@@ -14,14 +15,31 @@ pub(crate) const THREAD_SPAWN_APPROVAL_REASON: &str =
 
 static THREAD_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+pub(crate) struct ThreadAuthorityDraftParams<'a> {
+    pub(crate) parent_thread_id: Option<String>,
+    pub(crate) cwd: &'a Path,
+    pub(crate) model: String,
+    pub(crate) reasoning_effort: ReasoningEffort,
+    pub(crate) approval_policy: ThreadApprovalPolicy,
+    pub(crate) agent_id: AgentId,
+    pub(crate) toolset: Vec<String>,
+    pub(crate) writable: bool,
+    pub(crate) network: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ThreadAuthorityDraft {
     pub(crate) thread_id: String,
     pub(crate) parent_thread_id: Option<String>,
     pub(crate) cwd: String,
+    pub(crate) agent_id: AgentId,
     pub(crate) model: String,
     pub(crate) reasoning_effort: ReasoningEffort,
     pub(crate) approval_policy: ThreadApprovalPolicy,
+    pub(crate) toolset: Vec<String>,
+    pub(crate) worktrees: Vec<ThreadWorktree>,
+    pub(crate) granted_paths: Vec<ThreadGrantedPath>,
+    pub(crate) network: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,25 +95,44 @@ pub(crate) enum ThreadAuthorityError {
     },
     #[error("child cwd {child} is outside parent cwd {parent}")]
     WorkingDirectory { parent: String, child: String },
+    #[error("child toolset exceeds parent toolset: {excess:?}")]
+    Toolset { excess: Vec<String> },
 }
 
 impl ThreadAuthorityDraft {
-    pub(crate) fn new(
-        parent_thread_id: Option<String>,
-        cwd: &Path,
-        model: String,
-        reasoning_effort: ReasoningEffort,
-        approval_policy: ThreadApprovalPolicy,
-    ) -> AppResult<Self> {
-        ModelName::new(model.clone())?;
-        let cwd = canonical_directory(cwd)?;
-        Ok(Self {
-            thread_id: generated_id("thread"),
+    pub(crate) fn new(params: ThreadAuthorityDraftParams<'_>) -> AppResult<Self> {
+        let ThreadAuthorityDraftParams {
             parent_thread_id,
-            cwd: cwd.to_string_lossy().into_owned(),
+            cwd,
             model,
             reasoning_effort,
             approval_policy,
+            agent_id,
+            toolset,
+            writable,
+            network,
+        } = params;
+        ModelName::new(model.clone())?;
+        for tool in &toolset {
+            ToolName::new(tool.clone())?;
+        }
+        let cwd = canonical_directory(cwd)?;
+        let cwd = cwd.to_string_lossy().into_owned();
+        Ok(Self {
+            thread_id: generated_id("thread"),
+            parent_thread_id,
+            cwd: cwd.clone(),
+            agent_id,
+            model,
+            reasoning_effort,
+            approval_policy,
+            toolset,
+            worktrees: Vec::new(),
+            granted_paths: vec![ThreadGrantedPath {
+                path: cwd,
+                writable,
+            }],
+            network,
         })
     }
 
@@ -109,10 +146,14 @@ impl ThreadAuthorityDraft {
             thread_id: self.thread_id.clone(),
             parent_thread_id: self.parent_thread_id.clone(),
             spawning_actor,
-            cwd: self.cwd.clone(),
+            agent_id: Some(self.agent_id.clone()),
             model: self.model.clone(),
             reasoning_effort: self.reasoning_effort,
             approval_policy: self.approval_policy,
+            toolset: self.toolset.clone(),
+            worktrees: self.worktrees.clone(),
+            granted_paths: self.granted_paths.clone(),
+            network: self.network,
             created_at_ms,
         })
     }
@@ -209,11 +250,27 @@ pub(crate) fn validate_child_authority(
             child: child.approval_policy,
         });
     }
-    let parent_cwd = Path::new(&parent.cwd);
+    let excess = child
+        .toolset
+        .iter()
+        .filter(|tool| !parent.toolset.contains(tool))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !excess.is_empty() {
+        return Err(ThreadAuthorityError::Toolset { excess });
+    }
     let child_cwd = Path::new(&child.cwd);
-    if !child_cwd.starts_with(parent_cwd) {
+    if !parent
+        .worktrees
+        .iter()
+        .map(|worktree| worktree.path.as_str())
+        .chain(parent.granted_paths.iter().map(|grant| grant.path.as_str()))
+        .any(|path| child_cwd.starts_with(Path::new(path)))
+    {
         return Err(ThreadAuthorityError::WorkingDirectory {
-            parent: parent.cwd.clone(),
+            parent: authority_working_directory(parent)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "<no granted path>".into()),
             child: child.cwd.clone(),
         });
     }
@@ -231,14 +288,62 @@ pub(crate) fn validate_complete_authority(authority: &ThreadAuthorityRecord) -> 
         }
     }
     ActorId::new(authority.spawning_actor.clone())?;
-    ModelName::new(authority.model.clone())?;
-    let canonical_cwd = canonical_directory(Path::new(&authority.cwd))?;
-    if canonical_cwd.to_string_lossy() != authority.cwd {
+    if authority.agent_id.is_none() {
         return Err(AppError::Config(
-            "thread authority cwd must be canonical".into(),
+            "new thread authority requires an agent id".into(),
         ));
     }
+    ModelName::new(authority.model.clone())?;
+    for tool in &authority.toolset {
+        ToolName::new(tool.clone())?;
+    }
+    if authority.worktrees.is_empty() && authority.granted_paths.is_empty() {
+        return Err(AppError::Config(
+            "thread authority requires a worktree or granted path".into(),
+        ));
+    }
+    for worktree in &authority.worktrees {
+        if worktree.repo.trim().is_empty() || worktree.branch.trim().is_empty() {
+            return Err(AppError::Config(
+                "thread authority worktree repo and branch must not be empty".into(),
+            ));
+        }
+        validate_authority_path(&worktree.path)?;
+    }
+    for grant in &authority.granted_paths {
+        validate_authority_path(&grant.path)?;
+    }
     Ok(())
+}
+
+pub(crate) fn authority_working_directory(authority: &ThreadAuthorityRecord) -> Option<&Path> {
+    authority
+        .worktrees
+        .first()
+        .map(|worktree| Path::new(&worktree.path))
+        .or_else(|| {
+            authority
+                .granted_paths
+                .first()
+                .map(|grant| Path::new(&grant.path))
+        })
+}
+
+pub(crate) fn legacy_status_authority(
+    authority: &ThreadAuthorityRecord,
+) -> AppResult<ThreadStatusAuthority> {
+    let cwd = authority_working_directory(authority)
+        .ok_or_else(|| AppError::Config("thread authority has no compatibility cwd".into()))?;
+    Ok(ThreadStatusAuthority {
+        thread_id: authority.thread_id.clone(),
+        parent_thread_id: authority.parent_thread_id.clone(),
+        spawning_actor: authority.spawning_actor.clone(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        model: authority.model.clone(),
+        reasoning_effort: authority.reasoning_effort,
+        approval_policy: authority.approval_policy,
+        created_at_ms: authority.created_at_ms,
+    })
 }
 
 pub(crate) fn thread_spawn_effect() -> EffectClass {
@@ -280,6 +385,16 @@ fn canonical_directory(path: &Path) -> AppResult<PathBuf> {
     Ok(canonical)
 }
 
+fn validate_authority_path(path: &str) -> AppResult<()> {
+    let canonical = canonical_directory(Path::new(path))?;
+    if canonical.to_string_lossy() != path {
+        return Err(AppError::Config(
+            "thread authority paths must be canonical".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,15 +404,47 @@ mod tests {
             thread_id: "thread_parent".into(),
             parent_thread_id: None,
             spawning_actor: "stdin".into(),
-            cwd: canonical_directory(cwd)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
+            agent_id: Some(AgentId::new("plato").unwrap()),
             model: "gpt-parent".into(),
             reasoning_effort: ReasoningEffort::High,
             approval_policy: policy,
+            toolset: vec!["file.read".into(), "file.write".into()],
+            worktrees: Vec::new(),
+            granted_paths: vec![ThreadGrantedPath {
+                path: canonical_directory(cwd)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                writable: true,
+            }],
+            network: false,
             created_at_ms: 1,
         }
+    }
+
+    #[test]
+    fn legacy_status_cwd_prefers_worktree_then_granted_path() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        let mut authority = authority(root.path(), ThreadApprovalPolicy::Prompt);
+        authority.worktrees.push(ThreadWorktree {
+            repo: "repo".into(),
+            branch: "branch".into(),
+            path: worktree.to_string_lossy().into_owned(),
+        });
+
+        assert_eq!(
+            legacy_status_authority(&authority).unwrap().cwd,
+            worktree.to_string_lossy()
+        );
+        authority.worktrees.clear();
+        assert_eq!(
+            legacy_status_authority(&authority).unwrap().cwd,
+            root.path().canonicalize().unwrap().to_string_lossy()
+        );
+        authority.granted_paths.clear();
+        assert!(legacy_status_authority(&authority).is_err());
     }
 
     #[test]
@@ -325,13 +472,17 @@ mod tests {
             ),
             (ThreadApprovalPolicy::Yolo, ThreadApprovalPolicy::Yolo, true),
         ] {
-            let draft = ThreadAuthorityDraft::new(
-                Some("thread_parent".into()),
-                &child_dir,
-                "gpt-child".into(),
-                ReasoningEffort::Xhigh,
-                child_policy,
-            )
+            let draft = ThreadAuthorityDraft::new(ThreadAuthorityDraftParams {
+                parent_thread_id: Some("thread_parent".into()),
+                cwd: &child_dir,
+                model: "gpt-child".into(),
+                reasoning_effort: ReasoningEffort::Xhigh,
+                approval_policy: child_policy,
+                agent_id: AgentId::new("plato").unwrap(),
+                toolset: vec!["file.read".into()],
+                writable: false,
+                network: false,
+            })
             .unwrap();
             assert_eq!(
                 validate_child_authority(&authority(root.path(), parent_policy), &draft).is_ok(),
@@ -339,13 +490,17 @@ mod tests {
             );
         }
 
-        let outside_draft = ThreadAuthorityDraft::new(
-            Some("thread_parent".into()),
-            outside.path(),
-            "gpt-child".into(),
-            ReasoningEffort::Xhigh,
-            ThreadApprovalPolicy::Prompt,
-        )
+        let outside_draft = ThreadAuthorityDraft::new(ThreadAuthorityDraftParams {
+            parent_thread_id: Some("thread_parent".into()),
+            cwd: outside.path(),
+            model: "gpt-child".into(),
+            reasoning_effort: ReasoningEffort::Xhigh,
+            approval_policy: ThreadApprovalPolicy::Prompt,
+            agent_id: AgentId::new("plato").unwrap(),
+            toolset: vec!["file.read".into()],
+            writable: false,
+            network: false,
+        })
         .unwrap();
         assert!(matches!(
             validate_child_authority(
@@ -354,5 +509,37 @@ mod tests {
             ),
             Err(ThreadAuthorityError::WorkingDirectory { .. })
         ));
+    }
+
+    #[test]
+    fn child_toolset_must_be_a_subset_of_parent_toolset() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = authority(root.path(), ThreadApprovalPolicy::Yolo);
+
+        for (toolset, expected) in [
+            (Vec::<String>::new(), Ok(())),
+            (vec!["file.read".into()], Ok(())),
+            (vec!["file.write".into(), "file.read".into()], Ok(())),
+            (
+                vec!["file.read".into(), "web.fetch".into()],
+                Err(ThreadAuthorityError::Toolset {
+                    excess: vec!["web.fetch".into()],
+                }),
+            ),
+        ] {
+            let child = ThreadAuthorityDraft::new(ThreadAuthorityDraftParams {
+                parent_thread_id: Some("thread_parent".into()),
+                cwd: root.path(),
+                model: "gpt-child".into(),
+                reasoning_effort: ReasoningEffort::High,
+                approval_policy: ThreadApprovalPolicy::Prompt,
+                agent_id: AgentId::new("plato").unwrap(),
+                toolset,
+                writable: true,
+                network: false,
+            })
+            .unwrap();
+            assert_eq!(validate_child_authority(&parent, &child), expected);
+        }
     }
 }

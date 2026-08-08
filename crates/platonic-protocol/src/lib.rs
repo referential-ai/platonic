@@ -6,7 +6,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-use platonic_core::{EffectClass, RecordedEvent};
+use platonic_core::{AgentId, EffectClass, RecordedEvent};
 pub use platonic_core::{HarnessEvent, PolicyDecision};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use serde_json::Value;
@@ -130,6 +130,8 @@ pub const CAPABILITY_THREAD_SPAWN: &str = "thread.spawn";
 pub const CAPABILITY_THREAD_LIST: &str = "thread.list";
 /// Capability name for reading one durable thread with live daemon state.
 pub const CAPABILITY_THREAD_STATUS: &str = "thread.status";
+/// Capability name for reading one complete immutable thread authority record.
+pub const CAPABILITY_THREAD_AUTHORITY: &str = "thread.authority";
 /// Capability name for starting or steering one daemon-owned thread turn.
 pub const CAPABILITY_THREAD_SEND: &str = "thread.send";
 /// Capability name for observing retained live thread events.
@@ -138,7 +140,7 @@ pub const CAPABILITY_THREAD_EVENTS: &str = "thread.events";
 pub const CAPABILITY_THREAD_STOP: &str = "thread.stop";
 
 /// Capabilities advertised by a protocol v1 daemon, in wire order.
-pub const CAPABILITIES: [&str; 19] = [
+pub const CAPABILITIES: [&str; 20] = [
     CAPABILITY_HELLO,
     CAPABILITY_RUN_START,
     CAPABILITY_MESSAGE_APPEND,
@@ -155,6 +157,7 @@ pub const CAPABILITIES: [&str; 19] = [
     CAPABILITY_THREAD_SPAWN,
     CAPABILITY_THREAD_LIST,
     CAPABILITY_THREAD_STATUS,
+    CAPABILITY_THREAD_AUTHORITY,
     CAPABILITY_THREAD_SEND,
     CAPABILITY_THREAD_EVENTS,
     CAPABILITY_THREAD_STOP,
@@ -180,6 +183,8 @@ pub const ERROR_RUN_FAILED: &str = "run_failed";
 pub const ERROR_SESSIONS_LIST_FAILED: &str = "sessions_list_failed";
 /// Error code returned when requested thread authority exceeds its parent.
 pub const ERROR_THREAD_AUTHORITY_EXCEEDED: &str = "thread_authority_exceeded";
+/// Error code returned when one complete thread authority cannot be read.
+pub const ERROR_THREAD_AUTHORITY_FAILED: &str = "thread_authority_failed";
 /// Error code returned when live thread event observation fails.
 pub const ERROR_THREAD_EVENTS_FAILED: &str = "thread_events_failed";
 /// Error code returned when durable thread enumeration fails.
@@ -538,9 +543,34 @@ impl fmt::Display for ThreadApprovalPolicy {
     }
 }
 
-/// Complete immutable authority written before a spawned thread becomes live.
+/// One server-created worktree granted to a thread.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ThreadWorktree {
+    /// Repository identity within the thread's workspace.
+    pub repo: String,
+    /// Branch checked out for this thread.
+    pub branch: String,
+    /// Canonical path where the worktree was created.
+    pub path: String,
+}
+
+/// One host path granted to a thread independently of confinement mechanism.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadGrantedPath {
+    /// Canonical host path granted to the thread.
+    pub path: String,
+    /// Whether the thread may write beneath this path.
+    pub writable: bool,
+}
+
+/// Complete immutable authority written before a spawned thread becomes live.
+///
+/// The new fields default when decoding an older eight-field record. `cwd` is
+/// deliberately ignored on that compatibility path; persistence converts it
+/// to one writable granted path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ThreadAuthorityRecord {
     /// Stable daemon-minted thread identifier.
     pub thread_id: String,
@@ -548,7 +578,42 @@ pub struct ThreadAuthorityRecord {
     pub parent_thread_id: Option<String>,
     /// Actor whose approval admitted this spawn.
     pub spawning_actor: String,
-    /// Canonical working directory bounding workspace access.
+    /// Agent profile resolved for this thread, absent only on legacy records.
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
+    /// Exact model requested for the thread.
+    pub model: String,
+    /// Exact provider reasoning effort requested for the thread.
+    pub reasoning_effort: ReasoningEffort,
+    /// Immutable startup approval policy.
+    pub approval_policy: ThreadApprovalPolicy,
+    /// Exact internal tool names available after spawn-time resolution.
+    #[serde(default)]
+    pub toolset: Vec<String>,
+    /// Server-created repository worktrees assigned to this thread.
+    #[serde(default)]
+    pub worktrees: Vec<ThreadWorktree>,
+    /// Mechanism-independent host paths granted to this thread.
+    #[serde(default)]
+    pub granted_paths: Vec<ThreadGrantedPath>,
+    /// Whether this thread is granted network access.
+    #[serde(default)]
+    pub network: bool,
+    /// Authority creation time in Unix milliseconds.
+    pub created_at_ms: u64,
+}
+
+/// Protocol-v1-compatible authority projection used by thread spawn, list, and status.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadStatusAuthority {
+    /// Stable daemon-minted thread identifier.
+    pub thread_id: String,
+    /// Durable parent thread, or none for a locally approved root thread.
+    pub parent_thread_id: Option<String>,
+    /// Actor whose approval admitted this spawn.
+    pub spawning_actor: String,
+    /// Canonical compatibility working directory for this thread.
     pub cwd: String,
     /// Exact model requested for the thread.
     pub model: String,
@@ -577,8 +642,8 @@ pub struct ThreadLiveState {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadStatus {
-    /// Durable authority facts.
-    pub authority: ThreadAuthorityRecord,
+    /// Protocol-v1-compatible durable authority projection.
+    pub authority: ThreadStatusAuthority,
     /// Transient state queried from the serving daemon.
     pub live: ThreadLiveState,
 }
@@ -776,6 +841,22 @@ pub struct ThreadStatusParams {
 pub struct ThreadStatusResult {
     /// Complete durable and live readback.
     pub thread: ThreadStatus,
+}
+
+/// Parameters for one complete `thread.authority` readback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadAuthorityParams {
+    /// Thread whose immutable authority should be read.
+    pub thread_id: String,
+}
+
+/// Result returned by `thread.authority`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadAuthorityResult {
+    /// Complete twelve-field immutable authority record.
+    pub authority: ThreadAuthorityRecord,
 }
 
 /// Parameters for starting or steering one daemon-owned thread turn.
@@ -1656,6 +1737,7 @@ mod tests {
                 "thread.spawn",
                 "thread.list",
                 "thread.status",
+                "thread.authority",
                 "thread.send",
                 "thread.events",
                 "thread.stop",
@@ -1673,6 +1755,7 @@ mod tests {
                 ERROR_RUN_FAILED,
                 ERROR_SESSIONS_LIST_FAILED,
                 ERROR_THREAD_AUTHORITY_EXCEEDED,
+                ERROR_THREAD_AUTHORITY_FAILED,
                 ERROR_THREAD_EVENTS_FAILED,
                 ERROR_THREAD_LIST_FAILED,
                 ERROR_THREAD_SPAWN_FAILED,
@@ -1694,6 +1777,7 @@ mod tests {
                 "run_failed",
                 "sessions_list_failed",
                 "thread_authority_exceeded",
+                "thread_authority_failed",
                 "thread_events_failed",
                 "thread_list_failed",
                 "thread_spawn_failed",
@@ -1738,6 +1822,8 @@ mod tests {
         const SPAWN_REQUIRED_RESPONSE: &str = r#"{"v":1,"id":"spawn_start_1","kind":"response","method":"thread.spawn","result":{"effect":"workspace_write","reason":"thread.spawn requires approval","spawn_id":"spawn_1","status":"approval_required","thread_id":"thread_1"}}"#;
         const STATUS_RESPONSE: &str = r#"{"v":1,"id":"status_1","kind":"response","method":"thread.status","result":{"thread":{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1"},"live":{"current_turn_id":null,"last_activity_at_ms":47,"loaded":true}}}}"#;
         const LIST_RESPONSE: &str = r#"{"v":1,"id":"list_1","kind":"response","method":"thread.list","result":{"threads":[{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1"},"live":{"current_turn_id":null,"loaded":false}}]}}"#;
+        const AUTHORITY_REQUEST: &str = r#"{"v":1,"id":"authority_1","kind":"request","method":"thread.authority","params":{"thread_id":"thread_1"}}"#;
+        const AUTHORITY_RESPONSE: &str = r#"{"v":1,"id":"authority_1","kind":"response","method":"thread.authority","result":{"authority":{"agent_id":"plato","approval_policy":"prompt","created_at_ms":42,"granted_paths":[{"path":"/tmp/work","writable":true}],"model":"gpt-5.6-sol","network":false,"parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1","toolset":["file.read","file.write"],"worktrees":[]}}}"#;
         const SEND_START_REQUEST: &str = r#"{"v":1,"id":"send_1","kind":"request","method":"thread.send","params":{"controller_id":"terminal_a","message":"inspect it","thread_id":"thread_1"}}"#;
         const SEND_STEER_REQUEST: &str = r#"{"v":1,"id":"send_2","kind":"request","method":"thread.send","params":{"controller_id":"terminal_a","message":"also summarize","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
         const SEND_STARTED_RESPONSE: &str = r#"{"v":1,"id":"send_1","kind":"response","method":"thread.send","result":{"status":"started","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
@@ -1779,8 +1865,25 @@ mod tests {
             SPAWN_REQUIRED_RESPONSE
         );
 
+        let authority = ThreadAuthorityRecord {
+            thread_id: "thread_1".into(),
+            parent_thread_id: Some("thread_parent".into()),
+            spawning_actor: "stdin".into(),
+            agent_id: Some(AgentId::new("plato").unwrap()),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: ReasoningEffort::Xhigh,
+            approval_policy: ThreadApprovalPolicy::Prompt,
+            toolset: vec!["file.read".into(), "file.write".into()],
+            worktrees: Vec::new(),
+            granted_paths: vec![ThreadGrantedPath {
+                path: "/tmp/work".into(),
+                writable: true,
+            }],
+            network: false,
+            created_at_ms: 42,
+        };
         let thread = ThreadStatus {
-            authority: ThreadAuthorityRecord {
+            authority: ThreadStatusAuthority {
                 thread_id: "thread_1".into(),
                 parent_thread_id: Some("thread_parent".into()),
                 spawning_actor: "stdin".into(),
@@ -1796,6 +1899,38 @@ mod tests {
                 last_activity_at_ms: Some(47),
             },
         };
+        let legacy = serde_json::from_str::<ThreadAuthorityRecord>(
+            r#"{"thread_id":"thread_legacy","parent_thread_id":null,"spawning_actor":"stdin","cwd":"/tmp/legacy","model":"gpt-5.6-sol","reasoning_effort":"xhigh","approval_policy":"prompt","created_at_ms":41}"#,
+        )
+        .unwrap();
+        assert!(legacy.agent_id.is_none());
+        assert!(legacy.toolset.is_empty());
+        assert!(legacy.worktrees.is_empty());
+        assert!(legacy.granted_paths.is_empty());
+        assert!(!legacy.network);
+
+        let authority_request = decode_request(AUTHORITY_REQUEST).unwrap();
+        let params = serde_json::from_value::<ThreadAuthorityParams>(
+            authority_request.params.clone().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(params.thread_id, "thread_1");
+        assert_eq!(
+            serde_json::to_string(&authority_request).unwrap(),
+            AUTHORITY_REQUEST
+        );
+        let authority_response = Envelope::response_from(
+            Some("authority_1".into()),
+            Some("thread.authority".into()),
+            ThreadAuthorityResult {
+                authority: authority.clone(),
+            },
+        );
+        assert_eq!(
+            serde_json::to_string(&authority_response).unwrap(),
+            AUTHORITY_RESPONSE
+        );
+
         let status = Envelope::response(
             Some("status_1".into()),
             Some("thread.status".into()),
@@ -1889,6 +2024,99 @@ mod tests {
     }
 
     #[test]
+    fn base_v1_thread_list_and_status_decode_new_server_legacy_bytes() {
+        const STATUS_RESPONSE: &str = r#"{"v":1,"id":"status_1","kind":"response","method":"thread.status","result":{"thread":{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1"},"live":{"current_turn_id":null,"last_activity_at_ms":47,"loaded":true}}}}"#;
+        const LIST_RESPONSE: &str = r#"{"v":1,"id":"list_1","kind":"response","method":"thread.list","result":{"threads":[{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1"},"live":{"current_turn_id":null,"loaded":false}}]}}"#;
+
+        #[derive(Debug, Eq, PartialEq, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct BaseV1Authority {
+            thread_id: String,
+            parent_thread_id: Option<String>,
+            spawning_actor: String,
+            cwd: String,
+            model: String,
+            reasoning_effort: ReasoningEffort,
+            approval_policy: ThreadApprovalPolicy,
+            created_at_ms: u64,
+        }
+
+        #[derive(Debug, Eq, PartialEq, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct BaseV1LiveState {
+            loaded: bool,
+            current_turn_id: Option<String>,
+            #[serde(default)]
+            last_activity_at_ms: Option<u64>,
+        }
+
+        #[derive(Debug, Eq, PartialEq, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct BaseV1ThreadStatus {
+            authority: BaseV1Authority,
+            live: BaseV1LiveState,
+        }
+
+        #[derive(Debug, Eq, PartialEq, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct BaseV1ListResult {
+            threads: Vec<BaseV1ThreadStatus>,
+        }
+
+        #[derive(Debug, Eq, PartialEq, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct BaseV1StatusResult {
+            thread: BaseV1ThreadStatus,
+        }
+
+        fn authority() -> BaseV1Authority {
+            BaseV1Authority {
+                thread_id: "thread_1".into(),
+                parent_thread_id: Some("thread_parent".into()),
+                spawning_actor: "stdin".into(),
+                cwd: "/tmp/work".into(),
+                model: "gpt-5.6-sol".into(),
+                reasoning_effort: ReasoningEffort::Xhigh,
+                approval_policy: ThreadApprovalPolicy::Prompt,
+                created_at_ms: 42,
+            }
+        }
+
+        let status_envelope: Envelope = serde_json::from_str(STATUS_RESPONSE).unwrap();
+        let status: BaseV1StatusResult =
+            serde_json::from_value(status_envelope.result.unwrap()).unwrap();
+        assert_eq!(
+            status,
+            BaseV1StatusResult {
+                thread: BaseV1ThreadStatus {
+                    authority: authority(),
+                    live: BaseV1LiveState {
+                        loaded: true,
+                        current_turn_id: None,
+                        last_activity_at_ms: Some(47),
+                    },
+                },
+            }
+        );
+
+        let list_envelope: Envelope = serde_json::from_str(LIST_RESPONSE).unwrap();
+        let list: BaseV1ListResult = serde_json::from_value(list_envelope.result.unwrap()).unwrap();
+        assert_eq!(
+            list,
+            BaseV1ListResult {
+                threads: vec![BaseV1ThreadStatus {
+                    authority: authority(),
+                    live: BaseV1LiveState {
+                        loaded: false,
+                        current_turn_id: None,
+                        last_activity_at_ms: None,
+                    },
+                }],
+            }
+        );
+    }
+
+    #[test]
     fn thread_request_dtos_reject_unknown_fields() {
         for value in [
             json!({
@@ -1915,6 +2143,10 @@ mod tests {
             )
             .is_err()
         );
+        assert_unknown_field_rejected::<ThreadAuthorityParams>(json!({
+            "thread_id": "thread_1",
+            "future": true
+        }));
         assert_unknown_field_rejected::<ThreadSendParams>(json!({
             "thread_id": "thread_1",
             "controller_id": "terminal_a",

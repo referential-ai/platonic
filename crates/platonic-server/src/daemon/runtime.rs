@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::thread_authority::ThreadAuthorityDraftParams;
 use crate::{
     AppError, AppResult, ApprovalRequest, AssistantDeltaEvent,
     app::ExternalApprovalOutcome,
@@ -1447,13 +1449,17 @@ mod tests {
     fn pending_thread_spawn_blocks_shutdown_until_resolved() {
         let root = tempfile::tempdir().unwrap();
         let runtime = runtime();
-        let draft = ThreadAuthorityDraft::new(
-            None,
-            root.path(),
-            "gpt-5.6-sol".into(),
-            crate::daemon::protocol::ReasoningEffort::Xhigh,
-            crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
-        )
+        let draft = ThreadAuthorityDraft::new(ThreadAuthorityDraftParams {
+            parent_thread_id: None,
+            cwd: root.path(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: crate::daemon::protocol::ReasoningEffort::Xhigh,
+            approval_policy: crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+            agent_id: platonic_core::AgentId::new("plato").unwrap(),
+            toolset: vec!["file.read".into()],
+            writable: false,
+            network: false,
+        })
         .unwrap();
         runtime
             .reserve_thread_spawn("spawn_1".into(), draft)
