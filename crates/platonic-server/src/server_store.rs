@@ -28,9 +28,24 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// The name is the handle operators use; the root is the directory it wears.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkspaceRecord {
+    /// Minted once and never derived from the path (P021). A workspace that
+    /// moves keeps its identity and its history; only `root` changes.
+    pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) root: String,
-    pub(crate) registered_at_ms: u64,
+    pub(crate) ledger_path: String,
+    pub(crate) created_at_ms: u64,
+}
+
+/// Whether a registered workspace's directory is still where the registry says.
+///
+/// A workspace whose directory has vanished is reported broken, never omitted
+/// and never auto-removed (P021): its ledger is retained and spawning into it
+/// fails at the gate rather than silently resurrecting an empty workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceHealth {
+    Present,
+    Broken,
 }
 
 /// A thread authority record proven to be durably written.
@@ -85,31 +100,69 @@ impl ServerStore {
     /// know whether it is the first.
     pub(crate) fn register_workspace(
         &self,
+        id: &str,
         name: &str,
         root: &str,
+        ledger_path: &str,
         now_ms: u64,
     ) -> AppResult<WorkspaceRecord> {
-        if name.is_empty() {
-            return Err(AppError::Config("workspace name must not be empty".into()));
-        }
-        if root.is_empty() {
-            return Err(AppError::Config("workspace root must not be empty".into()));
+        for (field, value) in [
+            ("id", id),
+            ("name", name),
+            ("root", root),
+            ("ledger path", ledger_path),
+        ] {
+            if value.is_empty() {
+                return Err(AppError::Config(format!(
+                    "workspace {field} must not be empty"
+                )));
+            }
         }
         self.connection.execute(
-            "INSERT INTO workspaces (name, root, registered_at_ms)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO workspaces (id, name, root, ledger_path, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(name) DO NOTHING",
-            params![name, root, now_ms as i64],
+            params![
+                id,
+                name,
+                root,
+                ledger_path,
+                sqlite_i64(now_ms, "workspace created_at_ms")?
+            ],
         )?;
-        self.workspace(name)?
+        self.workspace_by_name(name)?
             .ok_or_else(|| AppError::Config(format!("workspace {name} vanished after insert")))
     }
 
-    pub(crate) fn workspace(&self, name: &str) -> AppResult<Option<WorkspaceRecord>> {
+    /// Point a workspace at a new directory without disturbing its identity.
+    ///
+    /// Moving a workspace is a registry update, never a new workspace (P021).
+    pub(crate) fn relocate_workspace(&self, id: &str, root: &str) -> AppResult<bool> {
+        let changed = self.connection.execute(
+            "UPDATE workspaces SET root = ?2 WHERE id = ?1",
+            params![id, root],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn workspace(&self, id: &str) -> AppResult<Option<WorkspaceRecord>> {
         Ok(self
             .connection
             .query_row(
-                "SELECT name, root, registered_at_ms FROM workspaces WHERE name = ?1",
+                "SELECT id, name, root, ledger_path, created_at_ms
+                   FROM workspaces WHERE id = ?1",
+                params![id],
+                workspace_from_row,
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn workspace_by_name(&self, name: &str) -> AppResult<Option<WorkspaceRecord>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT id, name, root, ledger_path, created_at_ms
+                   FROM workspaces WHERE name = ?1",
                 params![name],
                 workspace_from_row,
             )
@@ -118,12 +171,10 @@ impl ServerStore {
 
     /// Every registered workspace, whether or not a client has it open.
     ///
-    /// The control plane that serves this over the wire is plato-agent#447;
-    /// until then the cross-workspace enumeration test is its only caller.
-    #[allow(dead_code)]
     pub(crate) fn workspaces(&self) -> AppResult<Vec<WorkspaceRecord>> {
         let mut statement = self.connection.prepare(
-            "SELECT name, root, registered_at_ms FROM workspaces ORDER BY registered_at_ms, name",
+            "SELECT id, name, root, ledger_path, created_at_ms
+               FROM workspaces ORDER BY created_at_ms, name",
         )?;
         let rows = statement.query_map([], workspace_from_row)?;
         let mut records = Vec::new();
@@ -427,20 +478,65 @@ fn invalid_thread_column(index: usize, message: String) -> rusqlite::Error {
 
 fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
     Ok(WorkspaceRecord {
-        name: row.get(0)?,
-        root: row.get(1)?,
-        registered_at_ms: row_u64(row, 2, "workspace registered_at_ms")?,
+        id: row.get(0)?,
+        name: row.get(1)?,
+        root: row.get(2)?,
+        ledger_path: row.get(3)?,
+        created_at_ms: row_u64(row, 4, "workspace created_at_ms")?,
     })
+}
+
+/// Mint a workspace id that does not depend on where the workspace lives.
+///
+/// Deliberately not derived from the path, unlike `paths::workspace_id` (P021):
+/// a workspace that moves must keep its identity and its history rather than
+/// silently becoming a new, empty one.
+pub(crate) fn mint_workspace_id(name: &str, created_at_ms: u64) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(created_at_ms.to_be_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("ws-{hex}")
+}
+
+impl WorkspaceRecord {
+    /// A workspace is broken when the directory it points at is gone.
+    ///
+    /// Checked at read time rather than stored, because the filesystem can
+    /// change without the server running; a cached flag would lie.
+    pub(crate) fn health(&self) -> WorkspaceHealth {
+        if Path::new(&self.root).is_dir() {
+            WorkspaceHealth::Present
+        } else {
+            WorkspaceHealth::Broken
+        }
+    }
 }
 
 fn create_workspace_table(connection: &Connection) -> AppResult<()> {
     connection.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS workspaces (
-          name TEXT PRIMARY KEY,
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
           root TEXT NOT NULL,
-          registered_at_ms INTEGER NOT NULL
+          ledger_path TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL
         );
+
+        CREATE TRIGGER IF NOT EXISTS workspaces_identity_is_immutable
+        BEFORE UPDATE ON workspaces
+        WHEN OLD.id IS NOT NEW.id OR OLD.created_at_ms IS NOT NEW.created_at_ms
+        BEGIN
+          SELECT RAISE(ABORT, 'workspace identity is immutable');
+        END;
         "#,
     )?;
     Ok(())
@@ -756,10 +852,22 @@ mod tests {
 
         let mut store = ServerStore::open_or_create(&server_db).unwrap();
         store
-            .register_workspace("alpha", &alpha_root.to_string_lossy(), 10)
+            .register_workspace(
+                "ws-alpha",
+                "alpha",
+                &alpha_root.to_string_lossy(),
+                "alpha.db",
+                10,
+            )
             .unwrap();
         store
-            .register_workspace("beta", &beta_root.to_string_lossy(), 20)
+            .register_workspace(
+                "ws-beta",
+                "beta",
+                &beta_root.to_string_lossy(),
+                "beta.db",
+                20,
+            )
             .unwrap();
 
         for (index, (thread_id, spawn_id, root)) in [
@@ -823,9 +931,15 @@ mod tests {
 
         // Registration is idempotent: rebinding a workspace keeps its record.
         let rebound = reopened
-            .register_workspace("alpha", &alpha_root.to_string_lossy(), 999)
+            .register_workspace(
+                "ws-alpha",
+                "alpha",
+                &alpha_root.to_string_lossy(),
+                "alpha.db",
+                999,
+            )
             .unwrap();
-        assert_eq!(rebound.registered_at_ms, 10);
+        assert_eq!(rebound.created_at_ms, 10);
         assert_eq!(reopened.workspaces().unwrap().len(), 2);
     }
 
