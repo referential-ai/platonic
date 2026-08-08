@@ -1,15 +1,27 @@
 # Plato Agent Guide
 
 The workspace [naming authority](https://github.com/referential-ai/platonic-workspace/blob/main/product/branding.md)
-owns the hierarchy and exact forms. This repository hosts Plato Agent; its
-technical identities remain unchanged.
+owns the hierarchy and exact forms.
+
+This repository hosts **two** products, split across crates since #449:
+
+- **Platonic** — the agent server, and the product. Workspaces, agents,
+  threads, tools, providers, ledger, policy, approvals, protocol, gateways.
+  Crate `platonic-server`, command `platonic`.
+- **Plato Agent** — the client distribution built on it. Clients, curated
+  agent configurations, skills. Crate `plato-agent`, command `plato`.
+
+Architecture is indexed on the
+[decision map](https://github.com/referential-ai/platonic-workspace/issues/83).
 
 ## Repo Boundary
 
-- This repo owns app IO: CLI, config, provider calls, local tools, approvals, persistence, daemon, TUI, and connectors.
-- `platonic-core` owns pure typed harness primitives only.
+- `crates/platonic-server` owns workspaces, agents, threads, sessions, policy, approvals, provider calls, the ledger, the protocol, and gateways. Clients, distributions, and connectors do not acquire those semantics.
+- The root `plato-agent` package owns the distribution: binaries, the TUI, the Discord connector, and the voice subsystem. It depends on `platonic-server`, which keeps the one-shot and replay paths working without a daemon.
+- `platonic-core` owns pure typed harness primitives only. The server instantiates it once per thread and performs every effect it asks for; the kernel never does. That separation is enforced by the crate boundary, not by convention.
+- An **agent** is data — a configured profile bound to one workspace, providing a default toolset, operating many threads. Not a process the server launches, and not a linked plugin.
 - Do not move provider clients, tool implementations, stores, daemon code, TUI code, or connector code into `platonic-core`.
-- Do not split provider, tool, store, or replay code into candidate repos until a second concrete use and a `Ready for dev` issue/design justify the split.
+- Do not split provider, tool, store, or replay code into further crates until a second concrete use and a `Ready for dev` issue/design justify it. `platonic-server` stays one crate until something else consumes its pieces.
 
 ## Workflow
 
@@ -27,7 +39,8 @@ technical identities remain unchanged.
 - `plato` one-shot execution and `plato replay` must work without a daemon permanently.
 - One-shot, daemon, TUI, gateway, and desktop surfaces share one run-driving implementation. Do not duplicate model/tool/policy event choreography.
 - Provider fallback changes run outcome and must be recorded in the run ledger. Unrecorded fallback is forbidden.
-- `plato-agentd` owns the persistent workspace runtime; clients attach through the daemon protocol and do not own run semantics.
+- `plato-agentd` owns the persistent **server** runtime — one daemon per host, serving many workspaces. Clients attach through the server protocol and do not own run semantics.
+- A **workspace** is a named, registered directory owning one ledger and possibly several repositories. It is not derived from a path: the registry maps a stable server-minted id to the workspace's current directory and ledger location.
 - Connectors must not own sessions, policy, approvals, provider fallback, or run semantics.
 
 ## Verification
