@@ -7,7 +7,6 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    process::Command,
     sync::{Arc, Barrier, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
@@ -18,27 +17,26 @@ const PROOF_KEY_ENV: &str = "PLATO_APPIMAGE_PROOF_KEY";
 const PROOF_KEY_VALUE: &str = "appimage-proof-dummy";
 
 #[test]
-#[ignore = "requires provisioned PLATO_APPIMAGE_TEST_DAEMON and PLATO_APPIMAGE_TEST_CLI"]
+#[ignore = "requires provisioned PLATO_APPIMAGE_TEST_DAEMON"]
 fn provisioned_unix_sidecar_lifecycle() {
     let daemon = proof_executable("PLATO_APPIMAGE_TEST_DAEMON");
-    let cli = proof_executable("PLATO_APPIMAGE_TEST_CLI");
     let proof_key = env::var(PROOF_KEY_ENV)
         .unwrap_or_else(|_| panic!("{PROOF_KEY_ENV} must contain the scoped dummy credential"));
     assert_eq!(proof_key, PROOF_KEY_VALUE);
 
-    shell_exit_detaches_active_daemon(&daemon, &cli);
+    shell_exit_detaches_active_daemon(&daemon);
     crash_reconnect_recovers_lock_in_place(&daemon);
     concurrent_starters_attach_to_one_winner(&daemon);
 }
 
-fn shell_exit_detaches_active_daemon(daemon: &Path, cli: &Path) {
+fn shell_exit_detaches_active_daemon(daemon: &Path) {
     let workspace = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let workspace_root = canonical_workspace(workspace.path()).unwrap();
     let workspace_file = state.path().join("workspace.json");
     persist_canonical_workspace(&workspace_file, &workspace_root).unwrap();
-    let socket_path = paths::default_socket_path(&workspace_root).unwrap();
-    let lock_path = paths::default_lock_path(&workspace_root).unwrap();
+    let socket_path = paths::host_socket_path().unwrap();
+    let lock_path = paths::host_lock_path().unwrap();
     let config_path = workspace_root.join("plato.toml");
     let provider = PausedFakeProvider::start("appimage lifecycle survived");
     write_provider_config(&config_path, &provider.base_url);
@@ -81,20 +79,6 @@ fn shell_exit_detaches_active_daemon(daemon: &Path, cli: &Path) {
     );
     drop(surviving_client);
 
-    let one_shot = Command::new(cli)
-        .current_dir(&workspace_root)
-        .arg(format!(
-            "--db={}",
-            workspace_root.join("direct-proof.db").display()
-        ))
-        .arg("this must fail before provider access")
-        .output()
-        .unwrap();
-    let one_shot_error = String::from_utf8_lossy(&one_shot.stderr);
-    assert!(!one_shot.status.success());
-    assert!(one_shot_error.contains("daemon lock held"));
-    assert!(one_shot_error.contains(lock_path.to_string_lossy().as_ref()));
-
     provider.release();
     let mut fresh_client = connect_hello_bounded(&socket_path, &workspace_root);
     let transcript = wait_for_terminal_transcript(&mut fresh_client, &started.run_id);
@@ -121,8 +105,8 @@ fn crash_reconnect_recovers_lock_in_place(daemon: &Path) {
     let workspace_root = canonical_workspace(workspace.path()).unwrap();
     let workspace_file = state.path().join("workspace.json");
     persist_canonical_workspace(&workspace_file, &workspace_root).unwrap();
-    let socket_path = paths::default_socket_path(&workspace_root).unwrap();
-    let lock_path = paths::default_lock_path(&workspace_root).unwrap();
+    let socket_path = paths::host_socket_path().unwrap();
+    let lock_path = paths::host_lock_path().unwrap();
     let mut lifecycle = Mutex::new(DesktopLifecycle::default());
     let launch = test_launch(daemon.to_path_buf());
 
@@ -138,7 +122,7 @@ fn crash_reconnect_recovers_lock_in_place(daemon: &Path) {
     assert!(lock_path.exists(), "abrupt crash removed the daemon lock");
     let stale_lock = fs::read(&lock_path).unwrap();
 
-    let config = DaemonConnectionConfig::resolve(&workspace_root, None).unwrap();
+    let config = resolve_desktop_connection(&workspace_root, None).unwrap();
     let attach_error =
         try_attach_workspace_until(&config, Instant::now() + Duration::from_millis(250))
             .unwrap_err();
@@ -171,8 +155,8 @@ fn crash_reconnect_recovers_lock_in_place(daemon: &Path) {
 fn concurrent_starters_attach_to_one_winner(daemon: &Path) {
     let workspace = tempfile::tempdir().unwrap();
     let workspace_root = canonical_workspace(workspace.path()).unwrap();
-    let socket_path = paths::default_socket_path(&workspace_root).unwrap();
-    let lock_path = paths::default_lock_path(&workspace_root).unwrap();
+    let socket_path = paths::host_socket_path().unwrap();
+    let lock_path = paths::host_lock_path().unwrap();
     let launch = test_launch(daemon.to_path_buf());
     let barrier = Arc::new(Barrier::new(3));
 

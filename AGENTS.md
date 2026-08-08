@@ -17,7 +17,8 @@ Architecture is indexed on the
 ## Repo Boundary
 
 - `crates/platonic-server` owns workspaces, agents, threads, sessions, policy, approvals, provider calls, the ledger, the protocol, and gateways. Clients, distributions, and connectors do not acquire those semantics.
-- The root `plato-agent` package owns the distribution: binaries, the TUI, the Discord connector, and the voice subsystem. It depends on `platonic-server`, which keeps the one-shot and replay paths working without a daemon.
+- `crates/plato-agent` owns the client distribution: the `plato` and `plato-tui` binaries, the TUI, and the voice subsystem. It depends only on the client, protocol, core, and client-side leaf crates; it never links `platonic-server`.
+- `crates/platonic` owns the thin `platonic` product command over `platonic-server`. The Discord connector is a server module under `crates/platonic-server/src/gateway/discord`.
 - `platonic-core` owns pure typed harness primitives only. The server instantiates it once per thread and performs every effect it asks for; the kernel never does. That separation is enforced by the crate boundary, not by convention.
 - An **agent** is data — a configured profile bound to one workspace, providing a default toolset, operating many threads. Not a process the server launches, and not a linked plugin.
 - Do not move provider clients, tool implementations, stores, daemon code, TUI code, or connector code into `platonic-core`.
@@ -36,10 +37,10 @@ Architecture is indexed on the
 
 ## Runtime Topology
 
-- `plato` one-shot execution and `plato replay` must work without a daemon permanently.
+- `plato` one-shot execution auto-ensures the host server. `plato replay` remains fully offline and must work without the server binary.
 - One-shot, daemon, TUI, gateway, and desktop surfaces share one run-driving implementation. Do not duplicate model/tool/policy event choreography.
 - Provider fallback changes run outcome and must be recorded in the run ledger. Unrecorded fallback is forbidden.
-- `plato-agentd` owns the persistent **server** runtime — one daemon per host, serving many workspaces. Clients attach through the server protocol and do not own run semantics.
+- `platonic serve` owns the persistent **server** runtime — one daemon per host, serving many workspaces. Clients attach through the server protocol and do not own run semantics.
 - A **workspace** is a named, registered directory owning one ledger and possibly several repositories. It is not derived from a path: the registry maps a stable server-minted id to the workspace's current directory and ledger location.
 - Connectors must not own sessions, policy, approvals, provider fallback, or run semantics.
 
@@ -54,9 +55,9 @@ cargo clippy --workspace --locked --all-targets -- -D warnings
 cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
 ```
 
-`cargo test` takes `--workspace` because most of the code lives in
-`platonic-server` rather than the root package; without it the battery runs
-only the distribution and reports a fraction of the suite.
+`cargo test` takes `--workspace` because the repository root is a virtual
+workspace; package-scoped tests cover only one member and report a fraction of
+the suite.
 
 `desktop/src-tauri` is excluded from the Cargo workspace because it needs GTK
 and webkit system libraries. Even `--workspace` therefore does **not** cover

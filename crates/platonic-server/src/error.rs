@@ -1,4 +1,4 @@
-use plato_gateway_discord::GatewayError;
+use crate::gateway::discord::GatewayError;
 use platonic_client::ClientError;
 use platonic_protocol::ProtocolError;
 use std::path::PathBuf;

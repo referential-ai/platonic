@@ -1,30 +1,30 @@
 [package]
 name = "platonic-client"
-version = "0.2.0"
-edition = "2024"
-rust-version = "1.85"
-publish = ["crates-io"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 description = "Bounded daemon client and local IPC transport for Plato Agent."
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/referential-ai/plato-agent"
+license.workspace = true
+repository.workspace = true
 documentation = "https://docs.rs/platonic-client"
 readme = "README.md"
 include = ["src/**", "README.md"]
 
 [dependencies]
-platonic-protocol = { version = "0.2.0", path = "../platonic-protocol" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-thiserror = "2"
+platonic-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["event", "fs", "net", "process", "time"] }
+rustix.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-interprocess = "=2.4.2"
-widestring = "1"
-windows-sys = { version = "0.61", features = [
+interprocess.workspace = true
+widestring.workspace = true
+windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Security_Authorization",
@@ -34,5 +34,5 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-temp-env = "0.3"
-tempfile = "3"
+temp-env.workspace = true
+tempfile.workspace = true

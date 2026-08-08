@@ -28,9 +28,6 @@ jobs:
       - name: Install Rust 1.88.0
         run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
 
-      - name: Install Rust 1.85.0
-        run: rustup toolchain install 1.85.0 --profile minimal --component clippy
-
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -65,69 +62,6 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Prove platonic-protocol on Rust 1.85.0
-        run: |
-          cargo +1.85.0 check --locked -p platonic-protocol --all-targets
-          cargo +1.85.0 test --locked -p platonic-protocol
-          cargo +1.85.0 clippy --locked -p platonic-protocol --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo +1.85.0 doc --locked -p platonic-protocol --no-deps
-          cargo +1.85.0 package --locked -p platonic-protocol
-          cargo +1.85.0 package --locked --list -p platonic-protocol
-
-      - name: Prove platonic-client on Rust 1.85.0
-        run: |
-          cargo +1.85.0 check --locked -p platonic-client --all-targets
-          cargo +1.85.0 test --locked -p platonic-client
-          cargo +1.85.0 clippy --locked -p platonic-client --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo +1.85.0 doc --locked -p platonic-client --no-deps
-          cargo +1.85.0 package --locked --list -p platonic-client
-          package_log=$(mktemp)
-          if cargo +1.85.0 package --locked --no-verify -p platonic-client >"$package_log" 2>&1; then
-            cat "$package_log"
-          else
-            cat "$package_log"
-            grep -F 'no matching package named `platonic-protocol` found' "$package_log"
-          fi
-
-      - name: Prove plato-tui on Rust 1.88.0
-        run: |
-          cargo check --locked -p plato-tui --all-targets
-          cargo test --locked -p plato-tui
-          cargo clippy --locked -p plato-tui --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked -p plato-tui --no-deps
-          cargo package --locked --list -p plato-tui
-          package_log=$(mktemp)
-          if cargo package --locked --no-verify -p plato-tui >"$package_log" 2>&1; then
-            cat "$package_log"
-          else
-            cat "$package_log"
-            grep -F 'no matching package named `platonic-client` found' "$package_log"
-          fi
-
-      - name: Prove plato-gateway-discord on Rust 1.88.0
-        run: |
-          cargo check --locked -p plato-gateway-discord --all-targets
-          cargo test --locked -p plato-gateway-discord
-          cargo clippy --locked -p plato-gateway-discord --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked -p plato-gateway-discord --no-deps
-          cargo package --locked --list -p plato-gateway-discord
-          package_log=$(mktemp)
-          if cargo package --locked --no-verify -p plato-gateway-discord >"$package_log" 2>&1; then
-            cat "$package_log"
-          else
-            cat "$package_log"
-            grep -F 'no matching package named `platonic-client` found' "$package_log"
-          fi
-
-      - name: Prove plato-audio on Rust 1.88.0
-        run: |
-          cargo check --locked -p plato-audio --all-targets
-          cargo test --locked -p plato-audio
-          cargo clippy --locked -p plato-audio --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked -p plato-audio --no-deps
-          cargo package --locked -p plato-audio
-          cargo package --locked --list -p plato-audio
-
       - name: Run tests
         run: cargo test --workspace --locked
 
@@ -140,9 +74,8 @@ jobs:
       - name: Check command help
         run: |
           cargo run --locked -p plato-agent --bin plato -- --help
-          cargo run --locked -p plato-agent --bin plato-agentd -- --help
           cargo run --locked -p plato-agent --bin plato-tui -- --help
-          cargo run --locked -p plato-agent --bin plato-gateway-discord -- --help
+          cargo run --locked -p platonic --bin platonic -- --help
 
   macos:
     name: macOS

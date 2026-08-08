@@ -148,10 +148,10 @@ Function ${prefix}PlatoReleaseInstallerGate
 FunctionEnd
 
 Function ${prefix}PlatoShutdownDaemons
-  ${IfNot} ${FileExists} "$INSTDIR\plato-agentd.exe"
+  ${IfNot} ${FileExists} "$INSTDIR\platonic.exe"
     Return
   ${EndIf}
-  nsExec::Exec /TIMEOUT=${PLATO_CONTROL_TIMEOUT_MS} '"$INSTDIR\plato-agentd.exe" control shutdown-if-idle --quiet'
+  nsExec::Exec /TIMEOUT=${PLATO_CONTROL_TIMEOUT_MS} '"$INSTDIR\platonic.exe" shutdown --workspace "$INSTDIR"'
   Pop $0
   ${If} $0 != 0
     DetailPrint "Plato Agent daemon shutdown failed: $0"

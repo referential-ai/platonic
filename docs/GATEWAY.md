@@ -120,7 +120,7 @@ present, and start the daemon:
 ```bash
 cd "$HOME/plato-discord-workspace"
 unset DISCORD_BOT_TOKEN
-plato daemon
+platonic serve
 ```
 
 Leave it running. Provider credentials belong only in this daemon environment.
@@ -134,7 +134,7 @@ workspace:
 cd "$HOME/plato-discord-workspace"
 unset OPENAI_API_KEY OPENROUTER_API_KEY
 export DISCORD_BOT_TOKEN="$(tr -d '\r\n' < "$HOME/.config/plato/discord-bot-token")"
-plato gateway discord --config "$HOME/.config/plato/gateway.toml"
+platonic gateway discord --config "$HOME/.config/plato/gateway.toml"
 ```
 
 Also unset any custom provider credential variable named by your config. The

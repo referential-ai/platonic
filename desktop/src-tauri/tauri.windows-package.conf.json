@@ -3,7 +3,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "externalBin": ["binaries/plato-agentd"],
+    "externalBin": ["binaries/platonic"],
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper",

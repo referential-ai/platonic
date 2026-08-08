@@ -768,7 +768,7 @@ fn connect_workspace(
     workspace_root: &Path,
     socket_path: Option<PathBuf>,
 ) -> Result<BootstrapView, DesktopError> {
-    let config = DaemonConnectionConfig::resolve(workspace_root, socket_path)
+    let config = resolve_desktop_connection(workspace_root, socket_path)
         .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
     try_attach_workspace_until(&config, std::time::Instant::now() + DAEMON_ATTACH_TIMEOUT)
 }
@@ -870,7 +870,7 @@ fn try_attach_workspace_until(
         ));
     }
     let client = DaemonClient::connect_with_timeout(&config.socket_path, remaining)
-        .map_err(|error| DesktopError::daemon("Unable to connect to plato-agentd", error))?;
+        .map_err(|error| DesktopError::daemon("Unable to connect to Platonic", error))?;
     finish_attach_workspace(config, client, Some(deadline))
 }
 
@@ -907,7 +907,7 @@ fn attach_or_spawn_workspace(
     lifecycle: &mut DesktopLifecycle,
     launch: &DaemonLaunch,
 ) -> Result<BootstrapView, DesktopError> {
-    let config = DaemonConnectionConfig::resolve(workspace_root, socket_path)
+    let config = resolve_desktop_connection(workspace_root, socket_path)
         .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
     let initial =
         try_attach_workspace_until(&config, std::time::Instant::now() + DAEMON_ATTACH_TIMEOUT);
@@ -971,11 +971,7 @@ fn start_and_attach_workspace(
             daemon_start_error(config, "the packaged daemon sidecar path is unavailable")
         })?;
         #[cfg(windows)]
-        let child = lifecycle::spawn_detached_daemon(
-            executable,
-            &config.workspace_root,
-            Some(&config.socket_path),
-        );
+        let child = lifecycle::spawn_detached_daemon(executable, &config.workspace_root);
         #[cfg(unix)]
         let child = {
             let user_path = unix_lifecycle::user_launch_path().map_err(|error| {
@@ -987,12 +983,7 @@ fn start_and_attach_workspace(
                     ),
                 )
             })?;
-            unix_lifecycle::spawn_detached_daemon(
-                executable,
-                &config.workspace_root,
-                Some(&config.socket_path),
-                &user_path,
-            )
+            unix_lifecycle::spawn_detached_daemon(executable, &config.workspace_root, &user_path)
         };
         let child = child.map_err(|error| {
             daemon_start_error(
@@ -1073,13 +1064,13 @@ fn daemon_start_error(
     config: &DaemonConnectionConfig,
     detail: impl std::fmt::Display,
 ) -> DesktopError {
-    let lock = paths::default_lock_path(&config.workspace_root)
+    let lock = paths::host_lock_path()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|error| format!("<unresolved: {error}>"));
     DesktopError::new(
         "daemon_start_failed",
         format!(
-            "Unable to start plato-agentd: {detail}. Endpoint: {}. Lock: {lock}",
+            "Unable to start Platonic: {detail}. Endpoint: {}. Lock: {lock}",
             config.socket_path.display()
         ),
     )
@@ -1090,7 +1081,7 @@ fn read_run_from_workspace(
     run_id: &str,
     socket_path: Option<PathBuf>,
 ) -> Result<DesktopRun, DesktopError> {
-    let config = DaemonConnectionConfig::resolve(workspace_root, socket_path)
+    let config = resolve_desktop_connection(workspace_root, socket_path)
         .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
     let mut client = connect_client(&config)?;
     let hello = client
@@ -1179,7 +1170,18 @@ fn extract_typed_run(
 
 fn connect_client(config: &DaemonConnectionConfig) -> Result<DaemonClient, DesktopError> {
     DaemonClient::connect_with_timeout(&config.socket_path, DAEMON_ATTACH_TIMEOUT)
-        .map_err(|error| DesktopError::daemon("Unable to connect to plato-agentd", error))
+        .map_err(|error| DesktopError::daemon("Unable to connect to Platonic", error))
+}
+
+fn resolve_desktop_connection(
+    workspace_root: &Path,
+    socket_path: Option<PathBuf>,
+) -> Result<DaemonConnectionConfig, ClientError> {
+    let socket_path = match socket_path {
+        Some(path) => path,
+        None => paths::host_socket_path()?,
+    };
+    DaemonConnectionConfig::resolve(workspace_root, Some(socket_path))
 }
 
 fn with_workspace_client<T>(
@@ -1187,7 +1189,7 @@ fn with_workspace_client<T>(
     socket_path: Option<PathBuf>,
     run: impl FnOnce(&mut DaemonClient) -> Result<T, DesktopError>,
 ) -> Result<T, DesktopError> {
-    let config = DaemonConnectionConfig::resolve(workspace_root, socket_path)
+    let config = resolve_desktop_connection(workspace_root, socket_path)
         .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
     let mut client = connect_client(&config)?;
     let hello = client
@@ -2434,7 +2436,9 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let missing = socket_dir.path().join("missing-plato-agentd");
+        let missing = socket_dir.path().join("missing-platonic");
+        let lock = paths::host_lock_path().unwrap();
+        let lock_existed = lock.exists();
         let launch = DaemonLaunch {
             executable: Some(missing.clone()),
         };
@@ -2454,10 +2458,9 @@ mod tests {
                 .message
                 .contains(socket_path.to_string_lossy().as_ref())
         );
-        let lock = paths::default_lock_path(workspace.path()).unwrap();
         assert!(error.message.contains(lock.to_string_lossy().as_ref()));
         assert!(!socket_path.exists());
-        assert!(!lock.exists());
+        assert_eq!(lock.exists(), lock_existed);
     }
 
     #[test]

@@ -783,7 +783,7 @@ mod tests {
             let metadata = LockMetadata {
                 v: LOCK_VERSION,
                 pid: 1,
-                executable: Some(r"C:\plato-agentd.exe".into()),
+                executable: Some(r"C:\platonic.exe".into()),
                 workspace_root: r"C:\workspace".into(),
                 workspace_id: "workspace-1".into(),
                 socket_path: r"\\.\pipe\plato-agent-workspace-1".into(),

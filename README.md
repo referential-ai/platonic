@@ -14,23 +14,20 @@ owns the hierarchy and exact forms.
 
 **New here? Start with [docs/QUICKSTART.md](docs/QUICKSTART.md) — build, run, and test in five minutes.**
 
-Existing crate, repository, library, command, config, state, and release
-identities remain unchanged.
-
 The bootstrap surface is intentionally small:
 
 - Bare `plato` in a terminal ensures the host daemon, creates an approved durable thread, and opens the TUI on it.
 - `plato --remote <thread-id>` opens another TUI on the same host socket and existing thread.
-- `plato "question"` runs directly when no daemon is serving, or delegates the same default-ledger run to a live daemon.
+- `plato "question"` ensures the host server and runs as a short-lived client.
 - `plato -c "follow-up"` continues the latest workspace session from the SQLite ledger.
-- `plato --events <file> "question"` writes an explicit JSONL ledger.
 - `plato replay <file>` validates and prints a deterministic JSONL readback without network calls or tool execution.
 - `plato replay [--run <id>]` replays the default SQLite ledger; omitted `--run` selects the latest session.
 - `plato replay --db[=<path>] [--run <id>]` replays an explicit SQLite ledger.
 - `plato issue-prep start <run-dir>` runs the fixed issue preparation pipeline from Markdown on stdin.
-- `plato daemon` runs the current workspace daemon in the foreground.
 - `plato thread spawn|list|status|send|attach|stop` manages and observes durable threads on a serving host daemon.
-- `plato gateway discord` checks that daemon, then runs the Discord connector.
+- `platonic serve|status|shutdown` runs and operates the server.
+- `platonic workspace create|list|status` manages registered workspaces.
+- `platonic gateway discord` runs the server-owned Discord connector.
 
 ## Configuration
 
@@ -182,10 +179,8 @@ Every run uses this exact convention:
 
 - Bare `plato "..."` writes to the default platform user-state path.
 - `plato -c "..."` continues the latest session from that store.
-- `--db` also writes to the default platform user-state path.
-- `--db=<path>` writes to that SQLite file; relative paths resolve against the current workspace.
-- On Unix, default ledger directories are `0700` and the database and SQLite sidecars are `0600`; explicit `--db=<path>` permissions remain caller-managed.
-- Use `=` for explicit paths because `--db` also has a bare default form.
+- `--db[=<path>]` belongs to offline replay; one-shot runs always use the server-owned workspace ledger.
+- On Unix, default ledger directories are `0700` and the database and SQLite sidecars are `0600`.
 - Live assistant text, `run_id`, `ledger_path`, and replay hints print to stderr. Stdout remains only the final answer.
 - Replay shows final assistant messages, not partial streaming deltas.
 - Replay renders dropped oldest session turns as `[<turn_id>] context_compacted estimated_tokens=<before>-><after> dropped_turns=<start>..<end>`; the zero-based range has an exclusive end and the token values are host estimates of the complete context before and after compaction.
@@ -195,17 +190,13 @@ Every run uses this exact convention:
   omitted or partial usage is recorded as unknown.
 - `plato replay` without arguments replays the latest session from the default platform SQLite ledger.
 - `plato replay --run <id>` replays a single run.
-- `--events <file>` is the explicit JSONL export/debug path.
 - Read-only SQLite replay reads `user_version` first: schema v1 uses only
   `ledger_events`, v2 adds sessions, v3 adds voice companions, v4 adds
   immutable thread authority, and v5 adds immutable thread-stop records. Newer
   schemas fail without migration. Write-open
   remains the sole migration path to the current schema.
-- With a live workspace daemon, default-ledger prompts delegate to it. Replay,
-  explicit `--db=<path>`, and direct `--yolo` SQLite paths remain direct and
-  fail closed if they conflict with the daemon-owned store.
-- Direct SQLite CLI operations hold the workspace lock before session lookup or
-  database open through final output, then release it when the CLI exits.
+- Every prompt runs through the host server. Replay opens JSONL or SQLite
+  read-only and never starts or contacts the server.
 - SQLite session terminal events and their matching outcomes commit together.
   Daemon startup replays running session ledgers, reconciling an existing
   terminal event or recording one interruption failure before closing the run.
@@ -219,37 +210,33 @@ cargo run --bin plato -- replay --db=/tmp/plato-agent.db
 cargo run --bin plato -- replay --db=/tmp/plato-agent.db --run run_123
 ```
 
-## Daemon
+## Server
 
-`plato-agentd` is the local runtime daemon for session-facing clients such as
-`plato` and `plato-tui`. The runtime topology and verb set are defined in
+`platonic serve` is the local runtime for clients such as `plato`,
+`plato-tui`, and the desktop shell. The runtime topology and verb set are defined in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#runtime-topology) and issue
 [#11](https://github.com/referential-ai/plato-agent/issues/11).
 
-Start it in the foreground for the current workspace:
+Start the host server in the foreground:
 
 ```bash
-plato daemon
+platonic serve
 ```
 
-This delegates to the same-revision sibling `plato-agentd` and preserves its
-terminal, signals, output, and exit result. The direct
-`plato-agentd --workspace "$PWD"` technical command remains supported.
-
-The expansion-only host mode runs one local daemon for multiple workspaces:
+The explicit legacy workspace mode remains available for standalone clients
+and focused proofs:
 
 ```bash
-plato-agentd --host
+platonic serve --workspace "$PWD"
 ```
 
-It uses `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/plato-agent/host/agent.sock`
+Host mode uses `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/platonic/host/agent.sock`
 on Unix or `\\.\pipe\plato-agent-host` on Windows. Each connection selects its
 workspace through the existing `hello` request; the response adds
 `"daemon_scope":"host"` while retaining the existing build-provenance
-`daemon_version`. Bare `plato` and `plato --tui` ensure this daemon and attach
-as thread clients. The gateway, standalone `plato-tui`, and explicit
-workspace-daemon commands retain their current per-workspace endpoint in this
-migration stage.
+`daemon_version`. Bare `plato`, `plato "question"`, and `plato --tui` ensure
+this server and attach as clients. `platonic status`, `platonic shutdown`, and
+the `platonic workspace` commands operate it through the existing protocol.
 
 The `plato thread` commands connect only to this host endpoint. Spawn requires
 an explicit cwd, model, reasoning effort, and approval policy; cwd defaults to
@@ -338,17 +325,16 @@ ledger_path: <state-path>/agent.db
 
 Default paths are keyed by the workspace id:
 
-- Unix socket: `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/plato-agent/workspaces/<workspace-id>/agent.sock`
-- Unix lock: `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/plato-agent/workspaces/<workspace-id>/agent.lock`
-- Unix ledger: `${XDG_STATE_HOME:-$HOME/.local/state}/plato-agent/workspaces/<workspace-id>/agent.db`
+- Unix socket: `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/platonic/workspaces/<workspace-id>/agent.sock`
+- Unix lock: `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/platonic/workspaces/<workspace-id>/agent.lock`
+- Unix ledger: `${XDG_STATE_HOME:-$HOME/.local/state}/platonic/workspaces/<workspace-id>/agent.db`
 - Windows pipe: `\\.\pipe\plato-agent-<workspace-id>`
-- Windows lock and ledger: `%LOCALAPPDATA%\plato-agent\workspaces\<workspace-id>\agent.lock` and `agent.db`
+- Windows lock and ledger: `%LOCALAPPDATA%\platonic\workspaces\<workspace-id>\agent.lock` and `agent.db`
 
 Those workspace socket and lock paths remain for the explicit legacy daemon
 clients during migration. Interactive `plato` uses the host endpoint above.
-One-shot `plato "question"` remains daemonless through the embedded engine
-unless an explicit legacy workspace daemon is already serving; it writes the
-same default ledger either way.
+One-shot `plato "question"` auto-ensures the host server and always uses its
+server-owned workspace ledger.
 
 Runtime directories are restricted to `0700` and the daemon socket to `0600`.
 A custom Unix `--socket` parent is restricted to `0700` at startup. Windows
@@ -379,7 +365,7 @@ before `finished`, `failed`, or `canceled` can be observed.
 An accepted `run.cancel` stores `cancel_requested` before replying. Repeated
 requests return that state without another cancellation event, while terminal
 runs reject cancellation.
-Each daemon run executes in a supervised child process while `plato-agentd`
+Each daemon run executes in a supervised child process while `platonic serve`
 stays alive and authoritative. The daemon is the only SQLite writer; the child
 receives a prepared run snapshot without a ledger path and returns typed ledger
 operations, live deltas, approval requests, and its result over private stdio.
@@ -404,21 +390,18 @@ lock. Duplicate shutdown and run-admission requests dispatched before teardown
 fail with `daemon_shutting_down`; after the `shutdown` response, connection
 close is expected and lock removal confirms success.
 
-On Windows, installer control validates every current-user lock against its
-workspace and live process image. Exact sidecars also require the expected pipe
-server PID and `hello` response before control:
+The product command exposes the protocol-backed operator surface directly:
 
-```powershell
-plato-agentd control list-workspaces
-plato-agentd control shutdown-if-idle --workspace C:\path\to\workspace
-plato-agentd control shutdown-if-idle
+```bash
+platonic status --workspace "$PWD"
+platonic workspace create example /path/to/workspace
+platonic workspace list
+platonic workspace status <workspace-id>
+platonic shutdown --workspace "$PWD"
 ```
 
-The commands emit NDJSON. The aggregate shutdown validates the whole namespace
-before sending any shutdown request, attempts every validated daemon, and exits
-nonzero if a daemon is active or any lock cannot be validated. Locks are never
-removed by the control client. A missing targeted daemon reports `not_running`;
-a `shutdown` result is sent once and confirmed by process exit and lock removal.
+The commands emit one typed JSON result. Shutdown reports `refused_active`
+without changing an active server, or `shutdown` before graceful process exit.
 
 Minimal NDJSON-over-Unix-socket check, using the `workspace_id` and
 `socket_path` printed by the daemon:
@@ -462,7 +445,7 @@ PY
 NDJSON `run.start` and `message.append` default to `wait: false`, returning a
 `running` response immediately. Send `"wait": true` only when the connection can
 block until the run finishes.
-The TUI, desktop shell, embedded-daemon CLI probe, and Discord gateway bound
+The TUI, desktop shell, one-shot CLI client, and Discord gateway bound
 daemon connects and each complete request to three seconds. The desktop uses a
 fresh budget for hello and every normal read or mutation.
 
@@ -476,7 +459,7 @@ From a clean `develop` checkout, refresh the current-user binaries with:
 
 The command fetches `origin/develop`, requires local `develop` to equal it,
 builds the three locked release binaries, and installs them at
-`~/.local/lib/plato-agent/{plato,plato-agentd,plato-tui}-real`. Existing wrapper
+`~/.local/lib/plato-agent/{plato,platonic,plato-tui}-real`. Existing wrapper
 scripts are not changed. It prints before/after checksums, gracefully retires
 only an owner-validated idle installed daemon, and verifies a new isolated
 daemon hello plus TUI snapshot before completing the atomic set replacement.
@@ -496,7 +479,7 @@ outside the deploy command report `unknown` provenance explicitly.
 
 ## Desktop (Development)
 
-The Plato Agent root and desktop packages require Rust 1.88. Platonic Core
+The Plato Agent workspace and desktop package require Rust 1.88. Platonic Core
 remains on Rust 1.85.
 
 The desktop shell renders full typed session history, streams the selected run,
@@ -504,13 +487,13 @@ and supports new or continued messages, approval decisions, and cancel.
 Provider credentials remain with the daemon. Linux development attaches to a
 manually started daemon. On Windows, the shell first attaches to a valid daemon
 for the selected workspace; when none is listening, it starts the absolute
-sibling `plato-agentd.exe` sidecar and retries for a bounded interval.
+sibling `platonic.exe` sidecar and retries for a bounded interval.
 
 ![Plato Agent desktop showing an exact-run transcript](docs/images/desktop-plato-agent.png)
 
 ```bash
 # Terminal 1, from the repository root
-cargo run --bin plato-agentd -- --workspace "$PWD"
+cargo run --bin platonic -- serve
 
 # Terminal 2
 cd desktop
@@ -542,18 +525,17 @@ npm run tauri:bundle:windows
 ```
 
 The installer retains its technical `Plato` identity under `%LOCALAPPDATA%`,
-bundles the same-revision `plato-agentd.exe`, and downloads the WebView2
+bundles the same-revision `platonic.exe`, and downloads the WebView2
 Evergreen bootstrapper when the runtime is absent. Upgrade and uninstall first
 close the desktop, block new installed-sidecar starts, and make one bounded
-aggregate `plato-agentd control shutdown-if-idle` invocation. An active daemon or
-unvalidated lock aborts before installed binaries or user files change;
-idle daemons exit and remove their locks. These unsigned artifacts are for
+`platonic shutdown` invocation. An active server aborts before installed
+binaries or user files change; idle servers exit cleanly. These unsigned artifacts are for
 development proof only and are not distributed.
 
 ### Linux AppImage (Private Release)
 
 Linux releases target x86-64 Ubuntu 24.04 on the WebKitGTK 4.1 ABI. The
-AppImage contains the same-revision `plato-agentd` sidecar. It first attaches
+AppImage contains the same-revision `platonic` sidecar. It first attaches
 to a valid workspace daemon; if none is available, it restores only the user's
 login-shell `PATH`, starts the bundled sidecar, and retries for a bounded
 interval. Closing Plato Agent detaches without stopping the daemon or active runs.
@@ -579,7 +561,7 @@ are not a public community launch. Build the AppImage on Ubuntu 24.04 with
 
 ## Discord Gateway
 
-`plato-gateway-discord` receives Discord messages over an outbound WebSocket
+The Discord gateway in `platonic-server` receives messages over an outbound WebSocket
 and sends replies through Discord's REST API. Add the bot token variable name
 and numeric owner user ids to an authorized config:
 
@@ -609,18 +591,14 @@ that contains the bot token but no provider credentials:
 ```bash
 unset OPENAI_API_KEY OPENROUTER_API_KEY
 export DISCORD_BOT_TOKEN="$(cat /path/to/discord-bot-token)"
-plato gateway discord --config ~/.config/plato/gateway.toml
+platonic gateway discord --config ~/.config/plato/gateway.toml
 ```
 
-Both `plato gateway discord` and the direct gateway complete a bounded daemon
-`hello`, require the exact workspace ID plus `hello`, `run.start`,
+The server-owned gateway completes a bounded daemon `hello`, requires the exact
+workspace ID plus `hello`, `run.start`,
 `message.append`, `events.stream`, `sessions.list`, and `transcript.read`, then
-begin Discord REST and WebSocket work. The service entry enforces that same
-preflight before handing off to the same-revision sibling
-`plato-gateway-discord`. A failed probe starts no gateway and points to
-`plato daemon`; it never starts a daemon with the gateway environment. The
-direct `plato-gateway-discord --workspace "$PWD"` technical command remains
-supported.
+begin Discord REST and WebSocket work. A failed probe starts no gateway; the
+gateway never starts a server with its Discord environment.
 
 At startup, the gateway replaces the Discord application's global command
 registry with the commands this binary supports. The current registry contains
@@ -683,7 +661,7 @@ tint, accents, and semantic colors adapt to light or dark terminal backgrounds;
 cargo run --bin plato
 ```
 
-`plato-tui` remains a terminal client for a manually started `plato-agentd`. It
+`plato-tui` remains a terminal client for a manually started `platonic serve`. It
 does not spawn, supervise, restart, or stop the daemon, and it does not call
 providers, execute tools, or write SQLite directly.
 Assistant text appears live through daemon `events.stream`; replay remains
@@ -708,7 +686,7 @@ facts, and the selected session's live shell grant. The read-only modal does
 not invoke a model or change the session.
 
 ```bash
-cargo run --bin plato-agentd -- --workspace "$PWD"
+cargo run --bin platonic -- serve --workspace "$PWD"
 cargo run --bin plato-tui -- --workspace "$PWD"
 ```
 
@@ -756,17 +734,20 @@ cargo run --bin plato -- "read README.md and summarize it"
 cargo run --bin plato -- -c "what did you just summarize?"
 cargo run --bin plato -- --yolo "write local-proof.txt with hello from Plato Agent"
 cargo run --bin plato -- "run cargo test --locked and summarize the result"
-cargo run --bin plato -- daemon
+cargo run --bin platonic -- serve
+cargo run --bin platonic -- status
+cargo run --bin platonic -- workspace create example /path/to/workspace
+cargo run --bin platonic -- workspace list
+cargo run --bin platonic -- workspace status workspace_123
+cargo run --bin platonic -- shutdown
 cargo run --bin plato -- thread spawn --model gpt-5.6-sol --reasoning-effort xhigh
 cargo run --bin plato -- thread list
 cargo run --bin plato -- thread status thread_123
 cargo run --bin plato -- thread send thread_123 --controller terminal_a "inspect the workspace"
 cargo run --bin plato -- thread attach thread_123 --from-offset 0
-cargo run --bin plato -- gateway discord --config ~/.config/plato/gateway.toml
+cargo run --bin platonic -- gateway discord --config ~/.config/plato/gateway.toml
 cargo run --bin plato -- replay
 cargo run --bin plato -- replay events.jsonl
-cargo run --bin plato -- --db "read README.md and summarize it"
-cargo run --bin plato -- --db=/tmp/plato-agent.db "read README.md and summarize it"
 cargo run --bin plato -- replay --db
 cargo run --bin plato -- replay --db=/tmp/plato-agent.db --run run_123
 cargo run --bin plato -- --tui --config plato.toml
@@ -795,7 +776,7 @@ enabled = ["file.read", "file.list", "file.write", "file.edit"]
 TOML
 
 OPENROUTER_API_KEY="$(cat /path/to/your/openrouter-key)" \
-  cargo run --bin plato -- --config "$tmp/plato.toml" --db="$tmp/agent.db" \
+  cargo run --bin plato -- --config "$tmp/plato.toml" \
   "list the files in this workspace and summarize what you see"
 ```
 

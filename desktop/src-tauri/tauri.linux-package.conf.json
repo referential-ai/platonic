@@ -3,6 +3,6 @@
   "bundle": {
     "active": true,
     "targets": ["appimage"],
-    "externalBin": ["binaries/plato-agentd"]
+    "externalBin": ["binaries/platonic"]
   }
 }

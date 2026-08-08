@@ -1675,32 +1675,22 @@ name = "plato-agent"
 version = "0.2.0"
 dependencies = [
  "clap",
- "ctrlc",
  "hound",
- "html2text",
- "interprocess",
  "plato-audio",
- "plato-gateway-discord",
  "plato-tui",
  "platonic-client",
  "platonic-core",
  "platonic-protocol",
- "platonic-server",
  "pty-process",
  "rusqlite",
  "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2",
- "signal-hook",
  "temp-env",
  "tempfile",
  "thiserror 2.0.18",
- "toml",
- "ureq 2.12.1",
- "url",
  "vt100",
- "widestring",
  "windows-sys 0.61.2",
 ]
 
@@ -1722,21 +1712,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "plato-gateway-discord"
-version = "0.2.0"
-dependencies = [
- "platonic-client",
- "platonic-protocol",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tungstenite",
- "ureq 2.12.1",
- "url",
-]
-
-[[package]]
 name = "plato-tui"
 version = "0.2.0"
 dependencies = [
@@ -1752,6 +1727,27 @@ dependencies = [
  "tui-textarea",
  "unicode-segmentation",
  "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "platonic"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "ctrlc",
+ "interprocess",
+ "platonic-client",
+ "platonic-core",
+ "platonic-protocol",
+ "platonic-server",
+ "rusqlite",
+ "rustix 1.1.4",
+ "serde_json",
+ "signal-hook",
+ "temp-env",
+ "tempfile",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1789,6 +1785,7 @@ dependencies = [
  "platonic-core",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
 ]
 
@@ -1797,8 +1794,6 @@ name = "platonic-server"
 version = "0.2.0"
 dependencies = [
  "html2text",
- "plato-audio",
- "plato-gateway-discord",
  "platonic-client",
  "platonic-core",
  "platonic-protocol",
@@ -1811,6 +1806,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml",
+ "tungstenite",
  "ureq 2.12.1",
  "url",
 ]

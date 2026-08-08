@@ -1,10 +1,7 @@
-use crate::{
-    AppError, AppResult,
-    paths::DefaultSqlitePath,
-    voice_session::{VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope},
-};
+use crate::{AppError, AppResult, paths::DefaultSqlitePath};
 use platonic_core::{HarnessEvent, MessageRole, RecordedEvent, RunId, RunPhase, RunState};
 use platonic_protocol::RunStateName;
+use platonic_protocol::{VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use serde::{Deserialize, Serialize};
 use std::{

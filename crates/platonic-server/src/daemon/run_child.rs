@@ -670,7 +670,7 @@ fn resolve_run_child_executable_from(
     current: &Path,
     executable_suffix: &str,
 ) -> AppResult<PathBuf> {
-    let binary_name = format!("plato-agentd{executable_suffix}");
+    let binary_name = format!("platonic{executable_suffix}");
     let candidate = if current.file_name() == Some(OsStr::new(&binary_name)) {
         current.to_path_buf()
     } else {
@@ -1477,7 +1477,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let image = root
             .path()
-            .join(format!("plato-agentd{}", std::env::consts::EXE_SUFFIX));
+            .join(format!("platonic{}", std::env::consts::EXE_SUFFIX));
         fs::write(&image, []).unwrap();
 
         assert_eq!(
@@ -1504,7 +1504,7 @@ mod tests {
         fs::create_dir_all(&deps).unwrap();
         let host = deps.join(format!("plato-test{}", std::env::consts::EXE_SUFFIX));
         fs::write(&host, []).unwrap();
-        let image = profile.join(format!("plato-agentd{}", std::env::consts::EXE_SUFFIX));
+        let image = profile.join(format!("platonic{}", std::env::consts::EXE_SUFFIX));
         fs::write(&image, []).unwrap();
 
         assert_eq!(
@@ -1522,7 +1522,7 @@ mod tests {
         fs::write(&host, []).unwrap();
         let image = root
             .path()
-            .join(format!("plato-agentd{}", std::env::consts::EXE_SUFFIX));
+            .join(format!("platonic{}", std::env::consts::EXE_SUFFIX));
         fs::write(&image, []).unwrap();
 
         assert_eq!(
@@ -1555,7 +1555,7 @@ mod tests {
         fs::write(&host, []).unwrap();
         let image = root
             .path()
-            .join(format!("plato-agentd{}", std::env::consts::EXE_SUFFIX));
+            .join(format!("platonic{}", std::env::consts::EXE_SUFFIX));
         fs::create_dir(&image).unwrap();
 
         let error =
@@ -1567,11 +1567,11 @@ mod tests {
 
     #[test]
     fn resolver_uses_the_platform_executable_name() {
-        let name = format!("plato-agentd{}", std::env::consts::EXE_SUFFIX);
+        let name = format!("platonic{}", std::env::consts::EXE_SUFFIX);
         #[cfg(windows)]
-        assert_eq!(name, "plato-agentd.exe");
+        assert_eq!(name, "platonic.exe");
         #[cfg(not(windows))]
-        assert_eq!(name, "plato-agentd");
+        assert_eq!(name, "platonic");
     }
 
     #[test]
