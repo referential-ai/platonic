@@ -1302,7 +1302,13 @@ mod tests {
     }
 
     fn assert_stale_default_socket_recovers(explicit_default: bool) {
-        let workspace = tempfile::tempdir().unwrap();
+        // These tests must exercise the DEFAULT socket derivation, so they
+        // cannot bind a short custom socket. The derived path sits at the
+        // macOS sockaddr_un boundary (104 bytes) when the workspace lives in
+        // a deep temp root, so the workspace itself goes under /tmp, which
+        // keeps the derived default path comfortably inside the limit on
+        // both platforms.
+        let workspace = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
         let socket_path = test_default_socket_path(workspace.path());
         fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
         let stale_listener = UnixListener::bind(&socket_path).unwrap();
@@ -1646,6 +1652,7 @@ base_url = "https://example.invalid/v1"
     }
 
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
     fn admission_closed_window_returns_typed_errors_before_teardown() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();

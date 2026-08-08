@@ -3116,6 +3116,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "asserts Linux key labels; macOS renders its own keymap and needs a per-platform assertion; #465"
+    )]
     fn renders_shortcuts_overlay_from_styled_platform_keymap() {
         let mut state = TuiState::connected(
             "/tmp/work".into(),

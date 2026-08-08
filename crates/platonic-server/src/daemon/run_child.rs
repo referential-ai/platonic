@@ -1465,7 +1465,7 @@ mod tests {
 
     #[cfg(unix)]
     use crate::{RunLedger, RunOptions, RunSession, app::prepare_run, ledger::SqliteLedger};
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use platonic_core::{EffectClass, ToolCallId};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -2073,6 +2073,7 @@ while :; do :; done
                     },
                 );
                 let result = publish_for_test(result);
+                #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
                 let child_pid = match cancel_trigger {
                     Some(trigger) => trigger.join().unwrap(),
                     None => deadline_ready
