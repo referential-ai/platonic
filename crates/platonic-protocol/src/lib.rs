@@ -12,6 +12,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use serde_json::Value;
 use std::fmt;
 
+mod voice;
+
+pub use voice::{VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope};
+
 /// Provider reasoning effort carried by daemon run overrides.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

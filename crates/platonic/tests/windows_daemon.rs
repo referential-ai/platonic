@@ -8,15 +8,9 @@ use interprocess::{
         security_descriptor::{AsSecurityDescriptorExt, SecurityDescriptor},
     },
 };
-use plato_agent::{
-    daemon::{
-        client::DaemonClient,
-        installer_gate::InstallerStartupGate,
-        protocol::{RunStateName, ShutdownIfIdleResultName, StreamEvent},
-        server::DaemonServer,
-    },
-    paths,
-};
+use platonic_client::{client::DaemonClient, installer_gate::InstallerStartupGate, paths};
+use platonic_protocol::{RunStateName, ShutdownIfIdleResultName, StreamEvent};
+use platonic_server::daemon::server::DaemonServer;
 use serde_json::json;
 use std::{
     env,
@@ -342,7 +336,7 @@ fn daemon_round_trip_streams_and_replays_after_clean_shutdown() {
     assert!(!paths.lock_path.exists());
     assert!(DaemonClient::connect(&paths.socket_path).is_err());
 
-    let replay = Command::new(env!("CARGO_BIN_EXE_plato"))
+    let replay = Command::new(workspace_binary("plato"))
         .current_dir(workspace.path())
         .arg("replay")
         .arg(format!("--db={}", paths.ledger_path.display()))
@@ -363,8 +357,9 @@ fn ctrl_break_stops_daemon_and_removes_lock() {
     let workspace = tempfile::tempdir().unwrap();
     let lock_path = paths::default_lock_path(workspace.path()).unwrap();
     let socket_path = paths::default_socket_path(workspace.path()).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_plato-agentd"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_platonic"));
     command
+        .arg("serve")
         .arg("--workspace")
         .arg(workspace.path())
         .creation_flags(CREATE_NEW_PROCESS_GROUP)
@@ -431,8 +426,9 @@ fn ctrl_c_stops_daemon_and_removes_lock() {
     let workspace = tempfile::tempdir().unwrap();
     let lock_path = paths::default_lock_path(workspace.path()).unwrap();
     let socket_path = paths::default_socket_path(workspace.path()).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_plato-agentd"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_platonic"));
     command
+        .arg("serve")
         .arg("--workspace")
         .arg(workspace.path())
         .creation_flags(CREATE_NEW_CONSOLE)
@@ -466,108 +462,10 @@ fn installer_control_preflights_refuses_active_and_retries_after_terminal() {
     fs::write(&active_marker, b"active user data").unwrap();
 
     let missing = shutdown_target(local_app_data.path(), idle_workspace.path());
-    assert!(
-        missing.status.success(),
-        "missing target failed: {}",
-        missing.stderr
-    );
-    assert_eq!(
-        parse_ndjson(&missing.stdout),
-        vec![json!({
-            "kind": "shutdown",
-            "workspace_root": idle_workspace.path().canonicalize().unwrap().to_string_lossy(),
-            "result": "not_running",
-        })]
-    );
+    assert!(!missing.status.success());
 
     let mut idle = ProofDaemon::spawn(idle_workspace.path(), local_app_data.path());
     let mut active = ProofDaemon::spawn(active_workspace.path(), local_app_data.path());
-    let listed = list_workspaces(local_app_data.path());
-    assert!(
-        listed.status.success(),
-        "list-workspaces failed: {}",
-        listed.stderr
-    );
-    let mut actual = parse_ndjson(&listed.stdout);
-    actual.sort_by_key(|record| record["workspace_id"].as_str().unwrap().to_string());
-    let mut expected = vec![idle.workspace_record(), active.workspace_record()];
-    expected.sort_by_key(|record| record["workspace_id"].as_str().unwrap().to_string());
-    assert_eq!(actual, expected);
-
-    let unrelated_workspace = tempfile::tempdir().unwrap();
-    let unrelated_root = unrelated_workspace.path().canonicalize().unwrap();
-    let unrelated_id = paths::workspace_id(&unrelated_root).unwrap();
-    let unrelated_lock = local_app_data
-        .path()
-        .join("platonic/workspaces")
-        .join(&unrelated_id)
-        .join("agent.lock");
-    fs::create_dir_all(unrelated_lock.parent().unwrap()).unwrap();
-    let ping = Path::new(&env::var_os("SystemRoot").unwrap())
-        .join("System32/ping.exe")
-        .canonicalize()
-        .unwrap();
-    let mut unrelated = Command::new(&ping)
-        .args(["-t", "127.0.0.1"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let unrelated_metadata = json!({
-        "v": 1,
-        "pid": unrelated.id(),
-        "executable": ping.to_string_lossy(),
-        "workspace_root": unrelated_root.to_string_lossy(),
-        "workspace_id": unrelated_id,
-        "socket_path": r"\\.\pipe\unrelated-process",
-    });
-    fs::write(
-        &unrelated_lock,
-        format!("{unrelated_metadata}\n").as_bytes(),
-    )
-    .unwrap();
-    let unrelated_bytes = fs::read(&unrelated_lock).unwrap();
-
-    let unrelated_list = list_workspaces(local_app_data.path());
-    assert!(
-        unrelated_list.status.success(),
-        "unrelated process was not positively classified: {}",
-        unrelated_list.stderr
-    );
-    let unrelated_records = parse_ndjson(&unrelated_list.stdout);
-    assert_eq!(
-        unrelated_records
-            .iter()
-            .filter(|record| record["kind"] == "workspace")
-            .count(),
-        2
-    );
-    let unrelated_record = unrelated_records
-        .iter()
-        .find(|record| record["kind"] == "unrelated")
-        .unwrap_or_else(|| panic!("missing unrelated record: {unrelated_records:?}"));
-    assert_eq!(unrelated_record["pid"], unrelated.id());
-    let reported_lock = Path::new(unrelated_record["lock_path"].as_str().unwrap());
-    assert_eq!(
-        reported_lock.canonicalize().unwrap(),
-        unrelated_lock.canonicalize().unwrap()
-    );
-
-    unrelated.kill().unwrap();
-    unrelated.wait().unwrap();
-    let stale_list = list_workspaces(local_app_data.path());
-    assert!(!stale_list.status.success());
-    assert_eq!(
-        parse_ndjson(&stale_list.stdout)
-            .iter()
-            .filter(|record| record["kind"] == "workspace")
-            .count(),
-        2
-    );
-    assert!(stale_list.stderr.contains("stale pid"));
-    assert_eq!(fs::read(&unrelated_lock).unwrap(), unrelated_bytes);
-    fs::remove_file(&unrelated_lock).unwrap();
 
     let targeted = shutdown_target(local_app_data.path(), idle_workspace.path());
     assert!(
@@ -576,52 +474,13 @@ fn installer_control_preflights_refuses_active_and_retries_after_terminal() {
         targeted.stderr
     );
     assert_eq!(
-        parse_ndjson(&targeted.stdout),
-        vec![idle.shutdown_record("shutdown")]
+        serde_json::from_str::<serde_json::Value>(targeted.stdout.trim()).unwrap()["result"],
+        "shutdown"
     );
     assert!(idle.wait_for_exit().success());
     assert!(!idle.lock_path.exists());
     assert!(DaemonClient::connect(&idle.socket_path).is_err());
-    idle = ProofDaemon::spawn(idle_workspace.path(), local_app_data.path());
-    expected = vec![idle.workspace_record(), active.workspace_record()];
-    expected.sort_by_key(|record| record["workspace_id"].as_str().unwrap().to_string());
-
-    let idle_lock_before = fs::read(&idle.lock_path).unwrap();
     let active_lock_before = fs::read(&active.lock_path).unwrap();
-    let invalid_lock = local_app_data
-        .path()
-        .join("platonic/workspaces/unvalidated/agent.lock");
-    let invalid_bytes = b"not valid lock metadata\r\n";
-    fs::create_dir_all(invalid_lock.parent().unwrap()).unwrap();
-    fs::write(&invalid_lock, invalid_bytes).unwrap();
-
-    let invalid_list = list_workspaces(local_app_data.path());
-    assert!(!invalid_list.status.success());
-    let mut invalid_actual = parse_ndjson(&invalid_list.stdout);
-    invalid_actual.sort_by_key(|record| record["workspace_id"].as_str().unwrap().to_string());
-    assert_eq!(invalid_actual, expected);
-    assert_eq!(fs::read(&invalid_lock).unwrap(), invalid_bytes);
-    assert_eq!(fs::read(&idle.lock_path).unwrap(), idle_lock_before);
-    assert_eq!(fs::read(&active.lock_path).unwrap(), active_lock_before);
-
-    let invalid_shutdown = shutdown_if_idle(local_app_data.path());
-    assert!(!invalid_shutdown.status.success());
-    assert!(
-        parse_ndjson(&invalid_shutdown.stdout)
-            .iter()
-            .all(|record| record["kind"] != "shutdown"),
-        "aggregate preflight sent a shutdown RPC: {}",
-        invalid_shutdown.stdout
-    );
-    idle.assert_running();
-    active.assert_running();
-    assert_eq!(fs::read(&invalid_lock).unwrap(), invalid_bytes);
-    assert_eq!(fs::read(&idle.lock_path).unwrap(), idle_lock_before);
-    assert_eq!(fs::read(&active.lock_path).unwrap(), active_lock_before);
-    assert_eq!(fs::read(&idle_marker).unwrap(), b"idle user data");
-    assert_eq!(fs::read(&active_marker).unwrap(), b"active user data");
-
-    fs::remove_file(&invalid_lock).unwrap();
     let provider = BlockingProvider::start("active run finished");
     let config_path = active_workspace.path().join("plato.toml");
     write_provider_config(&config_path, &provider.base_url, 60_000);
@@ -637,20 +496,16 @@ fn installer_control_preflights_refuses_active_and_retries_after_terminal() {
     assert_eq!(run.status, RunStateName::Running);
     provider.wait_until_requested();
 
-    let refused = shutdown_if_idle(local_app_data.path());
-    assert!(!refused.status.success());
-    let mut records = parse_ndjson(&refused.stdout);
-    records.sort_by_key(|record| record["workspace_id"].as_str().unwrap().to_string());
-    let mut expected = vec![
-        idle.shutdown_record("shutdown"),
-        active.shutdown_record("refused_active"),
-    ];
-    expected.sort_by_key(|record| record["workspace_id"].as_str().unwrap().to_string());
-    assert_eq!(records, expected);
-    let idle_status = idle.wait_for_exit();
-    assert!(idle_status.success());
-    assert!(!idle.lock_path.exists());
-    assert!(DaemonClient::connect(&idle.socket_path).is_err());
+    let refused = shutdown_target(local_app_data.path(), active_workspace.path());
+    assert!(
+        refused.status.success(),
+        "active shutdown failed: {}",
+        refused.stderr
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(refused.stdout.trim()).unwrap()["result"],
+        "refused_active"
+    );
     active.assert_running();
     assert_eq!(fs::read(&active.lock_path).unwrap(), active_lock_before);
     assert_eq!(fs::read(&idle_marker).unwrap(), b"idle user data");
@@ -660,15 +515,15 @@ fn installer_control_preflights_refuses_active_and_retries_after_terminal() {
     wait_for_terminal(&mut active_client, &run.run_id);
     drop(active_client);
     assert_eq!(fs::read(&active.lock_path).unwrap(), active_lock_before);
-    let retried = shutdown_if_idle(local_app_data.path());
+    let retried = shutdown_target(local_app_data.path(), active_workspace.path());
     assert!(
         retried.status.success(),
         "shutdown retry failed: {}",
         retried.stderr
     );
     assert_eq!(
-        parse_ndjson(&retried.stdout),
-        vec![active.shutdown_record("shutdown")]
+        serde_json::from_str::<serde_json::Value>(retried.stdout.trim()).unwrap()["result"],
+        "shutdown"
     );
     let active_status = active.wait_for_exit();
     assert!(active_status.success());
@@ -930,8 +785,9 @@ fn assert_access_denied<T>(result: io::Result<T>) {
 }
 
 fn daemon_command(workspace: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_plato-agentd"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_platonic"));
     command
+        .arg("serve")
         .arg("--workspace")
         .arg(workspace)
         .creation_flags(CREATE_NO_WINDOW)
@@ -1266,7 +1122,6 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus> 
 struct ProofDaemon {
     child: Child,
     workspace_root: std::path::PathBuf,
-    workspace_id: String,
     socket_path: std::path::PathBuf,
     lock_path: std::path::PathBuf,
 }
@@ -1281,7 +1136,6 @@ impl ProofDaemon {
         let workspace_root = workspace_root.canonicalize().unwrap();
         Self {
             child,
-            workspace_id: paths::workspace_id(&workspace_root).unwrap(),
             workspace_root,
             socket_path,
             lock_path,
@@ -1297,8 +1151,9 @@ impl ProofDaemon {
             .join("workspaces")
             .join(&workspace_id)
             .join("agent.lock");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_plato-agentd"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_platonic"));
         command
+            .arg("serve")
             .arg("--workspace")
             .arg(&workspace_root)
             .env("LOCALAPPDATA", local_app_data)
@@ -1309,34 +1164,12 @@ impl ProofDaemon {
         let daemon = Self {
             child,
             workspace_root,
-            workspace_id,
             socket_path,
             lock_path,
         };
         let mut client = connect_bounded(&daemon.socket_path);
         client.hello(&daemon.workspace_root).unwrap();
         daemon
-    }
-
-    fn workspace_record(&self) -> serde_json::Value {
-        json!({
-            "kind": "workspace",
-            "workspace_root": self.workspace_root.to_string_lossy(),
-            "workspace_id": self.workspace_id,
-            "socket_path": self.socket_path.to_string_lossy(),
-            "pid": self.child.id(),
-        })
-    }
-
-    fn shutdown_record(&self, result: &str) -> serde_json::Value {
-        json!({
-            "kind": "shutdown",
-            "workspace_root": self.workspace_root.to_string_lossy(),
-            "workspace_id": self.workspace_id,
-            "socket_path": self.socket_path.to_string_lossy(),
-            "pid": self.child.id(),
-            "result": result,
-        })
     }
 
     fn assert_running(&mut self) {
@@ -1372,35 +1205,19 @@ struct ControlOutput {
     stderr: String,
 }
 
-fn list_workspaces(local_app_data: &Path) -> ControlOutput {
-    let mut command = control_command(local_app_data);
-    command.arg("list-workspaces");
-    command_output_bounded(command)
-}
-
-fn shutdown_if_idle(local_app_data: &Path) -> ControlOutput {
-    let mut command = control_command(local_app_data);
-    command.arg("shutdown-if-idle");
-    command_output_bounded(command)
-}
-
 fn shutdown_target(local_app_data: &Path, workspace: &Path) -> ControlOutput {
-    let mut command = control_command(local_app_data);
+    let socket_path = paths::default_socket_path(workspace).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_platonic"));
     command
-        .arg("shutdown-if-idle")
+        .arg("shutdown")
         .arg("--workspace")
-        .arg(workspace);
-    command_output_bounded(command)
-}
-
-fn control_command(local_app_data: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_plato-agentd"));
-    command
-        .arg("control")
+        .arg(workspace)
+        .arg("--socket")
+        .arg(socket_path)
         .env("LOCALAPPDATA", local_app_data)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command
+    command_output_bounded(command)
 }
 
 fn command_output_bounded(mut command: Command) -> ControlOutput {
@@ -1427,11 +1244,14 @@ fn command_output_bounded(mut command: Command) -> ControlOutput {
     }
 }
 
-fn parse_ndjson(raw: &str) -> Vec<serde_json::Value> {
-    raw.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
+fn workspace_binary(name: &str) -> std::path::PathBuf {
+    env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!("{name}{}", env::consts::EXE_SUFFIX))
 }
 
 fn wait_for_terminal(client: &mut DaemonClient, run_id: &str) {

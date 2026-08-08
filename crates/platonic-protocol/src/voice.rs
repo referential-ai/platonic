@@ -1,9 +1,7 @@
 //! Root-owned durable voice facts, separate from the core harness event schema.
 
-use plato_audio::CaptureReport;
 use platonic_core::{RunId, TurnId};
 use serde::{Deserialize, Deserializer, Serialize, de};
-use sha2::{Digest, Sha256};
 
 /// Revision of the root-owned voice event envelope and payload schema.
 pub const VOICE_EVENT_VERSION: u32 = 1;
@@ -22,7 +20,8 @@ pub struct VoiceEventEnvelope {
 }
 
 impl VoiceEventEnvelope {
-    pub(crate) fn revision_one(sequence: u64, event: VoiceEvent) -> Self {
+    /// Wraps one validated voice event in the current durable envelope.
+    pub fn revision_one(sequence: u64, event: VoiceEvent) -> Self {
         Self {
             v: VOICE_EVENT_VERSION,
             sequence,
@@ -89,24 +88,6 @@ pub enum VoiceEvent {
 }
 
 impl VoiceEvent {
-    pub fn captured(run_id: RunId, turn_id: TurnId, report: &CaptureReport) -> Self {
-        let (transcript_sha256, transcript_bytes) = transcript_identity(&report.transcript.text);
-        Self::VoiceCaptured {
-            run_id,
-            turn_id,
-            transcript_sha256,
-            transcript_bytes,
-            transcript_span_ms: report.transcript.span_ms,
-            input_frames: report.input_frames,
-            output_frames: report.output_frames,
-            vad_start_sample: report.endpoint.start_sample,
-            vad_speech_end_sample: report.endpoint.speech_end_sample,
-            vad_close_sample: report.endpoint.close_sample,
-            vad_close_to_final_us: report.vad_close_to_final_us,
-            normalization_resampling_us: report.normalization_resampling_us,
-        }
-    }
-
     /// Returns the stable run key duplicated by companion SQLite.
     pub fn run_id(&self) -> &RunId {
         match self {
@@ -125,7 +106,8 @@ impl VoiceEvent {
         }
     }
 
-    pub(crate) fn validate(&self) -> Result<(), String> {
+    /// Validates the bounded durable fields carried by this event.
+    pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::VoiceCaptured {
                 transcript_sha256,
@@ -160,14 +142,6 @@ impl VoiceEvent {
     }
 }
 
-fn transcript_identity(transcript: &str) -> (String, u64) {
-    let bytes = transcript.as_bytes();
-    (
-        format!("{:x}", Sha256::digest(bytes)),
-        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-    )
-}
-
 fn deserialize_revision_one<'de, D>(deserializer: D) -> Result<u32, D::Error>
 where
     D: Deserializer<'de>,
@@ -184,6 +158,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn transcript_identity(transcript: &str) -> (String, u64) {
+        let bytes = transcript.as_bytes();
+        (
+            format!("{:x}", Sha256::digest(bytes)),
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        )
+    }
 
     #[test]
     fn revision_one_serialization_is_literal_and_fail_closed() {

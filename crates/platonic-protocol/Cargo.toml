@@ -1,18 +1,21 @@
 [package]
 name = "platonic-protocol"
-version = "0.2.0"
-edition = "2024"
-rust-version = "1.85"
-publish = ["crates-io"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 description = "Sans-IO daemon wire protocol types for Plato Agent."
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/referential-ai/plato-agent"
+license.workspace = true
+repository.workspace = true
 documentation = "https://docs.rs/platonic-protocol"
 readme = "README.md"
 include = ["src/**", "README.md"]
 
 [dependencies]
-platonic-core = "0.3.1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
+platonic-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true

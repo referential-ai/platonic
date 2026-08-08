@@ -32,6 +32,18 @@ pub fn host_lock_path() -> ClientResult<PathBuf> {
         .join("agent.lock"))
 }
 
+/// Returns the default server-owned SQLite ledger path for a workspace.
+///
+/// This path calculation is intentionally available to clients so offline
+/// replay can inspect a ledger without linking or starting the server.
+pub fn default_ledger_path(workspace_root: &Path) -> ClientResult<PathBuf> {
+    Ok(state_home()?
+        .join("platonic")
+        .join("workspaces")
+        .join(workspace_id(workspace_root)?)
+        .join("agent.db"))
+}
+
 /// Returns the default local daemon endpoint for a workspace.
 #[cfg(unix)]
 pub fn default_socket_path(workspace_root: &Path) -> ClientResult<PathBuf> {
@@ -130,6 +142,17 @@ pub fn runtime_home() -> ClientResult<PathBuf> {
     Ok(runtime_home_and_fallback().0)
 }
 
+#[cfg(unix)]
+fn state_home() -> ClientResult<PathBuf> {
+    if let Some(value) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(value));
+    }
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| crate::ClientError::Config("HOME is required for ledger replay".into()))?;
+    Ok(PathBuf::from(home).join(".local").join("state"))
+}
+
 /// Returns the Unix runtime home and whether it is the system-temp fallback.
 #[cfg(unix)]
 pub fn runtime_home_and_fallback() -> (PathBuf, bool) {
@@ -149,6 +172,11 @@ pub fn runtime_home_and_fallback() -> (PathBuf, bool) {
 #[cfg(windows)]
 pub fn runtime_home() -> ClientResult<PathBuf> {
     local_app_data("default daemon runtime path")
+}
+
+#[cfg(windows)]
+fn state_home() -> ClientResult<PathBuf> {
+    local_app_data("default ledger replay path")
 }
 
 #[cfg(windows)]

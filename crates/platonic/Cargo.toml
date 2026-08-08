@@ -1,38 +1,38 @@
 [package]
-name = "platonic-client"
+name = "platonic"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "Bounded daemon client and local IPC transport for Plato Agent."
+description = "Platonic agent server command."
 license.workspace = true
 repository.workspace = true
-documentation = "https://docs.rs/platonic-client"
-readme = "README.md"
-include = ["src/**", "README.md"]
 
 [dependencies]
+clap.workspace = true
+platonic-client.workspace = true
 platonic-protocol.workspace = true
-serde.workspace = true
+platonic-server.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-thiserror.workspace = true
-
-[target.'cfg(unix)'.dependencies]
-rustix.workspace = true
+signal-hook.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+ctrlc.workspace = true
+
+[dev-dependencies]
 interprocess.workspace = true
+platonic-core.workspace = true
+rusqlite.workspace = true
+rustix.workspace = true
+temp-env.workspace = true
+tempfile.workspace = true
 widestring.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Security",
-  "Win32_Security_Authorization",
   "Win32_Storage_FileSystem",
   "Win32_System_Pipes",
   "Win32_System_Threading",
 ] }
-
-[dev-dependencies]
-temp-env.workspace = true
-tempfile.workspace = true

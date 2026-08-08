@@ -139,12 +139,13 @@ pub(crate) fn format_session_readback(session: &ledger::SessionRecords) -> AppRe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ledger::SqliteLedger, voice_session::VoiceEvent};
+    use crate::ledger::SqliteLedger;
     use platonic_core::{
         ActorId, AgentId, ContextPack, EffectClass, HarnessEvent, Message, MessageRole, ModelName,
         ModelUsage, PolicyDecision, ResultVisibility, RunId, ToolCall, ToolCallId, ToolName,
         ToolProposal, ToolResult, TurnId,
     };
+    use platonic_protocol::VoiceEvent;
     use rusqlite::{Connection, params};
     use serde_json::json;
 

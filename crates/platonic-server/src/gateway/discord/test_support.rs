@@ -12,7 +12,7 @@ use super::{
     rest::DiscordRestClient,
     websocket::{DISCORD_INTENTS, DiscordGatewayReceiver, DiscordMessage},
 };
-use crate::{DiscordGatewayTimings, GatewayResult};
+use super::{DiscordGatewayTimings, GatewayResult};
 use platonic_client::client::DaemonConnectionConfig;
 use platonic_protocol::{BufferedStreamEvent, RunOverrides};
 #[cfg(unix)]

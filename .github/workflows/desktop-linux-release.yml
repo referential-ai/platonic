@@ -102,11 +102,11 @@ jobs:
           (cd "$extract" && "$appimage" --appimage-extract >/dev/null)
           bin="$extract/squashfs-root/usr/bin"
           diff -u \
-            <(printf '%s\n' plato-agentd plato-desktop) \
+            <(printf '%s\n' platonic plato-desktop) \
             <(find "$bin" -maxdepth 1 -type f -perm /111 -printf '%f\n' | LC_ALL=C sort)
-          file -b "$bin/plato-agentd" | grep -Eq '^ELF 64-bit .*x86-64'
+          file -b "$bin/platonic" | grep -Eq '^ELF 64-bit .*x86-64'
           file -b "$bin/plato-desktop" | grep -Eq '^ELF 64-bit .*x86-64'
-          "$bin/plato-agentd" --help >/dev/null
+          "$bin/platonic" --help >/dev/null
 
           version="${GITHUB_REF_NAME#plato-desktop-v}"
           asset="Plato-${version}-x86_64.AppImage"

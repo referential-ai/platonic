@@ -1,15 +1,12 @@
 #[cfg(windows)]
-use plato_agent::daemon::installer_gate::InstallerStartupGate;
-use plato_agent::{
-    VoiceEvent,
-    daemon::{client::DaemonClient, lock::LockMetadata, protocol::ShutdownIfIdleResultName},
-    ledger::SqliteLedger,
-    paths,
-};
+use platonic_client::installer_gate::InstallerStartupGate;
+use platonic_client::{client::DaemonClient, lock::LockMetadata, paths};
 use platonic_core::{
     AgentId, ContextPack, HarnessEvent, Message, MessageRole, ModelName, ModelUsage, RecordedEvent,
     RunId, TurnId,
 };
+use platonic_protocol::{ShutdownIfIdleResultName, VoiceEvent};
+use platonic_server::ledger::SqliteLedger;
 use rusqlite::{Connection, params};
 use serde_json::json;
 use std::{
@@ -92,91 +89,11 @@ fn independent_daemon_startups_wait_for_installer_gate_release_once() {
 #[test]
 fn daemon_first_blocks_direct_sqlite_but_allows_jsonl_and_delegated_prompts() {
     let proof = ProofContext::new();
-    let provider = FakeProvider::start(["jsonl answer", "delegated answer", "continued answer"]);
+    ProofDaemon::start(&proof).stop();
+
+    let provider = FakeProvider::start(["delegated answer", "continued answer"]);
     let config_path = proof.workspace.join("plato.toml");
     write_provider_config(&config_path, &provider.base_url);
-    let explicit_db = proof.workspace.join("explicit.db");
-    let daemon = ProofDaemon::start(&proof);
-
-    let direct_cases = [
-        (
-            "default yolo run",
-            vec![
-                "--yolo".into(),
-                "--config".into(),
-                config_path.as_os_str().into(),
-                "blocked default run".into(),
-            ],
-        ),
-        (
-            "explicit run",
-            vec![
-                format!("--db={}", explicit_db.display()).into(),
-                "--config".into(),
-                config_path.as_os_str().into(),
-                "blocked explicit run".into(),
-            ],
-        ),
-        (
-            "default yolo continuation",
-            vec![
-                "--yolo".into(),
-                "-c".into(),
-                "--config".into(),
-                config_path.as_os_str().into(),
-                "blocked default continuation".into(),
-            ],
-        ),
-        (
-            "explicit continuation",
-            vec![
-                format!("--db={}", explicit_db.display()).into(),
-                "-c".into(),
-                "--config".into(),
-                config_path.as_os_str().into(),
-                "blocked explicit continuation".into(),
-            ],
-        ),
-        ("default replay", vec!["replay".into()]),
-        (
-            "explicit replay",
-            vec![
-                "replay".into(),
-                format!("--db={}", explicit_db.display()).into(),
-            ],
-        ),
-    ];
-
-    for (label, arguments) in direct_cases {
-        let output = proof.cli_output(&arguments);
-        assert_lock_conflict(label, &output, daemon.id());
-    }
-    assert!(
-        !explicit_db.exists(),
-        "direct SQLite conflict opened the explicit database"
-    );
-
-    let events_path = proof.workspace.join("events.jsonl");
-    let jsonl_run = proof.cli_output(&[
-        "--events".into(),
-        events_path.as_os_str().into(),
-        "--config".into(),
-        config_path.as_os_str().into(),
-        "jsonl question".into(),
-    ]);
-    assert_success("JSONL run with live daemon", &jsonl_run);
-    assert_eq!(
-        String::from_utf8(jsonl_run.stdout).unwrap(),
-        "jsonl answer\n"
-    );
-
-    let jsonl_replay = proof.cli_output(&["replay".into(), events_path.as_os_str().into()]);
-    assert_success("JSONL replay with live daemon", &jsonl_replay);
-    assert!(
-        String::from_utf8(jsonl_replay.stdout)
-            .unwrap()
-            .contains("assistant: jsonl answer")
-    );
 
     let delegated = proof.cli_output(&[
         "--config".into(),
@@ -202,13 +119,20 @@ fn daemon_first_blocks_direct_sqlite_but_allows_jsonl_and_delegated_prompts() {
     );
 
     let requests = provider.join();
-    assert_eq!(requests.len(), 3);
-    assert!(requests[0].contains("jsonl question"));
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("delegated question"));
     assert!(requests[1].contains("delegated question"));
-    assert!(requests[2].contains("delegated question"));
-    assert!(requests[2].contains("delegated answer"));
-    assert!(requests[2].contains("delegated follow up"));
-    daemon.stop();
+    assert!(requests[1].contains("delegated answer"));
+    assert!(requests[1].contains("delegated follow up"));
+
+    let replay = proof.cli_output(&["replay".into()]);
+    assert_success("offline replay after delegated prompts", &replay);
+    assert!(
+        String::from_utf8(replay.stdout)
+            .unwrap()
+            .contains("continued answer")
+    );
+    proof.stop_host_server();
 }
 
 #[test]
@@ -229,35 +153,40 @@ fn direct_default_run_blocks_daemon_then_releases_normally() {
 
     let request = provider.wait_for_request();
     assert!(request.contains("direct fallback question"));
-    let metadata = wait_for_lock_owner(&proof.lock_path, child.id(), &mut child);
-    assert_eq!(metadata.pid, child.id());
-    assert_daemon_blocked_by_cli(&proof, child.id());
+    let metadata = wait_for_lock(&proof.host_lock_path(), &mut child);
+    assert_ne!(
+        metadata.pid,
+        child.id(),
+        "the client must not own the server lock"
+    );
+    assert!(proof.host_client().is_ok());
 
     provider.finish();
     let output = child.wait_with_output().unwrap();
     assert_success("direct default run", &output);
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "direct answer\n");
 
-    ProofDaemon::start(&proof).stop();
+    proof.stop_host_server();
 }
 
 #[test]
 fn direct_continuation_lookup_holds_lock_and_abrupt_exit_releases_it() {
     let proof = ProofContext::new();
-    let explicit_db = proof.workspace.join("continuation.db");
-    seed_sqlite_session(
-        &explicit_db,
-        "session_1",
-        "run_1",
-        "prior question",
-        "prior answer",
-    );
-    let provider = BlockingProvider::start("follow-up answer");
+    let first_provider = FakeProvider::start(["prior answer"]);
     let config_path = proof.workspace.join("plato.toml");
+    write_provider_config(&config_path, &first_provider.base_url);
+    let first = proof.cli_output(&[
+        "--config".into(),
+        config_path.as_os_str().into(),
+        "prior question".into(),
+    ]);
+    assert_success("initial daemon-backed question", &first);
+    assert_eq!(first_provider.join().len(), 1);
+
+    let provider = BlockingProvider::start("follow-up answer");
     write_provider_config(&config_path, &provider.base_url);
     let mut child = proof
         .plato_command()
-        .arg(format!("--db={}", explicit_db.display()))
         .arg("-c")
         .arg("--config")
         .arg(&config_path)
@@ -271,15 +200,13 @@ fn direct_continuation_lookup_holds_lock_and_abrupt_exit_releases_it() {
     assert!(request.contains("prior question"));
     assert!(request.contains("prior answer"));
     assert!(request.contains("follow-up question"));
-    wait_for_lock_owner(&proof.lock_path, child.id(), &mut child);
-    assert_daemon_blocked_by_cli(&proof, child.id());
+    assert!(proof.host_client().is_ok());
 
     child.kill().unwrap();
     let status = child.wait().unwrap();
     assert!(!status.success(), "killed direct CLI exited successfully");
     provider.finish();
-
-    ProofDaemon::start(&proof).stop();
+    proof.stop_host_server();
 }
 
 #[test]
@@ -299,6 +226,10 @@ fn direct_replay_holds_lock_through_final_stdout() {
     );
     let mut child = proof
         .plato_command()
+        .env(
+            "PLATONIC_BIN",
+            proof.workspace.join("server-binary-removed"),
+        )
         .arg("replay")
         .arg(format!("--db={}", explicit_db.display()))
         .arg("--run")
@@ -308,13 +239,13 @@ fn direct_replay_holds_lock_through_final_stdout() {
         .spawn()
         .unwrap();
 
-    wait_for_lock_owner(&proof.lock_path, child.id(), &mut child);
     thread::sleep(Duration::from_millis(250));
     assert!(
         child.try_wait().unwrap().is_none(),
         "replay exited before its piped final output was drained"
     );
-    assert_daemon_blocked_by_cli(&proof, child.id());
+    assert!(!proof.host_lock_path().exists());
+    assert!(proof.host_client().is_err());
 
     let mut stdout = child.stdout.take().unwrap();
     let reader = thread::spawn(move || {
@@ -333,8 +264,6 @@ fn direct_replay_holds_lock_through_final_stdout() {
     let stdout = String::from_utf8(stdout).unwrap();
     assert!(stdout.contains("BEGIN LARGE REPLAY"));
     assert!(stdout.contains("END LARGE REPLAY"));
-
-    ProofDaemon::start(&proof).stop();
 }
 
 #[test]
@@ -446,6 +375,7 @@ fn selected_run_cli_replays_typed_voice_companion_without_writes() {
 struct ProofContext {
     _root: tempfile::TempDir,
     workspace: PathBuf,
+    #[cfg(windows)]
     lock_path: PathBuf,
     socket_path: PathBuf,
     #[cfg(unix)]
@@ -464,7 +394,7 @@ impl ProofContext {
         let workspace_id = paths::workspace_id(&workspace).unwrap();
 
         #[cfg(unix)]
-        let (lock_path, socket_path, runtime_root, state_root) = {
+        let (socket_path, runtime_root, state_root) = {
             let runtime_root = root.path().join("runtime");
             let state_root = root.path().join("state");
             let workspace_runtime = runtime_root
@@ -472,7 +402,6 @@ impl ProofContext {
                 .join("workspaces")
                 .join(&workspace_id);
             (
-                workspace_runtime.join("agent.lock"),
                 workspace_runtime.join("agent.sock"),
                 runtime_root,
                 state_root,
@@ -496,6 +425,7 @@ impl ProofContext {
         Self {
             _root: root,
             workspace,
+            #[cfg(windows)]
             lock_path,
             socket_path,
             #[cfg(unix)]
@@ -518,15 +448,17 @@ impl ProofContext {
     }
 
     fn plato_command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_plato"));
+        let mut command = Command::new(workspace_binary("plato"));
+        command.env("PLATONIC_BIN", env!("CARGO_BIN_EXE_platonic"));
         command.current_dir(&self.workspace);
         self.apply_environment(&mut command);
         command
     }
 
     fn daemon_command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_plato-agentd"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_platonic"));
         command
+            .arg("serve")
             .arg("--workspace")
             .arg(&self.workspace)
             .stdout(Stdio::null())
@@ -538,6 +470,83 @@ impl ProofContext {
     fn cli_output(&self, arguments: &[OsString]) -> Output {
         self.plato_command().args(arguments).output().unwrap()
     }
+
+    fn host_lock_path(&self) -> PathBuf {
+        #[cfg(unix)]
+        {
+            self.runtime_root
+                .join("platonic")
+                .join("host")
+                .join("agent.lock")
+        }
+        #[cfg(windows)]
+        {
+            self.local_app_data
+                .join("platonic")
+                .join("host")
+                .join("agent.lock")
+        }
+    }
+
+    fn host_socket_path(&self) -> PathBuf {
+        #[cfg(unix)]
+        {
+            self.runtime_root
+                .join("platonic")
+                .join("host")
+                .join("agent.sock")
+        }
+        #[cfg(windows)]
+        {
+            PathBuf::from(r"\\.\pipe\plato-agent-host")
+        }
+    }
+
+    fn host_client(&self) -> Result<DaemonClient, platonic_client::ClientError> {
+        let mut client = DaemonClient::connect_with_timeout(
+            &self.host_socket_path(),
+            Duration::from_millis(200),
+        )?;
+        client.hello(&self.workspace)?;
+        Ok(client)
+    }
+
+    fn stop_host_server(&self) {
+        let deadline = Instant::now() + PROOF_TIMEOUT;
+        while Instant::now() < deadline {
+            match self.host_client() {
+                Ok(mut client) => {
+                    let result = client.shutdown_if_idle().unwrap().result;
+                    drop(client);
+                    if result == ShutdownIfIdleResultName::Shutdown {
+                        while Instant::now() < deadline {
+                            if self.host_client().is_err() {
+                                return;
+                            }
+                            thread::sleep(POLL_INTERVAL);
+                        }
+                        break;
+                    }
+                }
+                Err(_) => return,
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        panic!(
+            "host server did not stop at {}",
+            self.host_socket_path().display()
+        );
+    }
+}
+
+fn workspace_binary(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
 
 struct ProofDaemon {
@@ -602,6 +611,7 @@ impl ProofDaemon {
         }
     }
 
+    #[cfg(windows)]
     fn id(&self) -> u32 {
         self.child.as_ref().unwrap().id()
     }
@@ -718,33 +728,6 @@ impl Drop for BlockingProvider {
     }
 }
 
-fn assert_daemon_blocked_by_cli(proof: &ProofContext, cli_pid: u32) {
-    let output = proof.daemon_command().output().unwrap();
-    assert_lock_conflict("daemon startup", &output, cli_pid);
-}
-
-fn assert_lock_conflict(label: &str, output: &Output, owner_pid: u32) {
-    assert!(
-        !output.status.success(),
-        "{label} unexpectedly succeeded:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("daemon lock held"),
-        "{label} did not report the workspace lock:\n{stderr}"
-    );
-    assert!(
-        stderr.contains(&format!("pid={owner_pid}")),
-        "{label} did not report owner pid {owner_pid}:\n{stderr}"
-    );
-    assert!(
-        output.stdout.is_empty(),
-        "{label} wrote stdout before failing"
-    );
-}
-
 fn assert_success(label: &str, output: &Output) {
     assert!(
         output.status.success(),
@@ -754,12 +737,11 @@ fn assert_success(label: &str, output: &Output) {
     );
 }
 
-fn wait_for_lock_owner(lock_path: &Path, expected_pid: u32, child: &mut Child) -> LockMetadata {
+fn wait_for_lock(lock_path: &Path, child: &mut Child) -> LockMetadata {
     let deadline = Instant::now() + PROOF_TIMEOUT;
     loop {
         if let Ok(raw) = fs::read_to_string(lock_path)
             && let Ok(metadata) = serde_json::from_str::<LockMetadata>(raw.trim())
-            && metadata.pid == expected_pid
         {
             return metadata;
         }

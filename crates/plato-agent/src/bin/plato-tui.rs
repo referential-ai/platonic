@@ -7,13 +7,13 @@ use std::path::PathBuf;
 #[command(about = "Plato Agent terminal client")]
 #[command(version = platonic_protocol::BUILD_IDENTITY)]
 struct Cli {
-    #[arg(long, default_value = ".", help = "Workspace served by plato-agentd")]
+    #[arg(long, default_value = ".", help = "Workspace served by platonic")]
     workspace: PathBuf,
 
     #[arg(
         long,
         value_name = "PATH",
-        help = "Daemon endpoint printed by plato-agentd"
+        help = "Server endpoint printed by platonic serve"
     )]
     socket: Option<PathBuf>,
 

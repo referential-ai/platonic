@@ -1,5 +1,5 @@
 use super::commands::{DiscordCommandHandler, InteractionCreateEvent, parse_snowflake};
-use crate::{GatewayError, GatewayResult};
+use super::{GatewayError, GatewayResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -396,10 +396,9 @@ fn set_read_timeout(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::test_support::*;
+    use super::super::test_support::*;
     #[cfg(unix)]
-    use crate::{
+    use super::super::{
         DiscordPlatform,
         commands::{
             DISCORD_APPLICATION_COMMAND, DISCORD_CHAT_INPUT_COMMAND,
@@ -409,6 +408,7 @@ mod tests {
             DISCORD_STATUS_DESCRIPTION, DISCORD_STRING_OPTION, reasoning_choices,
         },
     };
+    use super::*;
     use serde_json::json;
     use std::{
         net::TcpListener,
@@ -575,7 +575,7 @@ mod tests {
             &rest.base_url,
             "test-token".into(),
             commands,
-            crate::DiscordGatewayTimings::default(),
+            super::super::DiscordGatewayTimings::default(),
         )
         .unwrap();
         let message = platform

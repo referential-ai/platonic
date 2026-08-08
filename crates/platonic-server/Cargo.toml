@@ -1,32 +1,31 @@
 [package]
 name = "platonic-server"
-version = "0.2.0"
-edition = "2024"
-rust-version = "1.88"
-publish = ["crates-io"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 description = "Platonic agent server: workspaces, agents, threads, tools, providers, ledger, policy, approvals, and protocol."
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/referential-ai/plato-agent"
+license.workspace = true
+repository.workspace = true
 documentation = "https://docs.rs/platonic-server"
 readme = "README.md"
 
 [dependencies]
-html2text = "0.17.1"
-plato-audio = { version = "0.2.0", path = "../plato-audio" }
-plato-gateway-discord = { version = "0.2.0", path = "../plato-gateway-discord" }
-platonic-client = { version = "0.2.0", path = "../platonic-client" }
-platonic-core = "0.3.1"
-platonic-protocol = { version = "0.2.0", path = "../platonic-protocol" }
-rusqlite = { version = "0.39", features = ["bundled"] }
-rustix = { version = "1", features = ["event", "fs", "net", "process", "time"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-thiserror = "2"
-toml = "0.9"
-ureq = { version = "2", features = ["json"] }
-url = "2.5.8"
+html2text.workspace = true
+platonic-client.workspace = true
+platonic-core.workspace = true
+platonic-protocol.workspace = true
+rusqlite.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tungstenite.workspace = true
+ureq.workspace = true
+url.workspace = true
 
 [dev-dependencies]
-temp-env = "0.3"
-tempfile = "3"
+temp-env.workspace = true
+tempfile.workspace = true

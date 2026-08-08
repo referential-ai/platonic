@@ -1,4 +1,4 @@
-//! Bounded client calls and local IPC transport for `plato-agentd`.
+//! Bounded client calls and local IPC transport for `platonic serve`.
 //!
 //! This crate owns daemon connection mechanics, request deadlines, endpoint
 //! discovery, lock metadata, and the Windows installer startup gate. Daemon

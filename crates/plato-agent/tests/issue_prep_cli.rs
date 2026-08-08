@@ -3,11 +3,14 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -15,12 +18,13 @@ const PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
 fn cli_fake_provider_writes_candidate_artifacts_in_order_and_rejects_reuse() {
     let provider = FakeProvider::start(candidate_responses());
     let workspace = tempfile::tempdir().unwrap();
+    let environment = CliEnvironment::new(workspace.path());
     let config_path = workspace.path().join("test-plato.toml");
     write_config(&config_path, &provider.base_url);
     let run_dir = workspace.path().join("run");
     let input = "Turn this rough request into a bounded implementation issue.";
 
-    let output = run_cli(workspace.path(), &config_path, &run_dir, input);
+    let output = run_cli(&environment, &config_path, &run_dir, input);
 
     assert!(
         output.status.success(),
@@ -77,7 +81,7 @@ fn cli_fake_provider_writes_candidate_artifacts_in_order_and_rejects_reuse() {
     assert!(request_prompt(&requests[2]).starts_with("# Stage: Review"));
 
     let before = fs::read(run_dir.join("40-candidate.md")).unwrap();
-    let repeated = run_cli(workspace.path(), &config_path, &run_dir, input);
+    let repeated = run_cli(&environment, &config_path, &run_dir, input);
     assert!(!repeated.status.success());
     assert!(String::from_utf8_lossy(&repeated.stderr).contains("requires a new run directory"));
     assert_eq!(fs::read(run_dir.join("40-candidate.md")).unwrap(), before);
@@ -87,16 +91,12 @@ fn cli_fake_provider_writes_candidate_artifacts_in_order_and_rejects_reuse() {
 fn cli_fake_provider_structural_failure_blocks_before_refinement() {
     let provider = FakeProvider::start(vec!["not json".into()]);
     let workspace = tempfile::tempdir().unwrap();
+    let environment = CliEnvironment::new(workspace.path());
     let config_path = workspace.path().join("test-plato.toml");
     write_config(&config_path, &provider.base_url);
     let run_dir = workspace.path().join("run");
 
-    let output = run_cli(
-        workspace.path(),
-        &config_path,
-        &run_dir,
-        "Prepare this issue.",
-    );
+    let output = run_cli(&environment, &config_path, &run_dir, "Prepare this issue.");
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("blocked at prepare"));
@@ -120,13 +120,13 @@ fn cli_help_contains_only_the_start_execution_path() {
 }
 
 fn run_cli(
-    workspace: &Path,
+    environment: &CliEnvironment,
     config_path: &Path,
     run_dir: &Path,
     input: &str,
 ) -> std::process::Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_plato"))
-        .current_dir(workspace)
+    let mut command = environment.command(env!("CARGO_BIN_EXE_plato"));
+    let mut child = command
         .arg("--config")
         .arg(config_path)
         .args(["issue-prep", "start"])
@@ -144,6 +144,66 @@ fn run_cli(
         .write_all(input.as_bytes())
         .unwrap();
     child.wait_with_output().unwrap()
+}
+
+struct CliEnvironment {
+    workspace: PathBuf,
+    runtime: PathBuf,
+    state: PathBuf,
+    home: PathBuf,
+}
+
+impl CliEnvironment {
+    fn new(workspace: &Path) -> Self {
+        let environment = Self {
+            workspace: workspace.to_path_buf(),
+            runtime: workspace.join(".runtime"),
+            state: workspace.join(".state"),
+            home: workspace.join(".home"),
+        };
+        for directory in [&environment.runtime, &environment.state, &environment.home] {
+            fs::create_dir(directory).unwrap();
+            #[cfg(unix)]
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        environment
+    }
+
+    fn command(&self, binary: impl AsRef<Path>) -> Command {
+        let mut command = Command::new(binary.as_ref());
+        command
+            .current_dir(&self.workspace)
+            .env("PLATONIC_BIN", workspace_binary("platonic"))
+            .env("HOME", &self.home);
+        #[cfg(unix)]
+        command
+            .env("XDG_RUNTIME_DIR", &self.runtime)
+            .env("XDG_STATE_HOME", &self.state);
+        #[cfg(windows)]
+        command.env("LOCALAPPDATA", &self.state);
+        command
+    }
+}
+
+impl Drop for CliEnvironment {
+    fn drop(&mut self) {
+        let _ = self
+            .command(workspace_binary("platonic"))
+            .args(["shutdown", "--workspace", "."])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+fn workspace_binary(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn validation_kind(path: &Path) -> String {

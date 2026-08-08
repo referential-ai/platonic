@@ -1,13 +1,10 @@
 #![cfg(unix)]
 
-use plato_agent::{
-    daemon::protocol::{
-        ERROR_LAGGED, Envelope, EnvelopeKind, PROTOCOL_VERSION, RunStateName,
-        ShutdownIfIdleResultName,
-    },
-    paths,
-};
 use platonic_client::client::{DaemonClient, DaemonConnectionConfig};
+use platonic_client::paths;
+use platonic_protocol::{
+    ERROR_LAGGED, Envelope, EnvelopeKind, PROTOCOL_VERSION, RunStateName, ShutdownIfIdleResultName,
+};
 use pty_process::{
     Size,
     blocking::{Command, Pty, open},
@@ -1156,7 +1153,8 @@ impl SessionGrantWorkspaceDaemon {
         stderr_path: PathBuf,
     ) -> Self {
         let stderr = File::create(&stderr_path).unwrap();
-        let child = std::process::Command::new(env!("CARGO_BIN_EXE_plato-agentd"))
+        let child = std::process::Command::new(workspace_binary("platonic"))
+            .arg("serve")
             .arg("--workspace")
             .arg(workspace)
             .current_dir(workspace)
@@ -1262,6 +1260,16 @@ impl SessionGrantWorkspaceDaemon {
         let _ = child.kill();
         child.wait().ok().map(|status| (status, forced_cleanup))
     }
+}
+
+fn workspace_binary(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
 
 impl Drop for SessionGrantWorkspaceDaemon {

@@ -4,8 +4,8 @@ set -Eeuo pipefail
 umask 077
 
 readonly PROGRAM="${0##*/}"
-readonly -a BUILD_BINARIES=(plato plato-agentd plato-tui)
-readonly -a INSTALL_BINARIES=(plato-real plato-agentd-real plato-tui-real)
+readonly -a BUILD_BINARIES=(plato platonic plato-tui)
+readonly -a INSTALL_BINARIES=(plato-real platonic-real plato-tui-real)
 
 stage_dir=""
 proof_root=""
@@ -284,7 +284,8 @@ import time
 runtime_root, installed_daemon = sys.argv[1:]
 uid = os.getuid()
 installed_daemon = os.path.abspath(installed_daemon)
-workspaces = os.path.join(runtime_root, "plato-agent", "workspaces")
+host_directory = os.path.join(runtime_root, "platonic", "host")
+host_lock = os.path.join(host_directory, "agent.lock")
 maximum_lock_bytes = 16 * 1024
 
 def fail(message):
@@ -351,18 +352,15 @@ def request(stream, request_id, method, params=None):
     stream.sendall(json.dumps(payload, separators=(",", ":")).encode() + b"\n")
     return read_response(stream, request_id, method)
 
-if not os.path.exists(workspaces):
+if not os.path.exists(host_lock):
     print("old daemon not running")
     raise SystemExit(0)
-workspace_stat = os.lstat(workspaces)
-if not stat.S_ISDIR(workspace_stat.st_mode) or workspace_stat.st_uid != uid:
-    fail(f"daemon workspace namespace has invalid ownership: {workspaces}")
+host_stat = os.lstat(host_directory)
+if not stat.S_ISDIR(host_stat.st_mode) or host_stat.st_uid != uid or stat.S_IMODE(host_stat.st_mode) != 0o700:
+    fail(f"daemon host namespace has invalid type, ownership, or mode: {host_directory}")
 
 live = []
-for entry in sorted(os.scandir(workspaces), key=lambda item: item.name):
-    if not entry.is_dir(follow_symlinks=False):
-        continue
-    lock_path = os.path.join(entry.path, "agent.lock")
+for lock_path in [host_lock]:
     try:
         lock_stat = os.lstat(lock_path)
     except FileNotFoundError:
@@ -395,15 +393,8 @@ for entry in sorted(os.scandir(workspaces), key=lambda item: item.name):
     pid = metadata.get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         fail(f"daemon lock pid is invalid: {lock_path}")
-    workspace_root = metadata.get("workspace_root")
-    if not isinstance(workspace_root, str) or not os.path.isabs(workspace_root):
-        fail(f"daemon workspace_root is invalid: {lock_path}")
-    canonical_workspace = os.path.realpath(workspace_root)
-    if canonical_workspace != workspace_root or not os.path.isdir(canonical_workspace):
-        fail(f"daemon workspace_root is not an existing canonical directory: {workspace_root}")
-    expected_workspace_id = workspace_id(canonical_workspace)
-    if metadata.get("workspace_id") != expected_workspace_id or entry.name != expected_workspace_id:
-        fail(f"daemon workspace identity mismatch: {lock_path}")
+    if metadata.get("workspace_root") != "host" or metadata.get("workspace_id") != "host":
+        fail(f"daemon host identity mismatch: {lock_path}")
     executable = metadata.get("executable")
     if not isinstance(executable, str) or not os.path.isabs(executable):
         fail(f"daemon executable identity is missing: {lock_path}")
@@ -431,6 +422,8 @@ for entry in sorted(os.scandir(workspaces), key=lambda item: item.name):
     peer_pid, peer_uid, _ = struct.unpack("3i", stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
     if peer_pid != pid or peer_uid != uid:
         fail(f"installed daemon peer identity mismatch: pid={peer_pid} uid={peer_uid}")
+    canonical_workspace = os.path.realpath(os.path.dirname(installed_daemon))
+    expected_workspace_id = workspace_id(canonical_workspace)
     hello = request(stream, f"deploy_hello_{pid}", "hello", {
         "workspace_root": canonical_workspace,
         "workspace_id": expected_workspace_id,
@@ -605,7 +598,7 @@ done
 readonly install_parent="$HOME/.local/lib"
 readonly install_dir="$install_parent/plato-agent"
 readonly rollback_dir="$install_parent/plato-agent.rollback"
-readonly installed_daemon="$install_dir/plato-agentd-real"
+readonly installed_daemon="$install_dir/platonic-real"
 readonly runtime_root="${XDG_RUNTIME_DIR:-/tmp/plato-agent-$(id -u)}"
 
 if [[ "$mode" == "rollback" ]]; then
@@ -682,10 +675,11 @@ printf 'build: commit=%s date=%s\n' "$source_commit" "$build_date"
 PLATO_BUILD_IDENTITY="$build_identity" cargo build \
   --manifest-path "$repo_root/Cargo.toml" \
   --package plato-agent \
+  --package platonic \
   --locked \
   --release \
   --bin plato \
-  --bin plato-agentd \
+  --bin platonic \
   --bin plato-tui
 
 fetch_develop
@@ -756,7 +750,7 @@ proof_socket="$proof_root/runtime/proof.sock"
     PATH="$PATH" \
     XDG_RUNTIME_DIR="$proof_root/runtime" \
     XDG_STATE_HOME="$proof_root/state" \
-    "$installed_daemon" --workspace "$proof_root/workspace" --socket "$proof_socket"
+    "$installed_daemon" serve --workspace "$proof_root/workspace" --socket "$proof_socket"
 ) >"$proof_root/daemon.stdout" 2>"$proof_root/daemon.stderr" &
 proof_pid=$!
 

@@ -1,24 +1,18 @@
-use plato_agent::{
-    ApprovalMode, RunLedger, RunOptions, RunSession,
-    daemon::{
-        client::{ClientError, DaemonClient},
-        protocol::{
-            BufferedThreadEvent, CAPABILITY_THREAD_AUTHORITY, CAPABILITY_THREAD_EVENTS,
-            CAPABILITY_THREAD_LIST, CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_SPAWN,
-            CAPABILITY_THREAD_STATUS, CAPABILITY_THREAD_STOP, ERROR_NOT_FOUND, ReasoningEffort,
-            RunStateName, ShutdownIfIdleResultName, StreamEvent, ThreadApprovalPolicy,
-            ThreadSendRejectedReason, ThreadSendResult, ThreadSpawnDecision, ThreadSpawnResult,
-            ThreadStopResult,
-        },
-    },
-    ledger::SqliteLedger,
-    paths, run_question,
-};
+use platonic_client::{ClientError, client::DaemonClient, paths};
 use platonic_core::{
     ActorId, AgentId, ContextPack, EffectClass, HarnessEvent, Message, MessageRole, ModelName,
     ModelUsage, PolicyDecision, ReadbackEntry, RecordedEvent, ResultVisibility, RunId, RunPhase,
     RunReadback, ToolCall, ToolCallId, ToolName, ToolProposal, ToolResult, TurnId,
 };
+use platonic_protocol::{
+    BufferedThreadEvent, CAPABILITY_THREAD_AUTHORITY, CAPABILITY_THREAD_EVENTS,
+    CAPABILITY_THREAD_LIST, CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_SPAWN,
+    CAPABILITY_THREAD_STATUS, CAPABILITY_THREAD_STOP, ERROR_NOT_FOUND, ReasoningEffort,
+    RunStateName, ShutdownIfIdleResultName, StreamEvent, ThreadApprovalPolicy,
+    ThreadSendRejectedReason, ThreadSendResult, ThreadSpawnDecision, ThreadSpawnResult,
+    ThreadStopResult,
+};
+use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
@@ -43,6 +37,30 @@ const PROOF_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const REQUESTS_PER_LEG: usize = 2;
 static SCENARIO_SERIAL: Mutex<()> = Mutex::new(());
+
+fn read_sqlite_run(path: &Path, run_id: &str) -> Vec<RecordedEvent> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT seq, occurred_at_ms, event_json
+             FROM ledger_events WHERE run_id = ?1 ORDER BY seq ASC",
+        )
+        .unwrap();
+    statement
+        .query_map(params![run_id], |row| {
+            let seq = u64::try_from(row.get::<_, i64>(0)?).unwrap();
+            let occurred_at_ms = u64::try_from(row.get::<_, i64>(1)?).unwrap();
+            let event = serde_json::from_str(&row.get::<_, String>(2)?).unwrap();
+            Ok(RecordedEvent {
+                seq,
+                occurred_at_ms,
+                event,
+            })
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
 
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
@@ -74,28 +92,17 @@ fn child_and_embedded_provider_failure_have_identical_ordered_events() {
         write_provider_config(&embedded.config_path, &provider.base_url);
         write_provider_config(&child.config_path, &provider.base_url);
 
-        let embedded_run_id = RunId::new("run_embedded_failure").unwrap();
-        let result = run_question(RunOptions {
-            question: "fail this run".into(),
-            config_path: Some(PathBuf::from("plato.toml")),
-            overrides: Default::default(),
-            ledger: RunLedger::Sqlite(embedded.ledger_path.clone()),
-            workspace_root: embedded.workspace.clone(),
-            approval_mode: ApprovalMode::Deny { actor: "test" },
-            run_id: Some(embedded_run_id.clone()),
-            session: Some(RunSession::Fresh {
-                session_id: "session_embedded_failure".into(),
-            }),
-            event_sender: None,
-            stream_to_stderr: false,
-            cancel: None,
-            voice_interruption_context: None,
-        });
-        assert!(result.is_err());
-        let embedded_records = SqliteLedger::open_readonly(&embedded.ledger_path)
-            .unwrap()
-            .read_run(embedded_run_id.as_str())
+        let embedded_daemon = ProofDaemon::start_host(&embedded);
+        let mut embedded_client = embedded_daemon.connect();
+        let embedded_run = embedded_client
+            .run_start("fail this run".into(), Some("plato.toml".into()), false)
             .unwrap();
+        assert_eq!(
+            wait_for_terminal_status(&mut embedded_client, &embedded_run.run_id),
+            RunStateName::Failed
+        );
+        let embedded_records = read_sqlite_run(&embedded.ledger_path, &embedded_run.run_id);
+        embedded_daemon.stop(embedded_client);
 
         let daemon = ProofDaemon::start(&child);
         let mut client = daemon.connect();
@@ -106,10 +113,7 @@ fn child_and_embedded_provider_failure_have_identical_ordered_events() {
             wait_for_terminal_status(&mut client, &child_run.run_id),
             RunStateName::Failed
         );
-        let child_records = SqliteLedger::open_readonly(&child.ledger_path)
-            .unwrap()
-            .read_run(&child_run.run_id)
-            .unwrap();
+        let child_records = read_sqlite_run(&child.ledger_path, &child_run.run_id);
 
         assert_eq!(
             normalize_records(&embedded_records),
@@ -229,44 +233,26 @@ fn child_and_embedded_cancellation_with_key() {
     write_provider_config(&embedded.config_path, &provider.base_url);
     write_provider_config(&child.config_path, &provider.base_url);
 
-    let embedded_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let embedded_run_id = RunId::new("run_embedded_cancel").unwrap();
-    let embedded_run_id_for_worker = embedded_run_id.clone();
-    let embedded_cancel_for_worker = embedded_cancel.clone();
-    let embedded_workspace = embedded.workspace.clone();
-    let embedded_ledger = embedded.ledger_path.clone();
-    let (outcome_sender, outcome_receiver) = mpsc::channel();
-    let embedded_worker = thread::spawn(move || {
-        let outcome = run_question(RunOptions {
-            question: "cancel this run".into(),
-            config_path: Some(PathBuf::from("plato.toml")),
-            overrides: Default::default(),
-            ledger: RunLedger::Sqlite(embedded_ledger),
-            workspace_root: embedded_workspace,
-            approval_mode: ApprovalMode::Deny { actor: "test" },
-            run_id: Some(embedded_run_id_for_worker),
-            session: Some(RunSession::Fresh {
-                session_id: "session_embedded_cancel".into(),
-            }),
-            event_sender: None,
-            stream_to_stderr: false,
-            cancel: Some(embedded_cancel_for_worker),
-            voice_interruption_context: None,
-        });
-        outcome_sender.send(outcome).unwrap();
-    });
-    assert_eq!(provider.requested.recv_timeout(PROOF_TIMEOUT).unwrap(), 0);
-    embedded_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-    assert!(matches!(
-        outcome_receiver.recv_timeout(PROOF_TIMEOUT).unwrap(),
-        Err(plato_agent::AppError::RunCanceled)
-    ));
-    provider.release.send(()).unwrap();
-    embedded_worker.join().unwrap();
-    let embedded_records = SqliteLedger::open_readonly(&embedded.ledger_path)
-        .unwrap()
-        .read_run(embedded_run_id.as_str())
+    let embedded_daemon = ProofDaemon::start_host(&embedded);
+    let mut embedded_client = embedded_daemon.connect();
+    let embedded_run = embedded_client
+        .run_start("cancel this run".into(), Some("plato.toml".into()), false)
         .unwrap();
+    assert_eq!(provider.requested.recv_timeout(PROOF_TIMEOUT).unwrap(), 0);
+    assert_eq!(
+        embedded_client
+            .run_cancel(&embedded_run.run_id)
+            .unwrap()
+            .status,
+        RunStateName::CancelRequested
+    );
+    assert_eq!(
+        wait_for_terminal_status(&mut embedded_client, &embedded_run.run_id),
+        RunStateName::Canceled
+    );
+    provider.release.send(()).unwrap();
+    let embedded_records = read_sqlite_run(&embedded.ledger_path, &embedded_run.run_id);
+    embedded_daemon.stop(embedded_client);
 
     let daemon = ProofDaemon::start(&child);
     let mut client = daemon.connect();
@@ -283,10 +269,7 @@ fn child_and_embedded_cancellation_with_key() {
         RunStateName::Canceled
     );
     provider.release.send(()).unwrap();
-    let child_records = SqliteLedger::open_readonly(&child.ledger_path)
-        .unwrap()
-        .read_run(&child_run.run_id)
-        .unwrap();
+    let child_records = read_sqlite_run(&child.ledger_path, &child_run.run_id);
 
     assert_eq!(
         normalize_records(&embedded_records),
@@ -1226,16 +1209,34 @@ fn run_direct_leg(proof: &ProofContext, scenario: Scenario) -> RunEvidence {
         .to_owned();
     assert_eq!(answer, scenario.answer());
 
-    let records = SqliteLedger::open_readonly(&proof.ledger_path)
-        .unwrap()
-        .read_run(&run_id)
-        .unwrap();
+    let records = read_sqlite_run(&proof.ledger_path, &run_id);
     assert!(
         records
             .iter()
             .all(|record| record.event.run_id().as_str() == run_id)
     );
-    RunEvidence::from_leg(records, answer, fs::read(&proof.fixture_path).unwrap())
+    let evidence = RunEvidence::from_leg(records, answer, fs::read(&proof.fixture_path).unwrap());
+    stop_host_server(proof);
+    evidence
+}
+
+fn stop_host_server(proof: &ProofContext) {
+    let socket_path = proof.host_socket_path();
+    let mut client = DaemonClient::connect(&socket_path).unwrap();
+    client.hello(&proof.workspace).unwrap();
+    assert_eq!(
+        client.shutdown_if_idle().unwrap().result,
+        ShutdownIfIdleResultName::Shutdown
+    );
+    drop(client);
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    while Instant::now() < deadline {
+        if DaemonClient::connect_with_timeout(&socket_path, Duration::from_millis(50)).is_err() {
+            return;
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+    panic!("host server did not stop at {}", socket_path.display());
 }
 
 fn run_daemon_leg(
@@ -1298,10 +1299,7 @@ fn run_daemon_leg(
     assert_eq!(transcript.status, RunStateName::Finished);
     let answer = transcript.final_answer.unwrap();
     assert_eq!(answer, scenario.answer());
-    let records = SqliteLedger::open_readonly(&proof.ledger_path)
-        .unwrap()
-        .read_run(&started.run_id)
-        .unwrap();
+    let records = read_sqlite_run(&proof.ledger_path, &started.run_id);
     RunEvidence::from_leg(records, answer, fs::read(&proof.fixture_path).unwrap())
 }
 
@@ -1550,7 +1548,7 @@ fn assert_approval_transport(
             assert_eq!(
                 approval_snapshots(direct),
                 [ApprovalSnapshot::Granted {
-                    actor: "stdin".into()
+                    actor: "daemon".into()
                 }]
             );
             assert_eq!(
@@ -1564,7 +1562,7 @@ fn assert_approval_transport(
             assert_eq!(
                 approval_snapshots(direct),
                 [ApprovalSnapshot::Denied {
-                    actor: "stdin".into(),
+                    actor: "daemon".into(),
                     reason: DENIAL_REASON.into()
                 }]
             );
@@ -1790,15 +1788,17 @@ impl ProofContext {
     }
 
     fn plato_command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_plato"));
+        let mut command = Command::new(workspace_binary("plato"));
+        command.env("PLATONIC_BIN", workspace_binary("platonic"));
         command.current_dir(&self.workspace);
         self.apply_environment(&mut command);
         command
     }
 
     fn daemon_command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_plato-agentd"));
+        let mut command = Command::new(workspace_binary("platonic"));
         command
+            .arg("serve")
             .arg("--workspace")
             .arg(&self.workspace)
             .stdout(Stdio::null())
@@ -1808,9 +1808,9 @@ impl ProofContext {
     }
 
     fn host_daemon_command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_plato-agentd"));
+        let mut command = Command::new(workspace_binary("platonic"));
         command
-            .arg("--host")
+            .arg("serve")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         self.apply_environment(&mut command);
@@ -1829,6 +1829,16 @@ impl ProofContext {
             "{stage}: daemon socket unexpectedly exists"
         );
     }
+}
+
+fn workspace_binary(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
 
 struct ProofDaemon {

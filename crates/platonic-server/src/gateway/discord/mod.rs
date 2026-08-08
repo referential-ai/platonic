@@ -1,13 +1,13 @@
-//! Discord REST, WebSocket, command, and daemon-bridge runtime for Plato Agent.
+//! Discord REST, WebSocket, command, and daemon-bridge runtime for Platonic.
 //!
-//! The root `plato-agent` package owns configuration admission and installed
-//! binary composition. This crate consumes one resolved runtime configuration
-//! and connects only to an already-running `plato-agentd`.
+//! The server owns gateway configuration admission and connects the gateway
+//! runtime to an already-running Platonic endpoint.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 mod commands;
+mod config;
 mod daemon_bridge;
 mod error;
 mod rest;
@@ -15,6 +15,7 @@ mod rest;
 mod test_support;
 mod websocket;
 
+pub use config::{DiscordGatewayOptions, run_discord_gateway};
 pub use daemon_bridge::preflight_discord_gateway_daemon;
 pub use error::{GatewayError, GatewayResult};
 
@@ -140,7 +141,7 @@ impl DiscordGatewayRuntimeConfig {
 }
 
 /// Runs the Discord gateway against an already-running Plato Agent daemon.
-pub fn run_discord_gateway(config: DiscordGatewayRuntimeConfig) -> GatewayResult<()> {
+fn run_runtime(config: DiscordGatewayRuntimeConfig) -> GatewayResult<()> {
     preflight_discord_gateway_daemon(&config.daemon, config.timings.daemon_client_timeout)?;
     let overrides = Arc::new(Mutex::new(HashMap::new()));
     let allowed_channel_ids = config.channel_config_paths.keys().copied().collect();
@@ -391,7 +392,7 @@ mod tests {
         );
         let rest = spawn_observed_rest(Vec::new());
 
-        let error = run_discord_gateway(direct_runtime_config(
+        let error = run_runtime(direct_runtime_config(
             &workspace,
             socket_path,
             &rest.base_url,
@@ -420,7 +421,7 @@ mod tests {
             let daemon = spawn_preflight_daemon(&socket_path, workspace_id, capabilities);
             let rest = spawn_observed_rest(Vec::new());
 
-            let error = run_discord_gateway(direct_runtime_config(
+            let error = run_runtime(direct_runtime_config(
                 &workspace,
                 socket_path,
                 &rest.base_url,
@@ -455,7 +456,7 @@ mod tests {
         );
         let rest = spawn_fake_rest(3, 200, Some("not-a-websocket-url".into()));
 
-        let error = run_discord_gateway(direct_runtime_config(
+        let error = run_runtime(direct_runtime_config(
             &workspace,
             socket_path,
             &rest.base_url,

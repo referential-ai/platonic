@@ -1,8 +1,8 @@
+use super::{GatewayError, GatewayResult};
 use super::{
     daemon_bridge::require_gateway_daemon_contract,
     rest::{AllowedMentions, CreateMessage, DiscordRestClient, discord_http_error},
 };
-use crate::{GatewayError, GatewayResult};
 use platonic_client::client::{DaemonClient, DaemonConnectionConfig};
 use platonic_protocol::{ReasoningEffort, RunOverrides, RunStateName};
 use serde::{Deserialize, Serialize};
@@ -478,8 +478,8 @@ pub(super) fn parse_snowflake(value: &str) -> GatewayResult<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::*;
     use super::*;
-    use crate::test_support::*;
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
 

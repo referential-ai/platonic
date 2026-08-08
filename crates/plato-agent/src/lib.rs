@@ -1,22 +1,24 @@
 #![deny(unsafe_code)]
 
-//! Plato Agent: the client distribution built on Platonic.
+//! Plato Agent client distribution.
 //!
-//! Clients, curated agent configuration, and the voice subsystem. The server
-//! itself lives in `platonic-server`, which this crate depends on so the
-//! one-shot and replay paths keep working without a running daemon.
+//! This crate owns client presentation and local peripherals. Server runtime
+//! semantics live behind `platonic-protocol` and are reached through
+//! `platonic-client`; this crate never links the server implementation.
 
-pub mod discord_gateway;
+mod error;
+pub mod offline;
+pub mod run;
 pub mod tui;
 pub mod voice;
 
-pub use platonic_server::{
-    AppError, AppResult, ApprovalMode, ApprovalRequest, AssistantDeltaEvent, IssuePrepOptions,
-    IssuePrepOutcome, ReasoningEffort, RunEvent, RunLedger, RunOptions, RunOutcome, RunOverrides,
-    RunSession, VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope, app, config, daemon, error,
-    issue_prep, ledger, model, new_run_id, new_session_id, paths, provider, replay,
-    replay_default_sqlite, replay_file, replay_sqlite, replay_sqlite_session, run_issue_prep,
-    run_question, tool_catalog, tools, voice_session,
+pub use error::{AppError, AppResult};
+pub use platonic_protocol::{
+    ReasoningEffort, RunOverrides, VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope,
+};
+pub use run::{
+    ApprovalMode, AssistantDeltaEvent, RunEvent, RunOptions, RunOutcome, ensure_server,
+    run_question,
 };
 pub use voice::{
     CapturedRunOutcome, NarratedRunOutcome, NarratedSentenceReport, NarrationReport, VoiceError,

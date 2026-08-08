@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use plato_agent::{ApprovalMode, RunLedger, RunOptions, RunOverrides, VoiceSession, replay_sqlite};
+use plato_agent::{ApprovalMode, RunOptions, RunOverrides, VoiceSession};
 use plato_audio::{
     CaptureConfig, InputDeviceSelection, KokoroConfig, PlaybackConfig, SentenceCutter,
     SileroConfig, WhisperConfig, capture_devices,
@@ -78,9 +78,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             PlaybackConfig::default(),
         )?,
     };
-    let ledger = arguments.events.unwrap_or_else(|| {
-        std::env::temp_dir().join(format!("plato-narrated-run-{}.db", std::process::id()))
-    });
     let fixture = arguments.fixture.then(FixtureProvider::start).transpose()?;
     let config_path = fixture
         .as_ref()
@@ -90,17 +87,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         question: arguments.question,
         config_path,
         overrides: RunOverrides::default(),
-        ledger: RunLedger::Sqlite(ledger.clone()),
         workspace_root: arguments.workspace_root,
-        approval_mode: ApprovalMode::Deny {
-            actor: "narrated_run_example",
-        },
-        run_id: None,
-        session: None,
+        approval_mode: ApprovalMode::Deny,
+        session_id: None,
+        continue_latest: false,
         event_sender: None,
         stream_to_stderr: true,
         cancel: None,
-        voice_interruption_context: None,
     };
     let (run, narration, voice_events, capture) = if arguments.whisper_model.is_some() {
         let outcome = voice.capture_question(options, arguments.capture_timeout)?;
@@ -206,7 +199,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let model = voice.provenance().clone();
     let output = voice.device_info().clone();
     let shutdown = voice.shutdown()?;
-    let voice_replay = replay_sqlite(&ledger, Some(run.run_id.as_str()))?;
+    let ledger = run.ledger_path.clone();
+    let voice_replay = plato_agent::offline::replay_sqlite(&ledger, Some(run.run_id.as_str()))?;
     let proof = ProofOutput {
         schema: "plato_agent.narrated_run.v5",
         run_id: run.run_id.to_string(),
@@ -246,7 +240,6 @@ fn cut_sentences(text: &str) -> Vec<String> {
 struct Arguments {
     model_dir: PathBuf,
     config: Option<PathBuf>,
-    events: Option<PathBuf>,
     workspace_root: PathBuf,
     question: String,
     fixture: bool,
@@ -260,7 +253,6 @@ impl Arguments {
     fn read() -> Result<Option<Self>, Box<dyn Error>> {
         let mut model_dir = std::env::var_os("PLATO_AUDIO_KOKORO_DIR").map(PathBuf::from);
         let mut config = None;
-        let mut events = None;
         let mut workspace_root = std::env::current_dir()?;
         let mut question = Vec::new();
         let mut fixture = false;
@@ -279,11 +271,6 @@ impl Arguments {
                 "--config" => {
                     config = Some(PathBuf::from(
                         arguments.next().ok_or("--config requires a path")?,
-                    ));
-                }
-                "--events" => {
-                    events = Some(PathBuf::from(
-                        arguments.next().ok_or("--events requires a path")?,
                     ));
                 }
                 "--workspace-root" => {
@@ -320,7 +307,7 @@ impl Arguments {
                 }
                 "-h" | "--help" => {
                     println!(
-                        "Usage: narrated_run --model-dir PATH [--config PATH] [--events SQLITE_PATH]\n\
+                        "Usage: narrated_run --model-dir PATH [--config PATH]\n\
                          \x20      [--workspace-root PATH] [--fixture] [QUESTION ...]\n\
                          \x20      [--whisper-model PATH --silero-model PATH]\n\
                          \x20      [--input-device CPAL_ID]\n\
@@ -356,7 +343,6 @@ impl Arguments {
         Ok(Some(Self {
             model_dir,
             config,
-            events,
             workspace_root,
             question: if question.is_empty() {
                 DEFAULT_QUESTION.to_owned()

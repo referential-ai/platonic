@@ -1,32 +1,29 @@
+use super::{DiscordGatewayRuntimeConfig, run_runtime};
 use crate::{
     AppError, AppResult,
     config::{Config, DiscordGatewayConfig, ResolvedConfigPath, resolve_config},
-    daemon::client::DaemonConnectionConfig,
 };
-use plato_gateway_discord::DiscordGatewayRuntimeConfig;
+use platonic_client::client::DaemonConnectionConfig;
 use std::{
     collections::HashMap,
     ffi::OsString,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
+/// Server-owned inputs for one Discord gateway process.
 pub struct DiscordGatewayOptions {
+    /// Workspace served by the gateway.
     pub workspace_root: PathBuf,
+    /// Optional explicit server endpoint.
     pub socket_path: Option<PathBuf>,
+    /// Optional authorized server configuration path.
     pub config_path: Option<PathBuf>,
 }
 
+/// Resolves server configuration and runs the Discord gateway.
 pub fn run_discord_gateway(options: DiscordGatewayOptions) -> AppResult<()> {
     let runtime = resolve_discord_gateway_runtime(options)?;
-    plato_gateway_discord::run_discord_gateway(runtime).map_err(Into::into)
-}
-
-pub fn preflight_discord_gateway_daemon(
-    config: &DaemonConnectionConfig,
-    timeout: Duration,
-) -> AppResult<()> {
-    plato_gateway_discord::preflight_discord_gateway_daemon(config, timeout).map_err(Into::into)
+    run_runtime(runtime).map_err(Into::into)
 }
 
 fn resolve_discord_gateway_runtime(

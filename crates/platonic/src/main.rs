@@ -1,67 +1,121 @@
-use clap::Parser;
-#[cfg(windows)]
-use clap::Subcommand;
-use plato_agent::daemon::{
-    server::{DaemonServer, HostDaemonServer},
-    wake_listener,
+use clap::{Parser, Subcommand};
+use platonic_client::{
+    client::{DaemonClient, DaemonConnectionConfig},
+    paths,
+};
+use platonic_server::{
+    AppError, AppResult,
+    daemon::{
+        run_stdio_child,
+        server::{DaemonServer, HostDaemonServer},
+        wake_listener,
+    },
 };
 #[cfg(unix)]
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
     iterator::Signals,
 };
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
 use std::thread;
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+
+mod discord;
+
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Parser)]
-#[command(name = "plato-agentd")]
-#[command(about = "Plato Agent local daemon")]
+#[command(name = "platonic")]
+#[command(about = "Platonic agent server")]
 #[command(version = platonic_protocol::BUILD_IDENTITY)]
-#[command(args_conflicts_with_subcommands = true)]
 struct Cli {
-    #[cfg(windows)]
-    #[command(subcommand)]
-    command: Option<Command>,
-
     #[arg(long, hide = true)]
     run_child: bool,
 
-    #[arg(
-        long,
-        help = "Serve multiple workspaces on the stable host endpoint",
-        conflicts_with = "workspace",
-        conflicts_with = "socket"
-    )]
-    host: bool,
-
-    #[arg(long, default_value = ".", conflicts_with = "host")]
-    workspace: PathBuf,
-
-    #[arg(long, value_name = "PATH", conflicts_with = "host")]
-    socket: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
-#[cfg(windows)]
 #[derive(Debug, Subcommand)]
 enum Command {
-    Control {
+    /// Run the server in the foreground.
+    Serve {
+        /// Serve one legacy workspace instead of the host endpoint.
+        #[arg(long, value_name = "DIR")]
+        workspace: Option<PathBuf>,
+        /// Override the endpoint for a legacy workspace server.
+        #[arg(long, value_name = "PATH", requires = "workspace")]
+        socket: Option<PathBuf>,
+    },
+    /// Read server status for a workspace.
+    Status {
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        workspace: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+        #[arg(long, value_name = "SESSION_ID")]
+        session: Option<String>,
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+    },
+    /// Shut down an idle server.
+    Shutdown {
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        workspace: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Manage registered workspaces.
+    Workspace {
         #[command(subcommand)]
-        command: ControlCommand,
+        command: WorkspaceCommand,
+        #[arg(long, value_name = "DIR", default_value = ".", global = true)]
+        workspace: PathBuf,
+        #[arg(long, value_name = "PATH", global = true)]
+        socket: Option<PathBuf>,
+    },
+    /// Run a server-owned gateway connector.
+    Gateway {
+        #[command(subcommand)]
+        command: GatewayCommand,
     },
 }
 
-#[cfg(windows)]
 #[derive(Debug, Subcommand)]
-enum ControlCommand {
-    ListWorkspaces,
-    ShutdownIfIdle {
-        #[arg(long, value_name = "ROOT")]
-        workspace: Option<PathBuf>,
-        #[arg(long)]
-        quiet: bool,
+enum WorkspaceCommand {
+    /// Register a named workspace directory.
+    Create {
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(value_name = "DIR")]
+        root: PathBuf,
+    },
+    /// List every registered workspace.
+    List,
+    /// Read one workspace by its server-minted id.
+    Status {
+        #[arg(value_name = "WORKSPACE_ID")]
+        workspace_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GatewayCommand {
+    /// Run the Discord gateway for one workspace.
+    Discord {
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        workspace: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
     },
 }
 
@@ -72,71 +126,113 @@ fn main() {
     }
 }
 
-fn run() -> plato_agent::AppResult<()> {
+fn run() -> AppResult<()> {
     let cli = Cli::parse();
-    #[cfg(windows)]
-    if let Some(Command::Control { command }) = cli.command {
-        let stdout = std::io::stdout();
-        let mut output = stdout.lock();
-        return match command {
-            ControlCommand::ListWorkspaces => {
-                plato_agent::daemon::control::list_workspaces(&mut output)
-            }
-            ControlCommand::ShutdownIfIdle { workspace, quiet } => {
-                if quiet {
-                    plato_agent::daemon::control::shutdown_if_idle(
-                        workspace.as_deref(),
-                        &mut std::io::sink(),
-                    )
-                } else {
-                    plato_agent::daemon::control::shutdown_if_idle(
-                        workspace.as_deref(),
-                        &mut output,
-                    )
-                }
-            }
-        };
-    }
-
     if cli.run_child {
-        return plato_agent::daemon::run_stdio_child();
+        if cli.command.is_some() {
+            return Err(AppError::Config(
+                "--run-child cannot be combined with a command".into(),
+            ));
+        }
+        return run_stdio_child();
     }
 
+    match cli.command {
+        Some(Command::Serve { workspace, socket }) => serve(workspace, socket),
+        Some(Command::Status {
+            workspace,
+            socket,
+            session,
+            config,
+        }) => {
+            let mut client = connect(&workspace, socket)?;
+            let status = client.daemon_status(
+                session,
+                config.map(|path| path.to_string_lossy().into_owned()),
+            )?;
+            println!("{}", serde_json::to_string(&status)?);
+            Ok(())
+        }
+        Some(Command::Shutdown { workspace, socket }) => {
+            let mut client = connect(&workspace, socket)?;
+            println!("{}", serde_json::to_string(&client.shutdown_if_idle()?)?);
+            Ok(())
+        }
+        Some(Command::Workspace {
+            command,
+            workspace,
+            socket,
+        }) => run_workspace(command, workspace, socket),
+        Some(Command::Gateway { command }) => match command {
+            GatewayCommand::Discord {
+                workspace,
+                socket,
+                config,
+            } => discord::run(workspace, socket, config),
+        },
+        None => Err(AppError::Config("a command is required".into())),
+    }
+}
+
+fn serve(workspace: Option<PathBuf>, socket: Option<PathBuf>) -> AppResult<()> {
     #[cfg(windows)]
     let installer_gate =
-        plato_agent::daemon::installer_gate::InstallerStartupGate::acquire_for_daemon_startup()?;
-    if cli.host {
-        let server = HostDaemonServer::bind()?;
+        platonic_client::installer_gate::InstallerStartupGate::acquire_for_daemon_startup()?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    if let Some(workspace) = workspace {
+        let server = DaemonServer::bind(&workspace, socket)?;
         #[cfg(windows)]
         drop(installer_gate);
-        let socket_path = server.socket_path().to_path_buf();
-        eprintln!("daemon_scope: host");
+        let socket_path = server.paths().socket_path.clone();
+        eprintln!("workspace_id: {}", server.paths().workspace_id);
         eprintln!("socket_path: {}", socket_path.display());
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        install_shutdown_handler(shutdown.clone(), socket_path)?;
+        eprintln!("ledger_path: {}", server.paths().ledger_path.display());
+        install_shutdown_handler(Arc::clone(&shutdown), socket_path)?;
         return server.serve_forever(shutdown);
     }
 
-    let server = DaemonServer::bind(&cli.workspace, cli.socket)?;
+    let server = HostDaemonServer::bind()?;
     #[cfg(windows)]
     drop(installer_gate);
-    let socket_path = server.paths().socket_path.clone();
-    eprintln!("workspace_id: {}", server.paths().workspace_id);
+    let socket_path = server.socket_path().to_path_buf();
+    eprintln!("daemon_scope: host");
     eprintln!("socket_path: {}", socket_path.display());
-    eprintln!("ledger_path: {}", server.paths().ledger_path.display());
-
-    let shutdown = Arc::new(AtomicBool::new(false));
-    install_shutdown_handler(shutdown.clone(), socket_path)?;
-
+    install_shutdown_handler(Arc::clone(&shutdown), socket_path)?;
     server.serve_forever(shutdown)
 }
 
+fn connect(workspace: &std::path::Path, socket: Option<PathBuf>) -> AppResult<DaemonClient> {
+    let endpoint = match socket {
+        Some(socket) => socket,
+        None => paths::host_socket_path()?,
+    };
+    let config = DaemonConnectionConfig::resolve(workspace, Some(endpoint))?;
+    let mut client = DaemonClient::connect_with_timeout(&config.socket_path, CLIENT_TIMEOUT)?;
+    client.hello(&config.workspace_root)?;
+    Ok(client)
+}
+
+fn run_workspace(
+    command: WorkspaceCommand,
+    workspace: PathBuf,
+    socket: Option<PathBuf>,
+) -> AppResult<()> {
+    let mut client = connect(&workspace, socket)?;
+    let output = match command {
+        WorkspaceCommand::Create { name, root } => {
+            serde_json::to_string(&client.workspace_create(name, root)?)?
+        }
+        WorkspaceCommand::List => serde_json::to_string(&client.workspace_list()?)?,
+        WorkspaceCommand::Status { workspace_id } => {
+            serde_json::to_string(&client.workspace_status(workspace_id)?)?
+        }
+    };
+    println!("{output}");
+    Ok(())
+}
+
 #[cfg(unix)]
-fn install_shutdown_handler(
-    shutdown: Arc<AtomicBool>,
-    socket_path: PathBuf,
-) -> plato_agent::AppResult<()> {
+fn install_shutdown_handler(shutdown: Arc<AtomicBool>, socket_path: PathBuf) -> AppResult<()> {
     let mut signals = Signals::new([SIGINT, SIGTERM])?;
     thread::spawn(move || {
         if signals.forever().next().is_some() {
@@ -147,14 +243,8 @@ fn install_shutdown_handler(
 }
 
 #[cfg(windows)]
-fn install_shutdown_handler(
-    shutdown: Arc<AtomicBool>,
-    socket_path: PathBuf,
-) -> plato_agent::AppResult<()> {
-    ctrlc::set_handler(move || {
-        request_shutdown(&shutdown, &socket_path);
-    })
-    .map_err(|error| {
+fn install_shutdown_handler(shutdown: Arc<AtomicBool>, socket_path: PathBuf) -> AppResult<()> {
+    ctrlc::set_handler(move || request_shutdown(&shutdown, &socket_path)).map_err(|error| {
         std::io::Error::other(format!(
             "failed to install console control handler: {error}"
         ))
@@ -171,70 +261,11 @@ fn request_shutdown(shutdown: &AtomicBool, socket_path: &std::path::Path) {
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
-    #[test]
-    fn control_cli_parses_aggregate_and_targeted_shutdown() {
-        let aggregate =
-            Cli::try_parse_from(["plato-agentd", "control", "shutdown-if-idle"]).unwrap();
-        assert!(matches!(
-            aggregate.command,
-            Some(Command::Control {
-                command: ControlCommand::ShutdownIfIdle {
-                    workspace: None,
-                    quiet: false
-                }
-            })
-        ));
-
-        let targeted = Cli::try_parse_from([
-            "plato-agentd",
-            "control",
-            "shutdown-if-idle",
-            "--workspace",
-            r"C:\work",
-        ])
-        .unwrap();
-        assert!(matches!(
-            targeted.command,
-            Some(Command::Control {
-                command: ControlCommand::ShutdownIfIdle {
-                    workspace: Some(_),
-                    quiet: false
-                }
-            })
-        ));
-
-        let quiet = Cli::try_parse_from(["plato-agentd", "control", "shutdown-if-idle", "--quiet"])
-            .unwrap();
-        assert!(matches!(
-            quiet.command,
-            Some(Command::Control {
-                command: ControlCommand::ShutdownIfIdle { quiet: true, .. }
-            })
-        ));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn serve_arguments_conflict_with_control() {
-        assert!(
-            Cli::try_parse_from([
-                "plato-agentd",
-                "--socket",
-                r"\\.\pipe\custom",
-                "control",
-                "list-workspaces",
-            ])
-            .is_err()
-        );
-    }
-
     #[test]
     fn host_mode_conflicts_with_workspace_and_custom_socket() {
-        let host = Cli::try_parse_from(["plato-agentd", "--host"]).unwrap();
-        assert!(host.host);
-        assert!(Cli::try_parse_from(["plato-agentd", "--host", "--workspace", "."]).is_err());
-        assert!(Cli::try_parse_from(["plato-agentd", "--host", "--socket", "agent.sock"]).is_err());
+        assert!(Cli::try_parse_from(["platonic"]).is_ok());
+        assert!(Cli::try_parse_from(["platonic", "serve"]).is_ok());
+        assert!(Cli::try_parse_from(["platonic", "serve", "--socket", "agent.sock"]).is_err());
     }
 
     #[test]

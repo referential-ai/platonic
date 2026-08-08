@@ -159,9 +159,8 @@ jobs:
         env:
           PLATO_APPIMAGE_PROOF_KEY: appimage-proof-dummy
         run: |
-          cargo build --manifest-path ../Cargo.toml --locked --bin plato-agentd --bin plato
-          PLATO_APPIMAGE_TEST_DAEMON="$CARGO_TARGET_DIR/debug/plato-agentd" \
-          PLATO_APPIMAGE_TEST_CLI="$CARGO_TARGET_DIR/debug/plato" \
+          cargo build --manifest-path ../Cargo.toml --locked --bin platonic
+          PLATO_APPIMAGE_TEST_DAEMON="$CARGO_TARGET_DIR/debug/platonic" \
             cargo test --manifest-path src-tauri/Cargo.toml --locked \
               unix_proof::provisioned_unix_sidecar_lifecycle -- \
               --ignored --exact --nocapture --test-threads=1
@@ -188,11 +187,11 @@ jobs:
           (cd "$extract" && "$appimage" --appimage-extract >/dev/null)
           bin="$extract/squashfs-root/usr/bin"
           diff -u \
-            <(printf '%s\n' plato-agentd plato-desktop) \
+            <(printf '%s\n' platonic plato-desktop) \
             <(find "$bin" -maxdepth 1 -type f -perm /111 -printf '%f\n' | LC_ALL=C sort)
-          file -b "$bin/plato-agentd" | grep -Eq '^ELF 64-bit .*x86-64'
+          file -b "$bin/platonic" | grep -Eq '^ELF 64-bit .*x86-64'
           file -b "$bin/plato-desktop" | grep -Eq '^ELF 64-bit .*x86-64'
-          "$bin/plato-agentd" --help >/dev/null
+          "$bin/platonic" --help >/dev/null
 
           version=$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json')).version")
           out="$GITHUB_WORKSPACE/artifacts/linux-appimage"

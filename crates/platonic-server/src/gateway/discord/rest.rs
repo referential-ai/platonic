@@ -1,4 +1,4 @@
-use crate::{GatewayError, GatewayResult};
+use super::{GatewayError, GatewayResult};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::Cell,
@@ -21,7 +21,7 @@ pub(super) struct DiscordRestClient {
 impl DiscordRestClient {
     #[cfg(test)]
     pub(super) fn new(api_base: &str, token: String) -> Self {
-        let timings = crate::DiscordGatewayTimings::default();
+        let timings = super::DiscordGatewayTimings::default();
         Self::with_timeouts(
             api_base,
             token,
@@ -404,11 +404,11 @@ pub(super) struct AllowedMentions {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{
+    use super::super::{
         daemon_bridge::{EYES_EMOJI, SUCCESS_EMOJI},
         test_support::*,
     };
+    use super::*;
     use serde_json::{Value, json};
 
     #[test]

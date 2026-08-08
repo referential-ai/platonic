@@ -182,7 +182,7 @@ impl InstalledSnapshot {
             .expect("installer did not register InstallLocation");
         let install_dir = PathBuf::from(install_location.trim_matches('"'));
         let main = install_dir.join("plato-desktop.exe");
-        let sidecar = install_dir.join("plato-agentd.exe");
+        let sidecar = install_dir.join("platonic.exe");
         let uninstaller = install_dir.join("uninstall.exe");
         let version = registry_string("DisplayVersion")
             .unwrap()

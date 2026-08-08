@@ -1,16 +1,16 @@
 use plato_agent::{
-    AppError, ReasoningEffort as RootReasoningEffort, RunOverrides as RootRunOverrides,
-    daemon::protocol::*,
-    model::{ReasoningEffort as ModelReasoningEffort, RunOverrides as ModelRunOverrides},
+    AppError, ReasoningEffort as ClientReasoningEffort, RunOverrides as ClientRunOverrides,
+};
+use platonic_protocol::{
+    ERROR_RUN_FAILED, ProtocolError, ReasoningEffort, RunOverrides, RunStartParams,
 };
 
 #[test]
 fn historical_protocol_and_model_paths_share_the_extracted_types() {
-    let effort: ModelReasoningEffort = RootReasoningEffort::High;
-    let protocol_effort: ReasoningEffort = effort;
-    assert_eq!(protocol_effort, ReasoningEffort::High);
+    let effort: ReasoningEffort = ClientReasoningEffort::High;
+    assert_eq!(effort, ReasoningEffort::High);
 
-    let overrides: ModelRunOverrides = RootRunOverrides {
+    let overrides: RunOverrides = ClientRunOverrides {
         model: Some("openai/gpt-5".into()),
         reasoning_effort: Some(effort),
     };

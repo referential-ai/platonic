@@ -14,7 +14,8 @@ use platonic_protocol::{
     ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams, ThreadEventsResult,
     ThreadListResult, ThreadSendParams, ThreadSendResult, ThreadSpawnDecision, ThreadSpawnParams,
     ThreadSpawnResult, ThreadStatusParams, ThreadStatusResult, ThreadStopParams, ThreadStopResult,
-    TranscriptReadParams, TranscriptReadResult,
+    TranscriptReadParams, TranscriptReadResult, WorkspaceCreateParams, WorkspaceCreateResult,
+    WorkspaceListParams, WorkspaceListResult, WorkspaceStatusParams, WorkspaceStatusResult,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -24,7 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Synchronous client for one `plato-agentd` connection.
+/// Synchronous client for one Platonic server connection.
 pub struct DaemonClient {
     reader: BufReader<Stream>,
     writer: Stream,
@@ -102,6 +103,35 @@ impl DaemonClient {
     pub fn sessions_list(&mut self) -> ClientResult<Vec<SessionSummary>> {
         let result: SessionsListResult = self.request_without_params("sessions.list")?;
         Ok(result.sessions)
+    }
+
+    /// Registers one named workspace directory with the server.
+    pub fn workspace_create(
+        &mut self,
+        name: String,
+        root: PathBuf,
+    ) -> ClientResult<WorkspaceCreateResult> {
+        let root = root.canonicalize()?;
+        self.request(
+            "workspace.create",
+            WorkspaceCreateParams {
+                name,
+                root: root.to_string_lossy().into_owned(),
+            },
+        )
+    }
+
+    /// Lists every registered workspace, including broken entries.
+    pub fn workspace_list(&mut self) -> ClientResult<WorkspaceListResult> {
+        self.request("workspace.list", WorkspaceListParams::default())
+    }
+
+    /// Reads one registered workspace by its server-minted id.
+    pub fn workspace_status(
+        &mut self,
+        workspace_id: String,
+    ) -> ClientResult<WorkspaceStatusResult> {
+        self.request("workspace.status", WorkspaceStatusParams { workspace_id })
     }
 
     /// Starts one typed thread spawn admission.

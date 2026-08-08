@@ -1,5 +1,5 @@
 use super::{DiscordGateway, DiscordPlatform, rest::DISCORD_MESSAGE_LIMIT};
-use crate::{GatewayError, GatewayResult};
+use super::{GatewayError, GatewayResult};
 use platonic_client::{
     ClientError,
     client::{DaemonClient, DaemonConnectionConfig},
@@ -517,8 +517,8 @@ impl MessagePresentation {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::*;
     use super::*;
-    use crate::test_support::*;
     use platonic_protocol::TranscriptReadResult;
     #[cfg(unix)]
     use platonic_protocol::{ReasoningEffort, RunOverrides};
@@ -563,7 +563,7 @@ mod tests {
         ));
         assert!(elapsed < Duration::from_secs(1), "request took {elapsed:?}");
         assert_eq!(
-            crate::DiscordGatewayTimings::default().daemon_client_timeout,
+            super::super::DiscordGatewayTimings::default().daemon_client_timeout,
             Duration::from_secs(3)
         );
     }

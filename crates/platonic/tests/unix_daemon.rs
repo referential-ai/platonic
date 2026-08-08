@@ -1,11 +1,8 @@
 #![cfg(unix)]
 
-use plato_agent::{
-    daemon::{client::DaemonClient, lock::LockMetadata},
-    ledger::SqliteLedger,
-    paths,
-};
+use platonic_client::{client::DaemonClient, lock::LockMetadata};
 use platonic_core::{AgentId, HarnessEvent, RecordedEvent, RunId};
+use platonic_server::{ledger::SqliteLedger, paths};
 use std::{
     fs,
     io::Read,
@@ -166,8 +163,9 @@ fn daemon_paths(runtime: &Path, workspace: &Path) -> (PathBuf, PathBuf) {
 }
 
 fn daemon_command(runtime: &Path, state: &Path, workspace: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_plato-agentd"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_platonic"));
     command
+        .arg("serve")
         .arg("--workspace")
         .arg(workspace)
         .env("XDG_RUNTIME_DIR", runtime)
@@ -178,12 +176,22 @@ fn daemon_command(runtime: &Path, state: &Path, workspace: &Path) -> Command {
 }
 
 fn plato_command(runtime: &Path, state: &Path, workspace: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_plato"));
+    let mut command = Command::new(workspace_binary("plato"));
     command
         .current_dir(workspace)
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_STATE_HOME", state);
     command
+}
+
+fn workspace_binary(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn wait_for_lock_owner(lock_path: &Path, pid: u32, child: &mut DaemonChild) -> LockMetadata {

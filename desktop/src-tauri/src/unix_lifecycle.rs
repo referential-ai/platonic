@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DAEMON_EXECUTABLE: &str = "plato-agentd";
+const DAEMON_EXECUTABLE: &str = "platonic";
 const PATH_BEGIN: &[u8] = b"\x1ePLATO_USER_PATH_BEGIN_7E2F3C91\x1f";
 const PATH_END: &[u8] = b"\x1ePLATO_USER_PATH_END_7E2F3C91\x1f";
 const PATH_PROBE: &str = r#"command printf '\036PLATO_USER_PATH_BEGIN_7E2F3C91\037'; command printf '%s' "$PATH"; command printf '\036PLATO_USER_PATH_END_7E2F3C91\037'"#;
@@ -39,7 +39,6 @@ pub(crate) fn user_launch_path() -> io::Result<OsString> {
 pub(crate) fn spawn_detached_daemon(
     executable: &Path,
     canonical_workspace_root: &Path,
-    socket_path: Option<&Path>,
     user_path: &OsStr,
 ) -> io::Result<Child> {
     if !executable.is_absolute() {
@@ -63,16 +62,13 @@ pub(crate) fn spawn_detached_daemon(
 
     let mut command = Command::new(executable);
     command
-        .arg("--workspace")
-        .arg(canonical_workspace_root)
+        .arg("serve")
+        .current_dir(canonical_workspace_root)
         .env("PATH", user_path)
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Some(socket_path) = socket_path {
-        command.arg("--socket").arg(socket_path);
-    }
     command.spawn()
 }
 
@@ -364,13 +360,12 @@ mod tests {
         let observed = workspace_root.join("observed-path");
         write_executable(
             &daemon,
-            "#!/bin/sh\nprintf '%s' \"$PATH\" > \"$2/observed-path\"\n",
+            "#!/bin/sh\nprintf '%s' \"$PATH\" > observed-path\n",
         );
 
         let mut child = spawn_detached_daemon(
             &daemon,
             &workspace_root,
-            None,
             OsStr::new("/launch-only/bin:/usr/bin"),
         )
         .expect("spawn fake daemon");
@@ -387,23 +382,18 @@ mod tests {
     fn detached_daemon_rejects_invalid_paths() {
         let directory = tempdir().expect("create temp directory");
         let workspace_root = directory.path().canonicalize().expect("canonical root");
-        let executable = workspace_root.join("plato-agentd");
+        let executable = workspace_root.join("platonic");
 
         let executable_error = spawn_detached_daemon(
-            Path::new("plato-agentd"),
+            Path::new("platonic"),
             &workspace_root,
-            None,
             OsStr::new("/usr/bin"),
         )
         .expect_err("reject relative executable");
-        let workspace_error = spawn_detached_daemon(
-            &executable,
-            Path::new("workspace"),
-            None,
-            OsStr::new("/usr/bin"),
-        )
-        .expect_err("reject relative workspace");
-        let path_error = spawn_detached_daemon(&executable, &workspace_root, None, OsStr::new(""))
+        let workspace_error =
+            spawn_detached_daemon(&executable, Path::new("workspace"), OsStr::new("/usr/bin"))
+                .expect_err("reject relative workspace");
+        let path_error = spawn_detached_daemon(&executable, &workspace_root, OsStr::new(""))
             .expect_err("reject empty PATH");
 
         assert_eq!(executable_error.kind(), io::ErrorKind::InvalidInput);

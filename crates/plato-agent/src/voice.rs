@@ -1,4 +1,4 @@
-//! Root-owned composition from app run events to the audio IO leaf.
+//! Client-owned composition from protocol run events to the audio I/O leaf.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -22,14 +22,13 @@ use plato_audio::{
     Transcript, VadError, WhisperConfig, WhisperMetrics, WhisperMetricsReader, WhisperProvenance,
     WhisperRecognizer,
 };
-use platonic_core::{ContextLane, HarnessEvent, RunId, TurnId};
+use platonic_core::{HarnessEvent, RunId, TurnId};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    AppError, AssistantDeltaEvent, RunEvent, RunLedger, RunOptions, RunOutcome,
-    ledger::SqliteLedger,
-    voice_session::{VoiceEvent, VoiceEventEnvelope},
+    AppError, AssistantDeltaEvent, RunEvent, RunOptions, RunOutcome, VoiceEvent, VoiceEventEnvelope,
 };
 
 /// Root composition failures while interpreting existing run events.
@@ -71,12 +70,9 @@ pub enum VoiceError {
     /// The voice session was explicitly shut down.
     #[error("voice session is closed")]
     SessionClosed,
-    /// Durable voice facts require the root companion SQLite stream.
-    #[error("narrated runs require a SQLite ledger for durable voice facts")]
+    /// Voice facts require the server-owned SQLite stream returned by the run.
+    #[error("narrated runs require a server-owned SQLite ledger")]
     SqliteRequired,
-    /// The root companion stream could not be committed.
-    #[error("cannot persist voice facts: {0}")]
-    Persistence(#[source] AppError),
 }
 
 /// Failures from the app run or its root-owned narration composition.
@@ -123,7 +119,7 @@ pub struct NarratedRunOutcome {
     pub run: RunOutcome,
     /// Audio-only observation outside the durable harness ledger.
     pub narration: NarrationReport,
-    /// Exact revision-one companion facts committed before this outcome returned.
+    /// Exact revision-one companion facts produced by client-side observation.
     pub voice_events: Vec<VoiceEventEnvelope>,
 }
 
@@ -158,7 +154,6 @@ pub struct VoiceSession {
     silero_metrics: Option<SileroMetricsReader>,
     capture: Option<CaptureWorker>,
     cancel: Arc<AtomicBool>,
-    pending_interruption: Option<SpokenInterruption>,
 }
 
 impl VoiceSession {
@@ -183,7 +178,6 @@ impl VoiceSession {
             silero_metrics: None,
             capture: None,
             cancel,
-            pending_interruption: None,
         })
     }
 
@@ -303,7 +297,6 @@ impl VoiceSession {
         if options.event_sender.is_some() {
             return Err(VoiceRunError::EventSenderAlreadySet);
         }
-        require_voice_sqlite(&options.ledger)?;
         let display_live = options.stream_to_stderr;
         let mut input = ActiveVoiceInput::default();
         let mut input_error = None;
@@ -374,14 +367,8 @@ impl VoiceSession {
         if options.event_sender.is_some() {
             return Err(VoiceRunError::EventSenderAlreadySet);
         }
-        require_voice_sqlite(&options.ledger)?;
-        let voice_ledger = options.ledger.clone();
         bind_voice_cancel(&mut options, &self.cancel)?;
         let cancel = Arc::clone(&self.cancel);
-        let interruption_context = self.pending_interruption.as_ref().map(interruption_context);
-        options
-            .voice_interruption_context
-            .clone_from(&interruption_context);
         let (sender, receiver) = mpsc::channel();
         options.event_sender = Some(sender);
         let worker = self.worker.as_ref().ok_or(VoiceError::SessionClosed)?;
@@ -389,31 +376,17 @@ impl VoiceSession {
         worker.begin_run().map_err(VoiceError::from)?;
         let capture = self.capture.as_ref();
         let mut next_interruption = None;
-        let mut consumed_interruption_context = false;
         let mut accepted_sources = BTreeMap::new();
         let mut first_response_key = None;
 
         let result = std::thread::scope(|scope| {
-            let run = scope.spawn(move || crate::app::run_question(options));
+            let run = scope.spawn(move || crate::run_question(options));
             let mut stream = AssistantTextStream::default();
             let mut sentences = Vec::new();
             let mut voice_error = None;
-            let mut interruption_fragment_count = 0_usize;
-
             loop {
                 match receiver.recv_timeout(Duration::from_millis(1)) {
                     Ok(event) => {
-                        if let Some(expected) = interruption_context.as_deref() {
-                            interruption_fragment_count = interruption_fragment_count
-                                .saturating_add(interruption_fragment_matches(&event, expected));
-                            if interruption_fragment_count > 1 {
-                                voice_error = Some(contract_error(
-                                    "next run emitted more than one voice interruption context fragment",
-                                ));
-                                cancel.store(true, Ordering::Release);
-                                break;
-                            }
-                        }
                         let accepted = match stream.accept(event) {
                             Ok(accepted) => accepted,
                             Err(error) => {
@@ -487,8 +460,6 @@ impl VoiceSession {
                 Ok(None)
             };
             next_interruption = finish_result?;
-            consumed_interruption_context =
-                interruption_context.is_some() && interruption_fragment_count == 1;
             if let Some(error) = voice_error {
                 return Err(VoiceRunError::Voice(error));
             }
@@ -514,12 +485,6 @@ impl VoiceSession {
             })
         });
 
-        if consumed_interruption_context {
-            self.pending_interruption = None;
-        }
-        if let Some(interruption) = next_interruption.as_ref() {
-            self.pending_interruption = Some(interruption.clone());
-        }
         let mut outcome = result?;
         let events = voice_events_for_run(
             &outcome,
@@ -529,7 +494,14 @@ impl VoiceSession {
             next_interruption.as_ref(),
             worker,
         )?;
-        outcome.voice_events = persist_voice_events(&voice_ledger, &events)?;
+        require_voice_sqlite(&outcome.run.ledger_path)?;
+        outcome.voice_events = events
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, event)| {
+                VoiceEventEnvelope::revision_one(u64::try_from(sequence).unwrap_or(u64::MAX), event)
+            })
+            .collect();
         Ok(outcome)
     }
 }
@@ -547,26 +519,15 @@ struct VoiceTurnEvidence {
     interruption: Option<SpokenInterruption>,
 }
 
-fn require_voice_sqlite(ledger: &RunLedger) -> Result<(), VoiceError> {
-    match ledger {
-        RunLedger::Sqlite(_) | RunLedger::DefaultSqlite(_) => Ok(()),
-        RunLedger::Jsonl(_) => Err(VoiceError::SqliteRequired),
+fn require_voice_sqlite(ledger_path: &std::path::Path) -> Result<(), VoiceError> {
+    if ledger_path
+        .extension()
+        .is_some_and(|extension| extension == "db")
+    {
+        Ok(())
+    } else {
+        Err(VoiceError::SqliteRequired)
     }
-}
-
-fn persist_voice_events(
-    target: &RunLedger,
-    events: &[VoiceEvent],
-) -> Result<Vec<VoiceEventEnvelope>, VoiceError> {
-    let mut ledger = match target {
-        RunLedger::Sqlite(path) => SqliteLedger::open_or_create(path),
-        RunLedger::DefaultSqlite(path) => SqliteLedger::open_or_create_default(path),
-        RunLedger::Jsonl(_) => return Err(VoiceError::SqliteRequired),
-    }
-    .map_err(VoiceError::Persistence)?;
-    ledger
-        .append_voice_events(events)
-        .map_err(VoiceError::Persistence)
 }
 
 fn voice_events_for_run(
@@ -612,7 +573,7 @@ fn voice_events_for_observations(
                 "captured response run ID differed from the completed run",
             ));
         }
-        events.push(VoiceEvent::captured(
+        events.push(captured_event(
             run_id.clone(),
             response.turn_id.clone(),
             capture,
@@ -719,6 +680,24 @@ fn turn_evidence<'a>(
     turns.last_mut().expect("voice turn was just inserted")
 }
 
+fn captured_event(run_id: RunId, turn_id: TurnId, report: &CaptureReport) -> VoiceEvent {
+    let transcript = report.transcript.text.as_bytes();
+    VoiceEvent::VoiceCaptured {
+        run_id,
+        turn_id,
+        transcript_sha256: format!("{:x}", Sha256::digest(transcript)),
+        transcript_bytes: u64::try_from(transcript.len()).unwrap_or(u64::MAX),
+        transcript_span_ms: report.transcript.span_ms,
+        input_frames: report.input_frames,
+        output_frames: report.output_frames,
+        vad_start_sample: report.endpoint.start_sample,
+        vad_speech_end_sample: report.endpoint.speech_end_sample,
+        vad_close_sample: report.endpoint.close_sample,
+        vad_close_to_final_us: report.vad_close_to_final_us,
+        normalization_resampling_us: report.normalization_resampling_us,
+    }
+}
+
 #[derive(Default)]
 struct ActiveVoiceInput {
     partial: Option<Transcript>,
@@ -808,6 +787,7 @@ pub(crate) fn options_for_transcript(
     Ok(options)
 }
 
+#[cfg(test)]
 fn interruption_context(interruption: &SpokenInterruption) -> String {
     let prefix = serde_json::to_string(&interruption.spoken_prefix)
         .expect("serializing a Rust string cannot fail");
@@ -832,24 +812,6 @@ fn bind_voice_cancel(
     }
     options.cancel = Some(Arc::clone(session_cancel));
     Ok(())
-}
-
-fn interruption_fragment_matches(event: &RunEvent, expected: &str) -> usize {
-    let RunEvent::Ledger(record) = event else {
-        return 0;
-    };
-    let HarnessEvent::ContextBuilt { context, .. } = &record.event else {
-        return 0;
-    };
-    context
-        .fragments
-        .iter()
-        .filter(|fragment| {
-            fragment.lane == ContextLane::CurrentTask
-                && fragment.source == "voice.interruption"
-                && fragment.content == expected
-        })
-        .count()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1045,22 +1007,20 @@ mod tests {
 
     #[test]
     fn options_for_transcript_replaces_only_the_question_and_requires_a_final_transcript() {
-        use crate::{ApprovalMode, RunLedger, RunOptions, RunOverrides};
+        use crate::{ApprovalMode, RunOptions, RunOverrides};
         use std::path::PathBuf;
 
         let base = RunOptions {
             question: "typed placeholder".to_owned(),
             config_path: None,
             overrides: RunOverrides::default(),
-            ledger: RunLedger::Jsonl(PathBuf::from("unused.jsonl")),
             workspace_root: PathBuf::from("/tmp"),
-            approval_mode: ApprovalMode::Deny { actor: "test" },
-            run_id: None,
-            session: None,
+            approval_mode: ApprovalMode::Deny,
+            session_id: None,
+            continue_latest: false,
             event_sender: None,
             stream_to_stderr: false,
             cancel: None,
-            voice_interruption_context: None,
         };
 
         let final_transcript = Transcript::new("spoken parity question", true, 700).unwrap();
@@ -1069,7 +1029,6 @@ mod tests {
         assert_eq!(voiced.question, "spoken parity question");
         assert_eq!(voiced.workspace_root, base.workspace_root);
         assert_eq!(voiced.stream_to_stderr, base.stream_to_stderr);
-        assert!(voiced.voice_interruption_context.is_none());
 
         let partial = Transcript::new("still speaking", false, 700).unwrap();
         assert!(matches!(
@@ -1103,15 +1062,13 @@ mod tests {
             question: question.to_owned(),
             config_path: None,
             overrides: crate::RunOverrides::default(),
-            ledger: crate::RunLedger::Jsonl(std::path::PathBuf::from("unused.jsonl")),
             workspace_root: std::path::PathBuf::from("."),
-            approval_mode: crate::ApprovalMode::Deny { actor: "test" },
-            run_id: None,
-            session: None,
+            approval_mode: crate::ApprovalMode::Deny,
+            session_id: None,
+            continue_latest: false,
             event_sender: None,
             stream_to_stderr: false,
             cancel: None,
-            voice_interruption_context: None,
         }
     }
 
@@ -1261,10 +1218,10 @@ mod tests {
     #[test]
     fn voice_fact_emission_rejects_jsonl_instead_of_claiming_durability() {
         assert!(matches!(
-            require_voice_sqlite(&RunLedger::Jsonl("events.jsonl".into())),
+            require_voice_sqlite(std::path::Path::new("events.jsonl")),
             Err(VoiceError::SqliteRequired)
         ));
-        assert!(require_voice_sqlite(&RunLedger::Sqlite("events.db".into())).is_ok());
+        assert!(require_voice_sqlite(std::path::Path::new("events.db")).is_ok());
     }
 
     #[test]
@@ -1363,7 +1320,6 @@ mod tests {
         let bound = options.cancel.as_ref().unwrap();
         assert!(Arc::ptr_eq(bound, &cancel));
         assert!(bound.load(Ordering::Acquire));
-        assert!(options.voice_interruption_context.is_none());
     }
 
     #[test]

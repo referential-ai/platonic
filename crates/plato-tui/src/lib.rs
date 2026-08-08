@@ -2,7 +2,7 @@
 //!
 //! This crate owns terminal state, daemon-event reduction, rendering, and the
 //! terminal loop. Provider, daemon, policy, approval, and persistence semantics
-//! remain with `plato-agentd`.
+//! remain with `platonic serve`.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
