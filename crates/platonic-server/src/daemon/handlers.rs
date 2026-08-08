@@ -21,7 +21,10 @@ use crate::{
             ThreadEventsParams, ThreadListResult, ThreadSendParams, ThreadSpawnDecision,
             ThreadSpawnParams, ThreadSpawnResult, ThreadStatus, ThreadStatusParams,
             ThreadStatusResult, ThreadStopParams, ThreadStopResult, TranscriptReadParams,
-            TranscriptReadResult, TypedRun, TypedTranscript, TypedTranscriptEntry, decode_request,
+            TranscriptReadResult, TypedRun, TypedTranscript, TypedTranscriptEntry,
+            WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceHealthName, WorkspaceListParams,
+            WorkspaceListResult, WorkspaceStatusParams, WorkspaceStatusResult, WorkspaceSummary,
+            decode_request,
         },
         runtime::{
             DaemonRuntime, IssuePrepAdmissionError, RunAdmissionError, RunRecord,
@@ -93,6 +96,21 @@ pub(super) fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Enve
             handle_with_params(runtime, request, "thread.spawn", handle_thread_spawn)
         }
         Some("thread.list") => handle_thread_list(runtime, request),
+        Some("workspace.create") => handle_with_params(
+            runtime,
+            request,
+            "workspace.create",
+            handle_workspace_create,
+        ),
+        Some("workspace.list") => {
+            handle_with_params(runtime, request, "workspace.list", handle_workspace_list)
+        }
+        Some("workspace.status") => handle_with_params(
+            runtime,
+            request,
+            "workspace.status",
+            handle_workspace_status,
+        ),
         Some("thread.status") => {
             handle_with_params(runtime, request, "thread.status", handle_thread_status)
         }
@@ -1726,6 +1744,148 @@ fn handle_approval_decide(
     )
 }
 
+fn workspace_summary(record: &crate::server_store::WorkspaceRecord) -> WorkspaceSummary {
+    WorkspaceSummary {
+        id: record.id.clone(),
+        name: record.name.clone(),
+        root: record.root.clone(),
+        ledger_path: record.ledger_path.clone(),
+        created_at_ms: record.created_at_ms,
+        health: match record.health() {
+            crate::server_store::WorkspaceHealth::Present => WorkspaceHealthName::Present,
+            crate::server_store::WorkspaceHealth::Broken => WorkspaceHealthName::Broken,
+        },
+    }
+}
+
+/// `workspace.create` — name a directory so the server knows it deliberately.
+///
+/// The directory must exist. Creating a workspace over a missing directory
+/// would mint a record that is broken the moment it is written, which is worse
+/// than refusing (P021).
+fn handle_workspace_create(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: WorkspaceCreateParams,
+) -> Envelope {
+    let name = params.name.trim();
+    if name.is_empty() {
+        return Envelope::error(
+            request.id,
+            Some("workspace.create".into()),
+            ERROR_MALFORMED_REQUEST,
+            "workspace name must not be empty",
+        );
+    }
+    let root = std::path::Path::new(&params.root);
+    if !root.is_dir() {
+        return Envelope::error(
+            request.id,
+            Some("workspace.create".into()),
+            ERROR_MALFORMED_REQUEST,
+            format!("workspace root is not a directory: {}", params.root),
+        );
+    }
+    let root = match root.canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            return Envelope::error(
+                request.id,
+                Some("workspace.create".into()),
+                ERROR_MALFORMED_REQUEST,
+                format!("workspace root could not be resolved: {error}"),
+            );
+        }
+    };
+    let store = match runtime.paths.server_store() {
+        Ok(store) => store,
+        Err(error) => return store_error(request.id, "workspace.create", error),
+    };
+    match store.workspace_by_name(name) {
+        Ok(Some(_)) => {
+            return Envelope::error(
+                request.id,
+                Some("workspace.create".into()),
+                ERROR_MALFORMED_REQUEST,
+                format!("workspace already exists: {name}"),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => return store_error(request.id, "workspace.create", error),
+    }
+    let now_ms = crate::thread_authority::now_ms();
+    let ledger_path = match crate::paths::default_sqlite_path(&root) {
+        Ok(path) => path,
+        Err(error) => return store_error(request.id, "workspace.create", error),
+    };
+    match store.register_workspace(
+        &crate::server_store::mint_workspace_id(name, now_ms),
+        name,
+        &root.to_string_lossy(),
+        &ledger_path.to_string_lossy(),
+        now_ms,
+    ) {
+        Ok(record) => Envelope::response_from(
+            request.id,
+            Some("workspace.create".into()),
+            WorkspaceCreateResult {
+                workspace: workspace_summary(&record),
+            },
+        ),
+        Err(error) => store_error(request.id, "workspace.create", error),
+    }
+}
+
+/// `workspace.list` — every registered workspace, broken ones included.
+fn handle_workspace_list(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    _params: WorkspaceListParams,
+) -> Envelope {
+    let store = match runtime.paths.server_store() {
+        Ok(store) => store,
+        Err(error) => return store_error(request.id, "workspace.list", error),
+    };
+    match store.workspaces() {
+        Ok(records) => Envelope::response_from(
+            request.id,
+            Some("workspace.list".into()),
+            WorkspaceListResult {
+                workspaces: records.iter().map(workspace_summary).collect(),
+            },
+        ),
+        Err(error) => store_error(request.id, "workspace.list", error),
+    }
+}
+
+/// `workspace.status` — one workspace by minted id.
+fn handle_workspace_status(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: WorkspaceStatusParams,
+) -> Envelope {
+    let store = match runtime.paths.server_store() {
+        Ok(store) => store,
+        Err(error) => return store_error(request.id, "workspace.status", error),
+    };
+    match store.workspace(&params.workspace_id) {
+        Ok(Some(record)) => Envelope::response_from(
+            request.id,
+            Some("workspace.status".into()),
+            WorkspaceStatusResult {
+                workspace: workspace_summary(&record),
+            },
+        ),
+        Ok(None) => Envelope::error(
+            request.id,
+            Some("workspace.status".into()),
+            ERROR_NOT_FOUND,
+            format!("workspace not found: {}", params.workspace_id),
+        ),
+        Err(error) => store_error(request.id, "workspace.status", error),
+    }
+}
+
 fn handle_run_cancel(
     runtime: &DaemonRuntime,
     request: Envelope,
@@ -2109,6 +2269,16 @@ fn find_run(runtime: &DaemonRuntime, run_id: &str) -> Result<Arc<RunRecord>, Str
         .ok_or_else(|| format!("run not found: {run_id}"))
 }
 
+/// A failure to reach the server-wide store is internal, not a missing record.
+fn store_error(request_id: Option<String>, method: &'static str, error: AppError) -> Envelope {
+    Envelope::error(
+        request_id,
+        Some(method.into()),
+        ERROR_INTERNAL,
+        error.to_string(),
+    )
+}
+
 fn error_response(request_id: Option<String>, method: &'static str, message: String) -> Envelope {
     Envelope::error(request_id, Some(method.into()), ERROR_NOT_FOUND, message)
 }
@@ -2153,6 +2323,142 @@ mod tests {
             ledger_path,
         });
         (root, runtime)
+    }
+
+    fn workspace_request(id: &str, method: &str, params: serde_json::Value) -> Envelope {
+        Envelope {
+            v: 1,
+            id: Some(id.into()),
+            kind: crate::daemon::protocol::EnvelopeKind::Request,
+            method: Some(method.into()),
+            params: Some(params),
+            result: None,
+            error: None,
+        }
+    }
+
+    /// A workspace can be created, listed and inspected end to end, keeps a
+    /// stable identity when it moves, and is reported broken rather than
+    /// omitted when its directory vanishes (P021).
+    #[test]
+    fn workspace_is_created_listed_inspected_and_stays_itself_when_moved_or_broken() {
+        let (root, runtime) = thread_test_runtime();
+        let first = root.path().join("first");
+        std::fs::create_dir(&first).unwrap();
+
+        let created = handle_request(
+            &runtime,
+            workspace_request(
+                "c1",
+                "workspace.create",
+                json!({"name": "alpha", "root": first.to_string_lossy()}),
+            ),
+        );
+        assert_eq!(
+            created.kind,
+            crate::daemon::protocol::EnvelopeKind::Response
+        );
+        let created: WorkspaceCreateResult =
+            serde_json::from_value(created.result.unwrap()).unwrap();
+        let id = created.workspace.id.clone();
+        assert!(id.starts_with("ws-"), "id should be minted, got {id}");
+        assert_eq!(created.workspace.name, "alpha");
+        assert_eq!(created.workspace.health, WorkspaceHealthName::Present);
+
+        // The same name twice is refused rather than silently duplicated.
+        let duplicate = handle_request(
+            &runtime,
+            workspace_request(
+                "c2",
+                "workspace.create",
+                json!({"name": "alpha", "root": first.to_string_lossy()}),
+            ),
+        );
+        assert_eq!(duplicate.kind, crate::daemon::protocol::EnvelopeKind::Error);
+
+        // A root that is not a directory is refused, never registered broken.
+        let missing = handle_request(
+            &runtime,
+            workspace_request(
+                "c3",
+                "workspace.create",
+                json!({"name": "ghost", "root": root.path().join("nope").to_string_lossy()}),
+            ),
+        );
+        assert_eq!(missing.kind, crate::daemon::protocol::EnvelopeKind::Error);
+
+        let listed = handle_request(
+            &runtime,
+            workspace_request("l1", "workspace.list", json!({})),
+        );
+        let listed: WorkspaceListResult = serde_json::from_value(listed.result.unwrap()).unwrap();
+        assert_eq!(
+            listed
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha"]
+        );
+
+        let status = handle_request(
+            &runtime,
+            workspace_request("s1", "workspace.status", json!({"workspace_id": id})),
+        );
+        let status: WorkspaceStatusResult = serde_json::from_value(status.result.unwrap()).unwrap();
+        assert_eq!(status.workspace, created.workspace);
+
+        // Moving the directory keeps the identity: a relocation, not a new
+        // workspace and not a reset history.
+        let second = root.path().join("second");
+        std::fs::rename(&first, &second).unwrap();
+        let store = runtime.paths.server_store().unwrap();
+        assert!(
+            store
+                .relocate_workspace(&id, &second.to_string_lossy())
+                .unwrap()
+        );
+        drop(store);
+        let moved = handle_request(
+            &runtime,
+            workspace_request("s2", "workspace.status", json!({"workspace_id": id})),
+        );
+        let moved: WorkspaceStatusResult = serde_json::from_value(moved.result.unwrap()).unwrap();
+        assert_eq!(moved.workspace.id, id);
+        assert_eq!(
+            moved.workspace.created_at_ms,
+            created.workspace.created_at_ms
+        );
+        assert_eq!(moved.workspace.health, WorkspaceHealthName::Present);
+
+        // A vanished directory is reported broken, never omitted.
+        std::fs::remove_dir_all(&second).unwrap();
+        let broken = handle_request(
+            &runtime,
+            workspace_request("l2", "workspace.list", json!({})),
+        );
+        let broken: WorkspaceListResult = serde_json::from_value(broken.result.unwrap()).unwrap();
+        assert_eq!(broken.workspaces.len(), 1);
+        assert_eq!(broken.workspaces[0].health, WorkspaceHealthName::Broken);
+        assert_eq!(broken.workspaces[0].id, id);
+    }
+
+    /// Unknown fields are rejected on the way in, not ignored.
+    #[test]
+    fn workspace_params_reject_unknown_fields() {
+        let (root, runtime) = thread_test_runtime();
+        let dir = root.path().join("ws");
+        std::fs::create_dir(&dir).unwrap();
+        let response = handle_request(
+            &runtime,
+            workspace_request(
+                "bad",
+                "workspace.create",
+                json!({"name": "a", "root": dir.to_string_lossy(), "extra": true}),
+            ),
+        );
+        assert_eq!(response.kind, crate::daemon::protocol::EnvelopeKind::Error);
+        assert_eq!(response.error.unwrap().code, ERROR_MALFORMED_REQUEST);
     }
 
     fn start_thread(

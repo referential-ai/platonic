@@ -319,15 +319,32 @@ impl HostDaemonServer {
 ///
 /// Binding is the moment the server learns a workspace exists, so it is the
 /// moment the registry must learn it too. Registration is idempotent: a
-/// workspace that has been bound before simply keeps its original record.
+/// workspace bound before keeps its original identity and creation time.
+///
+/// A workspace bound this way is auto-registered under its path-derived name.
+/// `workspace.create` exists so a workspace can instead be named deliberately;
+/// requiring creation before use is a separate change, because it withdraws
+/// the "enter a directory and go" path every client currently relies on.
 fn register_workspace(paths: &DaemonPaths) -> AppResult<()> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or_default();
-    paths.server_store()?.register_workspace(
+    let store = paths.server_store()?;
+    let root = paths.workspace_root.to_string_lossy().into_owned();
+    // The name is stable across moves; the root is not. An existing workspace
+    // that has moved is relocated rather than duplicated (P021).
+    if let Some(existing) = store.workspace_by_name(&paths.workspace_id)? {
+        if existing.root != root {
+            store.relocate_workspace(&existing.id, &root)?;
+        }
+        return Ok(());
+    }
+    store.register_workspace(
+        &crate::server_store::mint_workspace_id(&paths.workspace_id, now_ms),
         &paths.workspace_id,
-        &paths.workspace_root.to_string_lossy(),
+        &root,
+        &paths.ledger_path.to_string_lossy(),
         now_ms,
     )?;
     Ok(())

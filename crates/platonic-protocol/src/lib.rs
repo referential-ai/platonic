@@ -674,6 +674,86 @@ pub enum ThreadSpawnResult {
     },
 }
 
+/// Whether a registered workspace's directory is still present.
+///
+/// A broken workspace is reported, never omitted: its ledger is retained and
+/// spawning into it fails at the gate rather than silently creating a new,
+/// empty workspace at the same name (P021).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceHealthName {
+    /// The registered directory is present.
+    Present,
+    /// The registered directory is gone; the ledger is retained.
+    Broken,
+}
+
+/// One registered workspace as reported over the wire.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceSummary {
+    /// Server-minted identity, stable across moves and never path-derived.
+    pub id: String,
+    /// The handle an operator uses. Unique among workspaces.
+    pub name: String,
+    /// Where the workspace currently lives.
+    pub root: String,
+    /// Where this workspace's ledger lives.
+    pub ledger_path: String,
+    /// When the workspace was first registered.
+    pub created_at_ms: u64,
+    /// Whether the registered directory is still present.
+    pub health: WorkspaceHealthName,
+}
+
+/// Parameters for `workspace.create`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceCreateParams {
+    /// Operator-chosen handle. Must be unique and must not be empty.
+    pub name: String,
+    /// Directory the workspace names. Must exist at creation.
+    pub root: String,
+}
+
+/// Result returned by `workspace.create`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceCreateResult {
+    /// The workspace that was created.
+    pub workspace: WorkspaceSummary,
+}
+
+/// Parameters for `workspace.list`. Empty today, present so the method has a
+/// place to grow a filter without a breaking change.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceListParams {}
+
+/// Result returned by `workspace.list`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceListResult {
+    /// Every registered workspace, broken ones included.
+    pub workspaces: Vec<WorkspaceSummary>,
+}
+
+/// Parameters for one `workspace.status` readback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceStatusParams {
+    /// Workspace to read, by minted id.
+    pub workspace_id: String,
+}
+
+/// Result returned by `workspace.status`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceStatusResult {
+    /// The workspace that was read.
+    pub workspace: WorkspaceSummary,
+}
+
 /// Result returned by `thread.list`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
