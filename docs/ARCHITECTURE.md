@@ -1,8 +1,8 @@
 # Plato Agent Architecture
 
 Status: **PARTLY SUPERSEDED, 2026-08-07.** This document recorded the topology
-that bootstrapped `referential-ai/plato-agent`, before the platform decisions of
-2026-08-06/07.
+that bootstrapped the repo now named `referential-ai/platonic`, before the
+platform decisions of 2026-08-06/07.
 
 > ### Read this before using the document below
 >
@@ -27,7 +27,7 @@ that bootstrapped `referential-ai/plato-agent`, before the platform decisions of
 
 ## Runtime Topology
 
-- One repo: `referential-ai/plato-agent`.
+- One repo: `referential-ai/platonic`.
 - End-state binaries:
   - `plato`: daemon-backed one-shot execution and offline replay.
   - `platonic`: server runtime and protocol-backed operator commands.

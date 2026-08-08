@@ -547,7 +547,7 @@ Authenticated private-release download and integrity check:
 ```bash
 gh auth status
 gh release download plato-desktop-v0.1.0 \
-  --repo referential-ai/plato-agent \
+  --repo referential-ai/platonic \
   --pattern 'Plato-*-x86_64.AppImage*'
 sha256sum --check Plato-*-x86_64.AppImage.sha256
 chmod +x Plato-*-x86_64.AppImage
