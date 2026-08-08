@@ -34,10 +34,10 @@ const requiredFiles = [
 const requiredExternalLinks = [
   "https://docs.rs/plato-agent/0.1.0/plato_agent/",
   "https://docs.rs/platonic-core/0.1.0/platonic_core/",
-  "https://github.com/referential-ai/plato-agent",
-  "https://github.com/referential-ai/plato-agent/blob/main/docs/QUICKSTART.md",
-  "https://github.com/referential-ai/plato-agent/discussions",
-  "https://github.com/referential-ai/plato-agent/releases",
+  "https://github.com/referential-ai/platonic",
+  "https://github.com/referential-ai/platonic/blob/main/docs/QUICKSTART.md",
+  "https://github.com/referential-ai/platonic/discussions",
+  "https://github.com/referential-ai/platonic/releases",
 ];
 
 const allowedExternalOrigins = new Set([
@@ -266,7 +266,7 @@ for (const [route, path] of routes) {
 
 for (const link of requiredExternalLinks) {
   const present = [...discoveredExternalLinks].some((candidate) => {
-    if (link === "https://github.com/referential-ai/plato-agent") {
+    if (link === "https://github.com/referential-ai/platonic") {
       return candidate === link || candidate === `${link}/` || candidate === `${link}#readme`;
     }
     return candidate === link;

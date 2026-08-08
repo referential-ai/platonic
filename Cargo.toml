@@ -21,7 +21,7 @@ edition = "2024"
 rust-version = "1.88"
 publish = false
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/referential-ai/plato-agent"
+repository = "https://github.com/referential-ai/platonic"
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }

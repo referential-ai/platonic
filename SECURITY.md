@@ -6,7 +6,7 @@ Only current `main` is supported.
 
 ## Reporting
 
-Do not open a public issue. Submit a [private vulnerability report](https://github.com/referential-ai/plato-agent/security/advisories/new) through the repository **Security** tab. Reports are confidential.
+Do not open a public issue. Submit a [private vulnerability report](https://github.com/referential-ai/platonic/security/advisories/new) through the repository **Security** tab. Reports are confidential.
 
 ## Current Containment
 
