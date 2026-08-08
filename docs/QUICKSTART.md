@@ -76,7 +76,9 @@ On the first local terminal invocation, `plato` asks for a workspace name and
 defaults it to the current directory basename. Press Enter once to register it
 and continue. Piped/headless commands and `plato --remote` never prompt or
 register; bootstrap those paths explicitly with a running host server and
-`platonic workspace create <name> <directory>`.
+`platonic workspace create <name> <directory>`. Standalone `plato-tui` prompts
+only on its default local endpoint; `--socket` attachments and `--snapshot` do
+not.
 
 Live assistant text prints to stderr; the final answer prints to stdout. The
 complete run ledger lands in the default platform SQLite store for the workspace.

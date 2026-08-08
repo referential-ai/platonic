@@ -1944,7 +1944,7 @@ fn handle_workspace_create(
             );
         }
     };
-    let store = match runtime.paths.server_store() {
+    let mut store = match runtime.paths.server_store() {
         Ok(store) => store,
         Err(error) => return store_error(request.id, "workspace.create", error),
     };
@@ -1988,12 +1988,28 @@ fn handle_workspace_create(
         &ledger_path.to_string_lossy(),
         now_ms,
     ) {
-        Ok(record) => Envelope::response_from(
+        Ok((record, true)) => Envelope::response_from(
             request.id,
             Some("workspace.create".into()),
             WorkspaceCreateResult {
                 workspace: workspace_summary(&record),
             },
+        ),
+        Ok((existing, false)) if existing.name == name => Envelope::error(
+            request.id,
+            Some("workspace.create".into()),
+            ERROR_MALFORMED_REQUEST,
+            format!("workspace already exists: {name}"),
+        ),
+        Ok((existing, false)) => Envelope::error(
+            request.id,
+            Some("workspace.create".into()),
+            ERROR_MALFORMED_REQUEST,
+            format!(
+                "workspace root is already registered as {}: {}",
+                existing.name,
+                root.display()
+            ),
         ),
         Err(error) => store_error(request.id, "workspace.create", error),
     }
@@ -2669,7 +2685,10 @@ mod tests {
     use serde_json::json;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
-    use std::{sync::Barrier, time::Duration};
+    use std::{
+        sync::{Arc, Barrier},
+        time::Duration,
+    };
 
     fn bare_thread_test_runtime() -> (tempfile::TempDir, DaemonRuntime) {
         let root = tempfile::tempdir().unwrap();
@@ -2842,6 +2861,68 @@ mod tests {
         assert_eq!(broken.workspaces.len(), 1);
         assert_eq!(broken.workspaces[0].health, WorkspaceHealthName::Broken);
         assert_eq!(broken.workspaces[0].id, id);
+    }
+
+    #[test]
+    fn concurrent_workspace_create_returns_one_typed_duplicate_without_a_second_row() {
+        let (root, runtime) = bare_thread_test_runtime();
+        let workspace_root = root.path().join("concurrent-workspace");
+        std::fs::create_dir(&workspace_root).unwrap();
+        drop(runtime.paths.server_store().unwrap());
+        let barrier = Arc::new(Barrier::new(3));
+        let handles =
+            [("alpha", "create-alpha"), ("beta", "create-beta")].map(|(name, request_id)| {
+                let runtime = runtime.clone();
+                let workspace_root = workspace_root.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    handle_request(
+                        &runtime,
+                        workspace_request(
+                            request_id,
+                            "workspace.create",
+                            json!({"name": name, "root": workspace_root.to_string_lossy()}),
+                        ),
+                    )
+                })
+            });
+        barrier.wait();
+        let responses: Vec<_> = handles
+            .map(|handle| handle.join().unwrap())
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| {
+                    response.kind == crate::daemon::protocol::EnvelopeKind::Response
+                })
+                .count(),
+            1
+        );
+        let errors: Vec<_> = responses
+            .iter()
+            .filter_map(|response| response.error.as_ref())
+            .collect();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, ERROR_MALFORMED_REQUEST);
+        assert!(
+            errors[0]
+                .message
+                .contains("workspace root is already registered")
+        );
+        assert_eq!(
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .workspaces()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

@@ -230,7 +230,8 @@ defaulting to the directory basename; pressing Enter creates it. Declining or
 EOF leaves it unregistered. Piped or otherwise headless one-shots,
 `plato --remote`, gateways, and desktop clients never ask or create: they fail
 with `workspace_unregistered` and name `platonic workspace create` as the
-operator action.
+operator action. Standalone `plato-tui` asks only on its default local endpoint;
+an explicit `--socket` attachment and `--snapshot` never ask or create.
 
 For scripts and services, register deliberately before attaching:
 

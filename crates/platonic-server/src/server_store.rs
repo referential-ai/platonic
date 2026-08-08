@@ -148,18 +148,17 @@ impl ServerStore {
         Ok(Self { connection })
     }
 
-    /// Register a workspace, or return the existing record under that name.
+    /// Register a workspace while atomically excluding duplicate names and roots.
     ///
-    /// Registration is idempotent so a client that reconnects does not need to
-    /// know whether it is the first.
+    /// The boolean is true only for the caller that inserted the returned row.
     pub(crate) fn register_workspace(
-        &self,
+        &mut self,
         id: &str,
         name: &str,
         root: &str,
         ledger_path: &str,
         now_ms: u64,
-    ) -> AppResult<WorkspaceRecord> {
+    ) -> AppResult<(WorkspaceRecord, bool)> {
         for (field, value) in [
             ("id", id),
             ("name", name),
@@ -172,20 +171,56 @@ impl ServerStore {
                 )));
             }
         }
-        self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = transaction
+            .query_row(
+                "SELECT id, name, root, ledger_path, created_at_ms
+                   FROM workspaces WHERE name = ?1",
+                params![name],
+                workspace_from_row,
+            )
+            .optional()?
+        {
+            transaction.commit()?;
+            return Ok((existing, false));
+        }
+        let root = Path::new(root).canonicalize()?;
+        let root = root.to_string_lossy().into_owned();
+        if let Some(existing) = transaction
+            .query_row(
+                "SELECT id, name, root, ledger_path, created_at_ms
+                   FROM workspaces WHERE root = ?1
+                   ORDER BY created_at_ms, name LIMIT 1",
+                params![root],
+                workspace_from_row,
+            )
+            .optional()?
+        {
+            transaction.commit()?;
+            return Ok((existing, false));
+        }
+        let record = WorkspaceRecord {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            root,
+            ledger_path: ledger_path.to_owned(),
+            created_at_ms: now_ms,
+        };
+        transaction.execute(
             "INSERT INTO workspaces (id, name, root, ledger_path, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(name) DO NOTHING",
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                id,
-                name,
-                root,
-                ledger_path,
+                record.id,
+                record.name,
+                record.root,
+                record.ledger_path,
                 sqlite_i64(now_ms, "workspace created_at_ms")?
             ],
         )?;
-        self.workspace_by_name(name)?
-            .ok_or_else(|| AppError::Config(format!("workspace {name} vanished after insert")))
+        transaction.commit()?;
+        Ok((record, true))
     }
 
     /// Point a workspace at a new directory without disturbing its identity.
@@ -1155,7 +1190,12 @@ pub(crate) fn thread_stop(path: &Path, thread_id: &str) -> AppResult<Option<Thre
 mod tests {
     use super::*;
     use platonic_protocol::ReasoningEffort;
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     #[test]
     fn opens_server_store_with_wal_full_and_default_autocheckpoint() {
@@ -1593,7 +1633,7 @@ mod tests {
         drop(store);
         fs::remove_dir_all(&alpha_root).unwrap();
 
-        let reopened = ServerStore::open_or_create(&server_db).unwrap();
+        let mut reopened = ServerStore::open_or_create(&server_db).unwrap();
         let workspaces = reopened.workspaces().unwrap();
         assert_eq!(
             workspaces
@@ -1618,8 +1658,8 @@ mod tests {
                 .is_some_and(|authority| authority.granted_paths[0].path.ends_with("alpha"))
         );
 
-        // Registration is idempotent: rebinding a workspace keeps its record.
-        let rebound = reopened
+        // Rebinding reports the existing record without changing it.
+        let (rebound, inserted) = reopened
             .register_workspace(
                 "ws-alpha",
                 "alpha",
@@ -1628,8 +1668,91 @@ mod tests {
                 999,
             )
             .unwrap();
+        assert!(!inserted);
         assert_eq!(rebound.created_at_ms, 10);
         assert_eq!(reopened.workspaces().unwrap().len(), 2);
+    }
+
+    fn run_workspace_registration_race(
+        server_db: PathBuf,
+        registrations: [(String, String, String, u64); 2],
+    ) -> Vec<(WorkspaceRecord, bool)> {
+        drop(ServerStore::open_or_create(&server_db).unwrap());
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = registrations.map(|(id, name, root, created_at_ms)| {
+            let server_db = server_db.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut store = ServerStore::open_or_create(&server_db).unwrap();
+                barrier.wait();
+                store
+                    .register_workspace(&id, &name, &root, &format!("{name}.db"), created_at_ms)
+                    .unwrap()
+            })
+        });
+        barrier.wait();
+        handles.map(|handle| handle.join().unwrap()).into()
+    }
+
+    #[test]
+    fn concurrent_workspace_registration_atomically_rejects_duplicate_name_and_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha_root = dir.path().join("alpha");
+        let beta_root = dir.path().join("beta");
+        fs::create_dir(&alpha_root).unwrap();
+        fs::create_dir(&beta_root).unwrap();
+        let alpha_root = alpha_root
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let beta_root = beta_root
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let same_root = run_workspace_registration_race(
+            dir.path().join("same-root.db"),
+            [
+                ("ws-alpha".into(), "alpha".into(), alpha_root.clone(), 10),
+                ("ws-beta".into(), "beta".into(), alpha_root.clone(), 20),
+            ],
+        );
+        assert_eq!(
+            same_root.iter().filter(|(_, inserted)| *inserted).count(),
+            1
+        );
+        assert_eq!(same_root[0].0, same_root[1].0);
+        assert_eq!(
+            ServerStore::open_or_create(&dir.path().join("same-root.db"))
+                .unwrap()
+                .workspaces()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let same_name = run_workspace_registration_race(
+            dir.path().join("same-name.db"),
+            [
+                ("ws-first".into(), "shared".into(), alpha_root, 30),
+                ("ws-second".into(), "shared".into(), beta_root, 40),
+            ],
+        );
+        assert_eq!(
+            same_name.iter().filter(|(_, inserted)| *inserted).count(),
+            1
+        );
+        assert_eq!(same_name[0].0, same_name[1].0);
+        assert_eq!(
+            ServerStore::open_or_create(&dir.path().join("same-name.db"))
+                .unwrap()
+                .workspaces()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1638,7 +1761,7 @@ mod tests {
         let workspace_root = dir.path().join("workspace");
         fs::create_dir(&workspace_root).unwrap();
         let server_db = dir.path().join("server.db");
-        let store = ServerStore::open_or_create(&server_db).unwrap();
+        let mut store = ServerStore::open_or_create(&server_db).unwrap();
         store
             .register_workspace(
                 "ws-alpha",

@@ -44,7 +44,8 @@ fn shell_exit_detaches_active_daemon(daemon: &Path) {
 
     let lifecycle = Mutex::new(DesktopLifecycle::default());
     let launch = test_launch(daemon.to_path_buf());
-    let view = bootstrap_with_lifecycle(&workspace_file, &lifecycle, &launch, None).unwrap();
+    let view =
+        bootstrap_and_register_workspace(&workspace_file, &lifecycle, &launch, &workspace_root);
     assert!(matches!(view, BootstrapView::Ready { .. }));
 
     let mut run_client = connect_hello_bounded(&socket_path, &workspace_root);
@@ -110,7 +111,7 @@ fn crash_reconnect_recovers_lock_in_place(daemon: &Path) {
     let mut lifecycle = Mutex::new(DesktopLifecycle::default());
     let launch = test_launch(daemon.to_path_buf());
 
-    bootstrap_with_lifecycle(&workspace_file, &lifecycle, &launch, None).unwrap();
+    bootstrap_and_register_workspace(&workspace_file, &lifecycle, &launch, &workspace_root);
     assert!(lifecycle.get_mut().unwrap().spawned_daemon.is_none());
     let metadata: LockMetadata = serde_json::from_slice(&fs::read(&lock_path).unwrap()).unwrap();
     let child_id = metadata.pid;
@@ -154,10 +155,25 @@ fn crash_reconnect_recovers_lock_in_place(daemon: &Path) {
 
 fn concurrent_starters_attach_to_one_winner(daemon: &Path) {
     let workspace = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
     let workspace_root = canonical_workspace(workspace.path()).unwrap();
+    let workspace_file = state.path().join("workspace.json");
+    persist_canonical_workspace(&workspace_file, &workspace_root).unwrap();
     let socket_path = paths::host_socket_path().unwrap();
     let lock_path = paths::host_lock_path().unwrap();
     let launch = test_launch(daemon.to_path_buf());
+    let lifecycle = Mutex::new(DesktopLifecycle::default());
+    bootstrap_and_register_workspace(&workspace_file, &lifecycle, &launch, &workspace_root);
+    let mut client = connect_hello_bounded(&socket_path, &workspace_root);
+    client.set_timeout(PROOF_TIMEOUT).unwrap();
+    assert_eq!(
+        client.shutdown_if_idle().unwrap().result,
+        ShutdownIfIdleResultName::Shutdown
+    );
+    drop(client);
+    drop(lifecycle);
+    wait_for_socket_removal_with_persistent_lock(&socket_path, &lock_path);
+
     let barrier = Arc::new(Barrier::new(3));
 
     let first_barrier = Arc::clone(&barrier);
@@ -204,6 +220,31 @@ fn concurrent_starters_attach_to_one_winner(daemon: &Path) {
     drop(client);
     wait_for_socket_removal_with_persistent_lock(&socket_path, &lock_path);
     wait_for_process_exit(winner.pid);
+}
+
+fn bootstrap_and_register_workspace(
+    workspace_file: &Path,
+    lifecycle: &Mutex<DesktopLifecycle>,
+    launch: &DaemonLaunch,
+    workspace_root: &Path,
+) -> BootstrapView {
+    let error = bootstrap_with_lifecycle(workspace_file, lifecycle, launch, None).unwrap_err();
+    assert_eq!(error.code, "workspace_unregistered");
+    assert!(error.message.contains("platonic workspace create"));
+
+    let socket_path = paths::host_socket_path().unwrap();
+    let mut control = DaemonClient::connect_with_timeout(&socket_path, PROOF_TIMEOUT).unwrap();
+    let workspace_id = paths::workspace_id(workspace_root).unwrap();
+    let created = control
+        .workspace_create(
+            format!("desktop-proof-{workspace_id}"),
+            workspace_root.to_path_buf(),
+        )
+        .unwrap();
+    assert_eq!(Path::new(&created.workspace.root), workspace_root);
+    drop(control);
+
+    bootstrap_with_lifecycle(workspace_file, lifecycle, launch, None).unwrap()
 }
 
 fn test_launch(executable: PathBuf) -> DaemonLaunch {

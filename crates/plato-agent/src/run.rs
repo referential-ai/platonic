@@ -1,7 +1,7 @@
 //! Daemon-backed one-shot execution for Plato Agent clients.
 
 use crate::{AppError, AppResult};
-use platonic_client::{client::DaemonClient, paths};
+use platonic_client::{ClientError, client::DaemonClient, paths};
 use platonic_core::{RecordedEvent, RunId, TurnId};
 use platonic_protocol::{
     ApprovalDecision, CompletionClaim, ERROR_WORKSPACE_UNREGISTERED, RunOverrides, RunStateName,
@@ -174,12 +174,33 @@ pub fn ensure_server_interactive(
     input: &mut dyn BufRead,
     errors: &mut dyn Write,
 ) -> AppResult<DaemonClient> {
-    let registration_error = match ensure_server(workspace_root) {
+    match ensure_server(workspace_root) {
         Ok(client) => return Ok(client),
-        Err(AppError::DaemonResponse(error)) if error.code == ERROR_WORKSPACE_UNREGISTERED => error,
+        Err(AppError::DaemonResponse(error)) if error.code == ERROR_WORKSPACE_UNREGISTERED => {}
         Err(error) => return Err(error),
-    };
+    }
+    attach_server_interactive(workspace_root, &paths::host_socket_path()?, input, errors)
+}
+
+/// Attaches to one local endpoint, asking once before registering its directory.
+pub fn attach_server_interactive(
+    workspace_root: &Path,
+    socket_path: &Path,
+    input: &mut dyn BufRead,
+    errors: &mut dyn Write,
+) -> AppResult<DaemonClient> {
     let workspace_root = workspace_root.canonicalize()?;
+    let mut client = DaemonClient::connect_with_timeout(socket_path, CONNECT_TIMEOUT)?;
+    let registration_error = match client.hello(&workspace_root) {
+        Ok(_) => {
+            client.clear_request_timeout()?;
+            return Ok(client);
+        }
+        Err(ClientError::DaemonResponse(error)) if error.code == ERROR_WORKSPACE_UNREGISTERED => {
+            error
+        }
+        Err(error) => return Err(error.into()),
+    };
     let default_name = workspace_root
         .file_name()
         .and_then(|name| name.to_str())
@@ -189,10 +210,10 @@ pub fn ensure_server_interactive(
         return Err(AppError::DaemonResponse(registration_error));
     };
 
-    let socket_path = paths::host_socket_path()?;
-    let mut client = DaemonClient::connect_with_timeout(&socket_path, CONNECT_TIMEOUT)?;
     client.workspace_create(name, workspace_root.clone())?;
-    ensure_server(&workspace_root)
+    client.hello(&workspace_root)?;
+    client.clear_request_timeout()?;
+    Ok(client)
 }
 
 fn prompt_workspace_name(
