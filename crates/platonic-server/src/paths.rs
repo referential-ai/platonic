@@ -23,12 +23,54 @@ impl DefaultSqlitePath {
     }
 }
 
+/// Absolute path to the server-wide state root, independent of any workspace.
+///
+/// Holds the workspace registry and every table that spans workspaces. A
+/// per-workspace ledger lives under `workspaces/<id>/` beneath this root.
+pub fn server_state_root() -> AppResult<PathBuf> {
+    let root = state_home()?.join("platonic");
+    adopt_legacy_state_root(&root)?;
+    Ok(root)
+}
+
+/// Move state written under the old `plato-agent` root to the current one.
+///
+/// The server was renamed to Platonic, and the state root followed. Without
+/// this, every ledger a user already has would become invisible rather than
+/// merely misfiled. Renaming the directory is atomic, and it happens only when
+/// the old root exists and the new one does not, so it runs at most once and
+/// never overwrites current state.
+fn adopt_legacy_state_root(root: &Path) -> AppResult<()> {
+    let Some(parent) = root.parent() else {
+        return Ok(());
+    };
+    let legacy = parent.join("plato-agent");
+    if !legacy.is_dir() || root.exists() {
+        return Ok(());
+    }
+    match std::fs::rename(&legacy, root) {
+        Ok(()) => Ok(()),
+        // Another process may have adopted it first; that is success, not failure.
+        Err(_) if root.exists() => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Absolute path to the server-wide database.
+///
+/// D005 requires every thread to be enumerable, including clientless threads
+/// and orphans. Thread authority therefore cannot live in a per-workspace
+/// ledger: an orphan in a workspace nobody has opened would be invisible.
+pub fn server_db_path() -> AppResult<PathBuf> {
+    Ok(server_state_root()?.join("server.db"))
+}
+
 pub fn default_sqlite_path(workspace_root: &Path) -> AppResult<PathBuf> {
     Ok(default_sqlite(workspace_root)?.path)
 }
 
 pub fn default_sqlite(workspace_root: &Path) -> AppResult<DefaultSqlitePath> {
-    let state_root = state_home()?.join("plato-agent");
+    let state_root = server_state_root()?;
     let path = state_root
         .join("workspaces")
         .join(workspace_id(workspace_root)?)
@@ -86,6 +128,39 @@ pub(crate) fn with_test_xdg<T>(root: &Path, run: impl FnOnce() -> T) -> T {
 mod tests {
     use super::*;
 
+    /// A user who already has ledgers under the old root keeps them. The
+    /// rename must not be a silent data loss.
+    #[cfg(unix)]
+    #[test]
+    fn existing_state_under_the_legacy_root_is_adopted_once_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        with_test_xdg(dir.path(), || {
+            let state_home = dir.path().join("xdg-state");
+            let legacy_ledger = state_home
+                .join("plato-agent")
+                .join("workspaces")
+                .join("workspace-abc")
+                .join("agent.db");
+            std::fs::create_dir_all(legacy_ledger.parent().unwrap()).unwrap();
+            std::fs::write(&legacy_ledger, b"original ledger bytes").unwrap();
+
+            let root = server_state_root().unwrap();
+            assert_eq!(root, state_home.join("platonic"));
+            let adopted = root
+                .join("workspaces")
+                .join("workspace-abc")
+                .join("agent.db");
+            assert_eq!(std::fs::read(&adopted).unwrap(), b"original ledger bytes");
+            assert!(!state_home.join("plato-agent").exists());
+
+            // A second legacy root appearing later must not clobber current state.
+            std::fs::create_dir_all(state_home.join("plato-agent")).unwrap();
+            std::fs::write(state_home.join("plato-agent").join("stray"), b"stray").unwrap();
+            assert_eq!(server_state_root().unwrap(), root);
+            assert_eq!(std::fs::read(&adopted).unwrap(), b"original ledger bytes");
+        });
+    }
+
     #[test]
     fn default_sqlite_path_uses_workspace_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -94,7 +169,7 @@ mod tests {
 
             assert!(
                 path.components()
-                    .any(|component| component.as_os_str() == "plato-agent")
+                    .any(|component| component.as_os_str() == "platonic")
             );
             assert!(
                 path.components()
@@ -115,7 +190,7 @@ mod tests {
             assert!(
                 socket_path
                     .components()
-                    .any(|component| component.as_os_str() == "plato-agent")
+                    .any(|component| component.as_os_str() == "platonic")
             );
             assert!(
                 socket_path
@@ -140,7 +215,7 @@ mod tests {
                 let workspace_id = workspace_id(workspace.path()).unwrap();
                 let workspace_dir = local_app_data
                     .path()
-                    .join("plato-agent")
+                    .join("platonic")
                     .join("workspaces")
                     .join(&workspace_id);
 

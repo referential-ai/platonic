@@ -499,7 +499,7 @@ fn installer_control_preflights_refuses_active_and_retries_after_terminal() {
     let unrelated_id = paths::workspace_id(&unrelated_root).unwrap();
     let unrelated_lock = local_app_data
         .path()
-        .join("plato-agent/workspaces")
+        .join("platonic/workspaces")
         .join(&unrelated_id)
         .join("agent.lock");
     fs::create_dir_all(unrelated_lock.parent().unwrap()).unwrap();
@@ -590,7 +590,7 @@ fn installer_control_preflights_refuses_active_and_retries_after_terminal() {
     let active_lock_before = fs::read(&active.lock_path).unwrap();
     let invalid_lock = local_app_data
         .path()
-        .join("plato-agent/workspaces/unvalidated/agent.lock");
+        .join("platonic/workspaces/unvalidated/agent.lock");
     let invalid_bytes = b"not valid lock metadata\r\n";
     fs::create_dir_all(invalid_lock.parent().unwrap()).unwrap();
     fs::write(&invalid_lock, invalid_bytes).unwrap();
@@ -1293,7 +1293,7 @@ impl ProofDaemon {
         let workspace_id = paths::workspace_id(&workspace_root).unwrap();
         let socket_path = std::path::PathBuf::from(format!(r"\\.\pipe\plato-agent-{workspace_id}"));
         let lock_path = local_app_data
-            .join("plato-agent")
+            .join("platonic")
             .join("workspaces")
             .join(&workspace_id)
             .join("agent.lock");

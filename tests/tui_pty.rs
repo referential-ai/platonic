@@ -52,7 +52,7 @@ fn plato_tui_cold_starts_host_thread_and_remote_reuses_it() {
     for directory in [&workspace, &runtime, &state, &home] {
         fs::create_dir(directory).unwrap();
     }
-    let endpoint = runtime.join("plato-agent").join("host").join("agent.sock");
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let config = DaemonConnectionConfig::resolve(&workspace, Some(endpoint.clone())).unwrap();
     let _daemon_cleanup = HostDaemonCleanup {
         config: config.clone(),
@@ -125,7 +125,7 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
 
     let workspace_id = paths::workspace_id(&workspace).unwrap();
     let endpoint = runtime
-        .join("plato-agent")
+        .join("platonic")
         .join("workspaces")
         .join(&workspace_id)
         .join("agent.sock");
@@ -291,7 +291,7 @@ fn composer_cursor_stays_real_at_placeholder_origin_and_narrow_wrap() {
 
     let workspace_id = paths::workspace_id(&workspace).unwrap();
     let endpoint = runtime
-        .join("plato-agent")
+        .join("platonic")
         .join("workspaces")
         .join(&workspace_id)
         .join("agent.sock");
@@ -343,7 +343,7 @@ fn composer_textarea_features_preserve_submit_queue_slash_and_history_contracts(
 
     let workspace_id = paths::workspace_id(&workspace).unwrap();
     let endpoint = runtime
-        .join("plato-agent")
+        .join("platonic")
         .join("workspaces")
         .join(&workspace_id)
         .join("agent.sock");
@@ -487,7 +487,7 @@ fn bare_plato_status_modal_sends_one_read_only_request_and_escape_closes() {
 
     let workspace_id = paths::workspace_id(&workspace).unwrap();
     let endpoint = runtime
-        .join("plato-agent")
+        .join("platonic")
         .join("workspaces")
         .join(&workspace_id)
         .join("agent.sock");
@@ -563,7 +563,7 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
 
     let workspace_id = paths::workspace_id(&workspace).unwrap();
     let endpoint = runtime
-        .join("plato-agent")
+        .join("platonic")
         .join("workspaces")
         .join(&workspace_id)
         .join("agent.sock");
@@ -684,7 +684,7 @@ enabled = ["shell.exec"]
 
     let workspace_id = paths::workspace_id(&workspace).unwrap();
     let endpoint = runtime
-        .join("plato-agent")
+        .join("platonic")
         .join("workspaces")
         .join(&workspace_id)
         .join("agent.sock");
@@ -882,7 +882,7 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
 
     let workspace_id = paths::workspace_id(&workspace).unwrap();
     let endpoint = runtime
-        .join("plato-agent")
+        .join("platonic")
         .join("workspaces")
         .join(&workspace_id)
         .join("agent.sock");
@@ -993,7 +993,7 @@ fn bare_plato_session_picker_resumes_exact_hidden_session_id() {
 
     let workspace_id = paths::workspace_id(&workspace).unwrap();
     let endpoint = runtime
-        .join("plato-agent")
+        .join("platonic")
         .join("workspaces")
         .join(&workspace_id)
         .join("agent.sock");
@@ -1055,7 +1055,7 @@ fn capture_initial_frame(
 ) -> CapturedFrame {
     let workspace_id = paths::workspace_id(workspace).unwrap();
     let endpoint = runtime
-        .join("plato-agent")
+        .join("platonic")
         .join("workspaces")
         .join(&workspace_id)
         .join("agent.sock");

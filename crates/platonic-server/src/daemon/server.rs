@@ -146,6 +146,7 @@ impl DaemonServer {
         prepare_socket_parent(&paths::runtime_home_and_fallback().0, &paths.socket_path)?;
         let lock = WorkspaceLock::acquire_for_workspace(&paths.workspace_root, &paths.socket_path)?;
         crate::ledger::interrupt_orphaned_default_sqlite_runs(&paths.default_ledger())?;
+        register_workspace(&paths)?;
         let endpoint = BoundEndpoint::bind(paths.socket_path.clone(), reclaim_default_socket)?;
         let runtime = DaemonRuntime::new(paths);
         Ok(Self {
@@ -312,6 +313,24 @@ impl HostDaemonServer {
         let stream = transport::accept(&self.endpoint.listener)?;
         handle_host_stream(self.runtime.clone(), stream)
     }
+}
+
+/// Record this workspace in the server-wide registry.
+///
+/// Binding is the moment the server learns a workspace exists, so it is the
+/// moment the registry must learn it too. Registration is idempotent: a
+/// workspace that has been bound before simply keeps its original record.
+fn register_workspace(paths: &DaemonPaths) -> AppResult<()> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default();
+    paths.server_store()?.register_workspace(
+        &paths.workspace_id,
+        &paths.workspace_root.to_string_lossy(),
+        now_ms,
+    )?;
+    Ok(())
 }
 
 fn prepare_workspace_lock_parent(paths: &DaemonPaths) -> AppResult<()> {
@@ -1130,7 +1149,7 @@ mod tests {
     fn runtime_permission_hardening_covers_the_private_chain() {
         let root_parent = tempfile::tempdir().unwrap();
         let root = root_parent.path().join("user");
-        let middle = root.join("plato-agent");
+        let middle = root.join("platonic");
         let leaf = middle.join("workspaces").join("workspace-1");
         fs::create_dir_all(&leaf).unwrap();
         for path in [&root, &middle, &leaf] {

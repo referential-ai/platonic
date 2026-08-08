@@ -493,7 +493,7 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     assert_eq!(stopped_root.live.last_activity_at_ms, None);
     assert!(orphaned_child.live.loaded);
     assert_eq!(orphaned_child.authority, child.authority);
-    let connection = rusqlite::Connection::open(&proof.ledger_path).unwrap();
+    let connection = rusqlite::Connection::open(&proof.server_db_path).unwrap();
     assert_eq!(
         connection
             .query_row(
@@ -1574,6 +1574,8 @@ struct ProofContext {
     fixture_path: PathBuf,
     socket_path: PathBuf,
     ledger_path: PathBuf,
+    /// The host's server-wide store, where thread state lives.
+    server_db_path: PathBuf,
     #[cfg(unix)]
     runtime_root: PathBuf,
     #[cfg(unix)]
@@ -1598,12 +1600,12 @@ impl ProofContext {
             let state_root = root.path().join("state");
             (
                 runtime_root
-                    .join("plato-agent")
+                    .join("platonic")
                     .join("workspaces")
                     .join(&workspace_id)
                     .join("agent.sock"),
                 state_root
-                    .join("plato-agent")
+                    .join("platonic")
                     .join("workspaces")
                     .join(&workspace_id)
                     .join("agent.db"),
@@ -1618,13 +1620,20 @@ impl ProofContext {
             (
                 PathBuf::from(format!(r"\\.\pipe\plato-agent-{workspace_id}")),
                 local_app_data
-                    .join("plato-agent")
+                    .join("platonic")
                     .join("workspaces")
                     .join(&workspace_id)
                     .join("agent.db"),
                 local_app_data,
             )
         };
+
+        // The server store sits beside the workspaces directory, not inside
+        // any one workspace.
+        #[cfg(unix)]
+        let server_db_path = state_root.join("platonic").join("server.db");
+        #[cfg(windows)]
+        let server_db_path = local_app_data.join("platonic").join("server.db");
 
         Self {
             config_path: workspace.join("plato.toml"),
@@ -1633,6 +1642,7 @@ impl ProofContext {
             workspace,
             socket_path,
             ledger_path,
+            server_db_path,
             #[cfg(unix)]
             runtime_root,
             #[cfg(unix)]
@@ -1646,7 +1656,7 @@ impl ProofContext {
         #[cfg(unix)]
         {
             self.runtime_root
-                .join("plato-agent")
+                .join("platonic")
                 .join("host")
                 .join("agent.sock")
         }
@@ -1662,7 +1672,7 @@ impl ProofContext {
         #[cfg(windows)]
         let runtime_root = &self.local_app_data;
         runtime_root
-            .join("plato-agent")
+            .join("platonic")
             .join("host")
             .join("agent.lock")
     }
@@ -1674,7 +1684,7 @@ impl ProofContext {
         #[cfg(windows)]
         let runtime_root = &self.local_app_data;
         runtime_root
-            .join("plato-agent")
+            .join("platonic")
             .join("workspaces")
             .join(workspace_id)
             .join("agent.lock")

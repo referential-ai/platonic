@@ -36,6 +36,7 @@ use crate::{
     new_run_id, new_session_id,
     paths::DefaultSqlitePath,
     replay::{format_readback, format_session_readback},
+    server_store::ServerStore,
     thread_authority::{
         THREAD_SPAWN_APPROVAL_REASON, ThreadAuthorityDraft, ThreadAuthorityError,
         ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, ThreadStopRecord, new_spawn_id,
@@ -402,9 +403,11 @@ fn start_thread_spawn(
         approval_policy,
     )
     .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
-    let mut ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger())
+    let mut store = runtime
+        .paths
+        .server_store()
         .map_err(|_| ThreadSpawnFailure::Persistence)?;
-    let parent = read_live_parent(runtime, &ledger, &draft)?;
+    let parent = read_live_parent(runtime, &store, &draft)?;
     let auto_grant = parent.as_ref().is_some_and(|parent| {
         parent.approval_policy == crate::daemon::protocol::ThreadApprovalPolicy::Yolo
     });
@@ -424,7 +427,7 @@ fn start_thread_spawn(
             .expect("newly reserved thread spawn can be claimed");
         return resolve_thread_spawn(
             runtime,
-            &mut ledger,
+            &mut store,
             pending,
             ThreadSpawnDecision::Grant {
                 actor: "yolo".into(),
@@ -448,13 +451,15 @@ fn decide_thread_spawn(
     if runtime.shutdown_accepted() {
         return Err(ThreadSpawnFailure::ShuttingDown);
     }
-    let mut ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger())
+    let mut store = runtime
+        .paths
+        .server_store()
         .map_err(|_| ThreadSpawnFailure::Persistence)?;
-    if let Some(existing) = ledger
+    if let Some(existing) = store
         .thread_spawn_approval(spawn_id)
         .map_err(|_| ThreadSpawnFailure::Persistence)?
     {
-        return persisted_thread_spawn_result(runtime, &ledger, existing, &decision);
+        return persisted_thread_spawn_result(runtime, &store, existing, &decision);
     }
     let pending = runtime
         .claim_thread_spawn(spawn_id)
@@ -469,16 +474,16 @@ fn decide_thread_spawn(
                 "thread spawn decision is already in progress: {spawn_id}"
             )),
         })?;
-    resolve_thread_spawn(runtime, &mut ledger, pending, decision)
+    resolve_thread_spawn(runtime, &mut store, pending, decision)
 }
 
 fn resolve_thread_spawn(
     runtime: &DaemonRuntime,
-    ledger: &mut SqliteLedger,
+    store: &mut ServerStore,
     pending: crate::daemon::runtime::PendingThreadSpawn,
     decision: ThreadSpawnDecision,
 ) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
-    let result = resolve_thread_spawn_inner(runtime, ledger, &pending, decision);
+    let result = resolve_thread_spawn_inner(runtime, store, &pending, decision);
     if result.is_err() {
         runtime.release_thread_spawn_claim(&pending.spawn_id);
     }
@@ -487,7 +492,7 @@ fn resolve_thread_spawn(
 
 fn resolve_thread_spawn_inner(
     runtime: &DaemonRuntime,
-    ledger: &mut SqliteLedger,
+    store: &mut ServerStore,
     pending: &crate::daemon::runtime::PendingThreadSpawn,
     decision: ThreadSpawnDecision,
 ) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
@@ -501,12 +506,12 @@ fn resolve_thread_spawn_inner(
     .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
     match decision {
         ThreadSpawnDecision::Grant { actor } => {
-            read_live_parent(runtime, ledger, &pending.draft)?;
+            read_live_parent(runtime, store, &pending.draft)?;
             let authority = pending
                 .draft
                 .complete(actor, decided_at_ms)
                 .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
-            let durable = ledger
+            let durable = store
                 .persist_thread_spawn(&approval, Some(&authority))
                 .map_err(|_| ThreadSpawnFailure::Persistence)?
                 .expect("granted spawn persistence returns durable authority");
@@ -517,7 +522,7 @@ fn resolve_thread_spawn_inner(
             })
         }
         ThreadSpawnDecision::Deny { actor, reason } => {
-            ledger
+            store
                 .persist_thread_spawn(&approval, None)
                 .map_err(|_| ThreadSpawnFailure::Persistence)?;
             runtime.complete_thread_spawn_without_authority(&pending.spawn_id);
@@ -529,7 +534,7 @@ fn resolve_thread_spawn_inner(
             })
         }
         ThreadSpawnDecision::Cancel { actor } => {
-            ledger
+            store
                 .persist_thread_spawn(&approval, None)
                 .map_err(|_| ThreadSpawnFailure::Persistence)?;
             runtime.complete_thread_spawn_without_authority(&pending.spawn_id);
@@ -544,7 +549,7 @@ fn resolve_thread_spawn_inner(
 
 fn persisted_thread_spawn_result(
     runtime: &DaemonRuntime,
-    ledger: &SqliteLedger,
+    store: &ServerStore,
     approval: ThreadSpawnApprovalRecord,
     requested: &ThreadSpawnDecision,
 ) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
@@ -556,7 +561,7 @@ fn persisted_thread_spawn_result(
     }
     match approval.decision {
         ThreadSpawnDecisionName::Granted => {
-            let authority = ledger
+            let authority = store
                 .thread_authority(&approval.thread_id)
                 .map_err(|_| ThreadSpawnFailure::Persistence)?
                 .ok_or(ThreadSpawnFailure::Persistence)?;
@@ -580,13 +585,13 @@ fn persisted_thread_spawn_result(
 
 fn read_live_parent(
     runtime: &DaemonRuntime,
-    ledger: &SqliteLedger,
+    store: &ServerStore,
     draft: &ThreadAuthorityDraft,
 ) -> Result<Option<crate::daemon::protocol::ThreadAuthorityRecord>, ThreadSpawnFailure> {
     let Some(parent_thread_id) = draft.parent_thread_id.as_deref() else {
         return Ok(None);
     };
-    let parent = ledger
+    let parent = store
         .thread_authority(parent_thread_id)
         .map_err(|_| ThreadSpawnFailure::Persistence)?
         .ok_or_else(|| {
@@ -612,7 +617,7 @@ fn handle_thread_list(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
             "thread.list params must be omitted or an empty object",
         );
     }
-    match crate::ledger::default_thread_authorities(&runtime.paths.default_ledger()) {
+    match crate::server_store::thread_authorities(&runtime.paths.server_db_path) {
         Ok(authorities) => Envelope::response_from(
             request.id,
             Some("thread.list".into()),
@@ -637,10 +642,7 @@ fn handle_thread_status(
     request: Envelope,
     params: ThreadStatusParams,
 ) -> Envelope {
-    match crate::ledger::default_thread_authority(
-        &runtime.paths.default_ledger(),
-        &params.thread_id,
-    ) {
+    match crate::server_store::thread_authority(&runtime.paths.server_db_path, &params.thread_id) {
         Ok(Some(authority)) => Envelope::response_from(
             request.id,
             Some("thread.status".into()),
@@ -679,8 +681,8 @@ fn handle_thread_send(
             message,
         );
     }
-    let authority = match crate::ledger::default_thread_authority(
-        &runtime.paths.default_ledger(),
+    let authority = match crate::server_store::thread_authority(
+        &runtime.paths.server_db_path,
         &params.thread_id,
     ) {
         Ok(Some(authority)) => authority,
@@ -701,7 +703,7 @@ fn handle_thread_send(
             );
         }
     };
-    match crate::ledger::default_thread_stop(&runtime.paths.default_ledger(), &params.thread_id) {
+    match crate::server_store::thread_stop(&runtime.paths.server_db_path, &params.thread_id) {
         Ok(Some(_)) => {
             return Envelope::error(
                 request.id,
@@ -838,7 +840,7 @@ fn handle_thread_events(
             format!("thread.events wait_ms must not exceed {MAX_THREAD_EVENT_WAIT_MS}"),
         );
     }
-    match crate::ledger::default_thread_authority(&runtime.paths.default_ledger(), &thread_id) {
+    match crate::server_store::thread_authority(&runtime.paths.server_db_path, &thread_id) {
         Ok(Some(_)) => {}
         Ok(None) => {
             return Envelope::error(
@@ -857,7 +859,7 @@ fn handle_thread_events(
             );
         }
     }
-    match crate::ledger::default_thread_stop(&runtime.paths.default_ledger(), &thread_id) {
+    match crate::server_store::thread_stop(&runtime.paths.server_db_path, &thread_id) {
         Ok(Some(_)) => {
             return Envelope::error(
                 request.id,
@@ -905,8 +907,8 @@ fn handle_thread_stop(
     request: Envelope,
     params: ThreadStopParams,
 ) -> Envelope {
-    let mut ledger = match SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()) {
-        Ok(ledger) => ledger,
+    let mut store = match runtime.paths.server_store() {
+        Ok(store) => store,
         Err(_) => {
             return Envelope::error(
                 request.id,
@@ -916,7 +918,7 @@ fn handle_thread_stop(
             );
         }
     };
-    let authority = match ledger.thread_authority(&params.thread_id) {
+    let authority = match store.thread_authority(&params.thread_id) {
         Ok(Some(authority)) => authority,
         Ok(None) => {
             return Envelope::error(
@@ -947,7 +949,7 @@ fn handle_thread_stop(
                 );
             }
         };
-    match ledger.thread_stop(&authority.thread_id) {
+    match store.thread_stop(&authority.thread_id) {
         Ok(Some(stop)) => {
             return Envelope::response_from(
                 request.id,
@@ -980,7 +982,7 @@ fn handle_thread_stop(
             );
         }
         Err(ThreadStopError::AlreadyStopped) => {
-            return match ledger.thread_stop(&authority.thread_id) {
+            return match store.thread_stop(&authority.thread_id) {
                 Ok(Some(stop)) => Envelope::response_from(
                     request.id,
                     Some("thread.stop".into()),
@@ -1019,7 +1021,7 @@ fn handle_thread_stop(
         now_ms(),
     )
     .expect("thread stop inputs were validated before lifecycle execution");
-    let (stop, inserted) = match ledger.persist_thread_stop(&stop) {
+    let (stop, inserted) = match store.persist_thread_stop(&stop) {
         Ok(result) => result,
         Err(_) => {
             runtime.abort_thread_stop(&authority.thread_id);
@@ -2138,7 +2140,7 @@ mod tests {
         let ledger_path = root
             .path()
             .join("state")
-            .join("plato-agent")
+            .join("platonic")
             .join("workspaces")
             .join("thread-tests")
             .join("agent.db");
@@ -2147,6 +2149,7 @@ mod tests {
             workspace_id: "thread-tests".into(),
             socket_path: root.path().join("agent.sock"),
             lock_path: root.path().join("agent.lock"),
+            server_db_path: root.path().join("server.db"),
             ledger_path,
         });
         (root, runtime)
@@ -2236,10 +2239,10 @@ mod tests {
             )
             .unwrap(),
         );
-        let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
-        assert!(ledger.thread_authority(&thread_id).unwrap().is_none());
+        let store = runtime.paths.server_store().unwrap();
+        assert!(store.thread_authority(&thread_id).unwrap().is_none());
         assert!(!runtime.thread_is_loaded(&thread_id));
-        drop(ledger);
+        drop(store);
 
         let status = grant_thread(&runtime, &spawn_id, "stdin");
         assert_eq!(status.authority.thread_id, thread_id);
@@ -2267,12 +2270,12 @@ mod tests {
                 last_activity_at_ms: Some(status.authority.created_at_ms),
             }
         );
-        let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
+        let store = runtime.paths.server_store().unwrap();
         assert_eq!(
-            ledger.thread_authority(&thread_id).unwrap(),
+            store.thread_authority(&thread_id).unwrap(),
             Some(status.authority.clone())
         );
-        let approval = ledger.thread_spawn_approval(&spawn_id).unwrap().unwrap();
+        let approval = store.thread_spawn_approval(&spawn_id).unwrap().unwrap();
         assert_eq!(approval.decision, ThreadSpawnDecisionName::Granted);
         assert_eq!(approval.actor, status.authority.spawning_actor);
     }
@@ -2312,11 +2315,10 @@ mod tests {
                 (ThreadSpawnResult::Denied { .. }, "denied")
                     | (ThreadSpawnResult::Canceled { .. }, "canceled")
             ));
-            let ledger =
-                SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
-            let approval = ledger.thread_spawn_approval(&spawn_id).unwrap().unwrap();
+            let store = runtime.paths.server_store().unwrap();
+            let approval = store.thread_spawn_approval(&spawn_id).unwrap().unwrap();
             assert_eq!(approval.decision, expected);
-            assert!(ledger.thread_authority(&thread_id).unwrap().is_none());
+            assert!(store.thread_authority(&thread_id).unwrap().is_none());
             assert!(!runtime.thread_is_loaded(&thread_id));
         }
     }
@@ -2382,12 +2384,12 @@ mod tests {
             }
         );
         assert_eq!(runtime.thread_live_state(&sibling_id), sibling_before);
-        let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
-        let durable = ledger.thread_stop(&target_id).unwrap().unwrap();
+        let store = runtime.paths.server_store().unwrap();
+        let durable = store.thread_stop(&target_id).unwrap().unwrap();
         assert_eq!(durable.actor, "operator");
         assert_eq!(durable.stopped_turn_id, None);
         assert_eq!(durable.occurred_at_ms, stopped_at_ms);
-        drop(ledger);
+        drop(store);
 
         let repeated = stop_thread(&runtime, &target_id, "other_operator");
         assert_eq!(
@@ -2451,14 +2453,14 @@ mod tests {
             ThreadStopResult::Stopped {
                 thread_id: target_id.clone(),
                 stopped_turn_id: Some("turn_active".into()),
-                stopped_at_ms: SqliteLedger::open_or_create_default(
-                    &runtime.paths.default_ledger()
-                )
-                .unwrap()
-                .thread_stop(&target_id)
-                .unwrap()
-                .unwrap()
-                .occurred_at_ms,
+                stopped_at_ms: runtime
+                    .paths
+                    .server_store()
+                    .unwrap()
+                    .thread_stop(&target_id)
+                    .unwrap()
+                    .unwrap()
+                    .occurred_at_ms,
             }
         );
         assert_eq!(record.status().state, RunStateName::Canceled);
@@ -2746,7 +2748,7 @@ IFS= read -r _
                 last_activity_at_ms: None,
             }
         );
-        let columns = rusqlite::Connection::open(&runtime.paths.ledger_path)
+        let columns = rusqlite::Connection::open(&runtime.paths.server_db_path)
             .unwrap()
             .prepare("PRAGMA table_info(thread_authorities)")
             .unwrap()
@@ -2770,7 +2772,10 @@ IFS= read -r _
             )
             .unwrap(),
         );
-        let connection = rusqlite::Connection::open(&runtime.paths.ledger_path).unwrap();
+        // The authority table lives in the server-wide store now, so the
+        // injected failure has to be planted there to exercise the same path.
+        drop(runtime.paths.server_store().unwrap());
+        let connection = rusqlite::Connection::open(&runtime.paths.server_db_path).unwrap();
         connection
             .execute_batch(
                 "CREATE TRIGGER fail_thread_authority_insert
@@ -2790,13 +2795,13 @@ IFS= read -r _
             ),
             Err(ThreadSpawnFailure::Persistence)
         ));
-        let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
-        assert!(ledger.thread_authority(&thread_id).unwrap().is_none());
-        assert!(ledger.thread_spawn_approval(&spawn_id).unwrap().is_none());
+        let store = runtime.paths.server_store().unwrap();
+        assert!(store.thread_authority(&thread_id).unwrap().is_none());
+        assert!(store.thread_spawn_approval(&spawn_id).unwrap().is_none());
         assert!(!runtime.thread_is_loaded(&thread_id));
-        drop(ledger);
+        drop(store);
 
-        let connection = rusqlite::Connection::open(&runtime.paths.ledger_path).unwrap();
+        let connection = rusqlite::Connection::open(&runtime.paths.server_db_path).unwrap();
         connection
             .execute_batch("DROP TRIGGER fail_thread_authority_insert")
             .unwrap();
@@ -2849,8 +2854,8 @@ IFS= read -r _
                 ThreadAuthorityError::WorkingDirectory { .. }
             ))
         ));
-        let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
-        assert_eq!(ledger.thread_authorities().unwrap().len(), 1);
+        let store = runtime.paths.server_store().unwrap();
+        assert_eq!(store.thread_authorities().unwrap().len(), 1);
     }
 
     #[test]
@@ -2880,7 +2885,7 @@ IFS= read -r _
             unexpected => panic!("expected auto-granted child, got {unexpected:?}"),
         };
         assert_eq!(child.authority.spawning_actor, "yolo");
-        let connection = rusqlite::Connection::open(&runtime.paths.ledger_path).unwrap();
+        let connection = rusqlite::Connection::open(&runtime.paths.server_db_path).unwrap();
         let approvals = connection
             .query_row(
                 "SELECT COUNT(*) FROM thread_spawn_approvals WHERE actor = 'yolo' AND decision = 'granted'",
@@ -2979,10 +2984,10 @@ IFS= read -r _
             ),
             Err(ThreadSpawnFailure::Conflict(message)) if message.contains("different durable decision")
         ));
-        let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
-        assert_eq!(ledger.thread_authorities().unwrap().len(), 1);
+        let store = runtime.paths.server_store().unwrap();
+        assert_eq!(store.thread_authorities().unwrap().len(), 1);
         assert_eq!(
-            ledger.thread_authority(&thread_id).unwrap(),
+            store.thread_authority(&thread_id).unwrap(),
             Some(first.authority)
         );
     }
@@ -3004,8 +3009,8 @@ IFS= read -r _
             r#"{"v":1,"id":"bad","kind":"request","method":"thread.spawn","params":{"action":"start","parent_thread_id":null,"cwd":"/tmp","model":"gpt-5.6-sol","reasoning_effort":"xhigh","approval_policy":"prompt","extra":true}}"#,
         );
         assert_eq!(response.error.unwrap().code, ERROR_MALFORMED_REQUEST);
-        let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
-        assert!(ledger.thread_authorities().unwrap().is_empty());
+        let store = runtime.paths.server_store().unwrap();
+        assert!(store.thread_authorities().unwrap().is_empty());
     }
 
     #[test]
@@ -3055,12 +3060,16 @@ IFS= read -r _
         );
         assert_eq!(invalid_events.error.unwrap().code, ERROR_MALFORMED_REQUEST);
         assert_eq!(runtime.thread_live_state(&thread_id).current_turn_id, None);
-        let ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
-        assert_eq!(
-            ledger.thread_authority(&thread_id).unwrap(),
-            Some(authority)
-        );
-        let connection = rusqlite::Connection::open(&runtime.paths.ledger_path).unwrap();
+        let store = runtime.paths.server_store().unwrap();
+        assert_eq!(store.thread_authority(&thread_id).unwrap(), Some(authority));
+        // The workspace ledger holds session_runs; the server store holds
+        // thread state. This assertion is about the former.
+        let connection = rusqlite::Connection::open(
+            SqliteLedger::open_or_create_default(&runtime.paths.default_ledger())
+                .map(|_| &runtime.paths.ledger_path)
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM session_runs", [], |row| {
@@ -3937,7 +3946,8 @@ enabled = ["file.read"]
             lock_path: root.path().join("a.lock"),
             ledger_path: root
                 .path()
-                .join("state/plato-agent/workspaces/terminal-order/agent.db"),
+                .join("state/platonic/workspaces/terminal-order/agent.db"),
+            server_db_path: root.path().join("state/platonic/server.db"),
         });
         let case = if cleanup_failure {
             "cleanup"
@@ -4225,6 +4235,7 @@ IFS= read -r _
             socket_path: PathBuf::from("/tmp/agent.sock"),
             lock_path: PathBuf::from("/tmp/agent.lock"),
             ledger_path: PathBuf::from("/tmp/agent.db"),
+            server_db_path: PathBuf::from("/tmp/platonic-server.db"),
         })
     }
 
@@ -4357,6 +4368,7 @@ IFS= read -r _
             socket_path: PathBuf::from("/tmp/agent.sock"),
             lock_path: PathBuf::from("/tmp/agent.lock"),
             ledger_path: PathBuf::from("/tmp/agent.db"),
+            server_db_path: PathBuf::from("/tmp/platonic-server.db"),
         });
         let record = Arc::new(RunRecord::new(
             "run_1".into(),

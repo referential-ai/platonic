@@ -339,9 +339,7 @@ fn recheck_preflight(exact: &[LiveWorkspace], unrelated: &[LiveUnrelatedProcess]
 }
 
 fn observed_lock_paths() -> AppResult<(Vec<PathBuf>, Vec<String>)> {
-    let root = paths::runtime_home()?
-        .join("plato-agent")
-        .join("workspaces");
+    let root = paths::runtime_home()?.join("platonic").join("workspaces");
     let entries = match fs::read_dir(&root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == ErrorKind::NotFound => {

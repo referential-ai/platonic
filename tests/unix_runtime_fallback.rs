@@ -49,7 +49,7 @@ fn no_xdg_runtime_fallback_child() {
 
     let first = DaemonServer::bind(workspace.path(), None).unwrap();
     let socket_path = first.paths().socket_path.clone();
-    assert!(socket_path.starts_with(runtime_home.join("plato-agent")));
+    assert!(socket_path.starts_with(runtime_home.join("platonic")));
     assert!(socket_path.exists());
     assert_eq!(mode(&runtime_home), PRIVATE_DIRECTORY_MODE);
     assert_eq!(
@@ -73,7 +73,7 @@ fn no_xdg_runtime_fallback_child() {
     let error = DaemonServer::bind(workspace.path(), None).unwrap_err();
 
     assert!(error.to_string().contains("not a real directory"));
-    assert!(!target.join("plato-agent").exists());
+    assert!(!target.join("platonic").exists());
     fs::remove_file(&runtime_home).unwrap();
 
     let workspace = tempfile::tempdir().unwrap();
@@ -82,7 +82,7 @@ fn no_xdg_runtime_fallback_child() {
     let error = DaemonServer::bind(workspace.path(), None).unwrap_err();
 
     assert!(error.to_string().contains("not a real directory"));
-    assert!(!runtime_home.join("plato-agent").exists());
+    assert!(!runtime_home.join("platonic").exists());
     fs::write(env::var_os(CHILD_PROOF_ENV).unwrap(), b"ok").unwrap();
 }
 

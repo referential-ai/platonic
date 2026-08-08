@@ -9,7 +9,7 @@ use crate::{
             ThreadSendRejectedReason, ThreadSendResult,
         },
     },
-    ledger::DurableThreadAuthority,
+    server_store::DurableThreadAuthority,
     thread_authority::ThreadAuthorityDraft,
     tool_catalog::SHELL_EXEC,
 };
@@ -1359,6 +1359,7 @@ mod tests {
             socket_path: PathBuf::from("/tmp/agent.sock"),
             lock_path: PathBuf::from("/tmp/agent.lock"),
             ledger_path: PathBuf::from("/tmp/agent.db"),
+            server_db_path: PathBuf::from("/tmp/platonic-server.db"),
         })
     }
 
