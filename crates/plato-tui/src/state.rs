@@ -56,11 +56,7 @@ pub struct TuiState {
     /// Transient events received since transcript readback.
     pub live_events: Vec<LiveEventLine>,
     pub(super) history_rows: HistoryRowsCache,
-    /// Scroll offset retained for compatibility with the active display mode.
-    pub scroll_offset: usize,
     pub(super) display_mode: DisplayMode,
-    pub(super) conversation_scroll_offset: usize,
-    pub(super) audit_scroll_offset: usize,
     /// Latest requested-or-responded model identity state for the selected run.
     pub active_model: Option<ModelIdentityStatus>,
     /// Elapsed active-run time, in seconds.
@@ -109,10 +105,7 @@ impl PartialEq for TuiState {
             && self.active_run == other.active_run
             && self.live_events == other.live_events
             && self.history_rows == other.history_rows
-            && self.scroll_offset == other.scroll_offset
             && self.display_mode == other.display_mode
-            && self.conversation_scroll_offset == other.conversation_scroll_offset
-            && self.audit_scroll_offset == other.audit_scroll_offset
             && self.active_model == other.active_model
             && self.active_run_elapsed_secs == other.active_run_elapsed_secs
             && self.working_elapsed_millis == other.working_elapsed_millis
@@ -219,10 +212,7 @@ impl TuiState {
             active_run: None,
             live_events: Vec::new(),
             history_rows: HistoryRowsCache::default(),
-            scroll_offset: 0,
             display_mode: DisplayMode::Conversation,
-            conversation_scroll_offset: 0,
-            audit_scroll_offset: 0,
             active_model: None,
             active_run_elapsed_secs: None,
             working_elapsed_millis: 0,
@@ -459,47 +449,11 @@ impl TuiState {
     }
 
     pub(super) fn toggle_display_mode(&mut self) {
-        match self.display_mode {
-            DisplayMode::Conversation => {
-                self.conversation_scroll_offset = self.scroll_offset;
-                self.scroll_offset = self.audit_scroll_offset;
-                self.display_mode = DisplayMode::Audit;
-            }
-            DisplayMode::Audit => {
-                self.audit_scroll_offset = self.scroll_offset;
-                self.scroll_offset = self.conversation_scroll_offset;
-                self.display_mode = DisplayMode::Conversation;
-            }
-        }
+        self.display_mode = match self.display_mode {
+            DisplayMode::Conversation => DisplayMode::Audit,
+            DisplayMode::Audit => DisplayMode::Conversation,
+        };
         self.invalidate_history_rows();
-    }
-
-    pub(super) fn scroll_history_up(&mut self, lines: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_add(lines);
-        self.remember_scroll_offset();
-    }
-
-    pub(super) fn scroll_history_down(&mut self, lines: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
-        self.remember_scroll_offset();
-    }
-
-    pub(super) fn reset_scroll(&mut self) {
-        self.scroll_offset = 0;
-        self.remember_scroll_offset();
-    }
-
-    pub(super) fn reset_all_scroll(&mut self) {
-        self.scroll_offset = 0;
-        self.conversation_scroll_offset = 0;
-        self.audit_scroll_offset = 0;
-    }
-
-    fn remember_scroll_offset(&mut self) {
-        match self.display_mode {
-            DisplayMode::Conversation => self.conversation_scroll_offset = self.scroll_offset,
-            DisplayMode::Audit => self.audit_scroll_offset = self.scroll_offset,
-        }
     }
 
     fn invalidate_history_rows(&mut self) {

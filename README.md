@@ -651,6 +651,13 @@ fenced code, and unified diffs in conversation view. User messages remain
 literal, while audit view retains the exact stored transcript source.
 The multiline composer uses the terminal cursor without adding a caret glyph to
 its text. Bracketed paste inserts literal text as one undoable edit.
+Committed conversation rows use the terminal's native scrollback, so wheel
+scrolling, text selection, search, and transcript retention after exit work as
+they do for ordinary terminal output. Audit, session, help, status, and approval
+overlays temporarily use the alternate screen and restore the conversation when
+they close. On resize, the terminal reflows rows already in scrollback while the
+TUI redraws only the live tail, composer, footer, and active overlay; committed
+rows are not duplicated at the new width.
 A nonempty `NO_COLOR` suppresses colors while retaining emphasis and layout.
 Otherwise, the TUI detects true color or xterm-256 support and makes one
 best-effort 100-millisecond OSC 11 background query at startup. User-message
@@ -719,7 +726,8 @@ Keys:
 - `g` / `d`: allow once or deny the focused approval request.
 - `s`: allow the focused `shell.exec` request and later shell calls in the
   selected session until the daemon exits. This action is hidden for other tools.
-- `Up` / `Down` and `PageUp` / `PageDown`: scroll the focused approval pane.
+- `Up` / `Down` and `PageUp` / `PageDown`: scroll the focused audit or approval
+  overlay.
 - `Ctrl-C`: request `run.cancel` for the active run; a second `Ctrl-C` exits the
   TUI. Exiting the TUI does not stop the daemon.
 - `r`: reconnect and reload daemon state.

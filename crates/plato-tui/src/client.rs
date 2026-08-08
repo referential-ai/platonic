@@ -722,7 +722,6 @@ pub(super) fn apply_client_event(
                     ));
                 }
             }
-            state.reset_scroll();
             start_next_queued(commands, state, runtime);
         }
         ClientEvent::EventsPolled(result) => apply_events_result(state, runtime, commands, result),
@@ -860,9 +859,6 @@ pub(super) fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
             loaded.live_events = std::mem::take(&mut state.live_events);
             loaded.history_rows.live_events = std::mem::take(&mut state.history_rows.live_events);
         }
-        loaded.scroll_offset = state.scroll_offset;
-        loaded.conversation_scroll_offset = state.conversation_scroll_offset;
-        loaded.audit_scroll_offset = state.audit_scroll_offset;
         if loaded.active_model.is_none() {
             loaded.active_model = state.active_model.clone();
         }
@@ -922,7 +918,6 @@ pub(super) fn apply_run_response(
         crate::LiveEventLine::status(None, format!("{message}: {run_id}"))
             .with_run_id(run_id.clone()),
     );
-    state.reset_scroll();
     runtime.active_run_id = Some(run_id);
     runtime.next_offset = 0;
     runtime.poll_in_flight = false;

@@ -38,6 +38,24 @@ const EXPECTED_DRAFT: &str = "ask hello café pasted text";
 const PENDING_RUN_ID: &str = "run_pty_pending";
 const PENDING_CALL_ID: &str = "call_pty_pending";
 const CONVERSATION_RUN_ID: &str = "run_pty_conversation_full_identifier";
+const SCROLLBACK_SENTINEL: &str = "PLATO_NATIVE_SCROLLBACK_SENTINEL_377";
+const CONVERSATION_USER_TEXT: &str = concat!(
+    "PLATO_NATIVE_SCROLLBACK_SENTINEL_377\n",
+    "history row 01\nhistory row 02\nhistory row 03\nhistory row 04\n",
+    "history row 05\nhistory row 06\nhistory row 07\nhistory row 08\n",
+    "history row 09\nhistory row 10\nhistory row 11\nhistory row 12\n",
+    "history row 13\nhistory row 14\nhistory row 15\nhistory row 16\n",
+    "history row 17\nhistory row 18\nhistory row 19\nhistory row 20\n",
+    "history row 21\nhistory row 22\nhistory row 23\nhistory row 24\n",
+    "history row 25\nhistory row 26\nhistory row 27\nhistory row 28\n",
+    "history row 29\nhistory row 30\n",
+    "**Conversation-first PTY question**",
+);
+const ENTER_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h";
+const LEAVE_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049l";
+const ENABLE_ALTERNATE_SCROLL: &[u8] = b"\x1b[?1007h";
+const DISABLE_ALTERNATE_SCROLL: &[u8] = b"\x1b[?1007l";
+const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
 
 #[test]
 fn plato_tui_cold_starts_host_thread_and_remote_reuses_it() {
@@ -594,6 +612,20 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
     let scrolled_approval = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "+new PTY");
     assert!(scrolled_approval.contains("+new PTY"));
 
+    let resize_at = shell.output_len();
+    shell.resize(18, 70);
+    let resized_approval = shell.wait_for_current_screen_text_after(resize_at, PENDING_CALL_ID);
+    assert!(resized_approval.contains("+new PTY"));
+    let resize_output = shell.output_since(resize_at);
+    assert_eq!(
+        resize_output
+            .windows(CURSOR_POSITION_QUERY.len())
+            .filter(|bytes| *bytes == CURSOR_POSITION_QUERY)
+            .count(),
+        1,
+        "overlay resize must refresh inline geometry while the event reader is paused"
+    );
+
     fake.wait_for_request_count("events.stream", 2);
     let stream_requests = fake.requests_for("events.stream");
     assert_eq!(
@@ -610,6 +642,7 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
         "lag recovery must request the current tip"
     );
 
+    let deny_at = shell.output_len();
     shell.write(b"d");
     let decision = fake.wait_for_request("approval.decide");
     let params = decision.params.as_ref().unwrap();
@@ -618,17 +651,34 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
     assert_eq!(params["decision"], "deny");
     assert_eq!(params["reason"], "denied by plato-tui");
 
-    let decided = shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, PENDING_CALL_ID);
-    assert!(decided.contains("You"));
+    let restored_output =
+        shell.wait_for_ordered_output_after(deny_at, LEAVE_ALTERNATE_SCREEN, b"\x1b[?2026l");
+    let decided = shell.wait_for_current_screen_text("Trace  approval | running");
+    assert!(
+        restored_output
+            .windows(b"You".len())
+            .any(|bytes| bytes == b"You")
+    );
+    assert!(
+        restored_output
+            .windows(LEAVE_ALTERNATE_SCREEN.len())
+            .any(|bytes| bytes == LEAVE_ALTERNATE_SCREEN)
+    );
+    assert!(
+        !restored_output
+            .windows(CURSOR_POSITION_QUERY.len())
+            .any(|bytes| bytes == CURSOR_POSITION_QUERY),
+        "daemon-driven overlay closure must not query the cursor after the reader resumes"
+    );
     assert!(decided.contains("Trace  approval | running"));
     assert!(!decided.contains("Trace  warning"));
     assert!(!decided.contains(PENDING_RUN_ID));
     assert!(!decided.contains(PENDING_CALL_ID));
 
     shell.write(b"v");
-    let audit = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "approval denied");
+    let audit = shell.wait_for_current_screen_text("approval denied");
     assert!(audit.contains(PENDING_CALL_ID));
-    assert!(audit.contains("? shortcuts · Tab queue 0"));
+    assert!(audit.contains("? shortcuts"));
     shell.write(b"q");
 
     let after_termios = shell.wait_for_marker("POST");
@@ -807,6 +857,7 @@ enabled = ["shell.exec"]
     );
     let second_daemon_pid = daemon.pid();
 
+    let restart_at = shell.output_len();
     shell.write(
         format!(
             "\"$PLATO_BIN\" --config \"{}\"; printf '\\n%sSTATUS2:%s\\n' \"$PTY_MARK\" \"$?\"\n",
@@ -814,6 +865,7 @@ enabled = ["shell.exec"]
         )
         .as_bytes(),
     );
+    shell.wait_for_ordered_output_after(restart_at, b"\x1b[6n", b"\x1b[?2026l");
     shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "different session");
     shell.write(b"/sessions\r");
     let picker = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Sessions");
@@ -907,7 +959,6 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
     let before_termios = shell.wait_for_marker("PRE");
     fake.wait_for_request_count("events.stream", 1);
     let default = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Trace");
-    assert!(default.contains("You"));
     assert!(default.contains("Plato"));
     assert!(default.contains("**Conversation-first PTY question**"));
     assert!(default.contains("Conversation-first PTY answer"));
@@ -925,58 +976,108 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
     );
     assert!(!default.contains(CONVERSATION_RUN_ID));
     assert!(!default.contains("#7"));
+    assert!(!default.contains(SCROLLBACK_SENTINEL));
+    let inline_output = shell.output_since(0);
+    assert_inline_scrollback_sequence(&inline_output);
+    assert!(
+        !inline_output
+            .windows(ENTER_ALTERNATE_SCREEN.len())
+            .any(|bytes| bytes == ENTER_ALTERNATE_SCREEN)
+    );
     assert_eq!(fake.requests_for("transcript.read").len(), 1);
 
-    for _ in 0..2 {
-        shell.write(b"v");
-        let audit = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, CONVERSATION_RUN_ID);
-        assert!(audit.contains("#7 model_stage"));
-        assert!(audit.contains("? shortcuts · Tab queue 0"));
-        assert!(audit.contains("**Conversation-first PTY question**"));
-        assert!(audit.contains("## Conversation-first PTY answer"));
-        assert!(audit.contains("**rendered Markdown**"));
-        assert!(audit.contains("```rust"));
-        let audit_rows = audit.lines().map(str::trim_end).collect::<Vec<_>>();
-        let empty_assistant = audit_rows
-            .iter()
-            .position(|line| *line == "assistant")
-            .unwrap();
-        let tool_call = audit_rows
-            .iter()
-            .position(|line| line.contains("call_pty file.read"))
-            .unwrap();
-        let tool_result = audit_rows
-            .iter()
-            .position(|line| line.contains("call_pty README loaded"))
-            .unwrap();
-        let final_assistant = audit_rows
-            .iter()
-            .position(|line| line.contains("Conversation-first PTY answer"))
-            .unwrap();
-        assert!(empty_assistant < tool_call);
-        assert!(tool_call < tool_result);
-        assert!(tool_result < final_assistant);
-
-        shell.write(b"v");
-        let conversation = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "You");
-        assert!(conversation.contains("Plato"));
-        assert_eq!(
-            conversation
-                .lines()
-                .filter(|line| line.trim_end() == "Plato")
-                .count(),
-            1
-        );
-        assert!(!conversation.contains(CONVERSATION_RUN_ID));
-        assert!(!conversation.contains("#7"));
-        assert!(conversation.contains("? shortcuts · Tab queue 0"));
+    let committed_answer_copies = inline_output
+        .windows(b"Conversation-first PTY answer".len())
+        .filter(|bytes| *bytes == b"Conversation-first PTY answer")
+        .count();
+    assert!(committed_answer_copies > 0);
+    for width in [40, 80, 120] {
+        let resize_at = shell.output_len();
+        shell.resize(INITIAL_ROWS, width);
+        let resized = shell.wait_for_current_screen_text_after(resize_at, "? shortcuts");
+        let rows = resized.lines().collect::<Vec<_>>();
+        assert!(rows[usize::from(INITIAL_ROWS - 2)].starts_with("> "));
+        assert!(rows[usize::from(INITIAL_ROWS - 1)].contains("? shortcuts"));
+        let answer_copies = shell
+            .output_since(0)
+            .windows(b"Conversation-first PTY answer".len())
+            .filter(|bytes| *bytes == b"Conversation-first PTY answer")
+            .count();
+        assert_eq!(answer_copies, committed_answer_copies, "width {width}");
     }
-    assert_eq!(fake.requests_for("transcript.read").len(), 1);
 
+    let overlay_at = shell.output_len();
+    shell.write(b"v");
+    let audit = shell.wait_for_current_screen_text(CONVERSATION_RUN_ID);
+    let overlay_output = shell.output_since(overlay_at);
+    assert!(
+        overlay_output
+            .windows(ENTER_ALTERNATE_SCREEN.len())
+            .any(|bytes| bytes == ENTER_ALTERNATE_SCREEN)
+    );
+    assert!(
+        overlay_output
+            .windows(ENABLE_ALTERNATE_SCROLL.len())
+            .any(|bytes| bytes == ENABLE_ALTERNATE_SCROLL)
+    );
+    assert!(audit.contains("#7 model_stage"));
+    assert!(audit.contains("? shortcuts · Tab queue 0"));
+    assert!(audit.contains("## Conversation-first PTY answer"));
+    assert!(audit.contains("**rendered Markdown**"));
+    assert!(audit.contains("```rust"));
+    assert!(!audit.contains(SCROLLBACK_SENTINEL));
+
+    shell.write(b"\x1b[5~\x1b[5~\x1b[5~\x1b[5~");
+    shell.wait_for_current_screen_text(SCROLLBACK_SENTINEL);
+    shell.write(b"\x1b[6~\x1b[6~\x1b[6~\x1b[6~");
+    shell.wait_for_current_screen_text("## Conversation-first PTY answer");
+
+    let restore_at = shell.output_len();
+    shell.write(b"v");
+    let conversation = shell.wait_for_current_screen_text("Plato");
+    let restore_output = shell.output_since(restore_at);
+    assert!(
+        restore_output
+            .windows(DISABLE_ALTERNATE_SCROLL.len())
+            .any(|bytes| bytes == DISABLE_ALTERNATE_SCROLL)
+    );
+    assert!(
+        restore_output
+            .windows(LEAVE_ALTERNATE_SCREEN.len())
+            .any(|bytes| bytes == LEAVE_ALTERNATE_SCREEN)
+    );
+    assert!(!conversation.contains(CONVERSATION_RUN_ID));
+    assert!(!conversation.contains("#7"));
+    assert!(conversation.contains("? shortcuts · Tab queue 0"));
+    assert_inline_scrollback_sequence(&shell.output_since(0));
+
+    let exit_overlay_at = shell.output_len();
+    shell.write(b"v");
+    shell.wait_for_current_screen_text(CONVERSATION_RUN_ID);
     shell.write(b"q");
     let after_termios = shell.wait_for_marker("POST");
+    let exit_output = shell.output_since(exit_overlay_at);
+    assert!(
+        exit_output
+            .windows(DISABLE_ALTERNATE_SCROLL.len())
+            .any(|bytes| bytes == DISABLE_ALTERNATE_SCROLL)
+    );
+    assert!(
+        exit_output
+            .windows(LEAVE_ALTERNATE_SCREEN.len())
+            .any(|bytes| bytes == LEAVE_ALTERNATE_SCREEN)
+    );
     assert_eq!(after_termios, before_termios);
     assert_eq!(shell.wait_for_marker("STATUS"), "0");
+    let retained_output = shell.output_since(0);
+    assert_inline_scrollback_sequence(&retained_output);
+    assert!(
+        retained_output
+            .windows(b"Conversation-first PTY answer".len())
+            .any(|bytes| bytes == b"Conversation-first PTY answer")
+    );
+    assert_eq!(fake.requests_for("transcript.read").len(), 1);
+
     shell.write(b"exit\r");
     assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
 
@@ -1120,6 +1221,8 @@ struct PtyShell {
     pty: Pty,
     child: Child,
     output: Arc<Mutex<Vec<u8>>>,
+    size: Arc<Mutex<(u16, u16)>>,
+    resizes: Mutex<Vec<(usize, u16, u16)>>,
     reader: Option<JoinHandle<()>>,
 }
 
@@ -1354,9 +1457,14 @@ impl PtyShell {
         let (pty, pts) = open().unwrap();
         pty.resize(Size::new(INITIAL_ROWS, INITIAL_COLS)).unwrap();
         let reader_file = File::from(pty.as_fd().try_clone_to_owned().unwrap());
+        let responder_file = File::from(pty.as_fd().try_clone_to_owned().unwrap());
         let output = Arc::new(Mutex::new(Vec::new()));
         let reader_output = Arc::clone(&output);
-        let reader = thread::spawn(move || read_pty(reader_file, reader_output));
+        let size = Arc::new(Mutex::new((INITIAL_ROWS, INITIAL_COLS)));
+        let reader_size = Arc::clone(&size);
+        let reader = thread::spawn(move || {
+            read_pty(reader_file, responder_file, reader_output, reader_size)
+        });
         let command = Command::new("/bin/sh")
             .arg("-i")
             .current_dir(workspace)
@@ -1382,6 +1490,8 @@ impl PtyShell {
             pty,
             child,
             output,
+            size,
+            resizes: Mutex::new(Vec::new()),
             reader: Some(reader),
         }
     }
@@ -1392,6 +1502,11 @@ impl PtyShell {
     }
 
     fn resize(&self, rows: u16, cols: u16) {
+        self.resizes
+            .lock()
+            .unwrap()
+            .push((self.output_len(), rows, cols));
+        *self.size.lock().unwrap() = (rows, cols);
         self.pty.resize(Size::new(rows, cols)).unwrap();
     }
 
@@ -1402,6 +1517,33 @@ impl PtyShell {
     fn output_since(&self, offset: usize) -> Vec<u8> {
         let output = self.output.lock().unwrap();
         output[offset.min(output.len())..].to_vec()
+    }
+
+    fn wait_for_current_screen_text(&mut self, expected: &str) -> String {
+        self.wait_for_current_screen_text_after(0, expected)
+    }
+
+    fn wait_for_current_screen_text_after(&mut self, offset: usize, expected: &str) -> String {
+        let deadline = Instant::now() + PROOF_TIMEOUT;
+        loop {
+            let output = self.output.lock().unwrap().clone();
+            let resizes = self.resizes.lock().unwrap().clone();
+            let parser = parsed_terminal(&output, &resizes, 0);
+            let screen = parser.screen();
+            let contents = screen.contents();
+            if output.len() > offset && contents.contains(expected) {
+                assert_eq!(screen.size(), *self.size.lock().unwrap());
+                return contents;
+            }
+            self.assert_running(expected);
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {expected:?} on the current rendered screen\nrendered:\n{}\nraw:\n{}",
+                contents,
+                output_tail(&output)
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn wait_for_marker(&mut self, name: &str) -> String {
@@ -1562,6 +1704,32 @@ impl PtyShell {
         }
     }
 
+    fn wait_for_ordered_output_after(
+        &mut self,
+        offset: usize,
+        first: &[u8],
+        second: &[u8],
+    ) -> Vec<u8> {
+        let deadline = Instant::now() + PROOF_TIMEOUT;
+        loop {
+            let output = self.output_since(offset);
+            if let Some(first_at) = output.windows(first.len()).position(|bytes| bytes == first)
+                && output[first_at + first.len()..]
+                    .windows(second.len())
+                    .any(|bytes| bytes == second)
+            {
+                return output;
+            }
+            self.assert_running("ordered terminal output");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for ordered terminal output after byte {offset}\n{}",
+                output_tail(&output)
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn assert_running(&mut self, context: &str) {
         if let Some(status) = self.child.try_wait().unwrap() {
             let output = self.output.lock().unwrap();
@@ -1603,12 +1771,41 @@ impl Drop for PtyShell {
     }
 }
 
-fn read_pty(mut reader: File, output: Arc<Mutex<Vec<u8>>>) {
+fn read_pty(
+    mut reader: File,
+    mut responder: File,
+    output: Arc<Mutex<Vec<u8>>>,
+    size: Arc<Mutex<(u16, u16)>>,
+) {
     let mut buffer = [0; 4096];
+    let mut parser = vt100::Parser::new(INITIAL_ROWS, INITIAL_COLS, 0);
+    let mut query_tail = Vec::new();
     loop {
         match reader.read(&mut buffer) {
             Ok(0) | Err(_) => break,
-            Ok(read) => output.lock().unwrap().extend_from_slice(&buffer[..read]),
+            Ok(read) => {
+                let (rows, cols) = *size.lock().unwrap();
+                if parser.screen().size() != (rows, cols) {
+                    parser.set_size(rows, cols);
+                }
+                let bytes = &buffer[..read];
+                parser.process(bytes);
+                output.lock().unwrap().extend_from_slice(bytes);
+                query_tail.extend_from_slice(bytes);
+                let cursor_queries = query_tail
+                    .windows(4)
+                    .filter(|window| *window == b"\x1b[6n")
+                    .count();
+                if cursor_queries > 0 {
+                    let (row, col) = parser.screen().cursor_position();
+                    for _ in 0..cursor_queries {
+                        write!(responder, "\x1b[{};{}R", row + 1, col + 1).unwrap();
+                    }
+                    responder.flush().unwrap();
+                }
+                let keep_from = query_tail.len().saturating_sub(3);
+                query_tail.drain(..keep_from);
+            }
         }
     }
 }
@@ -1624,6 +1821,23 @@ fn parsed_screen(output: &[u8], rows: u16, cols: u16, resize_at: Option<usize>) 
         parser.process(output);
     }
     parser.screen().clone()
+}
+
+fn parsed_terminal(
+    output: &[u8],
+    resizes: &[(usize, u16, u16)],
+    scrollback_len: usize,
+) -> vt100::Parser {
+    let mut parser = vt100::Parser::new(INITIAL_ROWS, INITIAL_COLS, scrollback_len);
+    let mut processed = 0;
+    for &(offset, rows, cols) in resizes {
+        let offset = offset.min(output.len()).max(processed);
+        parser.process(&output[processed..offset]);
+        parser.set_size(rows, cols);
+        processed = offset;
+    }
+    parser.process(&output[processed..]);
+    parser
 }
 
 fn marker_value(output: &[u8], name: &str) -> Option<String> {
@@ -1674,6 +1888,24 @@ fn assert_synchronized_frames(output: &[u8]) {
         }
     }
     assert_eq!(depth, 0, "synchronized frame was not closed");
+}
+
+fn assert_inline_scrollback_sequence(output: &[u8]) {
+    const SCROLL_INLINE_REGION: &[u8] = b"\x1b[1;12r\x1b[12S\x1b[r";
+    assert!(
+        output
+            .windows(SCROLLBACK_SENTINEL.len())
+            .any(|bytes| bytes == SCROLLBACK_SENTINEL.as_bytes()),
+        "committed sentinel was not written to the terminal"
+    );
+    assert!(
+        output
+            .windows(SCROLL_INLINE_REGION.len())
+            .filter(|bytes| *bytes == SCROLL_INLINE_REGION)
+            .count()
+            >= 3,
+        "long committed content did not exercise stock scrolling regions"
+    );
 }
 
 struct PtyShellSequenceProvider {
@@ -2203,7 +2435,7 @@ fn fake_response(
             "status": "running",
             "final_answer": null,
             "transcript": format!(
-                "run_id: {CONVERSATION_RUN_ID}\n[turn_pty] user: **Conversation-first PTY question**\n[turn_pty] assistant: \n[turn_pty] tool_call call_pty file.read {{\"path\":\"README.md\"}}\ntool_result call_pty README loaded\n[turn_pty] assistant: ## Conversation-first PTY answer\n\nUse **rendered Markdown**.\n\n```rust\nfn pty_rendered() {{}}\n```\n"
+                "run_id: {CONVERSATION_RUN_ID}\n[turn_pty] user: {CONVERSATION_USER_TEXT}\n[turn_pty] assistant: \n[turn_pty] tool_call call_pty file.read {{\"path\":\"README.md\"}}\ntool_result call_pty README loaded\n[turn_pty] assistant: ## Conversation-first PTY answer\n\nUse **rendered Markdown**.\n\n```rust\nfn pty_rendered() {{}}\n```\n"
             ),
             "typed": {
                 "runs": [{
@@ -2211,7 +2443,7 @@ fn fake_response(
                     "session_index": 0,
                     "status": "running",
                     "entries": [
-                        {"kind": "user", "text": "**Conversation-first PTY question**"},
+                        {"kind": "user", "text": CONVERSATION_USER_TEXT},
                         {"kind": "assistant", "text": ""},
                         {
                             "kind": "tool_call",
