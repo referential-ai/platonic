@@ -79,9 +79,15 @@ impl Drop for ProcessTreeChild {
 mod platform {
     use super::PROCESS_POLL_INTERVAL;
     use rustix::io::Errno;
+    // The process-tree walk reads /proc, so these are Linux-only in practice;
+    // macOS compiles this module without them and its clippy said so.
+    #[cfg(target_os = "linux")]
+    use std::collections::{HashSet, VecDeque};
+    #[cfg(target_os = "linux")]
+    use std::fs;
     use std::{
-        collections::{HashMap, HashSet, VecDeque},
-        fs, io,
+        collections::HashMap,
+        io,
         os::unix::process::CommandExt,
         process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus},
         time::{Duration, Instant},

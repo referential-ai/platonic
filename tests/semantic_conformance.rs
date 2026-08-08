@@ -19,8 +19,10 @@ use platonic_core::{
     RunReadback, ToolCall, ToolCallId, ToolName, ToolProposal, ToolResult, TurnId,
 };
 use serde_json::{Value, json};
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs,
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},

@@ -1275,6 +1275,7 @@ fn remove_session_grant_owned_file(path: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn assert_session_grant_lifecycle_absent(pid: u32, endpoint: &Path, lock_path: &Path) {
     #[cfg(target_os = "linux")]
     assert!(
