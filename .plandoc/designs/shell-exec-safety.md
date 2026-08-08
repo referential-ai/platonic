@@ -3,6 +3,16 @@ title: shell.exec Safety Boundary
 issue: https://github.com/referential-ai/plato-agent/issues/51
 ---
 
+> **PARTLY SUPERSEDED, 2026-08-07.** This design predates the platform
+> decisions of 2026-08-06/07. The
+> [platform decision map](https://github.com/referential-ai/platonic-workspace/issues/83)
+> supersedes it where they disagree, and the map wins.
+>
+> Confinement is now owned by plato-agent#437 (D008, Landlock-first with
+> Seatbelt on macOS) and shaped by P020, which records intent in the authority
+> record and the applied backend as a ledger event. P026 removes Windows from
+> scope entirely.
+
 # shell.exec Safety Boundary
 
 ## Authority

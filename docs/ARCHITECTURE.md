@@ -1,6 +1,30 @@
 # Plato Agent Architecture
 
-This document copies the topology decision from the Platonic workspace issue that bootstrapped `referential-ai/plato-agent`.
+Status: **PARTLY SUPERSEDED, 2026-08-07.** This document recorded the topology
+that bootstrapped `referential-ai/plato-agent`, before the platform decisions of
+2026-08-06/07.
+
+> ### Read this before using the document below
+>
+> The [platform decision map](https://github.com/referential-ai/platonic-workspace/issues/83)
+> supersedes parts of this document. Where they disagree, the map wins.
+>
+> - **Platonic is the server and the product; Plato Agent is the client
+>   distribution built on it** (P016, P018). This document treats `plato-agentd`
+>   as the runtime noun. That inverts.
+> - **The crate split has happened** (P015, P024). The Boundary Ladder below
+>   describes the pre-extraction rule that a crate needs a trigger; the
+>   architecture is now `platonic-core`, `platonic-protocol`, `platonic-client`,
+>   `platonic-server`, plus the `plato-*` distribution.
+> - **Windows is withdrawn** (P026). Every Windows named-pipe and `LocalAppData`
+>   statement below is historical.
+> - **A workspace is a first-class registered entity with a server-minted id**
+>   (P006, P021). Nothing derives from a mutable path.
+> - **The Sequence section is history**, not a plan.
+>
+> Sections not contradicted above still hold: the no-daemon invariant, the
+> shared host loop, the single-writer rule, the run-child boundary, the
+> connector rule, and ledger versioning.
 
 ## Runtime Topology
 
