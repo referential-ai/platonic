@@ -13,7 +13,7 @@ use std::{
 #[cfg(unix)]
 pub fn host_socket_path() -> ClientResult<PathBuf> {
     Ok(runtime_home()?
-        .join("plato-agent")
+        .join("platonic")
         .join("host")
         .join("agent.sock"))
 }
@@ -27,7 +27,7 @@ pub fn host_socket_path() -> ClientResult<PathBuf> {
 /// Returns the stable host-scoped daemon lock path.
 pub fn host_lock_path() -> ClientResult<PathBuf> {
     Ok(runtime_home()?
-        .join("plato-agent")
+        .join("platonic")
         .join("host")
         .join("agent.lock"))
 }
@@ -36,7 +36,7 @@ pub fn host_lock_path() -> ClientResult<PathBuf> {
 #[cfg(unix)]
 pub fn default_socket_path(workspace_root: &Path) -> ClientResult<PathBuf> {
     Ok(runtime_home()?
-        .join("plato-agent")
+        .join("platonic")
         .join("workspaces")
         .join(workspace_id(workspace_root)?)
         .join("agent.sock"))
@@ -54,7 +54,7 @@ pub fn default_socket_path(workspace_root: &Path) -> ClientResult<PathBuf> {
 /// Returns the default daemon lock path for a workspace.
 pub fn default_lock_path(workspace_root: &Path) -> ClientResult<PathBuf> {
     Ok(runtime_home()?
-        .join("plato-agent")
+        .join("platonic")
         .join("workspaces")
         .join(workspace_id(workspace_root)?)
         .join("agent.lock"))
@@ -188,7 +188,7 @@ mod tests {
                     socket_path,
                     runtime_home
                         .path()
-                        .join("plato-agent")
+                        .join("platonic")
                         .join("host")
                         .join("agent.sock")
                 );
@@ -217,7 +217,7 @@ mod tests {
                 assert!(
                     socket_path
                         .components()
-                        .any(|component| component.as_os_str() == "plato-agent")
+                        .any(|component| component.as_os_str() == "platonic")
                 );
                 assert!(
                     socket_path
@@ -247,7 +247,7 @@ mod tests {
                     host_lock_path().unwrap(),
                     local_app_data
                         .path()
-                        .join("plato-agent")
+                        .join("platonic")
                         .join("host")
                         .join("agent.lock")
                 );
@@ -267,7 +267,7 @@ mod tests {
                 let workspace_id = workspace_id(workspace.path()).unwrap();
                 let workspace_dir = local_app_data
                     .path()
-                    .join("plato-agent")
+                    .join("platonic")
                     .join("workspaces")
                     .join(&workspace_id);
 

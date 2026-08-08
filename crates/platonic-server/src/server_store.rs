@@ -1,0 +1,1144 @@
+//! Server-wide state, independent of any workspace.
+//!
+//! D005 requires every thread to be enumerable — including clientless threads
+//! and orphans. Thread authority therefore cannot live in a per-workspace
+//! ledger: a thread in a workspace nobody has opened would be invisible, and a
+//! dead parent would hide its children. This store lives once per host, beside
+//! the socket, and holds the records that must outlive any single workspace.
+//!
+//! Workspace ledgers keep what is workspace-scoped: the event log, sessions,
+//! and voice events. Nothing here is a log; every table is current state.
+
+use crate::{
+    AppError, AppResult,
+    ledger::{row_u64, sqlite_i64},
+    thread_authority::{
+        ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, ThreadStopRecord,
+        validate_child_authority, validate_complete_authority,
+    },
+};
+use platonic_protocol::{ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
+use std::{path::Path, time::Duration};
+
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A registered workspace: a named directory the server knows about.
+///
+/// The name is the handle operators use; the root is the directory it wears.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceRecord {
+    pub(crate) name: String,
+    pub(crate) root: String,
+    pub(crate) registered_at_ms: u64,
+}
+
+/// A thread authority record proven to be durably written.
+///
+/// The type exists so a caller cannot mistake an in-memory record for one that
+/// survived the write D005 requires before the first turn executes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DurableThreadAuthority(ThreadAuthorityRecord);
+
+impl DurableThreadAuthority {
+    pub(crate) fn record(&self) -> &ThreadAuthorityRecord {
+        &self.0
+    }
+}
+
+pub(crate) struct ServerStore {
+    connection: Connection,
+}
+
+impl ServerStore {
+    /// Open the server-wide store, creating it and its schema if absent.
+    pub(crate) fn open_or_create(path: &Path) -> AppResult<Self> {
+        if path.as_os_str().is_empty() {
+            return Err(AppError::EmptyLedger);
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let connection = Connection::open(path)?;
+        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        create_thread_authority_tables(&connection)?;
+        create_thread_stop_table(&connection)?;
+        create_workspace_table(&connection)?;
+        Ok(Self { connection })
+    }
+
+    /// Open the store without the ability to write, and without creating it.
+    ///
+    /// Readback that cannot mutate is how the immutability of authority
+    /// records is proven rather than asserted.
+    #[cfg(test)]
+    pub(crate) fn open_readonly(path: &Path) -> AppResult<Self> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        Ok(Self { connection })
+    }
+
+    /// Register a workspace, or return the existing record under that name.
+    ///
+    /// Registration is idempotent so a client that reconnects does not need to
+    /// know whether it is the first.
+    pub(crate) fn register_workspace(
+        &self,
+        name: &str,
+        root: &str,
+        now_ms: u64,
+    ) -> AppResult<WorkspaceRecord> {
+        if name.is_empty() {
+            return Err(AppError::Config("workspace name must not be empty".into()));
+        }
+        if root.is_empty() {
+            return Err(AppError::Config("workspace root must not be empty".into()));
+        }
+        self.connection.execute(
+            "INSERT INTO workspaces (name, root, registered_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO NOTHING",
+            params![name, root, now_ms as i64],
+        )?;
+        self.workspace(name)?
+            .ok_or_else(|| AppError::Config(format!("workspace {name} vanished after insert")))
+    }
+
+    pub(crate) fn workspace(&self, name: &str) -> AppResult<Option<WorkspaceRecord>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT name, root, registered_at_ms FROM workspaces WHERE name = ?1",
+                params![name],
+                workspace_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Every registered workspace, whether or not a client has it open.
+    ///
+    /// The control plane that serves this over the wire is plato-agent#447;
+    /// until then the cross-workspace enumeration test is its only caller.
+    #[allow(dead_code)]
+    pub(crate) fn workspaces(&self) -> AppResult<Vec<WorkspaceRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT name, root, registered_at_ms FROM workspaces ORDER BY registered_at_ms, name",
+        )?;
+        let rows = statement.query_map([], workspace_from_row)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        Ok(records)
+    }
+
+    pub(crate) fn persist_thread_spawn(
+        &mut self,
+        approval: &ThreadSpawnApprovalRecord,
+        authority: Option<&ThreadAuthorityRecord>,
+    ) -> AppResult<Option<DurableThreadAuthority>> {
+        if let Some(authority) = authority {
+            validate_complete_authority(authority)?;
+            if authority.spawning_actor != approval.actor {
+                return Err(AppError::Config(
+                    "thread.spawn approval actor must match spawning actor".into(),
+                ));
+            }
+        }
+        match (approval.decision, authority) {
+            (ThreadSpawnDecisionName::Granted, Some(authority))
+                if authority.thread_id == approval.thread_id => {}
+            (ThreadSpawnDecisionName::Granted, Some(_)) => {
+                return Err(AppError::Config(
+                    "thread.spawn approval and authority thread ids differ".into(),
+                ));
+            }
+            (ThreadSpawnDecisionName::Granted, None) => {
+                return Err(AppError::Config(
+                    "granted thread.spawn approval requires an authority record".into(),
+                ));
+            }
+            (ThreadSpawnDecisionName::Denied | ThreadSpawnDecisionName::Canceled, None) => {}
+            (ThreadSpawnDecisionName::Denied | ThreadSpawnDecisionName::Canceled, Some(_)) => {
+                return Err(AppError::Config(
+                    "denied or canceled thread.spawn cannot create authority".into(),
+                ));
+            }
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = thread_spawn_approval_from(&transaction, &approval.spawn_id)? {
+            if existing != *approval {
+                return Err(AppError::Config(format!(
+                    "thread.spawn decision conflicts with durable spawn {}",
+                    approval.spawn_id
+                )));
+            }
+            if let Some(authority) = authority {
+                let existing_authority = thread_authority_from(&transaction, &authority.thread_id)?
+                    .ok_or_else(|| {
+                        AppError::Config(format!(
+                            "granted spawn {} has no authority record",
+                            approval.spawn_id
+                        ))
+                    })?;
+                if existing_authority != *authority {
+                    return Err(AppError::Config(format!(
+                        "thread authority conflicts with durable thread {}",
+                        authority.thread_id
+                    )));
+                }
+            }
+            transaction.commit()?;
+            return Ok(authority.cloned().map(DurableThreadAuthority));
+        }
+
+        if let Some(authority) = authority
+            && let Some(parent_thread_id) = authority.parent_thread_id.as_deref()
+        {
+            let parent =
+                thread_authority_from(&transaction, parent_thread_id)?.ok_or_else(|| {
+                    AppError::Config(format!(
+                        "parent thread is no longer durable: {parent_thread_id}"
+                    ))
+                })?;
+            let draft = crate::thread_authority::ThreadAuthorityDraft {
+                thread_id: authority.thread_id.clone(),
+                parent_thread_id: authority.parent_thread_id.clone(),
+                cwd: authority.cwd.clone(),
+                model: authority.model.clone(),
+                reasoning_effort: authority.reasoning_effort,
+                approval_policy: authority.approval_policy,
+            };
+            validate_child_authority(&parent, &draft)
+                .map_err(|error| AppError::Config(error.to_string()))?;
+        }
+
+        transaction.execute(
+            "INSERT INTO thread_spawn_approvals
+               (spawn_id, thread_id, decision, actor, reason, occurred_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                approval.spawn_id,
+                approval.thread_id,
+                approval.decision.as_str(),
+                approval.actor,
+                approval.reason,
+                sqlite_i64(approval.occurred_at_ms, "thread approval occurred_at_ms")?
+            ],
+        )?;
+        if let Some(authority) = authority {
+            transaction.execute(
+                "INSERT INTO thread_authorities
+                   (thread_id, parent_thread_id, spawning_actor, cwd, model,
+                    reasoning_effort, approval_policy, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    authority.thread_id,
+                    authority.parent_thread_id,
+                    authority.spawning_actor,
+                    authority.cwd,
+                    authority.model,
+                    authority.reasoning_effort.as_str(),
+                    authority.approval_policy.as_str(),
+                    sqlite_i64(authority.created_at_ms, "thread created_at_ms")?
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(authority.cloned().map(DurableThreadAuthority))
+    }
+
+    pub(crate) fn thread_authority(
+        &self,
+        thread_id: &str,
+    ) -> AppResult<Option<ThreadAuthorityRecord>> {
+        thread_authority_from(&self.connection, thread_id)
+    }
+
+    pub(crate) fn thread_authorities(&self) -> AppResult<Vec<ThreadAuthorityRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT thread_id, parent_thread_id, spawning_actor, cwd, model,
+                    reasoning_effort, approval_policy, created_at_ms
+             FROM thread_authorities
+             ORDER BY created_at_ms ASC, thread_id ASC",
+        )?;
+        Ok(statement
+            .query_map([], thread_authority_from_row)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn thread_spawn_approval(
+        &self,
+        spawn_id: &str,
+    ) -> AppResult<Option<ThreadSpawnApprovalRecord>> {
+        thread_spawn_approval_from(&self.connection, spawn_id)
+    }
+
+    pub(crate) fn persist_thread_stop(
+        &mut self,
+        stop: &ThreadStopRecord,
+    ) -> AppResult<(ThreadStopRecord, bool)> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = thread_stop_from(&transaction, &stop.thread_id)? {
+            transaction.commit()?;
+            return Ok((existing, false));
+        }
+        if thread_authority_from(&transaction, &stop.thread_id)?.is_none() {
+            return Err(AppError::Config(format!(
+                "thread stop has no durable authority: {}",
+                stop.thread_id
+            )));
+        }
+        transaction.execute(
+            "INSERT INTO thread_stops (thread_id, actor, stopped_turn_id, occurred_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                stop.thread_id,
+                stop.actor,
+                stop.stopped_turn_id,
+                sqlite_i64(stop.occurred_at_ms, "thread stop occurred_at_ms")?
+            ],
+        )?;
+        transaction.commit()?;
+        Ok((stop.clone(), true))
+    }
+
+    pub(crate) fn thread_stop(&self, thread_id: &str) -> AppResult<Option<ThreadStopRecord>> {
+        thread_stop_from(&self.connection, thread_id)
+    }
+}
+
+fn thread_authority_from(
+    connection: &Connection,
+    thread_id: &str,
+) -> AppResult<Option<ThreadAuthorityRecord>> {
+    Ok(connection
+        .query_row(
+            "SELECT thread_id, parent_thread_id, spawning_actor, cwd, model,
+                    reasoning_effort, approval_policy, created_at_ms
+             FROM thread_authorities
+             WHERE thread_id = ?1",
+            params![thread_id],
+            thread_authority_from_row,
+        )
+        .optional()?)
+}
+
+fn thread_authority_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadAuthorityRecord> {
+    let reasoning_value: String = row.get(5)?;
+    let reasoning_effort = ReasoningEffort::parse(&reasoning_value).ok_or_else(|| {
+        invalid_thread_column(5, format!("unknown reasoning effort: {reasoning_value}"))
+    })?;
+    let policy_value: String = row.get(6)?;
+    let approval_policy = ThreadApprovalPolicy::parse(&policy_value).ok_or_else(|| {
+        invalid_thread_column(6, format!("unknown approval policy: {policy_value}"))
+    })?;
+    Ok(ThreadAuthorityRecord {
+        thread_id: row.get(0)?,
+        parent_thread_id: row.get(1)?,
+        spawning_actor: row.get(2)?,
+        cwd: row.get(3)?,
+        model: row.get(4)?,
+        reasoning_effort,
+        approval_policy,
+        created_at_ms: row_u64(row, 7, "thread created_at_ms")?,
+    })
+}
+
+fn thread_spawn_approval_from(
+    connection: &Connection,
+    spawn_id: &str,
+) -> AppResult<Option<ThreadSpawnApprovalRecord>> {
+    Ok(connection
+        .query_row(
+            "SELECT spawn_id, thread_id, decision, actor, reason, occurred_at_ms
+             FROM thread_spawn_approvals
+             WHERE spawn_id = ?1",
+            params![spawn_id],
+            |row| {
+                let decision_value: String = row.get(2)?;
+                let decision =
+                    ThreadSpawnDecisionName::parse(&decision_value).ok_or_else(|| {
+                        invalid_thread_column(
+                            2,
+                            format!("unknown thread spawn decision: {decision_value}"),
+                        )
+                    })?;
+                Ok(ThreadSpawnApprovalRecord {
+                    spawn_id: row.get(0)?,
+                    thread_id: row.get(1)?,
+                    decision,
+                    actor: row.get(3)?,
+                    reason: row.get(4)?,
+                    occurred_at_ms: row_u64(row, 5, "thread approval occurred_at_ms")?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn thread_stop_from(
+    connection: &Connection,
+    thread_id: &str,
+) -> AppResult<Option<ThreadStopRecord>> {
+    let record = connection
+        .query_row(
+            "SELECT thread_id, actor, stopped_turn_id, occurred_at_ms
+             FROM thread_stops
+             WHERE thread_id = ?1",
+            params![thread_id],
+            |row| {
+                Ok(ThreadStopRecord {
+                    thread_id: row.get(0)?,
+                    actor: row.get(1)?,
+                    stopped_turn_id: row.get(2)?,
+                    occurred_at_ms: row_u64(row, 3, "thread stop occurred_at_ms")?,
+                })
+            },
+        )
+        .optional()?;
+    match record {
+        Some(record) => Ok(Some(ThreadStopRecord::new(
+            record.thread_id,
+            record.actor,
+            record.stopped_turn_id,
+            record.occurred_at_ms,
+        )?)),
+        None => Ok(None),
+    }
+}
+
+fn invalid_thread_column(index: usize, message: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        index,
+        Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        )),
+    )
+}
+
+fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
+    Ok(WorkspaceRecord {
+        name: row.get(0)?,
+        root: row.get(1)?,
+        registered_at_ms: row_u64(row, 2, "workspace registered_at_ms")?,
+    })
+}
+
+fn create_workspace_table(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS workspaces (
+          name TEXT PRIMARY KEY,
+          root TEXT NOT NULL,
+          registered_at_ms INTEGER NOT NULL
+        );
+        "#,
+    )?;
+    Ok(())
+}
+fn create_thread_authority_tables(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS thread_authorities (
+          thread_id TEXT PRIMARY KEY,
+          parent_thread_id TEXT,
+          spawning_actor TEXT NOT NULL,
+          cwd TEXT NOT NULL,
+          model TEXT NOT NULL,
+          reasoning_effort TEXT NOT NULL,
+          approval_policy TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS thread_spawn_approvals (
+          spawn_id TEXT PRIMARY KEY,
+          thread_id TEXT NOT NULL,
+          decision TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          reason TEXT,
+          occurred_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TRIGGER IF NOT EXISTS thread_authorities_no_update
+        BEFORE UPDATE ON thread_authorities
+        BEGIN
+          SELECT RAISE(ABORT, 'thread authority records are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS thread_authorities_no_delete
+        BEFORE DELETE ON thread_authorities
+        BEGIN
+          SELECT RAISE(ABORT, 'thread authority records are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS thread_spawn_approvals_no_update
+        BEFORE UPDATE ON thread_spawn_approvals
+        BEGIN
+          SELECT RAISE(ABORT, 'thread spawn approvals are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS thread_spawn_approvals_no_delete
+        BEFORE DELETE ON thread_spawn_approvals
+        BEGIN
+          SELECT RAISE(ABORT, 'thread spawn approvals are immutable');
+        END;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn create_thread_stop_table(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS thread_stops (
+          thread_id TEXT PRIMARY KEY,
+          actor TEXT NOT NULL,
+          stopped_turn_id TEXT,
+          occurred_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TRIGGER IF NOT EXISTS thread_stops_no_update
+        BEFORE UPDATE ON thread_stops
+        BEGIN
+          SELECT RAISE(ABORT, 'thread stop records are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS thread_stops_no_delete
+        BEFORE DELETE ON thread_stops
+        BEGIN
+          SELECT RAISE(ABORT, 'thread stop records are immutable');
+        END;
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Read one thread's authority without holding a store open.
+///
+/// These mirror the store's methods for callers that read a single record.
+/// The store is created on first open, so an absent file reads as empty
+/// rather than as an error.
+pub(crate) fn thread_authorities(path: &Path) -> AppResult<Vec<ThreadAuthorityRecord>> {
+    ServerStore::open_or_create(path)?.thread_authorities()
+}
+
+pub(crate) fn thread_authority(
+    path: &Path,
+    thread_id: &str,
+) -> AppResult<Option<ThreadAuthorityRecord>> {
+    ServerStore::open_or_create(path)?.thread_authority(thread_id)
+}
+
+pub(crate) fn thread_stop(path: &Path, thread_id: &str) -> AppResult<Option<ThreadStopRecord>> {
+    ServerStore::open_or_create(path)?.thread_stop(thread_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use platonic_protocol::ReasoningEffort;
+    use std::{fs, path::Path};
+
+    fn thread_authority(
+        thread_id: &str,
+        parent_thread_id: Option<&str>,
+        actor: &str,
+        cwd: &Path,
+        policy: ThreadApprovalPolicy,
+        created_at_ms: u64,
+    ) -> ThreadAuthorityRecord {
+        ThreadAuthorityRecord {
+            thread_id: thread_id.into(),
+            parent_thread_id: parent_thread_id.map(str::to_owned),
+            spawning_actor: actor.into(),
+            cwd: cwd.canonicalize().unwrap().to_string_lossy().into_owned(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: ReasoningEffort::Xhigh,
+            approval_policy: policy,
+            created_at_ms,
+        }
+    }
+
+    fn thread_approval(
+        spawn_id: &str,
+        thread_id: &str,
+        decision: ThreadSpawnDecisionName,
+        actor: &str,
+        reason: Option<&str>,
+        occurred_at_ms: u64,
+    ) -> ThreadSpawnApprovalRecord {
+        ThreadSpawnApprovalRecord {
+            spawn_id: spawn_id.into(),
+            thread_id: thread_id.into(),
+            decision,
+            actor: actor.into(),
+            reason: reason.map(str::to_owned),
+            occurred_at_ms,
+        }
+    }
+
+    #[test]
+    fn thread_authority_persists_all_eight_fields_and_is_immutable_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        let mut ledger = ServerStore::open_or_create(&path).unwrap();
+        let columns = ledger
+            .connection
+            .prepare("PRAGMA table_info(thread_authorities)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            [
+                "thread_id",
+                "parent_thread_id",
+                "spawning_actor",
+                "cwd",
+                "model",
+                "reasoning_effort",
+                "approval_policy",
+                "created_at_ms",
+            ]
+        );
+
+        let authority = thread_authority(
+            "thread_root",
+            None,
+            "stdin",
+            dir.path(),
+            ThreadApprovalPolicy::Prompt,
+            42,
+        );
+        let approval = thread_approval(
+            "spawn_root",
+            "thread_root",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            42,
+        );
+        let durable = ledger
+            .persist_thread_spawn(&approval, Some(&authority))
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.record(), &authority);
+        assert_eq!(
+            ledger.thread_spawn_approval("spawn_root").unwrap(),
+            Some(approval.clone())
+        );
+
+        for statement in [
+            "UPDATE thread_authorities SET model = 'changed' WHERE thread_id = 'thread_root'",
+            "DELETE FROM thread_authorities WHERE thread_id = 'thread_root'",
+            "UPDATE thread_spawn_approvals SET actor = 'changed' WHERE spawn_id = 'spawn_root'",
+            "DELETE FROM thread_spawn_approvals WHERE spawn_id = 'spawn_root'",
+        ] {
+            let error = ledger.connection.execute(statement, []).unwrap_err();
+            assert!(error.to_string().contains("immutable"));
+        }
+        drop(ledger);
+
+        let reopened = ServerStore::open_readonly(&path).unwrap();
+        assert_eq!(
+            reopened.thread_authorities().unwrap(),
+            vec![authority.clone()]
+        );
+        assert_eq!(
+            reopened.thread_authority("thread_root").unwrap(),
+            Some(authority)
+        );
+        assert_eq!(
+            reopened.thread_spawn_approval("spawn_root").unwrap(),
+            Some(approval)
+        );
+    }
+
+    #[test]
+    fn thread_stop_is_immutable_idempotent_and_separate_from_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thread-stop.db");
+        let mut ledger = ServerStore::open_or_create(&path).unwrap();
+        let authority = thread_authority(
+            "thread_stop_target",
+            None,
+            "stdin",
+            dir.path(),
+            ThreadApprovalPolicy::Prompt,
+            42,
+        );
+        let approval = thread_approval(
+            "spawn_stop_target",
+            "thread_stop_target",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            42,
+        );
+        ledger
+            .persist_thread_spawn(&approval, Some(&authority))
+            .unwrap();
+        let stop = ThreadStopRecord::new(
+            "thread_stop_target".into(),
+            "operator".into(),
+            Some("turn_active".into()),
+            52,
+        )
+        .unwrap();
+        assert_eq!(
+            ledger.persist_thread_stop(&stop).unwrap(),
+            (stop.clone(), true)
+        );
+        let conflicting_retry = ThreadStopRecord::new(
+            "thread_stop_target".into(),
+            "other_operator".into(),
+            None,
+            99,
+        )
+        .unwrap();
+        assert_eq!(
+            ledger.persist_thread_stop(&conflicting_retry).unwrap(),
+            (stop.clone(), false)
+        );
+        assert_eq!(
+            ledger.thread_authority("thread_stop_target").unwrap(),
+            Some(authority.clone())
+        );
+        for statement in [
+            "UPDATE thread_stops SET actor = 'changed' WHERE thread_id = 'thread_stop_target'",
+            "DELETE FROM thread_stops WHERE thread_id = 'thread_stop_target'",
+        ] {
+            assert!(
+                ledger
+                    .connection
+                    .execute(statement, [])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("immutable")
+            );
+        }
+        drop(ledger);
+
+        let reopened = ServerStore::open_readonly(&path).unwrap();
+        assert_eq!(
+            reopened.thread_stop("thread_stop_target").unwrap(),
+            Some(stop)
+        );
+        assert_eq!(
+            reopened.thread_authority("thread_stop_target").unwrap(),
+            Some(authority)
+        );
+    }
+
+    /// The D005 proof: a thread stays enumerable from the server tier no
+    /// matter which workspace it belongs to, or whether that workspace is
+    /// still open. Two workspaces are registered, each spawns a thread, one
+    /// workspace is closed, and both threads still enumerate.
+    #[test]
+    fn threads_in_every_registered_workspace_enumerate_after_one_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha_root = dir.path().join("alpha");
+        let beta_root = dir.path().join("beta");
+        fs::create_dir(&alpha_root).unwrap();
+        fs::create_dir(&beta_root).unwrap();
+        let server_db = dir.path().join("state/platonic/server.db");
+
+        let mut store = ServerStore::open_or_create(&server_db).unwrap();
+        store
+            .register_workspace("alpha", &alpha_root.to_string_lossy(), 10)
+            .unwrap();
+        store
+            .register_workspace("beta", &beta_root.to_string_lossy(), 20)
+            .unwrap();
+
+        for (index, (thread_id, spawn_id, root)) in [
+            ("thread_alpha", "spawn_alpha", &alpha_root),
+            ("thread_beta", "spawn_beta", &beta_root),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let authority = thread_authority(
+                thread_id,
+                None,
+                "stdin",
+                root,
+                ThreadApprovalPolicy::Prompt,
+                30 + index as u64,
+            );
+            let approval = thread_approval(
+                spawn_id,
+                thread_id,
+                ThreadSpawnDecisionName::Granted,
+                "stdin",
+                None,
+                30 + index as u64,
+            );
+            store
+                .persist_thread_spawn(&approval, Some(&authority))
+                .unwrap()
+                .unwrap();
+        }
+
+        // Close the workspace holding thread_alpha. Nothing about the server
+        // tier depends on a workspace being open.
+        drop(store);
+        fs::remove_dir_all(&alpha_root).unwrap();
+
+        let reopened = ServerStore::open_or_create(&server_db).unwrap();
+        let workspaces = reopened.workspaces().unwrap();
+        assert_eq!(
+            workspaces
+                .iter()
+                .map(|workspace| workspace.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+
+        let threads = reopened.thread_authorities().unwrap();
+        assert_eq!(
+            threads
+                .iter()
+                .map(|authority| authority.thread_id.as_str())
+                .collect::<Vec<_>>(),
+            ["thread_alpha", "thread_beta"]
+        );
+        assert!(
+            reopened
+                .thread_authority("thread_alpha")
+                .unwrap()
+                .is_some_and(|authority| authority.cwd.ends_with("alpha"))
+        );
+
+        // Registration is idempotent: rebinding a workspace keeps its record.
+        let rebound = reopened
+            .register_workspace("alpha", &alpha_root.to_string_lossy(), 999)
+            .unwrap();
+        assert_eq!(rebound.registered_at_ms, 10);
+        assert_eq!(reopened.workspaces().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn literal_authority_fixture_reads_exactly_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("literal-authority.db");
+        let cwd = dir.path().canonicalize().unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE thread_authorities (
+                  thread_id TEXT PRIMARY KEY,
+                  parent_thread_id TEXT,
+                  spawning_actor TEXT NOT NULL,
+                  cwd TEXT NOT NULL,
+                  model TEXT NOT NULL,
+                  reasoning_effort TEXT NOT NULL,
+                  approval_policy TEXT NOT NULL,
+                  created_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE thread_stops (
+                  thread_id TEXT PRIMARY KEY,
+                  actor TEXT NOT NULL,
+                  stopped_turn_id TEXT,
+                  occurred_at_ms INTEGER NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO thread_authorities
+                   (thread_id, parent_thread_id, spawning_actor, cwd, model,
+                    reasoning_effort, approval_policy, created_at_ms)
+                 VALUES ('thread_literal', 'thread_parent', 'fixture_actor', ?1,
+                         'gpt-5.6-sol', 'xhigh', 'prompt', 42)",
+                params![cwd.to_string_lossy()],
+            )
+            .unwrap();
+        drop(connection);
+        let bytes_before = fs::read(&path).unwrap();
+
+        let ledger = ServerStore::open_readonly(&path).unwrap();
+        assert_eq!(
+            ledger.thread_authority("thread_literal").unwrap(),
+            Some(ThreadAuthorityRecord {
+                thread_id: "thread_literal".into(),
+                parent_thread_id: Some("thread_parent".into()),
+                spawning_actor: "fixture_actor".into(),
+                cwd: cwd.to_string_lossy().into_owned(),
+                model: "gpt-5.6-sol".into(),
+                reasoning_effort: ReasoningEffort::Xhigh,
+                approval_policy: ThreadApprovalPolicy::Prompt,
+                created_at_ms: 42,
+            })
+        );
+        assert!(ledger.thread_stop("thread_literal").unwrap().is_none());
+        drop(ledger);
+        assert_eq!(fs::read(&path).unwrap(), bytes_before);
+    }
+
+    #[test]
+    fn malformed_durable_thread_authority_fails_closed_on_readback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("malformed-v4.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE thread_authorities (
+                  thread_id TEXT PRIMARY KEY,
+                  parent_thread_id TEXT,
+                  spawning_actor TEXT NOT NULL,
+                  cwd TEXT NOT NULL,
+                  model TEXT NOT NULL,
+                  reasoning_effort TEXT NOT NULL,
+                  approval_policy TEXT NOT NULL,
+                  created_at_ms INTEGER NOT NULL
+                );
+                INSERT INTO thread_authorities VALUES
+                  ('thread_bad', NULL, 'fixture_actor', '/tmp', 'gpt-5.6-sol',
+                   'xhigh', 'expanded', 42);
+                PRAGMA user_version = 4;
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let ledger = ServerStore::open_readonly(&path).unwrap();
+        let error = ledger.thread_authority("thread_bad").unwrap_err();
+        assert!(error.to_string().contains("unknown approval policy"));
+    }
+
+    #[test]
+    fn denied_and_canceled_thread_spawns_record_actor_without_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        let mut ledger = ServerStore::open_or_create(&path).unwrap();
+        for approval in [
+            thread_approval(
+                "spawn_denied",
+                "thread_denied",
+                ThreadSpawnDecisionName::Denied,
+                "reviewer",
+                Some("not admitted"),
+                10,
+            ),
+            thread_approval(
+                "spawn_canceled",
+                "thread_canceled",
+                ThreadSpawnDecisionName::Canceled,
+                "stdin",
+                None,
+                11,
+            ),
+        ] {
+            assert!(
+                ledger
+                    .persist_thread_spawn(&approval, None)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                ledger.thread_spawn_approval(&approval.spawn_id).unwrap(),
+                Some(approval.clone())
+            );
+            assert!(
+                ledger
+                    .thread_authority(&approval.thread_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(ledger.thread_authorities().unwrap().is_empty());
+    }
+
+    #[test]
+    fn thread_spawn_persistence_failure_rolls_back_decision_and_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        let mut ledger = ServerStore::open_or_create(&path).unwrap();
+        ledger
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_thread_authority_insert
+                 BEFORE INSERT ON thread_authorities
+                 BEGIN SELECT RAISE(ABORT, 'injected authority failure'); END;",
+            )
+            .unwrap();
+        let authority = thread_authority(
+            "thread_failed",
+            None,
+            "stdin",
+            dir.path(),
+            ThreadApprovalPolicy::Prompt,
+            20,
+        );
+        let approval = thread_approval(
+            "spawn_failed",
+            "thread_failed",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            20,
+        );
+
+        assert!(
+            ledger
+                .persist_thread_spawn(&approval, Some(&authority))
+                .is_err()
+        );
+        assert!(
+            ledger
+                .thread_spawn_approval("spawn_failed")
+                .unwrap()
+                .is_none()
+        );
+        assert!(ledger.thread_authority("thread_failed").unwrap().is_none());
+    }
+
+    #[test]
+    fn duplicate_thread_spawn_is_idempotent_only_for_identical_durable_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        let mut ledger = ServerStore::open_or_create(&path).unwrap();
+        let authority = thread_authority(
+            "thread_root",
+            None,
+            "stdin",
+            dir.path(),
+            ThreadApprovalPolicy::Yolo,
+            30,
+        );
+        let approval = thread_approval(
+            "spawn_root",
+            "thread_root",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            30,
+        );
+        ledger
+            .persist_thread_spawn(&approval, Some(&authority))
+            .unwrap();
+        assert_eq!(
+            ledger
+                .persist_thread_spawn(&approval, Some(&authority))
+                .unwrap()
+                .unwrap()
+                .record(),
+            &authority
+        );
+
+        let conflicting_approval = thread_approval(
+            "spawn_root",
+            "thread_root",
+            ThreadSpawnDecisionName::Granted,
+            "different_actor",
+            None,
+            30,
+        );
+        let conflicting_authority = ThreadAuthorityRecord {
+            spawning_actor: "different_actor".into(),
+            ..authority.clone()
+        };
+        assert!(matches!(
+            ledger.persist_thread_spawn(
+                &conflicting_approval,
+                Some(&conflicting_authority)
+            ),
+            Err(AppError::Config(message)) if message.contains("conflicts")
+        ));
+
+        let mismatched_actor = ThreadAuthorityRecord {
+            spawning_actor: "reviewer".into(),
+            thread_id: "thread_other".into(),
+            ..authority
+        };
+        let other_approval = thread_approval(
+            "spawn_other",
+            "thread_other",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            31,
+        );
+        assert!(matches!(
+            ledger.persist_thread_spawn(&other_approval, Some(&mismatched_actor)),
+            Err(AppError::Config(message)) if message.contains("actor")
+        ));
+    }
+
+    #[test]
+    fn durable_parent_gate_rejects_policy_and_cwd_expansion_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let child_dir = root.path().join("child");
+        fs::create_dir(&child_dir).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = root.path().join("threads.db");
+        let mut ledger = ServerStore::open_or_create(&path).unwrap();
+        let parent = thread_authority(
+            "thread_parent",
+            None,
+            "stdin",
+            root.path(),
+            ThreadApprovalPolicy::Prompt,
+            1,
+        );
+        let parent_approval = thread_approval(
+            "spawn_parent",
+            "thread_parent",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            1,
+        );
+        ledger
+            .persist_thread_spawn(&parent_approval, Some(&parent))
+            .unwrap();
+
+        for (spawn_id, thread_id, cwd, policy) in [
+            (
+                "spawn_policy_expansion",
+                "thread_policy_expansion",
+                child_dir.as_path(),
+                ThreadApprovalPolicy::Yolo,
+            ),
+            (
+                "spawn_cwd_expansion",
+                "thread_cwd_expansion",
+                outside.path(),
+                ThreadApprovalPolicy::Prompt,
+            ),
+        ] {
+            let authority =
+                thread_authority(thread_id, Some("thread_parent"), "stdin", cwd, policy, 2);
+            let approval = thread_approval(
+                spawn_id,
+                thread_id,
+                ThreadSpawnDecisionName::Granted,
+                "stdin",
+                None,
+                2,
+            );
+            assert!(
+                ledger
+                    .persist_thread_spawn(&approval, Some(&authority))
+                    .is_err()
+            );
+            assert!(ledger.thread_spawn_approval(spawn_id).unwrap().is_none());
+            assert!(ledger.thread_authority(thread_id).unwrap().is_none());
+        }
+    }
+}

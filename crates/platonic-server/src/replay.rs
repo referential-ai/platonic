@@ -234,15 +234,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             tables,
-            [
-                "ledger_events",
-                "session_runs",
-                "sessions",
-                "thread_authorities",
-                "thread_spawn_approvals",
-                "thread_stops",
-                "voice_events"
-            ]
+            ["ledger_events", "session_runs", "sessions", "voice_events"]
         );
         let envelope_versions = connection
             .prepare("SELECT v FROM ledger_events ORDER BY seq ASC")

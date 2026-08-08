@@ -16,6 +16,7 @@ pub mod model;
 pub mod paths;
 pub mod provider;
 pub mod replay;
+mod server_store;
 mod thread_authority;
 pub mod tool_catalog;
 pub mod tools;

@@ -159,7 +159,7 @@ fn concurrent_daemon_acquisition_has_exactly_one_winner() {
 fn daemon_paths(runtime: &Path, workspace: &Path) -> (PathBuf, PathBuf) {
     let workspace_id = paths::workspace_id(workspace).unwrap();
     let directory = runtime
-        .join("plato-agent")
+        .join("platonic")
         .join("workspaces")
         .join(workspace_id);
     (directory.join("agent.lock"), directory.join("agent.sock"))

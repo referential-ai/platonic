@@ -344,14 +344,14 @@ fn replay_cli_reads_literal_v1_without_mutation_and_rejects_future_schema() {
     #[cfg(unix)]
     let v1_path = proof
         .state_root
-        .join("plato-agent")
+        .join("platonic")
         .join("workspaces")
         .join(&workspace_id)
         .join("agent.db");
     #[cfg(windows)]
     let v1_path = proof
         .local_app_data
-        .join("plato-agent")
+        .join("platonic")
         .join("workspaces")
         .join(&workspace_id)
         .join("agent.db");
@@ -468,7 +468,7 @@ impl ProofContext {
             let runtime_root = root.path().join("runtime");
             let state_root = root.path().join("state");
             let workspace_runtime = runtime_root
-                .join("plato-agent")
+                .join("platonic")
                 .join("workspaces")
                 .join(&workspace_id);
             (
@@ -483,7 +483,7 @@ impl ProofContext {
         let (lock_path, socket_path, local_app_data) = {
             let local_app_data = root.path().join("local-app-data");
             let workspace_runtime = local_app_data
-                .join("plato-agent")
+                .join("platonic")
                 .join("workspaces")
                 .join(&workspace_id);
             (

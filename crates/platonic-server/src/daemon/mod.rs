@@ -23,6 +23,9 @@ pub struct DaemonPaths {
     pub socket_path: PathBuf,
     pub lock_path: PathBuf,
     pub ledger_path: PathBuf,
+    /// The host's server-wide store. One per host, not one per workspace —
+    /// D005 requires threads to be enumerable from outside their workspace.
+    pub server_db_path: PathBuf,
 }
 
 impl DaemonPaths {
@@ -33,6 +36,7 @@ impl DaemonPaths {
         Ok(Self {
             lock_path: paths::default_lock_path(&workspace_root)?,
             ledger_path: paths::default_sqlite_path(&workspace_root)?,
+            server_db_path: paths::server_db_path()?,
             workspace_root,
             workspace_id,
             socket_path,
@@ -41,6 +45,10 @@ impl DaemonPaths {
 
     pub(crate) fn default_ledger(&self) -> paths::DefaultSqlitePath {
         paths::DefaultSqlitePath::from_path(self.ledger_path.clone())
+    }
+
+    pub(crate) fn server_store(&self) -> AppResult<crate::server_store::ServerStore> {
+        crate::server_store::ServerStore::open_or_create(&self.server_db_path)
     }
 }
 
