@@ -598,7 +598,16 @@ fn run_prompt(
         cancel: None,
         voice_interruption_context: None,
     })?;
-    write_run_success_output(&mut io::stdout(), &mut io::stderr(), &outcome, &ledger)
+    // The embedded run sets `stream_to_stderr`, and app.rs guarantees the
+    // answer reaches stderr either way: streamed as deltas arrive, or dumped
+    // by its fallback when the provider did not stream.
+    write_run_success_output(
+        &mut io::stdout(),
+        &mut io::stderr(),
+        &outcome,
+        &ledger,
+        true,
+    )
 }
 
 fn daemon_prompt_eligible(cli: &Cli) -> bool {
@@ -947,7 +956,13 @@ fn run_daemon_prompt(
                         started.run_id
                     ))
                 })?;
-                writeln!(stdout, "{final_answer}")?;
+                if !answer_already_visible(
+                    wrote_stderr_delta,
+                    io::stdout().is_terminal(),
+                    io::stderr().is_terminal(),
+                ) {
+                    writeln!(stdout, "{final_answer}")?;
+                }
                 write_sqlite_replay_hint(stderr, &run_id, Path::new(&started.ledger_path))?;
                 return Ok(());
             }
@@ -1085,13 +1100,34 @@ fn resolve_cli_path(path: PathBuf, workspace_root: &Path) -> PathBuf {
     }
 }
 
+/// Whether the answer has already been shown to the person running the command.
+///
+/// The answer goes to stdout so it can be piped, and the live stream goes to
+/// stderr so progress is visible. When both land on the same terminal the
+/// reader sees the same text twice (#387). Repeating it is only useful when
+/// something other than that terminal is reading stdout.
+fn answer_already_visible(
+    streamed_to_stderr: bool,
+    stdout_is_terminal: bool,
+    stderr_is_terminal: bool,
+) -> bool {
+    streamed_to_stderr && stdout_is_terminal && stderr_is_terminal
+}
+
 fn write_run_success_output(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
     outcome: &RunOutcome,
     ledger: &RunLedger,
+    streamed_to_stderr: bool,
 ) -> plato_agent::AppResult<()> {
-    writeln!(stdout, "{}", outcome.final_answer)?;
+    if !answer_already_visible(
+        streamed_to_stderr,
+        io::stdout().is_terminal(),
+        io::stderr().is_terminal(),
+    ) {
+        writeln!(stdout, "{}", outcome.final_answer)?;
+    }
     if let Some(ref claim) = outcome.completion_claim {
         write_claim(stderr, claim)?;
     }
@@ -1224,6 +1260,36 @@ mod tests {
         }
     }
 
+    /// #387: the answer goes to stdout for piping and to stderr as it streams.
+    /// On a shared terminal that shows it twice, so the stdout copy is dropped
+    /// there — and only there, because anything reading stdout still needs it.
+    #[test]
+    fn the_answer_repeats_on_stdout_only_when_something_else_reads_it() {
+        // Both on the same terminal: the reader already watched it stream.
+        assert!(answer_already_visible(true, true, true));
+        // Piped, redirected, or captured: stdout has a reader of its own.
+        assert!(!answer_already_visible(true, false, true));
+        assert!(!answer_already_visible(true, true, false));
+        assert!(!answer_already_visible(true, false, false));
+        // Nothing streamed, so stdout is the only place the answer can appear.
+        assert!(!answer_already_visible(false, true, true));
+    }
+
+    #[test]
+    fn a_streamed_answer_on_a_terminal_leaves_stdout_empty_but_keeps_the_hint() {
+        let outcome = RunOutcome {
+            run_id: RunId::new("run_387").unwrap(),
+            final_answer: "ping".into(),
+            completion_claim: None,
+        };
+        let ledger = RunLedger::Sqlite(PathBuf::from("/tmp/agent.db"));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        write_run_success_output(&mut stdout, &mut stderr, &outcome, &ledger, false).unwrap();
+        assert_eq!(String::from_utf8(stdout).unwrap(), "ping\n");
+        assert!(String::from_utf8(stderr).unwrap().contains("replay:"));
+    }
+
     #[test]
     fn sqlite_success_hint_goes_to_stderr_without_changing_stdout() {
         let outcome = RunOutcome {
@@ -1235,7 +1301,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        write_run_success_output(&mut stdout, &mut stderr, &outcome, &ledger).unwrap();
+        write_run_success_output(&mut stdout, &mut stderr, &outcome, &ledger, false).unwrap();
 
         assert_eq!(String::from_utf8(stdout).unwrap(), "done\n");
         let stderr = String::from_utf8(stderr).unwrap();
@@ -1262,7 +1328,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        write_run_success_output(&mut stdout, &mut stderr, &outcome, &ledger).unwrap();
+        write_run_success_output(&mut stdout, &mut stderr, &outcome, &ledger, false).unwrap();
 
         assert_eq!(String::from_utf8(stdout).unwrap(), "done\n");
         assert!(stderr.is_empty());
