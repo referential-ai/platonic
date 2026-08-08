@@ -11,10 +11,10 @@ use platonic_protocol::{
     HelloParams, HelloResult, IssuePrepStartParams, IssuePrepStartResult, MessageAppendParams,
     PROTOCOL_VERSION, RunCancelParams, RunOverrides, RunStartParams, RunStartResult,
     SessionSummary, SessionsListResult, ShutdownIfIdleResult, ThreadApprovalPolicy,
-    ThreadEventsParams, ThreadEventsResult, ThreadListResult, ThreadSendParams, ThreadSendResult,
-    ThreadSpawnDecision, ThreadSpawnParams, ThreadSpawnResult, ThreadStatusParams,
-    ThreadStatusResult, ThreadStopParams, ThreadStopResult, TranscriptReadParams,
-    TranscriptReadResult,
+    ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams, ThreadEventsResult,
+    ThreadListResult, ThreadSendParams, ThreadSendResult, ThreadSpawnDecision, ThreadSpawnParams,
+    ThreadSpawnResult, ThreadStatusParams, ThreadStatusResult, ThreadStopParams, ThreadStopResult,
+    TranscriptReadParams, TranscriptReadResult,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -145,6 +145,11 @@ impl DaemonClient {
     /// Reads one durable thread joined with current daemon state.
     pub fn thread_status(&mut self, thread_id: String) -> ClientResult<ThreadStatusResult> {
         self.request("thread.status", ThreadStatusParams { thread_id })
+    }
+
+    /// Reads one complete immutable twelve-field thread authority record.
+    pub fn thread_authority(&mut self, thread_id: String) -> ClientResult<ThreadAuthorityResult> {
+        self.request("thread.authority", ThreadAuthorityParams { thread_id })
     }
 
     /// Starts an idle thread turn or steers the exact active turn owned by `controller_id`.
@@ -956,6 +961,20 @@ mod tests {
             "thread_id": "thread_1",
             "parent_thread_id": null,
             "spawning_actor": "stdin",
+            "agent_id": "plato",
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "xhigh",
+            "approval_policy": "prompt",
+            "toolset": ["read_file"],
+            "worktrees": [],
+            "granted_paths": [{"path": "/tmp/work", "writable": false}],
+            "network": false,
+            "created_at_ms": 42
+        });
+        let legacy_authority = json!({
+            "thread_id": "thread_1",
+            "parent_thread_id": null,
+            "spawning_actor": "stdin",
             "cwd": "/tmp/work",
             "model": "gpt-5.6-sol",
             "reasoning_effort": "xhigh",
@@ -963,6 +982,7 @@ mod tests {
             "created_at_ms": 42
         });
         let server_authority = authority.clone();
+        let server_legacy_authority = legacy_authority.clone();
         let handle = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut writer = stream.try_clone().unwrap();
@@ -1011,7 +1031,7 @@ mod tests {
                 json!({
                     "status": "spawned",
                     "thread": {
-                        "authority": server_authority.clone(),
+                        "authority": server_legacy_authority.clone(),
                         "live": {"loaded": true, "current_turn_id": null, "last_activity_at_ms": 42}
                     }
                 }),
@@ -1026,7 +1046,7 @@ mod tests {
                 "thread.list",
                 json!({
                     "threads": [{
-                        "authority": server_authority.clone(),
+                        "authority": server_legacy_authority.clone(),
                         "live": {"loaded": true, "current_turn_id": null}
                     }]
                 }),
@@ -1041,10 +1061,20 @@ mod tests {
                 "thread.status",
                 json!({
                     "thread": {
-                        "authority": server_authority,
+                        "authority": server_legacy_authority,
                         "live": {"loaded": true, "current_turn_id": null}
                     }
                 }),
+            );
+
+            let authority = read_request(&mut reader);
+            assert_eq!(authority.method.as_deref(), Some("thread.authority"));
+            assert_eq!(authority.params, Some(json!({"thread_id": "thread_1"})));
+            write_response(
+                &mut writer,
+                authority.id,
+                "thread.authority",
+                json!({"authority": server_authority}),
             );
 
             let start_turn = read_request(&mut reader);
@@ -1162,6 +1192,16 @@ mod tests {
                     .thread_status("thread_1".into())
                     .unwrap()
                     .thread
+                    .authority
+            )
+            .unwrap(),
+            legacy_authority
+        );
+        assert_eq!(
+            serde_json::to_value(
+                client
+                    .thread_authority("thread_1".into())
+                    .unwrap()
                     .authority
             )
             .unwrap(),

@@ -9,16 +9,20 @@
 //! Workspace ledgers keep what is workspace-scoped: the event log, sessions,
 //! and voice events. Nothing here is a log; every table is current state.
 
+#[cfg(test)]
+use crate::thread_authority::legacy_status_authority;
 use crate::{
     AppError, AppResult,
     ledger::{row_u64, sqlite_i64},
     thread_authority::{
         ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, ThreadStopRecord,
-        validate_child_authority, validate_complete_authority,
+        authority_working_directory, validate_child_authority, validate_complete_authority,
     },
 };
-use platonic_core::EffectClass;
-use platonic_protocol::{ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord};
+use platonic_core::{AgentId, EffectClass};
+use platonic_protocol::{
+    ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadGrantedPath, ThreadWorktree,
+};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use std::{path::Path, time::Duration};
 
@@ -104,9 +108,9 @@ impl ServerStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
-        create_thread_authority_tables(&connection)?;
+        create_thread_authority_tables(&mut connection)?;
         create_thread_stop_table(&connection)?;
         create_workspace_table(&connection)?;
         create_tool_call_approval_table(&connection)?;
@@ -394,13 +398,24 @@ impl ServerStore {
                         "parent thread is no longer durable: {parent_thread_id}"
                     ))
                 })?;
+            let cwd = authority_working_directory(authority).ok_or_else(|| {
+                AppError::Config("thread authority has no working directory".into())
+            })?;
             let draft = crate::thread_authority::ThreadAuthorityDraft {
                 thread_id: authority.thread_id.clone(),
                 parent_thread_id: authority.parent_thread_id.clone(),
-                cwd: authority.cwd.clone(),
+                cwd: cwd.to_string_lossy().into_owned(),
+                agent_id: authority
+                    .agent_id
+                    .clone()
+                    .expect("complete authority has an agent id"),
                 model: authority.model.clone(),
                 reasoning_effort: authority.reasoning_effort,
                 approval_policy: authority.approval_policy,
+                toolset: authority.toolset.clone(),
+                worktrees: authority.worktrees.clone(),
+                granted_paths: authority.granted_paths.clone(),
+                network: authority.network,
             };
             validate_child_authority(&parent, &draft)
                 .map_err(|error| AppError::Config(error.to_string()))?;
@@ -420,19 +435,31 @@ impl ServerStore {
             ],
         )?;
         if let Some(authority) = authority {
+            let toolset = serde_json::to_string(&authority.toolset)?;
+            let worktrees = serde_json::to_string(&authority.worktrees)?;
+            let granted_paths = serde_json::to_string(&authority.granted_paths)?;
             transaction.execute(
                 "INSERT INTO thread_authorities
-                   (thread_id, parent_thread_id, spawning_actor, cwd, model,
-                    reasoning_effort, approval_policy, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                   (thread_id, parent_thread_id, spawning_actor, agent_id, model,
+                    reasoning_effort, approval_policy, toolset, worktrees,
+                    granted_paths, network, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     authority.thread_id,
                     authority.parent_thread_id,
                     authority.spawning_actor,
-                    authority.cwd,
+                    authority
+                        .agent_id
+                        .as_ref()
+                        .map(AgentId::as_str)
+                        .expect("complete authority has an agent id"),
                     authority.model,
                     authority.reasoning_effort.as_str(),
                     authority.approval_policy.as_str(),
+                    toolset,
+                    worktrees,
+                    granted_paths,
+                    authority.network,
                     sqlite_i64(authority.created_at_ms, "thread created_at_ms")?
                 ],
             )?;
@@ -450,8 +477,9 @@ impl ServerStore {
 
     pub(crate) fn thread_authorities(&self) -> AppResult<Vec<ThreadAuthorityRecord>> {
         let mut statement = self.connection.prepare(
-            "SELECT thread_id, parent_thread_id, spawning_actor, cwd, model,
-                    reasoning_effort, approval_policy, created_at_ms
+            "SELECT thread_id, parent_thread_id, spawning_actor, cwd, agent_id,
+                    model, reasoning_effort, approval_policy, toolset, worktrees,
+                    granted_paths, network, created_at_ms
              FROM thread_authorities
              ORDER BY created_at_ms ASC, thread_id ASC",
         )?;
@@ -509,8 +537,9 @@ fn thread_authority_from(
 ) -> AppResult<Option<ThreadAuthorityRecord>> {
     Ok(connection
         .query_row(
-            "SELECT thread_id, parent_thread_id, spawning_actor, cwd, model,
-                    reasoning_effort, approval_policy, created_at_ms
+            "SELECT thread_id, parent_thread_id, spawning_actor, cwd, agent_id,
+                    model, reasoning_effort, approval_policy, toolset, worktrees,
+                    granted_paths, network, created_at_ms
              FROM thread_authorities
              WHERE thread_id = ?1",
             params![thread_id],
@@ -520,23 +549,76 @@ fn thread_authority_from(
 }
 
 fn thread_authority_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadAuthorityRecord> {
-    let reasoning_value: String = row.get(5)?;
+    let legacy_cwd: Option<String> = row.get(3)?;
+    let agent_value: Option<String> = row.get(4)?;
+    let agent_id = agent_value
+        .map(AgentId::new)
+        .transpose()
+        .map_err(|error| invalid_thread_column(4, error.to_string()))?;
+    let reasoning_value: String = row.get(6)?;
     let reasoning_effort = ReasoningEffort::parse(&reasoning_value).ok_or_else(|| {
-        invalid_thread_column(5, format!("unknown reasoning effort: {reasoning_value}"))
+        invalid_thread_column(6, format!("unknown reasoning effort: {reasoning_value}"))
     })?;
-    let policy_value: String = row.get(6)?;
+    let policy_value: String = row.get(7)?;
     let approval_policy = ThreadApprovalPolicy::parse(&policy_value).ok_or_else(|| {
-        invalid_thread_column(6, format!("unknown approval policy: {policy_value}"))
+        invalid_thread_column(7, format!("unknown approval policy: {policy_value}"))
     })?;
+    let toolset = row
+        .get::<_, Option<String>>(8)?
+        .map(|value| {
+            serde_json::from_str::<Vec<String>>(&value)
+                .map_err(|error| invalid_thread_column(8, error.to_string()))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let worktrees = row
+        .get::<_, Option<String>>(9)?
+        .map(|value| {
+            serde_json::from_str::<Vec<ThreadWorktree>>(&value)
+                .map_err(|error| invalid_thread_column(9, error.to_string()))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let granted_paths = row
+        .get::<_, Option<String>>(10)?
+        .map(|value| {
+            serde_json::from_str::<Vec<ThreadGrantedPath>>(&value)
+                .map_err(|error| invalid_thread_column(10, error.to_string()))
+        })
+        .transpose()?
+        .unwrap_or_else(|| {
+            legacy_cwd
+                .map(|path| {
+                    vec![ThreadGrantedPath {
+                        path,
+                        writable: true,
+                    }]
+                })
+                .unwrap_or_default()
+        });
+    let network = match row.get::<_, Option<i64>>(11)? {
+        None | Some(0) => false,
+        Some(1) => true,
+        Some(value) => {
+            return Err(invalid_thread_column(
+                11,
+                format!("invalid network flag: {value}"),
+            ));
+        }
+    };
     Ok(ThreadAuthorityRecord {
         thread_id: row.get(0)?,
         parent_thread_id: row.get(1)?,
         spawning_actor: row.get(2)?,
-        cwd: row.get(3)?,
-        model: row.get(4)?,
+        agent_id,
+        model: row.get(5)?,
         reasoning_effort,
         approval_policy,
-        created_at_ms: row_u64(row, 7, "thread created_at_ms")?,
+        toolset,
+        worktrees,
+        granted_paths,
+        network,
+        created_at_ms: row_u64(row, 12, "thread created_at_ms")?,
     })
 }
 
@@ -786,17 +868,22 @@ fn create_tool_call_approval_table(connection: &Connection) -> AppResult<()> {
     Ok(())
 }
 
-fn create_thread_authority_tables(connection: &Connection) -> AppResult<()> {
+fn create_thread_authority_tables(connection: &mut Connection) -> AppResult<()> {
     connection.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS thread_authorities (
           thread_id TEXT PRIMARY KEY,
           parent_thread_id TEXT,
           spawning_actor TEXT NOT NULL,
-          cwd TEXT NOT NULL,
+          cwd TEXT,
+          agent_id TEXT,
           model TEXT NOT NULL,
           reasoning_effort TEXT NOT NULL,
           approval_policy TEXT NOT NULL,
+          toolset TEXT,
+          worktrees TEXT,
+          granted_paths TEXT,
+          network INTEGER,
           created_at_ms INTEGER NOT NULL
         );
 
@@ -808,7 +895,52 @@ fn create_thread_authority_tables(connection: &Connection) -> AppResult<()> {
           reason TEXT,
           occurred_at_ms INTEGER NOT NULL
         );
+        "#,
+    )?;
 
+    let columns = connection
+        .prepare("PRAGMA table_info(thread_authorities)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "agent_id") {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            r#"
+            DROP TRIGGER IF EXISTS thread_authorities_no_update;
+            DROP TRIGGER IF EXISTS thread_authorities_no_delete;
+            ALTER TABLE thread_authorities RENAME TO thread_authorities_legacy;
+
+            CREATE TABLE thread_authorities (
+              thread_id TEXT PRIMARY KEY,
+              parent_thread_id TEXT,
+              spawning_actor TEXT NOT NULL,
+              cwd TEXT,
+              agent_id TEXT,
+              model TEXT NOT NULL,
+              reasoning_effort TEXT NOT NULL,
+              approval_policy TEXT NOT NULL,
+              toolset TEXT,
+              worktrees TEXT,
+              granted_paths TEXT,
+              network INTEGER,
+              created_at_ms INTEGER NOT NULL
+            );
+
+            INSERT INTO thread_authorities
+              (thread_id, parent_thread_id, spawning_actor, cwd, model,
+               reasoning_effort, approval_policy, created_at_ms)
+            SELECT thread_id, parent_thread_id, spawning_actor, cwd, model,
+                   reasoning_effort, approval_policy, created_at_ms
+              FROM thread_authorities_legacy;
+
+            DROP TABLE thread_authorities_legacy;
+            "#,
+        )?;
+        transaction.commit()?;
+    }
+
+    connection.execute_batch(
+        r#"
         CREATE TRIGGER IF NOT EXISTS thread_authorities_no_update
         BEFORE UPDATE ON thread_authorities
         BEGIN
@@ -901,10 +1033,17 @@ mod tests {
             thread_id: thread_id.into(),
             parent_thread_id: parent_thread_id.map(str::to_owned),
             spawning_actor: actor.into(),
-            cwd: cwd.canonicalize().unwrap().to_string_lossy().into_owned(),
+            agent_id: Some(AgentId::new("plato").unwrap()),
             model: "gpt-5.6-sol".into(),
             reasoning_effort: ReasoningEffort::Xhigh,
             approval_policy: policy,
+            toolset: vec!["file.read".into(), "file.write".into()],
+            worktrees: Vec::new(),
+            granted_paths: vec![ThreadGrantedPath {
+                path: cwd.canonicalize().unwrap().to_string_lossy().into_owned(),
+                writable: true,
+            }],
+            network: false,
             created_at_ms,
         }
     }
@@ -928,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_authority_persists_all_eight_fields_and_is_immutable_after_restart() {
+    fn thread_authority_persists_all_twelve_fields_and_is_immutable_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("threads.db");
         let mut ledger = ServerStore::open_or_create(&path).unwrap();
@@ -947,9 +1086,14 @@ mod tests {
                 "parent_thread_id",
                 "spawning_actor",
                 "cwd",
+                "agent_id",
                 "model",
                 "reasoning_effort",
                 "approval_policy",
+                "toolset",
+                "worktrees",
+                "granted_paths",
+                "network",
                 "created_at_ms",
             ]
         );
@@ -975,6 +1119,39 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(durable.record(), &authority);
+        let stored = ledger
+            .connection
+            .query_row(
+                "SELECT cwd, agent_id, toolset, worktrees, granted_paths, network
+                   FROM thread_authorities WHERE thread_id = 'thread_root'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                None,
+                "plato".into(),
+                r#"["file.read","file.write"]"#.into(),
+                "[]".into(),
+                format!(
+                    r#"[{{"path":{},"writable":true}}]"#,
+                    serde_json::to_string(&dir.path().canonicalize().unwrap().to_string_lossy())
+                        .unwrap()
+                ),
+                0,
+            )
+        );
         assert_eq!(
             ledger.thread_spawn_approval("spawn_root").unwrap(),
             Some(approval.clone())
@@ -1278,7 +1455,7 @@ mod tests {
             reopened
                 .thread_authority("thread_alpha")
                 .unwrap()
-                .is_some_and(|authority| authority.cwd.ends_with("alpha"))
+                .is_some_and(|authority| authority.granted_paths[0].path.ends_with("alpha"))
         );
 
         // Registration is idempotent: rebinding a workspace keeps its record.
@@ -1296,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn literal_authority_fixture_reads_exactly_without_mutation() {
+    fn pre_migration_authority_rows_enumerate_with_conservative_typed_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("literal-authority.db");
         let cwd = dir.path().canonicalize().unwrap();
@@ -1314,6 +1491,16 @@ mod tests {
                   approval_policy TEXT NOT NULL,
                   created_at_ms INTEGER NOT NULL
                 );
+                CREATE TRIGGER thread_authorities_no_update
+                BEFORE UPDATE ON thread_authorities
+                BEGIN
+                  SELECT RAISE(ABORT, 'thread authority records are immutable');
+                END;
+                CREATE TRIGGER thread_authorities_no_delete
+                BEFORE DELETE ON thread_authorities
+                BEGIN
+                  SELECT RAISE(ABORT, 'thread authority records are immutable');
+                END;
                 CREATE TABLE thread_stops (
                   thread_id TEXT PRIMARY KEY,
                   actor TEXT NOT NULL,
@@ -1334,25 +1521,77 @@ mod tests {
             )
             .unwrap();
         drop(connection);
-        let bytes_before = fs::read(&path).unwrap();
 
-        let ledger = ServerStore::open_readonly(&path).unwrap();
+        let ledger = ServerStore::open_or_create(&path).unwrap();
+        let authority = ledger.thread_authority("thread_literal").unwrap().unwrap();
         assert_eq!(
-            ledger.thread_authority("thread_literal").unwrap(),
-            Some(ThreadAuthorityRecord {
+            authority,
+            ThreadAuthorityRecord {
                 thread_id: "thread_literal".into(),
                 parent_thread_id: Some("thread_parent".into()),
                 spawning_actor: "fixture_actor".into(),
-                cwd: cwd.to_string_lossy().into_owned(),
+                agent_id: None,
                 model: "gpt-5.6-sol".into(),
                 reasoning_effort: ReasoningEffort::Xhigh,
                 approval_policy: ThreadApprovalPolicy::Prompt,
+                toolset: Vec::new(),
+                worktrees: Vec::new(),
+                granted_paths: vec![ThreadGrantedPath {
+                    path: cwd.to_string_lossy().into_owned(),
+                    writable: true,
+                }],
+                network: false,
                 created_at_ms: 42,
-            })
+            }
         );
+        assert_eq!(
+            legacy_status_authority(&authority).unwrap().cwd,
+            cwd.to_string_lossy()
+        );
+        assert_eq!(ledger.thread_authorities().unwrap().len(), 1);
+        let legacy_columns = ledger
+            .connection
+            .query_row(
+                "SELECT cwd, agent_id, toolset, worktrees, granted_paths, network
+                   FROM thread_authorities WHERE thread_id = 'thread_literal'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            legacy_columns,
+            (
+                cwd.to_string_lossy().into_owned(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        );
+        for statement in [
+            "UPDATE thread_authorities SET model = 'changed' WHERE thread_id = 'thread_literal'",
+            "DELETE FROM thread_authorities WHERE thread_id = 'thread_literal'",
+        ] {
+            assert!(
+                ledger
+                    .connection
+                    .execute(statement, [])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("immutable")
+            );
+        }
         assert!(ledger.thread_stop("thread_literal").unwrap().is_none());
-        drop(ledger);
-        assert_eq!(fs::read(&path).unwrap(), bytes_before);
     }
 
     #[test]
@@ -1382,7 +1621,7 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let ledger = ServerStore::open_readonly(&path).unwrap();
+        let ledger = ServerStore::open_or_create(&path).unwrap();
         let error = ledger.thread_authority("thread_bad").unwrap_err();
         assert!(error.to_string().contains("unknown approval policy"));
     }
@@ -1547,7 +1786,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_parent_gate_rejects_policy_and_cwd_expansion_atomically() {
+    fn durable_parent_gate_rejects_policy_cwd_and_toolset_expansion_atomically() {
         let root = tempfile::tempdir().unwrap();
         let child_dir = root.path().join("child");
         fs::create_dir(&child_dir).unwrap();
@@ -1606,5 +1845,39 @@ mod tests {
             assert!(ledger.thread_spawn_approval(spawn_id).unwrap().is_none());
             assert!(ledger.thread_authority(thread_id).unwrap().is_none());
         }
+
+        let mut authority = thread_authority(
+            "thread_toolset_expansion",
+            Some("thread_parent"),
+            "stdin",
+            &child_dir,
+            ThreadApprovalPolicy::Prompt,
+            2,
+        );
+        authority.toolset.push("web.fetch".into());
+        let approval = thread_approval(
+            "spawn_toolset_expansion",
+            "thread_toolset_expansion",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            2,
+        );
+        assert!(matches!(
+            ledger.persist_thread_spawn(&approval, Some(&authority)),
+            Err(AppError::Config(message)) if message.contains("toolset")
+        ));
+        assert!(
+            ledger
+                .thread_spawn_approval("spawn_toolset_expansion")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ledger
+                .thread_authority("thread_toolset_expansion")
+                .unwrap()
+                .is_none()
+        );
     }
 }

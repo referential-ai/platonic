@@ -256,11 +256,25 @@ an explicit cwd, model, reasoning effort, and approval policy; cwd defaults to
 the current directory and policy defaults to `prompt`. A root spawn prompts on
 stdin. A child spawn is evaluated by its loaded parent's immutable policy:
 `prompt` asks for a decision and `yolo` auto-grants the workspace-write spawn
-effect. A child cwd must remain within its parent's cwd, and a child policy can
-never be more permissive. Every final approval decision and actor is stored in
-the workspace ledger. A grant atomically stores all eight immutable authority
-fields before the thread becomes loaded; denial, cancellation, or persistence
-failure creates no thread authority.
+effect. A child cwd must remain within its parent's granted paths, its toolset
+must be a subset of the parent's, and its policy can never be more permissive.
+Every final approval decision and actor is stored in the server store.
+
+A grant atomically stores the twelve immutable authority fields before the
+thread becomes loaded. The current compatibility spawn resolves agent `plato`,
+the configured toolset, no worktrees, the requested cwd as one granted path,
+and network access when a network tool is enabled. New rows leave the legacy
+`cwd` column null. Migrated eight-field rows remain enumerable without
+backfill: agent, toolset, and worktrees default absent or empty, the recorded
+cwd becomes one writable granted path, and network defaults denied. Denial,
+cancellation, or persistence failure creates no thread authority.
+
+Protocol-v1 `thread.list` and `thread.status` keep their original eight-field
+authority projection, including `cwd`, so compiled v1 clients continue to
+decode those responses byte-for-byte. New rows derive that compatibility cwd
+from the first recorded worktree or granted-path root; migrated rows retain
+their stored cwd. Daemons advertise `thread.authority` for a separate typed
+readback of the complete twelve-field immutable record.
 
 ```bash
 # Terminal 1

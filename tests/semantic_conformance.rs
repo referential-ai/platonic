@@ -3,11 +3,12 @@ use plato_agent::{
     daemon::{
         client::{ClientError, DaemonClient},
         protocol::{
-            BufferedThreadEvent, CAPABILITY_THREAD_EVENTS, CAPABILITY_THREAD_LIST,
-            CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_SPAWN, CAPABILITY_THREAD_STATUS,
-            CAPABILITY_THREAD_STOP, ERROR_NOT_FOUND, ReasoningEffort, RunStateName,
-            ShutdownIfIdleResultName, StreamEvent, ThreadApprovalPolicy, ThreadSendRejectedReason,
-            ThreadSendResult, ThreadSpawnDecision, ThreadSpawnResult, ThreadStopResult,
+            BufferedThreadEvent, CAPABILITY_THREAD_AUTHORITY, CAPABILITY_THREAD_EVENTS,
+            CAPABILITY_THREAD_LIST, CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_SPAWN,
+            CAPABILITY_THREAD_STATUS, CAPABILITY_THREAD_STOP, ERROR_NOT_FOUND, ReasoningEffort,
+            RunStateName, ShutdownIfIdleResultName, StreamEvent, ThreadApprovalPolicy,
+            ThreadSendRejectedReason, ThreadSendResult, ThreadSpawnDecision, ThreadSpawnResult,
+            ThreadStopResult,
         },
     },
     ledger::SqliteLedger,
@@ -362,6 +363,11 @@ fn one_host_daemon_serves_two_workspaces_and_coexists_with_legacy_daemon() {
 fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     let proof = ProofContext::new();
+    fs::write(
+        &proof.config_path,
+        "[tools]\nenabled = [\"file.read\", \"file.list\", \"file.write\", \"file.edit\", \"shell.exec\", \"web.fetch\"]\n",
+    )
+    .unwrap();
     let child_cwd = proof.workspace.join("child");
     fs::create_dir(&child_cwd).unwrap();
     let host = ProofDaemon::start_host(&proof);
@@ -371,6 +377,7 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
         CAPABILITY_THREAD_SPAWN,
         CAPABILITY_THREAD_LIST,
         CAPABILITY_THREAD_STATUS,
+        CAPABILITY_THREAD_AUTHORITY,
         CAPABILITY_THREAD_STOP,
     ] {
         assert!(hello.capabilities.iter().any(|served| served == capability));
@@ -402,7 +409,7 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
         }
         unexpected => panic!("expected root approval, got {unexpected:?}"),
     };
-    let root = match client
+    let root_status = match client
         .thread_spawn_decide(
             spawn_id,
             ThreadSpawnDecision::Grant {
@@ -414,25 +421,48 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
         ThreadSpawnResult::Spawned { thread } => thread,
         unexpected => panic!("expected spawned root, got {unexpected:?}"),
     };
-    assert_eq!(root.authority.thread_id, root_thread_id);
-    assert_eq!(root.authority.parent_thread_id, None);
-    assert_eq!(root.authority.spawning_actor, "semantic_fixture");
+    assert_eq!(root_status.authority.thread_id, root_thread_id);
+    assert_eq!(root_status.authority.parent_thread_id, None);
+    assert_eq!(root_status.authority.spawning_actor, "semantic_fixture");
     assert_eq!(
-        Path::new(&root.authority.cwd),
+        Path::new(&root_status.authority.cwd),
         proof.workspace.canonicalize().unwrap()
     );
-    assert_eq!(root.authority.model, "gpt-5.6-sol");
-    assert_eq!(root.authority.reasoning_effort, ReasoningEffort::Xhigh);
-    assert_eq!(root.authority.approval_policy, ThreadApprovalPolicy::Yolo);
-    assert!(root.authority.created_at_ms > 0);
-    assert!(root.live.loaded);
-    assert_eq!(root.live.current_turn_id, None);
+    let root = client
+        .thread_authority(root_thread_id.clone())
+        .unwrap()
+        .authority;
+    assert_eq!(root.agent_id, Some(AgentId::new("plato").unwrap()));
     assert_eq!(
-        root.live.last_activity_at_ms,
-        Some(root.authority.created_at_ms)
+        Path::new(&root.granted_paths[0].path),
+        proof.workspace.canonicalize().unwrap()
+    );
+    assert!(root.granted_paths[0].writable);
+    assert_eq!(
+        root.toolset,
+        [
+            "file.read",
+            "file.list",
+            "file.write",
+            "file.edit",
+            "shell.exec",
+            "web.fetch",
+        ]
+    );
+    assert!(root.worktrees.is_empty());
+    assert!(root.network);
+    assert_eq!(root.model, "gpt-5.6-sol");
+    assert_eq!(root.reasoning_effort, ReasoningEffort::Xhigh);
+    assert_eq!(root.approval_policy, ThreadApprovalPolicy::Yolo);
+    assert!(root.created_at_ms > 0);
+    assert!(root_status.live.loaded);
+    assert_eq!(root_status.live.current_turn_id, None);
+    assert_eq!(
+        root_status.live.last_activity_at_ms,
+        Some(root.created_at_ms)
     );
 
-    let child = match client
+    let child_status = match client
         .thread_spawn_start(
             Some(root_thread_id.clone()),
             child_cwd
@@ -449,15 +479,26 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
         ThreadSpawnResult::Spawned { thread } => thread,
         unexpected => panic!("expected yolo auto-grant, got {unexpected:?}"),
     };
+    let child_thread_id = child_status.authority.thread_id.clone();
     assert_eq!(
-        child.authority.parent_thread_id.as_deref(),
+        Path::new(&child_status.authority.cwd),
+        child_cwd.canonicalize().unwrap()
+    );
+    let child = client
+        .thread_authority(child_thread_id.clone())
+        .unwrap()
+        .authority;
+    assert_eq!(
+        child.parent_thread_id.as_deref(),
         Some(root_thread_id.as_str())
     );
-    assert_eq!(child.authority.spawning_actor, "yolo");
-    assert!(child.live.loaded);
+    assert_eq!(child.spawning_actor, "yolo");
+    assert_eq!(child.agent_id, root.agent_id);
+    assert_eq!(child.toolset, root.toolset);
+    assert!(child_status.live.loaded);
     assert_eq!(
-        child.live.last_activity_at_ms,
-        Some(child.authority.created_at_ms)
+        child_status.live.last_activity_at_ms,
+        Some(child.created_at_ms)
     );
 
     let listed = client.thread_list().unwrap().threads;
@@ -465,10 +506,10 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     assert!(listed.iter().all(|thread| thread.live.loaded));
     assert_eq!(
         client
-            .thread_status(child.authority.thread_id.clone())
+            .thread_status(child_thread_id.clone())
             .unwrap()
             .thread,
-        child
+        child_status
     );
     let root_stop = client
         .thread_stop(root_thread_id.clone(), "semantic_fixture".into())
@@ -492,12 +533,12 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
         .unwrap();
     let orphaned_child = listed
         .iter()
-        .find(|thread| thread.authority.thread_id == child.authority.thread_id)
+        .find(|thread| thread.authority.thread_id == child_thread_id)
         .unwrap();
     assert!(!stopped_root.live.loaded);
     assert_eq!(stopped_root.live.last_activity_at_ms, None);
     assert!(orphaned_child.live.loaded);
-    assert_eq!(orphaned_child.authority, child.authority);
+    assert_eq!(orphaned_child.authority, child_status.authority);
     let connection = rusqlite::Connection::open(&proof.server_db_path).unwrap();
     assert_eq!(
         connection
@@ -527,13 +568,13 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
             .all(|thread| thread.live.last_activity_at_ms.is_none())
     );
     let readback = restarted_client
-        .thread_status(child.authority.thread_id.clone())
+        .thread_status(child_thread_id.clone())
         .unwrap()
         .thread;
-    assert_eq!(readback.authority, child.authority);
+    assert_eq!(readback.authority, child_status.authority);
     assert!(!readback.live.loaded);
     let child_stop = restarted_client
-        .thread_stop(child.authority.thread_id.clone(), "restart_fixture".into())
+        .thread_stop(child_thread_id.clone(), "restart_fixture".into())
         .unwrap();
     let child_stopped_at_ms = match child_stop {
         ThreadStopResult::Stopped {
@@ -545,10 +586,10 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     };
     assert_eq!(
         restarted_client
-            .thread_stop(child.authority.thread_id.clone(), "retry_fixture".into())
+            .thread_stop(child_thread_id.clone(), "retry_fixture".into())
             .unwrap(),
         ThreadStopResult::AlreadyStopped {
-            thread_id: child.authority.thread_id.clone(),
+            thread_id: child_thread_id,
             stopped_turn_id: None,
             stopped_at_ms: child_stopped_at_ms,
         }
@@ -590,6 +631,7 @@ fn thread_send_and_three_observers_are_semantically_conformant_on_host_daemon() 
         CAPABILITY_THREAD_SPAWN,
         CAPABILITY_THREAD_LIST,
         CAPABILITY_THREAD_STATUS,
+        CAPABILITY_THREAD_AUTHORITY,
     ] {
         assert!(hello.capabilities.iter().any(|served| served == capability));
     }

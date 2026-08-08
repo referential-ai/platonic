@@ -77,6 +77,12 @@ fn plato_tui_cold_starts_host_thread_and_remote_reuses_it() {
     assert_eq!(thread.authority.spawning_actor, "local_tui");
     assert_eq!(thread.authority.cwd, workspace.to_string_lossy());
     let thread_id = thread.authority.thread_id.clone();
+    let authority = client
+        .thread_authority(thread_id.clone())
+        .unwrap()
+        .authority;
+    assert_eq!(authority.spawning_actor, "local_tui");
+    assert_eq!(authority.granted_paths[0].path, workspace.to_string_lossy());
     assert_eq!(
         client
             .thread_status(thread_id.clone())

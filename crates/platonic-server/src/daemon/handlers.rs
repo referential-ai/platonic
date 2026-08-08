@@ -11,20 +11,20 @@ use crate::{
             ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
             ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
             ERROR_SESSIONS_LIST_FAILED, ERROR_THREAD_AUTHORITY_EXCEEDED,
-            ERROR_THREAD_EVENTS_FAILED, ERROR_THREAD_LIST_FAILED, ERROR_THREAD_SEND_FAILED,
-            ERROR_THREAD_SPAWN_FAILED, ERROR_THREAD_STATUS_FAILED, ERROR_THREAD_STOP_FAILED,
-            ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH, Envelope, EventsStreamParams,
-            EventsStreamResult, HelloParams, HelloResult, IssuePrepResult, IssuePrepStartParams,
-            IssuePrepStartResult, MessageAppendParams, ModelIdentityStatus, RunCancelParams,
-            RunStartParams, RunStartResult, RunStateName, SessionSummary, SessionsListResult,
-            ShutdownIfIdleResult, ShutdownIfIdleResultName, ThreadApprovalPolicy,
-            ThreadEventsParams, ThreadListResult, ThreadSendParams, ThreadSpawnDecision,
-            ThreadSpawnParams, ThreadSpawnResult, ThreadStatus, ThreadStatusParams,
-            ThreadStatusResult, ThreadStopParams, ThreadStopResult, TranscriptReadParams,
-            TranscriptReadResult, TypedRun, TypedTranscript, TypedTranscriptEntry,
-            WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceHealthName, WorkspaceListParams,
-            WorkspaceListResult, WorkspaceStatusParams, WorkspaceStatusResult, WorkspaceSummary,
-            decode_request,
+            ERROR_THREAD_AUTHORITY_FAILED, ERROR_THREAD_EVENTS_FAILED, ERROR_THREAD_LIST_FAILED,
+            ERROR_THREAD_SEND_FAILED, ERROR_THREAD_SPAWN_FAILED, ERROR_THREAD_STATUS_FAILED,
+            ERROR_THREAD_STOP_FAILED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH, Envelope,
+            EventsStreamParams, EventsStreamResult, HelloParams, HelloResult, IssuePrepResult,
+            IssuePrepStartParams, IssuePrepStartResult, MessageAppendParams, ModelIdentityStatus,
+            RunCancelParams, RunStartParams, RunStartResult, RunStateName, SessionSummary,
+            SessionsListResult, ShutdownIfIdleResult, ShutdownIfIdleResultName,
+            ThreadApprovalPolicy, ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams,
+            ThreadListResult, ThreadSendParams, ThreadSpawnDecision, ThreadSpawnParams,
+            ThreadSpawnResult, ThreadStatus, ThreadStatusParams, ThreadStatusResult,
+            ThreadStopParams, ThreadStopResult, TranscriptReadParams, TranscriptReadResult,
+            TypedRun, TypedTranscript, TypedTranscriptEntry, WorkspaceCreateParams,
+            WorkspaceCreateResult, WorkspaceHealthName, WorkspaceListParams, WorkspaceListResult,
+            WorkspaceStatusParams, WorkspaceStatusResult, WorkspaceSummary, decode_request,
         },
         runtime::{
             DaemonRuntime, IssuePrepAdmissionError, RunAdmissionError, RunRecord,
@@ -41,14 +41,15 @@ use crate::{
     replay::{format_readback, format_session_readback},
     server_store::ServerStore,
     thread_authority::{
-        THREAD_SPAWN_APPROVAL_REASON, ThreadAuthorityDraft, ThreadAuthorityError,
-        ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, ThreadStopRecord, new_spawn_id,
-        new_thread_turn_id, now_ms, thread_spawn_effect, validate_child_authority,
+        THREAD_SPAWN_APPROVAL_REASON, ThreadAuthorityDraft, ThreadAuthorityDraftParams,
+        ThreadAuthorityError, ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, ThreadStopRecord,
+        authority_working_directory, legacy_status_authority, new_spawn_id, new_thread_turn_id,
+        now_ms, thread_spawn_effect, validate_child_authority,
     },
-    tool_catalog::SHELL_EXEC,
+    tool_catalog::{SHELL_EXEC, effect_for_tool},
 };
 use platonic_core::{
-    ActorId, EffectClass, HarnessEvent, ReadbackEntry, RecordedEvent, RunReadback, TurnId,
+    ActorId, AgentId, EffectClass, HarnessEvent, ReadbackEntry, RecordedEvent, RunReadback, TurnId,
 };
 use std::{
     path::{Path, PathBuf},
@@ -114,6 +115,12 @@ pub(super) fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Enve
         Some("thread.status") => {
             handle_with_params(runtime, request, "thread.status", handle_thread_status)
         }
+        Some("thread.authority") => handle_with_params(
+            runtime,
+            request,
+            "thread.authority",
+            handle_thread_authority,
+        ),
         Some("thread.send") => {
             handle_with_params(runtime, request, "thread.send", handle_thread_send)
         }
@@ -413,13 +420,31 @@ fn start_thread_spawn(
             "thread cwd must be an absolute path".into(),
         ));
     }
-    let draft = ThreadAuthorityDraft::new(
+    let config = Config::load(cwd, None)
+        .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
+    let writable = config.tools.enabled.iter().any(|tool| {
+        matches!(
+            effect_for_tool(tool),
+            EffectClass::WorkspaceWrite | EffectClass::ExternalSideEffect
+        )
+    });
+    let network = config
+        .tools
+        .enabled
+        .iter()
+        .any(|tool| matches!(effect_for_tool(tool), EffectClass::Network));
+    let draft = ThreadAuthorityDraft::new(ThreadAuthorityDraftParams {
         parent_thread_id,
         cwd,
         model,
         reasoning_effort,
         approval_policy,
-    )
+        agent_id: AgentId::new("plato")
+            .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?,
+        toolset: config.tools.enabled,
+        writable,
+        network,
+    })
     .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
     let mut store = runtime
         .paths
@@ -536,7 +561,8 @@ fn resolve_thread_spawn_inner(
             let authority = durable.record().clone();
             runtime.complete_thread_spawn(&pending.spawn_id, durable);
             Ok(ThreadSpawnResult::Spawned {
-                thread: joined_thread_status(runtime, authority),
+                thread: joined_thread_status(runtime, authority)
+                    .map_err(|_| ThreadSpawnFailure::Persistence)?,
             })
         }
         ThreadSpawnDecision::Deny { actor, reason } => {
@@ -584,7 +610,8 @@ fn persisted_thread_spawn_result(
                 .map_err(|_| ThreadSpawnFailure::Persistence)?
                 .ok_or(ThreadSpawnFailure::Persistence)?;
             Ok(ThreadSpawnResult::Spawned {
-                thread: joined_thread_status(runtime, authority),
+                thread: joined_thread_status(runtime, authority)
+                    .map_err(|_| ThreadSpawnFailure::Persistence)?,
             })
         }
         ThreadSpawnDecisionName::Denied => Ok(ThreadSpawnResult::Denied {
@@ -635,16 +662,18 @@ fn handle_thread_list(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
             "thread.list params must be omitted or an empty object",
         );
     }
-    match crate::server_store::thread_authorities(&runtime.paths.server_db_path) {
-        Ok(authorities) => Envelope::response_from(
+    match crate::server_store::thread_authorities(&runtime.paths.server_db_path).and_then(
+        |authorities| {
+            authorities
+                .into_iter()
+                .map(|authority| joined_thread_status(runtime, authority))
+                .collect::<AppResult<Vec<_>>>()
+        },
+    ) {
+        Ok(threads) => Envelope::response_from(
             request.id,
             Some("thread.list".into()),
-            ThreadListResult {
-                threads: authorities
-                    .into_iter()
-                    .map(|authority| joined_thread_status(runtime, authority))
-                    .collect(),
-            },
+            ThreadListResult { threads },
         ),
         Err(_) => Envelope::error(
             request.id,
@@ -660,13 +689,16 @@ fn handle_thread_status(
     request: Envelope,
     params: ThreadStatusParams,
 ) -> Envelope {
-    match crate::server_store::thread_authority(&runtime.paths.server_db_path, &params.thread_id) {
-        Ok(Some(authority)) => Envelope::response_from(
+    match crate::server_store::thread_authority(&runtime.paths.server_db_path, &params.thread_id)
+        .and_then(|authority| {
+            authority
+                .map(|authority| joined_thread_status(runtime, authority))
+                .transpose()
+        }) {
+        Ok(Some(thread)) => Envelope::response_from(
             request.id,
             Some("thread.status".into()),
-            ThreadStatusResult {
-                thread: joined_thread_status(runtime, authority),
-            },
+            ThreadStatusResult { thread },
         ),
         Ok(None) => Envelope::error(
             request.id,
@@ -679,6 +711,32 @@ fn handle_thread_status(
             Some("thread.status".into()),
             ERROR_THREAD_STATUS_FAILED,
             "thread status readback failed",
+        ),
+    }
+}
+
+fn handle_thread_authority(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: ThreadAuthorityParams,
+) -> Envelope {
+    match crate::server_store::thread_authority(&runtime.paths.server_db_path, &params.thread_id) {
+        Ok(Some(authority)) => Envelope::response_from(
+            request.id,
+            Some("thread.authority".into()),
+            ThreadAuthorityResult { authority },
+        ),
+        Ok(None) => Envelope::error(
+            request.id,
+            Some("thread.authority".into()),
+            ERROR_NOT_FOUND,
+            format!("thread authority not found: {}", params.thread_id),
+        ),
+        Err(_) => Envelope::error(
+            request.id,
+            Some("thread.authority".into()),
+            ERROR_THREAD_AUTHORITY_FAILED,
+            "thread authority readback failed",
         ),
     }
 }
@@ -782,8 +840,18 @@ fn handle_thread_send(
             );
         }
     };
+    let Some(workspace_root) = authority_working_directory(&authority).map(Path::to_path_buf)
+    else {
+        runtime.abort_thread_turn(&turn);
+        return Envelope::error(
+            request.id,
+            Some("thread.send".into()),
+            ERROR_THREAD_SEND_FAILED,
+            "thread authority has no working directory",
+        );
+    };
     let context = ThreadRunContext {
-        workspace_root: PathBuf::from(authority.cwd),
+        workspace_root,
         approval_policy: authority.approval_policy,
         turn: turn.clone(),
     };
@@ -1082,9 +1150,12 @@ fn thread_session_id(thread_id: &str) -> String {
 fn joined_thread_status(
     runtime: &DaemonRuntime,
     authority: crate::daemon::protocol::ThreadAuthorityRecord,
-) -> ThreadStatus {
+) -> AppResult<ThreadStatus> {
     let live = runtime.thread_live_state(&authority.thread_id);
-    ThreadStatus { authority, live }
+    Ok(ThreadStatus {
+        authority: legacy_status_authority(&authority)?,
+        live,
+    })
 }
 
 fn params_are_empty(params: Option<&serde_json::Value>) -> bool {
@@ -2682,8 +2753,38 @@ mod tests {
         assert_eq!(status.authority.parent_thread_id, None);
         assert_eq!(
             status.authority.cwd,
-            runtime.paths.workspace_root.to_string_lossy().into_owned()
+            runtime.paths.workspace_root.to_string_lossy()
         );
+        let authority_response = handle_line(
+            &runtime,
+            &format!(
+                r#"{{"v":1,"id":"authority","kind":"request","method":"thread.authority","params":{{"thread_id":"{thread_id}"}}}}"#
+            ),
+        );
+        let authority: ThreadAuthorityResult =
+            serde_json::from_value(authority_response.result.unwrap()).unwrap();
+        let authority = authority.authority;
+        assert_eq!(authority.agent_id, Some(AgentId::new("plato").unwrap()));
+        assert_eq!(
+            authority.granted_paths,
+            vec![crate::daemon::protocol::ThreadGrantedPath {
+                path: runtime.paths.workspace_root.to_string_lossy().into_owned(),
+                writable: true,
+            }]
+        );
+        assert_eq!(
+            authority.toolset,
+            [
+                "file.read",
+                "file.list",
+                "file.write",
+                "file.edit",
+                "shell.exec",
+                "web.fetch",
+            ]
+        );
+        assert!(authority.worktrees.is_empty());
+        assert!(authority.network);
         assert_eq!(status.authority.model, "gpt-5.6-sol");
         assert_eq!(
             status.authority.reasoning_effort,
@@ -2699,14 +2800,11 @@ mod tests {
             crate::daemon::protocol::ThreadLiveState {
                 loaded: true,
                 current_turn_id: None,
-                last_activity_at_ms: Some(status.authority.created_at_ms),
+                last_activity_at_ms: Some(authority.created_at_ms),
             }
         );
         let store = runtime.paths.server_store().unwrap();
-        assert_eq!(
-            store.thread_authority(&thread_id).unwrap(),
-            Some(status.authority.clone())
-        );
+        assert_eq!(store.thread_authority(&thread_id).unwrap(), Some(authority));
         let approval = store.thread_spawn_approval(&spawn_id).unwrap().unwrap();
         assert_eq!(approval.decision, ThreadSpawnDecisionName::Granted);
         assert_eq!(approval.actor, status.authority.spawning_actor);
@@ -2918,24 +3016,6 @@ mod tests {
         };
 
         let (_root, runtime) = thread_test_runtime();
-        std::fs::write(
-            runtime.paths.workspace_root.join("plato.toml"),
-            r#"[provider]
-kind = "open_ai"
-model = "test-model"
-api_key_env = "PATH"
-base_url = "http://127.0.0.1:1"
-
-[limits]
-token_budget = 4000
-max_output_tokens = 64
-max_turns = 1
-
-[tools]
-enabled = ["file.read"]
-"#,
-        )
-        .unwrap();
         let mut threads = Vec::new();
         for _ in 0..2 {
             let (spawn_id, _) = pending_spawn(
@@ -2980,6 +3060,24 @@ enabled = ["file.read"]
             .bind_thread_run(&sibling_turn, sibling.clone())
             .unwrap();
 
+        std::fs::write(
+            runtime.paths.workspace_root.join("plato.toml"),
+            r#"[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "http://127.0.0.1:1"
+
+[limits]
+token_budget = 4000
+max_output_tokens = 64
+max_turns = 1
+
+[tools]
+enabled = ["file.read"]
+"#,
+        )
+        .unwrap();
         let (prepared, recorder) = prepare_run(&RunOptions {
             question: "exercise thread.stop child ownership".into(),
             config_path: Some(runtime.paths.workspace_root.join("plato.toml")),
@@ -3188,7 +3286,7 @@ IFS= read -r _
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(columns.len(), 8);
+        assert_eq!(columns.len(), 13);
         assert!(!columns.iter().any(|column| column.contains("activity")));
     }
 
@@ -3288,6 +3386,55 @@ IFS= read -r _
         ));
         let store = runtime.paths.server_store().unwrap();
         assert_eq!(store.thread_authorities().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn spawned_thread_rejects_a_toolset_superset_at_the_typed_gate() {
+        let (_root, runtime) = thread_test_runtime();
+        let child_dir = runtime.paths.workspace_root.join("child");
+        std::fs::create_dir(&child_dir).unwrap();
+        std::fs::write(
+            runtime.paths.workspace_root.join("plato.toml"),
+            "[tools]\nenabled = [\"file.read\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            child_dir.join("plato.toml"),
+            "[tools]\nenabled = [\"file.read\", \"file.write\"]\n",
+        )
+        .unwrap();
+        let (spawn_id, _) = pending_spawn(
+            start_thread(
+                &runtime,
+                None,
+                &runtime.paths.workspace_root,
+                crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+            )
+            .unwrap(),
+        );
+        let parent = grant_thread(&runtime, &spawn_id, "stdin");
+
+        assert!(matches!(
+            start_thread(
+                &runtime,
+                Some(parent.authority.thread_id),
+                &child_dir,
+                crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+            ),
+            Err(ThreadSpawnFailure::Authority(
+                ThreadAuthorityError::Toolset { .. }
+            ))
+        ));
+        assert_eq!(
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .thread_authorities()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -3419,8 +3566,14 @@ IFS= read -r _
         let store = runtime.paths.server_store().unwrap();
         assert_eq!(store.thread_authorities().unwrap().len(), 1);
         assert_eq!(
-            store.thread_authority(&thread_id).unwrap(),
-            Some(first.authority)
+            legacy_status_authority(
+                &store
+                    .thread_authority(&thread_id)
+                    .unwrap()
+                    .expect("granted authority is durable")
+            )
+            .unwrap(),
+            first.authority
         );
     }
 
@@ -3443,6 +3596,16 @@ IFS= read -r _
         assert_eq!(response.error.unwrap().code, ERROR_MALFORMED_REQUEST);
         let store = runtime.paths.server_store().unwrap();
         assert!(store.thread_authorities().unwrap().is_empty());
+    }
+
+    #[test]
+    fn thread_authority_params_reject_unknown_fields_before_readback() {
+        let (_root, runtime) = thread_test_runtime();
+        let response = handle_line(
+            &runtime,
+            r#"{"v":1,"id":"bad","kind":"request","method":"thread.authority","params":{"thread_id":"thread_1","future":true}}"#,
+        );
+        assert_eq!(response.error.unwrap().code, ERROR_MALFORMED_REQUEST);
     }
 
     #[test]
@@ -3493,7 +3656,16 @@ IFS= read -r _
         assert_eq!(invalid_events.error.unwrap().code, ERROR_MALFORMED_REQUEST);
         assert_eq!(runtime.thread_live_state(&thread_id).current_turn_id, None);
         let store = runtime.paths.server_store().unwrap();
-        assert_eq!(store.thread_authority(&thread_id).unwrap(), Some(authority));
+        assert_eq!(
+            legacy_status_authority(
+                &store
+                    .thread_authority(&thread_id)
+                    .unwrap()
+                    .expect("granted authority is durable")
+            )
+            .unwrap(),
+            authority
+        );
         // The workspace ledger holds session_runs; the server store holds
         // thread state. This assertion is about the former.
         let connection = rusqlite::Connection::open(
