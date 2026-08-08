@@ -3,6 +3,15 @@ title: Desktop Shell
 issue: https://github.com/referential-ai/plato-agent/issues/139
 ---
 
+> **PARTLY SUPERSEDED, 2026-08-07.** This design predates the platform
+> decisions of 2026-08-06/07. The
+> [platform decision map](https://github.com/referential-ai/platonic-workspace/issues/83)
+> supersedes it where they disagree, and the map wins.
+>
+> The Tauri client sits on Platonic, not on `plato-agentd` as the product
+> (P016, P018). P026 withdraws Windows, so the signed-Windows path in this
+> design is out of scope; macOS distribution remains (#167).
+
 # Plato Desktop Shell (Tauri + Web UI over plato-agentd)
 
 Revision 6 — **Active**; adopted 2026-07-13 by explicit human adopt/merge instruction after clean lead closure (PR #140). Rev 2 folded R1–R9 (direction confirmed: Tauri client, shared daemon ownership, in-repo home, Windows named pipes); rev 3 added cross-platform scope per human direction (Windows, macOS, Linux all ship; Windows first); rev 4 folded C10–C12; rev 5 folded C13–C16; rev 6 folded C17 (C18 reconciled on issue #139). Implementation still starts only on `Ready for dev` child issues owned by #139.
