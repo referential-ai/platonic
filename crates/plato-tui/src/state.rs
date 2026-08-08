@@ -1,3 +1,7 @@
+use nucleo::{
+    Config, Matcher, Utf32Str,
+    pattern::{Atom, AtomKind, CaseMatching, Normalization},
+};
 use platonic_core::EffectClass;
 use platonic_protocol::{
     DaemonStatusResult, HelloResult, ModelIdentityStatus, PendingApprovalSnapshot, RunStateName,
@@ -9,7 +13,7 @@ use tui_textarea::{CursorMove, TextArea};
 
 use super::{
     ApprovalModalView,
-    commands::{SlashCommandSpec, has_slash_command_prefix, matching_slash_commands},
+    commands::{SlashCommandSpec, has_slash_command_match, matching_slash_commands},
     markdown::{MarkdownRenderer, SyntaxTheme},
 };
 
@@ -523,7 +527,7 @@ fn slash_filter_at_cursor(text: &str, cursor: usize) -> Option<String> {
     if name.is_empty() && !rest.is_empty() {
         return None;
     }
-    if name.is_empty() || has_slash_command_prefix(name) {
+    if name.is_empty() || has_slash_command_match(name) {
         Some(name.to_owned())
     } else {
         None
@@ -603,15 +607,57 @@ pub struct SessionPickerView {
 impl SessionPickerView {
     /// Returns sessions whose visible first-question label or recovery ID matches the filter.
     pub fn matching_sessions<'a>(&self, sessions: &'a [SessionSummary]) -> Vec<&'a SessionSummary> {
-        let filter = self.filter.to_lowercase();
-        sessions
+        if self.filter.is_empty() {
+            return sessions.iter().collect();
+        }
+
+        let fuzzy = Atom::new(
+            &self.filter,
+            CaseMatching::Ignore,
+            Normalization::Never,
+            AtomKind::Fuzzy,
+            false,
+        );
+        let prefix = Atom::new(
+            &self.filter,
+            CaseMatching::Ignore,
+            Normalization::Never,
+            AtomKind::Prefix,
+            false,
+        );
+        let mut config = Config::DEFAULT;
+        config.prefer_prefix = true;
+        let mut matcher = Matcher::new(config);
+        let mut chars = Vec::new();
+        let recovery_filter = self.filter.to_lowercase();
+        let mut matches: Vec<_> = sessions
             .iter()
-            .filter(|session| {
-                session_question_label(session)
-                    .to_lowercase()
-                    .contains(&filter)
-                    || session.session_id.to_lowercase().contains(&filter)
+            .enumerate()
+            .filter_map(|(source_index, session)| {
+                let label = session_question_label(session);
+                if let Some(score) = fuzzy.score(Utf32Str::new(label, &mut chars), &mut matcher) {
+                    let is_prefix = prefix
+                        .score(Utf32Str::new(label, &mut chars), &mut matcher)
+                        .is_some();
+                    Some((source_index, true, is_prefix, score, session))
+                } else if session.session_id.to_lowercase().contains(&recovery_filter) {
+                    Some((source_index, false, false, 0, session))
+                } else {
+                    None
+                }
             })
+            .collect();
+        matches.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| right.2.cmp(&left.2))
+                .then_with(|| right.3.cmp(&left.3))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        matches
+            .into_iter()
+            .map(|(_, _, _, _, session)| session)
             .collect()
     }
 }
@@ -958,7 +1004,49 @@ mod tests {
     }
 
     #[test]
-    fn session_picker_does_not_normalize_unicode_or_apply_locale_rules() {
+    fn session_picker_ranks_prefixes_before_mid_question_subsequences() {
+        let sessions = vec![
+            session("session_mid", "Plan the deploy checklist"),
+            session("session_prefix", "Deploy the release"),
+            session("session_other", "Review documentation"),
+        ];
+        let mut picker = SessionPickerView {
+            filter: "DEPLOY".into(),
+            selected: 0,
+        };
+
+        assert_eq!(
+            session_ids(picker.matching_sessions(&sessions)),
+            vec!["session_prefix", "session_mid"]
+        );
+
+        picker.filter = "checklist".into();
+        assert_eq!(
+            session_ids(picker.matching_sessions(&sessions)),
+            vec!["session_mid"]
+        );
+    }
+
+    #[test]
+    fn session_picker_preserves_source_order_for_equal_scores_across_repeated_runs() {
+        let sessions = vec![
+            session("session_1", "Review deterministic matching"),
+            session("session_2", "Review deterministic matching"),
+            session("session_3", "Review deterministic matching"),
+        ];
+        let picker = SessionPickerView {
+            filter: "rdm".into(),
+            selected: 0,
+        };
+        let expected = vec!["session_1", "session_2", "session_3"];
+
+        for _ in 0..32 {
+            assert_eq!(session_ids(picker.matching_sessions(&sessions)), expected);
+        }
+    }
+
+    #[test]
+    fn session_picker_uses_nucleo_case_folding_without_unicode_normalization() {
         let sessions = vec![
             session("session_1", "Review Café"),
             session("session_2", "Visit İSTANBUL"),
@@ -971,7 +1059,10 @@ mod tests {
         assert!(picker.matching_sessions(&sessions).is_empty());
 
         picker.filter = "istanbul".into();
-        assert!(picker.matching_sessions(&sessions).is_empty());
+        assert_eq!(
+            session_ids(picker.matching_sessions(&sessions)),
+            vec!["session_2"]
+        );
 
         picker.filter = "i\u{307}stanbul".into();
         assert_eq!(

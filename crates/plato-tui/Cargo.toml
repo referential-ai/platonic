@@ -13,6 +13,7 @@ include = ["src/**", "README.md"]
 
 [dependencies]
 crossterm.workspace = true
+nucleo.workspace = true
 platonic-client.workspace = true
 platonic-protocol.workspace = true
 platonic-core.workspace = true
