@@ -2159,12 +2159,46 @@ mod tests {
         config: DaemonConnectionConfig,
         shutdown: Arc<AtomicBool>,
         handle: Option<thread::JoinHandle<plato_agent::AppResult<()>>>,
+        #[cfg(unix)]
+        socket_path: PathBuf,
+    }
+
+    /// A socket path short enough for `sockaddr_un` on every supported unix.
+    ///
+    /// The default path derives from the XDG runtime root, which under a
+    /// temporary directory is far too long on macOS: `sun_path` holds 104
+    /// bytes there against 108 on Linux, and macOS temp roots live under
+    /// `/var/folders/...` rather than `/tmp`. AGENTS.md already requires a
+    /// short `/tmp` root for external-daemon proofs; these in-process tests
+    /// need the same discipline.
+    #[cfg(unix)]
+    fn short_test_socket_path() -> PathBuf {
+        use std::sync::atomic::AtomicU32;
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::SeqCst);
+        // A directory we own, not /tmp itself: binding tightens the parent's
+        // permissions, which cannot be done to a root-owned shared directory.
+        let root = PathBuf::from(format!("/tmp/p{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("agent.sock");
+        assert!(
+            path.as_os_str().len() < 100,
+            "test socket path must stay under the sockaddr_un limit: {}",
+            path.display()
+        );
+        path
     }
 
     impl TestDaemon {
         fn start(workspace: &Path) -> Self {
-            let server = DaemonServer::bind(workspace, None).unwrap();
-            let config = DaemonConnectionConfig::resolve(workspace, None).unwrap();
+            #[cfg(unix)]
+            let socket_path = short_test_socket_path();
+            #[cfg(unix)]
+            let socket = Some(socket_path.clone());
+            #[cfg(windows)]
+            let socket: Option<PathBuf> = None;
+            let server = DaemonServer::bind(workspace, socket.clone()).unwrap();
+            let config = DaemonConnectionConfig::resolve(workspace, socket.clone()).unwrap();
             let shutdown = Arc::new(AtomicBool::new(false));
             let server_shutdown = Arc::clone(&shutdown);
             let handle = thread::spawn(move || server.serve_forever(server_shutdown));
@@ -2172,6 +2206,8 @@ mod tests {
                 config,
                 shutdown,
                 handle: Some(handle),
+                #[cfg(unix)]
+                socket_path,
             }
         }
 
@@ -2191,6 +2227,12 @@ mod tests {
                 self.shutdown.store(true, Ordering::SeqCst);
                 wake_listener(&self.config.socket_path);
                 handle.join().unwrap().unwrap();
+            }
+            // The socket root lives outside the test's temp directory, so
+            // nothing else will remove it.
+            #[cfg(unix)]
+            if let Some(root) = self.socket_path.parent() {
+                let _ = std::fs::remove_dir_all(root);
             }
         }
     }
