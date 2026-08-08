@@ -113,6 +113,7 @@ fn plato_tui_cold_starts_host_thread_and_remote_reuses_it() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_preserves_draft_and_restores_parent_terminal() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -279,6 +280,7 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn composer_cursor_stays_real_at_placeholder_origin_and_narrow_wrap() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -331,6 +333,7 @@ fn composer_cursor_stays_real_at_placeholder_origin_and_narrow_wrap() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn composer_textarea_features_preserve_submit_queue_slash_and_history_contracts() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -450,6 +453,7 @@ fn composer_textarea_features_preserve_submit_queue_slash_and_history_contracts(
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn nonempty_no_color_suppresses_only_color_sgr_in_the_pty() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -475,6 +479,7 @@ fn nonempty_no_color_suppresses_only_color_sgr_in_the_pty() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_status_modal_sends_one_read_only_request_and_escape_closes() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -551,6 +556,7 @@ fn bare_plato_status_modal_sends_one_read_only_request_and_escape_closes() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -870,6 +876,7 @@ enabled = ["shell.exec"]
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -981,6 +988,7 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_session_picker_resumes_exact_hidden_session_id() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
