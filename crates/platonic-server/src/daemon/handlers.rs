@@ -1727,6 +1727,20 @@ fn handle_approval_decide(
                 .unwrap_or_else(|| "approval denied by daemon client".into()),
         },
     };
+    // Record the answer beside the question, so the decision survives the
+    // daemon exactly as the request does (#435). A failure here is reported
+    // rather than swallowed: an unrecorded decision would leave the approval
+    // looking unanswered forever.
+    if let Err(error) =
+        record_approval_decision(runtime, &record.run_id, &params.tool_call_id, &outcome)
+    {
+        return Envelope::error(
+            request.id,
+            Some("approval.decide".into()),
+            ERROR_INTERNAL,
+            format!("approval decision could not be recorded: {error}"),
+        );
+    }
     pending.decision = Some(crate::daemon::runtime::PendingApprovalDecision {
         decision: params.decision,
         outcome,
@@ -1884,6 +1898,31 @@ fn handle_workspace_status(
         ),
         Err(error) => store_error(request.id, "workspace.status", error),
     }
+}
+
+fn record_approval_decision(
+    runtime: &DaemonRuntime,
+    run_id: &str,
+    call_id: &str,
+    outcome: &ExternalApprovalOutcome,
+) -> AppResult<()> {
+    let (granted, actor, reason) = match outcome {
+        ExternalApprovalOutcome::Granted { actor } => (true, (*actor).to_owned(), None),
+        ExternalApprovalOutcome::Denied { actor, reason } => {
+            (false, (*actor).to_owned(), Some(reason.clone()))
+        }
+    };
+    runtime.paths.server_store()?.resolve_tool_call_approval(
+        run_id,
+        call_id,
+        &crate::server_store::ToolCallApprovalDecision {
+            granted,
+            actor,
+            reason,
+            decided_at_ms: crate::thread_authority::now_ms(),
+        },
+    )?;
+    Ok(())
 }
 
 fn handle_run_cancel(
@@ -2049,8 +2088,35 @@ fn runtime_pending_approval(
         .expect("runtime state lock poisoned")
         .runs
         .get(run_id)
-        .cloned()?;
-    record.pending_approval()
+        .cloned();
+    match record.and_then(|record| record.pending_approval()) {
+        Some(snapshot) => Some(snapshot),
+        // The run is not loaded, which is the state after a restart. The
+        // approval outlived its daemon, so read it from disk (#435).
+        None => restored_pending_approval(runtime, run_id),
+    }
+}
+
+fn restored_pending_approval(
+    runtime: &DaemonRuntime,
+    run_id: &str,
+) -> Option<crate::daemon::protocol::PendingApprovalSnapshot> {
+    let store = runtime.paths.server_store().ok()?;
+    let approval = store
+        .pending_tool_call_approvals()
+        .ok()?
+        .into_iter()
+        .find(|approval| approval.run_id == run_id)?;
+    Some(crate::daemon::protocol::PendingApprovalSnapshot {
+        run_id: approval.run_id,
+        tool_call_id: approval.call_id,
+        tool_name: approval.tool_name,
+        effect: approval.effect,
+        reason: Some(approval.reason),
+        input_preview: approval.input_preview,
+        approval_preview: approval.approval_preview,
+        diff_preview: approval.diff_preview,
+    })
 }
 
 fn read_run_transcript(path: &DefaultSqlitePath, run_id: &str) -> AppResult<TranscriptReadResult> {
@@ -2459,6 +2525,66 @@ mod tests {
         );
         assert_eq!(response.kind, crate::daemon::protocol::EnvelopeKind::Error);
         assert_eq!(response.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+    }
+
+    /// After a restart the run is gone from memory, but the approval it was
+    /// blocked on is not. The existing snapshot field must report it, so a
+    /// client returning to the terminal sees what is waiting (#435).
+    #[test]
+    fn restored_pending_approval_is_reported_when_the_run_is_not_loaded() {
+        let (_root, runtime) = thread_test_runtime();
+        let store = runtime.paths.server_store().unwrap();
+        store
+            .persist_tool_call_approval(&crate::server_store::ToolCallApprovalRecord {
+                run_id: "run_restored".into(),
+                call_id: "call_restored".into(),
+                session_id: "session_restored".into(),
+                tool_name: "shell_exec".into(),
+                effect: platonic_core::EffectClass::ExternalSideEffect,
+                reason: "writes outside the workspace".into(),
+                input_preview: Some("git push".into()),
+                approval_preview: Some("shell_exec: git push".into()),
+                diff_preview: None,
+                requested_at_ms: 4_200,
+                decision: None,
+            })
+            .unwrap();
+        drop(store);
+
+        // Nothing is loaded: this is exactly the post-restart state.
+        assert!(runtime.state.lock().unwrap().runs.is_empty());
+        let snapshot = runtime_pending_approval(&runtime, "run_restored")
+            .expect("restored approval should be reported");
+        assert_eq!(snapshot.run_id, "run_restored");
+        assert_eq!(snapshot.tool_call_id, "call_restored");
+        assert_eq!(snapshot.tool_name, "shell_exec");
+        assert_eq!(
+            snapshot.effect,
+            platonic_core::EffectClass::ExternalSideEffect
+        );
+        assert_eq!(
+            snapshot.reason.as_deref(),
+            Some("writes outside the workspace")
+        );
+        assert_eq!(snapshot.input_preview.as_deref(), Some("git push"));
+
+        // A decided approval is no longer waiting on anyone.
+        runtime
+            .paths
+            .server_store()
+            .unwrap()
+            .resolve_tool_call_approval(
+                "run_restored",
+                "call_restored",
+                &crate::server_store::ToolCallApprovalDecision {
+                    granted: false,
+                    actor: "stdin".into(),
+                    reason: Some("no".into()),
+                    decided_at_ms: 4_300,
+                },
+            )
+            .unwrap();
+        assert!(runtime_pending_approval(&runtime, "run_restored").is_none());
     }
 
     fn start_thread(

@@ -17,6 +17,7 @@ use crate::{
         validate_child_authority, validate_complete_authority,
     },
 };
+use platonic_core::EffectClass;
 use platonic_protocol::{ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use std::{path::Path, time::Duration};
@@ -46,6 +47,35 @@ pub(crate) struct WorkspaceRecord {
 pub(crate) enum WorkspaceHealth {
     Present,
     Broken,
+}
+
+/// A tool-call approval as it exists on disk: what was asked, and — once a
+/// client decides — what was answered.
+///
+/// An approval outlives the daemon that requested it. The run it belongs to
+/// does not: its child process dies with the daemon, so the run is recorded
+/// interrupted while the approval stays readable and resolvable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolCallApprovalRecord {
+    pub(crate) run_id: String,
+    pub(crate) call_id: String,
+    pub(crate) session_id: String,
+    pub(crate) tool_name: String,
+    pub(crate) effect: EffectClass,
+    pub(crate) reason: String,
+    pub(crate) input_preview: Option<String>,
+    pub(crate) approval_preview: Option<String>,
+    pub(crate) diff_preview: Option<String>,
+    pub(crate) requested_at_ms: u64,
+    pub(crate) decision: Option<ToolCallApprovalDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolCallApprovalDecision {
+    pub(crate) granted: bool,
+    pub(crate) actor: String,
+    pub(crate) reason: Option<String>,
+    pub(crate) decided_at_ms: u64,
 }
 
 /// A thread authority record proven to be durably written.
@@ -79,6 +109,7 @@ impl ServerStore {
         create_thread_authority_tables(&connection)?;
         create_thread_stop_table(&connection)?;
         create_workspace_table(&connection)?;
+        create_tool_call_approval_table(&connection)?;
         Ok(Self { connection })
     }
 
@@ -182,6 +213,113 @@ impl ServerStore {
             records.push(row?);
         }
         Ok(records)
+    }
+
+    /// Record a tool-call approval before the run blocks on it.
+    ///
+    /// Written before the request is announced to clients, so a daemon that
+    /// dies between announcing and deciding still leaves the ask on disk.
+    /// Re-requesting the same call is idempotent: the original request and any
+    /// decision already made both stand.
+    pub(crate) fn persist_tool_call_approval(
+        &self,
+        record: &ToolCallApprovalRecord,
+    ) -> AppResult<()> {
+        self.connection.execute(
+            "INSERT INTO tool_call_approvals
+               (run_id, call_id, session_id, tool_name, effect, reason,
+                input_preview, approval_preview, diff_preview, requested_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(run_id, call_id) DO NOTHING",
+            params![
+                record.run_id,
+                record.call_id,
+                record.session_id,
+                record.tool_name,
+                effect_to_text(&record.effect)?,
+                record.reason,
+                record.input_preview,
+                record.approval_preview,
+                record.diff_preview,
+                sqlite_i64(record.requested_at_ms, "approval requested_at_ms")?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record the decision for a tool-call approval.
+    ///
+    /// Returns false when the approval was already decided, so a late second
+    /// decider learns it lost rather than silently overwriting the first.
+    pub(crate) fn resolve_tool_call_approval(
+        &self,
+        run_id: &str,
+        call_id: &str,
+        decision: &ToolCallApprovalDecision,
+    ) -> AppResult<bool> {
+        let changed = self.connection.execute(
+            "UPDATE tool_call_approvals
+                SET decision = ?3, decided_by = ?4, decision_reason = ?5, decided_at_ms = ?6
+              WHERE run_id = ?1 AND call_id = ?2 AND decision IS NULL",
+            params![
+                run_id,
+                call_id,
+                if decision.granted {
+                    "granted"
+                } else {
+                    "denied"
+                },
+                decision.actor,
+                decision.reason,
+                sqlite_i64(decision.decided_at_ms, "approval decided_at_ms")?,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Every approval still awaiting a decision, across all workspaces.
+    ///
+    /// This is the away-from-terminal question — "what is waiting on me?" —
+    /// which is why approvals live in the server tier rather than in one
+    /// workspace's ledger.
+    pub(crate) fn pending_tool_call_approvals(&self) -> AppResult<Vec<ToolCallApprovalRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT run_id, call_id, session_id, tool_name, effect, reason,
+                    input_preview, approval_preview, diff_preview, requested_at_ms,
+                    decision, decided_by, decision_reason, decided_at_ms
+               FROM tool_call_approvals
+              WHERE decision IS NULL
+              ORDER BY requested_at_ms, run_id, call_id",
+        )?;
+        let rows = statement.query_map([], tool_call_approval_from_row)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row??);
+        }
+        Ok(records)
+    }
+
+    /// Read one approval, decided or not. Tests assert the decided shape;
+    /// the live restore path enumerates instead, because it has a run id and
+    /// not a call id.
+    #[cfg(test)]
+    pub(crate) fn tool_call_approval(
+        &self,
+        run_id: &str,
+        call_id: &str,
+    ) -> AppResult<Option<ToolCallApprovalRecord>> {
+        self.connection
+            .query_row(
+                "SELECT run_id, call_id, session_id, tool_name, effect, reason,
+                        input_preview, approval_preview, diff_preview, requested_at_ms,
+                        decision, decided_by, decision_reason, decided_at_ms
+                   FROM tool_call_approvals
+                  WHERE run_id = ?1 AND call_id = ?2",
+                params![run_id, call_id],
+                tool_call_approval_from_row,
+            )
+            .optional()?
+            .transpose()
     }
 
     pub(crate) fn persist_thread_spawn(
@@ -476,6 +614,52 @@ fn invalid_thread_column(index: usize, message: String) -> rusqlite::Error {
     )
 }
 
+fn effect_to_text(effect: &EffectClass) -> AppResult<String> {
+    match serde_json::to_value(effect) {
+        Ok(serde_json::Value::String(text)) => Ok(text),
+        _ => Err(AppError::Config("effect class is not a string".into())),
+    }
+}
+
+fn effect_from_text(text: &str) -> AppResult<EffectClass> {
+    serde_json::from_value(serde_json::Value::String(text.to_owned()))
+        .map_err(|_| AppError::Config(format!("unknown effect class: {text}")))
+}
+
+/// The outer Result is the row read; the inner one is the effect class, which
+/// can only be validated after the text leaves SQLite.
+fn tool_call_approval_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AppResult<ToolCallApprovalRecord>> {
+    let effect_text: String = row.get(4)?;
+    let decision: Option<String> = row.get(10)?;
+    let decided_by: Option<String> = row.get(11)?;
+    let decision_reason: Option<String> = row.get(12)?;
+    let decided_at_ms: Option<i64> = row.get(13)?;
+    let record = ToolCallApprovalRecord {
+        run_id: row.get(0)?,
+        call_id: row.get(1)?,
+        session_id: row.get(2)?,
+        tool_name: row.get(3)?,
+        effect: EffectClass::ReadOnly,
+        reason: row.get(5)?,
+        input_preview: row.get(6)?,
+        approval_preview: row.get(7)?,
+        diff_preview: row.get(8)?,
+        requested_at_ms: row_u64(row, 9, "approval requested_at_ms")?,
+        decision: match (decision, decided_by, decided_at_ms) {
+            (Some(decision), Some(actor), Some(at_ms)) => Some(ToolCallApprovalDecision {
+                granted: decision == "granted",
+                actor,
+                reason: decision_reason,
+                decided_at_ms: at_ms.max(0) as u64,
+            }),
+            _ => None,
+        },
+    };
+    Ok(effect_from_text(&effect_text).map(|effect| ToolCallApprovalRecord { effect, ..record }))
+}
+
 fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
     Ok(WorkspaceRecord {
         id: row.get(0)?,
@@ -541,6 +725,67 @@ fn create_workspace_table(connection: &Connection) -> AppResult<()> {
     )?;
     Ok(())
 }
+
+/// Pending tool-call approvals.
+///
+/// The request half is immutable, exactly like a spawn approval: what was
+/// asked can never be rewritten. The decision half starts empty and is
+/// written once, so an approval that outlives its daemon can still be
+/// resolved and recorded afterwards.
+fn create_tool_call_approval_table(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS tool_call_approvals (
+          run_id TEXT NOT NULL,
+          call_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          tool_name TEXT NOT NULL,
+          effect TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          input_preview TEXT,
+          approval_preview TEXT,
+          diff_preview TEXT,
+          requested_at_ms INTEGER NOT NULL,
+          decision TEXT,
+          decided_by TEXT,
+          decision_reason TEXT,
+          decided_at_ms INTEGER,
+          PRIMARY KEY (run_id, call_id)
+        );
+
+        CREATE TRIGGER IF NOT EXISTS tool_call_approvals_request_is_immutable
+        BEFORE UPDATE ON tool_call_approvals
+        WHEN OLD.run_id IS NOT NEW.run_id
+          OR OLD.call_id IS NOT NEW.call_id
+          OR OLD.session_id IS NOT NEW.session_id
+          OR OLD.tool_name IS NOT NEW.tool_name
+          OR OLD.effect IS NOT NEW.effect
+          OR OLD.reason IS NOT NEW.reason
+          OR OLD.input_preview IS NOT NEW.input_preview
+          OR OLD.approval_preview IS NOT NEW.approval_preview
+          OR OLD.diff_preview IS NOT NEW.diff_preview
+          OR OLD.requested_at_ms IS NOT NEW.requested_at_ms
+        BEGIN
+          SELECT RAISE(ABORT, 'tool call approval requests are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS tool_call_approvals_decide_once
+        BEFORE UPDATE ON tool_call_approvals
+        WHEN OLD.decision IS NOT NULL AND NEW.decision IS NOT OLD.decision
+        BEGIN
+          SELECT RAISE(ABORT, 'tool call approval decisions are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS tool_call_approvals_no_delete
+        BEFORE DELETE ON tool_call_approvals
+        BEGIN
+          SELECT RAISE(ABORT, 'tool call approvals are immutable');
+        END;
+        "#,
+    )?;
+    Ok(())
+}
+
 fn create_thread_authority_tables(connection: &Connection) -> AppResult<()> {
     connection.execute_batch(
         r#"
@@ -835,6 +1080,113 @@ mod tests {
             reopened.thread_authority("thread_stop_target").unwrap(),
             Some(authority)
         );
+    }
+
+    fn approval_record(run_id: &str, call_id: &str) -> ToolCallApprovalRecord {
+        ToolCallApprovalRecord {
+            run_id: run_id.into(),
+            call_id: call_id.into(),
+            session_id: "session_1".into(),
+            tool_name: "shell_exec".into(),
+            effect: EffectClass::ExternalSideEffect,
+            reason: "writes outside the workspace".into(),
+            input_preview: Some("rm -rf /tmp/x".into()),
+            approval_preview: Some("shell_exec: rm -rf /tmp/x".into()),
+            diff_preview: None,
+            requested_at_ms: 1_700,
+            decision: None,
+        }
+    }
+
+    /// The #435 proof: an approval outlives the daemon that asked it. The ask
+    /// survives a restart with every field intact, can be answered afterwards,
+    /// and can be answered only once.
+    #[test]
+    fn pending_approval_survives_restart_and_is_decided_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        let requested = approval_record("run_1", "call_1");
+
+        let store = ServerStore::open_or_create(&path).unwrap();
+        store.persist_tool_call_approval(&requested).unwrap();
+        // Re-asking the same call is idempotent, not a duplicate row.
+        store.persist_tool_call_approval(&requested).unwrap();
+        assert_eq!(store.pending_tool_call_approvals().unwrap().len(), 1);
+        drop(store);
+
+        // The daemon is gone. The question is not.
+        let restarted = ServerStore::open_or_create(&path).unwrap();
+        let pending = restarted.pending_tool_call_approvals().unwrap();
+        assert_eq!(pending, vec![requested.clone()]);
+
+        let decision = ToolCallApprovalDecision {
+            granted: true,
+            actor: "stdin".into(),
+            reason: None,
+            decided_at_ms: 1_900,
+        };
+        assert!(
+            restarted
+                .resolve_tool_call_approval("run_1", "call_1", &decision)
+                .unwrap()
+        );
+        assert!(restarted.pending_tool_call_approvals().unwrap().is_empty());
+        assert_eq!(
+            restarted
+                .tool_call_approval("run_1", "call_1")
+                .unwrap()
+                .unwrap(),
+            ToolCallApprovalRecord {
+                decision: Some(decision),
+                ..requested.clone()
+            }
+        );
+
+        // A second decider learns it lost rather than overwriting the first.
+        assert!(
+            !restarted
+                .resolve_tool_call_approval(
+                    "run_1",
+                    "call_1",
+                    &ToolCallApprovalDecision {
+                        granted: false,
+                        actor: "late".into(),
+                        reason: Some("too slow".into()),
+                        decided_at_ms: 2_000,
+                    }
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            restarted
+                .tool_call_approval("run_1", "call_1")
+                .unwrap()
+                .unwrap()
+                .decision
+                .unwrap()
+                .actor,
+            "stdin"
+        );
+    }
+
+    /// What was asked can never be rewritten, and no approval can be erased.
+    #[test]
+    fn approval_requests_are_immutable_and_undeletable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        let store = ServerStore::open_or_create(&path).unwrap();
+        store
+            .persist_tool_call_approval(&approval_record("run_1", "call_1"))
+            .unwrap();
+
+        for statement in [
+            "UPDATE tool_call_approvals SET tool_name = 'read_file' WHERE call_id = 'call_1'",
+            "UPDATE tool_call_approvals SET reason = 'rewritten' WHERE call_id = 'call_1'",
+            "DELETE FROM tool_call_approvals WHERE call_id = 'call_1'",
+        ] {
+            assert!(store.connection.execute_batch(statement).is_err());
+        }
+        assert_eq!(store.pending_tool_call_approvals().unwrap().len(), 1);
     }
 
     /// The D005 proof: a thread stays enumerable from the server tier no
