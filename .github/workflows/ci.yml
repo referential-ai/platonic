@@ -168,8 +168,20 @@ jobs:
 
       # P026 makes macOS a supported server platform and #167 boards DMG
       # distribution, but nothing has ever compiled it. This is the first gate.
+      #
+      # The bin tests run first, alone and single-threaded: the first macOS
+      # runs hung inside this suite with no per-test deadline, and libtest
+      # discards buffered output on cancellation. Serial execution makes the
+      # flushed log name the exact test that stopped. timeout-minutes turns a
+      # silent six-hour burn into a failure that reports.
+      - name: Run bin tests serially
+        timeout-minutes: 20
+        run: cargo test --locked -p plato-agent --bin plato -- --test-threads=1
+
       - name: Run tests
+        timeout-minutes: 45
         run: cargo test --workspace --locked
 
       - name: Run clippy
+        timeout-minutes: 30
         run: cargo clippy --workspace --locked --all-targets -- -D warnings
