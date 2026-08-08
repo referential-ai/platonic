@@ -23,14 +23,9 @@ fn daemon_command_execs_sibling_with_argv_output_and_exit_status() {
         .unwrap();
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
-    for command in ["serve", "status", "shutdown", "workspace"] {
+    for command in ["serve", "status", "shutdown", "workspace", "agent"] {
         assert!(help.contains(command), "missing {command} in:\n{help}");
     }
-    assert!(
-        !help
-            .lines()
-            .any(|line| line.trim_start().starts_with("agent "))
-    );
 }
 
 #[test]
@@ -69,24 +64,14 @@ fn gateway_command_hellos_then_execs_sibling_with_environment_and_exit_status() 
     fs::create_dir(&registered).unwrap();
 
     let created = fixture
-        .command([
-            "workspace",
-            "create",
-            "proof",
-            registered.to_str().unwrap(),
-            "--workspace",
-            ".",
-        ])
+        .command(["workspace", "create", "proof", registered.to_str().unwrap()])
         .output()
         .unwrap();
     assert_success(&created);
     let created: Value = serde_json::from_slice(&created.stdout).unwrap();
     let id = created["workspace"]["id"].as_str().unwrap();
 
-    let listed = fixture
-        .command(["workspace", "list", "--workspace", "."])
-        .output()
-        .unwrap();
+    let listed = fixture.command(["workspace", "list"]).output().unwrap();
     assert_success(&listed);
     let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert!(listed["workspaces"].as_array().unwrap().iter().any(|item| {
@@ -94,12 +79,147 @@ fn gateway_command_hellos_then_execs_sibling_with_environment_and_exit_status() 
     }));
 
     let status = fixture
-        .command(["workspace", "status", id, "--workspace", "."])
+        .command(["workspace", "status", id])
         .output()
         .unwrap();
     assert_success(&status);
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["workspace"]["id"], id);
+}
+
+#[test]
+fn agent_commands_resolve_config_defaults_and_explicit_overrides_end_to_end() {
+    let _guard = SERVER_TEST.lock().unwrap();
+    let fixture = ServerFixture::start("agent-verbs");
+    fs::write(
+        fixture.workspace.join("agent.toml"),
+        r#"
+[provider]
+model = "configured-model"
+api_key_env = "PLATONIC_AGENT_TEST_KEY"
+
+[tools]
+enabled = ["file.read"]
+"#,
+    )
+    .unwrap();
+    let workspaces = fixture.command(["workspace", "list"]).output().unwrap();
+    assert_success(&workspaces);
+    let workspaces: Value = serde_json::from_slice(&workspaces.stdout).unwrap();
+    let workspace_id = workspaces["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|workspace| workspace["name"] == "agent-verbs")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let configured = fixture
+        .command([
+            "agent",
+            "create",
+            "builder",
+            &workspace_id,
+            "--reasoning-effort",
+            "high",
+            "--approval-policy",
+            "yolo",
+            "--config",
+            "agent.toml",
+        ])
+        .env("PLATONIC_AGENT_TEST_KEY", "test-key")
+        .output()
+        .unwrap();
+    assert_success(&configured);
+    let configured: Value = serde_json::from_slice(&configured.stdout).unwrap();
+    assert_eq!(configured["agent"]["id"], "builder");
+    assert_eq!(configured["agent"]["workspace_id"], workspace_id);
+    assert_eq!(configured["agent"]["model"], "configured-model");
+    assert_eq!(configured["agent"]["reasoning_effort"], "high");
+    assert_eq!(configured["agent"]["approval_policy"], "yolo");
+    assert_eq!(
+        configured["agent"]["toolset"],
+        serde_json::json!(["file.read"])
+    );
+
+    let overridden = fixture
+        .command([
+            "agent",
+            "create",
+            "reviewer",
+            &workspace_id,
+            "--model",
+            "override-model",
+            "--tool",
+            "file.list",
+            "--config",
+            "agent.toml",
+        ])
+        .env("PLATONIC_AGENT_TEST_KEY", "test-key")
+        .output()
+        .unwrap();
+    assert_success(&overridden);
+    let overridden: Value = serde_json::from_slice(&overridden.stdout).unwrap();
+    assert_eq!(overridden["agent"]["model"], "override-model");
+    assert_eq!(overridden["agent"]["reasoning_effort"], "none");
+    assert_eq!(overridden["agent"]["approval_policy"], "prompt");
+    assert_eq!(
+        overridden["agent"]["toolset"],
+        serde_json::json!(["file.list"])
+    );
+
+    let listed = fixture.command(["agent", "list"]).output().unwrap();
+    assert_success(&listed);
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["agents"].as_array().unwrap().len(), 2);
+    let status = fixture
+        .command(["agent", "status", "builder"])
+        .output()
+        .unwrap();
+    assert_success(&status);
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["agent"], configured["agent"]);
+}
+
+#[test]
+fn agent_create_refuses_a_missing_configured_provider_key_without_a_row() {
+    let _guard = SERVER_TEST.lock().unwrap();
+    let fixture = ServerFixture::start("agent-missing-key");
+    fs::write(
+        fixture.workspace.join("agent.toml"),
+        "[provider]\napi_key_env = \"PLATONIC_AGENT_MISSING_KEY\"\n",
+    )
+    .unwrap();
+    let workspaces = fixture.command(["workspace", "list"]).output().unwrap();
+    assert_success(&workspaces);
+    let workspaces: Value = serde_json::from_slice(&workspaces.stdout).unwrap();
+    let workspace_id = workspaces["workspaces"][0]["id"].as_str().unwrap();
+
+    let refused = fixture
+        .command([
+            "agent",
+            "create",
+            "builder",
+            workspace_id,
+            "--config",
+            "agent.toml",
+        ])
+        .env_remove("PLATONIC_AGENT_MISSING_KEY")
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("set PLATONIC_AGENT_MISSING_KEY"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("provider.api_key_env"), "{stderr}");
+    let listed = fixture.command(["agent", "list"]).output().unwrap();
+    assert_success(&listed);
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert!(listed["agents"].as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -145,6 +265,7 @@ fn gateway_wrapper_rejects_workspace_gateway_before_daemon_or_service_access() {
 struct ServerFixture {
     root: tempfile::TempDir,
     workspace: PathBuf,
+    name: String,
     child: Option<Child>,
 }
 
@@ -174,6 +295,7 @@ impl ServerFixture {
         let fixture = Self {
             root,
             workspace,
+            name: name.into(),
             child: Some(child),
         };
         fixture.wait_ready();
@@ -195,6 +317,17 @@ impl ServerFixture {
         let deadline = Instant::now() + TIMEOUT;
         while Instant::now() < deadline {
             if socket.is_socket() {
+                let root = self.workspace.to_str().unwrap();
+                let created = self
+                    .command(["workspace", "create", &self.name, root])
+                    .output()
+                    .unwrap();
+                let already_created =
+                    String::from_utf8_lossy(&created.stderr).contains("workspace already exists");
+                if !created.status.success() && !already_created {
+                    thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
                 let output = self
                     .command(["status", "--workspace", "."])
                     .output()

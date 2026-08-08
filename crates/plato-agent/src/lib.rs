@@ -18,7 +18,7 @@ pub use platonic_protocol::{
 };
 pub use run::{
     ApprovalMode, AssistantDeltaEvent, RunEvent, RunOptions, RunOutcome, ensure_server,
-    run_question,
+    ensure_server_interactive, run_question,
 };
 pub use voice::{
     CapturedRunOutcome, NarratedRunOutcome, NarratedSentenceReport, NarrationReport, VoiceError,

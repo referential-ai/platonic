@@ -221,10 +221,17 @@ fn wait_for_lock_owner(lock_path: &Path, pid: u32, child: &mut DaemonChild) -> L
 fn wait_for_client(socket_path: &Path, workspace: &Path, child: &mut DaemonChild) -> DaemonClient {
     let deadline = Instant::now() + PROOF_TIMEOUT;
     loop {
-        if let Ok(mut client) = DaemonClient::connect(socket_path)
-            && client.hello(workspace).is_ok()
-        {
-            return client;
+        if let Ok(mut client) = DaemonClient::connect(socket_path) {
+            if client.hello(workspace).is_ok() {
+                return client;
+            }
+            if client
+                .workspace_create("unix-daemon-proof".into(), workspace.to_path_buf())
+                .is_ok()
+                && client.hello(workspace).is_ok()
+            {
+                return client;
+            }
         }
         if let Some(status) = child.try_wait().unwrap() {
             panic!(

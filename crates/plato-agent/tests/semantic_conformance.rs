@@ -5,9 +5,11 @@ use platonic_core::{
     RunReadback, ToolCall, ToolCallId, ToolName, ToolProposal, ToolResult, TurnId,
 };
 use platonic_protocol::{
-    BufferedThreadEvent, CAPABILITY_THREAD_AUTHORITY, CAPABILITY_THREAD_EVENTS,
-    CAPABILITY_THREAD_LIST, CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_SPAWN,
-    CAPABILITY_THREAD_STATUS, CAPABILITY_THREAD_STOP, ERROR_NOT_FOUND, ReasoningEffort,
+    BufferedThreadEvent, CAPABILITY_AGENT_CREATE, CAPABILITY_AGENT_LIST, CAPABILITY_AGENT_STATUS,
+    CAPABILITY_THREAD_AUTHORITY, CAPABILITY_THREAD_EVENTS, CAPABILITY_THREAD_LIST,
+    CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_SPAWN, CAPABILITY_THREAD_STATUS,
+    CAPABILITY_THREAD_STOP, CAPABILITY_WORKSPACE_CREATE, CAPABILITY_WORKSPACE_LIST,
+    CAPABILITY_WORKSPACE_STATUS, ERROR_NOT_FOUND, ERROR_WORKSPACE_UNREGISTERED, ReasoningEffort,
     RunStateName, ShutdownIfIdleResultName, StreamEvent, ThreadApprovalPolicy,
     ThreadSendRejectedReason, ThreadSendResult, ThreadSpawnDecision, ThreadSpawnResult,
     ThreadStopResult,
@@ -339,6 +341,96 @@ fn one_host_daemon_serves_two_workspaces_and_coexists_with_legacy_daemon() {
     assert_eq!(host.pid(), host_pid);
     legacy.stop(legacy_client);
     host.stop(host_client);
+}
+
+#[test]
+fn workspace_and_agent_six_method_control_plane_is_semantically_conformant() {
+    let _serial = SCENARIO_SERIAL.lock().unwrap();
+    let proof = ProofContext::new();
+    let host = ProofDaemon::start_host(&proof);
+    let mut client = host.connect();
+    let hello = client.hello(&proof.workspace).unwrap();
+    for capability in [
+        CAPABILITY_WORKSPACE_CREATE,
+        CAPABILITY_WORKSPACE_LIST,
+        CAPABILITY_WORKSPACE_STATUS,
+        CAPABILITY_AGENT_CREATE,
+        CAPABILITY_AGENT_LIST,
+        CAPABILITY_AGENT_STATUS,
+    ] {
+        assert!(hello.capabilities.iter().any(|served| served == capability));
+    }
+
+    let second = proof._root.path().join("agent-control-workspace");
+    fs::create_dir(&second).unwrap();
+    let created = client
+        .workspace_create("agent-control".into(), second.clone())
+        .unwrap()
+        .workspace;
+    assert_eq!(Path::new(&created.root), second);
+    let listed = client.workspace_list().unwrap().workspaces;
+    assert!(listed.iter().any(|workspace| workspace.id == created.id));
+    assert_eq!(
+        client
+            .workspace_status(created.id.clone())
+            .unwrap()
+            .workspace,
+        created
+    );
+
+    let created_agent = client
+        .agent_create(
+            AgentId::new("builder").unwrap(),
+            created.id.clone(),
+            "gpt-5.6-sol".into(),
+            ReasoningEffort::High,
+            ThreadApprovalPolicy::Prompt,
+            vec!["file.read".into(), "file.write".into()],
+        )
+        .unwrap()
+        .agent;
+    assert_eq!(created_agent.workspace_id, created.id);
+    assert_eq!(created_agent.toolset, ["file.read", "file.write"]);
+    assert_eq!(client.agent_list().unwrap().agents, [created_agent.clone()]);
+    assert_eq!(
+        client
+            .agent_status(AgentId::new("builder").unwrap())
+            .unwrap()
+            .agent,
+        created_agent
+    );
+    host.stop(client);
+}
+
+#[test]
+fn headless_one_shot_and_remote_never_prompt_or_register() {
+    let _serial = SCENARIO_SERIAL.lock().unwrap();
+    let proof = ProofContext::new();
+    let socket_path = proof.host_socket_path();
+    let mut child = proof.host_daemon_command().spawn().unwrap();
+    wait_for_endpoint(&socket_path, &mut child);
+
+    for args in [vec!["hello"], vec!["--remote", "thread_missing"]] {
+        let output = proof
+            .plato_command()
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(ERROR_WORKSPACE_UNREGISTERED), "{stderr}");
+        assert!(!stderr.contains("Workspace name ["), "{stderr}");
+    }
+
+    let mut control =
+        DaemonClient::connect_with_timeout(&socket_path, Duration::from_secs(2)).unwrap();
+    assert!(control.workspace_list().unwrap().workspaces.is_empty());
+    drop(control);
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 
 #[test]
@@ -1177,6 +1269,10 @@ fn assert_scenario_conformance(
 
 fn run_direct_leg(proof: &ProofContext, scenario: Scenario) -> RunEvidence {
     proof.assert_no_serving_daemon("before direct CLI run");
+    let bootstrap = ProofDaemon::start_host(proof);
+    let bootstrap_client = bootstrap.connect();
+    bootstrap.stop(bootstrap_client);
+    proof.assert_no_serving_daemon("after explicit workspace registration");
     let mut command = proof.plato_command();
     command
         .arg("--config")
@@ -1850,23 +1946,27 @@ struct ProofDaemon {
 impl ProofDaemon {
     fn start(proof: &ProofContext) -> Self {
         let mut child = proof.daemon_command().spawn().unwrap();
-        wait_for_daemon(&proof.socket_path, &proof.workspace, &mut child);
-        Self {
+        wait_for_endpoint(&proof.socket_path, &mut child);
+        let daemon = Self {
             child: Some(child),
             workspace: proof.workspace.clone(),
             socket_path: proof.socket_path.clone(),
-        }
+        };
+        drop(daemon.connect());
+        daemon
     }
 
     fn start_host(proof: &ProofContext) -> Self {
         let socket_path = proof.host_socket_path();
         let mut child = proof.host_daemon_command().spawn().unwrap();
         wait_for_endpoint(&socket_path, &mut child);
-        Self {
+        let daemon = Self {
             child: Some(child),
             workspace: proof.workspace.clone(),
             socket_path,
-        }
+        };
+        drop(daemon.connect());
+        daemon
     }
 
     fn connect(&self) -> DaemonClient {
@@ -1874,10 +1974,7 @@ impl ProofDaemon {
     }
 
     fn connect_workspace(&self, workspace: &Path) -> DaemonClient {
-        let mut client =
-            DaemonClient::connect_with_timeout(&self.socket_path, Duration::from_secs(2)).unwrap();
-        client.hello(workspace).unwrap();
-        client
+        connect_registered_workspace(&self.socket_path, workspace)
     }
 
     fn pid(&self) -> u32 {
@@ -1898,6 +1995,31 @@ impl ProofDaemon {
                 read_pipe(child.stderr.take())
             );
         }
+    }
+}
+
+fn connect_registered_workspace(socket_path: &Path, workspace: &Path) -> DaemonClient {
+    let mut client =
+        DaemonClient::connect_with_timeout(socket_path, Duration::from_secs(2)).unwrap();
+    match client.hello(workspace) {
+        Ok(_) => client,
+        Err(ClientError::DaemonResponse(error)) if error.code == ERROR_WORKSPACE_UNREGISTERED => {
+            drop(client);
+            let mut control =
+                DaemonClient::connect_with_timeout(socket_path, Duration::from_secs(2)).unwrap();
+            control
+                .workspace_create(
+                    paths::workspace_id(workspace).unwrap(),
+                    workspace.to_path_buf(),
+                )
+                .unwrap();
+            drop(control);
+            let mut client =
+                DaemonClient::connect_with_timeout(socket_path, Duration::from_secs(2)).unwrap();
+            client.hello(workspace).unwrap();
+            client
+        }
+        Err(error) => panic!("workspace attach failed: {error}"),
     }
 }
 
@@ -1926,26 +2048,6 @@ impl Drop for ProofDaemon {
             let _ = child.kill();
             let _ = child.wait();
         }
-    }
-}
-
-fn wait_for_daemon(socket_path: &Path, workspace: &Path, child: &mut Child) {
-    let deadline = Instant::now() + PROOF_TIMEOUT;
-    loop {
-        if let Ok(mut client) =
-            DaemonClient::connect_with_timeout(socket_path, Duration::from_millis(200))
-            && client.hello(workspace).is_ok()
-        {
-            return;
-        }
-        if let Some(status) = child.try_wait().unwrap() {
-            panic!(
-                "daemon exited before serving ({status}): {}",
-                read_pipe(child.stderr.take())
-            );
-        }
-        assert!(Instant::now() < deadline, "daemon did not start");
-        thread::sleep(POLL_INTERVAL);
     }
 }
 

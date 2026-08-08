@@ -6,16 +6,18 @@ use crate::{
     transport::{self, Stream},
 };
 use platonic_protocol::{
-    ApprovalDecideParams, ApprovalDecision, CommandAcceptedResult, DaemonStatusParams,
-    DaemonStatusResult, Envelope, EnvelopeKind, EventsStreamParams, EventsStreamResult,
-    HelloParams, HelloResult, IssuePrepStartParams, IssuePrepStartResult, MessageAppendParams,
-    PROTOCOL_VERSION, RunCancelParams, RunOverrides, RunStartParams, RunStartResult,
-    SessionSummary, SessionsListResult, ShutdownIfIdleResult, ThreadApprovalPolicy,
-    ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams, ThreadEventsResult,
-    ThreadListResult, ThreadSendParams, ThreadSendResult, ThreadSpawnDecision, ThreadSpawnParams,
-    ThreadSpawnResult, ThreadStatusParams, ThreadStatusResult, ThreadStopParams, ThreadStopResult,
-    TranscriptReadParams, TranscriptReadResult, WorkspaceCreateParams, WorkspaceCreateResult,
-    WorkspaceListParams, WorkspaceListResult, WorkspaceStatusParams, WorkspaceStatusResult,
+    AgentCreateParams, AgentCreateResult, AgentId, AgentListParams, AgentListResult,
+    AgentStatusParams, AgentStatusResult, ApprovalDecideParams, ApprovalDecision,
+    CommandAcceptedResult, DaemonStatusParams, DaemonStatusResult, Envelope, EnvelopeKind,
+    EventsStreamParams, EventsStreamResult, HelloParams, HelloResult, IssuePrepStartParams,
+    IssuePrepStartResult, MessageAppendParams, PROTOCOL_VERSION, ReasoningEffort, RunCancelParams,
+    RunOverrides, RunStartParams, RunStartResult, SessionSummary, SessionsListResult,
+    ShutdownIfIdleResult, ThreadApprovalPolicy, ThreadAuthorityParams, ThreadAuthorityResult,
+    ThreadEventsParams, ThreadEventsResult, ThreadListResult, ThreadSendParams, ThreadSendResult,
+    ThreadSpawnDecision, ThreadSpawnParams, ThreadSpawnResult, ThreadStatusParams,
+    ThreadStatusResult, ThreadStopParams, ThreadStopResult, TranscriptReadParams,
+    TranscriptReadResult, WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceListParams,
+    WorkspaceListResult, WorkspaceStatusParams, WorkspaceStatusResult,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -132,6 +134,39 @@ impl DaemonClient {
         workspace_id: String,
     ) -> ClientResult<WorkspaceStatusResult> {
         self.request("workspace.status", WorkspaceStatusParams { workspace_id })
+    }
+
+    /// Creates one configured agent profile with a hard workspace binding.
+    pub fn agent_create(
+        &mut self,
+        agent_id: AgentId,
+        workspace_id: String,
+        model: String,
+        reasoning_effort: ReasoningEffort,
+        approval_policy: ThreadApprovalPolicy,
+        toolset: Vec<String>,
+    ) -> ClientResult<AgentCreateResult> {
+        self.request(
+            "agent.create",
+            AgentCreateParams {
+                agent_id,
+                workspace_id,
+                model,
+                reasoning_effort,
+                approval_policy,
+                toolset,
+            },
+        )
+    }
+
+    /// Lists every configured agent profile.
+    pub fn agent_list(&mut self) -> ClientResult<AgentListResult> {
+        self.request("agent.list", AgentListParams::default())
+    }
+
+    /// Reads one configured agent profile.
+    pub fn agent_status(&mut self, agent_id: AgentId) -> ClientResult<AgentStatusResult> {
+        self.request("agent.status", AgentStatusParams { agent_id })
     }
 
     /// Starts one typed thread spawn admission.
@@ -980,6 +1015,163 @@ mod tests {
                 ledger_path: "/tmp/agent.db".into(),
             }]
         );
+    }
+
+    #[test]
+    fn client_sends_all_six_typed_workspace_and_agent_requests() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_root = workspace.path().canonicalize().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let expected_root = workspace_root.to_string_lossy().into_owned();
+        let server_root = expected_root.clone();
+        let workspace_json = json!({
+            "id": "ws-alpha",
+            "name": "alpha",
+            "root": server_root,
+            "ledger_path": "/state/alpha.db",
+            "created_at_ms": 41,
+            "health": "present"
+        });
+        let agent_json = json!({
+            "id": "builder",
+            "workspace_id": "ws-alpha",
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "xhigh",
+            "approval_policy": "prompt",
+            "toolset": ["file.read", "file.write"],
+            "created_at_ms": 42
+        });
+        let server_workspace = workspace_json.clone();
+        let server_agent = agent_json.clone();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+
+            let request = read_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some("workspace.create"));
+            assert_eq!(
+                request.params,
+                Some(json!({"name": "alpha", "root": expected_root}))
+            );
+            write_response(
+                &mut writer,
+                request.id,
+                "workspace.create",
+                json!({"workspace": server_workspace.clone()}),
+            );
+
+            let request = read_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some("workspace.list"));
+            assert_eq!(request.params, Some(json!({})));
+            write_response(
+                &mut writer,
+                request.id,
+                "workspace.list",
+                json!({"workspaces": [server_workspace.clone()]}),
+            );
+
+            let request = read_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some("workspace.status"));
+            assert_eq!(request.params, Some(json!({"workspace_id": "ws-alpha"})));
+            write_response(
+                &mut writer,
+                request.id,
+                "workspace.status",
+                json!({"workspace": server_workspace}),
+            );
+
+            let request = read_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some("agent.create"));
+            assert_eq!(
+                request.params,
+                Some(json!({
+                    "agent_id": "builder",
+                    "workspace_id": "ws-alpha",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "xhigh",
+                    "approval_policy": "prompt",
+                    "toolset": ["file.read", "file.write"]
+                }))
+            );
+            write_response(
+                &mut writer,
+                request.id,
+                "agent.create",
+                json!({"agent": server_agent.clone()}),
+            );
+
+            let request = read_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some("agent.list"));
+            assert_eq!(request.params, Some(json!({})));
+            write_response(
+                &mut writer,
+                request.id,
+                "agent.list",
+                json!({"agents": [server_agent.clone()]}),
+            );
+
+            let request = read_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some("agent.status"));
+            assert_eq!(request.params, Some(json!({"agent_id": "builder"})));
+            write_response(
+                &mut writer,
+                request.id,
+                "agent.status",
+                json!({"agent": server_agent}),
+            );
+        });
+
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                client
+                    .workspace_create("alpha".into(), workspace_root)
+                    .unwrap()
+                    .workspace
+            )
+            .unwrap(),
+            workspace_json
+        );
+        assert_eq!(client.workspace_list().unwrap().workspaces.len(), 1);
+        assert_eq!(
+            client
+                .workspace_status("ws-alpha".into())
+                .unwrap()
+                .workspace
+                .id,
+            "ws-alpha"
+        );
+        assert_eq!(
+            serde_json::to_value(
+                client
+                    .agent_create(
+                        AgentId::new("builder").unwrap(),
+                        "ws-alpha".into(),
+                        "gpt-5.6-sol".into(),
+                        ReasoningEffort::Xhigh,
+                        ThreadApprovalPolicy::Prompt,
+                        vec!["file.read".into(), "file.write".into()],
+                    )
+                    .unwrap()
+                    .agent
+            )
+            .unwrap(),
+            agent_json
+        );
+        assert_eq!(client.agent_list().unwrap().agents.len(), 1);
+        assert_eq!(
+            client
+                .agent_status(AgentId::new("builder").unwrap())
+                .unwrap()
+                .agent
+                .id
+                .as_str(),
+            "builder"
+        );
+        handle.join().unwrap();
     }
 
     #[test]

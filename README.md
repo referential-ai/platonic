@@ -16,7 +16,7 @@ owns the hierarchy and exact forms.
 
 The bootstrap surface is intentionally small:
 
-- Bare `plato` in a terminal ensures the host daemon, creates an approved durable thread, and opens the TUI on it.
+- Bare `plato` in a terminal ensures the host daemon, asks once before registering an unknown directory, creates an approved durable thread, and opens the TUI on it.
 - `plato --remote <thread-id>` opens another TUI on the same host socket and existing thread.
 - `plato "question"` ensures the host server and runs as a short-lived client.
 - `plato -c "follow-up"` continues the latest workspace session from the SQLite ledger.
@@ -27,6 +27,7 @@ The bootstrap surface is intentionally small:
 - `plato thread spawn|list|status|send|attach|stop` manages and observes durable threads on a serving host daemon.
 - `platonic serve|status|shutdown` runs and operates the server.
 - `platonic workspace create|list|status` manages registered workspaces.
+- `platonic agent create|list|status` manages configured agent profiles.
 - `platonic gateway discord` runs the server-owned Discord connector.
 
 ## Configuration
@@ -223,11 +224,27 @@ Start the host server in the foreground:
 platonic serve
 ```
 
+Attaching never registers a directory implicitly. A local `plato` one-shot or
+TUI with terminal stdin, stdout, and stderr asks once for a workspace name,
+defaulting to the directory basename; pressing Enter creates it. Declining or
+EOF leaves it unregistered. Piped or otherwise headless one-shots,
+`plato --remote`, gateways, and desktop clients never ask or create: they fail
+with `workspace_unregistered` and name `platonic workspace create` as the
+operator action.
+
+For scripts and services, register deliberately before attaching:
+
+```bash
+platonic workspace create example /path/to/workspace
+```
+
 The explicit legacy workspace mode remains available for standalone clients
-and focused proofs:
+and focused proofs, but it has the same create-before-use gate. Start it, then
+use the printed socket path for the control request before attaching:
 
 ```bash
 platonic serve --workspace "$PWD"
+platonic workspace create example "$PWD" --socket <printed-socket-path>
 ```
 
 Host mode uses `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/platonic/host/agent.sock`
@@ -237,6 +254,21 @@ workspace through the existing `hello` request; the response adds
 `daemon_version`. Bare `plato`, `plato "question"`, and `plato --tui` ensure
 this server and attach as clients. `platonic status`, `platonic shutdown`, and
 the `platonic workspace` commands operate it through the existing protocol.
+
+Agent profiles are immutable data hard-bound to one registered, present
+workspace. Creation resolves model and tool defaults through the normal config
+order, with explicit CLI overrides, and refuses a missing configured provider
+key environment variable with the exact env/config action. The record contains
+only the agent id, workspace id, model, reasoning effort, approval policy,
+validated internal tool names, and creation time; provider keys are never sent
+or stored.
+
+```bash
+platonic agent create builder <workspace-id> --reasoning-effort high
+platonic agent create reviewer <workspace-id> --model gpt-5.6-sol --tool file.read
+platonic agent list
+platonic agent status builder
+```
 
 The `plato thread` commands connect only to this host endpoint. Spawn requires
 an explicit cwd, model, reasoning effort, and approval policy; cwd defaults to

@@ -1,9 +1,13 @@
 #![cfg(unix)]
 
-use platonic_client::client::{DaemonClient, DaemonConnectionConfig};
 use platonic_client::paths;
+use platonic_client::{
+    ClientError,
+    client::{DaemonClient, DaemonConnectionConfig},
+};
 use platonic_protocol::{
-    ERROR_LAGGED, Envelope, EnvelopeKind, PROTOCOL_VERSION, RunStateName, ShutdownIfIdleResultName,
+    ERROR_LAGGED, ERROR_WORKSPACE_UNREGISTERED, Envelope, EnvelopeKind, PROTOCOL_VERSION,
+    RunStateName, ShutdownIfIdleResultName,
 };
 use pty_process::{
     Size,
@@ -79,6 +83,8 @@ fn plato_tui_cold_starts_host_thread_and_remote_reuses_it() {
         br#""$PLATO_ROOT_BIN" --tui; printf '\n%sLOCAL_STATUS:%s\n' "$PTY_MARK" "$?"
 "#,
     );
+    local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Workspace name [workspace]");
+    local.write(b"\r");
     local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Approve thread.spawn?");
     local.write(b"y\r");
     local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Plato Agent");
@@ -131,6 +137,76 @@ fn plato_tui_cold_starts_host_thread_and_remote_reuses_it() {
         ShutdownIfIdleResultName::Shutdown
     );
     wait_for_endpoint_removal(&endpoint);
+}
+
+#[test]
+fn local_interactive_one_shot_asks_once_and_enter_registers_the_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+    fs::write(workspace.join("missing-key.toml"), "[provider\n").unwrap();
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
+    let config = DaemonConnectionConfig::resolve(&workspace, Some(endpoint.clone())).unwrap();
+    let mut daemon = std::process::Command::new(workspace_binary("platonic"))
+        .arg("serve")
+        .current_dir(&workspace)
+        .env("HOME", &home)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", &state)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    loop {
+        if DaemonClient::connect(&config.socket_path).is_ok() {
+            break;
+        }
+        assert!(daemon.try_wait().unwrap().is_none(), "host daemon exited");
+        assert!(Instant::now() < deadline, "host daemon did not bind");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        br#""$PLATO_ROOT_BIN" --config missing-key.toml hello; printf '\n%sSTATUS:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Workspace name [workspace]");
+    shell.write(b"\r");
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    let mut client = loop {
+        if let Ok(mut client) = DaemonClient::connect(&config.socket_path)
+            && client
+                .workspace_list()
+                .is_ok_and(|listed| !listed.workspaces.is_empty())
+        {
+            break client;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Enter did not create the workspace"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    client.hello(&workspace).unwrap();
+    let workspaces = client.workspace_list().unwrap().workspaces;
+    assert_eq!(workspaces.len(), 1);
+    assert_eq!(workspaces[0].name, "workspace");
+    assert_eq!(Path::new(&workspaces[0].root), workspace);
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    assert_ne!(shell.wait_for_marker("STATUS"), "0");
+    fs::remove_file(&endpoint).unwrap();
+
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
 }
 
 #[test]
@@ -1295,10 +1371,23 @@ impl SessionGrantWorkspaceDaemon {
     fn wait_until_ready(&mut self, config: &DaemonConnectionConfig) {
         let deadline = Instant::now() + PROOF_TIMEOUT;
         loop {
-            if let Ok(mut client) = DaemonClient::connect(&config.socket_path)
-                && client.hello(&config.workspace_root).is_ok()
-            {
-                return;
+            if let Ok(mut client) = DaemonClient::connect(&config.socket_path) {
+                match client.hello(&config.workspace_root) {
+                    Ok(_) => return,
+                    Err(ClientError::DaemonResponse(error))
+                        if error.code == ERROR_WORKSPACE_UNREGISTERED =>
+                    {
+                        drop(client);
+                        let mut control = DaemonClient::connect(&config.socket_path).unwrap();
+                        control
+                            .workspace_create(
+                                paths::workspace_id(&config.workspace_root).unwrap(),
+                                config.workspace_root.clone(),
+                            )
+                            .unwrap();
+                    }
+                    Err(error) => panic!("workspace daemon hello failed: {error}"),
+                }
             }
             if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
                 let stderr = fs::read_to_string(&self.stderr_path).unwrap_or_default();
