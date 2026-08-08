@@ -173,8 +173,18 @@ jobs:
       # ignored on this platform only, tracked as #462. timeout-minutes stays
       # on every step so any future hang fails loudly in bounded time instead
       # of burning the six-hour job limit in silence.
+      # TMPDIR experiment: macOS puts $TMPDIR under /var/folders, and /var is
+      # a symlink to /private/var. The conformance suite's one-shot CLI fails
+      # there with SQLITE_CANTOPEN while the same layout passes on Linux. The
+      # private-ledger open path stacks NOFOLLOW and symlink-rejecting checks,
+      # so the temp root is the discriminating variable: RUNNER_TEMP lives
+      # under /Users with no symlink in the path. Green here confirms the
+      # interaction; the underlying portability question is tracked on #462's
+      # follow-up rather than hidden by this line.
       - name: Run tests
         timeout-minutes: 45
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: cargo test --workspace --locked
 
       - name: Run clippy
