@@ -179,6 +179,9 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
         let now = Instant::now();
         maybe_poll_events_at(&mut runtime, &commands, now);
         update_elapsed_at(&mut state, &mut runtime, now);
+        if state.drain_streaming_at(now) {
+            frames.schedule_frame();
+        }
         if frames.take_due(now) {
             terminal.draw(&state)?;
             if let Some(delay) = next_animation_frame_in(&state) {
@@ -186,7 +189,10 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
             }
         }
 
-        let deadline = earliest_deadline(frames.deadline(), runtime.poll_deadline());
+        let deadline = earliest_deadline(
+            earliest_deadline(frames.deadline(), runtime.poll_deadline()),
+            state.streaming_deadline(),
+        );
         let event = receive_ui_event(&events, deadline)?;
         let Some(event) = event else {
             continue;
@@ -1131,9 +1137,21 @@ fn update_elapsed_at(state: &mut TuiState, runtime: &mut UiRuntime, now: Instant
     });
 }
 
-pub(super) fn push_live_event(state: &mut TuiState, mut line: crate::LiveEventLine) {
+pub(super) fn push_live_event(state: &mut TuiState, line: crate::LiveEventLine) {
+    push_live_event_at(state, line, Instant::now());
+}
+
+pub(super) fn push_live_event_at(state: &mut TuiState, line: crate::LiveEventLine, now: Instant) {
     use crate::LiveEventKind;
 
+    if line.kind == LiveEventKind::AssistantDelta {
+        state.queue_assistant_delta(line, now);
+        return;
+    }
+    if line.kind == LiveEventKind::Assistant {
+        state.consolidate_assistant(line);
+        return;
+    }
     state.invalidate_live_event_rows();
     if line.kind == LiveEventKind::Approval
         && line.offset.is_some()
@@ -1145,25 +1163,6 @@ pub(super) fn push_live_event(state: &mut TuiState, mut line: crate::LiveEventLi
         })
     {
         *immediate = line;
-        return;
-    }
-    if line.kind == LiveEventKind::AssistantDelta {
-        if let Some(last) = state.live_events.last_mut()
-            && last.kind == LiveEventKind::Assistant
-            && last.run_id == line.run_id
-        {
-            last.text.push_str(&line.text);
-            last.offset = line.offset;
-            return;
-        }
-        line.kind = LiveEventKind::Assistant;
-    } else if line.kind == LiveEventKind::Assistant
-        && let Some(last) = state.live_events.last_mut()
-        && last.kind == LiveEventKind::Assistant
-        && last.run_id == line.run_id
-    {
-        last.text = line.text;
-        last.offset = line.offset;
         return;
     }
     state.live_events.push(line);
@@ -2847,11 +2846,98 @@ mod tests {
             },
         );
 
+        assert!(state.live_events.is_empty());
+        assert!(state.finalize_streaming(Some("run_1")));
         assert_eq!(state.live_events.len(), 1);
         assert_eq!(state.live_events[0].kind, crate::LiveEventKind::Assistant);
         assert_eq!(state.live_events[0].text.len(), 500);
         assert!(state.stream_warning.is_none());
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn assistant_burst_drains_adaptively_and_quiet_tail_flushes_on_time() {
+        let mut state = test_state();
+        let base = Instant::now();
+        let burst = (0..20)
+            .map(|index| format!("burst line {index:02}\n"))
+            .collect::<String>();
+        for (offset, line) in burst.split_inclusive('\n').enumerate() {
+            push_live_event_at(
+                &mut state,
+                crate::LiveEventLine::assistant_delta(Some(offset as u64), line)
+                    .with_run_id("run_1"),
+                base,
+            );
+        }
+
+        assert!(state.live_events.is_empty());
+        let first_deadline = state.streaming_deadline().unwrap();
+        assert!(first_deadline < base + Duration::from_millis(40));
+        assert!(!state.drain_streaming_at(first_deadline - Duration::from_nanos(1)));
+        assert!(state.drain_streaming_at(first_deadline));
+        assert!(state.live_events[0].text.len() < burst.len());
+
+        while let Some(deadline) = state.streaming_deadline() {
+            assert!(state.drain_streaming_at(deadline));
+        }
+        assert_eq!(state.live_events[0].text, burst);
+
+        let quiet_at = first_deadline + Duration::from_secs(1);
+        push_live_event_at(
+            &mut state,
+            crate::LiveEventLine::assistant_delta(Some(20), "ends mid-token").with_run_id("run_1"),
+            quiet_at,
+        );
+        let quiet_deadline = quiet_at + crate::state::STREAM_QUIET_FLUSH;
+        assert!(!state.drain_streaming_at(quiet_deadline - Duration::from_nanos(1)));
+        assert!(state.drain_streaming_at(quiet_deadline));
+        assert_eq!(state.live_events[0].text, format!("{burst}ends mid-token"));
+    }
+
+    #[test]
+    fn incomplete_markdown_table_is_held_and_released_as_one_raw_chunk() {
+        let mut state = test_state();
+        let base = Instant::now();
+        let table = "| Name | Value |\n| --- | --- |\n| alpha | one |\n";
+        for (offset, line) in table.split_inclusive('\n').enumerate() {
+            push_live_event_at(
+                &mut state,
+                crate::LiveEventLine::assistant_delta(Some(offset as u64), line)
+                    .with_run_id("run_1"),
+                base,
+            );
+        }
+
+        assert!(state.streaming_deadline().is_none());
+        assert!(!state.drain_streaming_at(base + Duration::from_secs(1)));
+        assert!(state.live_events.is_empty());
+
+        push_live_event_at(
+            &mut state,
+            crate::LiveEventLine::assistant_delta(Some(3), "\n").with_run_id("run_1"),
+            base + Duration::from_millis(1),
+        );
+        let deadline = state.streaming_deadline().unwrap();
+        assert!(state.drain_streaming_at(deadline));
+        assert_eq!(state.live_events.len(), 1);
+        assert_eq!(state.live_events[0].text, table);
+    }
+
+    #[test]
+    fn terminal_mid_token_stream_consolidates_exact_raw_source() {
+        let mut state = test_state();
+        let base = Instant::now();
+        push_live_event_at(
+            &mut state,
+            crate::LiveEventLine::assistant_delta(Some(1), "final mid-tok").with_run_id("run_1"),
+            base,
+        );
+
+        assert!(state.finalize_streaming(Some("run_1")));
+        assert_eq!(state.live_events.len(), 1);
+        assert_eq!(state.live_events[0].text.as_bytes(), b"final mid-tok");
+        assert!(state.streaming_deadline().is_none());
     }
 
     #[test]
@@ -3065,6 +3151,7 @@ mod tests {
             &mut state,
             crate::LiveEventLine::assistant_delta(Some(2), "second").with_run_id("run_2"),
         );
+        assert!(state.finalize_streaming(Some("run_2")));
 
         assert_eq!(state.live_events.len(), 2);
         assert_eq!(state.live_events[0].text, "first");
@@ -4061,6 +4148,44 @@ mod tests {
         assert!(output.contains("refreshed answer"));
         assert!(!output.contains("old answer"));
         assert!(output.contains("live status"));
+    }
+
+    #[test]
+    fn canceled_mid_stream_source_survives_matching_transcript_reload() {
+        let mut state = selected_state(
+            "session_1",
+            "run_1",
+            "[turn_1] user: cancel this response\n",
+        );
+        push_live_event_at(
+            &mut state,
+            crate::LiveEventLine::assistant_delta(Some(7), "kept through mid-tok")
+                .with_run_id("run_1"),
+            Instant::now(),
+        );
+        assert!(state.finalize_streaming(Some("run_1")));
+        state.active_run = Some(crate::ActiveRunView {
+            run_id: "run_1".into(),
+            status: RunStateName::Canceled,
+        });
+        state.sessions[0].status = RunStateName::Canceled;
+
+        let mut loaded = test_state();
+        loaded.sessions = state.sessions.clone();
+        loaded.selected_session_id = Some("session_1".into());
+        loaded.replace_transcript(loaded_transcript(
+            "run_1",
+            "[turn_1] user: cancel this response\n",
+        ));
+        apply_loaded_state(&mut state, loaded);
+
+        assert_eq!(state.live_events.len(), 1);
+        assert_eq!(
+            state.live_events[0].text.as_bytes(),
+            b"kept through mid-tok"
+        );
+        let output = render_snapshot(&state, 100, 24).unwrap();
+        assert!(output.contains("kept through mid-tok"));
     }
 
     #[test]

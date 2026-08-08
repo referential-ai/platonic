@@ -2393,6 +2393,28 @@ mod tests {
     }
 
     #[test]
+    fn finalized_raw_markdown_rerenders_from_120_to_40_and_back() {
+        let source = concat!(
+            "## Resize-safe answer\n\n",
+            "This deliberately long assistant sentence must wrap at forty columns while ",
+            "remaining one raw Markdown source when the terminal returns to one hundred twenty.\n\n",
+            "| Name | Value |\n| --- | --- |\n| alpha | one |"
+        );
+        let events = [LiveEventLine::assistant(Some(9), source).with_run_id("run_resize")];
+        let markdown = MarkdownRenderer::default();
+        let wide =
+            conversation_live_event_lines(&events, &[], 120, DEFAULT_SYNTAX_THEME, &markdown);
+        let narrow =
+            conversation_live_event_lines(&events, &[], 40, DEFAULT_SYNTAX_THEME, &markdown);
+        let wide_again =
+            conversation_live_event_lines(&events, &[], 120, DEFAULT_SYNTAX_THEME, &markdown);
+
+        assert_eq!(wide_again, wide);
+        assert!(narrow.len() > wide.len());
+        assert_eq!(events[0].text.as_bytes(), source.as_bytes());
+    }
+
+    #[test]
     fn conversation_preserves_whitespace_bearing_assistant_content() {
         let rows = conversation_live_event_lines(
             &[LiveEventLine::assistant(Some(1), " \t")],

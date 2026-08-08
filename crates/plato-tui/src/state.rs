@@ -8,7 +8,12 @@ use platonic_protocol::{
     SessionSummary, TranscriptReadResult, TypedTranscript,
 };
 use ratatui::text::Line;
-use std::{fmt, sync::RwLock, time::Instant};
+use std::{
+    collections::VecDeque,
+    fmt,
+    sync::RwLock,
+    time::{Duration, Instant},
+};
 use tui_textarea::{CursorMove, TextArea};
 
 use super::{
@@ -59,6 +64,7 @@ pub struct TuiState {
     pub active_run: Option<ActiveRunView>,
     /// Transient events received since transcript readback.
     pub live_events: Vec<LiveEventLine>,
+    pub(super) streaming: StreamingBuffer,
     pub(super) history_rows: HistoryRowsCache,
     pub(super) display_mode: DisplayMode,
     /// Latest requested-or-responded model identity state for the selected run.
@@ -108,6 +114,7 @@ impl PartialEq for TuiState {
             && self.transcript == other.transcript
             && self.active_run == other.active_run
             && self.live_events == other.live_events
+            && self.streaming == other.streaming
             && self.history_rows == other.history_rows
             && self.display_mode == other.display_mode
             && self.active_model == other.active_model
@@ -215,6 +222,7 @@ impl TuiState {
             transcript: TranscriptState::None,
             active_run: None,
             live_events: Vec::new(),
+            streaming: StreamingBuffer::default(),
             history_rows: HistoryRowsCache::default(),
             display_mode: DisplayMode::Conversation,
             active_model: None,
@@ -472,7 +480,104 @@ impl TuiState {
 
     pub(super) fn clear_live_events(&mut self) {
         self.live_events.clear();
+        self.streaming = StreamingBuffer::default();
         self.invalidate_live_event_rows();
+    }
+
+    pub(super) fn queue_assistant_delta(&mut self, line: LiveEventLine, now: Instant) {
+        if self.streaming.is_active() && !self.streaming.matches_run(line.run_id.as_deref()) {
+            self.finalize_streaming(None);
+        }
+        if !self.streaming.is_active() {
+            self.streaming
+                .start(line.run_id.clone(), self.live_events.len());
+        }
+        self.streaming.push(line.offset, &line.text, now);
+    }
+
+    pub(super) fn drain_streaming_at(&mut self, now: Instant) -> bool {
+        let Some(drained) = self.streaming.drain_at(now) else {
+            return false;
+        };
+        let run_id = self.streaming.run_id.clone();
+        let index = match self.streaming.event_index {
+            Some(index) => index,
+            None => {
+                let index = self.streaming.insertion_index.min(self.live_events.len());
+                self.live_events.insert(
+                    index,
+                    LiveEventLine {
+                        run_id,
+                        offset: drained.offset,
+                        kind: LiveEventKind::Assistant,
+                        text: String::new(),
+                    },
+                );
+                self.streaming.event_index = Some(index);
+                index
+            }
+        };
+        let event = &mut self.live_events[index];
+        event.text.push_str(&drained.text);
+        event.offset = drained.offset.or(event.offset);
+        self.invalidate_live_event_rows();
+        true
+    }
+
+    pub(super) fn streaming_deadline(&self) -> Option<Instant> {
+        self.streaming.deadline()
+    }
+
+    pub(super) fn finalize_streaming(&mut self, run_id: Option<&str>) -> bool {
+        if !self.streaming.is_active() || run_id.is_some() && !self.streaming.matches_run(run_id) {
+            return false;
+        }
+        let mut streaming = std::mem::take(&mut self.streaming);
+        let source = std::mem::take(&mut streaming.source);
+        let offset = streaming.last_offset;
+        self.install_stream_source(streaming, source, offset)
+    }
+
+    pub(super) fn consolidate_assistant(&mut self, line: LiveEventLine) {
+        if self.streaming.is_active() && self.streaming.matches_run(line.run_id.as_deref()) {
+            let streaming = std::mem::take(&mut self.streaming);
+            self.install_stream_source(streaming, line.text, line.offset);
+            return;
+        }
+        if let Some(last) = self.live_events.last_mut()
+            && last.kind == LiveEventKind::Assistant
+            && last.run_id == line.run_id
+        {
+            *last = line;
+        } else {
+            self.live_events.push(line);
+        }
+        self.invalidate_live_event_rows();
+    }
+
+    fn install_stream_source(
+        &mut self,
+        streaming: StreamingBuffer,
+        source: String,
+        offset: Option<u64>,
+    ) -> bool {
+        if source.is_empty() {
+            return false;
+        }
+        let line = LiveEventLine {
+            run_id: streaming.run_id,
+            offset,
+            kind: LiveEventKind::Assistant,
+            text: source,
+        };
+        if let Some(index) = streaming.event_index {
+            self.live_events[index] = line;
+        } else {
+            let index = streaming.insertion_index.min(self.live_events.len());
+            self.live_events.insert(index, line);
+        }
+        self.invalidate_live_event_rows();
+        true
     }
 
     pub(super) fn bind_latest_user_to_run(&mut self, run_id: &str) {
@@ -495,6 +600,223 @@ impl TuiState {
             .expect("live event row cache lock poisoned")
             .take();
     }
+}
+
+pub(super) const STREAM_QUIET_FLUSH: Duration = Duration::from_millis(80);
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct StreamingBuffer {
+    run_id: Option<String>,
+    source: String,
+    pending: String,
+    pending_offset: Option<u64>,
+    last_offset: Option<u64>,
+    last_arrival: Option<Instant>,
+    queued: VecDeque<StreamChunk>,
+    table_holdback: TableHoldback,
+    next_drain_at: Option<Instant>,
+    insertion_index: usize,
+    event_index: Option<usize>,
+}
+
+impl StreamingBuffer {
+    fn start(&mut self, run_id: Option<String>, insertion_index: usize) {
+        self.run_id = run_id;
+        self.insertion_index = insertion_index;
+    }
+
+    fn is_active(&self) -> bool {
+        self.run_id.is_some() || !self.source.is_empty()
+    }
+
+    fn matches_run(&self, run_id: Option<&str>) -> bool {
+        self.run_id.as_deref() == run_id
+    }
+
+    fn push(&mut self, offset: Option<u64>, text: &str, arrived_at: Instant) {
+        self.source.push_str(text);
+        self.pending.push_str(text);
+        self.pending_offset = offset.or(self.pending_offset);
+        self.last_offset = offset.or(self.last_offset);
+        self.last_arrival = Some(arrived_at);
+
+        while let Some(newline) = self.pending.find('\n') {
+            let remaining = self.pending.split_off(newline + 1);
+            let line = std::mem::replace(&mut self.pending, remaining);
+            self.collect_line(StreamChunk {
+                text: line,
+                offset: self.pending_offset,
+                arrived_at,
+            });
+        }
+        if self.pending.is_empty() {
+            self.pending_offset = None;
+        }
+    }
+
+    fn collect_line(&mut self, line: StreamChunk) {
+        match std::mem::take(&mut self.table_holdback) {
+            TableHoldback::None => {
+                if is_table_row(&line.text) {
+                    self.table_holdback = TableHoldback::Candidate(line);
+                } else {
+                    self.queue(line);
+                }
+            }
+            TableHoldback::Candidate(header) => {
+                if is_table_delimiter(&line.text) {
+                    self.table_holdback = TableHoldback::Table(vec![header, line]);
+                } else {
+                    self.queue(header);
+                    self.collect_line(line);
+                }
+            }
+            TableHoldback::Table(mut table) => {
+                if is_table_row(&line.text) {
+                    table.push(line);
+                    self.table_holdback = TableHoldback::Table(table);
+                } else {
+                    self.queue(combine_chunks(table));
+                    self.collect_line(line);
+                }
+            }
+        }
+    }
+
+    fn queue(&mut self, chunk: StreamChunk) {
+        let arrived_at = chunk.arrived_at;
+        self.queued.push_back(chunk);
+        let (delay, _) = drain_plan(self.queued.len());
+        let deadline = arrived_at + delay;
+        self.next_drain_at = Some(
+            self.next_drain_at
+                .map(|current| current.min(deadline))
+                .unwrap_or(deadline),
+        );
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        let quiet = self.last_arrival.and_then(|arrived| {
+            (!self.pending.is_empty()
+                && matches!(self.table_holdback, TableHoldback::None)
+                && !is_table_row(&self.pending))
+            .then_some(arrived + STREAM_QUIET_FLUSH)
+        });
+        match (self.next_drain_at, quiet) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        }
+    }
+
+    fn drain_at(&mut self, now: Instant) -> Option<StreamDrain> {
+        if self
+            .last_arrival
+            .is_some_and(|arrived| now.saturating_duration_since(arrived) >= STREAM_QUIET_FLUSH)
+            && !self.pending.is_empty()
+            && matches!(self.table_holdback, TableHoldback::None)
+            && !is_table_row(&self.pending)
+        {
+            let chunk = StreamChunk {
+                text: std::mem::take(&mut self.pending),
+                offset: self.pending_offset,
+                arrived_at: self.last_arrival.expect("quiet stream has an arrival"),
+            };
+            self.pending_offset = None;
+            self.queue(chunk);
+            self.next_drain_at = Some(now);
+        }
+
+        if self.next_drain_at.is_none_or(|deadline| deadline > now) {
+            return None;
+        }
+        let (_, count) = drain_plan(self.queued.len());
+        let mut text = String::new();
+        let mut offset = None;
+        for _ in 0..count {
+            let Some(chunk) = self.queued.pop_front() else {
+                break;
+            };
+            text.push_str(&chunk.text);
+            offset = chunk.offset.or(offset);
+        }
+        if self.queued.is_empty() {
+            self.next_drain_at = None;
+        } else {
+            let (delay, _) = drain_plan(self.queued.len());
+            self.next_drain_at = Some(now + delay);
+        }
+        (!text.is_empty()).then_some(StreamDrain { text, offset })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StreamChunk {
+    text: String,
+    offset: Option<u64>,
+    arrived_at: Instant,
+}
+
+struct StreamDrain {
+    text: String,
+    offset: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum TableHoldback {
+    #[default]
+    None,
+    Candidate(StreamChunk),
+    Table(Vec<StreamChunk>),
+}
+
+fn combine_chunks(chunks: Vec<StreamChunk>) -> StreamChunk {
+    let last = chunks.last().expect("table holdback is nonempty");
+    let offset = last.offset;
+    let arrived_at = last.arrived_at;
+    let mut text = String::new();
+    for chunk in chunks {
+        text.push_str(&chunk.text);
+    }
+    StreamChunk {
+        text,
+        offset,
+        arrived_at,
+    }
+}
+
+fn drain_plan(pressure: usize) -> (Duration, usize) {
+    match pressure {
+        0 => (Duration::ZERO, 0),
+        1..=3 => (Duration::from_millis(40), 1),
+        4..=15 => (Duration::from_millis(24), 2),
+        16..=63 => (Duration::from_millis(12), 4),
+        _ => (Duration::from_millis(8), 8),
+    }
+}
+
+fn is_table_row(line: &str) -> bool {
+    table_cells(line).is_some_and(|cells| cells.len() >= 2)
+}
+
+fn is_table_delimiter(line: &str) -> bool {
+    table_cells(line).is_some_and(|cells| {
+        cells.len() >= 2
+            && cells.into_iter().all(|cell| {
+                let marker = cell.trim().trim_start_matches(':').trim_end_matches(':');
+                marker.len() >= 3 && marker.bytes().all(|byte| byte == b'-')
+            })
+    })
+}
+
+fn table_cells(line: &str) -> Option<Vec<&str>> {
+    let line = line.trim_end_matches(['\r', '\n']).trim();
+    if line.is_empty() || !line.contains('|') {
+        return None;
+    }
+    let line = line.strip_prefix('|').unwrap_or(line);
+    let line = line.strip_suffix('|').unwrap_or(line);
+    Some(line.split('|').collect())
 }
 
 fn model_status_from_transcript(transcript: &TranscriptState) -> Option<ModelIdentityStatus> {

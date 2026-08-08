@@ -708,6 +708,9 @@ does not spawn, supervise, restart, or stop the daemon, and it does not call
 providers, execute tools, or write SQLite directly.
 Assistant text appears live through daemon `events.stream`; replay remains
 based on final ledger messages.
+Live Markdown drains at a pressure-adaptive cadence, flushes quiet partial text
+promptly, holds incomplete tables, and consolidates to the exact raw assistant
+source before transcript reload and resize.
 Session picker statuses are `running`, `finished`, `failed`, `canceled`, or
 `interrupted`; `interrupted` means a daemon restart closed a previously running
 session so it can be resumed. Picker rows show that status, a compact relative
