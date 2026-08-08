@@ -110,6 +110,12 @@ impl ServerStore {
         }
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        let journal_mode: String =
+            connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        if journal_mode != "wal" {
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+        }
+        connection.pragma_update(None, "synchronous", "FULL")?;
         create_thread_authority_tables(&mut connection)?;
         create_thread_stop_table(&connection)?;
         create_workspace_table(&connection)?;
@@ -1020,6 +1026,30 @@ mod tests {
     use super::*;
     use platonic_protocol::ReasoningEffort;
     use std::{fs, path::Path};
+
+    #[test]
+    fn opens_server_store_with_wal_full_and_default_autocheckpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        let store = ServerStore::open_or_create(&path).unwrap();
+
+        let journal_mode: String = store
+            .connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let synchronous: u32 = store
+            .connection
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        let autocheckpoint: u32 = store
+            .connection
+            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(synchronous, 2);
+        assert_eq!(autocheckpoint, 1_000);
+    }
 
     fn thread_authority(
         thread_id: &str,

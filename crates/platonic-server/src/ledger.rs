@@ -360,6 +360,7 @@ impl SqliteLedger {
         let mut connection = Connection::open(path)?;
         configure_sqlite_connection(&connection)?;
         migrate_sqlite(&mut connection)?;
+        configure_sqlite_journal_mode(&connection)?;
         Ok(Self {
             connection,
             schema_version: SQLITE_SCHEMA_VERSION,
@@ -1499,6 +1500,7 @@ fn open_private_default_sqlite(
     let schema_version = if create {
         configure_sqlite_connection(&connection)?;
         migrate_sqlite(&mut connection)?;
+        configure_sqlite_journal_mode(&connection)?;
         SQLITE_SCHEMA_VERSION
     } else {
         configure_sqlite_connection(&connection)?;
@@ -1730,6 +1732,16 @@ fn current_uid() -> u32 {
 
 fn configure_sqlite_connection(connection: &Connection) -> AppResult<()> {
     connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+    connection.pragma_update(None, "synchronous", "FULL")?;
+    Ok(())
+}
+
+fn configure_sqlite_journal_mode(connection: &Connection) -> AppResult<()> {
+    let journal_mode: String =
+        connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if journal_mode != "wal" {
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+    }
     Ok(())
 }
 
@@ -2046,6 +2058,79 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn opens_sqlite_ledger_with_wal_full_and_default_autocheckpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let ledger = SqliteLedger::open_or_create(&path).unwrap();
+
+        let journal_mode: String = ledger
+            .connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let synchronous: u32 = ledger
+            .connection
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        let autocheckpoint: u32 = ledger
+            .connection
+            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(synchronous, 2);
+        assert_eq!(autocheckpoint, 1_000);
+    }
+
+    #[test]
+    fn releasing_held_reader_allows_checkpoint_to_reduce_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let mut writer = SqliteLedger::open_or_create(&path).unwrap();
+        writer
+            .append("run_checkpoint", &started_record("run_checkpoint", 0, 0))
+            .unwrap();
+
+        let reader = SqliteLedger::open_readonly(&path).unwrap();
+        reader.connection.execute_batch("BEGIN").unwrap();
+        let visible_rows: u32 = reader
+            .connection
+            .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(visible_rows, 1);
+
+        writer
+            .append("run_checkpoint", &started_record("run_checkpoint", 1, 1))
+            .unwrap();
+
+        let mut wal_path = path.as_os_str().to_os_string();
+        wal_path.push("-wal");
+        let wal_path = PathBuf::from(wal_path);
+        let wal_len_held = fs::metadata(&wal_path).unwrap().len();
+        let (_, log_frames, checkpointed_frames): (u32, u32, u32) = writer
+            .connection
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+
+        assert!(checkpointed_frames < log_frames);
+
+        reader.connection.execute_batch("COMMIT").unwrap();
+        drop(reader);
+
+        let checkpoint: (u32, u32, u32) = writer
+            .connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        let wal_len_released = fs::metadata(&wal_path).unwrap().len();
+
+        assert_eq!(checkpoint, (0, 0, 0));
+        assert!(wal_len_released < wal_len_held);
+    }
+
     #[cfg(unix)]
     #[test]
     fn default_sqlite_creation_ignores_permissive_umask() {
@@ -2183,12 +2268,15 @@ mod tests {
             .execute_batch("BEGIN IMMEDIATE; UPDATE proof SET value = 2;")
             .unwrap();
 
-        let mut journal = location.as_path().as_os_str().to_os_string();
-        journal.push("-journal");
-        let journal = PathBuf::from(journal);
-        assert!(journal.is_file());
-        assert_eq!(mode(&journal), PRIVATE_FILE_MODE);
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = location.as_path().as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            assert!(sidecar.is_file());
+            assert_eq!(mode(&sidecar), PRIVATE_FILE_MODE);
+        }
         ledger.connection.execute_batch("ROLLBACK").unwrap();
+        drop(ledger);
 
         for suffix in ["-journal", "-wal", "-shm"] {
             let mut sidecar = location.as_path().as_os_str().to_os_string();
