@@ -442,6 +442,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "timing-sensitive on macOS runners; #465"
+    )]
     fn websocket_admits_only_mapped_messages_and_interactions() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();

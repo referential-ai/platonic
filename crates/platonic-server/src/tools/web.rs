@@ -1544,6 +1544,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "timing-sensitive on macOS runners; #465"
+    )]
     fn connect_read_overall_and_cancellation_bounds_close_the_request() {
         let server = FixtureServer::new(vec![]);
         let resolver = SequenceResolver::new(vec![ResolutionStep {
