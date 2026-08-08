@@ -651,6 +651,8 @@ fenced code, and unified diffs in conversation view. User messages remain
 literal, while audit view retains the exact stored transcript source.
 The multiline composer uses the terminal cursor without adding a caret glyph to
 its text. Bracketed paste inserts literal text as one undoable edit.
+Slash-command suggestions use case-insensitive subsequence matching while
+retaining the five-row popup.
 Committed conversation rows use the terminal's native scrollback, so wheel
 scrolling, text selection, search, and transcript retention after exit work as
 they do for ordinary terminal output. Audit, session, help, status, and approval
@@ -713,8 +715,9 @@ Keys:
   `Ctrl-W`, and `Ctrl-Y` retain the existing kill/yank bindings.
 - `v` (with an empty composer): toggle conversation and audit views. A `v`
   typed into a nonempty composer remains input.
-- `/sessions`: open the session picker. Type to filter first-question labels or
-  an exact session ID for recovery (`q` is text); `Backspace` edits; `Up`/`Down`
+- `/sessions`: open the session picker. Type a case-insensitive subsequence of a
+  first-question label or a raw session ID for recovery (`q` is text);
+  `Backspace` edits; `Up`/`Down`
   and `Ctrl-P`/`Ctrl-N` wrap through matches; `Enter` resumes the focused match;
   `Esc` closes. With no matches, `Enter` keeps the picker open.
 - `/status`: request one authoritative runtime readback; `Esc` closes the

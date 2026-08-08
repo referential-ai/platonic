@@ -97,6 +97,10 @@ fn accent_style() -> Style {
     color::active().accent_style()
 }
 
+fn selected_row_style() -> Style {
+    accent_style().add_modifier(Modifier::REVERSED)
+}
+
 fn user_message_style() -> Style {
     color::active().user_message_style()
 }
@@ -1542,16 +1546,17 @@ fn slash_popup_lines(state: &TuiState) -> Vec<Line<'static>> {
         .take(5)
         .enumerate()
         .map(|(index, command)| {
-            let style = if index == popup.selected {
-                accent_style()
+            let selected = index == popup.selected;
+            let style = if selected {
+                selected_row_style()
             } else {
                 chrome_style()
             };
             Line::from(vec![
-                Span::styled(if index == popup.selected { "> " } else { "  " }, style),
+                Span::styled(if selected { "> " } else { "  " }, style),
                 Span::styled(format!("/{}", command.name), style),
-                Span::raw("  "),
-                Span::styled(command.description.to_owned(), chrome_style()),
+                Span::styled("  ", style),
+                Span::styled(command.description.to_owned(), style),
             ])
         })
         .collect()
@@ -1872,10 +1877,20 @@ fn session_picker_row(
     } else {
         " "
     };
-    let style = if focused {
-        accent_style()
+    let focus_style = if focused {
+        selected_row_style()
     } else {
         Style::default()
+    };
+    let status_style = if focused {
+        selected_row_style()
+    } else {
+        status_style(&session.status)
+    };
+    let age_style = if focused {
+        selected_row_style()
+    } else {
+        chrome_style()
     };
     let age = relative_age(session.updated_at_ms, now_ms);
     let prefix_width = 3 + SESSION_STATUS_WIDTH + 1 + SESSION_AGE_WIDTH + 1;
@@ -1884,15 +1899,15 @@ fn session_picker_row(
         .min(SESSION_QUESTION_MAX_CHARS);
     let question = bounded_question_preview(session_question_label(session), question_width);
     Line::from(vec![
-        Span::styled(format!("{focus}{current} "), style),
+        Span::styled(format!("{focus}{current} "), focus_style),
         Span::styled(
             format!("{:<SESSION_STATUS_WIDTH$}", session.status),
-            status_style(&session.status),
+            status_style,
         ),
-        Span::raw(" "),
-        Span::styled(format!("{age:>SESSION_AGE_WIDTH$}"), chrome_style()),
-        Span::raw(" "),
-        Span::raw(question),
+        Span::styled(" ", focus_style),
+        Span::styled(format!("{age:>SESSION_AGE_WIDTH$}"), age_style),
+        Span::styled(" ", focus_style),
+        Span::styled(question, focus_style),
     ])
 }
 
@@ -3454,6 +3469,45 @@ mod tests {
     }
 
     #[test]
+    fn selected_picker_rows_have_full_row_accents_at_40_and_80_columns() {
+        let mut slash_state = TuiState::disconnected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            "offline".into(),
+        );
+        slash_state.set_composer_text("/sp");
+        slash_state.slash_popup = Some(super::super::state::SlashPopupView {
+            filter: "sp".into(),
+            selected: 0,
+        });
+
+        let mut session_state = TuiState::disconnected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            "offline".into(),
+        );
+        session_state.sessions = vec![SessionSummary {
+            session_id: "session_1".into(),
+            run_id: "run_1".into(),
+            status: RunStateName::Finished,
+            latest_question: "Review matching".into(),
+            first_question: "Review matching".into(),
+            updated_at_ms: 1,
+            ledger_path: "/tmp/agent.db".into(),
+        }];
+        session_state.selected_session_id = Some("session_1".into());
+        session_state.session_picker = Some(super::super::state::SessionPickerView {
+            filter: String::new(),
+            selected: 0,
+        });
+
+        for width in [40, 80] {
+            assert_selected_row_accent(&slash_state, width, "> /issue-prep");
+            assert_selected_row_accent(&session_state, width, ">* finished");
+        }
+    }
+
+    #[test]
     fn session_picker_renders_filtered_sessions_and_explicit_no_match() {
         let mut state = TuiState::connected(
             "/tmp/work".into(),
@@ -4096,6 +4150,45 @@ mod tests {
             output.push('\n');
         }
         output
+    }
+
+    fn assert_selected_row_accent(state: &TuiState, width: u16, needle: &str) {
+        let backend = TestBackend::new(width, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_overlay_at(frame, state, 0, 0))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let row = (area.top()..area.bottom())
+            .find(|y| {
+                let text = (area.left()..area.right())
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>();
+                text.contains(needle)
+            })
+            .unwrap_or_else(|| panic!("missing selected row {needle:?} at width {width}"));
+        let start = (area.left()..area.right())
+            .find(|x| buffer[(*x, row)].symbol() == ">")
+            .expect("selected row marker");
+        let styled_cells: Vec<_> = (start..area.right())
+            .filter(|x| {
+                let symbol = buffer[(*x, row)].symbol();
+                !symbol.trim().is_empty() && symbol != "│"
+            })
+            .collect();
+
+        assert!(
+            styled_cells.len() >= 8,
+            "selected row was truncated: {needle}"
+        );
+        for x in styled_cells {
+            let modifiers = buffer[(x, row)].modifier;
+            assert!(
+                modifiers.contains(Modifier::BOLD | Modifier::REVERSED),
+                "selected row cell at ({x}, {row}) lacked its full accent at width {width}"
+            );
+        }
     }
 
     fn cached_row_ptrs(state: &TuiState) -> (*const Line<'static>, *const Line<'static>) {
