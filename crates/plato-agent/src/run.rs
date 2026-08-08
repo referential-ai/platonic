@@ -1,10 +1,11 @@
 //! Daemon-backed one-shot execution for Plato Agent clients.
 
 use crate::{AppError, AppResult};
-use platonic_client::{client::DaemonClient, paths};
+use platonic_client::{ClientError, client::DaemonClient, paths};
 use platonic_core::{RecordedEvent, RunId, TurnId};
 use platonic_protocol::{
-    ApprovalDecision, CompletionClaim, RunOverrides, RunStateName, StreamEvent,
+    ApprovalDecision, CompletionClaim, ERROR_WORKSPACE_UNREGISTERED, RunOverrides, RunStateName,
+    StreamEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -108,7 +109,7 @@ pub struct RunOutcome {
 pub fn ensure_server(workspace_root: &Path) -> AppResult<DaemonClient> {
     let workspace_root = workspace_root.canonicalize()?;
     let socket_path = paths::host_socket_path()?;
-    if let Some(client) = connect_ready(&workspace_root, &socket_path) {
+    if let Some(client) = connect_ready(&workspace_root, &socket_path)? {
         return Ok(client);
     }
 
@@ -130,12 +131,12 @@ pub fn ensure_server(workspace_root: &Path) -> AppResult<DaemonClient> {
 
     let deadline = Instant::now() + ENSURE_TIMEOUT;
     loop {
-        if let Some(client) = connect_ready(&workspace_root, &socket_path) {
+        if let Some(client) = connect_ready(&workspace_root, &socket_path)? {
             return Ok(client);
         }
         if let Some(status) = child.try_wait()? {
             // A concurrent client can win the host lock while our child exits.
-            if let Some(client) = connect_ready(&workspace_root, &socket_path) {
+            if let Some(client) = connect_ready(&workspace_root, &socket_path)? {
                 return Ok(client);
             }
             return Err(AppError::Config(format!(
@@ -156,11 +157,85 @@ pub fn ensure_server(workspace_root: &Path) -> AppResult<DaemonClient> {
     }
 }
 
-fn connect_ready(workspace_root: &Path, socket_path: &Path) -> Option<DaemonClient> {
-    let mut client = DaemonClient::connect_with_timeout(socket_path, CONNECT_TIMEOUT).ok()?;
-    client.hello(workspace_root).ok()?;
-    client.clear_request_timeout().ok()?;
-    Some(client)
+fn connect_ready(workspace_root: &Path, socket_path: &Path) -> AppResult<Option<DaemonClient>> {
+    let mut client = match DaemonClient::connect_with_timeout(socket_path, CONNECT_TIMEOUT) {
+        Ok(client) => client,
+        Err(platonic_client::ClientError::Io(_)) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    client.hello(workspace_root)?;
+    client.clear_request_timeout()?;
+    Ok(Some(client))
+}
+
+/// Ensures a local server, asking once before registering an unrecognized directory.
+pub fn ensure_server_interactive(
+    workspace_root: &Path,
+    input: &mut dyn BufRead,
+    errors: &mut dyn Write,
+) -> AppResult<DaemonClient> {
+    match ensure_server(workspace_root) {
+        Ok(client) => return Ok(client),
+        Err(AppError::DaemonResponse(error)) if error.code == ERROR_WORKSPACE_UNREGISTERED => {}
+        Err(error) => return Err(error),
+    }
+    attach_server_interactive(workspace_root, &paths::host_socket_path()?, input, errors)
+}
+
+/// Attaches to one local endpoint, asking once before registering its directory.
+pub fn attach_server_interactive(
+    workspace_root: &Path,
+    socket_path: &Path,
+    input: &mut dyn BufRead,
+    errors: &mut dyn Write,
+) -> AppResult<DaemonClient> {
+    let workspace_root = workspace_root.canonicalize()?;
+    let mut client = DaemonClient::connect_with_timeout(socket_path, CONNECT_TIMEOUT)?;
+    let registration_error = match client.hello(&workspace_root) {
+        Ok(_) => {
+            client.clear_request_timeout()?;
+            return Ok(client);
+        }
+        Err(ClientError::DaemonResponse(error)) if error.code == ERROR_WORKSPACE_UNREGISTERED => {
+            error
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let default_name = workspace_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("workspace");
+    let Some(name) = prompt_workspace_name(default_name, input, errors)? else {
+        return Err(AppError::DaemonResponse(registration_error));
+    };
+
+    client.workspace_create(name, workspace_root.clone())?;
+    client.hello(&workspace_root)?;
+    client.clear_request_timeout()?;
+    Ok(client)
+}
+
+fn prompt_workspace_name(
+    default_name: &str,
+    input: &mut dyn BufRead,
+    errors: &mut dyn Write,
+) -> AppResult<Option<String>> {
+    write!(
+        errors,
+        "Workspace name [{default_name}] (Enter to create, n to decline): "
+    )?;
+    errors.flush()?;
+    let mut answer = String::new();
+    if input.read_line(&mut answer)? == 0 {
+        return Ok(None);
+    }
+    let name = answer.trim();
+    match name.to_ascii_lowercase().as_str() {
+        "" | "y" | "yes" => Ok(Some(default_name.to_owned())),
+        "n" | "no" => Ok(None),
+        _ => Ok(Some(name.to_owned())),
+    }
 }
 
 fn server_binary() -> AppResult<PathBuf> {
@@ -360,4 +435,42 @@ fn decide_approval(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prompt_workspace_name;
+    use std::io::Cursor;
+
+    #[test]
+    fn interactive_workspace_prompt_creates_on_enter_and_accepts_a_name() {
+        let mut output = Vec::new();
+        assert_eq!(
+            prompt_workspace_name("alpha", &mut Cursor::new("\n"), &mut output).unwrap(),
+            Some("alpha".into())
+        );
+        assert_eq!(
+            prompt_workspace_name("alpha", &mut Cursor::new("beta\n"), &mut output).unwrap(),
+            Some("beta".into())
+        );
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("Workspace name [alpha]")
+        );
+    }
+
+    #[test]
+    fn interactive_workspace_prompt_decline_and_eof_do_not_create() {
+        let mut output = Vec::new();
+        assert_eq!(
+            prompt_workspace_name("alpha", &mut Cursor::new("n\n"), &mut output).unwrap(),
+            None
+        );
+        assert_eq!(
+            prompt_workspace_name("alpha", &mut Cursor::new(Vec::<u8>::new()), &mut output)
+                .unwrap(),
+            None
+        );
+    }
 }

@@ -3,8 +3,10 @@ use platonic_client::{
     client::{DaemonClient, DaemonConnectionConfig},
     paths,
 };
+use platonic_protocol::{AgentId, ReasoningEffort, ThreadApprovalPolicy};
 use platonic_server::{
     AppError, AppResult,
+    config::Config,
     daemon::{
         run_stdio_child,
         server::{DaemonServer, HostDaemonServer},
@@ -19,7 +21,7 @@ use signal_hook::{
 #[cfg(unix)]
 use std::thread;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -76,8 +78,13 @@ enum Command {
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
-        #[arg(long, value_name = "DIR", default_value = ".", global = true)]
-        workspace: PathBuf,
+        #[arg(long, value_name = "PATH", global = true)]
+        socket: Option<PathBuf>,
+    },
+    /// Manage configured agent profiles.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
         #[arg(long, value_name = "PATH", global = true)]
         socket: Option<PathBuf>,
     },
@@ -103,6 +110,44 @@ enum WorkspaceCommand {
     Status {
         #[arg(value_name = "WORKSPACE_ID")]
         workspace_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentCommand {
+    /// Create a configured agent profile.
+    Create {
+        #[arg(value_name = "AGENT_ID")]
+        agent_id: String,
+        #[arg(value_name = "WORKSPACE_ID")]
+        workspace_id: String,
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        #[arg(
+            long,
+            value_name = "EFFORT",
+            default_value = "none",
+            value_parser = parse_reasoning_effort
+        )]
+        reasoning_effort: ReasoningEffort,
+        #[arg(
+            long,
+            value_name = "POLICY",
+            default_value = "prompt",
+            value_parser = parse_approval_policy
+        )]
+        approval_policy: ThreadApprovalPolicy,
+        #[arg(long = "tool", value_name = "TOOL")]
+        toolset: Vec<String>,
+    },
+    /// List every configured agent profile.
+    List,
+    /// Read one configured agent profile.
+    Status {
+        #[arg(value_name = "AGENT_ID")]
+        agent_id: String,
     },
 }
 
@@ -158,11 +203,8 @@ fn run() -> AppResult<()> {
             println!("{}", serde_json::to_string(&client.shutdown_if_idle()?)?);
             Ok(())
         }
-        Some(Command::Workspace {
-            command,
-            workspace,
-            socket,
-        }) => run_workspace(command, workspace, socket),
+        Some(Command::Workspace { command, socket }) => run_workspace(command, socket),
+        Some(Command::Agent { command, socket }) => run_agent(command, socket),
         Some(Command::Gateway { command }) => match command {
             GatewayCommand::Discord {
                 workspace,
@@ -212,12 +254,8 @@ fn connect(workspace: &std::path::Path, socket: Option<PathBuf>) -> AppResult<Da
     Ok(client)
 }
 
-fn run_workspace(
-    command: WorkspaceCommand,
-    workspace: PathBuf,
-    socket: Option<PathBuf>,
-) -> AppResult<()> {
-    let mut client = connect(&workspace, socket)?;
+fn run_workspace(command: WorkspaceCommand, socket: Option<PathBuf>) -> AppResult<()> {
+    let mut client = connect_control(socket)?;
     let output = match command {
         WorkspaceCommand::Create { name, root } => {
             serde_json::to_string(&client.workspace_create(name, root)?)?
@@ -229,6 +267,75 @@ fn run_workspace(
     };
     println!("{output}");
     Ok(())
+}
+
+fn connect_control(socket: Option<PathBuf>) -> AppResult<DaemonClient> {
+    let endpoint = match socket {
+        Some(socket) => socket,
+        None => paths::host_socket_path()?,
+    };
+    Ok(DaemonClient::connect_with_timeout(
+        &endpoint,
+        CLIENT_TIMEOUT,
+    )?)
+}
+
+fn run_agent(command: AgentCommand, socket: Option<PathBuf>) -> AppResult<()> {
+    let mut client = connect_control(socket)?;
+    let output = match command {
+        AgentCommand::Create {
+            agent_id,
+            workspace_id,
+            config,
+            model,
+            reasoning_effort,
+            approval_policy,
+            toolset,
+        } => {
+            let workspace = client.workspace_status(workspace_id.clone())?.workspace;
+            let config = Config::load(Path::new(&workspace.root), config.as_deref())?;
+            if std::env::var_os(&config.provider.api_key_env).is_none() {
+                return Err(AppError::Config(format!(
+                    "provider key is unavailable: set {} (for example, export {}=<provider-key>), or set provider.api_key_env in --config, PLATO_CONFIG, or the user config before running platonic agent create",
+                    config.provider.api_key_env, config.provider.api_key_env
+                )));
+            }
+            let model = model.unwrap_or(config.provider.model);
+            let toolset = if toolset.is_empty() {
+                config.tools.enabled
+            } else {
+                toolset
+            };
+            let result = client.agent_create(
+                AgentId::new(agent_id)?,
+                workspace_id,
+                model,
+                reasoning_effort,
+                approval_policy,
+                toolset,
+            )?;
+            serde_json::to_string(&result)?
+        }
+        AgentCommand::List => serde_json::to_string(&client.agent_list()?)?,
+        AgentCommand::Status { agent_id } => {
+            serde_json::to_string(&client.agent_status(AgentId::new(agent_id)?)?)?
+        }
+    };
+    println!("{output}");
+    Ok(())
+}
+
+fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort, String> {
+    ReasoningEffort::parse(value).ok_or_else(|| {
+        format!(
+            "unknown reasoning effort {value}; expected none, minimal, low, medium, high, xhigh, or max"
+        )
+    })
+}
+
+fn parse_approval_policy(value: &str) -> Result<ThreadApprovalPolicy, String> {
+    ThreadApprovalPolicy::parse(value)
+        .ok_or_else(|| format!("unknown approval policy {value}; expected prompt or yolo"))
 }
 
 #[cfg(unix)]
@@ -266,6 +373,9 @@ mod tests {
         assert!(Cli::try_parse_from(["platonic"]).is_ok());
         assert!(Cli::try_parse_from(["platonic", "serve"]).is_ok());
         assert!(Cli::try_parse_from(["platonic", "serve", "--socket", "agent.sock"]).is_err());
+        assert!(
+            Cli::try_parse_from(["platonic", "workspace", "list", "--workspace", "."]).is_err()
+        );
     }
 
     #[test]

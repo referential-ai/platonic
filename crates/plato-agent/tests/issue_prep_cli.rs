@@ -4,7 +4,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -151,20 +151,56 @@ struct CliEnvironment {
     runtime: PathBuf,
     state: PathBuf,
     home: PathBuf,
+    daemon: Option<Child>,
 }
 
 impl CliEnvironment {
     fn new(workspace: &Path) -> Self {
-        let environment = Self {
+        let mut environment = Self {
             workspace: workspace.to_path_buf(),
             runtime: workspace.join(".runtime"),
             state: workspace.join(".state"),
             home: workspace.join(".home"),
+            daemon: None,
         };
         for directory in [&environment.runtime, &environment.state, &environment.home] {
             fs::create_dir(directory).unwrap();
             #[cfg(unix)]
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let child = environment
+            .command(workspace_binary("platonic"))
+            .arg("serve")
+            .env("PLATO_ISSUE_PREP_TEST_KEY", "test-key")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        environment.daemon = Some(child);
+        let deadline = Instant::now() + PROVIDER_TIMEOUT;
+        loop {
+            let created = environment
+                .command(workspace_binary("platonic"))
+                .args(["workspace", "create", "issue-prep"])
+                .arg(workspace)
+                .output()
+                .unwrap();
+            if created.status.success() {
+                break;
+            }
+            assert!(
+                environment
+                    .daemon
+                    .as_mut()
+                    .unwrap()
+                    .try_wait()
+                    .unwrap()
+                    .is_none(),
+                "issue-prep daemon exited before workspace.create"
+            );
+            assert!(Instant::now() < deadline, "issue-prep daemon did not bind");
+            thread::sleep(Duration::from_millis(10));
         }
         environment
     }
@@ -193,6 +229,16 @@ impl Drop for CliEnvironment {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        if let Some(child) = self.daemon.as_mut() {
+            let deadline = Instant::now() + PROVIDER_TIMEOUT;
+            while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
 }
 

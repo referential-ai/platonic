@@ -6,8 +6,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-use platonic_core::{AgentId, EffectClass, RecordedEvent};
-pub use platonic_core::{HarnessEvent, PolicyDecision};
+pub use platonic_core::{AgentId, HarnessEvent, PolicyDecision};
+use platonic_core::{EffectClass, RecordedEvent};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use serde_json::Value;
 use std::fmt;
@@ -142,9 +142,21 @@ pub const CAPABILITY_THREAD_SEND: &str = "thread.send";
 pub const CAPABILITY_THREAD_EVENTS: &str = "thread.events";
 /// Capability name for stopping one durable thread and its active child process.
 pub const CAPABILITY_THREAD_STOP: &str = "thread.stop";
+/// Capability name for registering one named workspace.
+pub const CAPABILITY_WORKSPACE_CREATE: &str = "workspace.create";
+/// Capability name for listing every registered workspace.
+pub const CAPABILITY_WORKSPACE_LIST: &str = "workspace.list";
+/// Capability name for reading one registered workspace.
+pub const CAPABILITY_WORKSPACE_STATUS: &str = "workspace.status";
+/// Capability name for creating one configured agent profile.
+pub const CAPABILITY_AGENT_CREATE: &str = "agent.create";
+/// Capability name for listing every configured agent profile.
+pub const CAPABILITY_AGENT_LIST: &str = "agent.list";
+/// Capability name for reading one configured agent profile.
+pub const CAPABILITY_AGENT_STATUS: &str = "agent.status";
 
 /// Capabilities advertised by a protocol v1 daemon, in wire order.
-pub const CAPABILITIES: [&str; 20] = [
+pub const CAPABILITIES: [&str; 26] = [
     CAPABILITY_HELLO,
     CAPABILITY_RUN_START,
     CAPABILITY_MESSAGE_APPEND,
@@ -165,6 +177,12 @@ pub const CAPABILITIES: [&str; 20] = [
     CAPABILITY_THREAD_SEND,
     CAPABILITY_THREAD_EVENTS,
     CAPABILITY_THREAD_STOP,
+    CAPABILITY_WORKSPACE_CREATE,
+    CAPABILITY_WORKSPACE_LIST,
+    CAPABILITY_WORKSPACE_STATUS,
+    CAPABILITY_AGENT_CREATE,
+    CAPABILITY_AGENT_LIST,
+    CAPABILITY_AGENT_STATUS,
 ];
 
 /// Error code returned once daemon shutdown has begun.
@@ -207,6 +225,10 @@ pub const ERROR_UNSUPPORTED_METHOD: &str = "unsupported_method";
 pub const ERROR_UNSUPPORTED_VERSION: &str = "unsupported_version";
 /// Error code returned when client and daemon workspaces differ.
 pub const ERROR_WORKSPACE_MISMATCH: &str = "workspace_mismatch";
+/// Error code returned when a directory has not been registered as a workspace.
+pub const ERROR_WORKSPACE_UNREGISTERED: &str = "workspace_unregistered";
+/// Error code returned when a registered workspace directory has vanished.
+pub const ERROR_WORKSPACE_BROKEN: &str = "workspace_broken";
 
 /// Wire name for a daemon run lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -821,6 +843,81 @@ pub struct WorkspaceStatusParams {
 pub struct WorkspaceStatusResult {
     /// The workspace that was read.
     pub workspace: WorkspaceSummary,
+}
+
+/// One configured agent profile as reported over the wire.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSummary {
+    /// Operator-chosen stable agent identifier.
+    pub id: AgentId,
+    /// Hard workspace binding, resolved before any thread runs.
+    pub workspace_id: String,
+    /// Default model used by threads created from this profile.
+    pub model: String,
+    /// Default provider reasoning effort.
+    pub reasoning_effort: ReasoningEffort,
+    /// Default immutable approval policy.
+    pub approval_policy: ThreadApprovalPolicy,
+    /// Default validated internal tool names.
+    pub toolset: Vec<String>,
+    /// When the profile was created, in Unix milliseconds.
+    pub created_at_ms: u64,
+}
+
+/// Parameters for `agent.create`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCreateParams {
+    /// Operator-chosen stable agent identifier.
+    pub agent_id: AgentId,
+    /// Existing present workspace to bind permanently.
+    pub workspace_id: String,
+    /// Default model.
+    pub model: String,
+    /// Default provider reasoning effort.
+    pub reasoning_effort: ReasoningEffort,
+    /// Default immutable approval policy.
+    pub approval_policy: ThreadApprovalPolicy,
+    /// Default internal tool names.
+    pub toolset: Vec<String>,
+}
+
+/// Result returned by `agent.create`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCreateResult {
+    /// The profile that was created.
+    pub agent: AgentSummary,
+}
+
+/// Parameters for `agent.list`.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentListParams {}
+
+/// Result returned by `agent.list`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentListResult {
+    /// Every configured profile in creation order.
+    pub agents: Vec<AgentSummary>,
+}
+
+/// Parameters for `agent.status`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentStatusParams {
+    /// Agent profile to read.
+    pub agent_id: AgentId,
+}
+
+/// Result returned by `agent.status`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentStatusResult {
+    /// The configured profile.
+    pub agent: AgentSummary,
 }
 
 /// Result returned by `thread.list`.
@@ -1745,6 +1842,12 @@ mod tests {
                 "thread.send",
                 "thread.events",
                 "thread.stop",
+                "workspace.create",
+                "workspace.list",
+                "workspace.status",
+                "agent.create",
+                "agent.list",
+                "agent.status",
             ]
         );
         assert_eq!(
@@ -1769,6 +1872,8 @@ mod tests {
                 ERROR_UNSUPPORTED_METHOD,
                 ERROR_UNSUPPORTED_VERSION,
                 ERROR_WORKSPACE_MISMATCH,
+                ERROR_WORKSPACE_UNREGISTERED,
+                ERROR_WORKSPACE_BROKEN,
             ],
             [
                 "daemon_shutting_down",
@@ -1791,6 +1896,8 @@ mod tests {
                 "unsupported_method",
                 "unsupported_version",
                 "workspace_mismatch",
+                "workspace_unregistered",
+                "workspace_broken",
             ]
         );
 
@@ -1817,6 +1924,137 @@ mod tests {
         assert!(!ThreadApprovalPolicy::Prompt.permits(ThreadApprovalPolicy::Yolo));
         assert!(ThreadApprovalPolicy::Yolo.permits(ThreadApprovalPolicy::Prompt));
         assert!(ThreadApprovalPolicy::Yolo.permits(ThreadApprovalPolicy::Yolo));
+    }
+
+    #[test]
+    fn workspace_and_agent_control_fixtures_keep_exact_v1_bytes() {
+        const WORKSPACE_CREATE_REQUEST: &str = r#"{"v":1,"id":"wc_1","kind":"request","method":"workspace.create","params":{"name":"alpha","root":"/tmp/alpha"}}"#;
+        const WORKSPACE_LIST_REQUEST: &str =
+            r#"{"v":1,"id":"wl_1","kind":"request","method":"workspace.list","params":{}}"#;
+        const WORKSPACE_STATUS_REQUEST: &str = r#"{"v":1,"id":"ws_1","kind":"request","method":"workspace.status","params":{"workspace_id":"ws-alpha"}}"#;
+        const WORKSPACE_CREATE_RESPONSE: &str = r#"{"v":1,"id":"wc_1","kind":"response","method":"workspace.create","result":{"workspace":{"created_at_ms":41,"health":"present","id":"ws-alpha","ledger_path":"/state/alpha.db","name":"alpha","root":"/tmp/alpha"}}}"#;
+        const WORKSPACE_LIST_RESPONSE: &str = r#"{"v":1,"id":"wl_1","kind":"response","method":"workspace.list","result":{"workspaces":[{"created_at_ms":41,"health":"present","id":"ws-alpha","ledger_path":"/state/alpha.db","name":"alpha","root":"/tmp/alpha"}]}}"#;
+        const WORKSPACE_STATUS_RESPONSE: &str = r#"{"v":1,"id":"ws_1","kind":"response","method":"workspace.status","result":{"workspace":{"created_at_ms":41,"health":"present","id":"ws-alpha","ledger_path":"/state/alpha.db","name":"alpha","root":"/tmp/alpha"}}}"#;
+        const AGENT_CREATE_REQUEST: &str = r#"{"v":1,"id":"ac_1","kind":"request","method":"agent.create","params":{"agent_id":"builder","approval_policy":"prompt","model":"gpt-5.6-sol","reasoning_effort":"xhigh","toolset":["file.read","file.write"],"workspace_id":"ws-alpha"}}"#;
+        const AGENT_LIST_REQUEST: &str =
+            r#"{"v":1,"id":"al_1","kind":"request","method":"agent.list","params":{}}"#;
+        const AGENT_STATUS_REQUEST: &str = r#"{"v":1,"id":"as_1","kind":"request","method":"agent.status","params":{"agent_id":"builder"}}"#;
+        const AGENT_CREATE_RESPONSE: &str = r#"{"v":1,"id":"ac_1","kind":"response","method":"agent.create","result":{"agent":{"approval_policy":"prompt","created_at_ms":42,"id":"builder","model":"gpt-5.6-sol","reasoning_effort":"xhigh","toolset":["file.read","file.write"],"workspace_id":"ws-alpha"}}}"#;
+        const AGENT_LIST_RESPONSE: &str = r#"{"v":1,"id":"al_1","kind":"response","method":"agent.list","result":{"agents":[{"approval_policy":"prompt","created_at_ms":42,"id":"builder","model":"gpt-5.6-sol","reasoning_effort":"xhigh","toolset":["file.read","file.write"],"workspace_id":"ws-alpha"}]}}"#;
+        const AGENT_STATUS_RESPONSE: &str = r#"{"v":1,"id":"as_1","kind":"response","method":"agent.status","result":{"agent":{"approval_policy":"prompt","created_at_ms":42,"id":"builder","model":"gpt-5.6-sol","reasoning_effort":"xhigh","toolset":["file.read","file.write"],"workspace_id":"ws-alpha"}}}"#;
+
+        for fixture in [
+            WORKSPACE_CREATE_REQUEST,
+            WORKSPACE_LIST_REQUEST,
+            WORKSPACE_STATUS_REQUEST,
+            AGENT_CREATE_REQUEST,
+            AGENT_LIST_REQUEST,
+            AGENT_STATUS_REQUEST,
+        ] {
+            let request = decode_request(fixture).unwrap();
+            let params = request.params.clone().unwrap();
+            match request.method.as_deref().unwrap() {
+                "workspace.create" => {
+                    serde_json::from_value::<WorkspaceCreateParams>(params).unwrap();
+                }
+                "workspace.list" => {
+                    serde_json::from_value::<WorkspaceListParams>(params).unwrap();
+                }
+                "workspace.status" => {
+                    serde_json::from_value::<WorkspaceStatusParams>(params).unwrap();
+                }
+                "agent.create" => {
+                    serde_json::from_value::<AgentCreateParams>(params).unwrap();
+                }
+                "agent.list" => {
+                    serde_json::from_value::<AgentListParams>(params).unwrap();
+                }
+                "agent.status" => {
+                    serde_json::from_value::<AgentStatusParams>(params).unwrap();
+                }
+                method => panic!("unexpected control method: {method}"),
+            }
+            assert_eq!(serde_json::to_string(&request).unwrap(), fixture);
+        }
+
+        let workspace = WorkspaceSummary {
+            id: "ws-alpha".into(),
+            name: "alpha".into(),
+            root: "/tmp/alpha".into(),
+            ledger_path: "/state/alpha.db".into(),
+            created_at_ms: 41,
+            health: WorkspaceHealthName::Present,
+        };
+        let agent = AgentSummary {
+            id: AgentId::new("builder").unwrap(),
+            workspace_id: "ws-alpha".into(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: ReasoningEffort::Xhigh,
+            approval_policy: ThreadApprovalPolicy::Prompt,
+            toolset: vec!["file.read".into(), "file.write".into()],
+            created_at_ms: 42,
+        };
+        let responses = [
+            (
+                Envelope::response_from(
+                    Some("wc_1".into()),
+                    Some("workspace.create".into()),
+                    WorkspaceCreateResult {
+                        workspace: workspace.clone(),
+                    },
+                ),
+                WORKSPACE_CREATE_RESPONSE,
+            ),
+            (
+                Envelope::response_from(
+                    Some("wl_1".into()),
+                    Some("workspace.list".into()),
+                    WorkspaceListResult {
+                        workspaces: vec![workspace.clone()],
+                    },
+                ),
+                WORKSPACE_LIST_RESPONSE,
+            ),
+            (
+                Envelope::response_from(
+                    Some("ws_1".into()),
+                    Some("workspace.status".into()),
+                    WorkspaceStatusResult { workspace },
+                ),
+                WORKSPACE_STATUS_RESPONSE,
+            ),
+            (
+                Envelope::response_from(
+                    Some("ac_1".into()),
+                    Some("agent.create".into()),
+                    AgentCreateResult {
+                        agent: agent.clone(),
+                    },
+                ),
+                AGENT_CREATE_RESPONSE,
+            ),
+            (
+                Envelope::response_from(
+                    Some("al_1".into()),
+                    Some("agent.list".into()),
+                    AgentListResult {
+                        agents: vec![agent.clone()],
+                    },
+                ),
+                AGENT_LIST_RESPONSE,
+            ),
+            (
+                Envelope::response_from(
+                    Some("as_1".into()),
+                    Some("agent.status".into()),
+                    AgentStatusResult { agent },
+                ),
+                AGENT_STATUS_RESPONSE,
+            ),
+        ];
+        for (response, fixture) in responses {
+            assert_eq!(serde_json::to_string(&response).unwrap(), fixture);
+        }
     }
 
     #[test]

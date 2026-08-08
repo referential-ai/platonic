@@ -138,6 +138,7 @@ fn daemon_first_blocks_direct_sqlite_but_allows_jsonl_and_delegated_prompts() {
 #[test]
 fn direct_default_run_blocks_daemon_then_releases_normally() {
     let proof = ProofContext::new();
+    ProofDaemon::start(&proof).stop();
     let provider = BlockingProvider::start("direct answer");
     let config_path = proof.workspace.join("plato.toml");
     write_provider_config(&config_path, &provider.base_url);
@@ -172,6 +173,7 @@ fn direct_default_run_blocks_daemon_then_releases_normally() {
 #[test]
 fn direct_continuation_lookup_holds_lock_and_abrupt_exit_releases_it() {
     let proof = ProofContext::new();
+    ProofDaemon::start(&proof).stop();
     let first_provider = FakeProvider::start(["prior answer"]);
     let config_path = proof.workspace.join("plato.toml");
     write_provider_config(&config_path, &first_provider.base_url);
@@ -766,9 +768,17 @@ fn wait_for_daemon(socket_path: &Path, workspace: &Path, child: &mut Child) {
     loop {
         if let Ok(mut client) =
             DaemonClient::connect_with_timeout(socket_path, Duration::from_millis(200))
-            && client.hello(workspace).is_ok()
         {
-            return;
+            if client.hello(workspace).is_ok() {
+                return;
+            }
+            if client
+                .workspace_create("sqlite-lock-proof".into(), workspace.to_path_buf())
+                .is_ok()
+                && client.hello(workspace).is_ok()
+            {
+                return;
+            }
         }
         if let Some(status) = child.try_wait().unwrap() {
             let stderr = read_pipe(child.stderr.take());

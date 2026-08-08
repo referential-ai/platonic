@@ -42,6 +42,18 @@ pub(crate) struct WorkspaceRecord {
     pub(crate) created_at_ms: u64,
 }
 
+/// One immutable configured agent profile in server-wide state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentRecord {
+    pub(crate) id: AgentId,
+    pub(crate) workspace_id: String,
+    pub(crate) model: String,
+    pub(crate) reasoning_effort: ReasoningEffort,
+    pub(crate) approval_policy: ThreadApprovalPolicy,
+    pub(crate) toolset: Vec<String>,
+    pub(crate) created_at_ms: u64,
+}
+
 /// Whether a registered workspace's directory is still where the registry says.
 ///
 /// A workspace whose directory has vanished is reported broken, never omitted
@@ -119,6 +131,7 @@ impl ServerStore {
         create_thread_authority_tables(&mut connection)?;
         create_thread_stop_table(&connection)?;
         create_workspace_table(&connection)?;
+        create_agent_table(&connection)?;
         create_tool_call_approval_table(&connection)?;
         Ok(Self { connection })
     }
@@ -135,18 +148,17 @@ impl ServerStore {
         Ok(Self { connection })
     }
 
-    /// Register a workspace, or return the existing record under that name.
+    /// Register a workspace while atomically excluding duplicate names and roots.
     ///
-    /// Registration is idempotent so a client that reconnects does not need to
-    /// know whether it is the first.
+    /// The boolean is true only for the caller that inserted the returned row.
     pub(crate) fn register_workspace(
-        &self,
+        &mut self,
         id: &str,
         name: &str,
         root: &str,
         ledger_path: &str,
         now_ms: u64,
-    ) -> AppResult<WorkspaceRecord> {
+    ) -> AppResult<(WorkspaceRecord, bool)> {
         for (field, value) in [
             ("id", id),
             ("name", name),
@@ -159,25 +171,62 @@ impl ServerStore {
                 )));
             }
         }
-        self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = transaction
+            .query_row(
+                "SELECT id, name, root, ledger_path, created_at_ms
+                   FROM workspaces WHERE name = ?1",
+                params![name],
+                workspace_from_row,
+            )
+            .optional()?
+        {
+            transaction.commit()?;
+            return Ok((existing, false));
+        }
+        let root = Path::new(root).canonicalize()?;
+        let root = root.to_string_lossy().into_owned();
+        if let Some(existing) = transaction
+            .query_row(
+                "SELECT id, name, root, ledger_path, created_at_ms
+                   FROM workspaces WHERE root = ?1
+                   ORDER BY created_at_ms, name LIMIT 1",
+                params![root],
+                workspace_from_row,
+            )
+            .optional()?
+        {
+            transaction.commit()?;
+            return Ok((existing, false));
+        }
+        let record = WorkspaceRecord {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            root,
+            ledger_path: ledger_path.to_owned(),
+            created_at_ms: now_ms,
+        };
+        transaction.execute(
             "INSERT INTO workspaces (id, name, root, ledger_path, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(name) DO NOTHING",
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                id,
-                name,
-                root,
-                ledger_path,
+                record.id,
+                record.name,
+                record.root,
+                record.ledger_path,
                 sqlite_i64(now_ms, "workspace created_at_ms")?
             ],
         )?;
-        self.workspace_by_name(name)?
-            .ok_or_else(|| AppError::Config(format!("workspace {name} vanished after insert")))
+        transaction.commit()?;
+        Ok((record, true))
     }
 
     /// Point a workspace at a new directory without disturbing its identity.
     ///
     /// Moving a workspace is a registry update, never a new workspace (P021).
+    #[allow(dead_code)]
     pub(crate) fn relocate_workspace(&self, id: &str, root: &str) -> AppResult<bool> {
         let changed = self.connection.execute(
             "UPDATE workspaces SET root = ?2 WHERE id = ?1",
@@ -210,6 +259,19 @@ impl ServerStore {
             .optional()?)
     }
 
+    pub(crate) fn workspace_by_root(&self, root: &str) -> AppResult<Option<WorkspaceRecord>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT id, name, root, ledger_path, created_at_ms
+                   FROM workspaces WHERE root = ?1
+                   ORDER BY created_at_ms, name LIMIT 1",
+                params![root],
+                workspace_from_row,
+            )
+            .optional()?)
+    }
+
     /// Every registered workspace, whether or not a client has it open.
     ///
     pub(crate) fn workspaces(&self) -> AppResult<Vec<WorkspaceRecord>> {
@@ -223,6 +285,52 @@ impl ServerStore {
             records.push(row?);
         }
         Ok(records)
+    }
+
+    /// Insert one complete profile after its workspace and toolset are validated.
+    pub(crate) fn register_agent(&self, record: &AgentRecord) -> AppResult<bool> {
+        let toolset = serde_json::to_string(&record.toolset)?;
+        let changed = self.connection.execute(
+            "INSERT INTO agents
+               (id, workspace_id, model, reasoning_effort, approval_policy,
+                toolset, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO NOTHING",
+            params![
+                record.id.as_str(),
+                record.workspace_id,
+                record.model,
+                record.reasoning_effort.as_str(),
+                record.approval_policy.as_str(),
+                toolset,
+                sqlite_i64(record.created_at_ms, "agent created_at_ms")?,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn agent(&self, id: &AgentId) -> AppResult<Option<AgentRecord>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT id, workspace_id, model, reasoning_effort,
+                        approval_policy, toolset, created_at_ms
+                   FROM agents WHERE id = ?1",
+                params![id.as_str()],
+                agent_from_row,
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn agents(&self) -> AppResult<Vec<AgentRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, workspace_id, model, reasoning_effort,
+                    approval_policy, toolset, created_at_ms
+               FROM agents ORDER BY created_at_ms, id",
+        )?;
+        Ok(statement
+            .query_map([], agent_from_row)?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Record a tool-call approval before the run blocks on it.
@@ -758,6 +866,34 @@ fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceReco
     })
 }
 
+fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
+    let id = AgentId::new(row.get::<_, String>(0)?)
+        .map_err(|error| invalid_agent_column(0, error.to_string()))?;
+    let reasoning_value: String = row.get(3)?;
+    let reasoning_effort = ReasoningEffort::parse(&reasoning_value).ok_or_else(|| {
+        invalid_agent_column(3, format!("unknown reasoning effort: {reasoning_value}"))
+    })?;
+    let policy_value: String = row.get(4)?;
+    let approval_policy = ThreadApprovalPolicy::parse(&policy_value).ok_or_else(|| {
+        invalid_agent_column(4, format!("unknown approval policy: {policy_value}"))
+    })?;
+    let toolset = serde_json::from_str::<Vec<String>>(&row.get::<_, String>(5)?)
+        .map_err(|error| invalid_agent_column(5, error.to_string()))?;
+    Ok(AgentRecord {
+        id,
+        workspace_id: row.get(1)?,
+        model: row.get(2)?,
+        reasoning_effort,
+        approval_policy,
+        toolset,
+        created_at_ms: row_u64(row, 6, "agent created_at_ms")?,
+    })
+}
+
+fn invalid_agent_column(index: usize, message: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(index, Type::Text, message.into())
+}
+
 /// Mint a workspace id that does not depend on where the workspace lives.
 ///
 /// Deliberately not derived from the path, unlike `paths::workspace_id` (P021):
@@ -808,6 +944,35 @@ fn create_workspace_table(connection: &Connection) -> AppResult<()> {
         WHEN OLD.id IS NOT NEW.id OR OLD.created_at_ms IS NOT NEW.created_at_ms
         BEGIN
           SELECT RAISE(ABORT, 'workspace identity is immutable');
+        END;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn create_agent_table(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS agents (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          model TEXT NOT NULL,
+          reasoning_effort TEXT NOT NULL,
+          approval_policy TEXT NOT NULL,
+          toolset TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TRIGGER IF NOT EXISTS agents_no_update
+        BEFORE UPDATE ON agents
+        BEGIN
+          SELECT RAISE(ABORT, 'agent records are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS agents_no_delete
+        BEFORE DELETE ON agents
+        BEGIN
+          SELECT RAISE(ABORT, 'agent records are immutable');
         END;
         "#,
     )?;
@@ -1025,7 +1190,12 @@ pub(crate) fn thread_stop(path: &Path, thread_id: &str) -> AppResult<Option<Thre
 mod tests {
     use super::*;
     use platonic_protocol::ReasoningEffort;
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     #[test]
     fn opens_server_store_with_wal_full_and_default_autocheckpoint() {
@@ -1463,7 +1633,7 @@ mod tests {
         drop(store);
         fs::remove_dir_all(&alpha_root).unwrap();
 
-        let reopened = ServerStore::open_or_create(&server_db).unwrap();
+        let mut reopened = ServerStore::open_or_create(&server_db).unwrap();
         let workspaces = reopened.workspaces().unwrap();
         assert_eq!(
             workspaces
@@ -1488,8 +1658,8 @@ mod tests {
                 .is_some_and(|authority| authority.granted_paths[0].path.ends_with("alpha"))
         );
 
-        // Registration is idempotent: rebinding a workspace keeps its record.
-        let rebound = reopened
+        // Rebinding reports the existing record without changing it.
+        let (rebound, inserted) = reopened
             .register_workspace(
                 "ws-alpha",
                 "alpha",
@@ -1498,8 +1668,146 @@ mod tests {
                 999,
             )
             .unwrap();
+        assert!(!inserted);
         assert_eq!(rebound.created_at_ms, 10);
         assert_eq!(reopened.workspaces().unwrap().len(), 2);
+    }
+
+    fn run_workspace_registration_race(
+        server_db: PathBuf,
+        registrations: [(String, String, String, u64); 2],
+    ) -> Vec<(WorkspaceRecord, bool)> {
+        drop(ServerStore::open_or_create(&server_db).unwrap());
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = registrations.map(|(id, name, root, created_at_ms)| {
+            let server_db = server_db.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut store = ServerStore::open_or_create(&server_db).unwrap();
+                barrier.wait();
+                store
+                    .register_workspace(&id, &name, &root, &format!("{name}.db"), created_at_ms)
+                    .unwrap()
+            })
+        });
+        barrier.wait();
+        handles.map(|handle| handle.join().unwrap()).into()
+    }
+
+    #[test]
+    fn concurrent_workspace_registration_atomically_rejects_duplicate_name_and_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha_root = dir.path().join("alpha");
+        let beta_root = dir.path().join("beta");
+        fs::create_dir(&alpha_root).unwrap();
+        fs::create_dir(&beta_root).unwrap();
+        let alpha_root = alpha_root
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let beta_root = beta_root
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let same_root = run_workspace_registration_race(
+            dir.path().join("same-root.db"),
+            [
+                ("ws-alpha".into(), "alpha".into(), alpha_root.clone(), 10),
+                ("ws-beta".into(), "beta".into(), alpha_root.clone(), 20),
+            ],
+        );
+        assert_eq!(
+            same_root.iter().filter(|(_, inserted)| *inserted).count(),
+            1
+        );
+        assert_eq!(same_root[0].0, same_root[1].0);
+        assert_eq!(
+            ServerStore::open_or_create(&dir.path().join("same-root.db"))
+                .unwrap()
+                .workspaces()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let same_name = run_workspace_registration_race(
+            dir.path().join("same-name.db"),
+            [
+                ("ws-first".into(), "shared".into(), alpha_root, 30),
+                ("ws-second".into(), "shared".into(), beta_root, 40),
+            ],
+        );
+        assert_eq!(
+            same_name.iter().filter(|(_, inserted)| *inserted).count(),
+            1
+        );
+        assert_eq!(same_name[0].0, same_name[1].0);
+        assert_eq!(
+            ServerStore::open_or_create(&dir.path().join("same-name.db"))
+                .unwrap()
+                .workspaces()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn agents_round_trip_from_server_db_without_partial_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_root = dir.path().join("workspace");
+        fs::create_dir(&workspace_root).unwrap();
+        let server_db = dir.path().join("server.db");
+        let mut store = ServerStore::open_or_create(&server_db).unwrap();
+        store
+            .register_workspace(
+                "ws-alpha",
+                "alpha",
+                &workspace_root.to_string_lossy(),
+                "alpha.db",
+                10,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .workspace_by_root(&workspace_root.to_string_lossy())
+                .unwrap()
+                .unwrap()
+                .id,
+            "ws-alpha"
+        );
+        let record = AgentRecord {
+            id: AgentId::new("builder").unwrap(),
+            workspace_id: "ws-alpha".into(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: ReasoningEffort::Xhigh,
+            approval_policy: ThreadApprovalPolicy::Prompt,
+            toolset: vec!["file.read".into(), "file.write".into()],
+            created_at_ms: 20,
+        };
+
+        assert!(store.register_agent(&record).unwrap());
+        assert!(!store.register_agent(&record).unwrap());
+        assert_eq!(store.agent(&record.id).unwrap(), Some(record.clone()));
+        assert_eq!(store.agents().unwrap(), [record]);
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE agents SET model = 'changed' WHERE id = 'builder'",
+                    []
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .connection
+                .execute("DELETE FROM agents WHERE id = 'builder'", [])
+                .is_err()
+        );
     }
 
     #[test]

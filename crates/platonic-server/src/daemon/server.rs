@@ -7,8 +7,8 @@ use crate::{
         handlers::{handle_line, handle_request},
         lock::WorkspaceLock,
         protocol::{
-            ERROR_MALFORMED_REQUEST, ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind, HelloParams,
-            decode_request,
+            ERROR_INTERNAL, ERROR_MALFORMED_REQUEST, ERROR_WORKSPACE_MISMATCH,
+            ERROR_WORKSPACE_UNREGISTERED, Envelope, EnvelopeKind, HelloParams, decode_request,
         },
         runtime::{DaemonRuntime, RuntimeState},
         transport,
@@ -146,7 +146,6 @@ impl DaemonServer {
         prepare_socket_parent(&paths::runtime_home_and_fallback().0, &paths.socket_path)?;
         let lock = WorkspaceLock::acquire_for_workspace(&paths.workspace_root, &paths.socket_path)?;
         crate::ledger::interrupt_orphaned_default_sqlite_runs(&paths.default_ledger())?;
-        register_workspace(&paths)?;
         let endpoint = BoundEndpoint::bind(paths.socket_path.clone(), reclaim_default_socket)?;
         let runtime = DaemonRuntime::new(paths);
         Ok(Self {
@@ -196,30 +195,58 @@ struct HostRuntime {
     started_at: Instant,
     state: Arc<Mutex<RuntimeState>>,
     stop_requested: Arc<AtomicBool>,
+    control_runtime: DaemonRuntime,
     workspaces: Arc<Mutex<HashMap<PathBuf, HostWorkspaceRuntime>>>,
 }
 
 impl HostRuntime {
-    fn new(socket_path: PathBuf) -> Self {
-        Self {
+    fn new(socket_path: PathBuf) -> AppResult<Self> {
+        let started_at = Instant::now();
+        let state = Arc::new(Mutex::new(RuntimeState::default()));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let control_paths =
+            DaemonPaths::resolve(&std::env::current_dir()?, Some(socket_path.clone()))?;
+        let control_runtime = DaemonRuntime::new_shared(
+            control_paths,
+            started_at,
+            Arc::clone(&state),
+            Arc::clone(&stop_requested),
+        );
+        Ok(Self {
             socket_path,
-            started_at: Instant::now(),
-            state: Arc::new(Mutex::new(RuntimeState::default())),
-            stop_requested: Arc::new(AtomicBool::new(false)),
+            started_at,
+            state,
+            stop_requested,
+            control_runtime,
             workspaces: Arc::new(Mutex::new(HashMap::new())),
-        }
+        })
     }
 
-    fn workspace_runtime(&self, params: &HelloParams) -> Result<DaemonRuntime, String> {
+    fn workspace_runtime(
+        &self,
+        params: &HelloParams,
+    ) -> Result<DaemonRuntime, (&'static str, String)> {
         let workspace_root = PathBuf::from(&params.workspace_root)
             .canonicalize()
-            .map_err(|error| format!("workspace_root cannot be resolved: {error}"))?;
-        let workspace_id = crate::paths::workspace_id(&workspace_root)
-            .map_err(|error| format!("workspace_id cannot be derived: {error}"))?;
+            .map_err(|error| {
+                (
+                    ERROR_WORKSPACE_MISMATCH,
+                    format!("workspace_root cannot be resolved: {error}"),
+                )
+            })?;
+        let workspace_id = crate::paths::workspace_id(&workspace_root).map_err(|error| {
+            (
+                ERROR_WORKSPACE_MISMATCH,
+                format!("workspace_id cannot be derived: {error}"),
+            )
+        })?;
         if params.workspace_id != workspace_id {
-            return Err(format!(
-                "workspace_id mismatch: expected {workspace_id}, got {}",
-                params.workspace_id
+            return Err((
+                ERROR_WORKSPACE_MISMATCH,
+                format!(
+                    "workspace_id mismatch: expected {workspace_id}, got {}",
+                    params.workspace_id
+                ),
             ));
         }
 
@@ -232,13 +259,32 @@ impl HostRuntime {
         }
 
         let paths = DaemonPaths::resolve(&workspace_root, Some(self.socket_path.clone()))
-            .map_err(|error| error.to_string())?;
-        prepare_workspace_lock_parent(&paths).map_err(|error| error.to_string())?;
+            .map_err(|error| (ERROR_INTERNAL, error.to_string()))?;
+        let store = paths
+            .server_store()
+            .map_err(|error| (ERROR_INTERNAL, error.to_string()))?;
+        if store
+            .workspace_by_root(&workspace_root.to_string_lossy())
+            .map_err(|error| (ERROR_INTERNAL, error.to_string()))?
+            .is_none()
+        {
+            return Err((
+                ERROR_WORKSPACE_UNREGISTERED,
+                format!(
+                    "workspace is not registered: {}; run platonic workspace create <name> \"{}\"",
+                    workspace_root.display(),
+                    workspace_root.display()
+                ),
+            ));
+        }
+        drop(store);
+        prepare_workspace_lock_parent(&paths)
+            .map_err(|error| (ERROR_INTERNAL, error.to_string()))?;
         let workspace_lock =
             WorkspaceLock::acquire_for_workspace(&paths.workspace_root, &paths.socket_path)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| (ERROR_INTERNAL, error.to_string()))?;
         crate::ledger::interrupt_orphaned_default_sqlite_runs(&paths.default_ledger())
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| (ERROR_INTERNAL, error.to_string()))?;
         let runtime = DaemonRuntime::new_shared(
             paths,
             self.started_at,
@@ -287,7 +333,7 @@ impl HostDaemonServer {
         let endpoint = BoundEndpoint::bind(socket_path.clone(), true)?;
         Ok(Self {
             endpoint,
-            runtime: HostRuntime::new(socket_path),
+            runtime: HostRuntime::new(socket_path)?,
             handlers: Arc::new(HandlerCapacity::default()),
             _lock: lock,
         })
@@ -313,41 +359,6 @@ impl HostDaemonServer {
         let stream = transport::accept(&self.endpoint.listener)?;
         handle_host_stream(self.runtime.clone(), stream)
     }
-}
-
-/// Record this workspace in the server-wide registry.
-///
-/// Binding is the moment the server learns a workspace exists, so it is the
-/// moment the registry must learn it too. Registration is idempotent: a
-/// workspace bound before keeps its original identity and creation time.
-///
-/// A workspace bound this way is auto-registered under its path-derived name.
-/// `workspace.create` exists so a workspace can instead be named deliberately;
-/// requiring creation before use is a separate change, because it withdraws
-/// the "enter a directory and go" path every client currently relies on.
-fn register_workspace(paths: &DaemonPaths) -> AppResult<()> {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or_default();
-    let store = paths.server_store()?;
-    let root = paths.workspace_root.to_string_lossy().into_owned();
-    // The name is stable across moves; the root is not. An existing workspace
-    // that has moved is relocated rather than duplicated (P021).
-    if let Some(existing) = store.workspace_by_name(&paths.workspace_id)? {
-        if existing.root != root {
-            store.relocate_workspace(&existing.id, &root)?;
-        }
-        return Ok(());
-    }
-    store.register_workspace(
-        &crate::server_store::mint_workspace_id(&paths.workspace_id, now_ms),
-        &paths.workspace_id,
-        &root,
-        &paths.ledger_path.to_string_lossy(),
-        now_ms,
-    )?;
-    Ok(())
 }
 
 fn prepare_workspace_lock_parent(paths: &DaemonPaths) -> AppResult<()> {
@@ -669,6 +680,9 @@ fn handle_host_line(
         Ok(request) => request,
         Err(error) => return *error,
     };
+    if request.method.as_deref().is_some_and(is_control_method) {
+        return handle_request(&host.control_runtime, request);
+    }
     if request.method.as_deref() != Some("hello") {
         let method = request.method.clone();
         return Envelope::error(
@@ -704,13 +718,8 @@ fn handle_host_line(
     };
     let runtime = match host.workspace_runtime(&params) {
         Ok(runtime) => runtime,
-        Err(error) => {
-            return Envelope::error(
-                request.id,
-                Some("hello".into()),
-                ERROR_WORKSPACE_MISMATCH,
-                error,
-            );
+        Err((code, message)) => {
+            return Envelope::error(request.id, Some("hello".into()), code, message);
         }
     };
     let response = add_host_scope(handle_request(&runtime, request));
@@ -718,6 +727,18 @@ fn handle_host_line(
         *workspace_runtime = Some(runtime);
     }
     response
+}
+
+fn is_control_method(method: &str) -> bool {
+    matches!(
+        method,
+        "workspace.create"
+            | "workspace.list"
+            | "workspace.status"
+            | "agent.create"
+            | "agent.list"
+            | "agent.status"
+    )
 }
 
 fn add_host_scope(mut response: Envelope) -> Envelope {
@@ -1089,6 +1110,23 @@ mod tests {
         }
     }
 
+    fn register_legacy_workspace(server: &DaemonServer) {
+        let response = server.handle_line(
+            &json!({
+                "v": 1,
+                "id": "workspace_create",
+                "kind": "request",
+                "method": "workspace.create",
+                "params": {
+                    "name": server.paths().workspace_id,
+                    "root": server.paths().workspace_root,
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(response.kind, EnvelopeKind::Response);
+    }
+
     #[test]
     fn bind_sets_private_socket_permissions() {
         let workspace = tempfile::tempdir().unwrap();
@@ -1274,6 +1312,7 @@ mod tests {
         let socket_path = socket_root.path().join("agent.sock");
         let first_server =
             DaemonServer::bind(first_workspace.path(), Some(socket_path.clone())).unwrap();
+        register_legacy_workspace(&first_server);
         let first_identity = socket_identity(&socket_path);
 
         let error =
@@ -1319,6 +1358,7 @@ mod tests {
             explicit_default.then(|| socket_path.clone()),
         )
         .unwrap();
+        register_legacy_workspace(&server);
 
         assert_eq!(server.paths().socket_path, socket_path);
         assert_eq!(mode(&socket_path), SOCKET_MODE);
@@ -1373,14 +1413,35 @@ mod tests {
     }
 
     #[test]
-    fn hello_round_trip_over_unix_socket() {
+    fn legacy_hello_requires_workspace_create_before_round_trip() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let server =
+            Arc::new(DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap());
         let paths = server.paths().clone();
 
-        let handle = thread::spawn(move || server.serve_next().unwrap());
+        let runner = Arc::clone(&server);
+        let handle = thread::spawn(move || {
+            for _ in 0..3 {
+                runner.serve_next().unwrap();
+            }
+        });
+
+        let mut unregistered = DaemonClient::connect(&socket_path).unwrap();
+        let error = unregistered.hello(workspace.path()).unwrap_err();
+        assert!(matches!(
+            error,
+            platonic_client::ClientError::DaemonResponse(ProtocolError { ref code, .. })
+                if code == ERROR_WORKSPACE_UNREGISTERED
+        ));
+        drop(unregistered);
+
+        let mut control = DaemonClient::connect(&socket_path).unwrap();
+        control
+            .workspace_create("legacy".into(), workspace.path().to_path_buf())
+            .unwrap();
+        drop(control);
 
         let mut stream = UnixStream::connect(&socket_path).unwrap();
         writeln!(
@@ -1394,6 +1455,7 @@ mod tests {
 
         let mut raw = String::new();
         stream.read_to_string(&mut raw).unwrap();
+        drop(stream);
         handle.join().unwrap();
         let response: Envelope = serde_json::from_str(raw.trim()).unwrap();
 
@@ -1426,7 +1488,13 @@ mod tests {
                 "thread.authority",
                 "thread.send",
                 "thread.events",
-                "thread.stop"
+                "thread.stop",
+                "workspace.create",
+                "workspace.list",
+                "workspace.status",
+                "agent.create",
+                "agent.list",
+                "agent.status"
             ])
         );
     }
@@ -1437,28 +1505,51 @@ mod tests {
         let workspace = root.path().join("workspace");
         fs::create_dir(&workspace).unwrap();
         paths::with_test_xdg(root.path(), || {
-            let server = HostDaemonServer::bind().unwrap();
+            let server = Arc::new(HostDaemonServer::bind().unwrap());
             let socket_path = server.socket_path().to_path_buf();
             let workspace_id = paths::workspace_id(&workspace).unwrap();
             assert_eq!(socket_path, paths::host_socket_path().unwrap());
             assert_ne!(socket_path, paths::default_socket_path(&workspace).unwrap());
 
-            let handle = thread::spawn(move || server.serve_next().unwrap());
-            let mut stream = UnixStream::connect(&socket_path).unwrap();
+            let runner = Arc::clone(&server);
+            let handle = thread::spawn(move || {
+                for _ in 0..3 {
+                    runner.serve_next().unwrap();
+                }
+            });
+
+            let mut unregistered = DaemonClient::connect(&socket_path).unwrap();
+            let error = unregistered.hello(&workspace).unwrap_err();
+            assert!(matches!(
+                error,
+                platonic_client::ClientError::DaemonResponse(ProtocolError { ref code, ref message })
+                    if code == ERROR_WORKSPACE_UNREGISTERED
+                        && message.contains("platonic workspace create")
+            ));
+            drop(unregistered);
+
+            let mut control = DaemonClient::connect(&socket_path).unwrap();
+            assert!(control.workspace_list().unwrap().workspaces.is_empty());
+            let created = control
+                .workspace_create("workspace".into(), workspace.clone())
+                .unwrap();
+            assert_eq!(Path::new(&created.workspace.root), workspace);
+            drop(control);
+
+            let mut attached = UnixStream::connect(&socket_path).unwrap();
             writeln!(
-                stream,
+                attached,
                 r#"{{"v":1,"id":"host_hello","kind":"request","method":"hello","params":{{"workspace_root":"{}","workspace_id":"{}"}}}}"#,
                 workspace.display(),
                 workspace_id
             )
             .unwrap();
-            stream.shutdown(std::net::Shutdown::Write).unwrap();
-
+            attached.shutdown(std::net::Shutdown::Write).unwrap();
             let mut raw = String::new();
-            stream.read_to_string(&mut raw).unwrap();
-            handle.join().unwrap();
+            attached.read_to_string(&mut raw).unwrap();
             let response: Envelope = serde_json::from_str(raw.trim()).unwrap();
             let result = response.result.unwrap();
+            handle.join().unwrap();
 
             assert_eq!(response.kind, EnvelopeKind::Response);
             assert_eq!(result["daemon_scope"], "host");
@@ -1760,6 +1851,7 @@ base_url = "https://example.invalid/v1"
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
         let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        register_legacy_workspace(&server);
         let paths = server.paths().clone();
         let runtime = server.runtime.clone();
         let record = Arc::new(RunRecord::new(

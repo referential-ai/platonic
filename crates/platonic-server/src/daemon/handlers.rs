@@ -4,27 +4,29 @@ use crate::{
     config::{Config, ProviderKind},
     daemon::{
         protocol::{
-            ApprovalDecideParams, ApprovalDecision, ApprovalDecisionName, CAPABILITIES,
-            CommandAcceptedResult, DaemonStatusDaemon, DaemonStatusModel, DaemonStatusParams,
-            DaemonStatusProviderKind, DaemonStatusResult, DaemonStatusSession,
-            DaemonStatusTokenUsage, DaemonStatusTrust, DaemonStatusUsage,
-            ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
-            ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
-            ERROR_SESSIONS_LIST_FAILED, ERROR_THREAD_AUTHORITY_EXCEEDED,
+            AgentCreateParams, AgentCreateResult, AgentListParams, AgentListResult,
+            AgentStatusParams, AgentStatusResult, AgentSummary, ApprovalDecideParams,
+            ApprovalDecision, ApprovalDecisionName, CAPABILITIES, CommandAcceptedResult,
+            DaemonStatusDaemon, DaemonStatusModel, DaemonStatusParams, DaemonStatusProviderKind,
+            DaemonStatusResult, DaemonStatusSession, DaemonStatusTokenUsage, DaemonStatusTrust,
+            DaemonStatusUsage, ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED,
+            ERROR_LAGGED, ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD,
+            ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED, ERROR_THREAD_AUTHORITY_EXCEEDED,
             ERROR_THREAD_AUTHORITY_FAILED, ERROR_THREAD_EVENTS_FAILED, ERROR_THREAD_LIST_FAILED,
             ERROR_THREAD_SEND_FAILED, ERROR_THREAD_SPAWN_FAILED, ERROR_THREAD_STATUS_FAILED,
-            ERROR_THREAD_STOP_FAILED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH, Envelope,
-            EventsStreamParams, EventsStreamResult, HelloParams, HelloResult, IssuePrepResult,
-            IssuePrepStartParams, IssuePrepStartResult, MessageAppendParams, ModelIdentityStatus,
-            RunCancelParams, RunStartParams, RunStartResult, RunStateName, SessionSummary,
-            SessionsListResult, ShutdownIfIdleResult, ShutdownIfIdleResultName,
-            ThreadApprovalPolicy, ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams,
-            ThreadListResult, ThreadSendParams, ThreadSpawnDecision, ThreadSpawnParams,
-            ThreadSpawnResult, ThreadStatus, ThreadStatusParams, ThreadStatusResult,
-            ThreadStopParams, ThreadStopResult, TranscriptReadParams, TranscriptReadResult,
-            TypedRun, TypedTranscript, TypedTranscriptEntry, WorkspaceCreateParams,
-            WorkspaceCreateResult, WorkspaceHealthName, WorkspaceListParams, WorkspaceListResult,
-            WorkspaceStatusParams, WorkspaceStatusResult, WorkspaceSummary, decode_request,
+            ERROR_THREAD_STOP_FAILED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_BROKEN,
+            ERROR_WORKSPACE_MISMATCH, ERROR_WORKSPACE_UNREGISTERED, Envelope, EventsStreamParams,
+            EventsStreamResult, HelloParams, HelloResult, IssuePrepResult, IssuePrepStartParams,
+            IssuePrepStartResult, MessageAppendParams, ModelIdentityStatus, RunCancelParams,
+            RunStartParams, RunStartResult, RunStateName, SessionSummary, SessionsListResult,
+            ShutdownIfIdleResult, ShutdownIfIdleResultName, ThreadApprovalPolicy,
+            ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams, ThreadListResult,
+            ThreadSendParams, ThreadSpawnDecision, ThreadSpawnParams, ThreadSpawnResult,
+            ThreadStatus, ThreadStatusParams, ThreadStatusResult, ThreadStopParams,
+            ThreadStopResult, TranscriptReadParams, TranscriptReadResult, TypedRun,
+            TypedTranscript, TypedTranscriptEntry, WorkspaceCreateParams, WorkspaceCreateResult,
+            WorkspaceHealthName, WorkspaceListParams, WorkspaceListResult, WorkspaceStatusParams,
+            WorkspaceStatusResult, WorkspaceSummary, decode_request,
         },
         runtime::{
             DaemonRuntime, IssuePrepAdmissionError, RunAdmissionError, RunRecord,
@@ -39,14 +41,14 @@ use crate::{
     new_run_id, new_session_id,
     paths::DefaultSqlitePath,
     replay::{format_readback, format_session_readback},
-    server_store::ServerStore,
+    server_store::{AgentRecord, ServerStore},
     thread_authority::{
         THREAD_SPAWN_APPROVAL_REASON, ThreadAuthorityDraft, ThreadAuthorityDraftParams,
         ThreadAuthorityError, ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, ThreadStopRecord,
         authority_working_directory, legacy_status_authority, new_spawn_id, new_thread_turn_id,
         now_ms, thread_spawn_effect, validate_child_authority,
     },
-    tool_catalog::{SHELL_EXEC, effect_for_tool},
+    tool_catalog::{SHELL_EXEC, effect_for_tool, is_known_tool},
 };
 use platonic_core::{
     ActorId, AgentId, EffectClass, HarnessEvent, ReadbackEntry, RecordedEvent, RunReadback, TurnId,
@@ -112,6 +114,13 @@ pub(super) fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Enve
             "workspace.status",
             handle_workspace_status,
         ),
+        Some("agent.create") => {
+            handle_with_params(runtime, request, "agent.create", handle_agent_create)
+        }
+        Some("agent.list") => handle_with_params(runtime, request, "agent.list", handle_agent_list),
+        Some("agent.status") => {
+            handle_with_params(runtime, request, "agent.status", handle_agent_status)
+        }
         Some("thread.status") => {
             handle_with_params(runtime, request, "thread.status", handle_thread_status)
         }
@@ -187,6 +196,27 @@ fn handle_hello(runtime: &DaemonRuntime, request: Envelope, params: HelloParams)
                 format!("workspace_root cannot be resolved: {error}"),
             );
         }
+    }
+
+    let store = match runtime.paths.server_store() {
+        Ok(store) => store,
+        Err(error) => return store_error(request.id, "hello", error),
+    };
+    match store.workspace_by_root(&runtime.paths.workspace_root.to_string_lossy()) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Envelope::error(
+                request.id,
+                Some("hello".into()),
+                ERROR_WORKSPACE_UNREGISTERED,
+                format!(
+                    "workspace is not registered: {}; run platonic workspace create <name> \"{}\"",
+                    runtime.paths.workspace_root.display(),
+                    runtime.paths.workspace_root.display()
+                ),
+            );
+        }
+        Err(error) => return store_error(request.id, "hello", error),
     }
 
     Envelope::response_from(
@@ -325,7 +355,9 @@ fn known_build_part(part: Option<&str>) -> Option<String> {
 enum ThreadSpawnFailure {
     ShuttingDown,
     Malformed(String),
+    Unregistered(String),
     NotFound(String),
+    WorkspaceBroken(String),
     Authority(ThreadAuthorityError),
     Overload(String),
     Conflict(String),
@@ -346,10 +378,22 @@ fn handle_thread_spawn(
             ERROR_MALFORMED_REQUEST,
             message,
         ),
+        Err(ThreadSpawnFailure::Unregistered(message)) => Envelope::error(
+            request.id,
+            Some("thread.spawn".into()),
+            ERROR_WORKSPACE_UNREGISTERED,
+            message,
+        ),
         Err(ThreadSpawnFailure::NotFound(message)) => Envelope::error(
             request.id,
             Some("thread.spawn".into()),
             ERROR_NOT_FOUND,
+            message,
+        ),
+        Err(ThreadSpawnFailure::WorkspaceBroken(message)) => Envelope::error(
+            request.id,
+            Some("thread.spawn".into()),
+            ERROR_WORKSPACE_BROKEN,
             message,
         ),
         Err(ThreadSpawnFailure::Authority(error)) => Envelope::error(
@@ -420,6 +464,28 @@ fn start_thread_spawn(
             "thread cwd must be an absolute path".into(),
         ));
     }
+    let mut store = runtime
+        .paths
+        .server_store()
+        .map_err(|_| ThreadSpawnFailure::Persistence)?;
+    match store
+        .workspace_by_root(&runtime.paths.workspace_root.to_string_lossy())
+        .map_err(|_| ThreadSpawnFailure::Persistence)?
+    {
+        Some(workspace) if workspace.health() == crate::server_store::WorkspaceHealth::Present => {}
+        Some(workspace) => {
+            return Err(ThreadSpawnFailure::WorkspaceBroken(format!(
+                "workspace directory is missing: {}",
+                workspace.id
+            )));
+        }
+        None => {
+            return Err(ThreadSpawnFailure::Unregistered(format!(
+                "workspace is not registered: {}; run platonic workspace create",
+                runtime.paths.workspace_root.display()
+            )));
+        }
+    }
     let config = Config::load(cwd, None)
         .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
     let writable = config.tools.enabled.iter().any(|tool| {
@@ -446,10 +512,6 @@ fn start_thread_spawn(
         network,
     })
     .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
-    let mut store = runtime
-        .paths
-        .server_store()
-        .map_err(|_| ThreadSpawnFailure::Persistence)?;
     let parent = read_live_parent(runtime, &store, &draft)?;
     let auto_grant = parent.as_ref().is_some_and(|parent| {
         parent.approval_policy == crate::daemon::protocol::ThreadApprovalPolicy::Yolo
@@ -1882,7 +1944,7 @@ fn handle_workspace_create(
             );
         }
     };
-    let store = match runtime.paths.server_store() {
+    let mut store = match runtime.paths.server_store() {
         Ok(store) => store,
         Err(error) => return store_error(request.id, "workspace.create", error),
     };
@@ -1893,6 +1955,22 @@ fn handle_workspace_create(
                 Some("workspace.create".into()),
                 ERROR_MALFORMED_REQUEST,
                 format!("workspace already exists: {name}"),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => return store_error(request.id, "workspace.create", error),
+    }
+    match store.workspace_by_root(&root.to_string_lossy()) {
+        Ok(Some(existing)) => {
+            return Envelope::error(
+                request.id,
+                Some("workspace.create".into()),
+                ERROR_MALFORMED_REQUEST,
+                format!(
+                    "workspace root is already registered as {}: {}",
+                    existing.name,
+                    root.display()
+                ),
             );
         }
         Ok(None) => {}
@@ -1910,12 +1988,28 @@ fn handle_workspace_create(
         &ledger_path.to_string_lossy(),
         now_ms,
     ) {
-        Ok(record) => Envelope::response_from(
+        Ok((record, true)) => Envelope::response_from(
             request.id,
             Some("workspace.create".into()),
             WorkspaceCreateResult {
                 workspace: workspace_summary(&record),
             },
+        ),
+        Ok((existing, false)) if existing.name == name => Envelope::error(
+            request.id,
+            Some("workspace.create".into()),
+            ERROR_MALFORMED_REQUEST,
+            format!("workspace already exists: {name}"),
+        ),
+        Ok((existing, false)) => Envelope::error(
+            request.id,
+            Some("workspace.create".into()),
+            ERROR_MALFORMED_REQUEST,
+            format!(
+                "workspace root is already registered as {}: {}",
+                existing.name,
+                root.display()
+            ),
         ),
         Err(error) => store_error(request.id, "workspace.create", error),
     }
@@ -1968,6 +2062,159 @@ fn handle_workspace_status(
             format!("workspace not found: {}", params.workspace_id),
         ),
         Err(error) => store_error(request.id, "workspace.status", error),
+    }
+}
+
+fn agent_summary(record: &AgentRecord) -> AgentSummary {
+    AgentSummary {
+        id: record.id.clone(),
+        workspace_id: record.workspace_id.clone(),
+        model: record.model.clone(),
+        reasoning_effort: record.reasoning_effort,
+        approval_policy: record.approval_policy,
+        toolset: record.toolset.clone(),
+        created_at_ms: record.created_at_ms,
+    }
+}
+
+fn handle_agent_create(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: AgentCreateParams,
+) -> Envelope {
+    if params.model.trim().is_empty() {
+        return Envelope::error(
+            request.id,
+            Some("agent.create".into()),
+            ERROR_MALFORMED_REQUEST,
+            "agent model must not be empty",
+        );
+    }
+    if params.toolset.is_empty() {
+        return Envelope::error(
+            request.id,
+            Some("agent.create".into()),
+            ERROR_MALFORMED_REQUEST,
+            "agent toolset must not be empty",
+        );
+    }
+    if let Some(tool) = params.toolset.iter().find(|tool| !is_known_tool(tool)) {
+        return Envelope::error(
+            request.id,
+            Some("agent.create".into()),
+            ERROR_MALFORMED_REQUEST,
+            format!("unknown tool in agent toolset: {tool}"),
+        );
+    }
+    let store = match runtime.paths.server_store() {
+        Ok(store) => store,
+        Err(error) => return store_error(request.id, "agent.create", error),
+    };
+    match store.workspace(&params.workspace_id) {
+        Ok(Some(workspace))
+            if workspace.health() == crate::server_store::WorkspaceHealth::Present => {}
+        Ok(Some(_)) => {
+            return Envelope::error(
+                request.id,
+                Some("agent.create".into()),
+                ERROR_WORKSPACE_BROKEN,
+                format!("workspace directory is missing: {}", params.workspace_id),
+            );
+        }
+        Ok(None) => {
+            return Envelope::error(
+                request.id,
+                Some("agent.create".into()),
+                ERROR_NOT_FOUND,
+                format!("workspace not found: {}", params.workspace_id),
+            );
+        }
+        Err(error) => return store_error(request.id, "agent.create", error),
+    }
+    match store.agent(&params.agent_id) {
+        Ok(Some(_)) => {
+            return Envelope::error(
+                request.id,
+                Some("agent.create".into()),
+                ERROR_MALFORMED_REQUEST,
+                format!("agent already exists: {}", params.agent_id),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => return store_error(request.id, "agent.create", error),
+    }
+    let record = AgentRecord {
+        id: params.agent_id,
+        workspace_id: params.workspace_id,
+        model: params.model,
+        reasoning_effort: params.reasoning_effort,
+        approval_policy: params.approval_policy,
+        toolset: params.toolset,
+        created_at_ms: now_ms(),
+    };
+    match store.register_agent(&record) {
+        Ok(true) => Envelope::response_from(
+            request.id,
+            Some("agent.create".into()),
+            AgentCreateResult {
+                agent: agent_summary(&record),
+            },
+        ),
+        Ok(false) => Envelope::error(
+            request.id,
+            Some("agent.create".into()),
+            ERROR_MALFORMED_REQUEST,
+            format!("agent already exists: {}", record.id),
+        ),
+        Err(error) => store_error(request.id, "agent.create", error),
+    }
+}
+
+fn handle_agent_list(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    _params: AgentListParams,
+) -> Envelope {
+    let store = match runtime.paths.server_store() {
+        Ok(store) => store,
+        Err(error) => return store_error(request.id, "agent.list", error),
+    };
+    match store.agents() {
+        Ok(records) => Envelope::response_from(
+            request.id,
+            Some("agent.list".into()),
+            AgentListResult {
+                agents: records.iter().map(agent_summary).collect(),
+            },
+        ),
+        Err(error) => store_error(request.id, "agent.list", error),
+    }
+}
+
+fn handle_agent_status(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: AgentStatusParams,
+) -> Envelope {
+    let store = match runtime.paths.server_store() {
+        Ok(store) => store,
+        Err(error) => return store_error(request.id, "agent.status", error),
+    };
+    match store.agent(&params.agent_id) {
+        Ok(Some(record)) => Envelope::response_from(
+            request.id,
+            Some("agent.status".into()),
+            AgentStatusResult {
+                agent: agent_summary(&record),
+            },
+        ),
+        Ok(None) => Envelope::error(
+            request.id,
+            Some("agent.status".into()),
+            ERROR_NOT_FOUND,
+            format!("agent not found: {}", params.agent_id),
+        ),
+        Err(error) => store_error(request.id, "agent.status", error),
     }
 }
 
@@ -2438,9 +2685,12 @@ mod tests {
     use serde_json::json;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
-    use std::{sync::Barrier, time::Duration};
+    use std::{
+        sync::{Arc, Barrier},
+        time::Duration,
+    };
 
-    fn thread_test_runtime() -> (tempfile::TempDir, DaemonRuntime) {
+    fn bare_thread_test_runtime() -> (tempfile::TempDir, DaemonRuntime) {
         let root = tempfile::tempdir().unwrap();
         let workspace_root = root.path().join("workspace");
         std::fs::create_dir(&workspace_root).unwrap();
@@ -2462,6 +2712,23 @@ mod tests {
         (root, runtime)
     }
 
+    fn thread_test_runtime() -> (tempfile::TempDir, DaemonRuntime) {
+        let (root, runtime) = bare_thread_test_runtime();
+        runtime
+            .paths
+            .server_store()
+            .unwrap()
+            .register_workspace(
+                "workspace-thread-tests",
+                "thread-tests",
+                &runtime.paths.workspace_root.to_string_lossy(),
+                &runtime.paths.ledger_path.to_string_lossy(),
+                1,
+            )
+            .unwrap();
+        (root, runtime)
+    }
+
     fn workspace_request(id: &str, method: &str, params: serde_json::Value) -> Envelope {
         Envelope {
             v: 1,
@@ -2479,7 +2746,7 @@ mod tests {
     /// omitted when its directory vanishes (P021).
     #[test]
     fn workspace_is_created_listed_inspected_and_stays_itself_when_moved_or_broken() {
-        let (root, runtime) = thread_test_runtime();
+        let (root, runtime) = bare_thread_test_runtime();
         let first = root.path().join("first");
         std::fs::create_dir(&first).unwrap();
 
@@ -2512,6 +2779,22 @@ mod tests {
             ),
         );
         assert_eq!(duplicate.kind, crate::daemon::protocol::EnvelopeKind::Error);
+
+        let duplicate_root = handle_request(
+            &runtime,
+            workspace_request(
+                "c2-root",
+                "workspace.create",
+                json!({"name": "beta", "root": first.to_string_lossy()}),
+            ),
+        );
+        let duplicate_root = duplicate_root.error.unwrap();
+        assert_eq!(duplicate_root.code, ERROR_MALFORMED_REQUEST);
+        assert!(
+            duplicate_root
+                .message
+                .contains("already registered as alpha")
+        );
 
         // A root that is not a directory is refused, never registered broken.
         let missing = handle_request(
@@ -2580,6 +2863,206 @@ mod tests {
         assert_eq!(broken.workspaces[0].id, id);
     }
 
+    #[test]
+    fn concurrent_workspace_create_returns_one_typed_duplicate_without_a_second_row() {
+        let (root, runtime) = bare_thread_test_runtime();
+        let workspace_root = root.path().join("concurrent-workspace");
+        std::fs::create_dir(&workspace_root).unwrap();
+        drop(runtime.paths.server_store().unwrap());
+        let barrier = Arc::new(Barrier::new(3));
+        let handles =
+            [("alpha", "create-alpha"), ("beta", "create-beta")].map(|(name, request_id)| {
+                let runtime = runtime.clone();
+                let workspace_root = workspace_root.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    handle_request(
+                        &runtime,
+                        workspace_request(
+                            request_id,
+                            "workspace.create",
+                            json!({"name": name, "root": workspace_root.to_string_lossy()}),
+                        ),
+                    )
+                })
+            });
+        barrier.wait();
+        let responses: Vec<_> = handles
+            .map(|handle| handle.join().unwrap())
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| {
+                    response.kind == crate::daemon::protocol::EnvelopeKind::Response
+                })
+                .count(),
+            1
+        );
+        let errors: Vec<_> = responses
+            .iter()
+            .filter_map(|response| response.error.as_ref())
+            .collect();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, ERROR_MALFORMED_REQUEST);
+        assert!(
+            errors[0]
+                .message
+                .contains("workspace root is already registered")
+        );
+        assert_eq!(
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .workspaces()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn agent_create_list_and_status_are_typed_and_fail_before_partial_rows() {
+        let (root, runtime) = bare_thread_test_runtime();
+        let workspace_root = root.path().join("agent-workspace");
+        std::fs::create_dir(&workspace_root).unwrap();
+        let created_workspace = handle_request(
+            &runtime,
+            workspace_request(
+                "wc",
+                "workspace.create",
+                json!({"name": "alpha", "root": workspace_root.to_string_lossy()}),
+            ),
+        );
+        let workspace: WorkspaceCreateResult =
+            serde_json::from_value(created_workspace.result.unwrap()).unwrap();
+        let workspace_id = workspace.workspace.id;
+        let create_params = json!({
+            "agent_id": "builder",
+            "workspace_id": workspace_id,
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "xhigh",
+            "approval_policy": "prompt",
+            "toolset": ["file.read", "file.write"]
+        });
+
+        let created = handle_request(
+            &runtime,
+            workspace_request("ac", "agent.create", create_params.clone()),
+        );
+        let created: AgentCreateResult = serde_json::from_value(created.result.unwrap()).unwrap();
+        assert_eq!(created.agent.id.as_str(), "builder");
+        assert_eq!(created.agent.workspace_id, workspace_id);
+        assert_eq!(created.agent.model, "gpt-5.6-sol");
+        assert_eq!(
+            created.agent.reasoning_effort,
+            crate::daemon::protocol::ReasoningEffort::Xhigh
+        );
+        assert_eq!(created.agent.approval_policy, ThreadApprovalPolicy::Prompt);
+        assert_eq!(created.agent.toolset, ["file.read", "file.write"]);
+
+        let listed = handle_request(&runtime, workspace_request("al", "agent.list", json!({})));
+        let listed: AgentListResult = serde_json::from_value(listed.result.unwrap()).unwrap();
+        assert_eq!(listed.agents, [created.agent.clone()]);
+        let status = handle_request(
+            &runtime,
+            workspace_request("as", "agent.status", json!({"agent_id": "builder"})),
+        );
+        let status: AgentStatusResult = serde_json::from_value(status.result.unwrap()).unwrap();
+        assert_eq!(status.agent, created.agent);
+
+        let duplicate = handle_request(
+            &runtime,
+            workspace_request("dup", "agent.create", create_params),
+        );
+        assert_eq!(duplicate.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+        let invalid_id = handle_request(
+            &runtime,
+            workspace_request(
+                "bad-id",
+                "agent.create",
+                json!({
+                    "agent_id": " ", "workspace_id": workspace_id,
+                    "model": "gpt-5.6-sol", "reasoning_effort": "none",
+                    "approval_policy": "prompt", "toolset": ["file.read"]
+                }),
+            ),
+        );
+        assert_eq!(invalid_id.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+        let invalid_tool = handle_request(
+            &runtime,
+            workspace_request(
+                "bad-tool",
+                "agent.create",
+                json!({
+                    "agent_id": "bad-tool", "workspace_id": workspace_id,
+                    "model": "gpt-5.6-sol", "reasoning_effort": "none",
+                    "approval_policy": "prompt", "toolset": ["credential.store"]
+                }),
+            ),
+        );
+        assert_eq!(invalid_tool.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+        let missing_workspace = handle_request(
+            &runtime,
+            workspace_request(
+                "missing-workspace",
+                "agent.create",
+                json!({
+                    "agent_id": "orphan", "workspace_id": "ws-missing",
+                    "model": "gpt-5.6-sol", "reasoning_effort": "none",
+                    "approval_policy": "prompt", "toolset": ["file.read"]
+                }),
+            ),
+        );
+        assert_eq!(missing_workspace.error.unwrap().code, ERROR_NOT_FOUND);
+        let unknown_field = handle_request(
+            &runtime,
+            workspace_request(
+                "unknown",
+                "agent.create",
+                json!({
+                    "agent_id": "unknown", "workspace_id": workspace_id,
+                    "model": "gpt-5.6-sol", "reasoning_effort": "none",
+                    "approval_policy": "prompt", "toolset": ["file.read"],
+                    "credential": "must-not-land"
+                }),
+            ),
+        );
+        assert_eq!(unknown_field.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+        let missing_agent = handle_request(
+            &runtime,
+            workspace_request(
+                "missing-agent",
+                "agent.status",
+                json!({"agent_id": "missing"}),
+            ),
+        );
+        assert_eq!(missing_agent.error.unwrap().code, ERROR_NOT_FOUND);
+
+        std::fs::remove_dir_all(&workspace_root).unwrap();
+        let broken_workspace = handle_request(
+            &runtime,
+            workspace_request(
+                "broken",
+                "agent.create",
+                json!({
+                    "agent_id": "broken", "workspace_id": workspace_id,
+                    "model": "gpt-5.6-sol", "reasoning_effort": "none",
+                    "approval_policy": "prompt", "toolset": ["file.read"]
+                }),
+            ),
+        );
+        assert_eq!(broken_workspace.error.unwrap().code, ERROR_WORKSPACE_BROKEN);
+
+        let listed = handle_request(&runtime, workspace_request("al2", "agent.list", json!({})));
+        let listed: AgentListResult = serde_json::from_value(listed.result.unwrap()).unwrap();
+        assert_eq!(listed.agents.len(), 1);
+    }
+
     /// Unknown fields are rejected on the way in, not ignored.
     #[test]
     fn workspace_params_reject_unknown_fields() {
@@ -2596,6 +3079,38 @@ mod tests {
         );
         assert_eq!(response.kind, crate::daemon::protocol::EnvelopeKind::Error);
         assert_eq!(response.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+    }
+
+    #[test]
+    fn thread_spawn_rejects_an_unregistered_workspace_with_the_attach_error() {
+        let (_root, runtime) = bare_thread_test_runtime();
+        let response = handle_request(
+            &runtime,
+            workspace_request(
+                "spawn",
+                "thread.spawn",
+                json!({
+                    "action": "start",
+                    "parent_thread_id": null,
+                    "cwd": runtime.paths.workspace_root.to_string_lossy(),
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "none",
+                    "approval_policy": "prompt"
+                }),
+            ),
+        );
+        let error = response.error.unwrap();
+        assert_eq!(error.code, ERROR_WORKSPACE_UNREGISTERED);
+        assert!(error.message.contains("platonic workspace create"));
+        assert!(
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .thread_authorities()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// After a restart the run is gone from memory, but the approval it was

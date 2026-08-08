@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use plato_agent::{
-    AppError, AppResult, ApprovalMode, RunOptions, ensure_server, offline, run_question,
+    AppError, AppResult, ApprovalMode, RunOptions, ensure_server, ensure_server_interactive,
+    offline, run_question,
     tui::{ThreadAttachment, TuiOptions, run_tui},
 };
 use platonic_client::{client::DaemonClient, paths};
@@ -161,10 +162,14 @@ fn main() {
 fn run() -> AppResult<()> {
     let cli = Cli::parse();
     let workspace_root = std::env::current_dir()?;
-    let implicit_tui =
-        implicit_tui_requested(&cli, io::stdin().is_terminal(), io::stdout().is_terminal());
+    let stdin_is_terminal = io::stdin().is_terminal();
+    let stdout_is_terminal = io::stdout().is_terminal();
+    let stderr_is_terminal = io::stderr().is_terminal();
+    let local_interactive =
+        local_interactive(stdin_is_terminal, stdout_is_terminal, stderr_is_terminal);
+    let implicit_tui = implicit_tui_requested(&cli, stdin_is_terminal, stdout_is_terminal);
     if cli.tui || cli.remote.is_some() || implicit_tui {
-        return run_tui_mode(cli, workspace_root);
+        return run_tui_mode(cli, workspace_root, local_interactive);
     }
 
     match &cli.command {
@@ -194,8 +199,16 @@ fn run() -> AppResult<()> {
             run_issue_prep_cli(command, cli.config, workspace_root)
         }
         Some(Command::Thread { command }) => run_thread_cli(command, workspace_root),
-        None => run_prompt(cli, workspace_root),
+        None => run_prompt(cli, workspace_root, local_interactive),
     }
+}
+
+fn local_interactive(
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+    stderr_is_terminal: bool,
+) -> bool {
+    stdin_is_terminal && stdout_is_terminal && stderr_is_terminal
 }
 
 fn implicit_tui_requested(cli: &Cli, stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
@@ -253,7 +266,7 @@ fn replay_path(
     }
 }
 
-fn run_prompt(cli: Cli, workspace_root: PathBuf) -> AppResult<()> {
+fn run_prompt(cli: Cli, workspace_root: PathBuf, interactive: bool) -> AppResult<()> {
     if cli.db.is_some() {
         return Err(AppError::Config(
             "--db is an offline replay option; one-shot runs use the server ledger".into(),
@@ -262,6 +275,9 @@ fn run_prompt(cli: Cli, workspace_root: PathBuf) -> AppResult<()> {
     let question = cli.question.join(" ");
     if question.trim().is_empty() {
         return Err(AppError::Config("question is empty".into()));
+    }
+    if interactive {
+        ensure_server_interactive(&workspace_root, &mut io::stdin().lock(), &mut io::stderr())?;
     }
     let outcome = run_question(RunOptions {
         question,
@@ -411,9 +427,13 @@ fn run_issue_prep_cli(
     }
 }
 
-fn run_tui_mode(cli: Cli, workspace_root: PathBuf) -> AppResult<()> {
+fn run_tui_mode(cli: Cli, workspace_root: PathBuf, local_interactive: bool) -> AppResult<()> {
     validate_tui_cli(&cli)?;
-    let mut client = ensure_server(&workspace_root)?;
+    let mut client = if cli.remote.is_none() && local_interactive {
+        ensure_server_interactive(&workspace_root, &mut io::stdin().lock(), &mut io::stderr())?
+    } else {
+        ensure_server(&workspace_root)?
+    };
     let mut options = TuiOptions::new(workspace_root);
     options.socket = Some(paths::host_socket_path()?);
     options.config = cli.config.clone();
@@ -758,6 +778,14 @@ mod tests {
         assert!(!implicit_tui_requested(&cli, true, false));
         let cli = Cli::try_parse_from(["plato", "hello"]).unwrap();
         assert!(!implicit_tui_requested(&cli, true, true));
+    }
+
+    #[test]
+    fn local_registration_prompt_requires_every_terminal_stream() {
+        assert!(local_interactive(true, true, true));
+        assert!(!local_interactive(false, true, true));
+        assert!(!local_interactive(true, false, true));
+        assert!(!local_interactive(true, true, false));
     }
 
     #[test]

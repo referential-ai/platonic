@@ -72,6 +72,14 @@ plato -c "name the most important file from that summary"
 plato replay        # audit the latest default SQLite session
 ```
 
+On the first local terminal invocation, `plato` asks for a workspace name and
+defaults it to the current directory basename. Press Enter once to register it
+and continue. Piped/headless commands and `plato --remote` never prompt or
+register; bootstrap those paths explicitly with a running host server and
+`platonic workspace create <name> <directory>`. Standalone `plato-tui` prompts
+only on its default local endpoint; `--socket` attachments and `--snapshot` do
+not.
+
 Live assistant text prints to stderr; the final answer prints to stdout. The
 complete run ledger lands in the default platform SQLite store for the workspace.
 `-c` continues the latest workspace session through the same host server.
@@ -119,7 +127,8 @@ One terminal, same workspace:
 plato
 ```
 
-This ensures the host-scoped `platonic serve`, asks for the root thread spawn
+This ensures the host-scoped `platonic serve`, asks once to register an unknown
+directory (Enter accepts the basename), asks for the root thread spawn
 decision, and attaches the TUI to that durable thread. Quitting the TUI leaves
 the daemon and thread authority available. `plato --tui --config plato.toml`
 is the explicit form when selecting a config. During a run, one working row
@@ -144,6 +153,8 @@ The explicit legacy workspace-daemon mode still works:
 
 ```bash
 platonic serve --workspace "$PWD"                    # terminal A
+platonic workspace create example "$PWD" \
+  --socket <socket-path-printed-by-terminal-A>         # terminal B
 plato-tui --workspace "$PWD" --config plato.toml      # terminal B
 ```
 
