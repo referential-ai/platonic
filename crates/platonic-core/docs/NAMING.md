@@ -6,11 +6,10 @@ The workspace [naming authority](https://github.com/referential-ai/platonic-work
 owns the hierarchy and exact forms. This document only records core-specific
 technical vocabulary.
 
-Preferred GitHub layout:
+Source layout:
 
 ```text
-referential-ai/platonic-core
-referential-ai/plato-agent
+referential-ai/platonic/crates/platonic-core
 ```
 
 ## Deeper internal vocabulary

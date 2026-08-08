@@ -6,7 +6,7 @@ rust-version = "1.85"
 publish = ["crates-io"]
 description = "Core Rust harness primitives for disciplined, replayable agent execution."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/referential-ai/platonic-core"
+repository = "https://github.com/referential-ai/platonic"
 documentation = "https://docs.rs/platonic-core"
 include = [
     "src/**",

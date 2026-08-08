@@ -5,6 +5,7 @@ members = [
   "crates/plato-tui",
   "crates/platonic",
   "crates/platonic-client",
+  "crates/platonic-core",
   "crates/platonic-protocol",
   "crates/platonic-server",
 ]
@@ -36,7 +37,7 @@ ort = "=2.0.0-rc.13"
 plato-audio = { version = "0.2.0", path = "crates/plato-audio" }
 plato-tui = { version = "0.2.0", path = "crates/plato-tui" }
 platonic-client = { version = "0.2.0", path = "crates/platonic-client" }
-platonic-core = "0.3.1"
+platonic-core = { version = "0.3.1", path = "crates/platonic-core" }
 platonic-protocol = { version = "0.2.0", path = "crates/platonic-protocol" }
 platonic-server = { version = "0.2.0", path = "crates/platonic-server" }
 pty-process = "0.5.3"
