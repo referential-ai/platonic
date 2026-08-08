@@ -51,6 +51,21 @@ it, and the fourth command is required: CI proves the desktop crate in the
 `Linux shell` job, so a change that builds locally can still break CI without
 it. Clippy takes `--workspace` to match CI exactly.
 
+**Run the battery on the pinned toolchain, or its verdict is not CI's.** CI
+pins `1.88.0`; a newer toolchain reports lints CI does not, and an older one
+misses lints CI enforces. Both `rust-toolchain.toml` and `.mise.toml` pin
+`1.88.0`, so rustup and mise users each get the pinned toolchain
+automatically — but neither helps if `cargo` resolves to a distribution
+package instead. Check before trusting a green battery:
+
+```bash
+cargo clippy --version   # must report 0.1.88
+```
+
+A distribution `cargo` on `PATH` is not a rustup proxy and silently ignores
+`rust-toolchain.toml`. That is the configuration under which a clean local
+clippy run and a red CI run can both be honest.
+
 ## GitHub-Native Workflow
 
 <!-- BEGIN GITHUB WORKSPACE OPS -->
