@@ -184,7 +184,10 @@ jobs:
         timeout-minutes: 45
         env:
           TMPDIR: ${{ runner.temp }}
-        run: cargo test --workspace --locked --lib --bins
+        # --no-fail-fast: every failing target reports in one run instead of
+        # one per cycle, which is what let the integration tail hide behind
+        # itself for nine cycles.
+        run: cargo test --workspace --locked --lib --bins --no-fail-fast
 
       - name: Run clippy
         timeout-minutes: 30
