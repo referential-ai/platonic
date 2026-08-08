@@ -1301,6 +1301,17 @@ pub(super) fn approval_handler(
                 actor: "session_grant",
             });
         }
+        // Record the ask before announcing it. A daemon that dies between the
+        // announcement and the decision must still leave the question on disk,
+        // or "approvals wait" holds only for one daemon lifetime (#435). If it
+        // cannot be recorded it is denied: an unrecordable approval is one
+        // nobody could answer after a restart.
+        if let Err(error) = persist_approval_request(&runtime, &record, &request) {
+            return Ok(ExternalApprovalOutcome::Denied {
+                actor: "daemon",
+                reason: format!("approval could not be recorded: {error}"),
+            });
+        }
         approvals.insert(
             call_id.clone(),
             PendingApproval::new(record.session_id.clone(), request.clone()),
@@ -1314,16 +1325,20 @@ pub(super) fn approval_handler(
             }
             if record.cancel.load(Ordering::SeqCst) {
                 approvals.remove(&call_id);
+                let reason = "run canceled";
+                record_daemon_denial(&runtime, &request, reason);
                 return Ok(ExternalApprovalOutcome::Denied {
                     actor: "daemon",
-                    reason: "run canceled".into(),
+                    reason: reason.into(),
                 });
             }
             if record.status().state != RunStateName::Running {
                 approvals.remove(&call_id);
+                let reason = "run is no longer active";
+                record_daemon_denial(&runtime, &request, reason);
                 return Ok(ExternalApprovalOutcome::Denied {
                     actor: "daemon",
-                    reason: "run is no longer active".into(),
+                    reason: reason.into(),
                 });
             }
             approvals = record
@@ -1332,6 +1347,49 @@ pub(super) fn approval_handler(
                 .expect("approval condvar lock poisoned");
         }
     }
+}
+
+/// Record that the daemon itself answered an approval nobody else could.
+///
+/// Best effort by design: the run's outcome is already decided in memory, and
+/// a failed write leaves the approval visibly pending rather than silently
+/// gone — which is the failure mode #435 exists to prevent.
+fn record_daemon_denial(runtime: &DaemonRuntime, request: &ApprovalRequest, reason: &str) {
+    let Ok(store) = runtime.paths.server_store() else {
+        return;
+    };
+    let _ = store.resolve_tool_call_approval(
+        request.run_id.as_str(),
+        &request.call_id.to_string(),
+        &crate::server_store::ToolCallApprovalDecision {
+            granted: false,
+            actor: "daemon".into(),
+            reason: Some(reason.to_owned()),
+            decided_at_ms: crate::thread_authority::now_ms(),
+        },
+    );
+}
+
+fn persist_approval_request(
+    runtime: &DaemonRuntime,
+    record: &RunRecord,
+    request: &ApprovalRequest,
+) -> AppResult<()> {
+    runtime.paths.server_store()?.persist_tool_call_approval(
+        &crate::server_store::ToolCallApprovalRecord {
+            run_id: request.run_id.to_string(),
+            call_id: request.call_id.to_string(),
+            session_id: record.session_id.clone(),
+            tool_name: request.tool_name.clone(),
+            effect: request.effect.clone(),
+            reason: request.reason.clone(),
+            input_preview: request.input_preview.clone(),
+            approval_preview: request.approval_preview.clone(),
+            diff_preview: request.diff_preview.clone(),
+            requested_at_ms: crate::thread_authority::now_ms(),
+            decision: None,
+        },
+    )
 }
 
 fn approval_requested_event(request: &ApprovalRequest) -> StreamEvent {

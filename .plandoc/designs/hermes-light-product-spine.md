@@ -3,6 +3,16 @@ title: Hermes-light Product Spine
 issue: https://github.com/referential-ai/plato-agent/issues/42
 ---
 
+> **PARTLY SUPERSEDED, 2026-08-07.** This design predates the platform
+> decisions of 2026-08-06/07. The
+> [platform decision map](https://github.com/referential-ai/platonic-workspace/issues/83)
+> supersedes it where they disagree, and the map wins.
+>
+> Its stated goal — a "mini Hermes-style MVP" with `plato-agentd` owning
+> runtime semantics — is inverted by P016 and P018: Platonic is the server and
+> the product, and Plato Agent is the client distribution built on it. The
+> product statement and proof now live in `product/product.md`.
+
 # Hermes-light Product Spine
 
 ## Authority
