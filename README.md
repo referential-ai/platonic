@@ -753,9 +753,9 @@ Bare `plato` in a terminal is the interactive local entrypoint; `plato --tui`
 is its explicit equivalent. It ensures the host daemon, obtains the root thread
 spawn decision, and attaches to that durable thread. `plato --remote
 <thread-id>` attaches a second TUI without creating another thread. Exiting a
-TUI leaves the host daemon and authority record available. The standalone
-`plato-tui` binary remains the explicit legacy workspace-daemon client during
-this migration stage.
+TUI leaves the host daemon and authority record available. Standalone
+`plato-tui` attaches to the same host endpoint but never starts it; an explicit
+`--socket` remains available for focused legacy-endpoint proofs.
 It renders a conversation-first transcript with distinct `You` and `Plato`
 messages, at most one subtle trace summary per run, one status row, a composer,
 session picker, and a bounded approval pane above the composer. Press `v` from
@@ -813,7 +813,7 @@ facts, and the selected session's live shell grant. The read-only modal does
 not invoke a model or change the session.
 
 ```bash
-cargo run --bin platonic -- serve --workspace "$PWD"
+cargo run --bin platonic -- serve
 cargo run --bin plato-tui -- --workspace "$PWD"
 ```
 

@@ -260,26 +260,9 @@ fn standalone_tui_default_local_endpoint_asks_once_and_registers() {
     for directory in [&workspace, &runtime, &state, &home] {
         fs::create_dir(directory).unwrap();
     }
-    let workspace_id = paths::workspace_id(&workspace).unwrap();
-    let endpoint = runtime
-        .join("platonic")
-        .join("workspaces")
-        .join(&workspace_id)
-        .join("agent.sock");
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let config = DaemonConnectionConfig::resolve(&workspace, Some(endpoint.clone())).unwrap();
-    let mut daemon = std::process::Command::new(workspace_binary("platonic"))
-        .arg("serve")
-        .arg("--workspace")
-        .arg(&workspace)
-        .current_dir(&workspace)
-        .env("HOME", &home)
-        .env("XDG_RUNTIME_DIR", &runtime)
-        .env("XDG_STATE_HOME", &state)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut daemon = spawn_host_daemon(&workspace, &runtime, &state, &home);
     wait_for_unregistered_daemon(&config, &mut daemon);
     let _daemon_cleanup = HostDaemonCleanup {
         config: config.clone(),
@@ -313,6 +296,50 @@ fn standalone_tui_default_local_endpoint_asks_once_and_registers() {
     drop(client);
     wait_for_endpoint_removal(&endpoint);
     assert!(wait_for_daemon_exit(&mut daemon).success());
+}
+
+#[test]
+fn standalone_tui_default_local_endpoint_decline_stays_unregistered() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
+    let config = DaemonConnectionConfig::resolve(&workspace, Some(endpoint.clone())).unwrap();
+    let mut daemon = spawn_host_daemon(&workspace, &runtime, &state, &home);
+    wait_for_unregistered_daemon(&config, &mut daemon);
+    let _daemon_cleanup = HostDaemonCleanup {
+        config: config.clone(),
+        endpoint: endpoint.clone(),
+    };
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        br#""$PLATO_BIN"; printf '\n%sSTATUS:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Workspace name [workspace]");
+    shell.write(b"n\r");
+    assert_ne!(shell.wait_for_marker("STATUS"), "0");
+    let output = shell.output.lock().unwrap().clone();
+    let output = String::from_utf8_lossy(&output);
+    assert_eq!(output.matches("Workspace name [workspace]").count(), 1);
+    assert!(output.contains("workspace_unregistered"), "{output}");
+
+    let mut control = DaemonClient::connect(&endpoint).unwrap();
+    assert!(control.workspace_list().unwrap().workspaces.is_empty());
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+    drop(control);
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    if endpoint.exists() {
+        fs::remove_file(&endpoint).unwrap();
+    }
 }
 
 #[test]
@@ -388,26 +415,9 @@ fn standalone_tui_snapshot_returns_typed_unregistered_without_prompting() {
     for directory in [&workspace, &runtime, &state, &home] {
         fs::create_dir(directory).unwrap();
     }
-    let workspace_id = paths::workspace_id(&workspace).unwrap();
-    let endpoint = runtime
-        .join("platonic")
-        .join("workspaces")
-        .join(&workspace_id)
-        .join("agent.sock");
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let config = DaemonConnectionConfig::resolve(&workspace, Some(endpoint.clone())).unwrap();
-    let mut daemon = std::process::Command::new(workspace_binary("platonic"))
-        .arg("serve")
-        .arg("--workspace")
-        .arg(&workspace)
-        .current_dir(&workspace)
-        .env("HOME", &home)
-        .env("XDG_RUNTIME_DIR", &runtime)
-        .env("XDG_STATE_HOME", &state)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut daemon = spawn_host_daemon(&workspace, &runtime, &state, &home);
     wait_for_unregistered_daemon(&config, &mut daemon);
     let _daemon_cleanup = HostDaemonCleanup {
         config: config.clone(),
@@ -432,13 +442,12 @@ fn standalone_tui_snapshot_returns_typed_unregistered_without_prompting() {
 
     let mut control = DaemonClient::connect(&endpoint).unwrap();
     assert!(control.workspace_list().unwrap().workspaces.is_empty());
-    assert_eq!(
-        control.shutdown_if_idle().unwrap().result,
-        ShutdownIfIdleResultName::Shutdown
-    );
     drop(control);
-    wait_for_endpoint_removal(&endpoint);
-    assert!(wait_for_daemon_exit(&mut daemon).success());
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    if endpoint.exists() {
+        fs::remove_file(&endpoint).unwrap();
+    }
 }
 
 #[test]
@@ -451,6 +460,7 @@ fn standalone_tui_absent_default_endpoint_keeps_the_offline_view_without_prompti
     for directory in [&workspace, &runtime, &state, &home] {
         fs::create_dir(directory).unwrap();
     }
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
 
     shell.write(
@@ -462,10 +472,74 @@ fn standalone_tui_absent_default_endpoint_keeps_the_offline_view_without_prompti
         !String::from_utf8_lossy(&shell.output.lock().unwrap())
             .contains("Workspace name [workspace]")
     );
+    assert!(!endpoint.exists(), "standalone TUI started a host daemon");
     shell.write(b"q");
     assert_eq!(shell.wait_for_marker("STATUS"), "0");
     shell.write(b"exit\r");
     assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+}
+
+#[test]
+fn standalone_tui_reconnects_to_registered_host_after_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
+    let config = DaemonConnectionConfig::resolve(&workspace, Some(endpoint.clone())).unwrap();
+    let mut daemon = spawn_host_daemon(&workspace, &runtime, &state, &home);
+    wait_for_unregistered_daemon(&config, &mut daemon);
+    let mut control = DaemonClient::connect(&endpoint).unwrap();
+    control
+        .workspace_create("workspace".into(), workspace.clone())
+        .unwrap();
+    control.hello(&workspace).unwrap();
+    assert_eq!(
+        control.shutdown_if_idle().unwrap().result,
+        ShutdownIfIdleResultName::Shutdown
+    );
+    drop(control);
+    wait_for_endpoint_removal(&endpoint);
+    assert!(wait_for_daemon_exit(&mut daemon).success());
+
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+    shell.write(
+        br#""$PLATO_BIN"; printf '\n%sSTATUS:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "daemon unavailable");
+    assert!(
+        !endpoint.exists(),
+        "standalone TUI restarted the host daemon"
+    );
+
+    let mut restarted = spawn_host_daemon(&workspace, &runtime, &state, &home);
+    let mut restarted_control = connect_pty_daemon(&config);
+    restarted_control.hello(&workspace).unwrap();
+    shell.write(b"r");
+    let screen =
+        shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "daemon unavailable");
+    assert!(screen.contains("Plato Agent"), "{screen}");
+    assert!(
+        !String::from_utf8_lossy(&shell.output.lock().unwrap())
+            .contains("Workspace name [workspace]")
+    );
+
+    shell.write(b"q");
+    assert_eq!(shell.wait_for_marker("STATUS"), "0");
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+    assert_eq!(
+        restarted_control.shutdown_if_idle().unwrap().result,
+        ShutdownIfIdleResultName::Shutdown
+    );
+    drop(restarted_control);
+    wait_for_endpoint_removal(&endpoint);
+    assert!(wait_for_daemon_exit(&mut restarted).success());
 }
 
 #[test]
@@ -478,26 +552,9 @@ fn standalone_tui_surfaces_registration_io_failure_after_prompt() {
     for directory in [&workspace, &runtime, &state, &home] {
         fs::create_dir(directory).unwrap();
     }
-    let workspace_id = paths::workspace_id(&workspace).unwrap();
-    let endpoint = runtime
-        .join("platonic")
-        .join("workspaces")
-        .join(&workspace_id)
-        .join("agent.sock");
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let config = DaemonConnectionConfig::resolve(&workspace, Some(endpoint.clone())).unwrap();
-    let mut daemon = std::process::Command::new(workspace_binary("platonic"))
-        .arg("serve")
-        .arg("--workspace")
-        .arg(&workspace)
-        .current_dir(&workspace)
-        .env("HOME", &home)
-        .env("XDG_RUNTIME_DIR", &runtime)
-        .env("XDG_STATE_HOME", &state)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut daemon = spawn_host_daemon(&workspace, &runtime, &state, &home);
     wait_for_unregistered_daemon(&config, &mut daemon);
     let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
 
@@ -538,11 +595,7 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
     }
 
     let workspace_id = paths::workspace_id(&workspace).unwrap();
-    let endpoint = runtime
-        .join("platonic")
-        .join("workspaces")
-        .join(&workspace_id)
-        .join("agent.sock");
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let ledger = state.join("fake-agent.db");
     let fake = FakeDaemon::bind(&endpoint, &workspace, &workspace_id, &ledger);
     let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
@@ -704,11 +757,7 @@ fn composer_cursor_stays_real_at_placeholder_origin_and_narrow_wrap() {
     }
 
     let workspace_id = paths::workspace_id(&workspace).unwrap();
-    let endpoint = runtime
-        .join("platonic")
-        .join("workspaces")
-        .join(&workspace_id)
-        .join("agent.sock");
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let ledger = state.join("fake-agent.db");
     let fake = FakeDaemon::bind(&endpoint, &workspace, &workspace_id, &ledger);
     let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
@@ -757,11 +806,7 @@ fn composer_textarea_features_preserve_submit_queue_slash_and_history_contracts(
     }
 
     let workspace_id = paths::workspace_id(&workspace).unwrap();
-    let endpoint = runtime
-        .join("platonic")
-        .join("workspaces")
-        .join(&workspace_id)
-        .join("agent.sock");
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let ledger = state.join("fake-agent.db");
     let fake = FakeDaemon::bind(&endpoint, &workspace, &workspace_id, &ledger);
     let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
@@ -901,11 +946,7 @@ fn bare_plato_status_modal_sends_one_read_only_request_and_escape_closes() {
     }
 
     let workspace_id = paths::workspace_id(&workspace).unwrap();
-    let endpoint = runtime
-        .join("platonic")
-        .join("workspaces")
-        .join(&workspace_id)
-        .join("agent.sock");
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let ledger = state.join("fake-agent.db");
     let fake = FakeDaemon::bind(&endpoint, &workspace, &workspace_id, &ledger);
     let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
@@ -978,11 +1019,7 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
     }
 
     let workspace_id = paths::workspace_id(&workspace).unwrap();
-    let endpoint = runtime
-        .join("platonic")
-        .join("workspaces")
-        .join(&workspace_id)
-        .join("agent.sock");
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let ledger = state.join("fake-agent.db");
     let fake = FakeDaemon::bind_pending_approval(&endpoint, &workspace, &workspace_id, &ledger);
     let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
@@ -1124,21 +1161,16 @@ enabled = ["shell.exec"]
     )
     .unwrap();
 
-    let workspace_id = paths::workspace_id(&workspace).unwrap();
-    let endpoint = runtime
-        .join("platonic")
-        .join("workspaces")
-        .join(&workspace_id)
-        .join("agent.sock");
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let config = DaemonConnectionConfig::resolve(&workspace, Some(endpoint.clone())).unwrap();
     let lock_path = endpoint.with_file_name("agent.lock");
-    let mut daemon = SessionGrantWorkspaceDaemon::start(
+    let mut daemon = SessionGrantHostDaemon::start(
         &workspace,
         &runtime,
         &state,
         &home,
         &config,
-        root.path().join("workspace-daemon-1.stderr"),
+        root.path().join("host-daemon-1.stderr"),
     );
     let first_daemon_pid = daemon.pid();
     let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
@@ -1170,6 +1202,7 @@ enabled = ["shell.exec"]
     let repeated = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "done-repeat");
     assert!(!repeated.contains("Approval"));
     let mut client = connect_pty_daemon(&config);
+    client.hello(&workspace).unwrap();
     let session_id = wait_for_finished_session(&mut client, "allow once");
     let ready = shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "Esc interrupt");
     assert!(ready.contains("? shortcuts · Tab queue 0"));
@@ -1219,7 +1252,7 @@ enabled = ["shell.exec"]
     if !first_daemon_exit.forced_cleanup {
         assert!(
             first_daemon_exit.status.success(),
-            "workspace daemon {} failed ({})\n{}",
+            "host daemon {} failed ({})\n{}",
             first_daemon_exit.pid,
             first_daemon_exit.status,
             first_daemon_exit.stderr
@@ -1230,13 +1263,13 @@ enabled = ["shell.exec"]
     assert_session_grant_lifecycle_absent(first_daemon_pid, &endpoint, &lock_path);
     drop(daemon);
 
-    let mut daemon = SessionGrantWorkspaceDaemon::start(
+    let mut daemon = SessionGrantHostDaemon::start(
         &workspace,
         &runtime,
         &state,
         &home,
         &config,
-        root.path().join("workspace-daemon-2.stderr"),
+        root.path().join("host-daemon-2.stderr"),
     );
     let second_daemon_pid = daemon.pid();
 
@@ -1261,6 +1294,7 @@ enabled = ["shell.exec"]
     let restarted = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "printf restart");
     assert!(restarted.contains("s allow shell.exec for session"));
     let mut restarted_client = connect_pty_daemon(&config);
+    restarted_client.hello(&workspace).unwrap();
     assert!(
         !restarted_client
             .daemon_status(
@@ -1286,7 +1320,7 @@ enabled = ["shell.exec"]
     if !second_daemon_exit.forced_cleanup {
         assert!(
             second_daemon_exit.status.success(),
-            "workspace daemon {} failed ({})\n{}",
+            "host daemon {} failed ({})\n{}",
             second_daemon_exit.pid,
             second_daemon_exit.status,
             second_daemon_exit.stderr
@@ -1326,11 +1360,7 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
     }
 
     let workspace_id = paths::workspace_id(&workspace).unwrap();
-    let endpoint = runtime
-        .join("platonic")
-        .join("workspaces")
-        .join(&workspace_id)
-        .join("agent.sock");
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let ledger = state.join("fake-agent.db");
     let fake = FakeDaemon::bind_conversation_audit(&endpoint, &workspace, &workspace_id, &ledger);
     let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
@@ -1487,11 +1517,7 @@ fn streamed_markdown_smooths_holds_tables_and_survives_reload_and_resize() {
     }
 
     let workspace_id = paths::workspace_id(&workspace).unwrap();
-    let endpoint = runtime
-        .join("platonic")
-        .join("workspaces")
-        .join(&workspace_id)
-        .join("agent.sock");
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let ledger = state.join("fake-agent.db");
     let fake = FakeDaemon::bind_streaming(&endpoint, &workspace, &workspace_id, &ledger);
     let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
@@ -1585,11 +1611,7 @@ fn bare_plato_session_picker_resumes_exact_hidden_session_id() {
     }
 
     let workspace_id = paths::workspace_id(&workspace).unwrap();
-    let endpoint = runtime
-        .join("platonic")
-        .join("workspaces")
-        .join(&workspace_id)
-        .join("agent.sock");
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let ledger = state.join("fake-agent.db");
     let fake = FakeDaemon::bind_conversation_audit(&endpoint, &workspace, &workspace_id, &ledger);
     let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
@@ -1647,11 +1669,7 @@ fn capture_initial_frame(
     no_color: Option<&str>,
 ) -> CapturedFrame {
     let workspace_id = paths::workspace_id(workspace).unwrap();
-    let endpoint = runtime
-        .join("platonic")
-        .join("workspaces")
-        .join(&workspace_id)
-        .join("agent.sock");
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let ledger = state.join("fake-agent.db");
     let fake = FakeDaemon::bind(&endpoint, workspace, &workspace_id, &ledger);
     let mut shell = PtyShell::spawn_with_no_color(workspace, runtime, state, home, no_color);
@@ -1712,7 +1730,7 @@ struct HostDaemonCleanup {
     endpoint: PathBuf,
 }
 
-struct SessionGrantWorkspaceDaemon {
+struct SessionGrantHostDaemon {
     child: Option<Child>,
     pid: u32,
     stderr_path: PathBuf,
@@ -1727,7 +1745,7 @@ struct SessionGrantDaemonExit {
     forced_cleanup: bool,
 }
 
-impl SessionGrantWorkspaceDaemon {
+impl SessionGrantHostDaemon {
     fn start(
         workspace: &Path,
         runtime: &Path,
@@ -1739,8 +1757,6 @@ impl SessionGrantWorkspaceDaemon {
         let stderr = File::create(&stderr_path).unwrap();
         let child = std::process::Command::new(workspace_binary("platonic"))
             .arg("serve")
-            .arg("--workspace")
-            .arg(workspace)
             .current_dir(workspace)
             .env("HOME", home)
             .env("XDG_RUNTIME_DIR", runtime)
@@ -1791,19 +1807,19 @@ impl SessionGrantWorkspaceDaemon {
                             )
                             .unwrap();
                     }
-                    Err(error) => panic!("workspace daemon hello failed: {error}"),
+                    Err(error) => panic!("host daemon hello failed: {error}"),
                 }
             }
             if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
                 let stderr = fs::read_to_string(&self.stderr_path).unwrap_or_default();
                 panic!(
-                    "workspace daemon {} exited before readiness ({status})\n{stderr}",
+                    "host daemon {} exited before readiness ({status})\n{stderr}",
                     self.pid
                 );
             }
             assert!(
                 Instant::now() < deadline,
-                "workspace daemon {} did not create ready endpoint {}",
+                "host daemon {} did not create ready endpoint {}",
                 self.pid,
                 self.endpoint.display()
             );
@@ -1820,7 +1836,7 @@ impl SessionGrantWorkspaceDaemon {
             if Instant::now() >= deadline {
                 break self
                     .terminate_and_join()
-                    .expect("workspace daemon could not be joined after shutdown");
+                    .expect("host daemon could not be joined after shutdown");
             }
             thread::sleep(Duration::from_millis(10));
         };
@@ -1869,6 +1885,20 @@ fn workspace_binary(name: &str) -> PathBuf {
         .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
 
+fn spawn_host_daemon(workspace: &Path, runtime: &Path, state: &Path, home: &Path) -> Child {
+    std::process::Command::new(workspace_binary("platonic"))
+        .arg("serve")
+        .current_dir(workspace)
+        .env("HOME", home)
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("XDG_STATE_HOME", state)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
 fn wait_for_unregistered_daemon(config: &DaemonConnectionConfig, child: &mut Child) {
     let deadline = Instant::now() + PROOF_TIMEOUT;
     loop {
@@ -1902,7 +1932,7 @@ fn wait_for_daemon_exit(child: &mut Child) -> ExitStatus {
     }
 }
 
-impl Drop for SessionGrantWorkspaceDaemon {
+impl Drop for SessionGrantHostDaemon {
     fn drop(&mut self) {
         let _ = self.terminate_and_join();
         drop(self.child.take());
@@ -1924,16 +1954,16 @@ fn assert_session_grant_lifecycle_absent(pid: u32, endpoint: &Path, lock_path: &
     #[cfg(target_os = "linux")]
     assert!(
         !Path::new(&format!("/proc/{pid}")).exists(),
-        "workspace daemon {pid} remained after bounded join"
+        "host daemon {pid} remained after bounded join"
     );
     assert!(
         !endpoint.exists(),
-        "workspace daemon socket remained: {}",
+        "host daemon socket remained: {}",
         endpoint.display()
     );
     assert!(
         !lock_path.exists(),
-        "workspace daemon lock remained: {}",
+        "host daemon lock remained: {}",
         lock_path.display()
     );
 }
@@ -1941,7 +1971,16 @@ fn assert_session_grant_lifecycle_absent(pid: u32, endpoint: &Path, lock_path: &
 impl Drop for HostDaemonCleanup {
     fn drop(&mut self) {
         if let Ok(mut client) = DaemonClient::connect(&self.config.socket_path) {
-            let _ = client.hello(&self.config.workspace_root);
+            let hello = client.hello(&self.config.workspace_root);
+            if matches!(
+                hello,
+                Err(ClientError::DaemonResponse(ref error))
+                    if error.code == ERROR_WORKSPACE_UNREGISTERED
+            ) && let Ok(name) = paths::workspace_id(&self.config.workspace_root)
+            {
+                let _ = client.workspace_create(name, self.config.workspace_root.clone());
+                let _ = client.hello(&self.config.workspace_root);
+            }
             let _ = client.shutdown_if_idle();
         }
         let deadline = Instant::now() + PROOF_TIMEOUT;

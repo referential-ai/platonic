@@ -253,10 +253,9 @@ fn audit_history_lines(
             lines.push(Line::from(
                 "Quit and run plato --tui to ensure the host daemon.",
             ));
-            lines.push(Line::from(format!(
-                "Or start platonic serve --workspace {}, then press r to reconnect.",
-                state.workspace_root
-            )));
+            lines.push(Line::from(
+                "Or start platonic serve, then press r to reconnect.",
+            ));
         }
     }
 
@@ -309,10 +308,9 @@ fn conversation_history_lines(
             lines.push(Line::from(
                 "Quit and run plato --tui to ensure the host daemon.",
             ));
-            lines.push(Line::from(format!(
-                "Or start platonic serve --workspace {}, then press r to reconnect.",
-                state.workspace_root
-            )));
+            lines.push(Line::from(
+                "Or start platonic serve, then press r to reconnect.",
+            ));
         }
     }
 
@@ -2724,7 +2722,8 @@ mod tests {
 
         assert!(output.contains("daemon unavailable"));
         assert!(output.contains("plato --tui to ensure the host daemon"));
-        assert!(output.contains("platonic serve --workspace /tmp/work"));
+        assert!(output.contains("start platonic serve"));
+        assert!(!output.contains("serve --workspace"));
         assert!(!output.contains("cargo run"));
         assert!(output.contains("press r to reconnect"));
         assert!(output.contains("daemon unavailable — r to reconnect"));
