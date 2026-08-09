@@ -2653,10 +2653,8 @@ mod tests {
             daemon_version: "0.1.0".into(),
             workspace_id: "ws-0123456789abcdef".into(),
             ledger_path: "/secret/ledger.db".into(),
-            capabilities: REQUIRED_CAPABILITIES
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
+            capabilities: REQUIRED_CAPABILITIES.to_vec(),
+            daemon_scope: None,
         };
 
         validate_hello(workspace.path(), &hello).unwrap();

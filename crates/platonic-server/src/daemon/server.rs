@@ -657,7 +657,7 @@ fn handle_registered_line(runtime: &DaemonRuntime, line: &str) -> Envelope {
         Err(error) => match decode_request(line) {
             Ok(request) => Envelope::error(
                 request.id,
-                request.method,
+                request.method.map(|method| method.to_string()),
                 ERROR_INTERNAL,
                 error.to_string(),
             ),
