@@ -56,6 +56,30 @@ fn request_params_value(request: &Envelope) -> Value {
     let request = serde_json::to_value(request.params.as_ref().unwrap()).unwrap();
     request.get("params").cloned().unwrap()
 }
+
+fn init_git_repository(path: &Path) {
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(path)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--quiet", "--initial-branch", "main"]);
+    git(&["config", "user.name", "Platonic Test"]);
+    git(&["config", "user.email", "platonic@example.invalid"]);
+    fs::write(path.join(".gitkeep"), "").unwrap();
+    git(&["add", ".gitkeep"]);
+    git(&["commit", "--quiet", "-m", "initial"]);
+}
+
 const SCROLLBACK_SENTINEL: &str = "PLATO_NATIVE_SCROLLBACK_SENTINEL_377";
 const CONVERSATION_USER_TEXT: &str = concat!(
     "PLATO_NATIVE_SCROLLBACK_SENTINEL_377\n",
@@ -85,6 +109,7 @@ fn plato_tui_cold_starts_host_thread_and_remote_reuses_it() {
     for directory in [&workspace, &runtime, &state, &home] {
         fs::create_dir(directory).unwrap();
     }
+    init_git_repository(&workspace);
     let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let config = DaemonConnectionConfig::resolve(&workspace, Some(endpoint.clone())).unwrap();
     let _daemon_cleanup = HostDaemonCleanup {
@@ -110,14 +135,16 @@ fn plato_tui_cold_starts_host_thread_and_remote_reuses_it() {
     let thread = &threads[0];
     assert!(thread.live.loaded);
     assert_eq!(thread.authority.spawning_actor, "local_tui");
-    assert_eq!(thread.authority.cwd, workspace.to_string_lossy());
     let thread_id = thread.authority.thread_id.clone();
     let authority = client
         .thread_authority(thread_id.clone())
         .unwrap()
         .authority;
     assert_eq!(authority.spawning_actor, "local_tui");
-    assert_eq!(authority.granted_paths[0].path, workspace.to_string_lossy());
+    assert_eq!(authority.worktrees.len(), 1);
+    assert_eq!(thread.authority.cwd, authority.worktrees[0].path);
+    assert_eq!(authority.granted_paths.len(), 1);
+    assert!(authority.granted_paths[0].writable);
     assert_eq!(
         client
             .thread_status(thread_id.clone())

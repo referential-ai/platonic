@@ -27,6 +27,7 @@ const WORKSPACE_GATEWAY_ERROR: &str =
     "workspace plato.toml cannot set [gateway]; use --config, PLATO_CONFIG, or user config";
 const WORKSPACE_PRINCIPALS_ERROR: &str = "workspace plato.toml cannot set [principals]; define gateway principals only in the user config";
 const WORKSPACE_SPAWN_DEPTH_ERROR: &str = "workspace plato.toml cannot set limits.max_spawn_depth; use the user config and restart the server";
+const WORKSPACE_CONFINEMENT_ERROR: &str = "workspace plato.toml cannot set confinement.require; use the user config and restart the server";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolvedConfigPath {
@@ -53,7 +54,13 @@ pub struct Config {
     pub provider: ProviderConfig,
     pub limits: LimitsConfig,
     pub tools: ToolsConfig,
+    pub confinement: ConfinementConfig,
     pub gateway: Option<GatewayConfig>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ConfinementConfig {
+    pub require: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,8 +118,15 @@ struct RawConfig {
     provider: Option<RawProviderConfig>,
     limits: Option<RawLimitsConfig>,
     tools: Option<RawToolsConfig>,
+    confinement: Option<RawConfinementConfig>,
     gateway: Option<RawGatewayConfig>,
     principals: Option<RawPrincipalsConfig>,
+}
+
+#[derive(Default, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfinementConfig {
+    require: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,6 +211,9 @@ impl Config {
         {
             return Err(AppError::Config(WORKSPACE_SPAWN_DEPTH_ERROR.into()));
         }
+        if matches!(resolved, ResolvedConfigPath::Workspace(_)) && raw.confinement.is_some() {
+            return Err(AppError::Config(WORKSPACE_CONFINEMENT_ERROR.into()));
+        }
         if matches!(resolved, ResolvedConfigPath::Workspace(_))
             && raw.provider.as_ref().is_some_and(|provider| {
                 provider.api_key_env.is_some() || provider.base_url.is_some()
@@ -216,6 +233,7 @@ impl Config {
         let provider = raw.provider.unwrap_or_default();
         let limits = raw.limits.unwrap_or_default();
         let tools = raw.tools.unwrap_or_default();
+        let confinement = raw.confinement.unwrap_or_default();
         let gateway = raw.gateway.map(GatewayConfig::from_raw).transpose()?;
         let token_budget = positive(
             limits.token_budget.unwrap_or(DEFAULT_TOKEN_BUDGET),
@@ -288,6 +306,9 @@ impl Config {
                 max_spawn_depth,
             },
             tools: ToolsConfig { enabled },
+            confinement: ConfinementConfig {
+                require: confinement.require.unwrap_or(false),
+            },
             gateway,
         })
     }
@@ -316,6 +337,7 @@ impl Default for Config {
             tools: ToolsConfig {
                 enabled: default_enabled_tools(),
             },
+            confinement: ConfinementConfig::default(),
             gateway: None,
         }
     }
@@ -493,6 +515,14 @@ pub(crate) fn server_max_spawn_depth() -> AppResult<u32> {
     Ok(Config::load_resolved(resolved.as_ref())?
         .limits
         .max_spawn_depth)
+}
+
+pub(crate) fn server_require_confinement() -> AppResult<bool> {
+    let home = user_home();
+    let resolved = resolve_server_config_with(user_config_path(home.as_deref()));
+    Ok(Config::load_resolved(resolved.as_ref())?
+        .confinement
+        .require)
 }
 
 #[cfg(test)]
@@ -1124,6 +1154,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
     fn rejects_zero_token_budget() {
         let raw = RawConfig {
             provider: None,
+            confinement: None,
             limits: Some(RawLimitsConfig {
                 token_budget: Some(0),
                 max_output_tokens: None,
@@ -1139,9 +1170,37 @@ api_key_env = "DISCORD_BOT_TOKEN"
     }
 
     #[test]
+    fn parses_server_confinement_policy_and_rejects_workspace_override() {
+        let raw = RawConfig {
+            provider: None,
+            limits: None,
+            tools: None,
+            confinement: Some(RawConfinementConfig {
+                require: Some(true),
+            }),
+            gateway: None,
+            principals: None,
+        };
+        assert!(Config::from_raw(raw).unwrap().confinement.require);
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("plato.toml"),
+            "[confinement]\nrequire = true\n",
+        )
+        .unwrap();
+        let resolved = ResolvedConfigPath::Workspace(workspace.path().join("plato.toml"));
+        assert!(matches!(
+            Config::load_resolved(Some(&resolved)),
+            Err(AppError::Config(message)) if message == WORKSPACE_CONFINEMENT_ERROR
+        ));
+    }
+
+    #[test]
     fn rejects_zero_max_output_tokens() {
         let raw = RawConfig {
             provider: None,
+            confinement: None,
             limits: Some(RawLimitsConfig {
                 token_budget: None,
                 max_output_tokens: Some(0),
@@ -1160,6 +1219,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
     fn rejects_unknown_enabled_tools() {
         let raw = RawConfig {
             provider: None,
+            confinement: None,
             limits: None,
             tools: Some(RawToolsConfig {
                 enabled: Some(vec!["shell.delete".into()]),
@@ -1180,6 +1240,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
     fn rejects_zero_max_turns() {
         let raw = RawConfig {
             provider: None,
+            confinement: None,
             limits: Some(RawLimitsConfig {
                 token_budget: None,
                 max_output_tokens: None,
@@ -1198,6 +1259,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
     fn parses_configured_max_turns() {
         let raw = RawConfig {
             provider: None,
+            confinement: None,
             limits: Some(RawLimitsConfig {
                 token_budget: None,
                 max_output_tokens: None,
@@ -1216,6 +1278,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
     fn rejects_zero_max_spawn_depth() {
         let raw = RawConfig {
             provider: None,
+            confinement: None,
             limits: Some(RawLimitsConfig {
                 token_budget: None,
                 max_output_tokens: None,
@@ -1322,6 +1385,7 @@ stream_idle_timeout_ms = 9000
                 http_referer: None,
                 app_title: None,
             }),
+            confinement: None,
             limits: None,
             tools: None,
             gateway: None,

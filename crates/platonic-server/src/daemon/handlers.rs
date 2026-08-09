@@ -2,6 +2,7 @@ use crate::{
     AppError, AppResult, ApprovalMode, RunEvent, RunLedger, RunOptions, RunOutcome, RunSession,
     app::ExternalApprovalOutcome,
     config::{Config, ProviderKind},
+    confinement::ChildConfinement,
     daemon::{
         protocol::{
             AgentCreateParams, AgentCreateResult, AgentListParams, AgentListResult,
@@ -13,22 +14,23 @@ use crate::{
             ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
             ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
             ERROR_SESSIONS_LIST_FAILED, ERROR_THREAD_AUTHORITY_EXCEEDED,
-            ERROR_THREAD_AUTHORITY_FAILED, ERROR_THREAD_EVENTS_FAILED, ERROR_THREAD_LIST_FAILED,
-            ERROR_THREAD_SEND_FAILED, ERROR_THREAD_SPAWN_FAILED, ERROR_THREAD_STATUS_FAILED,
-            ERROR_THREAD_STOP_FAILED, ERROR_WORKSPACE_BROKEN, ERROR_WORKSPACE_MISMATCH,
-            ERROR_WORKSPACE_UNREGISTERED, Envelope, EventsStreamParams, EventsStreamResult,
-            HelloParams, HelloResult, IssuePrepResult, IssuePrepStartParams, IssuePrepStartResult,
-            MessageAppendParams, ModelIdentityStatus, ProtocolErrorCode, ProtocolRequest,
-            ProtocolResponse, RunCancelParams, RunStartParams, RunStartResult, RunStateName,
-            SessionSummary, SessionsListResult, ShutdownIfIdleResult, ShutdownIfIdleResultName,
-            StreamEvent, ThreadApprovalPolicy, ThreadAuthorityParams, ThreadAuthorityResult,
-            ThreadEventsParams, ThreadListResult, ThreadSendParams, ThreadSpawnDecision,
-            ThreadSpawnParams, ThreadSpawnResult, ThreadStatus, ThreadStatusParams,
-            ThreadStatusResult, ThreadStopParams, ThreadStopResult, TranscriptReadParams,
-            TranscriptReadResult, TypedRun, TypedTranscript, TypedTranscriptEntry,
-            WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceHealthName, WorkspaceListParams,
-            WorkspaceListResult, WorkspaceStatusParams, WorkspaceStatusResult, WorkspaceSummary,
-            decode_request,
+            ERROR_THREAD_AUTHORITY_FAILED, ERROR_THREAD_BRANCH_CLAIM_CONFLICT,
+            ERROR_THREAD_CONFINEMENT_UNAVAILABLE, ERROR_THREAD_EVENTS_FAILED,
+            ERROR_THREAD_LIST_FAILED, ERROR_THREAD_SEND_FAILED, ERROR_THREAD_SPAWN_FAILED,
+            ERROR_THREAD_STATUS_FAILED, ERROR_THREAD_STOP_FAILED, ERROR_WORKSPACE_BROKEN,
+            ERROR_WORKSPACE_MISMATCH, ERROR_WORKSPACE_UNREGISTERED, Envelope, EventsStreamParams,
+            EventsStreamResult, HelloParams, HelloResult, IssuePrepResult, IssuePrepStartParams,
+            IssuePrepStartResult, MessageAppendParams, ModelIdentityStatus, ProtocolErrorCode,
+            ProtocolRequest, ProtocolResponse, RunCancelParams, RunStartParams, RunStartResult,
+            RunStateName, SessionSummary, SessionsListResult, ShutdownIfIdleResult,
+            ShutdownIfIdleResultName, StreamEvent, ThreadApprovalPolicy, ThreadAuthorityParams,
+            ThreadAuthorityResult, ThreadConfinement, ThreadEventsParams, ThreadListResult,
+            ThreadRepositoryRequest, ThreadSendParams, ThreadSpawnDecision, ThreadSpawnParams,
+            ThreadSpawnResult, ThreadStatus, ThreadStatusParams, ThreadStatusResult,
+            ThreadStopParams, ThreadStopResult, TranscriptReadParams, TranscriptReadResult,
+            TypedRun, TypedTranscript, TypedTranscriptEntry, WorkspaceCreateParams,
+            WorkspaceCreateResult, WorkspaceHealthName, WorkspaceListParams, WorkspaceListResult,
+            WorkspaceStatusParams, WorkspaceStatusResult, WorkspaceSummary, decode_request,
         },
         runtime::{
             DaemonRuntime, IssuePrepAdmissionError, RunAdmissionError, RunRecord,
@@ -343,6 +345,8 @@ enum ThreadSpawnFailure {
     Authority(ThreadAuthorityError),
     Overload(String),
     Conflict(String),
+    BranchConflict(String),
+    ConfinementUnavailable,
     Persistence,
 }
 
@@ -402,6 +406,18 @@ fn handle_thread_spawn(
             ERROR_THREAD_SPAWN_FAILED,
             message,
         ),
+        Err(ThreadSpawnFailure::BranchConflict(message)) => Envelope::error(
+            request.id,
+            Some("thread.spawn".into()),
+            ERROR_THREAD_BRANCH_CLAIM_CONFLICT,
+            message,
+        ),
+        Err(ThreadSpawnFailure::ConfinementUnavailable) => Envelope::error(
+            request.id,
+            Some("thread.spawn".into()),
+            ERROR_THREAD_CONFINEMENT_UNAVAILABLE,
+            "server policy requires confinement, but this spawn cannot be confined",
+        ),
         Err(ThreadSpawnFailure::Persistence) => Envelope::error(
             request.id,
             Some("thread.spawn".into()),
@@ -422,6 +438,7 @@ fn thread_spawn(
             model,
             reasoning_effort,
             approval_policy,
+            repositories,
         } => start_thread_spawn(
             runtime,
             parent_thread_id,
@@ -429,6 +446,7 @@ fn thread_spawn(
             model,
             reasoning_effort,
             approval_policy,
+            repositories,
         ),
         ThreadSpawnParams::Decide { spawn_id, approval } => {
             decide_thread_spawn(runtime, &spawn_id, approval)
@@ -443,6 +461,7 @@ fn start_thread_spawn(
     model: String,
     reasoning_effort: crate::model::ReasoningEffort,
     approval_policy: crate::daemon::protocol::ThreadApprovalPolicy,
+    repositories: Vec<ThreadRepositoryRequest>,
 ) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
     if runtime.shutdown_accepted() {
         return Err(ThreadSpawnFailure::ShuttingDown);
@@ -494,6 +513,7 @@ fn start_thread_spawn(
         runtime,
         &mut store,
         draft,
+        repositories,
         runtime.max_spawn_depth(),
         "yolo",
     )
@@ -502,11 +522,23 @@ fn start_thread_spawn(
 fn start_thread_spawn_draft(
     runtime: &DaemonRuntime,
     store: &mut ServerStore,
-    draft: ThreadAuthorityDraft,
+    mut draft: ThreadAuthorityDraft,
+    repository_requests: Vec<ThreadRepositoryRequest>,
     max_spawn_depth: u32,
     auto_grant_actor: &str,
 ) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
     let parent = read_live_parent(runtime, store, &draft, max_spawn_depth)?;
+    draft.repositories = crate::thread_repository::resolve(
+        &runtime.paths.workspace_root,
+        &draft.thread_id,
+        Path::new(&draft.cwd),
+        parent.as_ref(),
+        &repository_requests,
+    )
+    .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
+    if let Some(parent) = parent.as_ref() {
+        validate_child_authority(parent, &draft).map_err(ThreadSpawnFailure::Authority)?;
+    }
     let auto_grant = parent.as_ref().is_some_and(|parent| {
         parent.approval_policy == crate::daemon::protocol::ThreadApprovalPolicy::Yolo
     });
@@ -644,10 +676,12 @@ fn model_thread_spawn_inner(
         toolset,
     })
     .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
+    let repositories = input.repositories.unwrap_or_default();
     let result = start_thread_spawn_draft(
         runtime,
         &mut store,
         draft,
+        repositories,
         runtime.max_spawn_depth(),
         &approving_actor,
     )?;
@@ -693,6 +727,13 @@ fn thread_spawn_rejection(error: ThreadSpawnFailure) -> (String, String) {
         ),
         ThreadSpawnFailure::Overload(reason) => (ERROR_OVERLOAD.to_string(), reason),
         ThreadSpawnFailure::Conflict(reason) => (ERROR_THREAD_SPAWN_FAILED.to_string(), reason),
+        ThreadSpawnFailure::BranchConflict(reason) => {
+            (ERROR_THREAD_BRANCH_CLAIM_CONFLICT.to_string(), reason)
+        }
+        ThreadSpawnFailure::ConfinementUnavailable => (
+            ERROR_THREAD_CONFINEMENT_UNAVAILABLE.to_string(),
+            "server policy requires confinement, but this spawn cannot be confined".into(),
+        ),
         ThreadSpawnFailure::Persistence => (
             ERROR_THREAD_SPAWN_FAILED.to_string(),
             "thread spawn could not be persisted".into(),
@@ -764,14 +805,64 @@ fn resolve_thread_spawn_inner(
     match decision {
         ThreadSpawnDecision::Grant { actor } => {
             read_live_parent(runtime, store, &pending.draft, pending.max_spawn_depth)?;
-            let authority = pending
+            let confinement = runtime
+                .thread_confinement()
+                .map_err(|()| ThreadSpawnFailure::ConfinementUnavailable)?;
+            let claims = pending
                 .draft
+                .repositories
+                .iter()
+                .map(|repository| (repository.repo.clone(), repository.branch.clone()))
+                .collect::<Vec<_>>();
+            if let Some(conflict) = store
+                .claim_thread_branches(
+                    &runtime.paths.workspace_id,
+                    &pending.draft.thread_id,
+                    &claims,
+                    decided_at_ms,
+                )
+                .map_err(|_| ThreadSpawnFailure::Persistence)?
+            {
+                return Err(ThreadSpawnFailure::BranchConflict(format!(
+                    "branch {} in repository {} is already claimed by thread {}",
+                    conflict.branch, conflict.repo, conflict.thread_id
+                )));
+            }
+            let mut draft = pending.draft.clone();
+            if !draft.repositories.is_empty() {
+                let prepared = match crate::thread_repository::prepare(
+                    &runtime.paths.server_db_path,
+                    &runtime.paths.workspace_id,
+                    &draft.thread_id,
+                    &draft.repositories,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        let _ = store.release_thread_claims(&draft.thread_id);
+                        return Err(ThreadSpawnFailure::Malformed(error.to_string()));
+                    }
+                };
+                draft.worktrees = prepared.worktrees;
+                draft.granted_paths = prepared.granted_paths;
+            }
+            let authority = draft
                 .complete(actor, decided_at_ms)
                 .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
-            let durable = store
-                .persist_thread_spawn(&approval, Some(&authority))
-                .map_err(|_| ThreadSpawnFailure::Persistence)?
-                .expect("granted spawn persistence returns durable authority");
+            let durable =
+                match store.persist_thread_spawn(&approval, Some(&authority), Some(confinement)) {
+                    Ok(Some(durable)) => durable,
+                    Ok(None) => unreachable!("granted spawn persistence returns durable authority"),
+                    Err(_) => {
+                        let _ = crate::thread_repository::discard(
+                            &runtime.paths.server_db_path,
+                            &runtime.paths.workspace_id,
+                            &draft.thread_id,
+                            &draft.repositories,
+                        );
+                        let _ = store.release_thread_claims(&draft.thread_id);
+                        return Err(ThreadSpawnFailure::Persistence);
+                    }
+                };
             let authority = durable.record().clone();
             runtime.complete_thread_spawn(&pending.spawn_id, durable);
             Ok(ThreadSpawnResult::Spawned {
@@ -781,7 +872,7 @@ fn resolve_thread_spawn_inner(
         }
         ThreadSpawnDecision::Deny { actor, reason } => {
             store
-                .persist_thread_spawn(&approval, None)
+                .persist_thread_spawn(&approval, None, None)
                 .map_err(|_| ThreadSpawnFailure::Persistence)?;
             runtime.complete_thread_spawn_without_authority(&pending.spawn_id);
             Ok(ThreadSpawnResult::Denied {
@@ -793,7 +884,7 @@ fn resolve_thread_spawn_inner(
         }
         ThreadSpawnDecision::Cancel { actor } => {
             store
-                .persist_thread_spawn(&approval, None)
+                .persist_thread_spawn(&approval, None, None)
                 .map_err(|_| ThreadSpawnFailure::Persistence)?;
             runtime.complete_thread_spawn_without_authority(&pending.spawn_id);
             Ok(ThreadSpawnResult::Canceled {
@@ -953,10 +1044,24 @@ fn handle_thread_authority(
     request: Envelope,
     params: ThreadAuthorityParams,
 ) -> Envelope {
-    match crate::server_store::thread_authority(&runtime.paths.server_db_path, &params.thread_id) {
-        Ok(Some(authority)) => Envelope::typed_response(
+    match crate::server_store::thread_authority(&runtime.paths.server_db_path, &params.thread_id)
+        .and_then(|authority| {
+            authority
+                .map(|authority| {
+                    crate::server_store::thread_confinement(
+                        &runtime.paths.server_db_path,
+                        &params.thread_id,
+                    )
+                    .map(|confinement| (authority, confinement))
+                })
+                .transpose()
+        }) {
+        Ok(Some((authority, confinement))) => Envelope::typed_response(
             request.id,
-            ProtocolResponse::ThreadAuthority(ThreadAuthorityResult { authority }),
+            ProtocolResponse::ThreadAuthority(ThreadAuthorityResult {
+                authority,
+                confinement,
+            }),
         ),
         Ok(None) => Envelope::error(
             request.id,
@@ -1082,6 +1187,18 @@ fn handle_thread_send(
             "thread authority has no working directory",
         );
     };
+    let confinement = match thread_child_confinement(runtime, &authority) {
+        Ok(confinement) => confinement,
+        Err(_) => {
+            runtime.abort_thread_turn(&turn);
+            return Envelope::error(
+                request.id,
+                Some("thread.send".into()),
+                ERROR_THREAD_SEND_FAILED,
+                "thread confinement readback failed",
+            );
+        }
+    };
     let context = ThreadRunContext {
         workspace_root,
         approval_policy: authority.approval_policy,
@@ -1090,6 +1207,7 @@ fn handle_thread_send(
             .unwrap_or_else(|| AgentId::new("plato").expect("static agent id is valid")),
         toolset: authority.toolset,
         turn: turn.clone(),
+        confinement,
     };
     let response = start_run(
         runtime,
@@ -1111,6 +1229,44 @@ fn handle_thread_send(
         return *response;
     }
     Envelope::typed_response(request.id, ProtocolResponse::ThreadSend(receipt))
+}
+
+fn thread_child_confinement(
+    runtime: &DaemonRuntime,
+    authority: &crate::daemon::protocol::ThreadAuthorityRecord,
+) -> AppResult<ChildConfinement> {
+    match crate::server_store::thread_confinement(
+        &runtime.paths.server_db_path,
+        &authority.thread_id,
+    )? {
+        Some(ThreadConfinement::Landlock) => {
+            let scratch = authority
+                .granted_paths
+                .iter()
+                .find(|grant| grant.writable)
+                .map(|grant| PathBuf::from(&grant.path))
+                .ok_or_else(|| {
+                    AppError::Config("confined thread authority has no scratch path".into())
+                })?;
+            let mut writable_paths = authority
+                .worktrees
+                .iter()
+                .map(|worktree| PathBuf::from(&worktree.path))
+                .collect::<Vec<_>>();
+            writable_paths.extend(
+                authority
+                    .granted_paths
+                    .iter()
+                    .filter(|grant| grant.writable)
+                    .map(|grant| PathBuf::from(&grant.path)),
+            );
+            Ok(ChildConfinement::Landlock {
+                writable_paths,
+                scratch,
+            })
+        }
+        Some(ThreadConfinement::None) | None => Ok(ChildConfinement::None),
+    }
 }
 
 fn validate_thread_send(params: &ThreadSendParams) -> Result<(), String> {
@@ -1334,6 +1490,20 @@ fn handle_thread_stop(
         }
     }
 
+    if let Err(error) = crate::thread_repository::integrate_and_discard(
+        &runtime.paths.server_db_path,
+        &runtime.paths.workspace_id,
+        &authority,
+    ) {
+        runtime.abort_thread_stop(&authority.thread_id);
+        return Envelope::error(
+            request.id,
+            Some("thread.stop".into()),
+            ERROR_THREAD_STOP_FAILED,
+            format!("thread repository integration failed: {error}"),
+        );
+    }
+
     let stop = ThreadStopRecord::new(
         authority.thread_id.clone(),
         validated.actor,
@@ -1532,6 +1702,7 @@ struct ThreadRunContext {
     agent_id: AgentId,
     toolset: Vec<String>,
     turn: ThreadTurnBinding,
+    confinement: ChildConfinement,
 }
 
 struct StartRunRequest {
@@ -1549,6 +1720,13 @@ struct ThreadTurnDriver {
     session_id: String,
     config_path: Option<String>,
     overrides: RunOverrides,
+}
+
+struct RunAuthorityProjection {
+    agent_id: Option<AgentId>,
+    toolset: Option<Vec<String>>,
+    thread_spawn: Option<ThreadSpawnToolHandler>,
+    confinement: ChildConfinement,
 }
 
 fn start_run(
@@ -1680,17 +1858,20 @@ fn start_run(
     let thread_spawn = thread_context
         .as_ref()
         .and_then(|context| projected_thread_spawn_handler(runtime, context));
+    let child_confinement = thread_context
+        .as_ref()
+        .map_or(ChildConfinement::None, |context| {
+            context.confinement.clone()
+        });
+    let authority = RunAuthorityProjection {
+        agent_id: run_agent_id,
+        toolset: run_toolset,
+        thread_spawn,
+        confinement: child_confinement,
+    };
 
     if wait.unwrap_or(false) {
-        match run_to_completion(
-            runtime,
-            &record,
-            options,
-            event_collector,
-            run_agent_id,
-            run_toolset,
-            thread_spawn,
-        ) {
+        match run_to_completion(runtime, &record, options, event_collector, authority) {
             Ok(_) => Ok(run_start_result(&record)),
             Err(error) => Err(Box::new(Envelope::error(
                 request_id,
@@ -1726,9 +1907,7 @@ fn start_run(
                         &worker_record,
                         options,
                         event_collector,
-                        run_agent_id,
-                        run_toolset,
-                        thread_spawn,
+                        authority,
                     );
                 });
             }
@@ -1744,18 +1923,13 @@ fn drive_thread_turn(
     event_collector: thread::JoinHandle<()>,
     driver: ThreadTurnDriver,
 ) {
-    let agent_id = Some(driver.context.agent_id.clone());
-    let toolset = Some(driver.context.toolset.clone());
-    let thread_spawn = projected_thread_spawn_handler(&runtime, &driver.context);
-    let _ = run_to_completion(
-        &runtime,
-        &record,
-        options,
-        event_collector,
-        agent_id,
-        toolset,
-        thread_spawn,
-    );
+    let authority = RunAuthorityProjection {
+        agent_id: Some(driver.context.agent_id.clone()),
+        toolset: Some(driver.context.toolset.clone()),
+        thread_spawn: projected_thread_spawn_handler(&runtime, &driver.context),
+        confinement: driver.context.confinement.clone(),
+    };
+    let _ = run_to_completion(&runtime, &record, options, event_collector, authority);
     while let Some(message) = runtime.next_thread_message(&driver.context.turn) {
         let _ = start_run(
             &runtime,
@@ -1780,10 +1954,16 @@ fn run_to_completion(
     record: &RunRecord,
     options: RunOptions,
     event_collector: thread::JoinHandle<()>,
-    agent_id: Option<AgentId>,
-    toolset: Option<Vec<String>>,
-    thread_spawn: Option<ThreadSpawnToolHandler>,
+    authority: RunAuthorityProjection,
 ) -> AppResult<RunOutcome> {
+    let RunAuthorityProjection {
+        agent_id,
+        toolset,
+        thread_spawn,
+        confinement,
+    } = authority;
+    #[cfg(test)]
+    let _ = &confinement;
     #[cfg(test)]
     let completion = RunCompletion::Published(match (agent_id, toolset, thread_spawn) {
         (Some(agent_id), Some(toolset), thread_spawn) => {
@@ -1808,6 +1988,7 @@ fn run_to_completion(
                             event_sender,
                             cancel,
                             thread_spawn,
+                            confinement,
                         ),
                     )),
                     (None, _) => RunCompletion::Published(Err(AppError::SupervisedRun(
@@ -3077,6 +3258,14 @@ mod tests {
     fn thread_test_runtime_with_max_spawn_depth(
         max_spawn_depth: u32,
     ) -> (tempfile::TempDir, DaemonRuntime) {
+        let (root, runtime) = repositoryless_thread_test_runtime(max_spawn_depth);
+        init_git_repository(&runtime.paths.workspace_root);
+        (root, runtime)
+    }
+
+    fn repositoryless_thread_test_runtime(
+        max_spawn_depth: u32,
+    ) -> (tempfile::TempDir, DaemonRuntime) {
         let (root, runtime) = bare_thread_test_runtime_with_max_spawn_depth(max_spawn_depth);
         runtime
             .paths
@@ -3573,8 +3762,55 @@ mod tests {
                 model: "gpt-5.6-sol".into(),
                 reasoning_effort: crate::daemon::protocol::ReasoningEffort::Xhigh,
                 approval_policy,
+                repositories: Vec::new(),
             },
         )
+    }
+
+    fn start_thread_with_repositories(
+        runtime: &DaemonRuntime,
+        repositories: Vec<ThreadRepositoryRequest>,
+    ) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
+        thread_spawn(
+            runtime,
+            ThreadSpawnParams::Start {
+                parent_thread_id: None,
+                cwd: runtime.paths.workspace_root.to_string_lossy().into_owned(),
+                model: "gpt-5.6-sol".into(),
+                reasoning_effort: crate::daemon::protocol::ReasoningEffort::Xhigh,
+                approval_policy: ThreadApprovalPolicy::Prompt,
+                repositories,
+            },
+        )
+    }
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().into()
+    }
+
+    fn init_git_repository(path: &Path) -> String {
+        if path.join(".git").is_dir() {
+            return git(path, &["rev-parse", "HEAD"]);
+        }
+        git(path, &["init", "--quiet", "--initial-branch", "main"]);
+        git(path, &["config", "user.name", "Platonic Test"]);
+        git(path, &["config", "user.email", "platonic@example.invalid"]);
+        std::fs::write(path.join("tracked.txt"), "user\n").unwrap();
+        git(path, &["add", "tracked.txt"]);
+        git(path, &["commit", "--quiet", "-m", "initial"]);
+        git(path, &["rev-parse", "HEAD"])
     }
 
     fn pending_spawn(result: ThreadSpawnResult) -> (String, String) {
@@ -3665,18 +3901,38 @@ mod tests {
 
     fn model_spawn_input(
         runtime: &DaemonRuntime,
+        parent_thread_id: &str,
         agent_id: &str,
         toolset: Option<Vec<String>>,
         approval_policy: Option<ThreadApprovalPolicy>,
     ) -> ThreadSpawnToolInput {
+        let cwd = thread_worktree(runtime, parent_thread_id)
+            .to_string_lossy()
+            .into_owned();
         ThreadSpawnToolInput {
             agent_id: agent_id.into(),
-            cwd: runtime.paths.workspace_root.to_string_lossy().into_owned(),
+            cwd,
             model: None,
             reasoning_effort: None,
             approval_policy,
             toolset,
+            repositories: None,
         }
+    }
+
+    fn thread_worktree(runtime: &DaemonRuntime, thread_id: &str) -> PathBuf {
+        PathBuf::from(
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .thread_authority(thread_id)
+                .unwrap()
+                .unwrap()
+                .worktrees[0]
+                .path
+                .clone(),
+        )
     }
 
     #[test]
@@ -3693,7 +3949,7 @@ mod tests {
         let output = model_thread_spawn(
             &runtime,
             &parent_thread_id,
-            model_spawn_input(&runtime, "worker", None, None),
+            model_spawn_input(&runtime, &parent_thread_id, "worker", None, None),
             "daemon".into(),
         )
         .unwrap();
@@ -3715,7 +3971,9 @@ mod tests {
         );
         assert_eq!(child.model, "worker-model");
         assert_eq!(child.toolset, ["file.read"]);
-        assert!(!child.granted_paths[0].writable);
+        assert_eq!(child.worktrees.len(), 1);
+        assert_eq!(child.granted_paths.len(), 1);
+        assert!(child.granted_paths[0].writable);
         assert!(!child.network);
         assert!(runtime.thread_is_loaded(&child_thread_id));
         drop(store);
@@ -3761,6 +4019,7 @@ mod tests {
                 "parent toolset",
                 model_spawn_input(
                     &runtime,
+                    &parent_thread_id,
                     "broad-worker",
                     Some(vec!["file.read".into(), "web.fetch".into()]),
                     None,
@@ -3770,6 +4029,7 @@ mod tests {
                 "parent policy",
                 model_spawn_input(
                     &runtime,
+                    &parent_thread_id,
                     "broad-worker",
                     Some(vec!["file.read".into()]),
                     Some(ThreadApprovalPolicy::Yolo),
@@ -3779,6 +4039,7 @@ mod tests {
                 "agent toolset",
                 model_spawn_input(
                     &runtime,
+                    &parent_thread_id,
                     "narrow-worker",
                     Some(vec!["file.write".into()]),
                     None,
@@ -3788,8 +4049,13 @@ mod tests {
                 "cwd",
                 ThreadSpawnToolInput {
                     cwd: outside.path().to_string_lossy().into_owned(),
+                    repositories: Some(vec![ThreadRepositoryRequest {
+                        repo: ".".into(),
+                        branch: None,
+                    }]),
                     ..model_spawn_input(
                         &runtime,
+                        &parent_thread_id,
                         "broad-worker",
                         Some(vec!["file.read".into()]),
                         None,
@@ -3825,6 +4091,7 @@ mod tests {
             &parent_thread_id,
             model_spawn_input(
                 &runtime,
+                &parent_thread_id,
                 "broad-worker",
                 Some(vec!["file.read".into(), "thread.spawn".into()]),
                 None,
@@ -3841,6 +4108,7 @@ mod tests {
             &first_child,
             model_spawn_input(
                 &runtime,
+                &first_child,
                 "broad-worker",
                 Some(vec!["file.read".into()]),
                 None,
@@ -3889,6 +4157,7 @@ mod tests {
             &parent_thread_id,
             model_spawn_input(
                 &runtime,
+                &parent_thread_id,
                 "worker",
                 Some(vec!["file.read".into(), "thread.spawn".into()]),
                 None,
@@ -3903,7 +4172,13 @@ mod tests {
         let rejected = model_thread_spawn(
             &runtime,
             &child_thread_id,
-            model_spawn_input(&runtime, "worker", Some(vec!["file.read".into()]), None),
+            model_spawn_input(
+                &runtime,
+                &child_thread_id,
+                "worker",
+                Some(vec!["file.read".into()]),
+                None,
+            ),
             "daemon".into(),
         )
         .unwrap();
@@ -3944,6 +4219,7 @@ mod tests {
             &parent_thread_id,
             model_spawn_input(
                 &runtime,
+                &parent_thread_id,
                 "worker",
                 Some(vec!["file.read".into(), "thread.spawn".into()]),
                 None,
@@ -3960,6 +4236,7 @@ mod tests {
             &child_thread_id,
             model_spawn_input(
                 &runtime,
+                &child_thread_id,
                 "worker",
                 Some(vec!["file.read".into(), "thread.spawn".into()]),
                 None,
@@ -3974,7 +4251,13 @@ mod tests {
         let rejected = model_thread_spawn(
             &runtime,
             &grandchild_thread_id,
-            model_spawn_input(&runtime, "worker", Some(vec!["file.read".into()]), None),
+            model_spawn_input(
+                &runtime,
+                &grandchild_thread_id,
+                "worker",
+                Some(vec!["file.read".into()]),
+                None,
+            ),
             "daemon".into(),
         )
         .unwrap();
@@ -4029,10 +4312,6 @@ mod tests {
         assert_eq!(status.authority.thread_id, thread_id);
         assert_eq!(status.authority.spawning_actor, "stdin");
         assert_eq!(status.authority.parent_thread_id, None);
-        assert_eq!(
-            status.authority.cwd,
-            runtime.paths.workspace_root.to_string_lossy()
-        );
         let authority_response = handle_line(
             &runtime,
             &format!(
@@ -4040,15 +4319,19 @@ mod tests {
             ),
         );
         let authority: ThreadAuthorityResult = response_result(&authority_response);
+        let expected_confinement = match runtime.confinement_support() {
+            crate::confinement::ConfinementSupport::Landlock => ThreadConfinement::Landlock,
+            crate::confinement::ConfinementSupport::None => ThreadConfinement::None,
+        };
+        assert_eq!(authority.confinement, Some(expected_confinement));
         let authority = authority.authority;
         assert_eq!(authority.agent_id, Some(AgentId::new("plato").unwrap()));
-        assert_eq!(
-            authority.granted_paths,
-            vec![crate::daemon::protocol::ThreadGrantedPath {
-                path: runtime.paths.workspace_root.to_string_lossy().into_owned(),
-                writable: true,
-            }]
-        );
+        assert_eq!(authority.worktrees.len(), 1);
+        assert_eq!(authority.worktrees[0].repo, ".");
+        assert_eq!(authority.worktrees[0].branch, format!("thread/{thread_id}"));
+        assert_eq!(status.authority.cwd, authority.worktrees[0].path);
+        assert_eq!(authority.granted_paths.len(), 1);
+        assert!(authority.granted_paths[0].writable);
         assert_eq!(
             authority.toolset,
             [
@@ -4060,7 +4343,6 @@ mod tests {
                 "web.fetch",
             ]
         );
-        assert!(authority.worktrees.is_empty());
         assert!(authority.network);
         assert_eq!(status.authority.model, "gpt-5.6-sol");
         assert_eq!(
@@ -4085,6 +4367,269 @@ mod tests {
         let approval = store.thread_spawn_approval(&spawn_id).unwrap().unwrap();
         assert_eq!(approval.decision, ThreadSpawnDecisionName::Granted);
         assert_eq!(approval.actor, status.authority.spawning_actor);
+    }
+
+    #[test]
+    fn repositoryless_spawn_is_rejected_before_admission_or_server_owned_state() {
+        let (_root, runtime) = repositoryless_thread_test_runtime(1);
+
+        let error = start_thread(
+            &runtime,
+            None,
+            &runtime.paths.workspace_root,
+            ThreadApprovalPolicy::Prompt,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                ThreadSpawnFailure::Malformed(message)
+                    if message.contains("thread spawn requires a named Git repository and claimed branch")
+            ),
+            "unexpected repository-less spawn failure: {error:?}"
+        );
+        let store = runtime.paths.server_store().unwrap();
+        assert!(store.thread_authorities().unwrap().is_empty());
+        assert!(store.branch_claims().unwrap().is_empty());
+        assert!(
+            !crate::paths::thread_repositories_root(&runtime.paths.server_db_path)
+                .unwrap()
+                .exists()
+        );
+    }
+
+    #[test]
+    fn landlock_support_is_always_recorded_for_an_admitted_spawn() {
+        let (_root, base) = thread_test_runtime();
+        let runtime = DaemonRuntime::new_with_server_policy(
+            base.paths,
+            1,
+            false,
+            crate::confinement::ConfinementSupport::Landlock,
+        );
+        let (spawn_id, thread_id) = pending_spawn(
+            start_thread(
+                &runtime,
+                None,
+                &runtime.paths.workspace_root,
+                ThreadApprovalPolicy::Prompt,
+            )
+            .unwrap(),
+        );
+
+        grant_thread(&runtime, &spawn_id, "stdin");
+
+        assert_eq!(
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .thread_confinement(&thread_id)
+                .unwrap(),
+            Some(ThreadConfinement::Landlock)
+        );
+    }
+
+    #[test]
+    fn git_thread_stop_integrates_private_commit_and_cleans_only_server_owned_state() {
+        let (_root, runtime) = thread_test_runtime();
+        let user_commit = init_git_repository(&runtime.paths.workspace_root);
+        let (spawn_id, thread_id) = pending_spawn(
+            start_thread(
+                &runtime,
+                None,
+                &runtime.paths.workspace_root,
+                ThreadApprovalPolicy::Prompt,
+            )
+            .unwrap(),
+        );
+        grant_thread(&runtime, &spawn_id, "stdin");
+        let store = runtime.paths.server_store().unwrap();
+        let authority = store.thread_authority(&thread_id).unwrap().unwrap();
+        assert_eq!(authority.worktrees.len(), 1);
+        assert_eq!(authority.worktrees[0].repo, ".");
+        assert_eq!(authority.worktrees[0].branch, format!("thread/{thread_id}"));
+        assert_eq!(store.branch_claims().unwrap().len(), 1);
+        drop(store);
+        let response = handle_line(
+            &runtime,
+            &format!(
+                r#"{{"v":1,"id":"authority","kind":"request","method":"thread.authority","params":{{"thread_id":"{thread_id}"}}}}"#
+            ),
+        );
+        let status: ThreadAuthorityResult = response_result(&response);
+        let expected_confinement = match runtime.confinement_support() {
+            crate::confinement::ConfinementSupport::Landlock => ThreadConfinement::Landlock,
+            crate::confinement::ConfinementSupport::None => ThreadConfinement::None,
+        };
+        assert_eq!(status.confinement, Some(expected_confinement));
+        assert_eq!(status.authority.worktrees, authority.worktrees);
+
+        let private = Path::new(&authority.worktrees[0].path);
+        git(private, &["config", "user.name", "Platonic Test"]);
+        git(
+            private,
+            &["config", "user.email", "platonic@example.invalid"],
+        );
+        std::fs::write(private.join("private.txt"), "private\n").unwrap();
+        git(private, &["add", "private.txt"]);
+        git(private, &["commit", "--quiet", "-m", "private"]);
+        let private_commit = git(private, &["rev-parse", "HEAD"]);
+
+        let response = stop_thread(&runtime, &thread_id, "stdin");
+        let _: ThreadStopResult = response_result(&response);
+        assert!(
+            !crate::paths::thread_repository_root(&runtime.paths.server_db_path, &thread_id,)
+                .unwrap()
+                .exists()
+        );
+        let store = runtime.paths.server_store().unwrap();
+        assert!(store.branch_claims().unwrap().is_empty());
+        drop(store);
+        let shared = crate::thread_repository::shared_repository_path(
+            &runtime.paths.server_db_path,
+            &runtime.paths.workspace_id,
+            ".",
+        )
+        .unwrap();
+        assert_eq!(
+            git(
+                shared.parent().unwrap(),
+                &[
+                    "--git-dir",
+                    &shared.to_string_lossy(),
+                    "rev-parse",
+                    &format!("refs/heads/thread/{thread_id}")
+                ]
+            ),
+            private_commit
+        );
+        assert_eq!(
+            git(&runtime.paths.workspace_root, &["rev-parse", "HEAD"]),
+            user_commit
+        );
+        assert!(!runtime.paths.workspace_root.join("private.txt").exists());
+    }
+
+    #[test]
+    fn branch_conflict_and_require_confinement_fail_before_child_launch() {
+        let (_root, runtime) = thread_test_runtime();
+        init_git_repository(&runtime.paths.workspace_root);
+        let request = ThreadRepositoryRequest {
+            repo: ".".into(),
+            branch: Some("main".into()),
+        };
+        let (first_spawn, _) =
+            pending_spawn(start_thread_with_repositories(&runtime, vec![request.clone()]).unwrap());
+        grant_thread(&runtime, &first_spawn, "stdin");
+        let (second_spawn, second_thread) =
+            pending_spawn(start_thread_with_repositories(&runtime, vec![request]).unwrap());
+        let conflict = handle_line(
+            &runtime,
+            &format!(
+                r#"{{"v":1,"id":"conflict","kind":"request","method":"thread.spawn","params":{{"action":"decide","spawn_id":"{second_spawn}","approval":{{"decision":"grant","actor":"stdin"}}}}}}"#
+            ),
+        );
+        assert_eq!(
+            conflict.error.unwrap().code,
+            ERROR_THREAD_BRANCH_CLAIM_CONFLICT
+        );
+        assert!(
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .thread_authority(&second_thread)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !crate::paths::thread_repository_root(&runtime.paths.server_db_path, &second_thread,)
+                .unwrap()
+                .exists()
+        );
+
+        let paths = runtime.paths.clone();
+        let fallback = DaemonRuntime::new_with_server_policy(
+            paths.clone(),
+            1,
+            false,
+            crate::confinement::ConfinementSupport::None,
+        );
+        let (fallback_spawn, fallback_thread) = pending_spawn(
+            start_thread_with_repositories(
+                &fallback,
+                vec![ThreadRepositoryRequest {
+                    repo: ".".into(),
+                    branch: None,
+                }],
+            )
+            .unwrap(),
+        );
+        grant_thread(&fallback, &fallback_spawn, "stdin");
+        assert_eq!(
+            fallback
+                .paths
+                .server_store()
+                .unwrap()
+                .thread_confinement(&fallback_thread)
+                .unwrap(),
+            Some(ThreadConfinement::None)
+        );
+        let fallback_status = handle_line(
+            &fallback,
+            &format!(
+                r#"{{"v":1,"id":"fallback-status","kind":"request","method":"thread.authority","params":{{"thread_id":"{fallback_thread}"}}}}"#
+            ),
+        );
+        let fallback_status: ThreadAuthorityResult = response_result(&fallback_status);
+        assert_eq!(fallback_status.confinement, Some(ThreadConfinement::None));
+
+        let required = DaemonRuntime::new_with_server_policy(
+            paths,
+            1,
+            true,
+            crate::confinement::ConfinementSupport::None,
+        );
+        let (spawn_id, required_thread) = pending_spawn(
+            start_thread_with_repositories(
+                &required,
+                vec![ThreadRepositoryRequest {
+                    repo: ".".into(),
+                    branch: None,
+                }],
+            )
+            .unwrap(),
+        );
+        let unavailable = handle_line(
+            &required,
+            &format!(
+                r#"{{"v":1,"id":"required","kind":"request","method":"thread.spawn","params":{{"action":"decide","spawn_id":"{spawn_id}","approval":{{"decision":"grant","actor":"stdin"}}}}}}"#
+            ),
+        );
+        assert_eq!(
+            unavailable.error.unwrap().code,
+            ERROR_THREAD_CONFINEMENT_UNAVAILABLE
+        );
+        assert!(
+            !crate::paths::thread_repository_root(
+                &required.paths.server_db_path,
+                &required_thread,
+            )
+            .unwrap()
+            .exists()
+        );
+        assert!(
+            required
+                .paths
+                .server_store()
+                .unwrap()
+                .branch_claims()
+                .unwrap()
+                .iter()
+                .all(|claim| claim.thread_id != required_thread)
+        );
     }
 
     #[test]
@@ -4625,8 +5170,6 @@ IFS= read -r _
     #[test]
     fn spawned_thread_never_exceeds_parent_policy_or_cwd_authority() {
         let (root, runtime) = thread_test_runtime();
-        let child_dir = runtime.paths.workspace_root.join("child");
-        std::fs::create_dir(&child_dir).unwrap();
         let outside_dir = root.path().join("outside");
         std::fs::create_dir(&outside_dir).unwrap();
         let (spawn_id, _) = pending_spawn(
@@ -4639,6 +5182,8 @@ IFS= read -r _
             .unwrap(),
         );
         let parent = grant_thread(&runtime, &spawn_id, "stdin");
+        let child_dir = thread_worktree(&runtime, &parent.authority.thread_id).join("child");
+        std::fs::create_dir(&child_dir).unwrap();
 
         assert!(matches!(
             start_thread(
@@ -4652,11 +5197,19 @@ IFS= read -r _
             ))
         ));
         assert!(matches!(
-            start_thread(
+            thread_spawn(
                 &runtime,
-                Some(parent.authority.thread_id),
-                &outside_dir,
-                crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+                ThreadSpawnParams::Start {
+                    parent_thread_id: Some(parent.authority.thread_id),
+                    cwd: outside_dir.to_string_lossy().into_owned(),
+                    model: "gpt-5.6-sol".into(),
+                    reasoning_effort: crate::daemon::protocol::ReasoningEffort::Xhigh,
+                    approval_policy: crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+                    repositories: vec![ThreadRepositoryRequest {
+                        repo: ".".into(),
+                        branch: None,
+                    }],
+                },
             ),
             Err(ThreadSpawnFailure::Authority(
                 ThreadAuthorityError::WorkingDirectory { .. }
@@ -4669,16 +5222,9 @@ IFS= read -r _
     #[test]
     fn spawned_thread_rejects_a_toolset_superset_at_the_typed_gate() {
         let (_root, runtime) = thread_test_runtime();
-        let child_dir = runtime.paths.workspace_root.join("child");
-        std::fs::create_dir(&child_dir).unwrap();
         std::fs::write(
             runtime.paths.workspace_root.join("plato.toml"),
             "[tools]\nenabled = [\"file.read\"]\n",
-        )
-        .unwrap();
-        std::fs::write(
-            child_dir.join("plato.toml"),
-            "[tools]\nenabled = [\"file.read\", \"file.write\"]\n",
         )
         .unwrap();
         let (spawn_id, _) = pending_spawn(
@@ -4691,6 +5237,13 @@ IFS= read -r _
             .unwrap(),
         );
         let parent = grant_thread(&runtime, &spawn_id, "stdin");
+        let child_dir = thread_worktree(&runtime, &parent.authority.thread_id).join("child");
+        std::fs::create_dir(&child_dir).unwrap();
+        std::fs::write(
+            child_dir.join("plato.toml"),
+            "[tools]\nenabled = [\"file.read\", \"file.write\"]\n",
+        )
+        .unwrap();
 
         assert!(matches!(
             start_thread(
@@ -4718,8 +5271,6 @@ IFS= read -r _
     #[test]
     fn yolo_parent_auto_grants_child_with_exact_actor() {
         let (_root, runtime) = thread_test_runtime();
-        let child_dir = runtime.paths.workspace_root.join("child");
-        std::fs::create_dir(&child_dir).unwrap();
         let (spawn_id, _) = pending_spawn(
             start_thread(
                 &runtime,
@@ -4730,6 +5281,8 @@ IFS= read -r _
             .unwrap(),
         );
         let parent = grant_thread(&runtime, &spawn_id, "stdin");
+        let child_dir = thread_worktree(&runtime, &parent.authority.thread_id).join("child");
+        std::fs::create_dir(&child_dir).unwrap();
         let child = match start_thread(
             &runtime,
             Some(parent.authority.thread_id),
@@ -4756,8 +5309,6 @@ IFS= read -r _
     #[test]
     fn thread_list_and_status_keep_clientless_orphans_after_restart() {
         let (_root, runtime) = thread_test_runtime();
-        let child_dir = runtime.paths.workspace_root.join("child");
-        std::fs::create_dir(&child_dir).unwrap();
         let (spawn_id, _) = pending_spawn(
             start_thread(
                 &runtime,
@@ -4768,6 +5319,8 @@ IFS= read -r _
             .unwrap(),
         );
         let parent = grant_thread(&runtime, &spawn_id, "stdin");
+        let child_dir = thread_worktree(&runtime, &parent.authority.thread_id).join("child");
+        std::fs::create_dir(&child_dir).unwrap();
         let child = match start_thread(
             &runtime,
             Some(parent.authority.thread_id.clone()),
