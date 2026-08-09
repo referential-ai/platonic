@@ -335,6 +335,10 @@ pub enum ProtocolErrorCode {
     SessionsListFailed,
     /// Requested thread authority exceeds its parent.
     ThreadAuthorityExceeded,
+    /// A repository branch already has a live thread claimant.
+    ThreadBranchClaimConflict,
+    /// Server policy requires confinement that this host cannot provide.
+    ThreadConfinementUnavailable,
     /// One complete thread authority could not be read.
     ThreadAuthorityFailed,
     /// Live thread event observation failed.
@@ -375,6 +379,8 @@ impl ProtocolErrorCode {
             Self::RunFailed => "run_failed",
             Self::SessionsListFailed => "sessions_list_failed",
             Self::ThreadAuthorityExceeded => "thread_authority_exceeded",
+            Self::ThreadBranchClaimConflict => "thread_branch_claim_conflict",
+            Self::ThreadConfinementUnavailable => "thread_confinement_unavailable",
             Self::ThreadAuthorityFailed => "thread_authority_failed",
             Self::ThreadEventsFailed => "thread_events_failed",
             Self::ThreadListFailed => "thread_list_failed",
@@ -418,6 +424,12 @@ pub const ERROR_SESSIONS_LIST_FAILED: ProtocolErrorCode = ProtocolErrorCode::Ses
 /// Error code returned when requested thread authority exceeds its parent.
 pub const ERROR_THREAD_AUTHORITY_EXCEEDED: ProtocolErrorCode =
     ProtocolErrorCode::ThreadAuthorityExceeded;
+/// Error code returned when a repository branch already has a live claimant.
+pub const ERROR_THREAD_BRANCH_CLAIM_CONFLICT: ProtocolErrorCode =
+    ProtocolErrorCode::ThreadBranchClaimConflict;
+/// Error code returned when required thread confinement is unavailable.
+pub const ERROR_THREAD_CONFINEMENT_UNAVAILABLE: ProtocolErrorCode =
+    ProtocolErrorCode::ThreadConfinementUnavailable;
 /// Error code returned when one complete thread authority cannot be read.
 pub const ERROR_THREAD_AUTHORITY_FAILED: ProtocolErrorCode =
     ProtocolErrorCode::ThreadAuthorityFailed;
@@ -1537,6 +1549,46 @@ pub struct ThreadWorktree {
     pub path: String,
 }
 
+/// One repository and optional existing branch requested at thread spawn.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadRepositoryRequest {
+    /// Workspace-relative repository name, with `.` naming the workspace root.
+    pub repo: String,
+    /// Existing branch to claim, or none for a fresh thread-named branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+/// Filesystem write-confinement selected immutably when a thread is admitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadConfinement {
+    /// Linux Landlock write confinement is applied before the run child starts work.
+    Landlock,
+    /// This host cannot confine the thread and server policy permits fallback.
+    None,
+}
+
+impl ThreadConfinement {
+    /// Returns the exact wire and persistence value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Landlock => "landlock",
+            Self::None => "none",
+        }
+    }
+
+    /// Parses an exact confinement value.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "landlock" => Some(Self::Landlock),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
 /// One host path granted to a thread independently of confinement mechanism.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1669,6 +1721,9 @@ pub enum ThreadSpawnParams {
         reasoning_effort: ReasoningEffort,
         /// Requested immutable approval policy.
         approval_policy: ThreadApprovalPolicy,
+        /// Repositories to assign, or empty to infer the repository containing `cwd`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        repositories: Vec<ThreadRepositoryRequest>,
     },
     /// Resolve a spawn waiting for explicit approval.
     Decide {
@@ -1914,6 +1969,9 @@ pub struct ThreadAuthorityParams {
 pub struct ThreadAuthorityResult {
     /// Complete twelve-field immutable authority record.
     pub authority: ThreadAuthorityRecord,
+    /// Immutable confinement fact, absent only for records created before confinement shipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confinement: Option<ThreadConfinement>,
 }
 
 /// Parameters for starting or steering one daemon-owned thread turn.
@@ -3376,6 +3434,7 @@ mod tests {
             Some("thread.authority".into()),
             ThreadAuthorityResult {
                 authority: authority.clone(),
+                confinement: None,
             },
         );
         assert_eq!(

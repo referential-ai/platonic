@@ -173,12 +173,33 @@ impl DaemonClient {
         reasoning_effort: platonic_protocol::ReasoningEffort,
         approval_policy: ThreadApprovalPolicy,
     ) -> ClientResult<ThreadSpawnResult> {
+        self.thread_spawn_start_with_repositories(
+            parent_thread_id,
+            cwd,
+            model,
+            reasoning_effort,
+            approval_policy,
+            Vec::new(),
+        )
+    }
+
+    /// Starts one typed thread spawn admission with explicit repository claims.
+    pub fn thread_spawn_start_with_repositories(
+        &mut self,
+        parent_thread_id: Option<String>,
+        cwd: String,
+        model: String,
+        reasoning_effort: platonic_protocol::ReasoningEffort,
+        approval_policy: ThreadApprovalPolicy,
+        repositories: Vec<platonic_protocol::ThreadRepositoryRequest>,
+    ) -> ClientResult<ThreadSpawnResult> {
         self.request(ProtocolRequest::ThreadSpawn(ThreadSpawnParams::Start {
             parent_thread_id,
             cwd,
             model,
             reasoning_effort,
             approval_policy,
+            repositories,
         }))
     }
 
