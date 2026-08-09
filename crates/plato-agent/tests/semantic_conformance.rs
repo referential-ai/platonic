@@ -15,6 +15,7 @@ use platonic_protocol::{
     ThreadStopResult,
 };
 use rusqlite::{Connection, OpenFlags, params};
+use serde::Deserialize;
 use serde_json::{Value, json};
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
@@ -40,7 +41,30 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const REQUESTS_PER_LEG: usize = 2;
 static SCENARIO_SERIAL: Mutex<()> = Mutex::new(());
 
-fn read_sqlite_run(path: &Path, run_id: &str) -> Vec<RecordedEvent> {
+#[derive(Deserialize)]
+struct JsonlRecord {
+    v: u32,
+    record: RecordedEvent,
+}
+
+fn read_run_events(path: &Path, run_id: &str) -> Vec<RecordedEvent> {
+    let jsonl_path = path
+        .parent()
+        .unwrap()
+        .join("runs")
+        .join(format!("{run_id}.jsonl"));
+    if jsonl_path.exists() {
+        return fs::read_to_string(jsonl_path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let line: JsonlRecord = serde_json::from_str(line).unwrap();
+                assert!(matches!(line.v, 1 | 2));
+                line.record
+            })
+            .collect();
+    }
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     let mut statement = connection
         .prepare(
@@ -103,7 +127,7 @@ fn child_and_embedded_provider_failure_have_identical_ordered_events() {
             wait_for_terminal_status(&mut embedded_client, &embedded_run.run_id),
             RunStateName::Failed
         );
-        let embedded_records = read_sqlite_run(&embedded.ledger_path(), &embedded_run.run_id);
+        let embedded_records = read_run_events(&embedded.ledger_path(), &embedded_run.run_id);
         embedded_daemon.stop(embedded_client);
 
         let daemon = ProofDaemon::start(&child);
@@ -115,7 +139,7 @@ fn child_and_embedded_provider_failure_have_identical_ordered_events() {
             wait_for_terminal_status(&mut client, &child_run.run_id),
             RunStateName::Failed
         );
-        let child_records = read_sqlite_run(&child.ledger_path(), &child_run.run_id);
+        let child_records = read_run_events(&child.ledger_path(), &child_run.run_id);
 
         assert_eq!(
             normalize_records(&embedded_records),
@@ -254,7 +278,7 @@ fn child_and_embedded_cancellation_with_key() {
         RunStateName::Canceled
     );
     provider.release.send(()).unwrap();
-    let embedded_records = read_sqlite_run(&embedded.ledger_path(), &embedded_run.run_id);
+    let embedded_records = read_run_events(&embedded.ledger_path(), &embedded_run.run_id);
     embedded_daemon.stop(embedded_client);
 
     let daemon = ProofDaemon::start(&child);
@@ -272,7 +296,7 @@ fn child_and_embedded_cancellation_with_key() {
         RunStateName::Canceled
     );
     provider.release.send(()).unwrap();
-    let child_records = read_sqlite_run(&child.ledger_path(), &child_run.run_id);
+    let child_records = read_run_events(&child.ledger_path(), &child_run.run_id);
 
     assert_eq!(
         normalize_records(&embedded_records),
@@ -1309,7 +1333,7 @@ fn run_direct_leg(proof: &ProofContext, scenario: Scenario) -> RunEvidence {
         .to_owned();
     assert_eq!(answer, scenario.answer());
 
-    let records = read_sqlite_run(&proof.ledger_path(), &run_id);
+    let records = read_run_events(&proof.ledger_path(), &run_id);
     assert!(
         records
             .iter()
@@ -1399,7 +1423,7 @@ fn run_daemon_leg(
     assert_eq!(transcript.status, RunStateName::Finished);
     let answer = transcript.final_answer.unwrap();
     assert_eq!(answer, scenario.answer());
-    let records = read_sqlite_run(&proof.ledger_path(), &started.run_id);
+    let records = read_run_events(&proof.ledger_path(), &started.run_id);
     RunEvidence::from_leg(records, answer, fs::read(&proof.fixture_path).unwrap())
 }
 

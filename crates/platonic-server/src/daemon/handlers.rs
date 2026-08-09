@@ -6,12 +6,13 @@ use crate::{
         protocol::{
             AgentCreateParams, AgentCreateResult, AgentListParams, AgentListResult,
             AgentStatusParams, AgentStatusResult, AgentSummary, ApprovalDecideParams,
-            ApprovalDecision, ApprovalDecisionName, CAPABILITIES, CommandAcceptedResult,
-            DaemonStatusDaemon, DaemonStatusModel, DaemonStatusParams, DaemonStatusProviderKind,
-            DaemonStatusResult, DaemonStatusSession, DaemonStatusTokenUsage, DaemonStatusTrust,
-            DaemonStatusUsage, ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED,
-            ERROR_LAGGED, ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD,
-            ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED, ERROR_THREAD_AUTHORITY_EXCEEDED,
+            ApprovalDecision, ApprovalDecisionName, BufferedStreamEvent, CAPABILITIES,
+            CommandAcceptedResult, DaemonStatusDaemon, DaemonStatusModel, DaemonStatusParams,
+            DaemonStatusProviderKind, DaemonStatusResult, DaemonStatusSession,
+            DaemonStatusTokenUsage, DaemonStatusTrust, DaemonStatusUsage,
+            ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
+            ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
+            ERROR_SESSIONS_LIST_FAILED, ERROR_THREAD_AUTHORITY_EXCEEDED,
             ERROR_THREAD_AUTHORITY_FAILED, ERROR_THREAD_EVENTS_FAILED, ERROR_THREAD_LIST_FAILED,
             ERROR_THREAD_SEND_FAILED, ERROR_THREAD_SPAWN_FAILED, ERROR_THREAD_STATUS_FAILED,
             ERROR_THREAD_STOP_FAILED, ERROR_WORKSPACE_BROKEN, ERROR_WORKSPACE_MISMATCH,
@@ -20,13 +21,14 @@ use crate::{
             MessageAppendParams, ModelIdentityStatus, ProtocolErrorCode, ProtocolRequest,
             ProtocolResponse, RunCancelParams, RunStartParams, RunStartResult, RunStateName,
             SessionSummary, SessionsListResult, ShutdownIfIdleResult, ShutdownIfIdleResultName,
-            ThreadApprovalPolicy, ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams,
-            ThreadListResult, ThreadSendParams, ThreadSpawnDecision, ThreadSpawnParams,
-            ThreadSpawnResult, ThreadStatus, ThreadStatusParams, ThreadStatusResult,
-            ThreadStopParams, ThreadStopResult, TranscriptReadParams, TranscriptReadResult,
-            TypedRun, TypedTranscript, TypedTranscriptEntry, WorkspaceCreateParams,
-            WorkspaceCreateResult, WorkspaceHealthName, WorkspaceListParams, WorkspaceListResult,
-            WorkspaceStatusParams, WorkspaceStatusResult, WorkspaceSummary, decode_request,
+            StreamEvent, ThreadApprovalPolicy, ThreadAuthorityParams, ThreadAuthorityResult,
+            ThreadEventsParams, ThreadListResult, ThreadSendParams, ThreadSpawnDecision,
+            ThreadSpawnParams, ThreadSpawnResult, ThreadStatus, ThreadStatusParams,
+            ThreadStatusResult, ThreadStopParams, ThreadStopResult, TranscriptReadParams,
+            TranscriptReadResult, TypedRun, TypedTranscript, TypedTranscriptEntry,
+            WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceHealthName, WorkspaceListParams,
+            WorkspaceListResult, WorkspaceStatusParams, WorkspaceStatusResult, WorkspaceSummary,
+            decode_request,
         },
         runtime::{
             DaemonRuntime, IssuePrepAdmissionError, RunAdmissionError, RunRecord,
@@ -1670,10 +1672,6 @@ fn handle_events_stream(
     request: Envelope,
     params: EventsStreamParams,
 ) -> Envelope {
-    let record = match find_run(runtime, &params.run_id) {
-        Ok(record) => record,
-        Err(error) => return error_response(request.id, "events.stream", error),
-    };
     let limit = params.limit.unwrap_or(DEFAULT_EVENT_LIMIT);
     if limit > MAX_EVENT_LIMIT {
         return Envelope::error(
@@ -1683,6 +1681,27 @@ fn handle_events_stream(
             format!("event stream limit exceeds maximum {MAX_EVENT_LIMIT}: {limit}"),
         );
     }
+    let record = match find_run(runtime, &params.run_id) {
+        Ok(record) => record,
+        Err(_) => {
+            return match durable_events_stream(runtime, &params, limit) {
+                Ok(result) => {
+                    Envelope::typed_response(request.id, ProtocolResponse::EventsStream(result))
+                }
+                Err(AppError::RunNotFound(_)) => error_response(
+                    request.id,
+                    "events.stream",
+                    format!("run not found: {}", params.run_id),
+                ),
+                Err(error) => Envelope::error(
+                    request.id,
+                    Some("events.stream".into()),
+                    ERROR_INTERNAL,
+                    error.to_string(),
+                ),
+            };
+        }
+    };
     let result = {
         // Terminal status is published only after collection, so snapshot status before events.
         let status = record.status.lock().expect("run status lock poisoned");
@@ -1719,6 +1738,44 @@ fn handle_events_stream(
         }
     };
     Envelope::typed_response(request.id, ProtocolResponse::EventsStream(result))
+}
+
+fn durable_events_stream(
+    runtime: &DaemonRuntime,
+    params: &EventsStreamParams,
+    limit: usize,
+) -> AppResult<EventsStreamResult> {
+    if std::fs::symlink_metadata(&runtime.paths.ledger_path)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Err(AppError::RunNotFound(params.run_id.clone()));
+    }
+    let run = SqliteLedger::open_default_readonly(&runtime.paths.default_ledger())?
+        .read_session_run(&params.run_id)?;
+    let tip = u64::try_from(run.records.len())
+        .map_err(|_| AppError::Config("durable event count exceeds u64".into()))?;
+    let from_offset = params.from_offset.unwrap_or(tip);
+    let events = run
+        .records
+        .into_iter()
+        .skip(usize::try_from(from_offset).unwrap_or(usize::MAX))
+        .take(limit)
+        .enumerate()
+        .map(|(index, record)| BufferedStreamEvent {
+            offset: from_offset + u64::try_from(index).unwrap_or(u64::MAX),
+            event: StreamEvent::Ledger { record },
+        })
+        .collect::<Vec<_>>();
+    let next_offset = from_offset
+        + u64::try_from(events.len())
+            .map_err(|_| AppError::Config("durable event page exceeds u64".into()))?;
+    Ok(EventsStreamResult {
+        run_id: run.run_id,
+        from_offset,
+        next_offset,
+        status: run.status,
+        events,
+    })
 }
 
 fn handle_approval_decide(
@@ -2600,6 +2657,105 @@ mod tests {
     fn response_result<T: serde::de::DeserializeOwned>(response: &Envelope) -> T {
         let response = serde_json::to_value(response.result.as_ref().unwrap()).unwrap();
         serde_json::from_value(response["result"].clone()).unwrap()
+    }
+
+    #[test]
+    fn transcript_read_is_identical_for_jsonl_and_legacy_sqlite_events() {
+        let (_root, runtime) = bare_thread_test_runtime();
+        let location = runtime.paths.default_ledger();
+        let run_id = RunId::new("run_parity").unwrap();
+        let turn_id = TurnId::new("turn_parity").unwrap();
+        let events = vec![
+            HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: AgentId::new("plato").unwrap(),
+            },
+            HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                context: platonic_core::ContextPack {
+                    fragments: vec![],
+                    token_budget: 4_000,
+                },
+            },
+            HarnessEvent::ModelRequested {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 0,
+                model: ModelName::new("test-model").unwrap(),
+            },
+            HarnessEvent::ModelResponded {
+                run_id: run_id.clone(),
+                turn_id,
+                step: 0,
+                output: Message {
+                    role: MessageRole::Assistant,
+                    content: "byte-faithful answer".into(),
+                },
+                proposed_calls: vec![],
+                served_model: None,
+                usage: None,
+            },
+            HarnessEvent::RunFinished {
+                run_id: run_id.clone(),
+            },
+        ];
+        let mut legacy = SqliteLedger::open_or_create_default(&location).unwrap();
+        legacy
+            .begin_session_run("session_parity", &run_id, "parity question", true)
+            .unwrap();
+        for (seq, event) in events.iter().cloned().enumerate() {
+            legacy
+                .append(
+                    run_id.as_str(),
+                    &RecordedEvent {
+                        seq: u64::try_from(seq).unwrap(),
+                        occurred_at_ms: u64::try_from(seq).unwrap(),
+                        event,
+                    },
+                )
+                .unwrap();
+        }
+        legacy
+            .finish_session_run(&run_id, "byte-faithful answer")
+            .unwrap();
+        drop(legacy);
+        let sqlite_transcript = read_run_transcript(&location, run_id.as_str()).unwrap();
+
+        let mut jsonl =
+            crate::ledger::EventRecorder::create_default_jsonl(&location, &run_id).unwrap();
+        for event in events.iter().cloned() {
+            jsonl.record(event).unwrap();
+        }
+        drop(jsonl);
+
+        assert_eq!(
+            read_run_transcript(&location, run_id.as_str()).unwrap(),
+            sqlite_transcript
+        );
+        let durable = durable_events_stream(
+            &runtime,
+            &EventsStreamParams {
+                run_id: run_id.to_string(),
+                from_offset: Some(0),
+                limit: Some(MAX_EVENT_LIMIT),
+            },
+            MAX_EVENT_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(durable.next_offset, 5);
+        assert_eq!(durable.status, RunStateName::Finished);
+        assert_eq!(
+            durable
+                .events
+                .into_iter()
+                .map(|buffered| match buffered.event {
+                    StreamEvent::Ledger { record } => record.event,
+                    event => panic!("durable stream returned transient event: {event:?}"),
+                })
+                .collect::<Vec<_>>(),
+            events
+        );
     }
 
     fn bare_thread_test_runtime() -> (tempfile::TempDir, DaemonRuntime) {

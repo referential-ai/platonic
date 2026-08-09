@@ -1,13 +1,13 @@
 use crate::{AppError, AppResult, paths::DefaultSqlitePath};
-use platonic_core::{HarnessEvent, MessageRole, RecordedEvent, RunId, RunPhase, RunState};
+use platonic_core::{AgentId, HarnessEvent, MessageRole, RecordedEvent, RunId, RunPhase, RunState};
 use platonic_protocol::RunStateName;
 use platonic_protocol::{VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, BufWriter, Write},
-    path::Path,
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,7 +15,6 @@ use std::{
 use std::{
     io::{Error, ErrorKind},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::PathBuf,
 };
 
 const LEGACY_LEDGER_VERSION: u32 = 1;
@@ -46,6 +45,19 @@ pub struct LedgerLine {
     pub record: RecordedEvent,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VoiceLedgerLine {
+    voice_events: Vec<VoiceEventEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PersistedLedgerLine {
+    Record(LedgerLine),
+    Voice(VoiceLedgerLine),
+}
+
 pub enum EventRecorder {
     Jsonl(JsonlEventRecorder),
     Sqlite(SqliteEventRecorder),
@@ -73,8 +85,24 @@ impl EventRecorder {
         )?))
     }
 
+    pub(crate) fn create_default_jsonl(
+        path: &DefaultSqlitePath,
+        run_id: &RunId,
+    ) -> AppResult<Self> {
+        Ok(Self::Jsonl(JsonlEventRecorder::create_private(
+            &run_jsonl_path(path.as_path(), run_id.as_str())?,
+        )?))
+    }
+
     pub(crate) fn from_session_sqlite(ledger: SqliteLedger, run_id: &RunId) -> Self {
         Self::Sqlite(SqliteEventRecorder::from_session(ledger, run_id))
+    }
+
+    pub(crate) fn with_session_jsonl(self, ledger: SqliteLedger, run_id: &RunId) -> Self {
+        match self {
+            Self::Jsonl(recorder) => Self::Jsonl(recorder.with_session(ledger, run_id)),
+            Self::Sqlite(_) => unreachable!("only a JSONL recorder can attach JSONL session state"),
+        }
     }
 
     pub fn record(&mut self, event: HarnessEvent) -> AppResult<RecordedEvent> {
@@ -90,9 +118,7 @@ impl EventRecorder {
         final_answer: &str,
     ) -> AppResult<RecordedEvent> {
         match self {
-            Self::Jsonl(recorder) => recorder.record(HarnessEvent::RunFinished {
-                run_id: run_id.clone(),
-            }),
+            Self::Jsonl(recorder) => recorder.finish_run(run_id, final_answer),
             Self::Sqlite(recorder) => recorder.finish_run(final_answer),
         }
     }
@@ -104,10 +130,7 @@ impl EventRecorder {
         canceled: bool,
     ) -> AppResult<RecordedEvent> {
         match self {
-            Self::Jsonl(recorder) => recorder.record(HarnessEvent::RunFailed {
-                run_id: run_id.clone(),
-                reason: error.into(),
-            }),
+            Self::Jsonl(recorder) => recorder.fail_run(run_id, error, canceled),
             Self::Sqlite(recorder) => recorder.fail_run(error, canceled),
         }
     }
@@ -133,8 +156,17 @@ impl RunEventRecorder for EventRecorder {
 }
 
 pub struct JsonlEventRecorder {
-    writer: BufWriter<File>,
+    file: File,
     state: RunState,
+    session: Option<JsonlSession>,
+    poisoned: bool,
+}
+
+struct JsonlSession {
+    ledger: SqliteLedger,
+    run_id: RunId,
+    open: bool,
+    terminal_attempted: bool,
 }
 
 impl JsonlEventRecorder {
@@ -143,33 +175,171 @@ impl JsonlEventRecorder {
             return Err(AppError::EmptyLedger);
         }
 
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    AppError::LedgerExists(path.into())
-                } else {
-                    AppError::Io(error)
-                }
-            })?;
+        let file = create_jsonl_file(path, false)?;
         Ok(Self {
-            writer: BufWriter::new(file),
+            file,
             state: RunState::new(),
+            session: None,
+            poisoned: false,
         })
     }
 
+    fn create_private(path: &Path) -> AppResult<Self> {
+        if path.as_os_str().is_empty() {
+            return Err(AppError::EmptyLedger);
+        }
+        let file = create_jsonl_file(path, true)?;
+        Ok(Self {
+            file,
+            state: RunState::new(),
+            session: None,
+            poisoned: false,
+        })
+    }
+
+    fn open(path: &Path) -> AppResult<Self> {
+        if path.as_os_str().is_empty() {
+            return Err(AppError::EmptyLedger);
+        }
+        let (file, state) = open_jsonl_for_append(path)?;
+        Ok(Self {
+            file,
+            state,
+            session: None,
+            poisoned: false,
+        })
+    }
+
+    fn with_session(mut self, ledger: SqliteLedger, run_id: &RunId) -> Self {
+        self.session = Some(JsonlSession {
+            ledger,
+            run_id: run_id.clone(),
+            open: true,
+            terminal_attempted: false,
+        });
+        self
+    }
+
     pub fn record(&mut self, event: HarnessEvent) -> AppResult<RecordedEvent> {
-        let record = next_record(&mut self.state, event)?;
+        if self.session.as_ref().is_some_and(|session| session.open)
+            && matches!(
+                event,
+                HarnessEvent::RunFinished { .. } | HarnessEvent::RunFailed { .. }
+            )
+        {
+            return Err(AppError::Config(
+                "JSONL session terminal events require a matching session outcome".into(),
+            ));
+        }
+        self.record_event(event)
+    }
+
+    fn record_event(&mut self, event: HarnessEvent) -> AppResult<RecordedEvent> {
+        if self.poisoned {
+            return Err(AppError::Config(
+                "JSONL recorder is unavailable after a prior write failure".into(),
+            ));
+        }
+        let mut next_state = self.state.clone();
+        let record = next_record(&mut next_state, event)?;
         let line = LedgerLine {
             v: LEDGER_VERSION,
             record: record.clone(),
         };
-        serde_json::to_writer(&mut self.writer, &line)?;
-        self.writer.write_all(b"\n")?;
-        self.writer.flush()?;
+        let mut bytes = serde_json::to_vec(&line)?;
+        bytes.push(b'\n');
+        let write = self.file.write_all(&bytes).and_then(|()| {
+            self.file.flush()?;
+            // A record is acknowledged only after its newline commit marker is durable.
+            self.file.sync_data()
+        });
+        if let Err(error) = write {
+            self.poisoned = true;
+            return Err(AppError::Io(error));
+        }
+        self.state = next_state;
         Ok(record)
+    }
+
+    fn finish_run(&mut self, run_id: &RunId, final_answer: &str) -> AppResult<RecordedEvent> {
+        self.record_terminal(
+            HarnessEvent::RunFinished {
+                run_id: run_id.clone(),
+            },
+            RunStateName::Finished,
+            Some(final_answer),
+            None,
+        )
+    }
+
+    fn fail_run(
+        &mut self,
+        run_id: &RunId,
+        error: &str,
+        canceled: bool,
+    ) -> AppResult<RecordedEvent> {
+        let status = if canceled {
+            RunStateName::Canceled
+        } else {
+            RunStateName::Failed
+        };
+        self.record_terminal(
+            HarnessEvent::RunFailed {
+                run_id: run_id.clone(),
+                reason: error.into(),
+            },
+            status,
+            None,
+            Some(error),
+        )
+    }
+
+    fn record_terminal(
+        &mut self,
+        event: HarnessEvent,
+        status: RunStateName,
+        final_answer: Option<&str>,
+        error: Option<&str>,
+    ) -> AppResult<RecordedEvent> {
+        let Some(session) = self.session.as_mut() else {
+            return self.record_event(event);
+        };
+        if !session.open {
+            return Err(AppError::Config(
+                "JSONL session run is already closed".into(),
+            ));
+        }
+        session.terminal_attempted = true;
+        let run_id = session.run_id.clone();
+        let record = self.record_event(event)?;
+        let session = self
+            .session
+            .as_mut()
+            .expect("JSONL session remains attached while recording");
+        session
+            .ledger
+            .complete_session_terminal(&run_id, status, final_answer, error)?;
+        session.open = false;
+        Ok(record)
+    }
+}
+
+impl Drop for JsonlEventRecorder {
+    fn drop(&mut self) {
+        let should_fail = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.open && !session.terminal_attempted)
+            && !self.poisoned;
+        if should_fail {
+            let run_id = self
+                .session
+                .as_ref()
+                .expect("checked attached JSONL session")
+                .run_id
+                .clone();
+            let _ = self.fail_run(&run_id, "run ended before session status was closed", false);
+        }
     }
 }
 
@@ -290,6 +460,7 @@ impl Drop for SqliteEventRecorder {
 
 pub struct SqliteLedger {
     connection: Connection,
+    path: PathBuf,
     schema_version: u32,
     #[cfg(test)]
     terminal_fault: Option<TerminalFaultBoundary>,
@@ -363,6 +534,7 @@ impl SqliteLedger {
         configure_sqlite_journal_mode(&connection)?;
         Ok(Self {
             connection,
+            path: path.to_path_buf(),
             schema_version: SQLITE_SCHEMA_VERSION,
             #[cfg(test)]
             terminal_fault: None,
@@ -389,6 +561,7 @@ impl SqliteLedger {
         let schema_version = read_sqlite_schema_version(&connection)?;
         Ok(Self {
             connection,
+            path: path.to_path_buf(),
             schema_version,
             #[cfg(test)]
             terminal_fault: None,
@@ -413,7 +586,7 @@ impl SqliteLedger {
     }
 
     pub fn read_run(&self, run_id: &str) -> AppResult<Vec<RecordedEvent>> {
-        read_run_from(&self.connection, run_id)
+        read_run_from(&self.connection, &self.path, run_id)
     }
 
     /// Atomically persists one complete, immutable per-run voice companion stream.
@@ -445,10 +618,17 @@ impl SqliteLedger {
                 Ok(VoiceEventEnvelope::revision_one(sequence, event))
             })
             .collect::<AppResult<Vec<_>>>()?;
+        let jsonl_path = run_jsonl_path(&self.path, &run_id)?;
+        if jsonl_path.exists() {
+            let records = self.read_run(&run_id)?;
+            validate_voice_event_keys(&records, &run_id, &envelopes)?;
+            return append_voice_events_to_jsonl(&jsonl_path, &run_id, &envelopes);
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_voice_event_keys(&transaction, &run_id, &envelopes)?;
+        let records = read_run_records_from(&transaction, &run_id)?;
+        validate_voice_event_keys(&records, &run_id, &envelopes)?;
         let existing = read_voice_events_from(&transaction, &run_id)?;
         if !existing.is_empty() {
             if existing == envelopes {
@@ -491,6 +671,10 @@ impl SqliteLedger {
 
     /// Reads and validates one selected run's ordered voice companion stream.
     pub fn read_voice_events(&self, run_id: &str) -> AppResult<Vec<VoiceEventEnvelope>> {
+        let jsonl_path = run_jsonl_path(&self.path, run_id)?;
+        if jsonl_path.exists() {
+            return read_voice_events_from_jsonl(&jsonl_path, run_id);
+        }
         if self.schema_version < VOICE_EVENT_SQLITE_SCHEMA_VERSION {
             return Ok(Vec::new());
         }
@@ -501,7 +685,8 @@ impl SqliteLedger {
             .collect::<Vec<_>>();
         validate_voice_event_stream(&events)?;
         if !envelopes.is_empty() {
-            validate_voice_event_keys(&self.connection, run_id, &envelopes)?;
+            let records = read_run_records_from(&self.connection, run_id)?;
+            validate_voice_event_keys(&records, run_id, &envelopes)?;
         }
         Ok(envelopes)
     }
@@ -690,12 +875,8 @@ impl SqliteLedger {
     }
 
     fn recover_running_session_runs(&mut self, error: &str) -> AppResult<usize> {
-        let now = sqlite_i64(now_ms(), "occurred_at_ms")?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let running_runs = {
-            let mut statement = transaction.prepare(
+            let mut statement = self.connection.prepare(
                 "SELECT session_id, run_id
                  FROM session_runs
                  WHERE status = ?1
@@ -708,46 +889,103 @@ impl SqliteLedger {
                 .collect::<Result<Vec<_>, _>>()?
         };
         for (session_id, run_id) in &running_runs {
-            let records = read_run_records_from(&transaction, run_id)?;
-            if records.is_empty() {
-                return Err(AppError::Config(format!(
-                    "running session run {run_id} has no ledger events"
-                )));
+            let jsonl_path = run_jsonl_path(&self.path, run_id)?;
+            if jsonl_path.exists() {
+                self.recover_jsonl_session_run(&jsonl_path, run_id, error)?;
+            } else {
+                self.recover_sqlite_session_run(session_id, run_id, error)?;
             }
-            let mut state = replay_records(&records)?;
-            let (status, final_answer, stored_error) = match state.phase() {
-                RunPhase::Finished => (
-                    RunStateName::Finished,
-                    Some(final_answer_from_records_str(run_id, &records)?),
-                    None,
-                ),
-                RunPhase::Failed { reason } => {
-                    (failure_status(reason), None, Some(reason.as_str()))
-                }
-                _ => {
-                    let record = next_record(
-                        &mut state,
-                        HarnessEvent::RunFailed {
-                            run_id: RunId::new(run_id.clone())?,
-                            reason: error.into(),
-                        },
-                    )?;
-                    append_record_in(&transaction, run_id, &record)?;
-                    (RunStateName::Interrupted, None, Some(error))
-                }
-            };
-            update_running_session_outcome(
-                &transaction,
-                run_id,
-                status,
-                final_answer,
-                stored_error,
-                now,
-            )?;
-            touch_session(&transaction, session_id, now)?;
         }
-        transaction.commit()?;
         Ok(running_runs.len())
+    }
+
+    fn recover_jsonl_session_run(
+        &mut self,
+        path: &Path,
+        run_id: &str,
+        error: &str,
+    ) -> AppResult<()> {
+        let run_id = RunId::new(run_id.to_owned())?;
+        let mut recorder = JsonlEventRecorder::open(path)?;
+        let mut records = read_records(path)?;
+        if records.is_empty() {
+            recorder.record(HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: AgentId::new("plato")?,
+            })?;
+            records = read_records(path)?;
+        }
+        let state = replay_records(&records)?;
+        let (status, final_answer, stored_error) = match state.phase() {
+            RunPhase::Finished => (
+                RunStateName::Finished,
+                Some(final_answer_from_records(&run_id, &records)?.to_owned()),
+                None,
+            ),
+            RunPhase::Failed { reason } => (failure_status(reason), None, Some(reason.to_owned())),
+            _ => {
+                recorder.record(HarnessEvent::RunFailed {
+                    run_id: run_id.clone(),
+                    reason: error.into(),
+                })?;
+                (RunStateName::Interrupted, None, Some(error.to_owned()))
+            }
+        };
+        self.complete_session_terminal(
+            &run_id,
+            status,
+            final_answer.as_deref(),
+            stored_error.as_deref(),
+        )
+    }
+
+    fn recover_sqlite_session_run(
+        &mut self,
+        session_id: &str,
+        run_id: &str,
+        error: &str,
+    ) -> AppResult<()> {
+        let now = sqlite_i64(now_ms(), "occurred_at_ms")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let records = read_run_records_from(&transaction, run_id)?;
+        if records.is_empty() {
+            return Err(AppError::Config(format!(
+                "running session run {run_id} has no ledger events"
+            )));
+        }
+        let mut state = replay_records(&records)?;
+        let (status, final_answer, stored_error) = match state.phase() {
+            RunPhase::Finished => (
+                RunStateName::Finished,
+                Some(final_answer_from_records_str(run_id, &records)?),
+                None,
+            ),
+            RunPhase::Failed { reason } => (failure_status(reason), None, Some(reason.as_str())),
+            _ => {
+                let record = next_record(
+                    &mut state,
+                    HarnessEvent::RunFailed {
+                        run_id: RunId::new(run_id.to_owned())?,
+                        reason: error.into(),
+                    },
+                )?;
+                append_record_in(&transaction, run_id, &record)?;
+                (RunStateName::Interrupted, None, Some(error))
+            }
+        };
+        update_running_session_outcome(
+            &transaction,
+            run_id,
+            status,
+            final_answer,
+            stored_error,
+            now,
+        )?;
+        touch_session(&transaction, session_id, now)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn read_session(&self, session_id: &str) -> AppResult<SessionRecords> {
@@ -770,7 +1008,7 @@ impl SqliteLedger {
             .into_iter()
             .map(|run| {
                 Ok(SessionRunRecords {
-                    records: read_run_from(&transaction, &run.run_id)?,
+                    records: read_run_from(&transaction, &self.path, &run.run_id)?,
                     run_id: run.run_id,
                     session_index: run.session_index,
                     question: run.question,
@@ -803,7 +1041,7 @@ impl SqliteLedger {
             )
             .optional()?
             .ok_or_else(|| AppError::RunNotFound(run_id.into()))?;
-        let records = read_run_from(&transaction, &run.run_id)?;
+        let records = read_run_from(&transaction, &self.path, &run.run_id)?;
         transaction.commit()?;
         Ok(SessionRunRecords {
             records,
@@ -940,6 +1178,40 @@ impl SqliteLedger {
         Ok(())
     }
 
+    fn complete_session_terminal(
+        &mut self,
+        run_id: &RunId,
+        status: RunStateName,
+        final_answer: Option<&str>,
+        error: Option<&str>,
+    ) -> AppResult<()> {
+        let now = sqlite_i64(now_ms(), "occurred_at_ms")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session_id: String = transaction
+            .query_row(
+                "SELECT session_id
+                 FROM session_runs
+                 WHERE run_id = ?1 AND status = ?2",
+                params![run_id.as_str(), RunStateName::Running.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| AppError::RunNotFound(run_id.to_string()))?;
+        update_running_session_outcome(
+            &transaction,
+            run_id.as_str(),
+            status,
+            final_answer,
+            error,
+            now,
+        )?;
+        touch_session(&transaction, &session_id, now)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     #[cfg(test)]
     fn inject_terminal_fault_at(&mut self, boundary: TerminalFaultBoundary) {
         self.terminal_fault = Some(boundary);
@@ -1054,8 +1326,17 @@ fn append_record_in(
     }
 }
 
-fn read_run_from(connection: &Connection, run_id: &str) -> AppResult<Vec<RecordedEvent>> {
-    let records = read_run_records_from(connection, run_id)?;
+fn read_run_from(
+    connection: &Connection,
+    sqlite_path: &Path,
+    run_id: &str,
+) -> AppResult<Vec<RecordedEvent>> {
+    let jsonl_path = run_jsonl_path(sqlite_path, run_id)?;
+    let records = if jsonl_path.exists() {
+        read_records(&jsonl_path)?
+    } else {
+        read_run_records_from(connection, run_id)?
+    };
     if records.is_empty() {
         Err(AppError::RunNotFound(run_id.into()))
     } else {
@@ -1203,11 +1484,10 @@ fn validate_voice_event_stream(events: &[VoiceEvent]) -> AppResult<()> {
 }
 
 fn validate_voice_event_keys(
-    connection: &Connection,
+    records: &[RecordedEvent],
     run_id: &str,
     envelopes: &[VoiceEventEnvelope],
 ) -> AppResult<()> {
-    let records = read_run_records_from(connection, run_id)?;
     if records.is_empty() {
         return Err(AppError::RunNotFound(run_id.into()));
     }
@@ -1515,6 +1795,7 @@ fn open_private_default_sqlite(
     )?;
     Ok(SqliteLedger {
         connection,
+        path: location.as_path().to_path_buf(),
         schema_version,
         #[cfg(test)]
         terminal_fault: None,
@@ -1836,6 +2117,221 @@ fn create_voice_event_table(connection: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+pub(crate) fn run_jsonl_path(sqlite_path: &Path, run_id: &str) -> AppResult<PathBuf> {
+    let run_id =
+        RunId::new(run_id.to_owned()).map_err(|_| AppError::RunNotFound(run_id.to_owned()))?;
+    let ledger_directory = sqlite_path.parent().ok_or_else(|| {
+        AppError::Config(format!(
+            "workspace ledger has no directory: {}",
+            sqlite_path.display()
+        ))
+    })?;
+    Ok(ledger_directory
+        .join("runs")
+        .join(format!("{run_id}.jsonl")))
+}
+
+fn create_jsonl_file(path: &Path, private: bool) -> AppResult<File> {
+    if private {
+        prepare_private_run_directory(path)?;
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options
+        .mode(PRIVATE_FILE_MODE)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    let file = options.open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            AppError::LedgerExists(path.into())
+        } else {
+            AppError::Io(error)
+        }
+    })?;
+    #[cfg(unix)]
+    if private {
+        file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+        verify_open_file(path, &file, PRIVATE_FILE_MODE, current_uid())?;
+    }
+    Ok(file)
+}
+
+fn prepare_private_run_directory(path: &Path) -> AppResult<()> {
+    let runs_directory = path
+        .parent()
+        .ok_or_else(|| AppError::Config(format!("run log has no directory: {}", path.display())))?;
+    let workspace_directory = runs_directory.parent().ok_or_else(|| {
+        AppError::Config(format!(
+            "run log has no workspace directory: {}",
+            path.display()
+        ))
+    })?;
+    if runs_directory.file_name() != Some(std::ffi::OsStr::new("runs")) {
+        return Err(AppError::Config(format!(
+            "default run log is outside the runs directory: {}",
+            path.display()
+        )));
+    }
+    let location = DefaultSqlitePath::from_path(workspace_directory.join("ledger.db"));
+    #[cfg(unix)]
+    {
+        prepare_private_directories(&location)?;
+        restrict_private_directory(runs_directory, current_uid())?;
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(runs_directory)?;
+    Ok(())
+}
+
+fn open_jsonl_for_append(path: &Path) -> AppResult<(File, RunState)> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    let mut file = options.open(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let committed_len = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let records = parse_ledger_lines(&bytes[..committed_len])?
+        .into_iter()
+        .filter_map(|line| match line {
+            PersistedLedgerLine::Record(line) => Some(line.record),
+            PersistedLedgerLine::Voice(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let state = replay_records(&records)?;
+    let committed_len = u64::try_from(committed_len)
+        .map_err(|_| AppError::Config("JSONL ledger length exceeds u64".into()))?;
+    if file.metadata()?.len() != committed_len {
+        file.set_len(committed_len)?;
+        file.sync_data()?;
+    }
+    file.seek(SeekFrom::End(0))?;
+    Ok((file, state))
+}
+
+fn parse_ledger_lines(bytes: &[u8]) -> AppResult<Vec<PersistedLedgerLine>> {
+    let mut lines = Vec::new();
+    for bytes in bytes.split(|byte| *byte == b'\n') {
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let line = serde_json::from_slice::<PersistedLedgerLine>(bytes)?;
+        if let PersistedLedgerLine::Record(line) = &line
+            && !supported_ledger_version(line.v)
+        {
+            return Err(AppError::LedgerVersion {
+                expected: LEDGER_VERSION,
+                actual: line.v,
+            });
+        }
+        if let PersistedLedgerLine::Voice(line) = &line {
+            validate_voice_envelopes(&line.voice_events)?;
+        }
+        lines.push(line);
+    }
+    Ok(lines)
+}
+
+fn read_ledger_lines(path: &Path) -> AppResult<Vec<PersistedLedgerLine>> {
+    let bytes = fs::read(path)?;
+    let committed_len = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let mut lines = parse_ledger_lines(&bytes[..committed_len])?;
+    if committed_len < bytes.len()
+        && serde_json::from_slice::<serde_json::Value>(&bytes[committed_len..]).is_ok()
+    {
+        lines.append(&mut parse_ledger_lines(&bytes[committed_len..])?);
+    }
+    Ok(lines)
+}
+
+fn validate_voice_envelopes(envelopes: &[VoiceEventEnvelope]) -> AppResult<()> {
+    let events = envelopes
+        .iter()
+        .enumerate()
+        .map(|(index, envelope)| {
+            let expected = u64::try_from(index).map_err(|_| {
+                AppError::VoiceEventContract("voice event sequence overflowed u64".into())
+            })?;
+            if envelope.sequence != expected {
+                return Err(AppError::VoiceEventContract(format!(
+                    "voice event sequence was {}, expected {expected}",
+                    envelope.sequence
+                )));
+            }
+            envelope
+                .event
+                .validate()
+                .map_err(AppError::VoiceEventContract)?;
+            Ok(envelope.event.clone())
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    validate_voice_event_stream(&events)
+}
+
+pub(crate) fn read_voice_events_from_jsonl(
+    path: &Path,
+    selected_run_id: &str,
+) -> AppResult<Vec<VoiceEventEnvelope>> {
+    let mut envelopes = Vec::new();
+    let mut batch_seen = false;
+    for line in read_ledger_lines(path)? {
+        if let PersistedLedgerLine::Voice(line) = line {
+            if batch_seen {
+                return Err(AppError::VoiceEventContract(format!(
+                    "run {selected_run_id} contains multiple voice event batches"
+                )));
+            }
+            batch_seen = true;
+            envelopes = line.voice_events;
+        }
+    }
+    for envelope in &envelopes {
+        if envelope.event.run_id().as_str() != selected_run_id {
+            return Err(AppError::VoiceEventContract(format!(
+                "voice event belongs to {}, expected {selected_run_id}",
+                envelope.event.run_id()
+            )));
+        }
+    }
+    validate_voice_envelopes(&envelopes)?;
+    Ok(envelopes)
+}
+
+fn append_voice_events_to_jsonl(
+    path: &Path,
+    run_id: &str,
+    envelopes: &[VoiceEventEnvelope],
+) -> AppResult<Vec<VoiceEventEnvelope>> {
+    let (mut file, _) = open_jsonl_for_append(path)?;
+    let existing = read_voice_events_from_jsonl(path, run_id)?;
+    if !existing.is_empty() {
+        if existing == envelopes {
+            return Ok(envelopes.to_vec());
+        }
+        return Err(AppError::VoiceLedgerConflict {
+            run_id: run_id.into(),
+            sequence: first_voice_difference(&existing, envelopes),
+        });
+    }
+    let line = VoiceLedgerLine {
+        voice_events: envelopes.to_vec(),
+    };
+    let mut bytes = serde_json::to_vec(&line)?;
+    bytes.push(b'\n');
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(&bytes)?;
+    file.flush()?;
+    file.sync_data()?;
+    Ok(envelopes.to_vec())
+}
+
 fn next_record(state: &mut RunState, event: HarnessEvent) -> AppResult<RecordedEvent> {
     let record = RecordedEvent {
         seq: state.next_seq(),
@@ -1851,26 +2347,13 @@ fn supported_ledger_version(version: u32) -> bool {
 }
 
 pub fn read_records(path: &Path) -> AppResult<Vec<RecordedEvent>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut records = Vec::new();
-
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let line: LedgerLine = serde_json::from_str(&line)?;
-        if !supported_ledger_version(line.v) {
-            return Err(AppError::LedgerVersion {
-                expected: LEDGER_VERSION,
-                actual: line.v,
-            });
-        }
-        records.push(line.record);
-    }
-
-    Ok(records)
+    Ok(read_ledger_lines(path)?
+        .into_iter()
+        .filter_map(|line| match line {
+            PersistedLedgerLine::Record(line) => Some(line.record),
+            PersistedLedgerLine::Voice(_) => None,
+        })
+        .collect())
 }
 
 pub fn read_sqlite_records(path: &Path, run_id: Option<&str>) -> AppResult<Vec<RecordedEvent>> {
@@ -1970,13 +2453,16 @@ mod tests {
     };
     use serde_json::Value;
     use std::{
+        io::{BufRead, BufReader},
+        process::Stdio,
         sync::atomic::{AtomicBool, Ordering},
+        sync::mpsc,
         thread,
-        time::Instant,
+        time::{Duration, Instant},
     };
 
     #[cfg(unix)]
-    use std::process::Command;
+    use std::{os::unix::process::ExitStatusExt, process::Command};
 
     #[cfg(unix)]
     fn default_location(root: &Path) -> DefaultSqlitePath {
@@ -2165,6 +2651,28 @@ mod tests {
         assert_eq!(mode(workspaces_directory), PRIVATE_DIRECTORY_MODE);
         assert_eq!(mode(workspace_directory), PRIVATE_DIRECTORY_MODE);
         assert_eq!(mode(location.as_path()), PRIVATE_FILE_MODE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_run_jsonl_uses_minted_private_layout() {
+        let root = tempfile::tempdir().unwrap();
+        let location = default_location(root.path());
+        let run_id = RunId::new("run_private").unwrap();
+
+        drop(EventRecorder::create_default_jsonl(&location, &run_id).unwrap());
+
+        let path = run_jsonl_path(location.as_path(), run_id.as_str()).unwrap();
+        assert_eq!(
+            path,
+            location
+                .as_path()
+                .parent()
+                .unwrap()
+                .join("runs/run_private.jsonl")
+        );
+        assert_eq!(mode(path.parent().unwrap()), PRIVATE_DIRECTORY_MODE);
+        assert_eq!(mode(&path), PRIVATE_FILE_MODE);
     }
 
     #[cfg(unix)]
@@ -2362,7 +2870,7 @@ mod tests {
         let path = dir.path().join("events.jsonl");
         let mut recorder = JsonlEventRecorder::create(&path).unwrap();
 
-        recorder
+        let record = recorder
             .record(HarnessEvent::RunStarted {
                 run_id: RunId::new("run_1").unwrap(),
                 agent_id: AgentId::new("plato").unwrap(),
@@ -2370,10 +2878,211 @@ mod tests {
             .unwrap();
 
         let records = read_records(&path).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].seq, 0);
+        assert_eq!(records, vec![record.clone()]);
+        let mut expected = serde_json::to_vec(&LedgerLine {
+            v: LEDGER_VERSION,
+            record,
+        })
+        .unwrap();
+        expected.push(b'\n');
+        assert_eq!(fs::read(&path).unwrap(), expected);
         let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(raw["v"], LEDGER_VERSION);
+    }
+
+    #[test]
+    fn an_open_tail_descriptor_reads_each_acknowledged_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let run_id = RunId::new("run_tail").unwrap();
+        let mut recorder = JsonlEventRecorder::create(&path).unwrap();
+        recorder
+            .record(HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: AgentId::new("plato").unwrap(),
+            })
+            .unwrap();
+        let mut tail = File::open(&path).unwrap();
+        tail.seek(SeekFrom::End(0)).unwrap();
+
+        let second = recorder
+            .record(HarnessEvent::ContextBuilt {
+                run_id,
+                turn_id: TurnId::new("turn_1").unwrap(),
+                context: ContextPack {
+                    fragments: vec![],
+                    token_budget: 4_000,
+                },
+            })
+            .unwrap();
+
+        let mut appended = Vec::new();
+        tail.read_to_end(&mut appended).unwrap();
+        let mut expected = serde_json::to_vec(&LedgerLine {
+            v: LEDGER_VERSION,
+            record: second,
+        })
+        .unwrap();
+        expected.push(b'\n');
+        assert_eq!(appended, expected);
+    }
+
+    #[test]
+    fn a_jsonl_write_failure_neither_acks_nor_appends_through_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let sqlite_path = dir.path().join("ledger.db");
+        let run_id = RunId::new("run_write_failure").unwrap();
+        let mut ledger = SqliteLedger::open_or_create(&sqlite_path).unwrap();
+        ledger
+            .begin_session_run("session_1", &run_id, "question", true)
+            .unwrap();
+        let mut recorder = JsonlEventRecorder::create(&path)
+            .unwrap()
+            .with_session(ledger, &run_id);
+        recorder
+            .record(HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: AgentId::new("plato").unwrap(),
+            })
+            .unwrap();
+        recorder.file = File::open(&path).unwrap();
+
+        assert!(matches!(
+            recorder.record(HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id: TurnId::new("turn_1").unwrap(),
+                context: ContextPack {
+                    fragments: vec![],
+                    token_budget: 4_000,
+                },
+            }),
+            Err(AppError::Io(_))
+        ));
+        assert!(matches!(
+            recorder.record(HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id: TurnId::new("turn_1").unwrap(),
+                context: ContextPack {
+                    fragments: vec![],
+                    token_budget: 4_000,
+                },
+            }),
+            Err(AppError::Config(_))
+        ));
+        drop(recorder);
+        assert_eq!(read_records(&path).unwrap().len(), 1);
+        let state = SqliteLedger::open_readonly(&sqlite_path).unwrap();
+        assert_eq!(
+            state
+                .connection
+                .query_row(
+                    "SELECT status FROM session_runs WHERE run_id = ?1",
+                    params![run_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            RunStateName::Running.as_str()
+        );
+        drop(state);
+
+        let mut recovered = JsonlEventRecorder::open(&path).unwrap();
+        let terminal = recovered
+            .record(HarnessEvent::RunFailed {
+                run_id,
+                reason: "recovered".into(),
+            })
+            .unwrap();
+        assert_eq!(terminal.seq, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigkill_torn_tail_recovery_retains_every_acknowledged_event() {
+        const CHILD_PATH: &str = "PLATONIC_JSONL_SIGKILL_CHILD_PATH";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ledger::tests::jsonl_sigkill_writer_child",
+                "--nocapture",
+            ])
+            .env(CHILD_PATH, &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                sender.send(line.unwrap()).unwrap();
+            }
+        });
+        loop {
+            let line = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            if line == "JSONL_TORN_READY acknowledged=2" {
+                break;
+            }
+        }
+
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(9));
+        reader.join().unwrap();
+        let torn_len = fs::metadata(&path).unwrap().len();
+
+        let mut recorder = JsonlEventRecorder::open(&path).unwrap();
+        let acknowledged = read_records(&path).unwrap();
+        assert_eq!(acknowledged.len(), 2);
+        assert_eq!(acknowledged[0].seq, 0);
+        assert_eq!(acknowledged[1].seq, 1);
+        assert!(fs::metadata(&path).unwrap().len() < torn_len);
+        let terminal = recorder
+            .record(HarnessEvent::RunFailed {
+                run_id: RunId::new("run_sigkill").unwrap(),
+                reason: "recovered".into(),
+            })
+            .unwrap();
+        assert_eq!(terminal.seq, 2);
+        assert_eq!(read_records(&path).unwrap().len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_sigkill_writer_child() {
+        const CHILD_PATH: &str = "PLATONIC_JSONL_SIGKILL_CHILD_PATH";
+        let Some(path) = std::env::var_os(CHILD_PATH).map(PathBuf::from) else {
+            return;
+        };
+        let run_id = RunId::new("run_sigkill").unwrap();
+        let mut recorder = JsonlEventRecorder::create(&path).unwrap();
+        recorder
+            .record(HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: AgentId::new("plato").unwrap(),
+            })
+            .unwrap();
+        recorder
+            .record(HarnessEvent::ContextBuilt {
+                run_id,
+                turn_id: TurnId::new("turn_1").unwrap(),
+                context: ContextPack {
+                    fragments: vec![],
+                    token_budget: 4_000,
+                },
+            })
+            .unwrap();
+        drop(recorder);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(br#"{"v":2,"record":{"seq":2"#).unwrap();
+        file.sync_data().unwrap();
+        println!("JSONL_TORN_READY acknowledged=2");
+        std::io::stdout().flush().unwrap();
+        let mut blocked = String::new();
+        std::io::stdin().read_line(&mut blocked).unwrap();
+        panic!("SIGKILL child was released instead of killed");
     }
 
     #[test]
@@ -2576,6 +3285,50 @@ mod tests {
             }) if run_id == "run_voice"
         ));
         assert_eq!(ledger.read_voice_events("run_voice").unwrap(), committed);
+    }
+
+    #[test]
+    fn new_run_voice_facts_share_jsonl_and_leave_sqlite_log_tables_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite_path = dir.path().join("ledger.db");
+        let run_id = RunId::new("run_voice").unwrap();
+        let jsonl_path = run_jsonl_path(&sqlite_path, run_id.as_str()).unwrap();
+        fs::create_dir_all(jsonl_path.parent().unwrap()).unwrap();
+        let mut recorder = JsonlEventRecorder::create(&jsonl_path).unwrap();
+        for event in response_run_events(&run_id, None) {
+            recorder.record(event).unwrap();
+        }
+        drop(recorder);
+        let core_records = read_records(&jsonl_path).unwrap();
+        let mut ledger = SqliteLedger::open_or_create(&sqlite_path).unwrap();
+        let events = completed_voice_events(run_id.as_str());
+
+        let committed = ledger.append_voice_events(&events).unwrap();
+
+        assert_eq!(
+            ledger.read_voice_events(run_id.as_str()).unwrap(),
+            committed
+        );
+        assert_eq!(read_records(&jsonl_path).unwrap(), core_records);
+        let lines = read_ledger_lines(&jsonl_path).unwrap();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| matches!(line, PersistedLedgerLine::Voice(_)))
+                .count(),
+            1
+        );
+        for table in ["ledger_events", "voice_events"] {
+            let count: i64 = ledger
+                .connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "new run wrote {table}");
+        }
+        let replay = crate::replay::replay_file(&jsonl_path).unwrap();
+        assert_eq!(replay.matches("voice_event:").count(), committed.len());
     }
 
     #[test]

@@ -19,10 +19,10 @@ The bootstrap surface is intentionally small:
 - Bare `plato` in a terminal ensures the host daemon, asks once before registering an unknown directory, creates an approved durable thread, and opens the TUI on it.
 - `plato --remote <thread-id>` opens another TUI on the same host socket and existing thread.
 - `plato "question"` ensures the host server and runs as a short-lived client.
-- `plato -c "follow-up"` continues the latest workspace session from the SQLite ledger.
+- `plato -c "follow-up"` continues the latest workspace session from the workspace ledger.
 - `plato replay <file>` validates and prints a deterministic JSONL readback without network calls or tool execution.
-- `plato replay [--run <id>]` replays the default SQLite ledger; omitted `--run` selects the latest session.
-- `plato replay --db[=<path>] [--run <id>]` replays an explicit SQLite ledger.
+- `plato replay [--run <id>]` replays the default workspace ledger; omitted `--run` selects the latest session.
+- `plato replay --db[=<path>] [--run <id>]` selects an explicit workspace state database and replays its run log.
 - `plato issue-prep start <run-dir>` runs the fixed issue preparation pipeline from Markdown on stdin.
 - `plato thread spawn|list|status|send|attach|stop` manages and observes durable threads on a serving host daemon.
 - `platonic serve|status|shutdown` runs and operates the server.
@@ -176,12 +176,16 @@ Every run uses this exact convention:
 40-candidate.md
 ```
 
-## SQLite Ledgers
+## Workspace Ledgers
 
 - Bare `plato "..."` writes to the default platform user-state path.
 - `plato -c "..."` continues the latest session from that store.
 - `--db[=<path>]` belongs to offline replay; one-shot runs always use the server-owned workspace ledger.
-- On Unix, default ledger directories are `0700` and the database and SQLite sidecars are `0600`.
+- New run events are append-only `RecordedEvent` envelopes in
+  `<workspace-ledger-dir>/runs/<run-id>.jsonl`. SQLite retains the session
+  index and other queryable state.
+- On Unix, default ledger directories are `0700`; run logs, the state database,
+  and SQLite sidecars are `0600`.
 - Live assistant text, `run_id`, `ledger_path`, and replay hints print to stderr. Stdout remains only the final answer.
 - Replay shows final assistant messages, not partial streaming deltas.
 - Replay renders dropped oldest session turns as `[<turn_id>] context_compacted estimated_tokens=<before>-><after> dropped_turns=<start>..<end>`; the zero-based range has an exclusive end and the token values are host estimates of the complete context before and after compaction.
@@ -189,8 +193,15 @@ Every run uses this exact convention:
 - Streamed runs request provider usage chunks. Usage is recorded only when the
   provider reports both token counts; reported zeros remain known, while
   omitted or partial usage is recorded as unknown.
-- `plato replay` without arguments replays the latest session from the default platform SQLite ledger.
+- `plato replay` without arguments replays the latest session from the default workspace ledger.
 - `plato replay --run <id>` replays a single run.
+- A JSONL record is acknowledged only after the complete serialized envelope,
+  its newline commit marker, a flush, and `sync_data`. Write-open validates the
+  committed prefix and truncates an unterminated tail before appending. Readers
+  never expose a malformed tail. An already-open `tail -f` sees each record
+  after it commits.
+- Voice companion envelopes append as one synced batch in the same per-run
+  JSONL. New runs do not write `ledger_events` or `voice_events` rows.
 - Read-only SQLite replay reads `user_version` first: schema v1 uses only
   `ledger_events`, v2 adds sessions, v3 adds voice companions, v4 adds
   immutable thread authority, and v5 adds immutable thread-stop records. Newer
@@ -198,9 +209,13 @@ Every run uses this exact convention:
   remains the sole migration path to the current schema.
 - Every prompt runs through the host server. Replay opens JSONL or SQLite
   read-only and never starts or contacts the server.
-- SQLite session terminal events and their matching outcomes commit together.
-  Daemon startup replays running session ledgers, reconciling an existing
-  terminal event or recording one interruption failure before closing the run.
+- Runs recorded before the JSONL transition remain readable from
+  `ledger_events` and `voice_events`. Readback prefers a run JSONL when present
+  and otherwise uses those legacy rows.
+- The server syncs a JSONL terminal event before updating its SQLite session
+  outcome. Daemon startup repairs a torn tail, reconciles an already committed
+  terminal event, or appends one interruption failure before closing a run
+  still marked running.
 
 Replay forms:
 
@@ -408,16 +423,18 @@ An accepted `run.cancel` stores `cancel_requested` before replying. Repeated
 requests return that state without another cancellation event, while terminal
 runs reject cancellation.
 Each daemon run executes in a supervised child process while `platonic serve`
-stays alive and authoritative. The daemon is the only SQLite writer; the child
-receives a prepared run snapshot without a ledger path and returns typed ledger
-operations, live deltas, approval requests, and its result over private stdio.
+stays alive and authoritative. The daemon is the only workspace-ledger writer;
+the child receives a prepared run snapshot without a ledger path and returns
+typed ledger operations, live deltas, approval requests, and its result over
+private stdio.
 Every child has an explicit 30-minute deadline. Cancellation or deadline expiry
 first sends the child cancellation token, then terminates its complete process
 tree after a bounded grace period, escalates to a kill when necessary, drains
 output for a bounded interval, and verifies that no child processes remain.
 The daemon retains event buffers for the newest 32 terminal runs in completion
-order. Older runs return `not_found` from `events.stream`; `transcript.read` and
-`sessions.list` remain ledger-backed.
+order. After eviction, `events.stream` replays durable ledger records from the
+run JSONL or legacy SQLite rows; transient deltas and approval notifications
+remain live-only. `transcript.read` and `sessions.list` remain ledger-backed.
 `hello` advertises `transcript.read.typed`. Successful `transcript.read`
 responses preserve the legacy `transcript` string and add ordered `typed.runs`
 with structured chat, tool, policy, and approval entries.
@@ -714,7 +731,7 @@ cargo run --bin plato
 
 `plato-tui` remains a terminal client for a manually started `platonic serve`. It
 does not spawn, supervise, restart, or stop the daemon, and it does not call
-providers, execute tools, or write SQLite directly.
+providers, execute tools, or write the workspace ledger directly.
 Assistant text appears live through daemon `events.stream`; replay remains
 based on final ledger messages.
 Live Markdown drains at a pressure-adaptive cadence, flushes quiet partial text

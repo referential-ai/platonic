@@ -1,7 +1,10 @@
 use crate::{
     AppError, AppResult,
     config::{Config, LimitsConfig, ProviderConfig, ProviderKind, ToolsConfig},
-    ledger::{EventRecorder, RUN_CANCELED_REASON, RunEventRecorder, SessionTurn, SqliteLedger},
+    ledger::{
+        EventRecorder, RUN_CANCELED_REASON, RunEventRecorder, SessionTurn, SqliteLedger,
+        run_jsonl_path,
+    },
     model::{
         ModelBlock, ModelMessage, ModelRequest, ModelResponse, ModelStop, RunOverrides,
         system_prompt,
@@ -301,6 +304,41 @@ fn begin_session_recorder(
     ))
 }
 
+fn begin_default_jsonl_session_recorder(
+    location: &DefaultSqlitePath,
+    session: &RunSession,
+    run_id: &RunId,
+    question: &str,
+    config: &Config,
+    tools: &[ToolSpec],
+    system_context: &str,
+) -> AppResult<(EventRecorder, SessionHydration)> {
+    let mut ledger = SqliteLedger::open_or_create_default(location)?;
+    let log_path = run_jsonl_path(location.as_path(), run_id.as_str())?;
+    let recorder = EventRecorder::create_default_jsonl(location, run_id)?;
+    let turns = match ledger.begin_session_run(
+        session.session_id(),
+        run_id,
+        question,
+        session.create_session(),
+    ) {
+        Ok(turns) => turns,
+        Err(error) => {
+            drop(recorder);
+            if let Err(cleanup) = fs::remove_file(&log_path) {
+                return Err(AppError::Config(format!(
+                    "{error}; failed to remove uncommitted run log {}: {cleanup}",
+                    log_path.display()
+                )));
+            }
+            return Err(error);
+        }
+    };
+    let recorder = recorder.with_session_jsonl(ledger, run_id);
+    let hydration = hydrated_messages(&turns, question, config, tools, system_context)?;
+    Ok((recorder, hydration))
+}
+
 fn hydrated_messages(
     turns: &[SessionTurn],
     question: &str,
@@ -509,8 +547,8 @@ pub(crate) fn prepare_run(options: &RunOptions) -> AppResult<(PreparedRun, Event
             (recorder, Some(hydration))
         }
         (RunLedger::DefaultSqlite(path), Some(session)) => {
-            let (recorder, hydration) = begin_session_recorder(
-                SqliteLedger::open_or_create_default(path)?,
+            let (recorder, hydration) = begin_default_jsonl_session_recorder(
+                path,
                 session,
                 &run_id,
                 &options.question,
@@ -526,7 +564,7 @@ pub(crate) fn prepare_run(options: &RunOptions) -> AppResult<(PreparedRun, Event
         (RunLedger::Jsonl(path), None) => (EventRecorder::create_jsonl(path)?, None),
         (RunLedger::Sqlite(path), None) => (EventRecorder::create_sqlite(path, &run_id)?, None),
         (RunLedger::DefaultSqlite(path), None) => {
-            (EventRecorder::create_default_sqlite(path, &run_id)?, None)
+            (EventRecorder::create_default_jsonl(path, &run_id)?, None)
         }
     };
     let messages = session_hydration

@@ -5,8 +5,7 @@ use platonic_protocol::{VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Deserialize;
 use std::{
-    fs::File,
-    io::{BufRead, BufReader},
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -50,6 +49,9 @@ pub enum OfflineError {
     /// SQLite readback failed.
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// A voice companion stream violated its durable envelope contract.
+    #[error("voice event contract failed: {0}")]
+    VoiceEventContract(String),
     /// The sans-I/O kernel rejected the durable event stream.
     #[error("core error: {0}")]
     Core(#[from] platonic_core::Error),
@@ -59,9 +61,23 @@ pub enum OfflineError {
 pub type OfflineResult<T> = Result<T, OfflineError>;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LedgerLine {
     v: u32,
     record: RecordedEvent,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VoiceLedgerLine {
+    voice_events: Vec<VoiceEventEnvelope>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PersistedLedgerLine {
+    Record(LedgerLine),
+    Voice(VoiceLedgerLine),
 }
 
 /// Resolves a workspace ledger through the server registry without contacting it.
@@ -85,23 +101,13 @@ pub fn workspace_ledger_path(
 
 /// Replays one JSONL ledger without contacting or linking the server.
 pub fn replay_file(path: &Path) -> OfflineResult<String> {
-    let file = File::open(path)?;
-    let mut records = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let line: LedgerLine = serde_json::from_str(&line)?;
-        if !matches!(line.v, 1 | LEDGER_VERSION) {
-            return Err(OfflineError::LedgerVersion {
-                expected: LEDGER_VERSION,
-                actual: line.v,
-            });
-        }
-        records.push(line.record);
+    let (records, voice_events) = read_jsonl(path)?;
+    let mut output = format_records(&records)?;
+    for envelope in voice_events {
+        output.push_str("\nvoice_event: ");
+        output.push_str(&serde_json::to_string(&envelope)?);
     }
-    format_records(&records)
+    Ok(output)
 }
 
 /// Replays a selected or latest SQLite run without contacting or linking the server.
@@ -117,7 +123,7 @@ pub fn replay_sqlite(path: &Path, run_id: Option<&str>) -> OfflineResult<String>
     }
 
     if let Some(run_id) = run_id {
-        return format_sqlite_run(&connection, schema_version, run_id);
+        return format_ledger_run(path, &connection, schema_version, run_id);
     }
 
     if schema_version >= 2
@@ -138,13 +144,18 @@ pub fn replay_sqlite(path: &Path, run_id: Option<&str>) -> OfflineResult<String>
         let mut output = vec![format!("session_id: {session_id}")];
         for run_id in run_ids {
             output.push(format!("run_id: {run_id}"));
-            output.push(format_sqlite_run(&connection, schema_version, &run_id)?);
+            output.push(format_ledger_run(
+                path,
+                &connection,
+                schema_version,
+                &run_id,
+            )?);
         }
         return Ok(output.join("\n"));
     }
 
     let run_id = latest_run_id(&connection)?.ok_or(OfflineError::NoRuns)?;
-    format_sqlite_run(&connection, schema_version, &run_id)
+    format_ledger_run(path, &connection, schema_version, &run_id)
 }
 
 fn latest_run_id(connection: &Connection) -> OfflineResult<Option<String>> {
@@ -157,11 +168,16 @@ fn latest_run_id(connection: &Connection) -> OfflineResult<Option<String>> {
         .optional()?)
 }
 
-fn format_sqlite_run(
+fn format_ledger_run(
+    sqlite_path: &Path,
     connection: &Connection,
     schema_version: u32,
     run_id: &str,
 ) -> OfflineResult<String> {
+    let jsonl_path = run_jsonl_path(sqlite_path, run_id)?;
+    if jsonl_path.exists() {
+        return replay_file(&jsonl_path);
+    }
     let records = read_run(connection, run_id)?;
     if records.is_empty() {
         return Err(OfflineError::RunNotFound(run_id.into()));
@@ -204,6 +220,102 @@ fn format_sqlite_run(
         }
     }
     Ok(output)
+}
+
+fn run_jsonl_path(sqlite_path: &Path, run_id: &str) -> OfflineResult<PathBuf> {
+    let run_id = platonic_core::RunId::new(run_id.to_owned()).map_err(OfflineError::Core)?;
+    let ledger_directory = sqlite_path.parent().ok_or_else(|| {
+        OfflineError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "workspace ledger has no directory: {}",
+                sqlite_path.display()
+            ),
+        ))
+    })?;
+    Ok(ledger_directory
+        .join("runs")
+        .join(format!("{run_id}.jsonl")))
+}
+
+fn read_jsonl(path: &Path) -> OfflineResult<(Vec<RecordedEvent>, Vec<VoiceEventEnvelope>)> {
+    let bytes = fs::read(path)?;
+    let committed_len = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let mut lines = parse_jsonl_lines(&bytes[..committed_len])?;
+    if committed_len < bytes.len()
+        && serde_json::from_slice::<serde_json::Value>(&bytes[committed_len..]).is_ok()
+    {
+        lines.append(&mut parse_jsonl_lines(&bytes[committed_len..])?);
+    }
+    let mut records = Vec::new();
+    let mut voice_events = Vec::new();
+    let mut voice_batch_seen = false;
+    for line in lines {
+        match line {
+            PersistedLedgerLine::Record(line) => records.push(line.record),
+            PersistedLedgerLine::Voice(line) => {
+                if voice_batch_seen {
+                    return Err(OfflineError::VoiceEventContract(
+                        "JSONL run contains multiple voice event batches".into(),
+                    ));
+                }
+                voice_batch_seen = true;
+                voice_events = line.voice_events;
+            }
+        }
+    }
+    for (index, envelope) in voice_events.iter().enumerate() {
+        let expected = u64::try_from(index).unwrap_or(u64::MAX);
+        if envelope.v != VOICE_EVENT_VERSION {
+            return Err(OfflineError::LedgerVersion {
+                expected: VOICE_EVENT_VERSION,
+                actual: envelope.v,
+            });
+        }
+        if envelope.sequence != expected {
+            return Err(OfflineError::VoiceEventContract(format!(
+                "voice event sequence was {}, expected {expected}",
+                envelope.sequence
+            )));
+        }
+        envelope
+            .event
+            .validate()
+            .map_err(OfflineError::VoiceEventContract)?;
+        if let Some(record) = records.first()
+            && envelope.event.run_id() != record.event.run_id()
+        {
+            return Err(OfflineError::VoiceEventContract(format!(
+                "voice event belongs to {}, expected {}",
+                envelope.event.run_id(),
+                record.event.run_id()
+            )));
+        }
+    }
+    Ok((records, voice_events))
+}
+
+fn parse_jsonl_lines(bytes: &[u8]) -> OfflineResult<Vec<PersistedLedgerLine>> {
+    let mut lines = Vec::new();
+    for bytes in bytes.split(|byte| *byte == b'\n') {
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let line = serde_json::from_slice::<PersistedLedgerLine>(bytes)?;
+        if let PersistedLedgerLine::Record(line) = &line
+            && !matches!(line.v, 1 | LEDGER_VERSION)
+        {
+            return Err(OfflineError::LedgerVersion {
+                expected: LEDGER_VERSION,
+                actual: line.v,
+            });
+        }
+        lines.push(line);
+    }
+    Ok(lines)
 }
 
 fn read_run(connection: &Connection, run_id: &str) -> OfflineResult<Vec<RecordedEvent>> {
