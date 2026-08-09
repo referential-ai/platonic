@@ -1303,13 +1303,13 @@ pub(super) fn approval_handler(
         }
         if record.cancel.load(Ordering::SeqCst) {
             return Ok(ExternalApprovalOutcome::Denied {
-                actor: "daemon",
+                actor: "daemon".into(),
                 reason: "run canceled".into(),
             });
         }
         if record.status().state != RunStateName::Running {
             return Ok(ExternalApprovalOutcome::Denied {
-                actor: "daemon",
+                actor: "daemon".into(),
                 reason: "run is no longer active".into(),
             });
         }
@@ -1318,7 +1318,7 @@ pub(super) fn approval_handler(
             && runtime.has_shell_session_grant(&record.session_id)
         {
             return Ok(ExternalApprovalOutcome::Granted {
-                actor: "session_grant",
+                actor: "session_grant".into(),
             });
         }
         // Record the ask before announcing it. A daemon that dies between the
@@ -1328,7 +1328,7 @@ pub(super) fn approval_handler(
         // nobody could answer after a restart.
         if let Err(error) = persist_approval_request(&runtime, &record, &request) {
             return Ok(ExternalApprovalOutcome::Denied {
-                actor: "daemon",
+                actor: "daemon".into(),
                 reason: format!("approval could not be recorded: {error}"),
             });
         }
@@ -1348,7 +1348,7 @@ pub(super) fn approval_handler(
                 let reason = "run canceled";
                 record_daemon_denial(&runtime, &request, reason);
                 return Ok(ExternalApprovalOutcome::Denied {
-                    actor: "daemon",
+                    actor: "daemon".into(),
                     reason: reason.into(),
                 });
             }
@@ -1357,7 +1357,7 @@ pub(super) fn approval_handler(
                 let reason = "run is no longer active";
                 record_daemon_denial(&runtime, &request, reason);
                 return Ok(ExternalApprovalOutcome::Denied {
-                    actor: "daemon",
+                    actor: "daemon".into(),
                     reason: reason.into(),
                 });
             }
@@ -2232,7 +2232,7 @@ mod tests {
         assert_eq!(
             outcome,
             ExternalApprovalOutcome::Denied {
-                actor: "daemon",
+                actor: "daemon".into(),
                 reason: "run canceled".into()
             }
         );
@@ -2281,7 +2281,7 @@ mod tests {
         approvals.get_mut("call_1").unwrap().decision = Some(PendingApprovalDecision {
             decision: ApprovalDecision::Deny,
             outcome: ExternalApprovalOutcome::Denied {
-                actor: "daemon",
+                actor: "daemon".into(),
                 reason: "test complete".into(),
             },
         });
@@ -2291,7 +2291,7 @@ mod tests {
         assert_eq!(
             worker.join().unwrap(),
             ExternalApprovalOutcome::Denied {
-                actor: "daemon",
+                actor: "daemon".into(),
                 reason: "test complete".into()
             }
         );

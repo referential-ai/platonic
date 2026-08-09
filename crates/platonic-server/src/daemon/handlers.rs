@@ -2036,6 +2036,28 @@ fn handle_approval_decide(
     request: Envelope,
     params: ApprovalDecideParams,
 ) -> Envelope {
+    let attributed_actor = match params.actor.as_deref() {
+        Some(actor) => match ActorId::new(actor.to_owned()) {
+            Ok(actor) => Some(actor.to_string()),
+            Err(error) => {
+                return Envelope::error(
+                    request.id,
+                    Some("approval.decide".into()),
+                    ERROR_MALFORMED_REQUEST,
+                    error.to_string(),
+                );
+            }
+        },
+        None => None,
+    };
+    // This field is attribution from an already-trusted local client. The
+    // run and call lookups below remain the complete approval authority gate.
+    let decision_actor = match params.decision {
+        ApprovalDecision::GrantSession => "tui_session_grant",
+        ApprovalDecision::Grant | ApprovalDecision::Deny => {
+            attributed_actor.as_deref().unwrap_or("daemon")
+        }
+    };
     let record = match find_run(runtime, &params.run_id) {
         Ok(record) => record,
         Err(error) => return error_response(request.id, "approval.decide", error),
@@ -2073,7 +2095,11 @@ fn handle_approval_decide(
         );
     }
     if let Some(existing) = &pending.decision {
-        if existing.decision == params.decision {
+        let existing_actor = match &existing.outcome {
+            ExternalApprovalOutcome::Granted { actor }
+            | ExternalApprovalOutcome::Denied { actor, .. } => actor,
+        };
+        if existing.decision == params.decision && existing_actor == decision_actor {
             return Envelope::typed_response(
                 request.id,
                 ProtocolResponse::ApprovalDecide(CommandAcceptedResult {
@@ -2090,7 +2116,9 @@ fn handle_approval_decide(
         );
     }
     let outcome = match params.decision {
-        ApprovalDecision::Grant => ExternalApprovalOutcome::Granted { actor: "daemon" },
+        ApprovalDecision::Grant => ExternalApprovalOutcome::Granted {
+            actor: decision_actor.into(),
+        },
         ApprovalDecision::GrantSession => {
             if pending.request.tool_name != SHELL_EXEC
                 || pending.request.effect != EffectClass::ExternalSideEffect
@@ -2104,11 +2132,11 @@ fn handle_approval_decide(
             }
             runtime.install_shell_session_grant(&record.session_id);
             ExternalApprovalOutcome::Granted {
-                actor: "tui_session_grant",
+                actor: "tui_session_grant".into(),
             }
         }
         ApprovalDecision::Deny => ExternalApprovalOutcome::Denied {
-            actor: "daemon",
+            actor: decision_actor.into(),
             reason: params
                 .reason
                 .unwrap_or_else(|| "approval denied by daemon client".into()),
@@ -2474,9 +2502,9 @@ fn record_approval_decision(
     outcome: &ExternalApprovalOutcome,
 ) -> AppResult<()> {
     let (granted, actor, reason) = match outcome {
-        ExternalApprovalOutcome::Granted { actor } => (true, (*actor).to_owned(), None),
+        ExternalApprovalOutcome::Granted { actor } => (true, actor.clone(), None),
         ExternalApprovalOutcome::Denied { actor, reason } => {
-            (false, (*actor).to_owned(), Some(reason.clone()))
+            (false, actor.clone(), Some(reason.clone()))
         }
     };
     runtime.paths.server_store()?.resolve_tool_call_approval(
@@ -5271,7 +5299,7 @@ IFS= read -r _
             Some(PendingApprovalDecision {
                 decision: ApprovalDecision::GrantSession,
                 outcome: ExternalApprovalOutcome::Granted {
-                    actor: "tui_session_grant"
+                    actor: "tui_session_grant".into()
                 },
             })
         );
@@ -5398,7 +5426,7 @@ IFS= read -r _
         assert_eq!(
             waiter.join().unwrap(),
             ExternalApprovalOutcome::Granted {
-                actor: "tui_session_grant"
+                actor: "tui_session_grant".into()
             }
         );
         assert_eq!(runtime.session_tool_grant_count(), 1);
@@ -5467,7 +5495,7 @@ IFS= read -r _
         assert_eq!(
             waiter.join().unwrap(),
             ExternalApprovalOutcome::Granted {
-                actor: "tui_session_grant"
+                actor: "tui_session_grant".into()
             }
         );
         assert_eq!(runtime.session_tool_grant_count(), 1);

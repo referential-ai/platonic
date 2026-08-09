@@ -401,6 +401,23 @@ impl DaemonClient {
             tool_call_id: tool_call_id.into(),
             decision: ApprovalDecision::Grant,
             reason: None,
+            actor: None,
+        }))
+    }
+
+    /// Grants a pending daemon approval and attributes the decision to an actor.
+    pub fn approval_grant_as(
+        &mut self,
+        run_id: &str,
+        tool_call_id: &str,
+        actor: String,
+    ) -> ClientResult<CommandAcceptedResult> {
+        self.request(ProtocolRequest::ApprovalDecide(ApprovalDecideParams {
+            run_id: run_id.into(),
+            tool_call_id: tool_call_id.into(),
+            decision: ApprovalDecision::Grant,
+            reason: None,
+            actor: Some(actor),
         }))
     }
 
@@ -415,6 +432,7 @@ impl DaemonClient {
             tool_call_id: tool_call_id.into(),
             decision: ApprovalDecision::GrantSession,
             reason: None,
+            actor: None,
         }))
     }
 
@@ -430,6 +448,24 @@ impl DaemonClient {
             tool_call_id: tool_call_id.into(),
             decision: ApprovalDecision::Deny,
             reason: Some(reason),
+            actor: None,
+        }))
+    }
+
+    /// Denies a pending daemon approval and attributes the decision to an actor.
+    pub fn approval_deny_as(
+        &mut self,
+        run_id: &str,
+        tool_call_id: &str,
+        actor: String,
+        reason: String,
+    ) -> ClientResult<CommandAcceptedResult> {
+        self.request(ProtocolRequest::ApprovalDecide(ApprovalDecideParams {
+            run_id: run_id.into(),
+            tool_call_id: tool_call_id.into(),
+            decision: ApprovalDecision::Deny,
+            reason: Some(reason),
+            actor: Some(actor),
         }))
     }
 
@@ -1917,6 +1953,7 @@ mod tests {
             assert_eq!(params["tool_call_id"], "call_1");
             assert_eq!(params["decision"], "grant");
             assert!(params["reason"].is_null());
+            assert!(params.get("actor").is_none());
             write_response(
                 &mut writer,
                 grant.id,
@@ -1939,6 +1976,12 @@ mod tests {
                 "grant_session"
             );
             assert!(request_params_value(&grant_session).unwrap()["reason"].is_null());
+            assert!(
+                request_params_value(&grant_session)
+                    .unwrap()
+                    .get("actor")
+                    .is_none()
+            );
             write_response(
                 &mut writer,
                 grant_session.id,
@@ -1958,6 +2001,7 @@ mod tests {
                 request_params_value(&deny).unwrap()["reason"],
                 "denied by plato-tui"
             );
+            assert!(request_params_value(&deny).unwrap().get("actor").is_none());
             write_response(
                 &mut writer,
                 deny.id,

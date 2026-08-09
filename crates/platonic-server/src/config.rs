@@ -1,7 +1,9 @@
 use crate::{
     AppError, AppResult,
+    daemon::protocol::ThreadApprovalPolicy,
     tool_catalog::{default_enabled_tools, is_known_tool},
 };
+use platonic_core::ActorId;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -23,6 +25,7 @@ const PLATO_CONFIG_ENV: &str = "PLATO_CONFIG";
 const WORKSPACE_PROVIDER_OVERRIDE_ERROR: &str = "workspace plato.toml cannot set provider.api_key_env or provider.base_url; use --config, PLATO_CONFIG, or user config";
 const WORKSPACE_GATEWAY_ERROR: &str =
     "workspace plato.toml cannot set [gateway]; use --config, PLATO_CONFIG, or user config";
+const WORKSPACE_PRINCIPALS_ERROR: &str = "workspace plato.toml cannot set [principals]; define gateway principals only in the user config";
 const WORKSPACE_SPAWN_DEPTH_ERROR: &str = "workspace plato.toml cannot set limits.max_spawn_depth; use the user config and restart the server";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,8 +64,13 @@ pub struct GatewayConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscordGatewayConfig {
     pub api_key_env: String,
-    pub owner_user_ids: Vec<u64>,
-    pub channel_configs: HashMap<u64, PathBuf>,
+    pub channel_threads: HashMap<u64, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscordGatewayPrincipal {
+    pub name: String,
+    pub remote_ceiling: ThreadApprovalPolicy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -104,6 +112,7 @@ struct RawConfig {
     limits: Option<RawLimitsConfig>,
     tools: Option<RawToolsConfig>,
     gateway: Option<RawGatewayConfig>,
+    principals: Option<RawPrincipalsConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,9 +125,22 @@ struct RawGatewayConfig {
 #[serde(deny_unknown_fields)]
 struct RawDiscordGatewayConfig {
     api_key_env: String,
-    owner_user_ids: Vec<u64>,
     #[serde(default)]
-    channel_configs: HashMap<String, PathBuf>,
+    channel_threads: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPrincipalsConfig {
+    #[serde(default)]
+    discord: HashMap<String, RawDiscordPrincipal>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDiscordPrincipal {
+    name: String,
+    remote_ceiling: Option<ThreadApprovalPolicy>,
 }
 
 #[derive(Default, Debug, Deserialize)]
@@ -163,6 +185,9 @@ impl Config {
         let raw = Self::read_raw(resolved.path())?;
         if matches!(resolved, ResolvedConfigPath::Workspace(_)) && raw.gateway.is_some() {
             return Err(AppError::Config(WORKSPACE_GATEWAY_ERROR.into()));
+        }
+        if matches!(resolved, ResolvedConfigPath::Workspace(_)) && raw.principals.is_some() {
+            return Err(AppError::Config(WORKSPACE_PRINCIPALS_ERROR.into()));
         }
         if matches!(resolved, ResolvedConfigPath::Workspace(_))
             && raw
@@ -310,44 +335,39 @@ impl GatewayConfig {
                 "gateway.discord.api_key_env must not be empty".into(),
             ));
         }
-        if raw.discord.owner_user_ids.is_empty() {
+        if raw.discord.channel_threads.is_empty() {
             return Err(AppError::Config(
-                "gateway.discord.owner_user_ids must not be empty".into(),
+                "gateway.discord.channel_threads must not be empty".into(),
             ));
         }
-        if raw.discord.owner_user_ids.contains(&0) {
-            return Err(AppError::Config(
-                "gateway.discord.owner_user_ids must contain positive integers".into(),
-            ));
-        }
-        if raw.discord.channel_configs.is_empty() {
-            return Err(AppError::Config(
-                "gateway.discord.channel_configs must not be empty".into(),
-            ));
-        }
-        let mut channel_configs = HashMap::new();
-        for (channel_id, path) in raw.discord.channel_configs {
+        let mut channel_threads = HashMap::new();
+        for (channel_id, thread_id) in raw.discord.channel_threads {
             if !channel_id.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(AppError::Config(
-                    "gateway.discord.channel_configs keys must be positive numeric Discord channel IDs"
+                    "gateway.discord.channel_threads keys must be positive numeric Discord channel IDs"
                         .into(),
                 ));
             }
             let channel_id = channel_id.parse::<u64>().map_err(|_| {
                 AppError::Config(
-                    "gateway.discord.channel_configs keys must be positive numeric Discord channel IDs"
+                    "gateway.discord.channel_threads keys must be positive numeric Discord channel IDs"
                         .into(),
                 )
             })?;
             if channel_id == 0 {
                 return Err(AppError::Config(
-                    "gateway.discord.channel_configs keys must be positive numeric Discord channel IDs"
+                    "gateway.discord.channel_threads keys must be positive numeric Discord channel IDs"
                         .into(),
                 ));
             }
-            if channel_configs.insert(channel_id, path).is_some() {
+            ActorId::new(thread_id.clone()).map_err(|error| {
+                AppError::Config(format!(
+                    "gateway.discord.channel_threads contains an invalid thread id: {error}"
+                ))
+            })?;
+            if channel_threads.insert(channel_id, thread_id).is_some() {
                 return Err(AppError::Config(
-                    "gateway.discord.channel_configs contains a duplicate numeric Discord channel ID"
+                    "gateway.discord.channel_threads contains a duplicate numeric Discord channel ID"
                         .into(),
                 ));
             }
@@ -355,11 +375,74 @@ impl GatewayConfig {
         Ok(Self {
             discord: DiscordGatewayConfig {
                 api_key_env: raw.discord.api_key_env,
-                owner_user_ids: raw.discord.owner_user_ids,
-                channel_configs,
+                channel_threads,
             },
         })
     }
+}
+
+pub(crate) fn server_discord_principals() -> AppResult<HashMap<u64, DiscordGatewayPrincipal>> {
+    let home = user_home();
+    server_discord_principals_with(user_config_path(home.as_deref()))
+}
+
+fn server_discord_principals_with(
+    user_config: Option<PathBuf>,
+) -> AppResult<HashMap<u64, DiscordGatewayPrincipal>> {
+    let Some(path) = user_config.filter(|path| path.exists()) else {
+        return Err(AppError::Config(
+            "Discord gateway principals require [principals.discord] in the user config".into(),
+        ));
+    };
+    let raw = Config::read_raw(&path)?;
+    let Some(raw) = raw.principals else {
+        return Err(AppError::Config(
+            "Discord gateway principals require [principals.discord] in the user config".into(),
+        ));
+    };
+    if raw.discord.is_empty() {
+        return Err(AppError::Config(
+            "principals.discord must not be empty in the user config".into(),
+        ));
+    }
+    let mut principals = HashMap::new();
+    for (external_id, principal) in raw.discord {
+        if !external_id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(AppError::Config(
+                "principals.discord keys must be positive numeric Discord user IDs".into(),
+            ));
+        }
+        let external_id = external_id.parse::<u64>().map_err(|_| {
+            AppError::Config(
+                "principals.discord keys must be positive numeric Discord user IDs".into(),
+            )
+        })?;
+        if external_id == 0 {
+            return Err(AppError::Config(
+                "principals.discord keys must be positive numeric Discord user IDs".into(),
+            ));
+        }
+        let name = ActorId::new(principal.name)
+            .map_err(|error| AppError::Config(format!("invalid Discord principal name: {error}")))?
+            .to_string();
+        if principals
+            .insert(
+                external_id,
+                DiscordGatewayPrincipal {
+                    name,
+                    remote_ceiling: principal
+                        .remote_ceiling
+                        .unwrap_or(ThreadApprovalPolicy::Prompt),
+                },
+            )
+            .is_some()
+        {
+            return Err(AppError::Config(
+                "principals.discord contains a duplicate numeric Discord user ID".into(),
+            ));
+        }
+    }
+    Ok(principals)
 }
 
 fn default_model(kind: &ProviderKind) -> &'static str {
@@ -575,10 +658,9 @@ mod tests {
             r#"
 [gateway.discord]
 api_key_env = "DISCORD_BOT_TOKEN"
-owner_user_ids = [123456789]
 
-[gateway.discord.channel_configs]
-"111111111111111111" = "~/.config/plato/channels/news.toml"
+[gateway.discord.channel_threads]
+"111111111111111111" = "thread_news"
 "#,
         )
         .unwrap();
@@ -588,18 +670,14 @@ owner_user_ids = [123456789]
         let discord = config.gateway.unwrap().discord;
 
         assert_eq!(discord.api_key_env, "DISCORD_BOT_TOKEN");
-        assert_eq!(discord.owner_user_ids, vec![123456789]);
         assert_eq!(
-            discord.channel_configs,
-            HashMap::from([(
-                111111111111111111,
-                PathBuf::from("~/.config/plato/channels/news.toml")
-            )])
+            discord.channel_threads,
+            HashMap::from([(111111111111111111, "thread_news".into())])
         );
     }
 
     #[test]
-    fn rejects_empty_discord_channel_configs() {
+    fn rejects_empty_discord_channel_threads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gateway.toml");
         std::fs::write(
@@ -607,7 +685,6 @@ owner_user_ids = [123456789]
             r#"
 [gateway.discord]
 api_key_env = "DISCORD_BOT_TOKEN"
-owner_user_ids = [123456789]
 "#,
         )
         .unwrap();
@@ -618,12 +695,12 @@ owner_user_ids = [123456789]
         assert!(matches!(
             error,
             AppError::Config(message)
-                if message == "gateway.discord.channel_configs must not be empty"
+                if message == "gateway.discord.channel_threads must not be empty"
         ));
     }
 
     #[test]
-    fn rejects_zero_and_nonnumeric_discord_channel_config_keys() {
+    fn rejects_zero_and_nonnumeric_discord_channel_thread_keys() {
         for channel_id in ["0", "+1", "not-a-channel"] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("plato.toml");
@@ -633,10 +710,9 @@ owner_user_ids = [123456789]
                     r#"
 [gateway.discord]
 api_key_env = "DISCORD_BOT_TOKEN"
-owner_user_ids = [123456789]
 
-[gateway.discord.channel_configs]
-"{channel_id}" = "channel.toml"
+[gateway.discord.channel_threads]
+"{channel_id}" = "thread_news"
 "#
                 ),
             )
@@ -649,13 +725,13 @@ owner_user_ids = [123456789]
                 error,
                 AppError::Config(message)
                     if message
-                        == "gateway.discord.channel_configs keys must be positive numeric Discord channel IDs"
+                        == "gateway.discord.channel_threads keys must be positive numeric Discord channel IDs"
             ));
         }
     }
 
     #[test]
-    fn rejects_duplicate_discord_channel_config_keys() {
+    fn rejects_duplicate_discord_channel_thread_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("plato.toml");
         std::fs::write(
@@ -663,11 +739,10 @@ owner_user_ids = [123456789]
             r#"
 [gateway.discord]
 api_key_env = "DISCORD_BOT_TOKEN"
-owner_user_ids = [123456789]
 
-[gateway.discord.channel_configs]
-"111111111111111111" = "news.toml"
-"111111111111111111" = "dev.toml"
+[gateway.discord.channel_threads]
+"111111111111111111" = "thread_news"
+"111111111111111111" = "thread_dev"
 "#,
         )
         .unwrap();
@@ -679,7 +754,7 @@ owner_user_ids = [123456789]
     }
 
     #[test]
-    fn rejects_discord_channel_config_keys_with_duplicate_numeric_values() {
+    fn rejects_discord_channel_thread_keys_with_duplicate_numeric_values() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("plato.toml");
         std::fs::write(
@@ -687,11 +762,10 @@ owner_user_ids = [123456789]
             r#"
 [gateway.discord]
 api_key_env = "DISCORD_BOT_TOKEN"
-owner_user_ids = [123456789]
 
-[gateway.discord.channel_configs]
-"1" = "news.toml"
-"01" = "dev.toml"
+[gateway.discord.channel_threads]
+"1" = "thread_news"
+"01" = "thread_dev"
 "#,
         )
         .unwrap();
@@ -703,7 +777,7 @@ owner_user_ids = [123456789]
             error,
             AppError::Config(message)
                 if message
-                    == "gateway.discord.channel_configs contains a duplicate numeric Discord channel ID"
+                    == "gateway.discord.channel_threads contains a duplicate numeric Discord channel ID"
         ));
     }
 
@@ -740,10 +814,9 @@ owner_user_ids = [123456789]
             r#"
 [gateway.discord]
 api_key_env = "DISCORD_BOT_TOKEN"
-owner_user_ids = [42]
 
-[gateway.discord.channel_configs]
-"200" = "channel.toml"
+[gateway.discord.channel_threads]
+"200" = "thread_news"
 "#,
         )
         .unwrap();
@@ -757,6 +830,82 @@ owner_user_ids = [42]
             error,
             AppError::Config(message) if message == WORKSPACE_GATEWAY_ERROR
         ));
+    }
+
+    #[test]
+    fn workspace_config_cannot_define_principal_authority() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("plato.toml"),
+            r#"
+[principals.discord."42"]
+name = "workspace_attacker"
+remote_ceiling = "yolo"
+"#,
+        )
+        .unwrap();
+        let resolved = resolve_config_with(workspace.path(), None, None, None, None)
+            .unwrap()
+            .unwrap();
+
+        let error = Config::load_resolved(Some(&resolved)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Config(message) if message == WORKSPACE_PRINCIPALS_ERROR
+        ));
+    }
+
+    #[test]
+    fn home_principals_default_to_prompt_and_require_explicit_yolo() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[principals.discord."42"]
+name = "jerome"
+
+[principals.discord."43"]
+name = "release_operator"
+remote_ceiling = "yolo"
+"#,
+        )
+        .unwrap();
+
+        let principals = server_discord_principals_with(Some(path)).unwrap();
+
+        assert_eq!(principals[&42].name, "jerome");
+        assert_eq!(principals[&42].remote_ceiling, ThreadApprovalPolicy::Prompt);
+        assert_eq!(principals[&43].remote_ceiling, ThreadApprovalPolicy::Yolo);
+    }
+
+    #[test]
+    fn missing_empty_and_malformed_home_principals_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing.toml");
+        assert!(server_discord_principals_with(Some(missing)).is_err());
+
+        for (contents, expected) in [
+            (
+                "[principals]\n",
+                "principals.discord must not be empty in the user config",
+            ),
+            (
+                "[principals.discord.\"0\"]\nname = \"jerome\"\n",
+                "principals.discord keys must be positive numeric Discord user IDs",
+            ),
+            (
+                "[principals.discord.\"42\"]\nname = \"\"\n",
+                "invalid Discord principal name",
+            ),
+        ] {
+            let path = root.path().join("config.toml");
+            std::fs::write(&path, contents).unwrap();
+            let error = server_discord_principals_with(Some(path)).unwrap_err();
+
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]
@@ -931,10 +1080,9 @@ base_url = "https://provider.example/v1"
 
 [gateway.discord]
 api_key_env = "DISCORD_BOT_TOKEN"
-owner_user_ids = [42]
 
-[gateway.discord.channel_configs]
-"200" = "channel.toml"
+[gateway.discord.channel_threads]
+"200" = "thread_news"
 "#,
             )
             .unwrap();
@@ -965,10 +1113,9 @@ owner_user_ids = [42]
             assert_eq!(config.provider.api_key_env, "AUTHORIZED_SECRET");
             assert_eq!(config.provider.base_url, "https://provider.example/v1");
             let discord = config.gateway.unwrap().discord;
-            assert_eq!(discord.owner_user_ids, vec![42]);
             assert_eq!(
-                discord.channel_configs,
-                HashMap::from([(200, PathBuf::from("channel.toml"))])
+                discord.channel_threads,
+                HashMap::from([(200, "thread_news".into())])
             );
         }
     }
@@ -985,6 +1132,7 @@ owner_user_ids = [42]
             }),
             tools: None,
             gateway: None,
+            principals: None,
         };
 
         assert!(matches!(Config::from_raw(raw), Err(AppError::Config(_))));
@@ -1002,6 +1150,7 @@ owner_user_ids = [42]
             }),
             tools: None,
             gateway: None,
+            principals: None,
         };
 
         assert!(matches!(Config::from_raw(raw), Err(AppError::Config(_))));
@@ -1016,6 +1165,7 @@ owner_user_ids = [42]
                 enabled: Some(vec!["shell.delete".into()]),
             }),
             gateway: None,
+            principals: None,
         };
 
         let err = Config::from_raw(raw).unwrap_err();
@@ -1038,6 +1188,7 @@ owner_user_ids = [42]
             }),
             tools: None,
             gateway: None,
+            principals: None,
         };
 
         assert!(matches!(Config::from_raw(raw), Err(AppError::Config(_))));
@@ -1055,6 +1206,7 @@ owner_user_ids = [42]
             }),
             tools: None,
             gateway: None,
+            principals: None,
         };
 
         assert_eq!(Config::from_raw(raw).unwrap().limits.max_turns, 3);
@@ -1072,6 +1224,7 @@ owner_user_ids = [42]
             }),
             tools: None,
             gateway: None,
+            principals: None,
         };
 
         assert!(matches!(Config::from_raw(raw), Err(AppError::Config(_))));
@@ -1172,6 +1325,7 @@ stream_idle_timeout_ms = 9000
             limits: None,
             tools: None,
             gateway: None,
+            principals: None,
         };
 
         let config = Config::from_raw(raw).unwrap();

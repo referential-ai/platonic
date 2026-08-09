@@ -56,36 +56,44 @@ test "$(stat -c '%a' "$TOKEN_FILE")" = 600
 Never print or inspect the token to verify it. A successful final `test`
 command verifies the file mode without revealing the contents.
 
-## 3. Add the numeric owner and channel allowlists
+## 3. Add the principal and channel context map
 
 In Discord, enable **User Settings > Advanced > Developer Mode**, then
 right-click your own user and select **Copy User ID**. Use the numeric ID of the
 human account that will send messages, not the application, bot, server, or
-channel ID. Right-click the text channel used for this walkthrough, select
-**Copy Channel ID**, and choose a provider config already proven by the
-[Quickstart](QUICKSTART.md#0-one-time-setup) for runs from that channel.
+channel ID. Right-click the text channel used for this walkthrough and select
+**Copy Channel ID**.
 
-Use an authorized Plato config selected explicitly with `--config`. Create
-`~/.config/plato/gateway.toml`, retain the provider settings already proven in
-the [Quickstart configuration](QUICKSTART.md#0-one-time-setup), and add:
+Principal authority must be in the canonical home config
+`~/.config/plato/config.toml`:
+
+```toml
+[principals.discord."123456789"]
+name = "jerome"
+```
+
+The quoted key is the Discord user ID. `name` is the stable actor recorded for
+gateway-originated approvals and coordinator spawns. The remote ceiling defaults
+to `prompt`. Add `remote_ceiling = "yolo"` only for a deliberately high-trust
+principal that may control yolo threads.
+
+Create `~/.config/plato/gateway.toml` with the routing configuration selected
+explicitly by `--config`. Keep `thread_123` as a placeholder until the next
+step starts the daemon and creates the durable thread:
 
 ```toml
 [gateway.discord]
 api_key_env = "DISCORD_BOT_TOKEN"
-owner_user_ids = [123456789]
 
-[gateway.discord.channel_configs]
-"111111111111111111" = "~/.config/plato/test-channel.toml"
+[gateway.discord.channel_threads]
+"111111111111111111" = "thread_123"
 ```
 
-Replace the first example with your user ID; it must remain an unquoted,
-positive TOML integer. Replace the quoted numeric channel ID with the copied
-test channel ID, and replace the mapped path with the mode-`0600` authorized
-provider config for that channel. The token itself does not belong in either
-config. `channel_configs` must have at least one entry and is the gateway's
-complete channel allowlist. A DM must be added by its numeric DM channel ID too;
-an owner message or interaction in any unmapped channel is ignored before
-content scanning or remote and daemon side effects.
+Replace the quoted numeric channel ID with the copied test channel ID and
+`thread_123` with the existing thread. The token itself does not belong in
+either config. `channel_threads` must have at least one entry. A DM must be
+added by its numeric DM channel ID too. Channels select thread context only;
+they never grant identity authority.
 
 ```bash
 GATEWAY_CONFIG="$HOME/.config/plato/gateway.toml"
@@ -94,9 +102,11 @@ chmod 600 "$GATEWAY_CONFIG"
 "${EDITOR:-vi}" "$GATEWAY_CONFIG"
 ```
 
-Passing this file with `--config` makes it an authorized config. The entire
-`[gateway]` table, including the token variable name and owner IDs, is rejected
-from an auto-discovered workspace `plato.toml`. The
+Passing this file with `--config` admits gateway routing, but cannot supply
+principal authority. The gateway always reads principals from the canonical
+home config, ignoring principal definitions in `--config` or `PLATO_CONFIG`.
+An auto-discovered workspace `plato.toml` rejects both `[gateway]` and
+`[principals]`. The
 [configuration reference](../README.md#configuration) owns resolution order
 and provider settings. The
 [Discord gateway reference](../README.md#discord-gateway) owns channel-mapping
@@ -127,11 +137,14 @@ Leave it running. Provider credentials belong only in this daemon environment.
 The [runtime topology](ARCHITECTURE.md#runtime-topology) explains why the daemon,
 not the gateway, owns runs, tools, policy, approvals, and the ledger.
 
-In terminal 2, expose only the Discord token and start the gateway from the same
-workspace:
+In terminal 2, use the configured provider credential to create the mapped
+thread, then remove provider credentials, expose only the Discord token, and
+start the gateway from the same workspace:
 
 ```bash
 cd "$HOME/plato-discord-workspace"
+# Approve the prompt, then replace thread_123 in gateway.toml with the printed id.
+plato thread spawn
 unset OPENAI_API_KEY OPENROUTER_API_KEY
 export DISCORD_BOT_TOKEN="$(tr -d '\r\n' < "$HOME/.config/plato/discord-bot-token")"
 platonic gateway discord --config "$HOME/.config/plato/gateway.toml"
@@ -140,8 +153,9 @@ platonic gateway discord --config "$HOME/.config/plato/gateway.toml"
 Also unset any custom provider credential variable named by your config. The
 gateway fails closed if it can see a provider credential. Leave the gateway
 running. Before the first Discord REST request or WebSocket connection, both
-the wrapper and direct gateway require a bounded daemon `hello` with the exact
-workspace ID and all six daemon capabilities consumed by the connector.
+the wrapper and direct gateway require a bounded daemon `hello`, the exact
+workspace ID, all six daemon capabilities consumed by the connector, and a
+successful authority readback for every mapped thread.
 
 ## 5. Receive the first reply
 
@@ -152,27 +166,21 @@ channel, such as:
 Reply with one short greeting.
 ```
 
-Wait for the bot's final reply before continuing. Messages from every other
-user ID are silently ignored. During one gateway process, the first allowed
-message in a mapped channel or DM starts one daemon session; later messages in
-that same channel or DM continue that session. A different mapped channel or DM
-starts a separate session.
+Wait for the bot's final reply before continuing. Messages from identities not
+listed in the home principal map are silently denied before channel lookup,
+content scanning, daemon access, or effects. An admitted principal in an
+unmapped channel is separately ignored. Each mapped channel or DM sends to its
+configured durable thread.
 
-## Local-only approvals
+## Gateway approvals
 
-Use a read-only prompt for the first-reply check so no approval is needed. If a
-later Discord run proposes an approval-gated tool, Discord receives a bounded
-notification, but it cannot grant or deny the request. Attach a TUI on the same
-machine and workspace:
-
-```bash
-plato-tui --workspace "$HOME/plato-discord-workspace"
-```
-
-Grant or deny in that local TUI. The gateway never sends an approval decision;
-typing approval language into Discord has no effect. See the
-[Quickstart approval boundary](QUICKSTART.md#2-test-the-approval-boundary) and
-[TUI controls](../README.md#tui) for the canonical behavior.
+If a Discord turn proposes an approval-gated tool, Discord receives a bounded
+notification naming the effect and preview. Use `/approve` or `/deny` in that
+same channel. The command is bound to the exact pending run and tool-call IDs,
+and the home-config principal name is recorded as the actor. The attributed
+actor does not grant authority by itself; the pending-operation lookup,
+principal ceiling, thread authority, and descendant subset gate still apply.
+Typing approval language as ordinary message content has no effect.
 
 ## 6. Replay the reply
 
@@ -196,20 +204,20 @@ forms and ledger details.
 
 ## Troubleshooting
 
-### Bot ignores the owner: wrong owner ID
+### Bot ignores the principal: wrong user ID
 
-An unlisted sender is ignored before daemon access, so there is no reply and no
+An unlisted sender is denied before daemon access, so there is no reply and no
 new run to replay. Copy the sending human account's **User ID** again with
-Developer Mode enabled, replace the numeric `owner_user_ids` entry, and restart
-the gateway so it reloads the config. Do not substitute a display name or an
-application, bot, server, or channel ID.
+Developer Mode enabled, replace the quoted key under `principals.discord` in
+the canonical home config, and restart the gateway. Do not substitute a display
+name or an application, bot, server, or channel ID.
 
 ### Bot ignores the owner: channel is not mapped
 
 Messages and interactions are accepted only when their numeric channel ID is a
-key in `gateway.discord.channel_configs`. Add the text, thread, or DM channel ID
-and its provider config path to the authorized gateway config, then restart the
-gateway.
+key in `gateway.discord.channel_threads`. Add the text, Discord thread, or DM
+channel ID and its durable Platonic thread ID to the authorized gateway config,
+then restart the gateway.
 
 ### Gateway closes with code 4014: Message Content intent is disabled
 

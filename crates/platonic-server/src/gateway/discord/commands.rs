@@ -1,32 +1,26 @@
-use super::{GatewayError, GatewayResult};
 use super::{
-    daemon_bridge::require_gateway_daemon_contract,
+    GatewayError, GatewayResult, PendingGatewayApproval,
+    daemon_bridge::{require_gateway_daemon_contract, require_remote_ceiling},
     rest::{AllowedMentions, CreateMessage, DiscordRestClient, discord_http_error},
 };
+use crate::config::DiscordGatewayPrincipal;
 use platonic_client::client::{DaemonClient, DaemonConnectionConfig};
-use platonic_protocol::{ReasoningEffort, RunOverrides, RunStateName};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Mutex},
     thread,
 };
 
 pub(super) const DISCORD_STATUS_COMMAND: &str = "status";
-pub(super) const DISCORD_STATUS_DESCRIPTION: &str = "Show Plato Agent gateway and daemon status";
-pub(super) const DISCORD_MODEL_COMMAND: &str = "model";
-pub(super) const DISCORD_MODEL_DESCRIPTION: &str = "Show or set this channel's model";
-pub(super) const DISCORD_REASONING_COMMAND: &str = "reasoning";
-pub(super) const DISCORD_REASONING_DESCRIPTION: &str =
-    "Show or set this channel's reasoning effort";
-pub(super) const DISCORD_MODEL_OPTION: &str = "name";
-pub(super) const DISCORD_REASONING_OPTION: &str = "effort";
-const DISCORD_DEFAULT_SETTING: &str = "default";
-const DISCORD_MODEL_LIMIT: usize = 256;
+pub(super) const DISCORD_STATUS_DESCRIPTION: &str = "Show this gateway thread status";
+pub(super) const DISCORD_APPROVE_COMMAND: &str = "approve";
+pub(super) const DISCORD_APPROVE_DESCRIPTION: &str = "Approve this channel's pending effect";
+pub(super) const DISCORD_DENY_COMMAND: &str = "deny";
+pub(super) const DISCORD_DENY_DESCRIPTION: &str = "Deny this channel's pending effect";
 pub(super) const DISCORD_APPLICATION_COMMAND: u8 = 2;
 pub(super) const DISCORD_CHAT_INPUT_COMMAND: u8 = 1;
-pub(super) const DISCORD_STRING_OPTION: u8 = 3;
 pub(super) const DISCORD_DEFERRED_CHANNEL_MESSAGE: u8 = 5;
 pub(super) const DISCORD_EPHEMERAL_FLAG: u64 = 64;
 
@@ -37,31 +31,16 @@ impl DiscordRestClient {
                 kind: DISCORD_CHAT_INPUT_COMMAND,
                 name: DISCORD_STATUS_COMMAND,
                 description: DISCORD_STATUS_DESCRIPTION,
-                options: Vec::new(),
             },
             DiscordApplicationCommand {
                 kind: DISCORD_CHAT_INPUT_COMMAND,
-                name: DISCORD_MODEL_COMMAND,
-                description: DISCORD_MODEL_DESCRIPTION,
-                options: vec![DiscordApplicationCommandOption {
-                    kind: DISCORD_STRING_OPTION,
-                    name: DISCORD_MODEL_OPTION,
-                    description: "Model name or default",
-                    required: false,
-                    choices: Vec::new(),
-                }],
+                name: DISCORD_APPROVE_COMMAND,
+                description: DISCORD_APPROVE_DESCRIPTION,
             },
             DiscordApplicationCommand {
                 kind: DISCORD_CHAT_INPUT_COMMAND,
-                name: DISCORD_REASONING_COMMAND,
-                description: DISCORD_REASONING_DESCRIPTION,
-                options: vec![DiscordApplicationCommandOption {
-                    kind: DISCORD_STRING_OPTION,
-                    name: DISCORD_REASONING_OPTION,
-                    description: "Reasoning effort or default",
-                    required: false,
-                    choices: reasoning_choices(),
-                }],
+                name: DISCORD_DENY_COMMAND,
+                description: DISCORD_DENY_DESCRIPTION,
             },
         ];
         let response = self
@@ -76,8 +55,8 @@ impl DiscordRestClient {
         })?;
         let expected = [
             DISCORD_STATUS_COMMAND,
-            DISCORD_MODEL_COMMAND,
-            DISCORD_REASONING_COMMAND,
+            DISCORD_APPROVE_COMMAND,
+            DISCORD_DENY_COMMAND,
         ];
         if registered.len() != expected.len()
             || expected.iter().any(|expected| {
@@ -99,35 +78,24 @@ pub(super) struct DiscordCommandHandler {
     pub(super) api_base: String,
     pub(super) application_id: u64,
     pub(super) daemon: DaemonConnectionConfig,
-    pub(super) owner_user_ids: HashSet<u64>,
-    pub(super) allowed_channel_ids: HashSet<u64>,
-    pub(super) base_model: String,
-    pub(super) overrides: Arc<Mutex<HashMap<u64, RunOverrides>>>,
+    pub(super) principals: HashMap<u64, DiscordGatewayPrincipal>,
+    pub(super) channel_thread_ids: HashMap<u64, String>,
+    pub(super) pending_approvals: Arc<Mutex<HashMap<u64, PendingGatewayApproval>>>,
     pub(super) daemon_client_timeout: std::time::Duration,
     pub(super) presentation_timeout: std::time::Duration,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DiscordCommand {
     Status,
-    Model(Option<String>),
-    Reasoning(Option<String>),
+    Approve,
+    Deny,
 }
 
 impl DiscordCommandHandler {
     pub(super) fn handle(&self, interaction: InteractionCreateEvent) -> GatewayResult<()> {
         if interaction.kind != DISCORD_APPLICATION_COMMAND {
             return Ok(());
-        }
-        let channel_id = parse_snowflake(&interaction.channel_id)?;
-        if !self.allowed_channel_ids.contains(&channel_id) {
-            return Ok(());
-        }
-        let application_id = parse_snowflake(&interaction.application_id)?;
-        if application_id != self.application_id {
-            return Err(GatewayError::Discord(
-                "discord interaction used an unexpected application id".into(),
-            ));
         }
         let author_id = interaction
             .member
@@ -139,8 +107,18 @@ impl DiscordCommandHandler {
             .ok_or_else(|| {
                 GatewayError::Discord("discord interaction omitted its author".into())
             })?;
-        if !self.owner_user_ids.contains(&author_id) {
+        let Some(principal) = self.principals.get(&author_id).cloned() else {
             return Ok(());
+        };
+        let channel_id = parse_snowflake(&interaction.channel_id)?;
+        if !self.channel_thread_ids.contains_key(&channel_id) {
+            return Ok(());
+        }
+        let application_id = parse_snowflake(&interaction.application_id)?;
+        if application_id != self.application_id {
+            return Err(GatewayError::Discord(
+                "discord interaction application id does not match the authenticated bot".into(),
+            ));
         }
         let Some(data) = interaction.data.as_ref() else {
             return Err(GatewayError::Discord(
@@ -156,16 +134,20 @@ impl DiscordCommandHandler {
         let interaction_id = parse_snowflake(&interaction.id)?;
         if interaction.token.is_empty() {
             return Err(GatewayError::Discord(
-                "discord interaction omitted its token".into(),
+                "discord interaction omitted its authentication token".into(),
             ));
         }
         let handler = self.clone();
         thread::Builder::new()
             .name("discord-command".into())
             .spawn(move || {
-                if let Err(error) =
-                    handler.respond(interaction_id, &interaction.token, channel_id, command)
-                {
+                if let Err(error) = handler.respond(
+                    interaction_id,
+                    &interaction.token,
+                    channel_id,
+                    principal,
+                    command,
+                ) {
                     eprintln!("discord command interaction failed: {error}");
                 }
             })?;
@@ -177,6 +159,7 @@ impl DiscordCommandHandler {
         interaction_id: u64,
         interaction_token: &str,
         channel_id: u64,
+        principal: DiscordGatewayPrincipal,
         command: DiscordCommand,
     ) -> GatewayResult<()> {
         let agent = ureq::AgentBuilder::new()
@@ -196,9 +179,9 @@ impl DiscordCommandHandler {
             .map_err(|error| discord_http_error("command defer", error))?;
 
         let content = match command {
-            DiscordCommand::Status => self.status_content(channel_id)?,
-            DiscordCommand::Model(value) => self.model_content(channel_id, value)?,
-            DiscordCommand::Reasoning(value) => self.reasoning_content(channel_id, value)?,
+            DiscordCommand::Status => self.status_content(channel_id, &principal)?,
+            DiscordCommand::Approve => self.decide_pending(channel_id, &principal, true)?,
+            DiscordCommand::Deny => self.decide_pending(channel_id, &principal, false)?,
         };
         agent
             .patch(&format!(
@@ -213,158 +196,110 @@ impl DiscordCommandHandler {
         Ok(())
     }
 
-    fn status_content(&self, channel_id: u64) -> GatewayResult<String> {
-        let (model, reasoning) = self.effective_settings(channel_id)?;
-        match self.daemon_status() {
-            Ok((version, sessions, active_runs)) => Ok(format!(
-                "Plato Agent status\nGateway: connected\nDaemon: connected\nDaemon version: {version}\nModel: {model}\nReasoning effort: {reasoning}\nWorkspace sessions: {sessions}\nActive runs: {active_runs}"
-            )),
-            Err(_) => Ok(format!(
-                "Plato Agent status\nGateway: connected\nDaemon: unavailable\nModel: {model}\nReasoning effort: {reasoning}"
-            )),
-        }
-    }
-
-    fn model_content(&self, channel_id: u64, value: Option<String>) -> GatewayResult<String> {
-        if let Some(value) = value {
-            let value = value.trim();
-            if value.eq_ignore_ascii_case(DISCORD_DEFAULT_SETTING) {
-                self.update_overrides(channel_id, |overrides| overrides.model = None)?;
-            } else {
-                if value.len() > DISCORD_MODEL_LIMIT || value.chars().any(char::is_whitespace) {
-                    return Ok(format!(
-                        "Model names must be one non-whitespace value of at most {DISCORD_MODEL_LIMIT} bytes."
-                    ));
-                }
-                if value.is_empty() {
-                    return Err(GatewayError::EmptyModelName);
-                }
-                let model = value.to_string();
-                self.update_overrides(channel_id, |overrides| overrides.model = Some(model))?;
-            }
-        }
-        let (model, _) = self.effective_settings(channel_id)?;
-        Ok(format!(
-            "Model: {model}\nScope: this Discord channel\nApplies to later messages."
-        ))
-    }
-
-    fn reasoning_content(&self, channel_id: u64, value: Option<String>) -> GatewayResult<String> {
-        if let Some(value) = value {
-            if value.eq_ignore_ascii_case(DISCORD_DEFAULT_SETTING) {
-                self.update_overrides(channel_id, |overrides| {
-                    overrides.reasoning_effort = None;
-                })?;
-            } else {
-                let normalized = value.to_ascii_lowercase();
-                let Some(effort) = ReasoningEffort::parse(&normalized) else {
-                    return Ok(
-                        "Reasoning effort must be default, none, minimal, low, medium, high, xhigh, or max."
-                            .into(),
-                    );
-                };
-                self.update_overrides(channel_id, |overrides| {
-                    overrides.reasoning_effort = Some(effort);
-                })?;
-            }
-        }
-        let (_, reasoning) = self.effective_settings(channel_id)?;
-        Ok(format!(
-            "Reasoning effort: {reasoning}\nScope: this Discord channel\nApplies to later messages."
-        ))
-    }
-
-    fn update_overrides(
+    fn status_content(
         &self,
         channel_id: u64,
-        update: impl FnOnce(&mut RunOverrides),
-    ) -> GatewayResult<()> {
-        let mut settings = self
-            .overrides
-            .lock()
-            .map_err(|_| GatewayError::Discord("discord run settings lock poisoned".into()))?;
-        let overrides = settings.entry(channel_id).or_default();
-        update(overrides);
-        if overrides.is_empty() {
-            settings.remove(&channel_id);
+        principal: &DiscordGatewayPrincipal,
+    ) -> GatewayResult<String> {
+        let thread_id = &self.channel_thread_ids[&channel_id];
+        let status = (|| {
+            let mut daemon = self.connect_daemon()?;
+            let thread = daemon.thread_status(thread_id.clone())?.thread;
+            require_remote_ceiling(principal, thread.authority.approval_policy)?;
+            Ok::<_, GatewayError>(thread)
+        })();
+        match status {
+            Ok(thread) => Ok(format!(
+                "Platonic gateway status\nDaemon: connected\nPrincipal: {}\nThread: {}\nModel: {}\nReasoning effort: {}\nApproval policy: {}\nState: {}",
+                principal.name,
+                thread.authority.thread_id,
+                thread.authority.model,
+                thread.authority.reasoning_effort,
+                thread.authority.approval_policy,
+                if thread.live.current_turn_id.is_some() {
+                    "running"
+                } else {
+                    "idle"
+                },
+            )),
+            Err(_) => Ok(format!(
+                "Platonic gateway status\nDaemon: unavailable\nPrincipal: {}\nThread: {thread_id}",
+                principal.name
+            )),
         }
-        Ok(())
     }
 
-    fn effective_settings(&self, channel_id: u64) -> GatewayResult<(String, String)> {
-        let settings = self
-            .overrides
+    fn decide_pending(
+        &self,
+        channel_id: u64,
+        principal: &DiscordGatewayPrincipal,
+        grant: bool,
+    ) -> GatewayResult<String> {
+        let pending = self
+            .pending_approvals
             .lock()
-            .map_err(|_| GatewayError::Discord("discord run settings lock poisoned".into()))?;
-        let overrides = settings.get(&channel_id);
-        let model = overrides
-            .and_then(|overrides| overrides.model.clone())
-            .unwrap_or_else(|| self.base_model.clone());
-        let reasoning = overrides
-            .and_then(|overrides| overrides.reasoning_effort)
-            .map_or_else(|| "provider default".into(), |effort| effort.to_string());
-        Ok((model, reasoning))
+            .map_err(|_| GatewayError::Discord("discord pending approval lock poisoned".into()))?
+            .get(&channel_id)
+            .cloned();
+        let Some(pending) = pending else {
+            return Ok("No pending effect for this channel.".into());
+        };
+        let thread_id = &self.channel_thread_ids[&channel_id];
+        let mut daemon = self.connect_daemon()?;
+        let authority = daemon.thread_authority(thread_id.clone())?.authority;
+        require_remote_ceiling(principal, authority.approval_policy)?;
+        if grant {
+            daemon.approval_grant_as(
+                &pending.run_id,
+                &pending.tool_call_id,
+                principal.name.clone(),
+            )?;
+        } else {
+            daemon.approval_deny_as(
+                &pending.run_id,
+                &pending.tool_call_id,
+                principal.name.clone(),
+                "denied by Discord principal".into(),
+            )?;
+        }
+        let mut shared = self
+            .pending_approvals
+            .lock()
+            .map_err(|_| GatewayError::Discord("discord pending approval lock poisoned".into()))?;
+        if shared.get(&channel_id) == Some(&pending) {
+            shared.remove(&channel_id);
+        }
+        Ok(format!(
+            "{} operation `{}` as `{}`.",
+            if grant { "Approved" } else { "Denied" },
+            pending.tool_call_id,
+            principal.name
+        ))
     }
 
-    fn daemon_status(&self) -> GatewayResult<(String, usize, usize)> {
+    fn connect_daemon(&self) -> GatewayResult<DaemonClient> {
         let mut daemon = DaemonClient::connect_with_timeout(
             &self.daemon.socket_path,
             self.daemon_client_timeout,
         )?;
         let hello = daemon.hello(&self.daemon.workspace_root)?;
         require_gateway_daemon_contract(&self.daemon.workspace_root, &hello)?;
-        let sessions = daemon.sessions_list()?;
-        let active_runs = sessions
-            .iter()
-            .filter(|session| {
-                matches!(
-                    session.status,
-                    RunStateName::Running | RunStateName::CancelRequested
-                )
-            })
-            .count();
-        Ok((hello.daemon_version, sessions.len(), active_runs))
+        Ok(daemon)
     }
 }
 
 fn discord_command(data: &InteractionData) -> GatewayResult<Option<DiscordCommand>> {
-    match data.name.as_str() {
-        DISCORD_STATUS_COMMAND => {
-            if !data.options.is_empty() {
-                return Err(GatewayError::Discord(
-                    "discord status interaction included unexpected options".into(),
-                ));
-            }
-            Ok(Some(DiscordCommand::Status))
-        }
-        DISCORD_MODEL_COMMAND => optional_string_option(data, DISCORD_MODEL_OPTION)
-            .map(|value| Some(DiscordCommand::Model(value))),
-        DISCORD_REASONING_COMMAND => optional_string_option(data, DISCORD_REASONING_OPTION)
-            .map(|value| Some(DiscordCommand::Reasoning(value))),
-        _ => Ok(None),
-    }
-}
-
-fn optional_string_option(data: &InteractionData, expected: &str) -> GatewayResult<Option<String>> {
-    if data.options.is_empty() {
-        return Ok(None);
-    }
-    if data.options.len() != 1 {
+    if !data.options.is_empty() {
         return Err(GatewayError::Discord(
             "discord command interaction included unexpected options".into(),
         ));
     }
-    let option = &data.options[0];
-    if option.kind != DISCORD_STRING_OPTION || option.name != expected {
-        return Err(GatewayError::Discord(
-            "discord command interaction included an unexpected option".into(),
-        ));
-    }
-    option
-        .value
-        .as_str()
-        .map(|value| Some(value.to_string()))
-        .ok_or_else(|| GatewayError::Discord("discord command option was not a string".into()))
+    Ok(match data.name.as_str() {
+        DISCORD_STATUS_COMMAND => Some(DiscordCommand::Status),
+        DISCORD_APPROVE_COMMAND => Some(DiscordCommand::Approve),
+        DISCORD_DENY_COMMAND => Some(DiscordCommand::Deny),
+        _ => None,
+    })
 }
 
 #[derive(Serialize)]
@@ -373,41 +308,6 @@ struct DiscordApplicationCommand {
     kind: u8,
     name: &'static str,
     description: &'static str,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    options: Vec<DiscordApplicationCommandOption>,
-}
-
-#[derive(Serialize)]
-struct DiscordApplicationCommandOption {
-    #[serde(rename = "type")]
-    kind: u8,
-    name: &'static str,
-    description: &'static str,
-    required: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    choices: Vec<DiscordApplicationCommandChoice>,
-}
-
-#[derive(Serialize)]
-pub(super) struct DiscordApplicationCommandChoice {
-    name: &'static str,
-    value: &'static str,
-}
-
-pub(super) fn reasoning_choices() -> Vec<DiscordApplicationCommandChoice> {
-    [
-        DISCORD_DEFAULT_SETTING,
-        "none",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max",
-    ]
-    .into_iter()
-    .map(|value| DiscordApplicationCommandChoice { name: value, value })
-    .collect()
 }
 
 #[derive(Deserialize)]
@@ -436,15 +336,7 @@ pub(super) struct InteractionData {
     pub(super) kind: u8,
     pub(super) name: String,
     #[serde(default)]
-    pub(super) options: Vec<InteractionOption>,
-}
-
-#[derive(Deserialize)]
-pub(super) struct InteractionOption {
-    #[serde(rename = "type")]
-    pub(super) kind: u8,
-    pub(super) name: String,
-    pub(super) value: Value,
+    pub(super) options: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -484,28 +376,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     #[test]
-    fn status_interaction_reports_unavailable_daemon_after_defer() {
-        let workspace = tempfile::tempdir().unwrap();
-        let socket_dir = tempfile::tempdir().unwrap();
-        let rest = spawn_fake_rest(2, 200, None);
-        let handler = test_command_handler(
-            &rest.base_url,
-            &workspace,
-            socket_dir.path().join("missing.sock"),
-        );
-
-        handler.handle(discord_status_interaction(42)).unwrap();
-
-        let requests = rest.handle.join().unwrap();
-        assert_eq!(requests[0].body["type"], DISCORD_DEFERRED_CHANNEL_MESSAGE);
-        assert_eq!(
-            requests[1].body["content"],
-            "Plato Agent status\nGateway: connected\nDaemon: unavailable\nModel: base-model\nReasoning effort: provider default"
-        );
-    }
-
-    #[test]
-    fn non_owner_command_interaction_is_ignored_before_rest_or_daemon_access() {
+    fn unknown_principal_command_is_ignored_before_channel_rest_or_daemon_access() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let rest = spawn_fake_rest(0, 200, None);
@@ -518,19 +389,19 @@ mod tests {
         handler
             .handle(discord_command_interaction(
                 99,
-                200,
-                DISCORD_MODEL_COMMAND,
-                Some((DISCORD_MODEL_OPTION, "openai/gpt-5")),
+                201,
+                DISCORD_APPROVE_COMMAND,
+                None,
             ))
             .unwrap();
 
         assert!(rest.handle.join().unwrap().is_empty());
-        assert!(handler.overrides.lock().unwrap().is_empty());
+        assert!(handler.pending_approvals.lock().unwrap().is_empty());
     }
 
     #[cfg(unix)]
     #[test]
-    fn unmapped_owner_interaction_is_ignored_before_scanning_rest_daemon_or_dispatch() {
+    fn unmapped_principal_interaction_is_ignored_before_rest_or_daemon_access() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("daemon.sock");
@@ -538,16 +409,8 @@ mod tests {
         daemon.set_nonblocking(true).unwrap();
         let rest = spawn_observed_rest(Vec::new());
         let handler = test_command_handler(&rest.base_url, &workspace, socket_path);
-        handler.overrides.lock().unwrap().insert(
-            201,
-            RunOverrides {
-                model: Some("unchanged-model".into()),
-                reasoning_effort: None,
-            },
-        );
         let mut interaction = discord_status_interaction(42);
         interaction.channel_id = "201".into();
-        interaction.data = None;
 
         handler.handle(interaction).unwrap();
 
@@ -556,43 +419,10 @@ mod tests {
             daemon.accept(),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
-        assert_eq!(
-            handler.overrides.lock().unwrap()[&201].model.as_deref(),
-            Some("unchanged-model")
-        );
     }
 
     #[test]
-    fn unsupported_and_malformed_commands_do_not_access_daemon_or_settings() {
-        let workspace = tempfile::tempdir().unwrap();
-        let socket_dir = tempfile::tempdir().unwrap();
-        let rest = spawn_fake_rest(0, 200, None);
-        let handler = test_command_handler(
-            &rest.base_url,
-            &workspace,
-            socket_dir.path().join("missing.sock"),
-        );
-
-        handler
-            .handle(discord_command_interaction(42, 200, "unsupported", None))
-            .unwrap();
-        assert!(
-            handler
-                .handle(discord_command_interaction(
-                    42,
-                    200,
-                    DISCORD_MODEL_COMMAND,
-                    Some(("unexpected", "openai/gpt-5")),
-                ))
-                .is_err()
-        );
-
-        assert!(rest.handle.join().unwrap().is_empty());
-        assert!(handler.overrides.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn model_and_reasoning_settings_are_channel_scoped_and_resettable() {
+    fn mismatched_application_and_empty_interaction_token_fail_closed() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let handler = test_command_handler(
@@ -600,108 +430,23 @@ mod tests {
             &workspace,
             socket_dir.path().join("missing.sock"),
         );
-
-        assert_eq!(
-            handler
-                .model_content(200, Some("openai/gpt-5".into()))
-                .unwrap(),
-            "Model: openai/gpt-5\nScope: this Discord channel\nApplies to later messages."
-        );
-        assert_eq!(
-            handler
-                .reasoning_content(200, Some("XHIGH".into()))
-                .unwrap(),
-            "Reasoning effort: xhigh\nScope: this Discord channel\nApplies to later messages."
-        );
-        assert_eq!(
-            handler.effective_settings(200).unwrap(),
-            ("openai/gpt-5".into(), "xhigh".into())
-        );
-        assert_eq!(
-            handler.effective_settings(201).unwrap(),
-            ("base-model".into(), "provider default".into())
-        );
+        let mut mismatched = discord_status_interaction(42);
+        mismatched.application_id = "101".into();
         assert!(
             handler
-                .status_content(200)
-                .unwrap()
-                .contains("Model: openai/gpt-5\nReasoning effort: xhigh")
-        );
-
-        handler.model_content(200, Some("DEFAULT".into())).unwrap();
-        handler
-            .reasoning_content(200, Some("default".into()))
-            .unwrap();
-
-        assert_eq!(
-            handler.effective_settings(200).unwrap(),
-            ("base-model".into(), "provider default".into())
-        );
-        assert!(handler.overrides.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn invalid_run_settings_do_not_mutate_channel_state() {
-        let workspace = tempfile::tempdir().unwrap();
-        let socket_dir = tempfile::tempdir().unwrap();
-        let handler = test_command_handler(
-            "http://127.0.0.1",
-            &workspace,
-            socket_dir.path().join("missing.sock"),
-        );
-
-        assert!(
-            handler
-                .model_content(200, Some("two models".into()))
-                .unwrap()
-                .starts_with("Model names must be")
-        );
-        assert!(
-            handler
-                .reasoning_content(200, Some("turbo".into()))
-                .unwrap()
-                .starts_with("Reasoning effort must be")
-        );
-        assert_eq!(
-            handler
-                .model_content(200, Some(" \t".into()))
+                .handle(mismatched)
                 .unwrap_err()
-                .to_string(),
-            "core error: ModelName cannot be empty"
+                .to_string()
+                .contains("does not match the authenticated bot")
         );
-        assert!(handler.overrides.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn owner_model_interaction_is_ephemeral_and_updates_its_channel() {
-        let workspace = tempfile::tempdir().unwrap();
-        let socket_dir = tempfile::tempdir().unwrap();
-        let rest = spawn_fake_rest(2, 200, None);
-        let handler = test_command_handler(
-            &rest.base_url,
-            &workspace,
-            socket_dir.path().join("missing.sock"),
-        );
-
-        handler
-            .handle(discord_command_interaction(
-                42,
-                200,
-                DISCORD_MODEL_COMMAND,
-                Some((DISCORD_MODEL_OPTION, "openai/gpt-5-mini")),
-            ))
-            .unwrap();
-
-        let requests = rest.handle.join().unwrap();
-        assert_eq!(requests[0].body["type"], DISCORD_DEFERRED_CHANNEL_MESSAGE);
-        assert_eq!(requests[0].body["data"]["flags"], DISCORD_EPHEMERAL_FLAG);
-        assert_eq!(
-            requests[1].body["content"],
-            "Model: openai/gpt-5-mini\nScope: this Discord channel\nApplies to later messages."
-        );
-        assert_eq!(
-            handler.effective_settings(200).unwrap().0,
-            "openai/gpt-5-mini"
+        let mut empty = discord_status_interaction(42);
+        empty.token.clear();
+        assert!(
+            handler
+                .handle(empty)
+                .unwrap_err()
+                .to_string()
+                .contains("omitted its authentication token")
         );
     }
 }

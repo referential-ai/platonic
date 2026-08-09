@@ -1,14 +1,10 @@
 use super::{DiscordGatewayRuntimeConfig, run_runtime};
 use crate::{
     AppError, AppResult,
-    config::{Config, DiscordGatewayConfig, ResolvedConfigPath, resolve_config},
+    config::{Config, DiscordGatewayConfig, resolve_config, server_discord_principals},
 };
 use platonic_client::client::DaemonConnectionConfig;
-use std::{
-    collections::HashMap,
-    ffi::OsString,
-    path::{Path, PathBuf},
-};
+use std::{ffi::OsString, path::PathBuf};
 
 /// Server-owned inputs for one Discord gateway process.
 pub struct DiscordGatewayOptions {
@@ -36,76 +32,27 @@ fn resolve_discord_gateway_runtime(
         .clone()
         .map(|gateway| gateway.discord)
         .ok_or_else(|| AppError::Config("gateway.discord configuration is required".into()))?;
-    let (channel_config_paths, mapped_provider_envs) =
-        resolve_channel_configs(&options.workspace_root, &discord.channel_configs)?;
-    let token = gateway_token(&config, &discord, &mapped_provider_envs, |name| {
-        std::env::var_os(name)
-    })?;
+    let principals = server_discord_principals()?;
+    let token = gateway_token(&config, &discord, |name| std::env::var_os(name))?;
     let daemon = DaemonConnectionConfig::resolve(&options.workspace_root, options.socket_path)?;
     Ok(DiscordGatewayRuntimeConfig::new(
         token,
-        discord.owner_user_ids,
-        channel_config_paths,
-        config.provider.model,
+        principals,
+        discord.channel_threads,
         daemon,
-    ))
-}
-
-fn resolve_channel_configs(
-    workspace_root: &Path,
-    channel_configs: &HashMap<u64, PathBuf>,
-) -> AppResult<(HashMap<u64, String>, Vec<String>)> {
-    let mut resolved_paths = HashMap::new();
-    let mut provider_envs = Vec::new();
-    for (channel_id, path) in channel_configs {
-        let resolved = resolve_config(workspace_root, Some(path)).map_err(|_| {
-            AppError::Config(
-                "gateway.discord.channel_configs contains an invalid mapped path".into(),
-            )
-        })?;
-        let Some(resolved) = resolved.as_ref() else {
-            return Err(AppError::Config(
-                "gateway.discord.channel_configs contains an invalid mapped path".into(),
-            ));
-        };
-        let ResolvedConfigPath::Authorized(resolved_path) = resolved else {
-            return Err(AppError::Config(
-                "gateway.discord.channel_configs contains an unauthorized mapped path".into(),
-            ));
-        };
-        let mapped_config = Config::load_resolved(Some(resolved))
-            .map_err(|error| mapped_config_error(*channel_id, error))?;
-        resolved_paths.insert(*channel_id, resolved_path.to_string_lossy().into_owned());
-        provider_envs.push(mapped_config.provider.api_key_env);
-    }
-    provider_envs.sort();
-    provider_envs.dedup();
-    Ok((resolved_paths, provider_envs))
-}
-
-fn mapped_config_error(channel_id: u64, error: AppError) -> AppError {
-    let reason = match error {
-        AppError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => "does not exist",
-        AppError::Io(_) => "could not be read",
-        _ => "is invalid",
-    };
-    AppError::Config(format!(
-        "gateway.discord.channel_configs entry for channel {channel_id} {reason}"
     ))
 }
 
 fn gateway_token(
     config: &Config,
     discord: &DiscordGatewayConfig,
-    mapped_provider_envs: &[String],
     env: impl Fn(&str) -> Option<OsString>,
 ) -> AppResult<String> {
-    let mut provider_envs = vec![
+    let provider_envs = vec![
         config.provider.api_key_env.as_str(),
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
     ];
-    provider_envs.extend(mapped_provider_envs.iter().map(String::as_str));
     if provider_envs
         .iter()
         .any(|name| *name == discord.api_key_env)
@@ -139,12 +86,12 @@ fn gateway_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn discord_config() -> DiscordGatewayConfig {
         DiscordGatewayConfig {
             api_key_env: "DISCORD_BOT_TOKEN".into(),
-            owner_user_ids: vec![42],
-            channel_configs: HashMap::from([(200, PathBuf::from("mapped.toml"))]),
+            channel_threads: HashMap::from([(200, "thread_news".into())]),
         }
     }
 
@@ -153,7 +100,7 @@ mod tests {
         let config = Config::default();
         let discord = discord_config();
 
-        let error = gateway_token(&config, &discord, &[], |name| match name {
+        let error = gateway_token(&config, &discord, |name| match name {
             "DISCORD_BOT_TOKEN" => Some(OsString::from("discord-secret")),
             "OPENROUTER_API_KEY" => Some(OsString::from("provider-secret")),
             _ => None,
@@ -166,50 +113,37 @@ mod tests {
     }
 
     #[test]
-    fn gateway_environment_rejects_mapped_provider_credentials() {
+    fn gateway_environment_rejects_missing_and_empty_tokens() {
         let config = Config::default();
         let discord = discord_config();
-        let mapped_provider_envs = vec!["CHANNEL_PROVIDER_KEY".into()];
 
-        let error = gateway_token(
-            &config,
-            &discord,
-            &mapped_provider_envs,
-            |name| match name {
-                "DISCORD_BOT_TOKEN" => Some(OsString::from("discord-secret")),
-                "CHANNEL_PROVIDER_KEY" => Some(OsString::from("provider-secret")),
-                _ => None,
-            },
-        )
+        let missing = gateway_token(&config, &discord, |_| None).unwrap_err();
+        let empty = gateway_token(&config, &discord, |name| {
+            (name == "DISCORD_BOT_TOKEN").then(OsString::new)
+        })
         .unwrap_err();
 
-        assert!(error.to_string().contains("CHANNEL_PROVIDER_KEY"));
-        assert!(!error.to_string().contains("provider-secret"));
-        assert!(!error.to_string().contains("discord-secret"));
+        assert_eq!(
+            missing.to_string(),
+            "config error: gateway token env var DISCORD_BOT_TOKEN is not set"
+        );
+        assert_eq!(
+            empty.to_string(),
+            "config error: gateway token must not be empty"
+        );
     }
 
     #[test]
     fn workspace_gateway_table_fails_before_discord_or_daemon_access() {
         let workspace = tempfile::tempdir().unwrap();
-        let mapped_path = workspace.path().join("mapped.toml");
-        std::fs::write(
-            &mapped_path,
-            r#"
-[provider]
-api_key_env = "CHANNEL_PROVIDER_KEY"
-base_url = "https://provider.example/v1"
-"#,
-        )
-        .unwrap();
         std::fs::write(
             workspace.path().join("plato.toml"),
             r#"
 [gateway.discord]
 api_key_env = "DISCORD_BOT_TOKEN"
-owner_user_ids = [42]
 
-[gateway.discord.channel_configs]
-"200" = "mapped.toml"
+[gateway.discord.channel_threads]
+"200" = "thread_news"
 "#,
         )
         .unwrap();
@@ -234,64 +168,111 @@ owner_user_ids = [42]
     }
 
     #[test]
-    fn authorized_channel_configs_resolve_relative_paths_and_validate_contents() {
+    #[cfg(unix)]
+    fn explicit_and_environment_configs_cannot_supply_gateway_principal_authority() {
         let workspace = tempfile::tempdir().unwrap();
-        let mapped_path = workspace.path().join("configs").join("mapped.toml");
-        std::fs::create_dir_all(mapped_path.parent().unwrap()).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let explicit = workspace.path().join("gateway.toml");
         std::fs::write(
-            &mapped_path,
+            &explicit,
             r#"
-[provider]
-api_key_env = "CHANNEL_PROVIDER_KEY"
-base_url = "https://provider.example/v1"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+
+[gateway.discord.channel_threads]
+"200" = "thread_news"
+
+[principals.discord."42"]
+name = "workspace_attacker"
+remote_ceiling = "yolo"
 "#,
         )
         .unwrap();
-        let channel_configs = HashMap::from([(200, PathBuf::from("configs/mapped.toml"))]);
-
-        let (paths, provider_envs) =
-            resolve_channel_configs(workspace.path(), &channel_configs).unwrap();
-
-        assert_eq!(Path::new(&paths[&200]), mapped_path.as_path());
-        assert_eq!(provider_envs, vec!["CHANNEL_PROVIDER_KEY"]);
-    }
-
-    #[test]
-    fn authorized_channel_configs_expand_leading_tilde() {
-        let workspace = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let mapped_path = home.path().join("mapped.toml");
-        std::fs::write(&mapped_path, "").unwrap();
-        let channel_configs = HashMap::from([(200, PathBuf::from("~/mapped.toml"))]);
 
         let home_env = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        temp_env::with_var(home_env, Some(home.path().as_os_str()), || {
-            let (paths, _) = resolve_channel_configs(workspace.path(), &channel_configs).unwrap();
+        for through_environment in [false, true] {
+            temp_env::with_vars(
+                [
+                    (home_env, Some(home.path().as_os_str())),
+                    ("DISCORD_BOT_TOKEN", Some(std::ffi::OsStr::new("secret"))),
+                    (
+                        "PLATO_CONFIG",
+                        through_environment.then_some(explicit.as_os_str()),
+                    ),
+                ],
+                || {
+                    let error = match resolve_discord_gateway_runtime(DiscordGatewayOptions {
+                        workspace_root: workspace.path().to_path_buf(),
+                        socket_path: Some(workspace.path().join("never-contact.sock")),
+                        config_path: (!through_environment).then(|| explicit.clone()),
+                    }) {
+                        Ok(_) => {
+                            panic!("non-home config unexpectedly supplied principal authority")
+                        }
+                        Err(error) => error,
+                    };
 
-            assert_eq!(paths[&200], mapped_path.to_string_lossy());
-        });
+                    assert_eq!(
+                        error.to_string(),
+                        "config error: Discord gateway principals require [principals.discord] in the user config"
+                    );
+                },
+            );
+        }
     }
 
     #[test]
-    fn missing_and_invalid_channel_configs_return_bounded_config_errors() {
+    #[cfg(unix)]
+    fn runtime_uses_only_canonical_home_principals() {
         let workspace = tempfile::tempdir().unwrap();
-        let invalid_path = workspace.path().join("invalid.toml");
-        std::fs::write(&invalid_path, "[provider\n").unwrap();
-        for (name, reason) in [
-            ("missing.toml", "does not exist"),
-            ("invalid.toml", "is invalid"),
-        ] {
-            let channel_configs = HashMap::from([(200, PathBuf::from(name))]);
-            let error = resolve_channel_configs(workspace.path(), &channel_configs).unwrap_err();
-            let AppError::Config(message) = error else {
-                panic!("mapped config error was not bounded as a config error");
-            };
+        let home = tempfile::tempdir().unwrap();
+        let explicit = workspace.path().join("gateway.toml");
+        let home_config = home.path().join(".config/plato/config.toml");
+        std::fs::create_dir_all(home_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &explicit,
+            r#"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
 
-            assert!(message.contains(reason));
-            assert_eq!(
-                message,
-                format!("gateway.discord.channel_configs entry for channel 200 {reason}")
-            );
-        }
+[gateway.discord.channel_threads]
+"200" = "thread_news"
+
+[principals.discord."42"]
+name = "ignored_explicit_actor"
+remote_ceiling = "yolo"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &home_config,
+            r#"
+[principals.discord."42"]
+name = "jerome"
+"#,
+        )
+        .unwrap();
+
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.path().as_os_str())),
+                ("DISCORD_BOT_TOKEN", Some(std::ffi::OsStr::new("secret"))),
+            ],
+            || {
+                let runtime = resolve_discord_gateway_runtime(DiscordGatewayOptions {
+                    workspace_root: workspace.path().to_path_buf(),
+                    socket_path: Some(workspace.path().join("daemon.sock")),
+                    config_path: Some(explicit.clone()),
+                })
+                .unwrap();
+
+                assert_eq!(runtime.principals[&42].name, "jerome");
+                assert_eq!(
+                    runtime.principals[&42].remote_ceiling,
+                    platonic_protocol::ThreadApprovalPolicy::Prompt
+                );
+                assert_eq!(runtime.channel_thread_ids[&200], "thread_news");
+            },
+        );
     }
 }

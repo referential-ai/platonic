@@ -199,9 +199,10 @@ without wrapping.
 | Ctrl-U | clear the composer |
 
 When the Discord gateway reaches an approval-required tool, Discord gets one
-bounded notification with the tool, effect, and preview. Grant or deny it
-locally in `plato-tui`; the gateway never sends approval decisions. Failed runs
-post `Run failed. Inspect it locally with: plato replay`. Canceled and
+bounded notification with the tool, effect, and preview. An admitted home-config
+principal can use `/approve` or `/deny` in the mapped channel; the gateway binds
+the decision to that exact pending operation and records the principal name as
+attribution. Failed runs post `Run failed. Inspect it locally with: plato replay`. Canceled and
 interrupted runs do not post terminal messages. Allowed messages show 👀 and a
 typing indicator while active, then ✅ or ❌; canceled and interrupted runs
 remove 👀 without a terminal reaction. The bot needs Add Reactions and Read

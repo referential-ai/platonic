@@ -124,8 +124,8 @@ pub struct ApprovalHandler {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExternalApprovalOutcome {
-    Granted { actor: &'static str },
-    Denied { actor: &'static str, reason: String },
+    Granted { actor: String },
+    Denied { actor: String, reason: String },
 }
 
 impl fmt::Debug for ApprovalMode {
@@ -204,10 +204,13 @@ impl ApprovalMode {
         decide: impl Fn(ApprovalRequest) -> AppResult<ApprovalOutcome> + Send + Sync + 'static,
     ) -> Self {
         Self::external_with_actor(actor, move |request| match decide(request)? {
-            ApprovalOutcome::Granted => Ok(ExternalApprovalOutcome::Granted { actor }),
-            ApprovalOutcome::Denied { reason } => {
-                Ok(ExternalApprovalOutcome::Denied { actor, reason })
-            }
+            ApprovalOutcome::Granted => Ok(ExternalApprovalOutcome::Granted {
+                actor: actor.into(),
+            }),
+            ApprovalOutcome::Denied { reason } => Ok(ExternalApprovalOutcome::Denied {
+                actor: actor.into(),
+                reason,
+            }),
         })
     }
 
@@ -1033,7 +1036,7 @@ pub(crate) fn run_prepared_question(
                                         HarnessEvent::ApprovalGranted {
                                             run_id: run_id.clone(),
                                             call_id: call_id.clone(),
-                                            actor_id: ActorId::new(actor)?,
+                                            actor_id: ActorId::new(actor.clone())?,
                                         },
                                     )?;
                                     execute_and_record_tool(
@@ -1042,7 +1045,7 @@ pub(crate) fn run_prepared_question(
                                         &config,
                                         &run_id,
                                         call.clone(),
-                                        Some(actor),
+                                        Some(&actor),
                                         thread_spawn.as_ref(),
                                     )?
                                 }
@@ -3201,9 +3204,9 @@ enabled = ["shell.exec"]
                 *decisions += 1;
                 Ok(ExternalApprovalOutcome::Granted {
                     actor: if *decisions == 1 {
-                        "tui_session_grant"
+                        "tui_session_grant".into()
                     } else {
-                        "session_grant"
+                        "session_grant".into()
                     },
                 })
             }),

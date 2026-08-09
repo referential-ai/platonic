@@ -250,7 +250,7 @@ fn gateway_wrapper_rejects_workspace_gateway_before_daemon_or_service_access() {
     let fixture = ServerFixture::start("gateway-config");
     fs::write(
         fixture.workspace.join("plato.toml"),
-        "[gateway.discord]\napi_key_env = \"DISCORD_BOT_TOKEN\"\nowner_user_ids = [42]\n",
+        "[gateway.discord]\napi_key_env = \"DISCORD_BOT_TOKEN\"\n[gateway.discord.channel_threads]\n\"200\" = \"thread_news\"\n",
     )
     .unwrap();
     let output = fixture

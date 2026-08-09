@@ -640,28 +640,41 @@ are not a public community launch. Build the AppImage on Ubuntu 24.04 with
 ## Discord Gateway
 
 The Discord gateway in `platonic-server` receives messages over an outbound WebSocket
-and sends replies through Discord's REST API. Add the bot token variable name
-and numeric owner user ids to an authorized config:
+and sends replies through Discord's REST API. Gateway routing maps Discord
+channels to existing durable threads:
 
 ```toml
 [gateway.discord]
 api_key_env = "DISCORD_BOT_TOKEN"
-owner_user_ids = [123456789]
 
-[gateway.discord.channel_configs]
-"111111111111111111" = "~/.config/plato/channels/news.toml"
+[gateway.discord.channel_threads]
+"111111111111111111" = "thread_123"
 ```
 
 The entire `[gateway]` table is accepted only from `--config`, `PLATO_CONFIG`,
 or the user config, not auto-discovered workspace `plato.toml`.
-`channel_configs` must contain at least one positive numeric channel ID and is
-the allowlist for messages and interactions, including DMs by their channel ID.
-Unmapped channels are ignored before input scanning, daemon access, Discord
-response work, or channel session and override changes. Each mapped file is an
-ordinary Plato config and may omit `[gateway]`. Mapped paths are resolved and
-validated when the gateway starts, so mapping changes require a restart. The
-daemon loads the selected file for each fresh or continued run, so file-content
-changes do not require a gateway restart.
+`channel_threads` must contain at least one positive numeric channel ID. It
+selects context only; it does not authorize a Discord identity. Every mapped
+thread must already exist in the selected workspace, and its immutable
+authority remains daemon-owned.
+
+Discord identity authority comes only from the canonical user config
+`~/.config/plato/config.toml`:
+
+```toml
+[principals.discord."123456789"]
+name = "jerome"
+# remote_ceiling = "yolo" # optional, high-trust explicit grant
+```
+
+An omitted `remote_ceiling` is `prompt`. A prompting principal cannot control a
+`yolo` thread; remote yolo is possible only with the explicit home-owned grant,
+and child authority remains capped by the existing parent subset gate. A
+workspace `plato.toml` cannot define `[principals]`. Neither `--config` nor
+`PLATO_CONFIG` supplies principal authority, even when it selects gateway
+routing. Unknown identities are denied before channel lookup, content scanning,
+daemon access, session lookup, Discord response work, or effects. An admitted
+identity in an unmapped channel is ignored at the separate context gate.
 
 With the workspace daemon already running, start the gateway in an environment
 that contains the bot token but no provider credentials:
@@ -673,31 +686,31 @@ platonic gateway discord --config ~/.config/plato/gateway.toml
 ```
 
 The server-owned gateway completes a bounded daemon `hello`, requires the exact
-workspace ID plus `hello`, `run.start`,
-`message.append`, `events.stream`, `sessions.list`, and `transcript.read`, then
-begin Discord REST and WebSocket work. A failed probe starts no gateway; the
-gateway never starts a server with its Discord environment.
+workspace ID plus `hello`, `thread.authority`, `thread.status`, `thread.send`,
+`thread.events`, and `approval.decide`, and validates every mapped thread before
+beginning Discord REST and WebSocket work. Missing or empty principal maps and
+bot tokens fail at startup with an actionable diagnostic. Stale bot credentials
+fail the first authenticated Discord lookup, while mismatched application IDs
+and missing interaction tokens fail closed at ingress. A failed probe starts no
+gateway; the gateway never starts a server with its Discord environment.
 
 At startup, the gateway replaces the Discord application's global command
 registry with the commands this binary supports. The current registry contains
-`/status`, `/model`, and `/reasoning`. For an allowed owner, all three respond
-ephemerally and do not invoke a model or mutate the ledger. `/status` reports
-gateway and daemon connectivity, daemon version, effective model and reasoning
-effort, workspace session count, and active run count. `/model` and
-`/reasoning` read or set the current channel's later-message overrides; use
-`default` to clear either override. Settings are held in memory until the
-gateway restarts.
+`/status`, `/approve`, and `/deny`. For an admitted principal, `/status` reports
+the mapped durable thread and its authority. `/approve` and `/deny` resolve only
+that channel's exact pending run and tool-call identifiers. The named principal
+is recorded as attribution in the existing tool and coordinator-spawn approval
+chain; the actor field is not an independent grant of authority.
 
 Enable the bot's Message Content intent. Grant View Channel, Send Messages, Add
 Reactions, and Read Message History; also grant Send Messages in Threads when
-using threads. Messages from other user ids are ignored. For allowed messages,
+using threads. Messages from unknown identities are ignored. For admitted messages,
 the gateway adds 👀, refreshes Discord's typing indicator while the run is
 active, then replaces 👀 with ✅ or ❌. Canceled and interrupted runs remove 👀
-without a terminal reaction. Each channel or DM continues one daemon session;
-final answers are recovered from the ledger after daemon reconnects.
+without a terminal reaction. Each channel or DM drives its mapped durable
+thread; final answers are recovered from typed thread events after daemon reconnects.
 Approval-required runs post one bounded notification with the tool, effect, and
-preview; grant or deny the request locally in `plato-tui`. The gateway never
-sends approval decisions. Failed runs post
+preview; `/approve` or `/deny` resolves that exact operation. Failed runs post
 `Run failed. Inspect it locally with: plato replay`; canceled and interrupted
 runs stay silent.
 A Discord response-delivery failure is contained to that message, and the
@@ -706,9 +719,11 @@ gateway continues processing subsequent messages. A definitely rejected HTTP
 retries that message chunk once; transport failures and HTTP 5xx responses are
 not retried.
 
-Allowed-owner messages over 4,096 UTF-8 bytes or matching the fixed unsafe-input
+Admitted-principal messages over 4,096 UTF-8 bytes or matching the fixed unsafe-input
 markers are rejected before daemon access with `Message rejected: unsafe or
-oversized Discord input.` Accepted messages are forwarded unchanged.
+oversized Discord input.` Authentication and authorization do not make message
+text trusted: accepted messages are still untrusted content and are forwarded
+unchanged only after the existing ingress scan.
 
 ## TUI
 
