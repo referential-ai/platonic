@@ -127,62 +127,38 @@ pub(crate) fn adopt_legacy_sqlite(
     )
 }
 
-/// Put an adopted database back if registry insertion does not commit.
-pub(crate) fn restore_legacy_sqlite(
-    server_db_path: &Path,
-    workspace_root: &Path,
-    destination: &Path,
-) -> AppResult<()> {
-    let legacy = legacy_sqlite_path_at(server_db_path, workspace_root)?;
-    if move_sqlite_files(destination, &legacy)? {
-        Ok(())
-    } else {
-        Err(AppError::Config(format!(
-            "adopted ledger vanished before registry rollback: {}",
-            destination.display()
-        )))
-    }
-}
-
-fn move_sqlite_files(source: &Path, destination: &Path) -> AppResult<bool> {
-    match std::fs::symlink_metadata(source) {
-        Ok(metadata) if metadata.file_type().is_file() => {}
-        Ok(_) => {
-            return Err(AppError::Config(format!(
-                "workspace ledger is not a regular file: {}",
-                source.display()
-            )));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    }
-
-    let mut moves = Vec::new();
-    for suffix in ["", "-journal", "-wal", "-shm"] {
+pub(crate) fn move_sqlite_files(source: &Path, destination: &Path) -> AppResult<bool> {
+    // Companions move before the main database, which acts as the completion
+    // marker. A retry can therefore finish or roll back an interrupted move.
+    let mut files = Vec::new();
+    for suffix in ["-journal", "-wal", "-shm", ""] {
         let source = sqlite_companion(source, suffix);
         let destination = sqlite_companion(destination, suffix);
-        match std::fs::symlink_metadata(&source) {
-            Ok(metadata) if metadata.file_type().is_file() => {}
-            Ok(_) => {
-                return Err(AppError::Config(format!(
-                    "workspace ledger companion is not a regular file: {}",
-                    source.display()
-                )));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
+        let at_source = regular_sqlite_file(&source)?;
+        let at_destination = regular_sqlite_file(&destination)?;
+        if at_source && at_destination {
+            return Err(AppError::Config(format!(
+                "workspace ledger exists at both migration paths: {} and {}",
+                source.display(),
+                destination.display()
+            )));
         }
-        match std::fs::symlink_metadata(&destination) {
-            Ok(_) => {
-                return Err(AppError::Config(format!(
-                    "workspace ledger destination already exists: {}",
-                    destination.display()
-                )));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        files.push((source, destination, at_source, at_destination));
+    }
+
+    let (_, _, source_main, destination_main) = files
+        .last()
+        .expect("SQLite migration always includes the main database");
+    if !source_main && !destination_main {
+        if files
+            .iter()
+            .any(|(_, _, at_source, at_destination)| *at_source || *at_destination)
+        {
+            return Err(AppError::Config(
+                "workspace ledger companions exist without a main database".into(),
+            ));
         }
-        moves.push((source, destination));
+        return Ok(false);
     }
 
     let parent = destination.parent().ok_or_else(|| {
@@ -191,9 +167,18 @@ fn move_sqlite_files(source: &Path, destination: &Path) -> AppResult<bool> {
             destination.display()
         ))
     })?;
-    std::fs::create_dir_all(parent)?;
-    let mut moved = Vec::new();
-    for (source, destination) in moves {
+    if files.iter().any(|(_, _, at_source, _)| *at_source) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut moved = files
+        .iter()
+        .filter(|(_, _, _, at_destination)| *at_destination)
+        .map(|(source, destination, _, _)| (source.clone(), destination.clone()))
+        .collect::<Vec<_>>();
+    for (source, destination, at_source, _) in files {
+        if !at_source {
+            continue;
+        }
         if let Err(error) = std::fs::rename(&source, &destination) {
             for (source, destination) in moved.into_iter().rev() {
                 if let Err(rollback) = std::fs::rename(&destination, &source) {
@@ -207,6 +192,18 @@ fn move_sqlite_files(source: &Path, destination: &Path) -> AppResult<bool> {
         moved.push((source, destination));
     }
     Ok(true)
+}
+
+fn regular_sqlite_file(path: &Path) -> AppResult<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(AppError::Config(format!(
+            "workspace ledger path is not a regular file: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn sqlite_companion(path: &Path, suffix: &str) -> PathBuf {
@@ -333,7 +330,7 @@ mod tests {
             );
             assert!(!legacy.exists());
 
-            restore_legacy_sqlite(&server_db, &workspace, &destination).unwrap();
+            assert!(move_sqlite_files(&destination, &legacy).unwrap());
             assert_eq!(std::fs::read(&legacy).unwrap(), b"ledger");
             assert_eq!(
                 std::fs::read(sqlite_companion(&legacy, "-wal")).unwrap(),
@@ -345,6 +342,35 @@ mod tests {
             assert!(adopt_legacy_sqlite(&server_db, &workspace, &destination).is_err());
             assert_eq!(std::fs::read(&legacy).unwrap(), b"ledger");
             assert_eq!(std::fs::read(&destination).unwrap(), b"occupied");
+        });
+    }
+
+    #[test]
+    fn interrupted_sidecar_move_resumes_before_the_main_database_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        with_test_xdg(dir.path(), || {
+            let legacy = legacy_sqlite_path(&workspace).unwrap();
+            let destination = default_sqlite_path("ws-1234").unwrap();
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, b"ledger").unwrap();
+            let legacy_wal = sqlite_companion(&legacy, "-wal");
+            let destination_wal = sqlite_companion(&destination, "-wal");
+            std::fs::write(&legacy_wal, b"wal").unwrap();
+
+            // Simulate termination after a companion rename but before the
+            // main database, then prove the next adoption completes it.
+            std::fs::rename(&legacy_wal, &destination_wal).unwrap();
+            assert!(
+                adopt_legacy_sqlite(&server_db_path().unwrap(), &workspace, &destination).unwrap()
+            );
+
+            assert_eq!(std::fs::read(&destination).unwrap(), b"ledger");
+            assert_eq!(std::fs::read(&destination_wal).unwrap(), b"wal");
+            assert!(!legacy.exists());
+            assert!(!legacy_wal.exists());
         });
     }
 

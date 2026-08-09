@@ -363,6 +363,9 @@ id or its history:
 - Unix ledger: `${XDG_STATE_HOME:-$HOME/.local/state}/platonic/workspaces/<workspace-id>/ledger.db`
 - Windows ledger: `%LOCALAPPDATA%\platonic\workspaces\<workspace-id>\ledger.db`
 
+On first attach, a registered workspace that still points at the legacy
+path-derived `agent.db` is moved to this layout and its registry row is updated.
+
 Explicit legacy daemon endpoints remain keyed by the path-derived workspace id
 during migration:
 

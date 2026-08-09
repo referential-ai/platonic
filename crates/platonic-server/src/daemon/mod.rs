@@ -50,8 +50,8 @@ impl DaemonPaths {
     }
 
     pub(crate) fn resolve_workspace_record(self) -> AppResult<Self> {
-        let store = self.server_store()?;
-        let record = store.workspace_by_root(&self.workspace_root.to_string_lossy())?;
+        let mut store = self.server_store()?;
+        let record = store.workspace_for_attachment(&self.workspace_root.to_string_lossy())?;
         match record {
             Some(record) => Ok(self.with_workspace_record(&record)),
             None => Ok(self),

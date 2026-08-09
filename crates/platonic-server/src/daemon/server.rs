@@ -1084,6 +1084,7 @@ mod tests {
         AgentId, ContextPack, EffectClass, HarnessEvent, Message, MessageRole, ModelName,
         ModelUsage, RecordedEvent, RunId, ToolCallId, TurnId,
     };
+    use rusqlite::params;
     use serde_json::json;
     use std::{
         io::{BufRead, Read},
@@ -1583,11 +1584,12 @@ mod tests {
     }
 
     #[test]
-    fn host_adopts_legacy_history_and_relocation_preserves_replay() {
+    fn host_first_attach_migrates_registered_legacy_history_and_relocation_preserves_replay() {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
         fs::create_dir(&workspace).unwrap();
         paths::with_test_xdg(root.path(), || {
+            let workspace_id = "ws-0123456789abcdef";
             let legacy_ledger = paths::legacy_sqlite_path(&workspace).unwrap();
             fs::create_dir_all(legacy_ledger.parent().unwrap()).unwrap();
             seed_finished_session(
@@ -1596,35 +1598,48 @@ mod tests {
                 "session_legacy",
                 "preserved answer",
             );
+            let server_db = paths::server_db_path().unwrap();
+            drop(crate::server_store::ServerStore::open_or_create(&server_db).unwrap());
+            let registry = rusqlite::Connection::open(&server_db).unwrap();
+            registry
+                .execute(
+                    "INSERT INTO workspaces (id, name, root, ledger_path, created_at_ms)
+                     VALUES (?1, 'adopted', ?2, ?3, 10)",
+                    params![
+                        workspace_id,
+                        workspace.canonicalize().unwrap().to_string_lossy(),
+                        legacy_ledger.to_string_lossy()
+                    ],
+                )
+                .unwrap();
+            drop(registry);
+
             let server = Arc::new(HostDaemonServer::bind().unwrap());
             let socket_path = server.socket_path().to_path_buf();
             let runner = Arc::clone(&server);
             let handle = thread::spawn(move || {
-                for _ in 0..3 {
+                for _ in 0..2 {
                     runner.serve_next().unwrap();
                 }
             });
 
-            let mut control = DaemonClient::connect(&socket_path).unwrap();
-            let created = control
-                .workspace_create("adopted".into(), workspace.clone())
-                .unwrap()
-                .workspace;
-            drop(control);
-            let ledger_path = PathBuf::from(&created.ledger_path);
-            assert_eq!(
-                ledger_path,
-                paths::default_sqlite_path(&created.id).unwrap()
-            );
-            assert_eq!(ledger_path.file_name().unwrap(), "ledger.db");
-            assert!(ledger_path.is_file());
-            assert!(!legacy_ledger.exists());
-
             let mut first = DaemonClient::connect(&socket_path).unwrap();
             let first_hello = first.hello(&workspace).unwrap();
             drop(first);
-            assert_eq!(first_hello.workspace_id, created.id);
+            let ledger_path = paths::default_sqlite_path(workspace_id).unwrap();
+            assert_eq!(ledger_path, PathBuf::from(&first_hello.ledger_path));
+            assert_eq!(ledger_path.file_name().unwrap(), "ledger.db");
+            assert!(ledger_path.is_file());
+            assert!(!legacy_ledger.exists());
+            assert_eq!(first_hello.workspace_id, workspace_id);
             assert_eq!(Path::new(&first_hello.ledger_path), ledger_path);
+            let migrated = crate::server_store::ServerStore::open_or_create(&server_db)
+                .unwrap()
+                .workspace(workspace_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(migrated.id, workspace_id);
+            assert_eq!(Path::new(&migrated.ledger_path), ledger_path);
             assert!(
                 crate::replay::replay_sqlite(&ledger_path, Some("run_legacy"))
                     .unwrap()
@@ -1638,7 +1653,7 @@ mod tests {
                     .unwrap();
             assert!(
                 store
-                    .relocate_workspace(&created.id, &relocated.to_string_lossy())
+                    .relocate_workspace(workspace_id, &relocated.to_string_lossy())
                     .unwrap()
             );
             drop(store);
@@ -1647,7 +1662,7 @@ mod tests {
             let moved_hello = moved.hello(&relocated).unwrap();
             drop(moved);
             handle.join().unwrap();
-            assert_eq!(moved_hello.workspace_id, created.id);
+            assert_eq!(moved_hello.workspace_id, workspace_id);
             assert_eq!(Path::new(&moved_hello.ledger_path), ledger_path);
             assert!(
                 crate::replay::replay_sqlite(&ledger_path, Some("run_legacy"))

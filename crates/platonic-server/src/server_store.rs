@@ -221,6 +221,7 @@ impl ServerStore {
             created_at_ms: now_ms,
         };
         let created_at_ms = sqlite_i64(now_ms, "workspace created_at_ms")?;
+        let legacy_path = paths::legacy_sqlite_path_at(&store_path, Path::new(&record.root))?;
         let adopted = paths::adopt_legacy_sqlite(
             &store_path,
             Path::new(&record.root),
@@ -238,12 +239,20 @@ impl ServerStore {
             ],
         ) {
             drop(transaction);
-            restore_adopted_ledger(&store_path, &record, adopted, &error)?;
-            return Err(error.into());
+            return Err(rollback_adopted_ledger(
+                &legacy_path,
+                Path::new(&record.ledger_path),
+                adopted,
+                error.into(),
+            ));
         }
         if let Err(error) = transaction.commit() {
-            restore_adopted_ledger(&store_path, &record, adopted, &error)?;
-            return Err(error.into());
+            return Err(rollback_adopted_ledger(
+                &legacy_path,
+                Path::new(&record.ledger_path),
+                adopted,
+                error.into(),
+            ));
         }
         Ok((record, true))
     }
@@ -296,6 +305,90 @@ impl ServerStore {
                 workspace_from_row,
             )
             .optional()?)
+    }
+
+    /// Resolve one registered workspace and migrate its pre-minted ledger path.
+    ///
+    /// The immediate transaction serializes the filesystem move with the row
+    /// update, so concurrent attachers either observe the old complete state
+    /// or the new complete state. A failed update restores the legacy files.
+    pub(crate) fn workspace_for_attachment(
+        &mut self,
+        root: &str,
+    ) -> AppResult<Option<WorkspaceRecord>> {
+        let store_path = self.path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut record) = transaction
+            .query_row(
+                "SELECT id, name, root, ledger_path, created_at_ms
+                   FROM workspaces WHERE root = ?1
+                   ORDER BY created_at_ms, name LIMIT 1",
+                params![root],
+                workspace_from_row,
+            )
+            .optional()?
+        else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let state_root = store_path.parent().ok_or_else(|| {
+            AppError::Config(format!(
+                "server database has no state root: {}",
+                store_path.display()
+            ))
+        })?;
+        let legacy_path = PathBuf::from(&record.ledger_path);
+        if legacy_path.file_name() != Some(std::ffi::OsStr::new("agent.db"))
+            || legacy_path.parent().and_then(Path::parent)
+                != Some(state_root.join("workspaces").as_path())
+        {
+            transaction.commit()?;
+            return Ok(Some(record));
+        }
+
+        let destination = paths::workspace_sqlite_path(&store_path, &record.id)?;
+        let adopted = paths::move_sqlite_files(&legacy_path, &destination)?;
+        let destination = destination.to_string_lossy().into_owned();
+        let changed = match transaction.execute(
+            "UPDATE workspaces SET ledger_path = ?2
+              WHERE id = ?1 AND ledger_path = ?3",
+            params![record.id, destination, record.ledger_path],
+        ) {
+            Ok(changed) => changed,
+            Err(error) => {
+                drop(transaction);
+                return Err(rollback_adopted_ledger(
+                    &legacy_path,
+                    Path::new(&destination),
+                    adopted,
+                    error.into(),
+                ));
+            }
+        };
+        if changed != 1 {
+            drop(transaction);
+            return Err(rollback_adopted_ledger(
+                &legacy_path,
+                Path::new(&destination),
+                adopted,
+                AppError::Config(format!(
+                    "workspace ledger migration updated {changed} rows for {}",
+                    record.id
+                )),
+            ));
+        }
+        if let Err(error) = transaction.commit() {
+            return Err(rollback_adopted_ledger(
+                &legacy_path,
+                Path::new(&destination),
+                adopted,
+                error.into(),
+            ));
+        }
+        record.ledger_path = destination;
+        Ok(Some(record))
     }
 
     /// Every registered workspace, whether or not a client has it open.
@@ -671,25 +764,24 @@ impl ServerStore {
     }
 }
 
-fn restore_adopted_ledger(
-    store_path: &Path,
-    record: &WorkspaceRecord,
+fn rollback_adopted_ledger(
+    source: &Path,
+    destination: &Path,
     adopted: bool,
-    registration_error: &rusqlite::Error,
-) -> AppResult<()> {
+    operation_error: AppError,
+) -> AppError {
     if !adopted {
-        return Ok(());
+        return operation_error;
     }
-    paths::restore_legacy_sqlite(
-        store_path,
-        Path::new(&record.root),
-        Path::new(&record.ledger_path),
-    )
-    .map_err(|rollback_error| {
-        AppError::Config(format!(
-            "workspace registration failed ({registration_error}) and ledger adoption rollback failed ({rollback_error})"
-        ))
-    })
+    match paths::move_sqlite_files(destination, source) {
+        Ok(true) => operation_error,
+        Ok(false) => AppError::Config(format!(
+            "workspace ledger operation failed ({operation_error}) and adoption rollback found no destination ledger"
+        )),
+        Err(rollback_error) => AppError::Config(format!(
+            "workspace ledger operation failed ({operation_error}) and adoption rollback failed ({rollback_error})"
+        )),
+    }
 }
 
 fn thread_authority_from(
@@ -1748,6 +1840,46 @@ mod tests {
         handles.map(|handle| handle.join().unwrap()).into()
     }
 
+    fn seed_legacy_workspace_record(store: &ServerStore, id: &str, root: &Path) -> PathBuf {
+        let root = root.canonicalize().unwrap();
+        let legacy = paths::legacy_sqlite_path_at(&store.path, &root).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO workspaces (id, name, root, ledger_path, created_at_ms)
+                 VALUES (?1, 'legacy', ?2, ?3, 10)",
+                params![id, root.to_string_lossy(), legacy.to_string_lossy()],
+            )
+            .unwrap();
+        legacy
+    }
+
+    fn sqlite_test_companion(path: &Path, suffix: &str) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        PathBuf::from(value)
+    }
+
+    fn run_workspace_attachment_race(server_db: &Path, root: &Path) -> Vec<WorkspaceRecord> {
+        let root = root.canonicalize().unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = [(), ()].map(|()| {
+            let server_db = server_db.to_path_buf();
+            let root = root.to_path_buf();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut store = ServerStore::open_or_create(&server_db).unwrap();
+                barrier.wait();
+                store
+                    .workspace_for_attachment(&root.to_string_lossy())
+                    .unwrap()
+                    .unwrap()
+            })
+        });
+        barrier.wait();
+        handles.map(|handle| handle.join().unwrap()).into()
+    }
+
     #[test]
     fn concurrent_workspace_registration_atomically_rejects_duplicate_name_and_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -1858,6 +1990,121 @@ mod tests {
                 .unwrap()
                 .exists()
         );
+    }
+
+    #[test]
+    fn concurrent_attachment_migrates_one_existing_registry_row_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_root = dir.path().join("workspace");
+        fs::create_dir(&workspace_root).unwrap();
+        let server_db = dir.path().join("state/platonic/server.db");
+        let store = ServerStore::open_or_create(&server_db).unwrap();
+        let legacy = seed_legacy_workspace_record(&store, "ws-0123456789abcdef", &workspace_root);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"registered legacy history").unwrap();
+        drop(store);
+
+        let records = run_workspace_attachment_race(&server_db, &workspace_root);
+        assert_eq!(records[0], records[1]);
+        assert_eq!(records[0].id, "ws-0123456789abcdef");
+        let destination = paths::workspace_sqlite_path(&server_db, &records[0].id).unwrap();
+        assert_eq!(Path::new(&records[0].ledger_path), destination);
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"registered legacy history"
+        );
+        assert!(!legacy.exists());
+
+        let reopened = ServerStore::open_or_create(&server_db).unwrap();
+        assert_eq!(
+            reopened
+                .workspace("ws-0123456789abcdef")
+                .unwrap()
+                .unwrap()
+                .ledger_path,
+            destination.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn existing_registry_migration_restores_legacy_files_when_update_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_root = dir.path().join("workspace");
+        fs::create_dir(&workspace_root).unwrap();
+        let server_db = dir.path().join("state/platonic/server.db");
+        let mut store = ServerStore::open_or_create(&server_db).unwrap();
+        let legacy = seed_legacy_workspace_record(&store, "ws-0123456789abcdef", &workspace_root);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"registered legacy history").unwrap();
+        fs::write(sqlite_test_companion(&legacy, "-wal"), b"legacy wal").unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_workspace_ledger_migration
+                 BEFORE UPDATE OF ledger_path ON workspaces
+                 BEGIN
+                   SELECT RAISE(FAIL, 'injected ledger migration failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = store
+            .workspace_for_attachment(&workspace_root.canonicalize().unwrap().to_string_lossy())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected ledger migration failure")
+        );
+        let destination = paths::workspace_sqlite_path(&server_db, "ws-0123456789abcdef").unwrap();
+        assert_eq!(fs::read(&legacy).unwrap(), b"registered legacy history");
+        assert_eq!(
+            fs::read(sqlite_test_companion(&legacy, "-wal")).unwrap(),
+            b"legacy wal"
+        );
+        assert!(!destination.exists());
+        assert_eq!(
+            store
+                .workspace("ws-0123456789abcdef")
+                .unwrap()
+                .unwrap()
+                .ledger_path,
+            legacy.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn existing_registry_migration_recovers_a_move_completed_before_row_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_root = dir.path().join("workspace");
+        fs::create_dir(&workspace_root).unwrap();
+        let server_db = dir.path().join("state/platonic/server.db");
+        let mut store = ServerStore::open_or_create(&server_db).unwrap();
+        let legacy = seed_legacy_workspace_record(&store, "ws-0123456789abcdef", &workspace_root);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"registered legacy history").unwrap();
+        let destination = paths::workspace_sqlite_path(&server_db, "ws-0123456789abcdef").unwrap();
+        assert!(paths::move_sqlite_files(&legacy, &destination).unwrap());
+        assert_eq!(
+            store
+                .workspace("ws-0123456789abcdef")
+                .unwrap()
+                .unwrap()
+                .ledger_path,
+            legacy.to_string_lossy()
+        );
+
+        let record = store
+            .workspace_for_attachment(&workspace_root.canonicalize().unwrap().to_string_lossy())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(Path::new(&record.ledger_path), destination);
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"registered legacy history"
+        );
+        assert!(!legacy.exists());
     }
 
     #[test]
