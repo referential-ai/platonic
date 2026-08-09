@@ -661,6 +661,7 @@ pub(crate) fn run_prepared_question(
     let config = Config {
         provider: config.provider,
         limits: config.limits,
+        confinement: Default::default(),
         tools: config.tools,
         gateway: None,
     };

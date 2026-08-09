@@ -26,6 +26,9 @@ tungstenite.workspace = true
 ureq.workspace = true
 url.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock.workspace = true
+
 [dev-dependencies]
 temp-env.workspace = true
 tempfile.workspace = true

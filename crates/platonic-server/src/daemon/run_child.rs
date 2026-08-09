@@ -568,6 +568,7 @@ struct ChildLaunch {
     limits: ChildLifecycleLimits,
     executable: PathBuf,
     ready_child: Option<mpsc::Sender<u32>>,
+    confinement: crate::confinement::ChildConfinement,
     #[cfg(test)]
     terminal_stage_barriers: Option<TerminalStageBarriers>,
 }
@@ -592,6 +593,7 @@ pub(super) fn run_supervised(
     event_sender: mpsc::Sender<RunEvent>,
     cancel: Arc<AtomicBool>,
     thread_spawn: Option<ThreadSpawnToolHandler>,
+    confinement: crate::confinement::ChildConfinement,
 ) -> SupervisedRunCompletion {
     let executable = match resolve_run_child_executable() {
         Ok(executable) => executable,
@@ -611,6 +613,7 @@ pub(super) fn run_supervised(
             limits: ChildLifecycleLimits::default(),
             executable,
             ready_child: None,
+            confinement,
             #[cfg(test)]
             terminal_stage_barriers: None,
         },
@@ -638,6 +641,7 @@ pub(super) fn run_supervised_for_test(
             limits: ChildLifecycleLimits::default(),
             executable: launch.executable,
             ready_child: Some(launch.ready_child),
+            confinement: crate::confinement::ChildConfinement::None,
             terminal_stage_barriers: Some(launch.terminal_stage_barriers),
         },
     )
@@ -703,6 +707,7 @@ fn run_supervised_with_limits(
         limits,
         executable,
         ready_child,
+        confinement,
         #[cfg(test)]
         terminal_stage_barriers,
     } = launch;
@@ -718,6 +723,9 @@ fn run_supervised_with_limits(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Err(error) = crate::confinement::configure_child(&mut command, &confinement) {
+        return recorder.complete(&run_id, Err(error), false);
+    }
     let child = match ProcessTreeChild::spawn(&mut command) {
         Ok(child) => child,
         Err(error) => {
@@ -1067,6 +1075,7 @@ fn drain_after_exit(
 }
 
 pub fn run_stdio_child() -> AppResult<()> {
+    crate::confinement::apply_child()?;
     let cancel = Arc::new(AtomicBool::new(false));
     let (parent_sender, parent_receiver) = mpsc::channel();
     let reader_cancel = cancel.clone();
@@ -1536,6 +1545,7 @@ mod tests {
                 reasoning_effort: None,
                 approval_policy: None,
                 toolset: Some(vec!["file.read".into()]),
+                repositories: None,
             },
             approving_actor: "daemon".into(),
         };
@@ -1884,6 +1894,7 @@ while :; do :; done
                         },
                         executable: fixture,
                         ready_child: Some(ready_sender),
+                        confinement: crate::confinement::ChildConfinement::None,
                         terminal_stage_barriers: None,
                     },
                 );
@@ -1995,6 +2006,7 @@ IFS= read -r _
                         limits: ChildLifecycleLimits::default(),
                         executable: healthy_fixture,
                         ready_child: None,
+                        confinement: crate::confinement::ChildConfinement::None,
                         terminal_stage_barriers: None,
                     },
                 );
@@ -2152,6 +2164,7 @@ while :; do :; done
                         },
                         executable: fixture,
                         ready_child: Some(ready_sender),
+                        confinement: crate::confinement::ChildConfinement::None,
                         terminal_stage_barriers: None,
                     },
                 );

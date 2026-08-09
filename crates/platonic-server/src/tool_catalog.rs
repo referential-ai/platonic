@@ -253,6 +253,26 @@ impl ToolInputSchema {
                         "items": {"type": "string"},
                         "uniqueItems": true,
                         "description": "Optional narrowing override of the target agent's default toolset."
+                    },
+                    "repositories": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "repo": {
+                                    "type": "string",
+                                    "description": "Workspace-relative repository name."
+                                },
+                                "branch": {
+                                    "type": "string",
+                                    "description": "Existing branch to claim; omitted for a fresh thread branch."
+                                }
+                            },
+                            "required": ["repo"],
+                            "additionalProperties": false
+                        },
+                        "uniqueItems": true,
+                        "description": "Optional repository and branch claims."
                     }
                 },
                 "required": ["agent_id", "cwd"],
@@ -399,6 +419,26 @@ mod tests {
                         "items": {"type": "string"},
                         "uniqueItems": true,
                         "description": "Optional narrowing override of the target agent's default toolset."
+                    },
+                    "repositories": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "repo": {
+                                    "type": "string",
+                                    "description": "Workspace-relative repository name."
+                                },
+                                "branch": {
+                                    "type": "string",
+                                    "description": "Existing branch to claim; omitted for a fresh thread branch."
+                                }
+                            },
+                            "required": ["repo"],
+                            "additionalProperties": false
+                        },
+                        "uniqueItems": true,
+                        "description": "Optional repository and branch claims."
                     }
                 },
                 "required": ["agent_id", "cwd"],

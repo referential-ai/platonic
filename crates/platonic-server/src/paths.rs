@@ -65,6 +65,20 @@ pub fn server_db_path() -> AppResult<PathBuf> {
     Ok(server_state_root()?.join("server.db"))
 }
 
+/// Server-owned private repositories, grouped by immutable thread id.
+pub(crate) fn thread_repositories_root(server_db_path: &Path) -> AppResult<PathBuf> {
+    Ok(server_state_parent(server_db_path)?.join("worktrees"))
+}
+
+pub(crate) fn thread_repository_root(server_db_path: &Path, thread_id: &str) -> AppResult<PathBuf> {
+    Ok(thread_repositories_root(server_db_path)?.join(thread_id))
+}
+
+/// Server-owned shared Git storage. Thread processes receive read-only alternates into it.
+pub(crate) fn shared_git_root(server_db_path: &Path) -> AppResult<PathBuf> {
+    Ok(server_state_parent(server_db_path)?.join("git"))
+}
+
 pub fn default_sqlite_path(workspace_id: &str) -> AppResult<PathBuf> {
     Ok(default_sqlite(workspace_id)?.path)
 }
@@ -81,16 +95,20 @@ pub(crate) fn workspace_sqlite_path(
     server_db_path: &Path,
     workspace_id: &str,
 ) -> AppResult<PathBuf> {
-    let state_root = server_db_path.parent().ok_or_else(|| {
-        AppError::Config(format!(
-            "server database has no state root: {}",
-            server_db_path.display()
-        ))
-    })?;
+    let state_root = server_state_parent(server_db_path)?;
     Ok(state_root
         .join("workspaces")
         .join(workspace_id)
         .join("ledger.db"))
+}
+
+fn server_state_parent(server_db_path: &Path) -> AppResult<&Path> {
+    server_db_path.parent().ok_or_else(|| {
+        AppError::Config(format!(
+            "server database has no state root: {}",
+            server_db_path.display()
+        ))
+    })
 }
 
 /// Path used by the pre-registry, path-derived ledger layout.

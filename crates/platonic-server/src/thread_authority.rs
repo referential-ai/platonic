@@ -1,3 +1,4 @@
+use crate::thread_repository::ThreadRepositoryDraft;
 use crate::{AppError, AppResult};
 use platonic_core::{ActorId, AgentId, EffectClass, ModelName, ToolName};
 use platonic_protocol::{
@@ -38,6 +39,7 @@ pub(crate) struct ThreadAuthorityDraft {
     pub(crate) approval_policy: ThreadApprovalPolicy,
     pub(crate) toolset: Vec<String>,
     pub(crate) worktrees: Vec<ThreadWorktree>,
+    pub(crate) repositories: Vec<ThreadRepositoryDraft>,
     pub(crate) granted_paths: Vec<ThreadGrantedPath>,
     pub(crate) network: bool,
 }
@@ -97,6 +99,8 @@ pub(crate) enum ThreadAuthorityError {
     WorkingDirectory { parent: String, child: String },
     #[error("child writable path {child} exceeds parent path authority")]
     WritablePath { child: String },
+    #[error("child repository {repo} exceeds parent repository authority")]
+    Repository { repo: String },
     #[error("child toolset exceeds parent toolset: {excess:?}")]
     Toolset { excess: Vec<String> },
     #[error("child network authority exceeds parent network authority")]
@@ -134,6 +138,7 @@ impl ThreadAuthorityDraft {
             approval_policy,
             toolset,
             worktrees: Vec::new(),
+            repositories: Vec::new(),
             granted_paths: vec![ThreadGrantedPath {
                 path: cwd,
                 writable,
@@ -268,14 +273,70 @@ pub(crate) fn validate_child_authority(
     if child.network && !parent.network {
         return Err(ThreadAuthorityError::Network);
     }
-    validate_child_path(parent, &child.cwd, !child.worktrees.is_empty())?;
-    for worktree in &child.worktrees {
-        validate_child_path(parent, &worktree.path, true)?;
+    for repository in &child.repositories {
+        if !parent
+            .worktrees
+            .iter()
+            .any(|worktree| worktree.repo == repository.repo)
+        {
+            return Err(ThreadAuthorityError::Repository {
+                repo: repository.repo.clone(),
+            });
+        }
     }
-    for grant in &child.granted_paths {
-        validate_child_path(parent, &grant.path, grant.writable)?;
+    if child.worktrees.is_empty() {
+        validate_child_path(parent, &child.cwd, false)?;
+        for grant in &child.granted_paths {
+            validate_child_path(parent, &grant.path, grant.writable)?;
+        }
+    } else {
+        for worktree in &child.worktrees {
+            if !parent
+                .worktrees
+                .iter()
+                .any(|parent_worktree| parent_worktree.repo == worktree.repo)
+            {
+                return Err(ThreadAuthorityError::Repository {
+                    repo: worktree.repo.clone(),
+                });
+            }
+        }
+        if !child
+            .worktrees
+            .iter()
+            .any(|worktree| Path::new(&child.cwd).starts_with(&worktree.path))
+        {
+            return Err(ThreadAuthorityError::WorkingDirectory {
+                parent: "server-created child repositories".into(),
+                child: child.cwd.clone(),
+            });
+        }
+        for grant in &child.granted_paths {
+            if !child_owned_path(child, Path::new(&grant.path)) {
+                validate_child_path(parent, &grant.path, grant.writable)?;
+            }
+        }
     }
     Ok(())
+}
+
+fn child_owned_path(child: &ThreadAuthorityDraft, path: &Path) -> bool {
+    child.worktrees.iter().any(|worktree| {
+        let private = Path::new(&worktree.path);
+        let Some(repos_root) = private.parent() else {
+            return false;
+        };
+        if repos_root.file_name().is_none_or(|name| name != "repos") {
+            return false;
+        }
+        let Some(thread_root) = repos_root.parent() else {
+            return false;
+        };
+        thread_root
+            .file_name()
+            .is_some_and(|name| name == child.thread_id.as_str())
+            && path == thread_root.join("scratch")
+    })
 }
 
 fn validate_child_path(

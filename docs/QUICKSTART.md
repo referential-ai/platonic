@@ -161,7 +161,8 @@ The explicit legacy workspace-daemon mode still works:
 platonic serve --workspace "$PWD"                    # terminal A
 platonic workspace create example "$PWD" \
   --socket <socket-path-printed-by-terminal-A>         # terminal B
-plato-tui --workspace "$PWD" --config plato.toml      # terminal B
+plato-tui --workspace "$PWD" --config plato.toml \
+  --socket <socket-path-printed-by-terminal-A>         # terminal B
 ```
 
 `platonic serve --workspace` stays in the foreground. Ctrl-C shuts it down
