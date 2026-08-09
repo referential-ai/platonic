@@ -10,9 +10,10 @@ use platonic_client::{
 use platonic_protocol::BufferedStreamEvent;
 use platonic_protocol::{
     BufferedThreadEvent, CAPABILITY_APPROVAL_DECIDE, CAPABILITY_HELLO, CAPABILITY_THREAD_AUTHORITY,
-    CAPABILITY_THREAD_EVENTS, CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_STATUS, Capability,
-    ERROR_LAGGED, ERROR_NOT_FOUND, HarnessEvent, HelloResult, RunStateName, StreamEvent,
-    ThreadApprovalPolicy, ThreadSendResult,
+    CAPABILITY_THREAD_EVENTS, CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_STATUS,
+    CAPABILITY_TRANSCRIPT_READ, Capability, ERROR_LAGGED, ERROR_NOT_FOUND, HarnessEvent,
+    HelloResult, RunStateName, StreamEvent, ThreadApprovalPolicy, ThreadSendResult,
+    TranscriptReadResult,
 };
 use std::{
     collections::HashMap,
@@ -29,13 +30,14 @@ pub(super) const SUCCESS_EMOJI: &str = "✅";
 pub(super) const FAILURE_EMOJI: &str = "❌";
 pub(super) const TYPING_INTERVAL: Duration = Duration::from_secs(8);
 const RECONNECT_ATTEMPTS: usize = 40;
-pub(super) const REQUIRED_CAPABILITIES: [Capability; 6] = [
+pub(super) const REQUIRED_CAPABILITIES: [Capability; 7] = [
     CAPABILITY_HELLO,
     CAPABILITY_THREAD_AUTHORITY,
     CAPABILITY_THREAD_STATUS,
     CAPABILITY_THREAD_SEND,
     CAPABILITY_THREAD_EVENTS,
     CAPABILITY_APPROVAL_DECIDE,
+    CAPABILITY_TRANSCRIPT_READ,
 ];
 
 impl DiscordGateway {
@@ -106,6 +108,7 @@ impl DiscordGateway {
         let mut approvals = ApprovalNotifications::default();
         let mut readback = ThreadTurnReadback::default();
         let mut canceling = false;
+        let mut needs_durable_terminal = false;
         loop {
             match daemon
                 .thread_events(
@@ -135,11 +138,15 @@ impl DiscordGateway {
                     {
                         report_response_delivery_failure(&error);
                     }
-                    if events.current_turn_id.is_none() && !needs_catch_up {
+                    if events.current_turn_id.as_deref() != Some(turn_id) && !needs_catch_up {
                         presentation.stop_typing();
                         approvals.clear();
                         self.sync_pending_approval(channel_id, None)?;
-                        return readback.finish(thread_id, turn_id);
+                        return if needs_durable_terminal {
+                            self.read_durable_thread_turn(daemon, thread_id, turn_id, &readback)
+                        } else {
+                            readback.finish(thread_id, turn_id)
+                        };
                     }
                     presentation.observe_running(
                         &self.platform,
@@ -150,11 +157,12 @@ impl DiscordGateway {
                 Err(GatewayError::Client(ClientError::DaemonResponse(error)))
                     if error.code == ERROR_LAGGED =>
                 {
-                    next_offset = None;
                     approvals.clear();
                     self.sync_pending_approval(channel_id, None)?;
                     canceling = false;
                     presentation.stop_typing();
+                    needs_durable_terminal = true;
+                    next_offset = None;
                 }
                 Err(error) if reconnectable(&error) => {
                     *daemon = self.reconnect_daemon()?;
@@ -162,12 +170,9 @@ impl DiscordGateway {
                     self.sync_pending_approval(channel_id, None)?;
                     canceling = false;
                     presentation.stop_typing();
-                    let status = daemon.thread_status(thread_id.into())?.thread;
-                    if status.live.current_turn_id.as_deref() == Some(turn_id) {
-                        next_offset = None;
-                    } else {
-                        return readback.finish(thread_id, turn_id);
-                    }
+                    readback.clear_terminal_facts();
+                    next_offset = Some(0);
+                    needs_durable_terminal = true;
                 }
                 Err(error) => return Err(error),
             }
@@ -185,6 +190,57 @@ impl DiscordGateway {
         Err(GatewayError::DaemonProtocol(
             "daemon unavailable during gateway recovery".into(),
         ))
+    }
+
+    fn read_durable_thread_turn(
+        &self,
+        daemon: &mut DaemonClient,
+        thread_id: &str,
+        turn_id: &str,
+        readback: &ThreadTurnReadback,
+    ) -> GatewayResult<FinishedThreadTurn> {
+        let run_id = readback.run_id.as_deref().ok_or_else(|| {
+            GatewayError::DaemonProtocol(format!(
+                "cannot safely recover thread {thread_id} turn {turn_id}: no exact run identifier was retained"
+            ))
+        })?;
+        let transcript = self.read_exact_run(daemon, run_id)?;
+        if transcript.run_id != run_id {
+            return Err(GatewayError::DaemonProtocol(format!(
+                "transcript.read returned run {} while recovering exact run {run_id}",
+                transcript.run_id
+            )));
+        }
+        match transcript.status {
+            RunStateName::Finished
+            | RunStateName::Failed
+            | RunStateName::Canceled
+            | RunStateName::Interrupted => Ok(FinishedThreadTurn {
+                status: transcript.status,
+                final_answer: transcript.final_answer,
+            }),
+            RunStateName::Running | RunStateName::CancelRequested => {
+                Err(GatewayError::DaemonProtocol(format!(
+                    "thread {thread_id} turn {turn_id} became idle while exact run {run_id} remained {}",
+                    transcript.status
+                )))
+            }
+        }
+    }
+
+    fn read_exact_run(
+        &self,
+        daemon: &mut DaemonClient,
+        run_id: &str,
+    ) -> GatewayResult<TranscriptReadResult> {
+        match daemon.transcript_read(run_id).map_err(GatewayError::from) {
+            Ok(transcript) => Ok(transcript),
+            Err(error) if reconnectable(&error) => {
+                *daemon = self.reconnect_daemon()?;
+                Ok(daemon.transcript_read(run_id)?)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn connect_daemon(&self, timeout: Duration) -> GatewayResult<DaemonClient> {
@@ -321,6 +377,7 @@ fn terminal_message(readback: FinishedThreadTurn) -> GatewayResult<Option<String
 
 #[derive(Default)]
 struct ThreadTurnReadback {
+    run_id: Option<String>,
     status: Option<RunStateName>,
     final_answer: Option<String>,
 }
@@ -333,6 +390,9 @@ struct FinishedThreadTurn {
 impl ThreadTurnReadback {
     fn fold(&mut self, entries: &[BufferedThreadEvent], turn_id: &str) {
         for entry in entries.iter().filter(|entry| entry.turn_id == turn_id) {
+            if let Some(run_id) = stream_event_run_id(&entry.event) {
+                self.run_id = Some(run_id.into());
+            }
             match &entry.event {
                 StreamEvent::Ledger { record } => match &record.event {
                     HarnessEvent::ModelResponded { output, .. } => {
@@ -348,6 +408,11 @@ impl ThreadTurnReadback {
         }
     }
 
+    fn clear_terminal_facts(&mut self) {
+        self.status = None;
+        self.final_answer = None;
+    }
+
     fn finish(self, thread_id: &str, turn_id: &str) -> GatewayResult<FinishedThreadTurn> {
         let Some(status) = self.status else {
             return Err(GatewayError::DaemonProtocol(format!(
@@ -358,6 +423,17 @@ impl ThreadTurnReadback {
             status,
             final_answer: self.final_answer,
         })
+    }
+}
+
+fn stream_event_run_id(event: &StreamEvent) -> Option<&str> {
+    match event {
+        StreamEvent::Ledger { record } => Some(record.event.run_id().as_str()),
+        StreamEvent::AssistantDelta { run_id, .. }
+        | StreamEvent::ApprovalRequested { run_id, .. }
+        | StreamEvent::Canceled { run_id }
+        | StreamEvent::CompletionClaimed { run_id, .. } => Some(run_id),
+        StreamEvent::Unknown(_) => None,
     }
 }
 
@@ -753,6 +829,118 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn thread_turn_readback_rejects_a_later_turn_terminal() {
+        let later = serde_json::from_value(json!({
+            "offset": 9,
+            "turn_id": "turn_later",
+            "event": {
+                "kind": "ledger",
+                "record": {
+                    "seq": 9,
+                    "occurred_at_ms": 9,
+                    "event": {
+                        "event": "run_finished",
+                        "run_id": "run_later"
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let mut readback = ThreadTurnReadback::default();
+
+        readback.fold(&[later], "turn_gateway");
+
+        assert_eq!(
+            readback
+                .finish("thread_news", "turn_gateway")
+                .err()
+                .unwrap()
+                .to_string(),
+            "daemon protocol error: thread thread_news turn turn_gateway became idle without a terminal event"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnect_replays_exact_completed_turn_and_clears_pending_approval() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("daemon.sock");
+        let daemon = spawn_reconnecting_completed_thread_daemon(&socket_path);
+        let rest = spawn_fake_rest(5, 200, None);
+        let platform = test_platform(&rest.base_url, discord_message(42, 200, "finish it"));
+        let mut gateway = test_gateway(&workspace, socket_path, platform);
+        let pending_approvals = Arc::clone(&gateway.pending_approvals);
+
+        gateway.poll_once().unwrap();
+
+        let daemon_requests = daemon.join().unwrap();
+        let rest_requests = rest.handle.join().unwrap();
+        assert_eq!(
+            daemon_requests
+                .iter()
+                .map(|request| request.method.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "thread.status",
+                "thread.send",
+                "thread.events",
+                "thread.events",
+                "thread.events",
+                "thread.events",
+                "transcript.read"
+            ]
+        );
+        assert!(pending_approvals.lock().unwrap().is_empty());
+        assert_reaction(&rest_requests[0], "PUT", EYES_EMOJI);
+        assert!(
+            rest_requests[1].body["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("Approval required:")
+        );
+        assert_eq!(rest_requests[2].body["content"], "recovered exact answer");
+        assert_reaction(&rest_requests[3], "DELETE", EYES_EMOJI);
+        assert_reaction(&rest_requests[4], "PUT", SUCCESS_EMOJI);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lag_recovers_the_exact_run_from_durable_terminal_readback() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("daemon.sock");
+        let daemon = spawn_lagged_completed_thread_daemon(&socket_path);
+        let rest = spawn_fake_rest(5, 200, None);
+        let platform = test_platform(&rest.base_url, discord_message(42, 200, "finish it"));
+        let mut gateway = test_gateway(&workspace, socket_path, platform);
+
+        gateway.poll_once().unwrap();
+
+        let daemon_requests = daemon.join().unwrap();
+        let rest_requests = rest.handle.join().unwrap();
+        assert_eq!(
+            daemon_requests
+                .iter()
+                .map(|request| request.method.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "thread.status",
+                "thread.send",
+                "thread.events",
+                "thread.events",
+                "thread.events",
+                "transcript.read"
+            ]
+        );
+        assert_reaction(&rest_requests[0], "PUT", EYES_EMOJI);
+        assert_eq!(rest_requests[1].path, "/channels/200/typing");
+        assert_eq!(rest_requests[2].body["content"], "durable answer after lag");
+        assert_reaction(&rest_requests[3], "DELETE", EYES_EMOJI);
+        assert_reaction(&rest_requests[4], "PUT", SUCCESS_EMOJI);
     }
 
     #[cfg(unix)]

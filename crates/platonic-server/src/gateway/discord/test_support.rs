@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use super::daemon_bridge::REQUIRED_CAPABILITIES;
+use super::daemon_bridge::{EVENT_PAGE_LIMIT, REQUIRED_CAPABILITIES};
 use super::{
     DiscordGateway, DiscordPlatform,
     commands::{
@@ -268,6 +268,390 @@ pub(super) fn spawn_gateway_roundtrip_daemon(
             }),
         );
         requests.push(terminal_events);
+        requests
+    })
+}
+
+#[cfg(unix)]
+pub(super) fn spawn_reconnecting_completed_thread_daemon(
+    socket_path: &Path,
+) -> thread::JoinHandle<Vec<Envelope>> {
+    let listener = UnixListener::bind(socket_path).unwrap();
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        {
+            let (gateway_stream, _) = listener.accept().unwrap();
+            let mut gateway_writer = gateway_stream.try_clone().unwrap();
+            let mut gateway_reader = BufReader::new(gateway_stream);
+            respond_hello(&mut gateway_reader, &mut gateway_writer);
+
+            let status = read_daemon_request(&mut gateway_reader);
+            write_daemon_response(
+                &mut gateway_writer,
+                status.id.clone(),
+                "thread.status",
+                json!({
+                    "thread": {
+                        "authority": {
+                            "thread_id": "thread_news",
+                            "parent_thread_id": null,
+                            "spawning_actor": "local",
+                            "cwd": "/tmp/workspace",
+                            "model": "test-model",
+                            "reasoning_effort": "medium",
+                            "approval_policy": "prompt",
+                            "created_at_ms": 1
+                        },
+                        "live": {
+                            "loaded": true,
+                            "current_turn_id": "turn_gateway"
+                        }
+                    }
+                }),
+            );
+            requests.push(status);
+
+            let send = read_daemon_request(&mut gateway_reader);
+            write_daemon_response(
+                &mut gateway_writer,
+                send.id.clone(),
+                "thread.send",
+                json!({
+                    "status": "steered",
+                    "thread_id": "thread_news",
+                    "turn_id": "turn_gateway"
+                }),
+            );
+            requests.push(send);
+
+            let pending = read_daemon_request(&mut gateway_reader);
+            write_daemon_response(
+                &mut gateway_writer,
+                pending.id.clone(),
+                "thread.events",
+                json!({
+                    "thread_id": "thread_news",
+                    "from_offset": 0,
+                    "next_offset": 1,
+                    "current_turn_id": "turn_gateway",
+                    "events": [{
+                        "offset": 0,
+                        "turn_id": "turn_gateway",
+                        "event": {
+                            "kind": "approval_requested",
+                            "run_id": "run_gateway",
+                            "tool_call_id": "call_exact",
+                            "tool_name": "file.write",
+                            "effect": "workspace_write",
+                            "reason": "approval required",
+                            "approval_preview": "write note.txt"
+                        }
+                    }]
+                }),
+            );
+            requests.push(pending);
+
+            let disconnected = read_daemon_request(&mut gateway_reader);
+            assert_eq!(disconnected.method.as_deref(), Some("thread.events"));
+            assert_eq!(request_params_value(&disconnected)["from_offset"], 1);
+            requests.push(disconnected);
+        }
+
+        let (recovered_stream, _) = listener.accept().unwrap();
+        let mut recovered_writer = recovered_stream.try_clone().unwrap();
+        let mut recovered_reader = BufReader::new(recovered_stream);
+        respond_hello(&mut recovered_reader, &mut recovered_writer);
+        let replay = read_daemon_request(&mut recovered_reader);
+        assert_eq!(replay.method.as_deref(), Some("thread.events"));
+        assert_eq!(request_params_value(&replay)["from_offset"], 0);
+        let mut replay_events = vec![
+            json!({
+                "offset": 0,
+                "turn_id": "turn_gateway",
+                "event": {
+                    "kind": "approval_requested",
+                    "run_id": "run_gateway",
+                    "tool_call_id": "call_exact",
+                    "tool_name": "file.write",
+                    "effect": "workspace_write",
+                    "reason": "approval required",
+                    "approval_preview": "write note.txt"
+                }
+            }),
+            json!({
+                "offset": 1,
+                "turn_id": "turn_gateway",
+                "event": {
+                    "kind": "ledger",
+                    "record": {
+                        "seq": 1,
+                        "occurred_at_ms": 1,
+                        "event": {
+                            "event": "approval_granted",
+                            "run_id": "run_gateway",
+                            "call_id": "call_exact",
+                            "actor_id": "jerome"
+                        }
+                    }
+                }
+            }),
+        ];
+        replay_events.extend((2..EVENT_PAGE_LIMIT as u64).map(|offset| {
+            json!({
+                "offset": offset,
+                "turn_id": "turn_gateway",
+                "event": {
+                    "kind": "assistant_delta",
+                    "run_id": "run_gateway",
+                    "turn_id": "model_turn",
+                    "step": 1,
+                    "delta_index": offset,
+                    "text": "partial"
+                }
+            })
+        }));
+        write_daemon_response(
+            &mut recovered_writer,
+            replay.id.clone(),
+            "thread.events",
+            json!({
+                "thread_id": "thread_news",
+                "from_offset": 0,
+                "next_offset": EVENT_PAGE_LIMIT,
+                "current_turn_id": null,
+                "events": replay_events
+            }),
+        );
+        requests.push(replay);
+
+        let terminal = read_daemon_request(&mut recovered_reader);
+        assert_eq!(terminal.method.as_deref(), Some("thread.events"));
+        assert_eq!(
+            request_params_value(&terminal)["from_offset"],
+            EVENT_PAGE_LIMIT
+        );
+        write_daemon_response(
+            &mut recovered_writer,
+            terminal.id.clone(),
+            "thread.events",
+            json!({
+                "thread_id": "thread_news",
+                "from_offset": EVENT_PAGE_LIMIT,
+                "next_offset": EVENT_PAGE_LIMIT + 3,
+                "current_turn_id": "turn_later",
+                "events": [
+                    {
+                        "offset": EVENT_PAGE_LIMIT,
+                        "turn_id": "turn_gateway",
+                        "event": {
+                            "kind": "ledger",
+                            "record": {
+                                "seq": EVENT_PAGE_LIMIT,
+                                "occurred_at_ms": EVENT_PAGE_LIMIT,
+                                "event": {
+                                    "event": "model_responded",
+                                    "run_id": "run_gateway",
+                                    "turn_id": "model_turn",
+                                    "step": 1,
+                                    "output": {
+                                        "role": "assistant",
+                                        "content": "recovered exact answer"
+                                    },
+                                    "proposed_calls": [],
+                                    "usage": null
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "offset": EVENT_PAGE_LIMIT + 1,
+                        "turn_id": "turn_gateway",
+                        "event": {
+                            "kind": "ledger",
+                            "record": {
+                                "seq": EVENT_PAGE_LIMIT + 1,
+                                "occurred_at_ms": EVENT_PAGE_LIMIT + 1,
+                                "event": {
+                                    "event": "run_finished",
+                                    "run_id": "run_gateway"
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "offset": EVENT_PAGE_LIMIT + 2,
+                        "turn_id": "turn_later",
+                        "event": {
+                            "kind": "ledger",
+                            "record": {
+                                "seq": EVENT_PAGE_LIMIT + 2,
+                                "occurred_at_ms": EVENT_PAGE_LIMIT + 2,
+                                "event": {
+                                    "event": "model_responded",
+                                    "run_id": "run_later",
+                                    "turn_id": "later_model_turn",
+                                    "step": 1,
+                                    "output": {
+                                        "role": "assistant",
+                                        "content": "wrong later answer"
+                                    },
+                                    "proposed_calls": [],
+                                    "usage": null
+                                }
+                            }
+                        }
+                    }
+                ]
+            }),
+        );
+        requests.push(terminal);
+
+        let transcript = read_daemon_request(&mut recovered_reader);
+        assert_eq!(transcript.method.as_deref(), Some("transcript.read"));
+        assert_eq!(request_params_value(&transcript)["run_id"], "run_gateway");
+        write_daemon_response(
+            &mut recovered_writer,
+            transcript.id.clone(),
+            "transcript.read",
+            json!({
+                "run_id": "run_gateway",
+                "status": "finished",
+                "final_answer": "recovered exact answer",
+                "transcript": "not parsed"
+            }),
+        );
+        requests.push(transcript);
+        requests
+    })
+}
+
+#[cfg(unix)]
+pub(super) fn spawn_lagged_completed_thread_daemon(
+    socket_path: &Path,
+) -> thread::JoinHandle<Vec<Envelope>> {
+    let listener = UnixListener::bind(socket_path).unwrap();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut requests = Vec::new();
+        respond_hello(&mut reader, &mut writer);
+
+        let status = read_daemon_request(&mut reader);
+        write_daemon_response(
+            &mut writer,
+            status.id.clone(),
+            "thread.status",
+            json!({
+                "thread": {
+                    "authority": {
+                        "thread_id": "thread_news",
+                        "parent_thread_id": null,
+                        "spawning_actor": "local",
+                        "cwd": "/tmp/workspace",
+                        "model": "test-model",
+                        "reasoning_effort": "medium",
+                        "approval_policy": "prompt",
+                        "created_at_ms": 1
+                    },
+                    "live": {
+                        "loaded": true,
+                        "current_turn_id": "turn_gateway"
+                    }
+                }
+            }),
+        );
+        requests.push(status);
+
+        let send = read_daemon_request(&mut reader);
+        write_daemon_response(
+            &mut writer,
+            send.id.clone(),
+            "thread.send",
+            json!({
+                "status": "steered",
+                "thread_id": "thread_news",
+                "turn_id": "turn_gateway"
+            }),
+        );
+        requests.push(send);
+
+        let started = read_daemon_request(&mut reader);
+        write_daemon_response(
+            &mut writer,
+            started.id.clone(),
+            "thread.events",
+            json!({
+                "thread_id": "thread_news",
+                "from_offset": 0,
+                "next_offset": 1,
+                "current_turn_id": "turn_gateway",
+                "events": [{
+                    "offset": 0,
+                    "turn_id": "turn_gateway",
+                    "event": {
+                        "kind": "ledger",
+                        "record": {
+                            "seq": 0,
+                            "occurred_at_ms": 0,
+                            "event": {
+                                "event": "run_started",
+                                "run_id": "run_gateway",
+                                "agent_id": "plato"
+                            }
+                        }
+                    }
+                }]
+            }),
+        );
+        requests.push(started);
+
+        let lagged = read_daemon_request(&mut reader);
+        serde_json::to_writer(
+            &mut writer,
+            &Envelope::error(
+                lagged.id.clone(),
+                Some("thread.events".into()),
+                platonic_protocol::ERROR_LAGGED,
+                "requested thread events were evicted; first available offset is 8",
+            ),
+        )
+        .unwrap();
+        writer.write_all(b"\n").unwrap();
+        writer.flush().unwrap();
+        requests.push(lagged);
+
+        let tip = read_daemon_request(&mut reader);
+        assert!(request_params_value(&tip).get("from_offset").is_none());
+        write_daemon_response(
+            &mut writer,
+            tip.id.clone(),
+            "thread.events",
+            json!({
+                "thread_id": "thread_news",
+                "from_offset": 8,
+                "next_offset": 8,
+                "current_turn_id": null,
+                "events": []
+            }),
+        );
+        requests.push(tip);
+
+        let transcript = read_daemon_request(&mut reader);
+        assert_eq!(transcript.method.as_deref(), Some("transcript.read"));
+        assert_eq!(request_params_value(&transcript)["run_id"], "run_gateway");
+        write_daemon_response(
+            &mut writer,
+            transcript.id.clone(),
+            "transcript.read",
+            json!({
+                "run_id": "run_gateway",
+                "status": "finished",
+                "final_answer": "durable answer after lag",
+                "transcript": "not parsed"
+            }),
+        );
+        requests.push(transcript);
         requests
     })
 }

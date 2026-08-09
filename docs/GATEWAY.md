@@ -154,7 +154,7 @@ Also unset any custom provider credential variable named by your config. The
 gateway fails closed if it can see a provider credential. Leave the gateway
 running. Before the first Discord REST request or WebSocket connection, both
 the wrapper and direct gateway require a bounded daemon `hello`, the exact
-workspace ID, all six daemon capabilities consumed by the connector, and a
+workspace ID, all seven daemon capabilities consumed by the connector, and a
 successful authority readback for every mapped thread.
 
 ## 5. Receive the first reply
