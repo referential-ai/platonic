@@ -103,7 +103,7 @@ fn child_and_embedded_provider_failure_have_identical_ordered_events() {
             wait_for_terminal_status(&mut embedded_client, &embedded_run.run_id),
             RunStateName::Failed
         );
-        let embedded_records = read_sqlite_run(&embedded.ledger_path, &embedded_run.run_id);
+        let embedded_records = read_sqlite_run(&embedded.ledger_path(), &embedded_run.run_id);
         embedded_daemon.stop(embedded_client);
 
         let daemon = ProofDaemon::start(&child);
@@ -115,7 +115,7 @@ fn child_and_embedded_provider_failure_have_identical_ordered_events() {
             wait_for_terminal_status(&mut client, &child_run.run_id),
             RunStateName::Failed
         );
-        let child_records = read_sqlite_run(&child.ledger_path, &child_run.run_id);
+        let child_records = read_sqlite_run(&child.ledger_path(), &child_run.run_id);
 
         assert_eq!(
             normalize_records(&embedded_records),
@@ -185,9 +185,10 @@ fn killed_wedged_child_has_no_ledger_handle_and_other_run_stays_healthy() {
 
     #[cfg(target_os = "linux")]
     {
-        assert!(linux_process_has_fd(daemon_pid, &proof.ledger_path));
-        assert!(!linux_process_has_fd(first_child, &proof.ledger_path));
-        assert!(!linux_process_has_fd(second_child, &proof.ledger_path));
+        let ledger_path = proof.ledger_path();
+        assert!(linux_process_has_fd(daemon_pid, &ledger_path));
+        assert!(!linux_process_has_fd(first_child, &ledger_path));
+        assert!(!linux_process_has_fd(second_child, &ledger_path));
     }
 
     kill_process_exact(first_child);
@@ -253,7 +254,7 @@ fn child_and_embedded_cancellation_with_key() {
         RunStateName::Canceled
     );
     provider.release.send(()).unwrap();
-    let embedded_records = read_sqlite_run(&embedded.ledger_path, &embedded_run.run_id);
+    let embedded_records = read_sqlite_run(&embedded.ledger_path(), &embedded_run.run_id);
     embedded_daemon.stop(embedded_client);
 
     let daemon = ProofDaemon::start(&child);
@@ -271,7 +272,7 @@ fn child_and_embedded_cancellation_with_key() {
         RunStateName::Canceled
     );
     provider.release.send(()).unwrap();
-    let child_records = read_sqlite_run(&child.ledger_path, &child_run.run_id);
+    let child_records = read_sqlite_run(&child.ledger_path(), &child_run.run_id);
 
     assert_eq!(
         normalize_records(&embedded_records),
@@ -318,7 +319,7 @@ fn one_host_daemon_serves_two_workspaces_and_coexists_with_legacy_daemon() {
     for (proof, scenario, provider, direct) in prepared {
         let mut client = host.connect_workspace(&proof.workspace);
         let hello = client.hello(&proof.workspace).unwrap();
-        assert_eq!(Path::new(&hello.ledger_path), proof.ledger_path);
+        assert_eq!(Path::new(&hello.ledger_path), proof.ledger_path());
         let daemon = run_daemon_leg(&proof, scenario, &mut client);
         drop(client);
         assert_scenario_conformance(scenario, direct, daemon, provider.join());
@@ -1230,7 +1231,7 @@ fn run_scenario(scenario: Scenario) {
     let daemon = ProofDaemon::start(&proof);
     let mut client = daemon.connect();
     let hello = client.hello(&proof.workspace).unwrap();
-    assert_eq!(Path::new(&hello.ledger_path), proof.ledger_path);
+    assert_eq!(Path::new(&hello.ledger_path), proof.ledger_path());
     let daemon_leg = run_daemon_leg(&proof, scenario, &mut client);
     daemon.stop(client);
 
@@ -1300,7 +1301,7 @@ fn run_direct_leg(proof: &ProofContext, scenario: Scenario) -> RunEvidence {
     let run_id = output_field(&stderr, "run_id: ");
     assert_eq!(
         Path::new(&output_field(&stderr, "ledger_path: ")),
-        proof.ledger_path
+        proof.ledger_path()
     );
     let answer = String::from_utf8(output.stdout)
         .unwrap()
@@ -1308,7 +1309,7 @@ fn run_direct_leg(proof: &ProofContext, scenario: Scenario) -> RunEvidence {
         .to_owned();
     assert_eq!(answer, scenario.answer());
 
-    let records = read_sqlite_run(&proof.ledger_path, &run_id);
+    let records = read_sqlite_run(&proof.ledger_path(), &run_id);
     assert!(
         records
             .iter()
@@ -1346,7 +1347,7 @@ fn run_daemon_leg(
     let started = client
         .run_start(scenario.question().into(), Some("plato.toml".into()), false)
         .unwrap();
-    assert_eq!(Path::new(&started.ledger_path), proof.ledger_path);
+    assert_eq!(Path::new(&started.ledger_path), proof.ledger_path());
     let deadline = Instant::now() + PROOF_TIMEOUT;
     let mut approval_decided = false;
     let mut from_offset = Some(0);
@@ -1398,7 +1399,7 @@ fn run_daemon_leg(
     assert_eq!(transcript.status, RunStateName::Finished);
     let answer = transcript.final_answer.unwrap();
     assert_eq!(answer, scenario.answer());
-    let records = read_sqlite_run(&proof.ledger_path, &started.run_id);
+    let records = read_sqlite_run(&proof.ledger_path(), &started.run_id);
     RunEvidence::from_leg(records, answer, fs::read(&proof.fixture_path).unwrap())
 }
 
@@ -1718,7 +1719,6 @@ struct ProofContext {
     config_path: PathBuf,
     fixture_path: PathBuf,
     socket_path: PathBuf,
-    ledger_path: PathBuf,
     /// The host's server-wide store, where thread state lives.
     server_db_path: PathBuf,
     #[cfg(unix)]
@@ -1752,7 +1752,7 @@ impl ProofContext {
         let workspace_id = paths::workspace_id(&workspace).unwrap();
 
         #[cfg(unix)]
-        let (socket_path, ledger_path, runtime_root, state_root) = {
+        let (socket_path, runtime_root, state_root) = {
             // The runtime root holds sockets, and sockaddr_un caps sun_path at
             // 104 bytes on macOS against 108 on Linux. A runtime root inside
             // the temporary directory overflows that on macOS runners, so the
@@ -1778,11 +1778,6 @@ impl ProofContext {
                     .join("workspaces")
                     .join(&workspace_id)
                     .join("agent.sock"),
-                state_root
-                    .join("platonic")
-                    .join("workspaces")
-                    .join(&workspace_id)
-                    .join("agent.db"),
                 runtime_root,
                 state_root,
             )
@@ -1795,15 +1790,10 @@ impl ProofContext {
         );
 
         #[cfg(windows)]
-        let (socket_path, ledger_path, local_app_data) = {
+        let (socket_path, local_app_data) = {
             let local_app_data = root.path().join("local-app-data");
             (
                 PathBuf::from(format!(r"\\.\pipe\plato-agent-{workspace_id}")),
-                local_app_data
-                    .join("platonic")
-                    .join("workspaces")
-                    .join(&workspace_id)
-                    .join("agent.db"),
                 local_app_data,
             )
         };
@@ -1821,7 +1811,6 @@ impl ProofContext {
             _root: root,
             workspace,
             socket_path,
-            ledger_path,
             server_db_path,
             #[cfg(unix)]
             runtime_root,
@@ -1830,6 +1819,20 @@ impl ProofContext {
             #[cfg(windows)]
             local_app_data,
         }
+    }
+
+    fn ledger_path(&self) -> PathBuf {
+        let connection =
+            Connection::open_with_flags(&self.server_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        connection
+            .query_row(
+                "SELECT ledger_path FROM workspaces WHERE root = ?1",
+                params![self.workspace.canonicalize().unwrap().to_string_lossy()],
+                |row| row.get::<_, String>(0),
+            )
+            .map(PathBuf::from)
+            .unwrap()
     }
 
     fn host_socket_path(&self) -> PathBuf {

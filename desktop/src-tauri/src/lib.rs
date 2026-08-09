@@ -1095,13 +1095,19 @@ fn read_run_from_workspace(
 }
 
 fn validate_hello(workspace_root: &Path, hello: &HelloResult) -> Result<(), DesktopError> {
-    let expected_workspace_id = paths::workspace_id(workspace_root)
+    let legacy_workspace_id = paths::workspace_id(workspace_root)
         .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
-    if hello.workspace_id != expected_workspace_id {
+    let minted_workspace_id = hello
+        .workspace_id
+        .strip_prefix("ws-")
+        .is_some_and(|suffix| {
+            suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    if hello.workspace_id != legacy_workspace_id && !minted_workspace_id {
         return Err(DesktopError::new(
             "incompatible_daemon",
             format!(
-                "Incompatible daemon: expected workspace {expected_workspace_id}, got {}",
+                "Incompatible daemon: expected workspace {legacy_workspace_id} or a server-minted id, got {}",
                 hello.workspace_id
             ),
         ));
@@ -2641,7 +2647,21 @@ mod tests {
     }
 
     #[test]
-    fn hello_validation_rejects_a_different_workspace() {
+    fn hello_validation_accepts_the_registry_minted_workspace_id() {
+        let workspace = tempfile::tempdir().unwrap();
+        let hello = HelloResult {
+            daemon_version: "0.1.0".into(),
+            workspace_id: "ws-0123456789abcdef".into(),
+            ledger_path: "/secret/ledger.db".into(),
+            capabilities: REQUIRED_CAPABILITIES.to_vec(),
+            daemon_scope: None,
+        };
+
+        validate_hello(workspace.path(), &hello).unwrap();
+    }
+
+    #[test]
+    fn hello_validation_rejects_an_id_that_is_neither_legacy_nor_minted() {
         let workspace = tempfile::tempdir().unwrap();
         let hello = HelloResult {
             daemon_version: "0.1.0".into(),
@@ -2659,7 +2679,8 @@ mod tests {
                 .message
                 .starts_with("Incompatible daemon: expected workspace ")
         );
-        assert!(error.message.ends_with(", got other-workspace"));
+        assert!(error.message.contains(" or a server-minted id, got "));
+        assert!(error.message.ends_with("other-workspace"));
         assert!(!error.message.contains("ledger.db"));
     }
 

@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::{
     fs::File,
     io::{BufRead, BufReader},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 const LEDGER_VERSION: u32 = 2;
@@ -38,6 +38,9 @@ pub enum OfflineError {
     /// The selected run does not exist.
     #[error("run not found in sqlite ledger: {0}")]
     RunNotFound(String),
+    /// The current directory has no workspace registry record.
+    #[error("workspace is not registered: {0}; run platonic workspace create")]
+    WorkspaceUnregistered(PathBuf),
     /// Local filesystem I/O failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -59,6 +62,25 @@ pub type OfflineResult<T> = Result<T, OfflineError>;
 struct LedgerLine {
     v: u32,
     record: RecordedEvent,
+}
+
+/// Resolves a workspace ledger through the server registry without contacting it.
+pub fn workspace_ledger_path(
+    server_db_path: &Path,
+    workspace_root: &Path,
+) -> OfflineResult<PathBuf> {
+    let workspace_root = workspace_root.canonicalize()?;
+    let connection = Connection::open_with_flags(server_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection
+        .query_row(
+            "SELECT ledger_path FROM workspaces WHERE root = ?1
+             ORDER BY created_at_ms, name LIMIT 1",
+            params![workspace_root.to_string_lossy()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(PathBuf::from)
+        .ok_or(OfflineError::WorkspaceUnregistered(workspace_root))
 }
 
 /// Replays one JSONL ledger without contacting or linking the server.

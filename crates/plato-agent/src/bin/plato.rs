@@ -258,7 +258,10 @@ fn replay_path(
 ) -> AppResult<PathBuf> {
     match (db, file) {
         (Some(Some(path)), None) => Ok(resolve_cli_path(path, workspace_root)),
-        (Some(None) | None, None) => Ok(paths::default_ledger_path(workspace_root)?),
+        (Some(None) | None, None) => Ok(offline::workspace_ledger_path(
+            &paths::server_db_path()?,
+            workspace_root,
+        )?),
         (None, Some(path)) => Ok(resolve_cli_path(path, workspace_root)),
         (Some(_), Some(_)) => Err(AppError::Config(
             "plato replay accepts either --db or FILE, not both".into(),
@@ -693,7 +696,8 @@ fn resolve_cli_path(path: PathBuf, workspace_root: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use clap::CommandFactory;
-    use platonic_core::RunId;
+    use platonic_core::{AgentId, HarnessEvent, RecordedEvent, RunId};
+    use rusqlite::params;
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -849,13 +853,109 @@ mod tests {
     }
 
     #[test]
-    fn bare_replay_uses_default_sqlite_path() {
+    fn registered_replay_survives_workspace_relocation() {
         let _guard = env_lock();
-        let workspace = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
         let state = tempfile::tempdir().unwrap();
         temp_env::with_var("XDG_STATE_HOME", Some(state.path().as_os_str()), || {
-            let path = replay_path(None, None, workspace.path()).unwrap();
-            assert_eq!(path.file_name().unwrap(), "agent.db");
+            let server_db_path = paths::server_db_path().unwrap();
+            std::fs::create_dir_all(server_db_path.parent().unwrap()).unwrap();
+            let server = rusqlite::Connection::open(&server_db_path).unwrap();
+            server
+                .execute_batch(
+                    "CREATE TABLE workspaces (
+                       id TEXT PRIMARY KEY,
+                       name TEXT NOT NULL,
+                       root TEXT NOT NULL,
+                       ledger_path TEXT NOT NULL,
+                       created_at_ms INTEGER NOT NULL
+                     );",
+                )
+                .unwrap();
+            let ledger_path = state.path().join("platonic/workspaces/ws-proof/ledger.db");
+            std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
+            let ledger = rusqlite::Connection::open(&ledger_path).unwrap();
+            ledger
+                .execute_batch(
+                    "CREATE TABLE ledger_events (
+                       run_id TEXT NOT NULL,
+                       seq INTEGER NOT NULL,
+                       occurred_at_ms INTEGER NOT NULL,
+                       v INTEGER NOT NULL,
+                       event_json TEXT NOT NULL,
+                       PRIMARY KEY (run_id, seq)
+                     );
+                     PRAGMA user_version = 1;",
+                )
+                .unwrap();
+            let run_id = RunId::new("run_old").unwrap();
+            for record in [
+                RecordedEvent {
+                    seq: 0,
+                    occurred_at_ms: 0,
+                    event: HarnessEvent::RunStarted {
+                        run_id: run_id.clone(),
+                        agent_id: AgentId::new("agent_1").unwrap(),
+                    },
+                },
+                RecordedEvent {
+                    seq: 1,
+                    occurred_at_ms: 1,
+                    event: HarnessEvent::RunFailed {
+                        run_id: run_id.clone(),
+                        reason: "preserved proof".into(),
+                    },
+                },
+            ] {
+                ledger
+                    .execute(
+                        "INSERT INTO ledger_events
+                         (run_id, seq, occurred_at_ms, v, event_json)
+                         VALUES (?1, ?2, ?3, 2, ?4)",
+                        params![
+                            run_id.as_str(),
+                            record.seq as i64,
+                            record.occurred_at_ms as i64,
+                            serde_json::to_string(&record.event).unwrap()
+                        ],
+                    )
+                    .unwrap();
+            }
+            drop(ledger);
+            server
+                .execute(
+                    "INSERT INTO workspaces
+                     (id, name, root, ledger_path, created_at_ms)
+                     VALUES ('ws-proof', 'proof', ?1, ?2, 1)",
+                    params![
+                        workspace.canonicalize().unwrap().to_string_lossy(),
+                        ledger_path.to_string_lossy()
+                    ],
+                )
+                .unwrap();
+
+            assert_eq!(replay_path(None, None, &workspace).unwrap(), ledger_path);
+            assert!(
+                offline::replay_sqlite(&ledger_path, Some("run_old"))
+                    .unwrap()
+                    .contains("final_phase: Failed")
+            );
+
+            let relocated = root.path().join("relocated");
+            std::fs::rename(&workspace, &relocated).unwrap();
+            server
+                .execute(
+                    "UPDATE workspaces SET root = ?2 WHERE id = ?1",
+                    params![
+                        "ws-proof",
+                        relocated.canonicalize().unwrap().to_string_lossy()
+                    ],
+                )
+                .unwrap();
+            assert_eq!(replay_path(None, None, &relocated).unwrap(), ledger_path);
+            assert!(offline::replay_sqlite(&ledger_path, Some("run_old")).is_ok());
         });
     }
 

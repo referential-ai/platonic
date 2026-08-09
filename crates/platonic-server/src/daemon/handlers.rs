@@ -116,20 +116,8 @@ pub(super) fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Enve
 }
 
 fn handle_hello(runtime: &DaemonRuntime, request: Envelope, params: HelloParams) -> Envelope {
-    if params.workspace_id != runtime.paths.workspace_id {
-        return Envelope::error(
-            request.id,
-            Some("hello".into()),
-            ERROR_WORKSPACE_MISMATCH,
-            format!(
-                "workspace_id mismatch: expected {}, got {}",
-                runtime.paths.workspace_id, params.workspace_id
-            ),
-        );
-    }
-
-    match PathBuf::from(&params.workspace_root).canonicalize() {
-        Ok(root) if root == runtime.paths.workspace_root => {}
+    let request_root = match PathBuf::from(&params.workspace_root).canonicalize() {
+        Ok(root) if root == runtime.paths.workspace_root => root,
         Ok(root) => {
             return Envelope::error(
                 request.id,
@@ -150,6 +138,30 @@ fn handle_hello(runtime: &DaemonRuntime, request: Envelope, params: HelloParams)
                 format!("workspace_root cannot be resolved: {error}"),
             );
         }
+    };
+    let legacy_workspace_id = match crate::paths::workspace_id(&request_root) {
+        Ok(workspace_id) => workspace_id,
+        Err(error) => {
+            return Envelope::error(
+                request.id,
+                Some("hello".into()),
+                ERROR_WORKSPACE_MISMATCH,
+                format!("workspace_id cannot be derived: {error}"),
+            );
+        }
+    };
+    if params.workspace_id != runtime.paths.workspace_id
+        && params.workspace_id != legacy_workspace_id
+    {
+        return Envelope::error(
+            request.id,
+            Some("hello".into()),
+            ERROR_WORKSPACE_MISMATCH,
+            format!(
+                "workspace_id mismatch: expected {}, got {}",
+                runtime.paths.workspace_id, params.workspace_id
+            ),
+        );
     }
 
     let store = match runtime.paths.server_store() {
@@ -157,7 +169,17 @@ fn handle_hello(runtime: &DaemonRuntime, request: Envelope, params: HelloParams)
         Err(error) => return store_error(request.id, "hello", error),
     };
     match store.workspace_by_root(&runtime.paths.workspace_root.to_string_lossy()) {
-        Ok(Some(_)) => {}
+        Ok(Some(record))
+            if record.id == runtime.paths.workspace_id
+                && Path::new(&record.ledger_path) == runtime.paths.ledger_path => {}
+        Ok(Some(_)) => {
+            return Envelope::error(
+                request.id,
+                Some("hello".into()),
+                ERROR_INTERNAL,
+                "workspace runtime does not match its registry record",
+            );
+        }
         Ok(None) => {
             return Envelope::error(
                 request.id,
@@ -1898,12 +1920,14 @@ fn handle_workspace_create(
         Err(error) => return store_error(request.id, "workspace.create", error),
     }
     let now_ms = crate::thread_authority::now_ms();
-    let ledger_path = match crate::paths::default_sqlite_path(&root) {
-        Ok(path) => path,
-        Err(error) => return store_error(request.id, "workspace.create", error),
-    };
+    let workspace_id = crate::server_store::mint_workspace_id(name, now_ms);
+    let ledger_path =
+        match crate::paths::workspace_sqlite_path(&runtime.paths.server_db_path, &workspace_id) {
+            Ok(path) => path,
+            Err(error) => return store_error(request.id, "workspace.create", error),
+        };
     match store.register_workspace(
-        &crate::server_store::mint_workspace_id(name, now_ms),
+        &workspace_id,
         name,
         &root.to_string_lossy(),
         &ledger_path.to_string_lossy(),
@@ -2588,13 +2612,13 @@ mod tests {
             .join("platonic")
             .join("workspaces")
             .join("thread-tests")
-            .join("agent.db");
+            .join("ledger.db");
         let runtime = DaemonRuntime::new(crate::daemon::server::DaemonPaths {
             workspace_root: workspace_root.canonicalize().unwrap(),
             workspace_id: "thread-tests".into(),
             socket_path: root.path().join("agent.sock"),
             lock_path: root.path().join("agent.lock"),
-            server_db_path: root.path().join("server.db"),
+            server_db_path: root.path().join("state/platonic/server.db"),
             ledger_path,
         });
         (root, runtime)
@@ -2673,6 +2697,17 @@ mod tests {
         assert!(id.starts_with("ws-"), "id should be minted, got {id}");
         assert_eq!(created.workspace.name, "alpha");
         assert_eq!(created.workspace.health, WorkspaceHealthName::Present);
+        assert_eq!(
+            Path::new(&created.workspace.ledger_path),
+            runtime
+                .paths
+                .server_db_path
+                .parent()
+                .unwrap()
+                .join("workspaces")
+                .join(&id)
+                .join("ledger.db")
+        );
 
         // The same name twice is refused rather than silently duplicated.
         let duplicate = handle_request(
@@ -2750,6 +2785,7 @@ mod tests {
         );
         let moved: WorkspaceStatusResult = response_result(&moved);
         assert_eq!(moved.workspace.id, id);
+        assert_eq!(moved.workspace.ledger_path, created.workspace.ledger_path);
         assert_eq!(
             moved.workspace.created_at_ms,
             created.workspace.created_at_ms
@@ -4957,7 +4993,7 @@ enabled = ["file.read"]
             lock_path: root.path().join("a.lock"),
             ledger_path: root
                 .path()
-                .join("state/platonic/workspaces/terminal-order/agent.db"),
+                .join("state/platonic/workspaces/terminal-order/ledger.db"),
             server_db_path: root.path().join("state/platonic/server.db"),
         });
         let case = if cleanup_failure {

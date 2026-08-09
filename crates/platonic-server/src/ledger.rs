@@ -1541,7 +1541,7 @@ fn prepare_private_directories(location: &DefaultSqlitePath) -> std::io::Result<
             "default ledger workspaces directory has no parent",
         )
     })?;
-    if location.as_path().file_name() != Some(std::ffi::OsStr::new("agent.db"))
+    if location.as_path().file_name() != Some(std::ffi::OsStr::new("ledger.db"))
         || workspaces_directory.file_name() != Some(std::ffi::OsStr::new("workspaces"))
         || state_root.file_name() != Some(std::ffi::OsStr::new("platonic"))
     {
@@ -1985,7 +1985,7 @@ mod tests {
                 .join("platonic")
                 .join("workspaces")
                 .join("workspace-1")
-                .join("agent.db"),
+                .join("ledger.db"),
         )
     }
 

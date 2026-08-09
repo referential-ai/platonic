@@ -273,21 +273,40 @@ fn replay_cli_reads_literal_v1_without_mutation_and_rejects_future_schema() {
     let proof = ProofContext::new();
     let workspace_id = paths::workspace_id(&proof.workspace).unwrap();
     #[cfg(unix)]
-    let v1_path = proof
+    let legacy_path = proof
         .state_root
         .join("platonic")
         .join("workspaces")
         .join(&workspace_id)
         .join("agent.db");
     #[cfg(windows)]
-    let v1_path = proof
+    let legacy_path = proof
         .local_app_data
         .join("platonic")
         .join("workspaces")
         .join(&workspace_id)
         .join("agent.db");
-    write_literal_v1_sqlite(&v1_path);
-    let bytes_before = fs::read(&v1_path).unwrap();
+    write_literal_v1_sqlite(&legacy_path);
+    let bytes_before = fs::read(&legacy_path).unwrap();
+
+    ProofDaemon::start(&proof).stop();
+    #[cfg(unix)]
+    let server_db_path = proof.state_root.join("platonic/server.db");
+    #[cfg(windows)]
+    let server_db_path = proof.local_app_data.join("platonic/server.db");
+    let registry = Connection::open(server_db_path).unwrap();
+    let ledger_path = PathBuf::from(
+        registry
+            .query_row(
+                "SELECT ledger_path FROM workspaces WHERE root = ?1",
+                params![proof.workspace.canonicalize().unwrap().to_string_lossy()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+    );
+    drop(registry);
+    assert!(!legacy_path.exists());
+    assert_eq!(fs::read(&ledger_path).unwrap(), bytes_before);
 
     let latest = proof.cli_output(&["replay".into()]);
     assert_success("literal v1 latest replay", &latest);
@@ -299,7 +318,7 @@ fn replay_cli_reads_literal_v1_without_mutation_and_rejects_future_schema() {
             .unwrap()
             .contains("assistant: old answer")
     );
-    assert_eq!(fs::read(&v1_path).unwrap(), bytes_before);
+    assert_eq!(fs::read(&ledger_path).unwrap(), bytes_before);
 
     let v6_path = proof.workspace.join("schema-v6.db");
     let connection = Connection::open(&v6_path).unwrap();

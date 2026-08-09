@@ -353,19 +353,28 @@ On startup it prints:
 ```text
 workspace_id: <workspace-id>
 socket_path: <daemon-endpoint>
-ledger_path: <state-path>/agent.db
+ledger_path: <state-path>/ledger.db
 ```
 
-Default paths are keyed by the workspace id:
+Default ledger paths are keyed by the server-minted workspace id stored in the
+registry. Moving a workspace updates its registry root without changing that
+id or its history:
+
+- Unix ledger: `${XDG_STATE_HOME:-$HOME/.local/state}/platonic/workspaces/<workspace-id>/ledger.db`
+- Windows ledger: `%LOCALAPPDATA%\platonic\workspaces\<workspace-id>\ledger.db`
+
+On first attach, a registered workspace that still points at the legacy
+path-derived `agent.db` is moved to this layout and its registry row is updated.
+
+Explicit legacy daemon endpoints remain keyed by the path-derived workspace id
+during migration:
 
 - Unix socket: `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/platonic/workspaces/<workspace-id>/agent.sock`
 - Unix lock: `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/platonic/workspaces/<workspace-id>/agent.lock`
-- Unix ledger: `${XDG_STATE_HOME:-$HOME/.local/state}/platonic/workspaces/<workspace-id>/agent.db`
 - Windows pipe: `\\.\pipe\plato-agent-<workspace-id>`
-- Windows lock and ledger: `%LOCALAPPDATA%\platonic\workspaces\<workspace-id>\agent.lock` and `agent.db`
+- Windows lock: `%LOCALAPPDATA%\platonic\workspaces\<workspace-id>\agent.lock`
 
-Those workspace socket and lock paths remain for the explicit legacy daemon
-clients during migration. Interactive `plato` uses the host endpoint above.
+Interactive `plato` uses the host endpoint above.
 One-shot `plato "question"` auto-ensures the host server and always uses its
 server-owned workspace ledger.
 
