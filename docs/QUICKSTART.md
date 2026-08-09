@@ -173,9 +173,10 @@ export DISCORD_BOT_TOKEN="$(cat /path/to/discord-bot-token)"
 platonic gateway discord --config ~/.config/plato/gateway.toml
 ```
 
-The gateway entry requires a successful workspace daemon `hello`. Probe
-failures start no connector; the gateway never starts a server with its
-Discord environment.
+The gateway attaches to the host endpoint and requires a successful `hello` for
+the selected workspace. Probe failures start no connector; the gateway never
+starts a server with its Discord environment. An explicit `--socket` remains a
+test/operator override during the endpoint migration.
 
 The TUI footer is contextual by default and moves model and workspace context
 out of the transcript. Press `?` for the shared shortcut overlay. The footer
