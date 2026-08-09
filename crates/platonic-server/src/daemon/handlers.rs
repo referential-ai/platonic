@@ -50,7 +50,9 @@ use crate::{
         authority_working_directory, legacy_status_authority, new_spawn_id, new_thread_turn_id,
         now_ms, thread_spawn_effect, validate_child_authority,
     },
-    tool_catalog::{FILE_EDIT, FILE_WRITE, SHELL_EXEC, effect_for_tool, is_known_tool},
+    tool_catalog::{
+        FILE_EDIT, FILE_WRITE, SHELL_EXEC, THREAD_SPAWN, effect_for_tool, is_known_tool,
+    },
     tools::{ThreadSpawnToolHandler, ThreadSpawnToolInput, ThreadSpawnToolOutput},
 };
 use platonic_core::{
@@ -552,6 +554,17 @@ fn model_thread_spawn_handler(
     ThreadSpawnToolHandler::new(move |input, approving_actor| {
         model_thread_spawn(&runtime, &parent_thread_id, input, approving_actor)
     })
+}
+
+fn projected_thread_spawn_handler(
+    runtime: &DaemonRuntime,
+    context: &ThreadRunContext,
+) -> Option<ThreadSpawnToolHandler> {
+    context
+        .toolset
+        .iter()
+        .any(|tool| tool == THREAD_SPAWN)
+        .then(|| model_thread_spawn_handler(runtime.clone(), context.turn.thread_id.clone()))
 }
 
 fn model_thread_spawn(
@@ -1665,7 +1678,7 @@ fn start_run(
         .map(|context| context.toolset.clone());
     let thread_spawn = thread_context
         .as_ref()
-        .map(|context| model_thread_spawn_handler(runtime.clone(), context.turn.thread_id.clone()));
+        .and_then(|context| projected_thread_spawn_handler(runtime, context));
 
     if wait.unwrap_or(false) {
         match run_to_completion(
@@ -1732,10 +1745,7 @@ fn drive_thread_turn(
 ) {
     let agent_id = Some(driver.context.agent_id.clone());
     let toolset = Some(driver.context.toolset.clone());
-    let thread_spawn = Some(model_thread_spawn_handler(
-        runtime.clone(),
-        driver.context.turn.thread_id.clone(),
-    ));
+    let thread_spawn = projected_thread_spawn_handler(&runtime, &driver.context);
     let _ = run_to_completion(
         &runtime,
         &record,
@@ -1775,7 +1785,7 @@ fn run_to_completion(
 ) -> AppResult<RunOutcome> {
     #[cfg(test)]
     let completion = RunCompletion::Published(match (agent_id, toolset, thread_spawn) {
-        (Some(agent_id), Some(toolset), Some(thread_spawn)) => {
+        (Some(agent_id), Some(toolset), thread_spawn) => {
             crate::app::run_question_for_thread(options, agent_id, &toolset, thread_spawn)
         }
         (None, None, None) => crate::run_question(options),

@@ -3,6 +3,7 @@ use crate::{
     app::{ExternalApprovalOutcome, PreparedRun, run_prepared_question},
     daemon::child_process::ProcessTreeChild,
     ledger::{EventRecorder, RUN_CANCELED_REASON, RunEventRecorder},
+    tool_catalog::THREAD_SPAWN,
     tools::{ThreadSpawnToolHandler, ThreadSpawnToolInput, ThreadSpawnToolOutput},
 };
 use platonic_core::{HarnessEvent, RecordedEvent, RunId};
@@ -1144,7 +1145,12 @@ pub fn run_stdio_child() -> AppResult<()> {
         )
     });
     let approval_rpc = rpc.clone();
-    let thread_spawn_rpc = rpc.clone();
+    let thread_spawn = prepared.has_tool(THREAD_SPAWN).then(|| {
+        let thread_spawn_rpc = rpc.clone();
+        ThreadSpawnToolHandler::new(move |input, approving_actor| {
+            thread_spawn_rpc.thread_spawn(input, approving_actor)
+        })
+    });
     let outcome = run_prepared_question(
         prepared,
         &mut recorder,
@@ -1152,9 +1158,7 @@ pub fn run_stdio_child() -> AppResult<()> {
         Some(event_sender),
         false,
         Some(cancel),
-        Some(ThreadSpawnToolHandler::new(
-            move |input, approving_actor| thread_spawn_rpc.thread_spawn(input, approving_actor),
-        )),
+        thread_spawn,
     );
     event_forwarder
         .join()

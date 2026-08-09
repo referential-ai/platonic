@@ -282,6 +282,10 @@ impl PreparedRun {
     pub(crate) fn run_id(&self) -> &RunId {
         &self.run_id
     }
+
+    pub(crate) fn has_tool(&self, name: &str) -> bool {
+        self.config.tools.enabled.iter().any(|tool| tool == name)
+    }
 }
 
 fn begin_session_recorder(
@@ -512,7 +516,7 @@ pub(crate) fn run_question_for_thread(
     options: RunOptions,
     agent_id: AgentId,
     toolset: &[String],
-    thread_spawn: ThreadSpawnToolHandler,
+    thread_spawn: Option<ThreadSpawnToolHandler>,
 ) -> AppResult<RunOutcome> {
     let (prepared, mut recorder) = prepare_run_for_thread(&options, Some(agent_id), Some(toolset))?;
     run_prepared_question(
@@ -522,7 +526,7 @@ pub(crate) fn run_question_for_thread(
         options.event_sender,
         options.stream_to_stderr,
         options.cancel,
-        Some(thread_spawn),
+        thread_spawn,
     )
 }
 
@@ -1676,6 +1680,7 @@ enabled = ["file.read", "file.write"]
                 .unwrap();
 
         assert_eq!(prepared.agent_id, agent_id);
+        assert!(prepared.has_tool(THREAD_SPAWN));
         assert_eq!(prepared.config.tools.enabled, resolved_toolset);
         assert_eq!(
             tool_specs(&prepared.config.tools.enabled)
