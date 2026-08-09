@@ -10,16 +10,16 @@ use platonic_protocol::{
     AgentStatusParams, AgentStatusResult, ApprovalDecideParams, ApprovalDecision,
     CommandAcceptedResult, DaemonStatusParams, DaemonStatusResult, Envelope, EnvelopeKind,
     EventsStreamParams, EventsStreamResult, HelloParams, HelloResult, IssuePrepStartParams,
-    IssuePrepStartResult, MessageAppendParams, PROTOCOL_VERSION, ReasoningEffort, RunCancelParams,
-    RunOverrides, RunStartParams, RunStartResult, SessionSummary, SessionsListResult,
-    ShutdownIfIdleResult, ThreadApprovalPolicy, ThreadAuthorityParams, ThreadAuthorityResult,
-    ThreadEventsParams, ThreadEventsResult, ThreadListResult, ThreadSendParams, ThreadSendResult,
-    ThreadSpawnDecision, ThreadSpawnParams, ThreadSpawnResult, ThreadStatusParams,
-    ThreadStatusResult, ThreadStopParams, ThreadStopResult, TranscriptReadParams,
-    TranscriptReadResult, WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceListParams,
-    WorkspaceListResult, WorkspaceStatusParams, WorkspaceStatusResult,
+    IssuePrepStartResult, MessageAppendParams, PROTOCOL_VERSION, ProtocolMethod, ProtocolRequest,
+    ProtocolResponse, ReasoningEffort, RunCancelParams, RunOverrides, RunStartParams,
+    RunStartResult, SessionSummary, SessionsListResult, ShutdownIfIdleResult, ThreadApprovalPolicy,
+    ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams, ThreadEventsResult,
+    ThreadListResult, ThreadSendParams, ThreadSendResult, ThreadSpawnDecision, ThreadSpawnParams,
+    ThreadSpawnResult, ThreadStatusParams, ThreadStatusResult, ThreadStopParams, ThreadStopResult,
+    TranscriptReadParams, TranscriptReadResult, WorkspaceCreateParams, WorkspaceCreateResult,
+    WorkspaceListParams, WorkspaceListResult, WorkspaceStatusParams, WorkspaceStatusResult,
 };
-use serde::{Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::{
     io::{BufRead, BufReader, Write},
@@ -92,18 +92,15 @@ impl DaemonClient {
     pub fn hello(&mut self, workspace_root: &Path) -> ClientResult<HelloResult> {
         let workspace_root = workspace_root.canonicalize()?;
         let workspace_id = paths::workspace_id(&workspace_root)?;
-        self.request(
-            "hello",
-            HelloParams {
-                workspace_root: workspace_root.to_string_lossy().into_owned(),
-                workspace_id,
-            },
-        )
+        self.request(ProtocolRequest::Hello(HelloParams {
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            workspace_id,
+        }))
     }
 
     /// Lists daemon sessions for the connected workspace.
     pub fn sessions_list(&mut self) -> ClientResult<Vec<SessionSummary>> {
-        let result: SessionsListResult = self.request_without_params("sessions.list")?;
+        let result: SessionsListResult = self.request(ProtocolRequest::SessionsList)?;
         Ok(result.sessions)
     }
 
@@ -114,18 +111,17 @@ impl DaemonClient {
         root: PathBuf,
     ) -> ClientResult<WorkspaceCreateResult> {
         let root = root.canonicalize()?;
-        self.request(
-            "workspace.create",
-            WorkspaceCreateParams {
-                name,
-                root: root.to_string_lossy().into_owned(),
-            },
-        )
+        self.request(ProtocolRequest::WorkspaceCreate(WorkspaceCreateParams {
+            name,
+            root: root.to_string_lossy().into_owned(),
+        }))
     }
 
     /// Lists every registered workspace, including broken entries.
     pub fn workspace_list(&mut self) -> ClientResult<WorkspaceListResult> {
-        self.request("workspace.list", WorkspaceListParams::default())
+        self.request(ProtocolRequest::WorkspaceList(
+            WorkspaceListParams::default(),
+        ))
     }
 
     /// Reads one registered workspace by its server-minted id.
@@ -133,7 +129,9 @@ impl DaemonClient {
         &mut self,
         workspace_id: String,
     ) -> ClientResult<WorkspaceStatusResult> {
-        self.request("workspace.status", WorkspaceStatusParams { workspace_id })
+        self.request(ProtocolRequest::WorkspaceStatus(WorkspaceStatusParams {
+            workspace_id,
+        }))
     }
 
     /// Creates one configured agent profile with a hard workspace binding.
@@ -146,27 +144,24 @@ impl DaemonClient {
         approval_policy: ThreadApprovalPolicy,
         toolset: Vec<String>,
     ) -> ClientResult<AgentCreateResult> {
-        self.request(
-            "agent.create",
-            AgentCreateParams {
-                agent_id,
-                workspace_id,
-                model,
-                reasoning_effort,
-                approval_policy,
-                toolset,
-            },
-        )
+        self.request(ProtocolRequest::AgentCreate(AgentCreateParams {
+            agent_id,
+            workspace_id,
+            model,
+            reasoning_effort,
+            approval_policy,
+            toolset,
+        }))
     }
 
     /// Lists every configured agent profile.
     pub fn agent_list(&mut self) -> ClientResult<AgentListResult> {
-        self.request("agent.list", AgentListParams::default())
+        self.request(ProtocolRequest::AgentList(AgentListParams::default()))
     }
 
     /// Reads one configured agent profile.
     pub fn agent_status(&mut self, agent_id: AgentId) -> ClientResult<AgentStatusResult> {
-        self.request("agent.status", AgentStatusParams { agent_id })
+        self.request(ProtocolRequest::AgentStatus(AgentStatusParams { agent_id }))
     }
 
     /// Starts one typed thread spawn admission.
@@ -178,16 +173,13 @@ impl DaemonClient {
         reasoning_effort: platonic_protocol::ReasoningEffort,
         approval_policy: ThreadApprovalPolicy,
     ) -> ClientResult<ThreadSpawnResult> {
-        self.request(
-            "thread.spawn",
-            ThreadSpawnParams::Start {
-                parent_thread_id,
-                cwd,
-                model,
-                reasoning_effort,
-                approval_policy,
-            },
-        )
+        self.request(ProtocolRequest::ThreadSpawn(ThreadSpawnParams::Start {
+            parent_thread_id,
+            cwd,
+            model,
+            reasoning_effort,
+            approval_policy,
+        }))
     }
 
     /// Resolves one pending typed thread spawn admission.
@@ -196,25 +188,29 @@ impl DaemonClient {
         spawn_id: String,
         approval: ThreadSpawnDecision,
     ) -> ClientResult<ThreadSpawnResult> {
-        self.request(
-            "thread.spawn",
-            ThreadSpawnParams::Decide { spawn_id, approval },
-        )
+        self.request(ProtocolRequest::ThreadSpawn(ThreadSpawnParams::Decide {
+            spawn_id,
+            approval,
+        }))
     }
 
     /// Lists every durable thread in the selected workspace authority ledger.
     pub fn thread_list(&mut self) -> ClientResult<ThreadListResult> {
-        self.request_without_params("thread.list")
+        self.request(ProtocolRequest::ThreadList)
     }
 
     /// Reads one durable thread joined with current daemon state.
     pub fn thread_status(&mut self, thread_id: String) -> ClientResult<ThreadStatusResult> {
-        self.request("thread.status", ThreadStatusParams { thread_id })
+        self.request(ProtocolRequest::ThreadStatus(ThreadStatusParams {
+            thread_id,
+        }))
     }
 
     /// Reads one complete immutable twelve-field thread authority record.
     pub fn thread_authority(&mut self, thread_id: String) -> ClientResult<ThreadAuthorityResult> {
-        self.request("thread.authority", ThreadAuthorityParams { thread_id })
+        self.request(ProtocolRequest::ThreadAuthority(ThreadAuthorityParams {
+            thread_id,
+        }))
     }
 
     /// Starts an idle thread turn or steers the exact active turn owned by `controller_id`.
@@ -225,15 +221,12 @@ impl DaemonClient {
         turn_id: Option<String>,
         message: String,
     ) -> ClientResult<ThreadSendResult> {
-        self.request(
-            "thread.send",
-            ThreadSendParams {
-                thread_id,
-                controller_id,
-                turn_id,
-                message,
-            },
-        )
+        self.request(ProtocolRequest::ThreadSend(ThreadSendParams {
+            thread_id,
+            controller_id,
+            turn_id,
+            message,
+        }))
     }
 
     /// Reads one bounded retained event page for a live thread.
@@ -244,15 +237,12 @@ impl DaemonClient {
         limit: usize,
         wait_ms: u64,
     ) -> ClientResult<ThreadEventsResult> {
-        self.request(
-            "thread.events",
-            ThreadEventsParams {
-                thread_id,
-                from_offset,
-                limit: Some(limit),
-                wait_ms: Some(wait_ms),
-            },
-        )
+        self.request(ProtocolRequest::ThreadEvents(ThreadEventsParams {
+            thread_id,
+            from_offset,
+            limit: Some(limit),
+            wait_ms: Some(wait_ms),
+        }))
     }
 
     /// Stops one durable thread and records the requesting actor.
@@ -261,7 +251,10 @@ impl DaemonClient {
         thread_id: String,
         actor: String,
     ) -> ClientResult<ThreadStopResult> {
-        self.request("thread.stop", ThreadStopParams { thread_id, actor })
+        self.request(ProtocolRequest::ThreadStop(ThreadStopParams {
+            thread_id,
+            actor,
+        }))
     }
 
     /// Reads authoritative daemon, model, session, usage, and trust status.
@@ -270,29 +263,23 @@ impl DaemonClient {
         session_id: Option<String>,
         config_path: Option<String>,
     ) -> ClientResult<DaemonStatusResult> {
-        self.request(
-            "daemon.status",
-            DaemonStatusParams {
-                session_id,
-                config_path,
-            },
-        )
+        self.request(ProtocolRequest::DaemonStatus(DaemonStatusParams {
+            session_id,
+            config_path,
+        }))
     }
 
     /// Requests daemon shutdown when no run or approval is active.
     pub fn shutdown_if_idle(&mut self) -> ClientResult<ShutdownIfIdleResult> {
-        self.request_without_params("daemon.shutdown_if_idle")
+        self.request(ProtocolRequest::DaemonShutdownIfIdle)
     }
 
     /// Reads the ledger-backed transcript containing `run_id`.
     pub fn transcript_read(&mut self, run_id: &str) -> ClientResult<TranscriptReadResult> {
-        self.request(
-            "transcript.read",
-            TranscriptReadParams {
-                run_id: Some(run_id.into()),
-                session_id: None,
-            },
-        )
+        self.request(ProtocolRequest::TranscriptRead(TranscriptReadParams {
+            run_id: Some(run_id.into()),
+            session_id: None,
+        }))
     }
 
     /// Reads the latest ledger-backed transcript for `session_id`.
@@ -300,13 +287,10 @@ impl DaemonClient {
         &mut self,
         session_id: &str,
     ) -> ClientResult<TranscriptReadResult> {
-        self.request(
-            "transcript.read",
-            TranscriptReadParams {
-                run_id: None,
-                session_id: Some(session_id.into()),
-            },
-        )
+        self.request(ProtocolRequest::TranscriptRead(TranscriptReadParams {
+            run_id: None,
+            session_id: Some(session_id.into()),
+        }))
     }
 
     /// Starts a new daemon run with default model overrides.
@@ -327,15 +311,12 @@ impl DaemonClient {
         overrides: RunOverrides,
         wait: bool,
     ) -> ClientResult<RunStartResult> {
-        self.request(
-            "run.start",
-            RunStartParams {
-                question,
-                config_path,
-                overrides,
-                wait: Some(wait),
-            },
-        )
+        self.request(ProtocolRequest::RunStart(RunStartParams {
+            question,
+            config_path,
+            overrides,
+            wait: Some(wait),
+        }))
     }
 
     /// Appends a message to the daemon's latest workspace session.
@@ -374,16 +355,13 @@ impl DaemonClient {
         overrides: RunOverrides,
         wait: bool,
     ) -> ClientResult<RunStartResult> {
-        self.request(
-            "message.append",
-            MessageAppendParams {
-                message,
-                session_id,
-                config_path,
-                overrides,
-                wait: Some(wait),
-            },
-        )
+        self.request(ProtocolRequest::MessageAppend(MessageAppendParams {
+            message,
+            session_id,
+            config_path,
+            overrides,
+            wait: Some(wait),
+        }))
     }
 
     /// Runs the daemon's synchronous issue-preparation command.
@@ -392,10 +370,10 @@ impl DaemonClient {
         input: String,
         config_path: Option<String>,
     ) -> ClientResult<IssuePrepStartResult> {
-        self.request(
-            "issue-prep.start",
-            IssuePrepStartParams { input, config_path },
-        )
+        self.request(ProtocolRequest::IssuePrepStart(IssuePrepStartParams {
+            input,
+            config_path,
+        }))
     }
 
     /// Reads one buffered event page for `run_id`.
@@ -405,14 +383,11 @@ impl DaemonClient {
         from_offset: Option<u64>,
         limit: usize,
     ) -> ClientResult<EventsStreamResult> {
-        self.request(
-            "events.stream",
-            EventsStreamParams {
-                run_id: run_id.into(),
-                from_offset,
-                limit: Some(limit),
-            },
-        )
+        self.request(ProtocolRequest::EventsStream(EventsStreamParams {
+            run_id: run_id.into(),
+            from_offset,
+            limit: Some(limit),
+        }))
     }
 
     /// Grants a pending daemon approval request.
@@ -421,15 +396,12 @@ impl DaemonClient {
         run_id: &str,
         tool_call_id: &str,
     ) -> ClientResult<CommandAcceptedResult> {
-        self.request(
-            "approval.decide",
-            ApprovalDecideParams {
-                run_id: run_id.into(),
-                tool_call_id: tool_call_id.into(),
-                decision: ApprovalDecision::Grant,
-                reason: None,
-            },
-        )
+        self.request(ProtocolRequest::ApprovalDecide(ApprovalDecideParams {
+            run_id: run_id.into(),
+            tool_call_id: tool_call_id.into(),
+            decision: ApprovalDecision::Grant,
+            reason: None,
+        }))
     }
 
     /// Grants a pending `shell.exec` request and later calls in its daemon session.
@@ -438,15 +410,12 @@ impl DaemonClient {
         run_id: &str,
         tool_call_id: &str,
     ) -> ClientResult<CommandAcceptedResult> {
-        self.request(
-            "approval.decide",
-            ApprovalDecideParams {
-                run_id: run_id.into(),
-                tool_call_id: tool_call_id.into(),
-                decision: ApprovalDecision::GrantSession,
-                reason: None,
-            },
-        )
+        self.request(ProtocolRequest::ApprovalDecide(ApprovalDecideParams {
+            run_id: run_id.into(),
+            tool_call_id: tool_call_id.into(),
+            decision: ApprovalDecision::GrantSession,
+            reason: None,
+        }))
     }
 
     /// Denies a pending daemon approval request with a reason.
@@ -456,56 +425,28 @@ impl DaemonClient {
         tool_call_id: &str,
         reason: String,
     ) -> ClientResult<CommandAcceptedResult> {
-        self.request(
-            "approval.decide",
-            ApprovalDecideParams {
-                run_id: run_id.into(),
-                tool_call_id: tool_call_id.into(),
-                decision: ApprovalDecision::Deny,
-                reason: Some(reason),
-            },
-        )
+        self.request(ProtocolRequest::ApprovalDecide(ApprovalDecideParams {
+            run_id: run_id.into(),
+            tool_call_id: tool_call_id.into(),
+            decision: ApprovalDecision::Deny,
+            reason: Some(reason),
+        }))
     }
 
     /// Requests cancellation for an active daemon run.
     pub fn run_cancel(&mut self, run_id: &str) -> ClientResult<CommandAcceptedResult> {
-        self.request(
-            "run.cancel",
-            RunCancelParams {
-                run_id: run_id.into(),
-            },
-        )
+        self.request(ProtocolRequest::RunCancel(RunCancelParams {
+            run_id: run_id.into(),
+        }))
     }
 
-    fn request_without_params<T>(&mut self, method: &str) -> ClientResult<T>
+    fn request<T>(&mut self, request: ProtocolRequest) -> ClientResult<T>
     where
         T: DeserializeOwned,
     {
-        self.request_value(method, None)
-    }
-
-    fn request<T, P>(&mut self, method: &str, params: P) -> ClientResult<T>
-    where
-        T: DeserializeOwned,
-        P: Serialize,
-    {
-        self.request_value(method, Some(serde_json::to_value(params)?))
-    }
-
-    fn request_value<T>(&mut self, method: &str, params: Option<Value>) -> ClientResult<T>
-    where
-        T: DeserializeOwned,
-    {
-        let id = self.next_request_id(method);
-        let envelope = Envelope {
-            v: PROTOCOL_VERSION,
-            id: Some(id.clone()),
-            kind: EnvelopeKind::Request,
-            method: Some(method.into()),
-            params,
-            result: None,
-            error: None,
-        };
+        let method = request.method();
+        let id = self.next_request_id(method.as_str());
+        let envelope = Envelope::request(Some(id.clone()), request);
         let mut request = serde_json::to_vec(&envelope)?;
         request.push(b'\n');
         let deadline = self.request_timeout.map(|timeout| Instant::now() + timeout);
@@ -517,7 +458,7 @@ impl DaemonClient {
         if let Some(deadline) = deadline {
             transport::set_deadline(self.reader.get_mut(), deadline)?;
             transport::set_deadline(&mut self.writer, deadline)?;
-            self.write_until_deadline(method, &request, deadline)?;
+            self.write_until_deadline(method.as_str(), &request, deadline)?;
         } else {
             self.writer.write_all(&request)?;
             self.writer.flush()?;
@@ -525,12 +466,18 @@ impl DaemonClient {
 
         let mut line = Vec::new();
         if let Some(deadline) = deadline {
-            let bytes_read =
-                self.read_line_until_deadline(method, self.response_limit, deadline, &mut line)?;
+            let bytes_read = self.read_line_until_deadline(
+                method.as_str(),
+                self.response_limit,
+                deadline,
+                &mut line,
+            )?;
             return self.decode_response(method, id, bytes_read, line);
         }
         let bytes_read = match self.response_limit {
-            Some(limit) => Self::read_limited_line(&mut self.reader, method, limit, &mut line)?,
+            Some(limit) => {
+                Self::read_limited_line(&mut self.reader, method.as_str(), limit, &mut line)?
+            }
             None => self.reader.read_until(b'\n', &mut line)?,
         };
         self.decode_response(method, id, bytes_read, line)
@@ -538,7 +485,7 @@ impl DaemonClient {
 
     fn decode_response<T>(
         &self,
-        method: &str,
+        method: ProtocolMethod,
         id: String,
         bytes_read: usize,
         line: Vec<u8>,
@@ -566,12 +513,18 @@ impl DaemonClient {
                 response.id
             )));
         }
+        if response.method != Some(method) {
+            return Err(ClientError::DaemonProtocol(format!(
+                "response method mismatch: expected {method}, got {:?}",
+                response.method
+            )));
+        }
         match response.kind {
             EnvelopeKind::Response => {
                 let result = response.result.ok_or_else(|| {
                     ClientError::DaemonProtocol(format!("{method} response missing result"))
                 })?;
-                Ok(serde_json::from_value(result)?)
+                Ok(serde_json::from_value(response_result_value(result)?)?)
             }
             EnvelopeKind::Error => {
                 let error = response.error.ok_or_else(|| {
@@ -700,6 +653,41 @@ impl DaemonClient {
         self.next_id += 1;
         id
     }
+}
+
+fn response_result_value(response: ProtocolResponse) -> serde_json::Result<Value> {
+    match response {
+        ProtocolResponse::Hello(result) => serde_json::to_value(result),
+        ProtocolResponse::RunStart(result) => serde_json::to_value(result),
+        ProtocolResponse::MessageAppend(result) => serde_json::to_value(result),
+        ProtocolResponse::IssuePrepStart(result) => serde_json::to_value(result),
+        ProtocolResponse::EventsStream(result) => serde_json::to_value(result),
+        ProtocolResponse::ApprovalDecide(result) => serde_json::to_value(result),
+        ProtocolResponse::RunCancel(result) => serde_json::to_value(result),
+        ProtocolResponse::SessionsList(result) => serde_json::to_value(result),
+        ProtocolResponse::TranscriptRead(result) => serde_json::to_value(result),
+        ProtocolResponse::DaemonStatus(result) => serde_json::to_value(result),
+        ProtocolResponse::DaemonShutdownIfIdle(result) => serde_json::to_value(result),
+        ProtocolResponse::ThreadSpawn(result) => serde_json::to_value(result),
+        ProtocolResponse::ThreadList(result) => serde_json::to_value(result),
+        ProtocolResponse::ThreadStatus(result) => serde_json::to_value(result),
+        ProtocolResponse::ThreadAuthority(result) => serde_json::to_value(result),
+        ProtocolResponse::ThreadSend(result) => serde_json::to_value(result),
+        ProtocolResponse::ThreadEvents(result) => serde_json::to_value(result),
+        ProtocolResponse::ThreadStop(result) => serde_json::to_value(result),
+        ProtocolResponse::WorkspaceCreate(result) => serde_json::to_value(result),
+        ProtocolResponse::WorkspaceList(result) => serde_json::to_value(result),
+        ProtocolResponse::WorkspaceStatus(result) => serde_json::to_value(result),
+        ProtocolResponse::AgentCreate(result) => serde_json::to_value(result),
+        ProtocolResponse::AgentList(result) => serde_json::to_value(result),
+        ProtocolResponse::AgentStatus(result) => serde_json::to_value(result),
+    }
+}
+
+#[cfg(test)]
+fn request_params_value(envelope: &Envelope) -> Option<Value> {
+    let request = serde_json::to_value(envelope.params.as_ref()?).expect("request serializes");
+    request.get("params").cloned()
 }
 
 /// Canonical workspace and endpoint used to establish daemon connections.
@@ -932,7 +920,7 @@ mod timeout_tests {
 mod tests {
     use super::*;
     use platonic_protocol::{
-        DaemonStatusProviderKind, ProtocolError, RunStateName, SessionSummary,
+        DaemonStatusProviderKind, ERROR_NOT_FOUND, ProtocolError, RunStateName, SessionSummary,
         ShutdownIfIdleResultName,
     };
     use serde_json::json;
@@ -960,9 +948,12 @@ mod tests {
 
             let hello = read_request(&mut reader);
             assert_eq!(hello.method.as_deref(), Some("hello"));
-            assert_eq!(hello.params.as_ref().unwrap()["workspace_id"], expected_id);
             assert_eq!(
-                hello.params.as_ref().unwrap()["workspace_root"],
+                request_params_value(&hello).unwrap()["workspace_id"],
+                expected_id
+            );
+            assert_eq!(
+                request_params_value(&hello).unwrap()["workspace_root"],
                 expected_root
             );
             write_response(
@@ -1053,7 +1044,7 @@ mod tests {
             let request = read_request(&mut reader);
             assert_eq!(request.method.as_deref(), Some("workspace.create"));
             assert_eq!(
-                request.params,
+                request_params_value(&request),
                 Some(json!({"name": "alpha", "root": expected_root}))
             );
             write_response(
@@ -1065,7 +1056,7 @@ mod tests {
 
             let request = read_request(&mut reader);
             assert_eq!(request.method.as_deref(), Some("workspace.list"));
-            assert_eq!(request.params, Some(json!({})));
+            assert_eq!(request_params_value(&request), Some(json!({})));
             write_response(
                 &mut writer,
                 request.id,
@@ -1075,7 +1066,10 @@ mod tests {
 
             let request = read_request(&mut reader);
             assert_eq!(request.method.as_deref(), Some("workspace.status"));
-            assert_eq!(request.params, Some(json!({"workspace_id": "ws-alpha"})));
+            assert_eq!(
+                request_params_value(&request),
+                Some(json!({"workspace_id": "ws-alpha"}))
+            );
             write_response(
                 &mut writer,
                 request.id,
@@ -1086,7 +1080,7 @@ mod tests {
             let request = read_request(&mut reader);
             assert_eq!(request.method.as_deref(), Some("agent.create"));
             assert_eq!(
-                request.params,
+                request_params_value(&request),
                 Some(json!({
                     "agent_id": "builder",
                     "workspace_id": "ws-alpha",
@@ -1105,7 +1099,7 @@ mod tests {
 
             let request = read_request(&mut reader);
             assert_eq!(request.method.as_deref(), Some("agent.list"));
-            assert_eq!(request.params, Some(json!({})));
+            assert_eq!(request_params_value(&request), Some(json!({})));
             write_response(
                 &mut writer,
                 request.id,
@@ -1115,7 +1109,10 @@ mod tests {
 
             let request = read_request(&mut reader);
             assert_eq!(request.method.as_deref(), Some("agent.status"));
-            assert_eq!(request.params, Some(json!({"agent_id": "builder"})));
+            assert_eq!(
+                request_params_value(&request),
+                Some(json!({"agent_id": "builder"}))
+            );
             write_response(
                 &mut writer,
                 request.id,
@@ -1213,7 +1210,7 @@ mod tests {
             let start = read_request(&mut reader);
             assert_eq!(start.method.as_deref(), Some("thread.spawn"));
             assert_eq!(
-                start.params,
+                request_params_value(&start),
                 Some(json!({
                     "action": "start",
                     "parent_thread_id": null,
@@ -1239,7 +1236,7 @@ mod tests {
             let decide = read_request(&mut reader);
             assert_eq!(decide.method.as_deref(), Some("thread.spawn"));
             assert_eq!(
-                decide.params,
+                request_params_value(&decide),
                 Some(json!({
                     "action": "decide",
                     "spawn_id": "spawn_1",
@@ -1261,7 +1258,7 @@ mod tests {
 
             let list = read_request(&mut reader);
             assert_eq!(list.method.as_deref(), Some("thread.list"));
-            assert_eq!(list.params, None);
+            assert_eq!(request_params_value(&list), None);
             write_response(
                 &mut writer,
                 list.id,
@@ -1276,7 +1273,10 @@ mod tests {
 
             let status = read_request(&mut reader);
             assert_eq!(status.method.as_deref(), Some("thread.status"));
-            assert_eq!(status.params, Some(json!({"thread_id": "thread_1"})));
+            assert_eq!(
+                request_params_value(&status),
+                Some(json!({"thread_id": "thread_1"}))
+            );
             write_response(
                 &mut writer,
                 status.id,
@@ -1291,7 +1291,10 @@ mod tests {
 
             let authority = read_request(&mut reader);
             assert_eq!(authority.method.as_deref(), Some("thread.authority"));
-            assert_eq!(authority.params, Some(json!({"thread_id": "thread_1"})));
+            assert_eq!(
+                request_params_value(&authority),
+                Some(json!({"thread_id": "thread_1"}))
+            );
             write_response(
                 &mut writer,
                 authority.id,
@@ -1302,7 +1305,7 @@ mod tests {
             let start_turn = read_request(&mut reader);
             assert_eq!(start_turn.method.as_deref(), Some("thread.send"));
             assert_eq!(
-                start_turn.params,
+                request_params_value(&start_turn),
                 Some(json!({
                     "thread_id": "thread_1",
                     "controller_id": "terminal_a",
@@ -1323,7 +1326,7 @@ mod tests {
             let steer = read_request(&mut reader);
             assert_eq!(steer.method.as_deref(), Some("thread.send"));
             assert_eq!(
-                steer.params,
+                request_params_value(&steer),
                 Some(json!({
                     "thread_id": "thread_1",
                     "controller_id": "terminal_a",
@@ -1345,7 +1348,7 @@ mod tests {
             let events = read_request(&mut reader);
             assert_eq!(events.method.as_deref(), Some("thread.events"));
             assert_eq!(
-                events.params,
+                request_params_value(&events),
                 Some(json!({
                     "thread_id": "thread_1",
                     "from_offset": 0,
@@ -1369,7 +1372,7 @@ mod tests {
             let stop = read_request(&mut reader);
             assert_eq!(stop.method.as_deref(), Some("thread.stop"));
             assert_eq!(
-                stop.params,
+                request_params_value(&stop),
                 Some(json!({"thread_id": "thread_1", "actor": "stdin"}))
             );
             write_response(
@@ -1483,7 +1486,7 @@ mod tests {
             let request = read_request(&mut reader);
             assert_eq!(request.method.as_deref(), Some("daemon.status"));
             assert_eq!(
-                request.params,
+                request_params_value(&request),
                 Some(json!({
                     "session_id": "session_1",
                     "config_path": "config/plato.toml"
@@ -1571,7 +1574,7 @@ mod tests {
             for outcome in ["shutdown", "refused_active"] {
                 let request = read_request(&mut reader);
                 assert_eq!(request.method.as_deref(), Some("daemon.shutdown_if_idle"));
-                assert!(request.params.is_none());
+                assert!(request_params_value(&request).is_none());
                 write_response(
                     &mut writer,
                     request.id,
@@ -1611,7 +1614,7 @@ mod tests {
                 params: None,
                 result: None,
                 error: Some(ProtocolError {
-                    code: "not_found".into(),
+                    code: ERROR_NOT_FOUND,
                     message: "missing".into(),
                 }),
             };
@@ -1626,7 +1629,7 @@ mod tests {
         assert!(matches!(
             error,
             ClientError::DaemonResponse(ProtocolError { code, message })
-                if code == "not_found" && message == "missing"
+                if code == ERROR_NOT_FOUND && message == "missing"
         ));
     }
 
@@ -1698,10 +1701,10 @@ mod tests {
             let run_start = read_request(&mut reader);
             assert_eq!(run_start.method.as_deref(), Some("run.start"));
             assert_eq!(
-                run_start.params.as_ref().unwrap()["question"],
+                request_params_value(&run_start).unwrap()["question"],
                 "summarize this"
             );
-            assert_eq!(run_start.params.as_ref().unwrap()["wait"], false);
+            assert_eq!(request_params_value(&run_start).unwrap()["wait"], false);
             write_response(
                 &mut writer,
                 run_start.id,
@@ -1717,9 +1720,9 @@ mod tests {
 
             let events = read_request(&mut reader);
             assert_eq!(events.method.as_deref(), Some("events.stream"));
-            assert_eq!(events.params.as_ref().unwrap()["run_id"], "run_1");
-            assert_eq!(events.params.as_ref().unwrap()["from_offset"], 2);
-            assert_eq!(events.params.as_ref().unwrap()["limit"], 16);
+            assert_eq!(request_params_value(&events).unwrap()["run_id"], "run_1");
+            assert_eq!(request_params_value(&events).unwrap()["from_offset"], 2);
+            assert_eq!(request_params_value(&events).unwrap()["limit"], 16);
             write_response(
                 &mut writer,
                 events.id,
@@ -1738,7 +1741,12 @@ mod tests {
 
             let tail = read_request(&mut reader);
             assert_eq!(tail.method.as_deref(), Some("events.stream"));
-            assert!(tail.params.as_ref().unwrap().get("from_offset").is_none());
+            assert!(
+                request_params_value(&tail)
+                    .unwrap()
+                    .get("from_offset")
+                    .is_none()
+            );
             write_response(
                 &mut writer,
                 tail.id,
@@ -1781,7 +1789,7 @@ mod tests {
             let request = read_request(&mut reader);
             assert_eq!(request.method.as_deref(), Some("issue-prep.start"));
             assert_eq!(
-                request.params,
+                request_params_value(&request),
                 Some(json!({
                     "input": "rough issue",
                     "config_path": "plato.toml"
@@ -1830,9 +1838,9 @@ mod tests {
 
             let transcript = read_request(&mut reader);
             assert_eq!(transcript.method.as_deref(), Some("transcript.read"));
-            assert!(transcript.params.as_ref().unwrap()["run_id"].is_null());
+            assert!(request_params_value(&transcript).unwrap()["run_id"].is_null());
             assert_eq!(
-                transcript.params.as_ref().unwrap()["session_id"],
+                request_params_value(&transcript).unwrap()["session_id"],
                 "session_1"
             );
             write_response(
@@ -1849,9 +1857,15 @@ mod tests {
 
             let append = read_request(&mut reader);
             assert_eq!(append.method.as_deref(), Some("message.append"));
-            assert_eq!(append.params.as_ref().unwrap()["message"], "follow up");
-            assert_eq!(append.params.as_ref().unwrap()["session_id"], "session_1");
-            assert_eq!(append.params.as_ref().unwrap()["wait"], false);
+            assert_eq!(
+                request_params_value(&append).unwrap()["message"],
+                "follow up"
+            );
+            assert_eq!(
+                request_params_value(&append).unwrap()["session_id"],
+                "session_1"
+            );
+            assert_eq!(request_params_value(&append).unwrap()["wait"], false);
             write_response(
                 &mut writer,
                 append.id,
@@ -1898,10 +1912,11 @@ mod tests {
 
             let grant = read_request(&mut reader);
             assert_eq!(grant.method.as_deref(), Some("approval.decide"));
-            assert_eq!(grant.params.as_ref().unwrap()["run_id"], "run_1");
-            assert_eq!(grant.params.as_ref().unwrap()["tool_call_id"], "call_1");
-            assert_eq!(grant.params.as_ref().unwrap()["decision"], "grant");
-            assert!(grant.params.as_ref().unwrap()["reason"].is_null());
+            let params = request_params_value(&grant).unwrap();
+            assert_eq!(params["run_id"], "run_1");
+            assert_eq!(params["tool_call_id"], "call_1");
+            assert_eq!(params["decision"], "grant");
+            assert!(params["reason"].is_null());
             write_response(
                 &mut writer,
                 grant.id,
@@ -1912,18 +1927,18 @@ mod tests {
             let grant_session = read_request(&mut reader);
             assert_eq!(grant_session.method.as_deref(), Some("approval.decide"));
             assert_eq!(
-                grant_session.params.as_ref().unwrap()["run_id"],
+                request_params_value(&grant_session).unwrap()["run_id"],
                 "run_session"
             );
             assert_eq!(
-                grant_session.params.as_ref().unwrap()["tool_call_id"],
+                request_params_value(&grant_session).unwrap()["tool_call_id"],
                 "call_session"
             );
             assert_eq!(
-                grant_session.params.as_ref().unwrap()["decision"],
+                request_params_value(&grant_session).unwrap()["decision"],
                 "grant_session"
             );
-            assert!(grant_session.params.as_ref().unwrap()["reason"].is_null());
+            assert!(request_params_value(&grant_session).unwrap()["reason"].is_null());
             write_response(
                 &mut writer,
                 grant_session.id,
@@ -1933,11 +1948,14 @@ mod tests {
 
             let deny = read_request(&mut reader);
             assert_eq!(deny.method.as_deref(), Some("approval.decide"));
-            assert_eq!(deny.params.as_ref().unwrap()["run_id"], "run_2");
-            assert_eq!(deny.params.as_ref().unwrap()["tool_call_id"], "call_2");
-            assert_eq!(deny.params.as_ref().unwrap()["decision"], "deny");
+            assert_eq!(request_params_value(&deny).unwrap()["run_id"], "run_2");
             assert_eq!(
-                deny.params.as_ref().unwrap()["reason"],
+                request_params_value(&deny).unwrap()["tool_call_id"],
+                "call_2"
+            );
+            assert_eq!(request_params_value(&deny).unwrap()["decision"], "deny");
+            assert_eq!(
+                request_params_value(&deny).unwrap()["reason"],
                 "denied by plato-tui"
             );
             write_response(
@@ -1949,7 +1967,7 @@ mod tests {
 
             let cancel = read_request(&mut reader);
             assert_eq!(cancel.method.as_deref(), Some("run.cancel"));
-            assert_eq!(cancel.params.as_ref().unwrap()["run_id"], "run_3");
+            assert_eq!(request_params_value(&cancel).unwrap()["run_id"], "run_3");
             write_response(
                 &mut writer,
                 cancel.id,

@@ -14,19 +14,19 @@ use crate::{
             ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED, ERROR_THREAD_AUTHORITY_EXCEEDED,
             ERROR_THREAD_AUTHORITY_FAILED, ERROR_THREAD_EVENTS_FAILED, ERROR_THREAD_LIST_FAILED,
             ERROR_THREAD_SEND_FAILED, ERROR_THREAD_SPAWN_FAILED, ERROR_THREAD_STATUS_FAILED,
-            ERROR_THREAD_STOP_FAILED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_BROKEN,
-            ERROR_WORKSPACE_MISMATCH, ERROR_WORKSPACE_UNREGISTERED, Envelope, EventsStreamParams,
-            EventsStreamResult, HelloParams, HelloResult, IssuePrepResult, IssuePrepStartParams,
-            IssuePrepStartResult, MessageAppendParams, ModelIdentityStatus, RunCancelParams,
-            RunStartParams, RunStartResult, RunStateName, SessionSummary, SessionsListResult,
-            ShutdownIfIdleResult, ShutdownIfIdleResultName, ThreadApprovalPolicy,
-            ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams, ThreadListResult,
-            ThreadSendParams, ThreadSpawnDecision, ThreadSpawnParams, ThreadSpawnResult,
-            ThreadStatus, ThreadStatusParams, ThreadStatusResult, ThreadStopParams,
-            ThreadStopResult, TranscriptReadParams, TranscriptReadResult, TypedRun,
-            TypedTranscript, TypedTranscriptEntry, WorkspaceCreateParams, WorkspaceCreateResult,
-            WorkspaceHealthName, WorkspaceListParams, WorkspaceListResult, WorkspaceStatusParams,
-            WorkspaceStatusResult, WorkspaceSummary, decode_request,
+            ERROR_THREAD_STOP_FAILED, ERROR_WORKSPACE_BROKEN, ERROR_WORKSPACE_MISMATCH,
+            ERROR_WORKSPACE_UNREGISTERED, Envelope, EventsStreamParams, EventsStreamResult,
+            HelloParams, HelloResult, IssuePrepResult, IssuePrepStartParams, IssuePrepStartResult,
+            MessageAppendParams, ModelIdentityStatus, ProtocolErrorCode, ProtocolRequest,
+            ProtocolResponse, RunCancelParams, RunStartParams, RunStartResult, RunStateName,
+            SessionSummary, SessionsListResult, ShutdownIfIdleResult, ShutdownIfIdleResultName,
+            ThreadApprovalPolicy, ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams,
+            ThreadListResult, ThreadSendParams, ThreadSpawnDecision, ThreadSpawnParams,
+            ThreadSpawnResult, ThreadStatus, ThreadStatusParams, ThreadStatusResult,
+            ThreadStopParams, ThreadStopResult, TranscriptReadParams, TranscriptReadResult,
+            TypedRun, TypedTranscript, TypedTranscriptEntry, WorkspaceCreateParams,
+            WorkspaceCreateResult, WorkspaceHealthName, WorkspaceListParams, WorkspaceListResult,
+            WorkspaceStatusParams, WorkspaceStatusResult, WorkspaceSummary, decode_request,
         },
         runtime::{
             DaemonRuntime, IssuePrepAdmissionError, RunAdmissionError, RunRecord,
@@ -75,89 +75,43 @@ pub(super) fn handle_line(runtime: &DaemonRuntime, line: &str) -> Envelope {
 }
 
 pub(super) fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
-    match request.method.as_deref() {
-        Some("hello") => handle_with_params(runtime, request, "hello", handle_hello),
-        Some("run.start") => handle_with_params(runtime, request, "run.start", handle_run_start),
-        Some("message.append") => {
-            handle_with_params(runtime, request, "message.append", handle_message_append)
+    match request
+        .params
+        .clone()
+        .expect("decoded request carries typed params")
+    {
+        ProtocolRequest::Hello(params) => handle_hello(runtime, request, params),
+        ProtocolRequest::RunStart(params) => handle_run_start(runtime, request, params),
+        ProtocolRequest::MessageAppend(params) => handle_message_append(runtime, request, params),
+        ProtocolRequest::IssuePrepStart(params) => {
+            handle_issue_prep_start(runtime, request, params)
         }
-        Some("issue-prep.start") => handle_with_params(
-            runtime,
-            request,
-            "issue-prep.start",
-            handle_issue_prep_start,
-        ),
-        Some("events.stream") => {
-            handle_with_params(runtime, request, "events.stream", handle_events_stream)
+        ProtocolRequest::EventsStream(params) => handle_events_stream(runtime, request, params),
+        ProtocolRequest::ApprovalDecide(params) => handle_approval_decide(runtime, request, params),
+        ProtocolRequest::RunCancel(params) => handle_run_cancel(runtime, request, params),
+        ProtocolRequest::SessionsList => handle_sessions_list(runtime, request),
+        ProtocolRequest::TranscriptRead(params) => handle_transcript_read(runtime, request, params),
+        ProtocolRequest::DaemonStatus(params) => handle_daemon_status(runtime, request, params),
+        ProtocolRequest::DaemonShutdownIfIdle => handle_shutdown_if_idle(runtime, request),
+        ProtocolRequest::ThreadSpawn(params) => handle_thread_spawn(runtime, request, params),
+        ProtocolRequest::ThreadList => handle_thread_list(runtime, request),
+        ProtocolRequest::ThreadStatus(params) => handle_thread_status(runtime, request, params),
+        ProtocolRequest::ThreadAuthority(params) => {
+            handle_thread_authority(runtime, request, params)
         }
-        Some("approval.decide") => {
-            handle_with_params(runtime, request, "approval.decide", handle_approval_decide)
+        ProtocolRequest::ThreadSend(params) => handle_thread_send(runtime, request, params),
+        ProtocolRequest::ThreadEvents(params) => handle_thread_events(runtime, request, params),
+        ProtocolRequest::ThreadStop(params) => handle_thread_stop(runtime, request, params),
+        ProtocolRequest::WorkspaceCreate(params) => {
+            handle_workspace_create(runtime, request, params)
         }
-        Some("run.cancel") => handle_with_params(runtime, request, "run.cancel", handle_run_cancel),
-        Some("sessions.list") => handle_sessions_list(runtime, request),
-        Some("thread.spawn") => {
-            handle_with_params(runtime, request, "thread.spawn", handle_thread_spawn)
+        ProtocolRequest::WorkspaceList(params) => handle_workspace_list(runtime, request, params),
+        ProtocolRequest::WorkspaceStatus(params) => {
+            handle_workspace_status(runtime, request, params)
         }
-        Some("thread.list") => handle_thread_list(runtime, request),
-        Some("workspace.create") => handle_with_params(
-            runtime,
-            request,
-            "workspace.create",
-            handle_workspace_create,
-        ),
-        Some("workspace.list") => {
-            handle_with_params(runtime, request, "workspace.list", handle_workspace_list)
-        }
-        Some("workspace.status") => handle_with_params(
-            runtime,
-            request,
-            "workspace.status",
-            handle_workspace_status,
-        ),
-        Some("agent.create") => {
-            handle_with_params(runtime, request, "agent.create", handle_agent_create)
-        }
-        Some("agent.list") => handle_with_params(runtime, request, "agent.list", handle_agent_list),
-        Some("agent.status") => {
-            handle_with_params(runtime, request, "agent.status", handle_agent_status)
-        }
-        Some("thread.status") => {
-            handle_with_params(runtime, request, "thread.status", handle_thread_status)
-        }
-        Some("thread.authority") => handle_with_params(
-            runtime,
-            request,
-            "thread.authority",
-            handle_thread_authority,
-        ),
-        Some("thread.send") => {
-            handle_with_params(runtime, request, "thread.send", handle_thread_send)
-        }
-        Some("thread.events") => {
-            handle_with_params(runtime, request, "thread.events", handle_thread_events)
-        }
-        Some("thread.stop") => {
-            handle_with_params(runtime, request, "thread.stop", handle_thread_stop)
-        }
-        Some("daemon.status") => {
-            handle_with_params(runtime, request, "daemon.status", handle_daemon_status)
-        }
-        Some("daemon.shutdown_if_idle") => handle_shutdown_if_idle(runtime, request),
-        Some("transcript.read") => {
-            handle_with_params(runtime, request, "transcript.read", handle_transcript_read)
-        }
-        Some(method) => Envelope::error(
-            request.id,
-            Some(method.into()),
-            ERROR_UNSUPPORTED_METHOD,
-            format!("unsupported method: {method}"),
-        ),
-        None => Envelope::error(
-            request.id,
-            None,
-            ERROR_MALFORMED_REQUEST,
-            "request method is required",
-        ),
+        ProtocolRequest::AgentCreate(params) => handle_agent_create(runtime, request, params),
+        ProtocolRequest::AgentList(params) => handle_agent_list(runtime, request, params),
+        ProtocolRequest::AgentStatus(params) => handle_agent_status(runtime, request, params),
     }
 }
 
@@ -219,15 +173,15 @@ fn handle_hello(runtime: &DaemonRuntime, request: Envelope, params: HelloParams)
         Err(error) => return store_error(request.id, "hello", error),
     }
 
-    Envelope::response_from(
+    Envelope::typed_response(
         request.id,
-        Some("hello".into()),
-        HelloResult {
+        ProtocolResponse::Hello(HelloResult {
             daemon_version: platonic_protocol::BUILD_IDENTITY.into(),
             workspace_id: runtime.paths.workspace_id.clone(),
             ledger_path: runtime.paths.ledger_path.to_string_lossy().into_owned(),
-            capabilities: CAPABILITIES.into_iter().map(str::to_owned).collect(),
-        },
+            capabilities: CAPABILITIES.to_vec(),
+            daemon_scope: None,
+        }),
     )
 }
 
@@ -237,7 +191,7 @@ fn handle_daemon_status(
     params: DaemonStatusParams,
 ) -> Envelope {
     match daemon_status(runtime, params) {
-        Ok(status) => Envelope::response_from(request.id, Some("daemon.status".into()), status),
+        Ok(status) => Envelope::typed_response(request.id, ProtocolResponse::DaemonStatus(status)),
         Err(error) => match error {
             AppError::SessionNotFound(session_id) => Envelope::error(
                 request.id,
@@ -370,7 +324,7 @@ fn handle_thread_spawn(
     params: ThreadSpawnParams,
 ) -> Envelope {
     match thread_spawn(runtime, params) {
-        Ok(result) => Envelope::response_from(request.id, Some("thread.spawn".into()), result),
+        Ok(result) => Envelope::typed_response(request.id, ProtocolResponse::ThreadSpawn(result)),
         Err(ThreadSpawnFailure::ShuttingDown) => shutting_down_response(request.id, "thread.spawn"),
         Err(ThreadSpawnFailure::Malformed(message)) => Envelope::error(
             request.id,
@@ -716,14 +670,6 @@ fn read_live_parent(
 }
 
 fn handle_thread_list(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
-    if !params_are_empty(request.params.as_ref()) {
-        return Envelope::error(
-            request.id,
-            request.method,
-            ERROR_MALFORMED_REQUEST,
-            "thread.list params must be omitted or an empty object",
-        );
-    }
     match crate::server_store::thread_authorities(&runtime.paths.server_db_path).and_then(
         |authorities| {
             authorities
@@ -732,10 +678,9 @@ fn handle_thread_list(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
                 .collect::<AppResult<Vec<_>>>()
         },
     ) {
-        Ok(threads) => Envelope::response_from(
+        Ok(threads) => Envelope::typed_response(
             request.id,
-            Some("thread.list".into()),
-            ThreadListResult { threads },
+            ProtocolResponse::ThreadList(ThreadListResult { threads }),
         ),
         Err(_) => Envelope::error(
             request.id,
@@ -757,10 +702,9 @@ fn handle_thread_status(
                 .map(|authority| joined_thread_status(runtime, authority))
                 .transpose()
         }) {
-        Ok(Some(thread)) => Envelope::response_from(
+        Ok(Some(thread)) => Envelope::typed_response(
             request.id,
-            Some("thread.status".into()),
-            ThreadStatusResult { thread },
+            ProtocolResponse::ThreadStatus(ThreadStatusResult { thread }),
         ),
         Ok(None) => Envelope::error(
             request.id,
@@ -783,10 +727,9 @@ fn handle_thread_authority(
     params: ThreadAuthorityParams,
 ) -> Envelope {
     match crate::server_store::thread_authority(&runtime.paths.server_db_path, &params.thread_id) {
-        Ok(Some(authority)) => Envelope::response_from(
+        Ok(Some(authority)) => Envelope::typed_response(
             request.id,
-            Some("thread.authority".into()),
-            ThreadAuthorityResult { authority },
+            ProtocolResponse::ThreadAuthority(ThreadAuthorityResult { authority }),
         ),
         Ok(None) => Envelope::error(
             request.id,
@@ -881,7 +824,7 @@ fn handle_thread_send(
         }
         ThreadSendAdmission::Started { receipt, turn } => (receipt, turn),
         ThreadSendAdmission::Steered { receipt } | ThreadSendAdmission::Rejected { receipt } => {
-            return Envelope::response_from(request.id, Some("thread.send".into()), receipt);
+            return Envelope::typed_response(request.id, ProtocolResponse::ThreadSend(receipt));
         }
     };
     let session_id = thread_session_id(&params.thread_id);
@@ -932,11 +875,11 @@ fn handle_thread_send(
             thread_context: Some(context),
         },
     );
-    if response.error.is_some() {
+    if let Err(response) = response {
         runtime.abort_thread_turn(&turn);
-        return response;
+        return *response;
     }
-    Envelope::response_from(request.id, Some("thread.send".into()), receipt)
+    Envelope::typed_response(request.id, ProtocolResponse::ThreadSend(receipt))
 }
 
 fn validate_thread_send(params: &ThreadSendParams) -> Result<(), String> {
@@ -1032,7 +975,7 @@ fn handle_thread_events(
         limit,
         std::time::Duration::from_millis(wait_ms),
     ) {
-        Ok(result) => Envelope::response_from(request.id, Some("thread.events".into()), result),
+        Ok(result) => Envelope::typed_response(request.id, ProtocolResponse::ThreadEvents(result)),
         Err(ThreadEventsError::Lagged { first_offset }) => Envelope::error(
             request.id,
             Some("thread.events".into()),
@@ -1099,10 +1042,9 @@ fn handle_thread_stop(
         };
     match store.thread_stop(&authority.thread_id) {
         Ok(Some(stop)) => {
-            return Envelope::response_from(
+            return Envelope::typed_response(
                 request.id,
-                Some("thread.stop".into()),
-                thread_stop_result(stop, true),
+                ProtocolResponse::ThreadStop(thread_stop_result(stop, true)),
             );
         }
         Ok(None) => {}
@@ -1131,10 +1073,9 @@ fn handle_thread_stop(
         }
         Err(ThreadStopError::AlreadyStopped) => {
             return match store.thread_stop(&authority.thread_id) {
-                Ok(Some(stop)) => Envelope::response_from(
+                Ok(Some(stop)) => Envelope::typed_response(
                     request.id,
-                    Some("thread.stop".into()),
-                    thread_stop_result(stop, true),
+                    ProtocolResponse::ThreadStop(thread_stop_result(stop, true)),
                 ),
                 _ => Envelope::error(
                     request.id,
@@ -1182,10 +1123,9 @@ fn handle_thread_stop(
         }
     };
     runtime.complete_thread_stop(&authority.thread_id);
-    Envelope::response_from(
+    Envelope::typed_response(
         request.id,
-        Some("thread.stop".into()),
-        thread_stop_result(stop, !inserted),
+        ProtocolResponse::ThreadStop(thread_stop_result(stop, !inserted)),
     )
 }
 
@@ -1220,23 +1160,16 @@ fn joined_thread_status(
     })
 }
 
-fn params_are_empty(params: Option<&serde_json::Value>) -> bool {
-    match params {
-        None => true,
-        Some(serde_json::Value::Object(params)) => params.is_empty(),
-        Some(_) => false,
-    }
-}
-
 fn handle_run_start(
     runtime: &DaemonRuntime,
     request: Envelope,
     params: RunStartParams,
 ) -> Envelope {
-    start_run(
+    let request_id = request.id;
+    match start_run(
         runtime,
         StartRunRequest {
-            request_id: request.id,
+            request_id: request_id.clone(),
             question: params.question,
             session: RunSession::Fresh {
                 session_id: new_session_id(),
@@ -1246,7 +1179,10 @@ fn handle_run_start(
             wait: params.wait,
             thread_context: None,
         },
-    )
+    ) {
+        Ok(result) => Envelope::typed_response(request_id, ProtocolResponse::RunStart(result)),
+        Err(response) => *response,
+    }
 }
 
 fn handle_message_append(
@@ -1274,10 +1210,11 @@ fn handle_message_append(
             }
         },
     };
-    start_run(
+    let request_id = request.id;
+    match start_run(
         runtime,
         StartRunRequest {
-            request_id: request.id,
+            request_id: request_id.clone(),
             question: params.message,
             session: RunSession::Continue { session_id },
             config_path: params.config_path,
@@ -1285,7 +1222,10 @@ fn handle_message_append(
             wait: params.wait,
             thread_context: None,
         },
-    )
+    ) {
+        Ok(result) => Envelope::typed_response(request_id, ProtocolResponse::MessageAppend(result)),
+        Err(response) => *response,
+    }
 }
 
 fn handle_issue_prep_start(
@@ -1331,10 +1271,9 @@ fn handle_issue_prep_start(
         input: params.input,
     };
     match run_issue_prep(options) {
-        Ok(outcome) => Envelope::response_from(
+        Ok(outcome) => Envelope::typed_response(
             request.id,
-            Some("issue-prep.start".into()),
-            IssuePrepStartResult {
+            ProtocolResponse::IssuePrepStart(IssuePrepStartResult {
                 run_dir: run_dir.to_string_lossy().into_owned(),
                 outcome: match outcome {
                     IssuePrepOutcome::Candidate { markdown } => {
@@ -1344,7 +1283,7 @@ fn handle_issue_prep_start(
                         IssuePrepResult::Blocked { stage, reasons }
                     }
                 },
-            },
+            }),
         ),
         Err(error) => Envelope::error(
             request.id,
@@ -1379,7 +1318,10 @@ struct ThreadTurnDriver {
     overrides: RunOverrides,
 }
 
-fn start_run(runtime: &DaemonRuntime, request: StartRunRequest) -> Envelope {
+fn start_run(
+    runtime: &DaemonRuntime,
+    request: StartRunRequest,
+) -> Result<RunStartResult, Box<Envelope>> {
     let StartRunRequest {
         request_id,
         question,
@@ -1403,12 +1345,12 @@ fn start_run(runtime: &DaemonRuntime, request: StartRunRequest) -> Envelope {
     let run_id = match new_run_id() {
         Ok(run_id) => run_id,
         Err(error) => {
-            return Envelope::error(
+            return Err(Box::new(Envelope::error(
                 request_id,
                 Some(method.into()),
                 error_code,
                 error.to_string(),
-            );
+            )));
         }
     };
     let run_id_string = run_id.to_string();
@@ -1428,10 +1370,10 @@ fn start_run(runtime: &DaemonRuntime, request: StartRunRequest) -> Envelope {
     match runtime.reserve_run(record.clone()) {
         Ok(()) => {}
         Err(RunAdmissionError::ShuttingDown) => {
-            return shutting_down_response(request_id, method);
+            return Err(Box::new(shutting_down_response(request_id, method)));
         }
         Err(RunAdmissionError::SessionActive { run_id }) => {
-            return Envelope::error(
+            return Err(Box::new(Envelope::error(
                 request_id,
                 Some(method.into()),
                 ERROR_OVERLOAD,
@@ -1439,7 +1381,7 @@ fn start_run(runtime: &DaemonRuntime, request: StartRunRequest) -> Envelope {
                     "session already has an active run: {} ({run_id})",
                     record.session_id
                 ),
-            );
+            )));
         }
     }
     if let Some(context) = thread_context.as_ref()
@@ -1447,7 +1389,7 @@ fn start_run(runtime: &DaemonRuntime, request: StartRunRequest) -> Envelope {
     {
         runtime.release_run_reservation(&record);
         runtime.abort_thread_turn(&context.turn);
-        return match error {
+        return Err(Box::new(match error {
             ThreadRunBindError::Stopping | ThreadRunBindError::NotLoaded => Envelope::error(
                 request_id,
                 Some(method.into()),
@@ -1463,7 +1405,7 @@ fn start_run(runtime: &DaemonRuntime, request: StartRunRequest) -> Envelope {
                     context.turn.thread_id
                 ),
             ),
-        };
+        }));
     }
 
     let (event_sender, event_receiver) = mpsc::channel::<RunEvent>();
@@ -1499,13 +1441,13 @@ fn start_run(runtime: &DaemonRuntime, request: StartRunRequest) -> Envelope {
 
     if wait.unwrap_or(false) {
         match run_to_completion(runtime, &record, options, event_collector) {
-            Ok(_) => run_start_response(request_id, method, &record),
-            Err(error) => Envelope::error(
+            Ok(_) => Ok(run_start_result(&record)),
+            Err(error) => Err(Box::new(Envelope::error(
                 request_id,
                 Some(method.into()),
                 error_code,
                 error.to_string(),
-            ),
+            ))),
         }
     } else {
         let worker_runtime = runtime.clone();
@@ -1538,7 +1480,7 @@ fn start_run(runtime: &DaemonRuntime, request: StartRunRequest) -> Envelope {
                 });
             }
         }
-        run_start_response(request_id, method, &record)
+        Ok(run_start_result(&record))
     }
 }
 
@@ -1661,33 +1603,18 @@ fn finish_run_after_event_collection(
 }
 
 fn handle_shutdown_if_idle(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
-    let valid_params = match request.params.as_ref() {
-        None => true,
-        Some(serde_json::Value::Object(params)) => params.is_empty(),
-        Some(_) => false,
-    };
-    if !valid_params {
-        return Envelope::error(
-            request.id,
-            request.method,
-            ERROR_MALFORMED_REQUEST,
-            "daemon.shutdown_if_idle params must be omitted or an empty object",
-        );
-    }
     match runtime.shutdown_if_idle() {
-        ShutdownIfIdleDecision::Shutdown => Envelope::response_from(
+        ShutdownIfIdleDecision::Shutdown => Envelope::typed_response(
             request.id,
-            Some("daemon.shutdown_if_idle".into()),
-            ShutdownIfIdleResult {
+            ProtocolResponse::DaemonShutdownIfIdle(ShutdownIfIdleResult {
                 result: ShutdownIfIdleResultName::Shutdown,
-            },
+            }),
         ),
-        ShutdownIfIdleDecision::RefusedActive => Envelope::response_from(
+        ShutdownIfIdleDecision::RefusedActive => Envelope::typed_response(
             request.id,
-            Some("daemon.shutdown_if_idle".into()),
-            ShutdownIfIdleResult {
+            ProtocolResponse::DaemonShutdownIfIdle(ShutdownIfIdleResult {
                 result: ShutdownIfIdleResultName::RefusedActive,
-            },
+            }),
         ),
         ShutdownIfIdleDecision::AlreadyShuttingDown => {
             shutting_down_response(request.id, "daemon.shutdown_if_idle")
@@ -1704,20 +1631,16 @@ fn shutting_down_response(request_id: Option<String>, method: &'static str) -> E
     )
 }
 
-fn run_start_response(request_id: Option<String>, method: &str, record: &RunRecord) -> Envelope {
+fn run_start_result(record: &RunRecord) -> RunStartResult {
     let status = record.status();
-    Envelope::response_from(
-        request_id,
-        Some(method.into()),
-        RunStartResult {
-            run_id: record.run_id.clone(),
-            session_id: record.session_id.clone(),
-            ledger_path: record.ledger_path.to_string_lossy().into_owned(),
-            status: status.state,
-            final_answer: status.final_answer,
-            completion_claim: status.completion_claim,
-        },
-    )
+    RunStartResult {
+        run_id: record.run_id.clone(),
+        session_id: record.session_id.clone(),
+        ledger_path: record.ledger_path.to_string_lossy().into_owned(),
+        status: status.state,
+        final_answer: status.final_answer,
+        completion_claim: status.completion_claim,
+    }
 }
 
 fn handle_events_stream(
@@ -1773,7 +1696,7 @@ fn handle_events_stream(
             events,
         }
     };
-    Envelope::response_from(request.id, Some("events.stream".into()), result)
+    Envelope::typed_response(request.id, ProtocolResponse::EventsStream(result))
 }
 
 fn handle_approval_decide(
@@ -1819,13 +1742,12 @@ fn handle_approval_decide(
     }
     if let Some(existing) = &pending.decision {
         if existing.decision == params.decision {
-            return Envelope::response_from(
+            return Envelope::typed_response(
                 request.id,
-                Some("approval.decide".into()),
-                CommandAcceptedResult {
+                ProtocolResponse::ApprovalDecide(CommandAcceptedResult {
                     run_id: record.run_id.clone(),
                     status: status.state,
-                },
+                }),
             );
         }
         return Envelope::error(
@@ -1881,13 +1803,12 @@ fn handle_approval_decide(
     record.approval_changed.notify_all();
     drop(status);
     drop(approvals);
-    Envelope::response_from(
+    Envelope::typed_response(
         request.id,
-        Some("approval.decide".into()),
-        CommandAcceptedResult {
+        ProtocolResponse::ApprovalDecide(CommandAcceptedResult {
             run_id: record.run_id.clone(),
             status: record.status().state,
-        },
+        }),
     )
 }
 
@@ -1988,12 +1909,11 @@ fn handle_workspace_create(
         &ledger_path.to_string_lossy(),
         now_ms,
     ) {
-        Ok((record, true)) => Envelope::response_from(
+        Ok((record, true)) => Envelope::typed_response(
             request.id,
-            Some("workspace.create".into()),
-            WorkspaceCreateResult {
+            ProtocolResponse::WorkspaceCreate(WorkspaceCreateResult {
                 workspace: workspace_summary(&record),
-            },
+            }),
         ),
         Ok((existing, false)) if existing.name == name => Envelope::error(
             request.id,
@@ -2026,12 +1946,11 @@ fn handle_workspace_list(
         Err(error) => return store_error(request.id, "workspace.list", error),
     };
     match store.workspaces() {
-        Ok(records) => Envelope::response_from(
+        Ok(records) => Envelope::typed_response(
             request.id,
-            Some("workspace.list".into()),
-            WorkspaceListResult {
+            ProtocolResponse::WorkspaceList(WorkspaceListResult {
                 workspaces: records.iter().map(workspace_summary).collect(),
-            },
+            }),
         ),
         Err(error) => store_error(request.id, "workspace.list", error),
     }
@@ -2048,12 +1967,11 @@ fn handle_workspace_status(
         Err(error) => return store_error(request.id, "workspace.status", error),
     };
     match store.workspace(&params.workspace_id) {
-        Ok(Some(record)) => Envelope::response_from(
+        Ok(Some(record)) => Envelope::typed_response(
             request.id,
-            Some("workspace.status".into()),
-            WorkspaceStatusResult {
+            ProtocolResponse::WorkspaceStatus(WorkspaceStatusResult {
                 workspace: workspace_summary(&record),
-            },
+            }),
         ),
         Ok(None) => Envelope::error(
             request.id,
@@ -2153,12 +2071,11 @@ fn handle_agent_create(
         created_at_ms: now_ms(),
     };
     match store.register_agent(&record) {
-        Ok(true) => Envelope::response_from(
+        Ok(true) => Envelope::typed_response(
             request.id,
-            Some("agent.create".into()),
-            AgentCreateResult {
+            ProtocolResponse::AgentCreate(AgentCreateResult {
                 agent: agent_summary(&record),
-            },
+            }),
         ),
         Ok(false) => Envelope::error(
             request.id,
@@ -2180,12 +2097,11 @@ fn handle_agent_list(
         Err(error) => return store_error(request.id, "agent.list", error),
     };
     match store.agents() {
-        Ok(records) => Envelope::response_from(
+        Ok(records) => Envelope::typed_response(
             request.id,
-            Some("agent.list".into()),
-            AgentListResult {
+            ProtocolResponse::AgentList(AgentListResult {
                 agents: records.iter().map(agent_summary).collect(),
-            },
+            }),
         ),
         Err(error) => store_error(request.id, "agent.list", error),
     }
@@ -2201,12 +2117,11 @@ fn handle_agent_status(
         Err(error) => return store_error(request.id, "agent.status", error),
     };
     match store.agent(&params.agent_id) {
-        Ok(Some(record)) => Envelope::response_from(
+        Ok(Some(record)) => Envelope::typed_response(
             request.id,
-            Some("agent.status".into()),
-            AgentStatusResult {
+            ProtocolResponse::AgentStatus(AgentStatusResult {
                 agent: agent_summary(&record),
-            },
+            }),
         ),
         Ok(None) => Envelope::error(
             request.id,
@@ -2259,22 +2174,20 @@ fn handle_run_cancel(
             format!("run is not active: {}", record.run_id),
         );
     };
-    Envelope::response_from(
+    Envelope::typed_response(
         request.id,
-        Some("run.cancel".into()),
-        CommandAcceptedResult {
+        ProtocolResponse::RunCancel(CommandAcceptedResult {
             run_id: record.run_id.clone(),
             status,
-        },
+        }),
     )
 }
 
 fn handle_sessions_list(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
     match session_summaries(runtime) {
-        Ok(sessions) => Envelope::response_from(
+        Ok(sessions) => Envelope::typed_response(
             request.id,
-            Some("sessions.list".into()),
-            SessionsListResult { sessions },
+            ProtocolResponse::SessionsList(SessionsListResult { sessions }),
         ),
         Err(error) => Envelope::error(
             request.id,
@@ -2385,7 +2298,7 @@ fn handle_transcript_read(
     match transcript {
         Ok(mut transcript) => {
             transcript.pending_approval = runtime_pending_approval(runtime, &transcript.run_id);
-            Envelope::response_from(request.id, Some("transcript.read".into()), transcript)
+            Envelope::typed_response(request.id, ProtocolResponse::TranscriptRead(transcript))
         }
         Err(error) => Envelope::error(
             request.id,
@@ -2573,7 +2486,7 @@ fn typed_entries(
     entries
 }
 
-fn transcript_error_code(error: &AppError) -> &'static str {
+fn transcript_error_code(error: &AppError) -> ProtocolErrorCode {
     match error {
         AppError::RunNotFound(_)
         | AppError::SessionNotFound(_)
@@ -2592,36 +2505,6 @@ fn latest_session_id(runtime: &DaemonRuntime) -> Result<String, String> {
             error => error.to_string(),
         },
     )
-}
-
-fn handle_with_params<T: serde::de::DeserializeOwned>(
-    runtime: &DaemonRuntime,
-    request: Envelope,
-    method: &'static str,
-    handler: fn(&DaemonRuntime, Envelope, T) -> Envelope,
-) -> Envelope {
-    let params = match &request.params {
-        Some(params) => match serde_json::from_value::<T>(params.clone()) {
-            Ok(params) => params,
-            Err(error) => {
-                return Envelope::error(
-                    request.id,
-                    Some(method.into()),
-                    ERROR_MALFORMED_REQUEST,
-                    format!("{method} params are invalid: {error}"),
-                );
-            }
-        },
-        None => {
-            return Envelope::error(
-                request.id,
-                Some(method.into()),
-                ERROR_MALFORMED_REQUEST,
-                format!("{method} params are required"),
-            );
-        }
-    };
-    handler(runtime, request, params)
 }
 
 fn spawn_event_collector(
@@ -2690,6 +2573,11 @@ mod tests {
         time::Duration,
     };
 
+    fn response_result<T: serde::de::DeserializeOwned>(response: &Envelope) -> T {
+        let response = serde_json::to_value(response.result.as_ref().unwrap()).unwrap();
+        serde_json::from_value(response["result"].clone()).unwrap()
+    }
+
     fn bare_thread_test_runtime() -> (tempfile::TempDir, DaemonRuntime) {
         let root = tempfile::tempdir().unwrap();
         let workspace_root = root.path().join("workspace");
@@ -2730,15 +2618,33 @@ mod tests {
     }
 
     fn workspace_request(id: &str, method: &str, params: serde_json::Value) -> Envelope {
-        Envelope {
-            v: 1,
-            id: Some(id.into()),
-            kind: crate::daemon::protocol::EnvelopeKind::Request,
-            method: Some(method.into()),
-            params: Some(params),
-            result: None,
-            error: None,
-        }
+        serde_json::from_value(json!({
+            "v": 1,
+            "id": id,
+            "kind": "request",
+            "method": method,
+            "params": params,
+        }))
+        .unwrap()
+    }
+
+    fn handle_workspace_line(
+        runtime: &DaemonRuntime,
+        id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Envelope {
+        handle_line(
+            runtime,
+            &json!({
+                "v": 1,
+                "id": id,
+                "kind": "request",
+                "method": method,
+                "params": params,
+            })
+            .to_string(),
+        )
     }
 
     /// A workspace can be created, listed and inspected end to end, keeps a
@@ -2762,8 +2668,7 @@ mod tests {
             created.kind,
             crate::daemon::protocol::EnvelopeKind::Response
         );
-        let created: WorkspaceCreateResult =
-            serde_json::from_value(created.result.unwrap()).unwrap();
+        let created: WorkspaceCreateResult = response_result(&created);
         let id = created.workspace.id.clone();
         assert!(id.starts_with("ws-"), "id should be minted, got {id}");
         assert_eq!(created.workspace.name, "alpha");
@@ -2811,7 +2716,7 @@ mod tests {
             &runtime,
             workspace_request("l1", "workspace.list", json!({})),
         );
-        let listed: WorkspaceListResult = serde_json::from_value(listed.result.unwrap()).unwrap();
+        let listed: WorkspaceListResult = response_result(&listed);
         assert_eq!(
             listed
                 .workspaces
@@ -2825,7 +2730,7 @@ mod tests {
             &runtime,
             workspace_request("s1", "workspace.status", json!({"workspace_id": id})),
         );
-        let status: WorkspaceStatusResult = serde_json::from_value(status.result.unwrap()).unwrap();
+        let status: WorkspaceStatusResult = response_result(&status);
         assert_eq!(status.workspace, created.workspace);
 
         // Moving the directory keeps the identity: a relocation, not a new
@@ -2843,7 +2748,7 @@ mod tests {
             &runtime,
             workspace_request("s2", "workspace.status", json!({"workspace_id": id})),
         );
-        let moved: WorkspaceStatusResult = serde_json::from_value(moved.result.unwrap()).unwrap();
+        let moved: WorkspaceStatusResult = response_result(&moved);
         assert_eq!(moved.workspace.id, id);
         assert_eq!(
             moved.workspace.created_at_ms,
@@ -2857,7 +2762,7 @@ mod tests {
             &runtime,
             workspace_request("l2", "workspace.list", json!({})),
         );
-        let broken: WorkspaceListResult = serde_json::from_value(broken.result.unwrap()).unwrap();
+        let broken: WorkspaceListResult = response_result(&broken);
         assert_eq!(broken.workspaces.len(), 1);
         assert_eq!(broken.workspaces[0].health, WorkspaceHealthName::Broken);
         assert_eq!(broken.workspaces[0].id, id);
@@ -2938,8 +2843,7 @@ mod tests {
                 json!({"name": "alpha", "root": workspace_root.to_string_lossy()}),
             ),
         );
-        let workspace: WorkspaceCreateResult =
-            serde_json::from_value(created_workspace.result.unwrap()).unwrap();
+        let workspace: WorkspaceCreateResult = response_result(&created_workspace);
         let workspace_id = workspace.workspace.id;
         let create_params = json!({
             "agent_id": "builder",
@@ -2954,7 +2858,7 @@ mod tests {
             &runtime,
             workspace_request("ac", "agent.create", create_params.clone()),
         );
-        let created: AgentCreateResult = serde_json::from_value(created.result.unwrap()).unwrap();
+        let created: AgentCreateResult = response_result(&created);
         assert_eq!(created.agent.id.as_str(), "builder");
         assert_eq!(created.agent.workspace_id, workspace_id);
         assert_eq!(created.agent.model, "gpt-5.6-sol");
@@ -2966,13 +2870,13 @@ mod tests {
         assert_eq!(created.agent.toolset, ["file.read", "file.write"]);
 
         let listed = handle_request(&runtime, workspace_request("al", "agent.list", json!({})));
-        let listed: AgentListResult = serde_json::from_value(listed.result.unwrap()).unwrap();
+        let listed: AgentListResult = response_result(&listed);
         assert_eq!(listed.agents, [created.agent.clone()]);
         let status = handle_request(
             &runtime,
             workspace_request("as", "agent.status", json!({"agent_id": "builder"})),
         );
-        let status: AgentStatusResult = serde_json::from_value(status.result.unwrap()).unwrap();
+        let status: AgentStatusResult = response_result(&status);
         assert_eq!(status.agent, created.agent);
 
         let duplicate = handle_request(
@@ -2980,17 +2884,15 @@ mod tests {
             workspace_request("dup", "agent.create", create_params),
         );
         assert_eq!(duplicate.error.unwrap().code, ERROR_MALFORMED_REQUEST);
-        let invalid_id = handle_request(
+        let invalid_id = handle_workspace_line(
             &runtime,
-            workspace_request(
-                "bad-id",
-                "agent.create",
-                json!({
-                    "agent_id": " ", "workspace_id": workspace_id,
-                    "model": "gpt-5.6-sol", "reasoning_effort": "none",
-                    "approval_policy": "prompt", "toolset": ["file.read"]
-                }),
-            ),
+            "bad-id",
+            "agent.create",
+            json!({
+                "agent_id": " ", "workspace_id": workspace_id,
+                "model": "gpt-5.6-sol", "reasoning_effort": "none",
+                "approval_policy": "prompt", "toolset": ["file.read"]
+            }),
         );
         assert_eq!(invalid_id.error.unwrap().code, ERROR_MALFORMED_REQUEST);
         let invalid_tool = handle_request(
@@ -3019,18 +2921,16 @@ mod tests {
             ),
         );
         assert_eq!(missing_workspace.error.unwrap().code, ERROR_NOT_FOUND);
-        let unknown_field = handle_request(
+        let unknown_field = handle_workspace_line(
             &runtime,
-            workspace_request(
-                "unknown",
-                "agent.create",
-                json!({
-                    "agent_id": "unknown", "workspace_id": workspace_id,
-                    "model": "gpt-5.6-sol", "reasoning_effort": "none",
-                    "approval_policy": "prompt", "toolset": ["file.read"],
-                    "credential": "must-not-land"
-                }),
-            ),
+            "unknown",
+            "agent.create",
+            json!({
+                "agent_id": "unknown", "workspace_id": workspace_id,
+                "model": "gpt-5.6-sol", "reasoning_effort": "none",
+                "approval_policy": "prompt", "toolset": ["file.read"],
+                "credential": "must-not-land"
+            }),
         );
         assert_eq!(unknown_field.error.unwrap().code, ERROR_MALFORMED_REQUEST);
         let missing_agent = handle_request(
@@ -3059,7 +2959,7 @@ mod tests {
         assert_eq!(broken_workspace.error.unwrap().code, ERROR_WORKSPACE_BROKEN);
 
         let listed = handle_request(&runtime, workspace_request("al2", "agent.list", json!({})));
-        let listed: AgentListResult = serde_json::from_value(listed.result.unwrap()).unwrap();
+        let listed: AgentListResult = response_result(&listed);
         assert_eq!(listed.agents.len(), 1);
     }
 
@@ -3069,13 +2969,11 @@ mod tests {
         let (root, runtime) = thread_test_runtime();
         let dir = root.path().join("ws");
         std::fs::create_dir(&dir).unwrap();
-        let response = handle_request(
+        let response = handle_workspace_line(
             &runtime,
-            workspace_request(
-                "bad",
-                "workspace.create",
-                json!({"name": "a", "root": dir.to_string_lossy(), "extra": true}),
-            ),
+            "bad",
+            "workspace.create",
+            json!({"name": "a", "root": dir.to_string_lossy(), "extra": true}),
         );
         assert_eq!(response.kind, crate::daemon::protocol::EnvelopeKind::Error);
         assert_eq!(response.error.unwrap().code, ERROR_MALFORMED_REQUEST);
@@ -3276,8 +3174,7 @@ mod tests {
                 r#"{{"v":1,"id":"authority","kind":"request","method":"thread.authority","params":{{"thread_id":"{thread_id}"}}}}"#
             ),
         );
-        let authority: ThreadAuthorityResult =
-            serde_json::from_value(authority_response.result.unwrap()).unwrap();
+        let authority: ThreadAuthorityResult = response_result(&authority_response);
         let authority = authority.authority;
         assert_eq!(authority.agent_id, Some(AgentId::new("plato").unwrap()));
         assert_eq!(
@@ -3407,7 +3304,7 @@ mod tests {
         let sibling_before = runtime.thread_live_state(&sibling_id);
 
         let stopped = stop_thread(&runtime, &target_id, "operator");
-        let stopped: ThreadStopResult = serde_json::from_value(stopped.result.unwrap()).unwrap();
+        let stopped: ThreadStopResult = response_result(&stopped);
         let stopped_at_ms = match stopped {
             ThreadStopResult::Stopped {
                 thread_id,
@@ -3438,7 +3335,7 @@ mod tests {
 
         let repeated = stop_thread(&runtime, &target_id, "other_operator");
         assert_eq!(
-            serde_json::from_value::<ThreadStopResult>(repeated.result.unwrap()).unwrap(),
+            response_result::<ThreadStopResult>(&repeated),
             ThreadStopResult::AlreadyStopped {
                 thread_id: target_id.clone(),
                 stopped_turn_id: None,
@@ -3494,7 +3391,7 @@ mod tests {
         let stopped = stop_thread(&runtime, &target_id, "operator");
         worker.join().unwrap();
         assert_eq!(
-            serde_json::from_value::<ThreadStopResult>(stopped.result.unwrap()).unwrap(),
+            response_result::<ThreadStopResult>(&stopped),
             ThreadStopResult::Stopped {
                 thread_id: target_id.clone(),
                 stopped_turn_id: Some("turn_active".into()),
@@ -3729,7 +3626,7 @@ IFS= read -r _
 
         let stopped = stop_thread(&runtime, &target_id, "operator");
         assert!(matches!(
-            serde_json::from_value::<ThreadStopResult>(stopped.result.unwrap()).unwrap(),
+            response_result::<ThreadStopResult>(&stopped),
             ThreadStopResult::Stopped {
                 stopped_turn_id: Some(ref turn_id),
                 ..
@@ -4031,7 +3928,7 @@ IFS= read -r _
             &restarted,
             r#"{"v":1,"id":"list","kind":"request","method":"thread.list"}"#,
         );
-        let listed: ThreadListResult = serde_json::from_value(list.result.unwrap()).unwrap();
+        let listed: ThreadListResult = response_result(&list);
         assert_eq!(listed.threads.len(), 2);
         assert!(listed.threads.iter().all(|thread| !thread.live.loaded));
         assert!(listed.threads.iter().any(|thread| {
@@ -4047,7 +3944,7 @@ IFS= read -r _
                 child.authority.thread_id
             ),
         );
-        let status: ThreadStatusResult = serde_json::from_value(status.result.unwrap()).unwrap();
+        let status: ThreadStatusResult = response_result(&status);
         assert_eq!(status.thread.authority, child.authority);
         assert!(!status.thread.live.loaded);
     }
@@ -4151,10 +4048,7 @@ IFS= read -r _
             ),
         );
         assert_eq!(
-            serde_json::from_value::<crate::daemon::protocol::ThreadSendResult>(
-                stale.result.unwrap()
-            )
-            .unwrap(),
+            response_result::<crate::daemon::protocol::ThreadSendResult>(&stale),
             crate::daemon::protocol::ThreadSendResult::Rejected {
                 thread_id: thread_id.clone(),
                 turn_id: None,
@@ -4376,8 +4270,7 @@ IFS= read -r _
         runtime.reserve_run(record.clone()).unwrap();
 
         let first = cancel_run(&runtime, "cancel_1", &record.run_id);
-        let first_result: CommandAcceptedResult =
-            serde_json::from_value(first.result.clone().unwrap()).unwrap();
+        let first_result: CommandAcceptedResult = response_result(&first);
 
         assert_eq!(first.kind, crate::daemon::protocol::EnvelopeKind::Response);
         assert_eq!(first_result.run_id, record.run_id);
@@ -4398,8 +4291,7 @@ IFS= read -r _
         ));
 
         let duplicate = cancel_run(&runtime, "cancel_2", &record.run_id);
-        let duplicate_result: CommandAcceptedResult =
-            serde_json::from_value(duplicate.result.clone().unwrap()).unwrap();
+        let duplicate_result: CommandAcceptedResult = response_result(&duplicate);
         assert_eq!(
             duplicate.kind,
             crate::daemon::protocol::EnvelopeKind::Response
@@ -5344,7 +5236,7 @@ IFS= read -r _
             response.kind,
             crate::daemon::protocol::EnvelopeKind::Response
         );
-        serde_json::from_value(response.result.unwrap()).unwrap()
+        response_result(&response)
     }
 
     fn test_runtime() -> DaemonRuntime {
@@ -5527,7 +5419,7 @@ IFS= read -r _
         );
 
         assert_eq!(response.v, 1);
-        let result: EventsStreamResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        let result: EventsStreamResult = response_result(&response);
         assert_eq!(result.events.len(), 1);
         let wire = serde_json::to_value(&result.events[0]).unwrap();
         assert_eq!(wire["event"]["kind"], "ledger");

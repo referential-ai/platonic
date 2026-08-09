@@ -38,7 +38,7 @@ pub enum GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use platonic_protocol::ProtocolError;
+    use platonic_protocol::{ERROR_NOT_FOUND, ProtocolError};
 
     #[test]
     fn display_matches_the_historical_root_errors() {
@@ -60,7 +60,7 @@ mod tests {
         );
         assert_eq!(
             GatewayError::from(ClientError::DaemonResponse(ProtocolError {
-                code: "not_found".into(),
+                code: ERROR_NOT_FOUND,
                 message: "missing".into(),
             }))
             .to_string(),

@@ -8,7 +8,9 @@
 
 pub use platonic_core::{AgentId, HarnessEvent, PolicyDecision};
 use platonic_core::{EffectClass, RecordedEvent};
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::SerializeStruct,
+};
 use serde_json::Value;
 use std::fmt;
 
@@ -102,61 +104,185 @@ pub const BUILD_IDENTITY: &str = match option_env!("PLATO_BUILD_IDENTITY") {
     None => concat!(env!("CARGO_PKG_VERSION"), " unknown unknown"),
 };
 
+/// One capability advertised during the protocol v1 handshake.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub enum Capability {
+    /// Initial daemon handshake.
+    #[serde(rename = "hello")]
+    Hello,
+    /// Start a fresh run.
+    #[serde(rename = "run.start")]
+    RunStart,
+    /// Append a message to a session.
+    #[serde(rename = "message.append")]
+    MessageAppend,
+    /// Start issue preparation.
+    #[serde(rename = "issue-prep.start")]
+    IssuePrepStart,
+    /// Stream buffered run events.
+    #[serde(rename = "events.stream")]
+    EventsStream,
+    /// Decide a pending approval.
+    #[serde(rename = "approval.decide")]
+    ApprovalDecide,
+    /// Request run cancellation.
+    #[serde(rename = "run.cancel")]
+    RunCancel,
+    /// List sessions.
+    #[serde(rename = "sessions.list")]
+    SessionsList,
+    /// Read a transcript.
+    #[serde(rename = "transcript.read")]
+    TranscriptRead,
+    /// Read a typed transcript.
+    #[serde(rename = "transcript.read.typed")]
+    TranscriptReadTyped,
+    /// Read a pending approval in a transcript.
+    #[serde(rename = "transcript.read.pending_approval")]
+    TranscriptReadPendingApproval,
+    /// Read authoritative daemon status.
+    #[serde(rename = "daemon.status")]
+    DaemonStatus,
+    /// Shut down an idle daemon.
+    #[serde(rename = "daemon.shutdown_if_idle")]
+    DaemonShutdownIfIdle,
+    /// Durably create a thread authority record.
+    #[serde(rename = "thread.spawn")]
+    ThreadSpawn,
+    /// List durable threads with live state.
+    #[serde(rename = "thread.list")]
+    ThreadList,
+    /// Read one durable thread with live state.
+    #[serde(rename = "thread.status")]
+    ThreadStatus,
+    /// Read one complete immutable thread authority record.
+    #[serde(rename = "thread.authority")]
+    ThreadAuthority,
+    /// Start or steer one daemon-owned thread turn.
+    #[serde(rename = "thread.send")]
+    ThreadSend,
+    /// Observe retained live thread events.
+    #[serde(rename = "thread.events")]
+    ThreadEvents,
+    /// Stop one durable thread and its active child process.
+    #[serde(rename = "thread.stop")]
+    ThreadStop,
+    /// Register one named workspace.
+    #[serde(rename = "workspace.create")]
+    WorkspaceCreate,
+    /// List every registered workspace.
+    #[serde(rename = "workspace.list")]
+    WorkspaceList,
+    /// Read one registered workspace.
+    #[serde(rename = "workspace.status")]
+    WorkspaceStatus,
+    /// Create one configured agent profile.
+    #[serde(rename = "agent.create")]
+    AgentCreate,
+    /// List every configured agent profile.
+    #[serde(rename = "agent.list")]
+    AgentList,
+    /// Read one configured agent profile.
+    #[serde(rename = "agent.status")]
+    AgentStatus,
+}
+
+impl Capability {
+    /// Returns the exact capability wire value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hello => "hello",
+            Self::RunStart => "run.start",
+            Self::MessageAppend => "message.append",
+            Self::IssuePrepStart => "issue-prep.start",
+            Self::EventsStream => "events.stream",
+            Self::ApprovalDecide => "approval.decide",
+            Self::RunCancel => "run.cancel",
+            Self::SessionsList => "sessions.list",
+            Self::TranscriptRead => "transcript.read",
+            Self::TranscriptReadTyped => "transcript.read.typed",
+            Self::TranscriptReadPendingApproval => "transcript.read.pending_approval",
+            Self::DaemonStatus => "daemon.status",
+            Self::DaemonShutdownIfIdle => "daemon.shutdown_if_idle",
+            Self::ThreadSpawn => "thread.spawn",
+            Self::ThreadList => "thread.list",
+            Self::ThreadStatus => "thread.status",
+            Self::ThreadAuthority => "thread.authority",
+            Self::ThreadSend => "thread.send",
+            Self::ThreadEvents => "thread.events",
+            Self::ThreadStop => "thread.stop",
+            Self::WorkspaceCreate => "workspace.create",
+            Self::WorkspaceList => "workspace.list",
+            Self::WorkspaceStatus => "workspace.status",
+            Self::AgentCreate => "agent.create",
+            Self::AgentList => "agent.list",
+            Self::AgentStatus => "agent.status",
+        }
+    }
+}
+
+impl fmt::Display for Capability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.pad(self.as_str())
+    }
+}
+
 /// Capability name for the initial daemon handshake.
-pub const CAPABILITY_HELLO: &str = "hello";
+pub const CAPABILITY_HELLO: Capability = Capability::Hello;
 /// Capability name for starting a fresh run.
-pub const CAPABILITY_RUN_START: &str = "run.start";
+pub const CAPABILITY_RUN_START: Capability = Capability::RunStart;
 /// Capability name for appending a message to a session.
-pub const CAPABILITY_MESSAGE_APPEND: &str = "message.append";
+pub const CAPABILITY_MESSAGE_APPEND: Capability = Capability::MessageAppend;
 /// Capability name for starting issue preparation.
-pub const CAPABILITY_ISSUE_PREP_START: &str = "issue-prep.start";
+pub const CAPABILITY_ISSUE_PREP_START: Capability = Capability::IssuePrepStart;
 /// Capability name for streaming buffered run events.
-pub const CAPABILITY_EVENTS_STREAM: &str = "events.stream";
+pub const CAPABILITY_EVENTS_STREAM: Capability = Capability::EventsStream;
 /// Capability name for deciding a pending approval.
-pub const CAPABILITY_APPROVAL_DECIDE: &str = "approval.decide";
+pub const CAPABILITY_APPROVAL_DECIDE: Capability = Capability::ApprovalDecide;
 /// Capability name for requesting run cancellation.
-pub const CAPABILITY_RUN_CANCEL: &str = "run.cancel";
+pub const CAPABILITY_RUN_CANCEL: Capability = Capability::RunCancel;
 /// Capability name for listing sessions.
-pub const CAPABILITY_SESSIONS_LIST: &str = "sessions.list";
+pub const CAPABILITY_SESSIONS_LIST: Capability = Capability::SessionsList;
 /// Capability name for reading a transcript.
-pub const CAPABILITY_TRANSCRIPT_READ: &str = "transcript.read";
+pub const CAPABILITY_TRANSCRIPT_READ: Capability = Capability::TranscriptRead;
 /// Capability name for typed transcript readback.
-pub const CAPABILITY_TRANSCRIPT_READ_TYPED: &str = "transcript.read.typed";
+pub const CAPABILITY_TRANSCRIPT_READ_TYPED: Capability = Capability::TranscriptReadTyped;
 /// Capability name for pending-approval transcript readback.
-pub const CAPABILITY_TRANSCRIPT_READ_PENDING_APPROVAL: &str = "transcript.read.pending_approval";
+pub const CAPABILITY_TRANSCRIPT_READ_PENDING_APPROVAL: Capability =
+    Capability::TranscriptReadPendingApproval;
 /// Capability name for authoritative daemon status readback.
-pub const CAPABILITY_DAEMON_STATUS: &str = "daemon.status";
+pub const CAPABILITY_DAEMON_STATUS: Capability = Capability::DaemonStatus;
 /// Capability name for shutting down an idle daemon.
-pub const CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE: &str = "daemon.shutdown_if_idle";
+pub const CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE: Capability = Capability::DaemonShutdownIfIdle;
 /// Capability name for durably creating a thread authority record.
-pub const CAPABILITY_THREAD_SPAWN: &str = "thread.spawn";
+pub const CAPABILITY_THREAD_SPAWN: Capability = Capability::ThreadSpawn;
 /// Capability name for listing durable threads with live daemon state.
-pub const CAPABILITY_THREAD_LIST: &str = "thread.list";
+pub const CAPABILITY_THREAD_LIST: Capability = Capability::ThreadList;
 /// Capability name for reading one durable thread with live daemon state.
-pub const CAPABILITY_THREAD_STATUS: &str = "thread.status";
+pub const CAPABILITY_THREAD_STATUS: Capability = Capability::ThreadStatus;
 /// Capability name for reading one complete immutable thread authority record.
-pub const CAPABILITY_THREAD_AUTHORITY: &str = "thread.authority";
+pub const CAPABILITY_THREAD_AUTHORITY: Capability = Capability::ThreadAuthority;
 /// Capability name for starting or steering one daemon-owned thread turn.
-pub const CAPABILITY_THREAD_SEND: &str = "thread.send";
+pub const CAPABILITY_THREAD_SEND: Capability = Capability::ThreadSend;
 /// Capability name for observing retained live thread events.
-pub const CAPABILITY_THREAD_EVENTS: &str = "thread.events";
+pub const CAPABILITY_THREAD_EVENTS: Capability = Capability::ThreadEvents;
 /// Capability name for stopping one durable thread and its active child process.
-pub const CAPABILITY_THREAD_STOP: &str = "thread.stop";
+pub const CAPABILITY_THREAD_STOP: Capability = Capability::ThreadStop;
 /// Capability name for registering one named workspace.
-pub const CAPABILITY_WORKSPACE_CREATE: &str = "workspace.create";
+pub const CAPABILITY_WORKSPACE_CREATE: Capability = Capability::WorkspaceCreate;
 /// Capability name for listing every registered workspace.
-pub const CAPABILITY_WORKSPACE_LIST: &str = "workspace.list";
+pub const CAPABILITY_WORKSPACE_LIST: Capability = Capability::WorkspaceList;
 /// Capability name for reading one registered workspace.
-pub const CAPABILITY_WORKSPACE_STATUS: &str = "workspace.status";
+pub const CAPABILITY_WORKSPACE_STATUS: Capability = Capability::WorkspaceStatus;
 /// Capability name for creating one configured agent profile.
-pub const CAPABILITY_AGENT_CREATE: &str = "agent.create";
+pub const CAPABILITY_AGENT_CREATE: Capability = Capability::AgentCreate;
 /// Capability name for listing every configured agent profile.
-pub const CAPABILITY_AGENT_LIST: &str = "agent.list";
+pub const CAPABILITY_AGENT_LIST: Capability = Capability::AgentList;
 /// Capability name for reading one configured agent profile.
-pub const CAPABILITY_AGENT_STATUS: &str = "agent.status";
+pub const CAPABILITY_AGENT_STATUS: Capability = Capability::AgentStatus;
 
 /// Capabilities advertised by a protocol v1 daemon, in wire order.
-pub const CAPABILITIES: [&str; 26] = [
+pub const CAPABILITIES: [Capability; 26] = [
     CAPABILITY_HELLO,
     CAPABILITY_RUN_START,
     CAPABILITY_MESSAGE_APPEND,
@@ -185,50 +311,139 @@ pub const CAPABILITIES: [&str; 26] = [
     CAPABILITY_AGENT_STATUS,
 ];
 
+/// Stable machine-readable protocol error code.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolErrorCode {
+    /// Daemon shutdown has begun.
+    DaemonShuttingDown,
+    /// The request envelope or parameters are invalid.
+    MalformedRequest,
+    /// A requested event offset is no longer retained.
+    Lagged,
+    /// An unexpected daemon failure occurred.
+    InternalError,
+    /// Issue preparation failed.
+    IssuePrepFailed,
+    /// The requested resource does not exist.
+    NotFound,
+    /// The daemon cannot admit more work.
+    Overload,
+    /// A run failed.
+    RunFailed,
+    /// Sessions could not be listed.
+    SessionsListFailed,
+    /// Requested thread authority exceeds its parent.
+    ThreadAuthorityExceeded,
+    /// One complete thread authority could not be read.
+    ThreadAuthorityFailed,
+    /// Live thread event observation failed.
+    ThreadEventsFailed,
+    /// Durable thread enumeration failed.
+    ThreadListFailed,
+    /// Thread spawn admission or persistence failed.
+    ThreadSpawnFailed,
+    /// An admitted thread send could not start its run.
+    ThreadSendFailed,
+    /// One thread status could not be read.
+    ThreadStatusFailed,
+    /// A thread could not be stopped and recorded.
+    ThreadStopFailed,
+    /// The method is not supported.
+    UnsupportedMethod,
+    /// The protocol version is not supported.
+    UnsupportedVersion,
+    /// Client and daemon workspaces differ.
+    WorkspaceMismatch,
+    /// A directory has not been registered as a workspace.
+    WorkspaceUnregistered,
+    /// A registered workspace directory has vanished.
+    WorkspaceBroken,
+}
+
+impl ProtocolErrorCode {
+    /// Returns the exact error-code wire value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DaemonShuttingDown => "daemon_shutting_down",
+            Self::MalformedRequest => "malformed_request",
+            Self::Lagged => "lagged",
+            Self::InternalError => "internal_error",
+            Self::IssuePrepFailed => "issue_prep_failed",
+            Self::NotFound => "not_found",
+            Self::Overload => "overload",
+            Self::RunFailed => "run_failed",
+            Self::SessionsListFailed => "sessions_list_failed",
+            Self::ThreadAuthorityExceeded => "thread_authority_exceeded",
+            Self::ThreadAuthorityFailed => "thread_authority_failed",
+            Self::ThreadEventsFailed => "thread_events_failed",
+            Self::ThreadListFailed => "thread_list_failed",
+            Self::ThreadSpawnFailed => "thread_spawn_failed",
+            Self::ThreadSendFailed => "thread_send_failed",
+            Self::ThreadStatusFailed => "thread_status_failed",
+            Self::ThreadStopFailed => "thread_stop_failed",
+            Self::UnsupportedMethod => "unsupported_method",
+            Self::UnsupportedVersion => "unsupported_version",
+            Self::WorkspaceMismatch => "workspace_mismatch",
+            Self::WorkspaceUnregistered => "workspace_unregistered",
+            Self::WorkspaceBroken => "workspace_broken",
+        }
+    }
+}
+
+impl fmt::Display for ProtocolErrorCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.pad(self.as_str())
+    }
+}
+
 /// Error code returned once daemon shutdown has begun.
-pub const ERROR_DAEMON_SHUTTING_DOWN: &str = "daemon_shutting_down";
+pub const ERROR_DAEMON_SHUTTING_DOWN: ProtocolErrorCode = ProtocolErrorCode::DaemonShuttingDown;
 /// Error code returned for an invalid request envelope or parameters.
-pub const ERROR_MALFORMED_REQUEST: &str = "malformed_request";
+pub const ERROR_MALFORMED_REQUEST: ProtocolErrorCode = ProtocolErrorCode::MalformedRequest;
 /// Error code returned when a requested event offset is no longer retained.
-pub const ERROR_LAGGED: &str = "lagged";
+pub const ERROR_LAGGED: ProtocolErrorCode = ProtocolErrorCode::Lagged;
 /// Error code returned for an unexpected daemon failure.
-pub const ERROR_INTERNAL: &str = "internal_error";
+pub const ERROR_INTERNAL: ProtocolErrorCode = ProtocolErrorCode::InternalError;
 /// Error code returned when issue preparation fails.
-pub const ERROR_ISSUE_PREP_FAILED: &str = "issue_prep_failed";
+pub const ERROR_ISSUE_PREP_FAILED: ProtocolErrorCode = ProtocolErrorCode::IssuePrepFailed;
 /// Error code returned when the requested resource does not exist.
-pub const ERROR_NOT_FOUND: &str = "not_found";
+pub const ERROR_NOT_FOUND: ProtocolErrorCode = ProtocolErrorCode::NotFound;
 /// Error code returned when the daemon cannot admit more work.
-pub const ERROR_OVERLOAD: &str = "overload";
+pub const ERROR_OVERLOAD: ProtocolErrorCode = ProtocolErrorCode::Overload;
 /// Error code returned when a run fails.
-pub const ERROR_RUN_FAILED: &str = "run_failed";
+pub const ERROR_RUN_FAILED: ProtocolErrorCode = ProtocolErrorCode::RunFailed;
 /// Error code returned when sessions cannot be listed.
-pub const ERROR_SESSIONS_LIST_FAILED: &str = "sessions_list_failed";
+pub const ERROR_SESSIONS_LIST_FAILED: ProtocolErrorCode = ProtocolErrorCode::SessionsListFailed;
 /// Error code returned when requested thread authority exceeds its parent.
-pub const ERROR_THREAD_AUTHORITY_EXCEEDED: &str = "thread_authority_exceeded";
+pub const ERROR_THREAD_AUTHORITY_EXCEEDED: ProtocolErrorCode =
+    ProtocolErrorCode::ThreadAuthorityExceeded;
 /// Error code returned when one complete thread authority cannot be read.
-pub const ERROR_THREAD_AUTHORITY_FAILED: &str = "thread_authority_failed";
+pub const ERROR_THREAD_AUTHORITY_FAILED: ProtocolErrorCode =
+    ProtocolErrorCode::ThreadAuthorityFailed;
 /// Error code returned when live thread event observation fails.
-pub const ERROR_THREAD_EVENTS_FAILED: &str = "thread_events_failed";
+pub const ERROR_THREAD_EVENTS_FAILED: ProtocolErrorCode = ProtocolErrorCode::ThreadEventsFailed;
 /// Error code returned when durable thread enumeration fails.
-pub const ERROR_THREAD_LIST_FAILED: &str = "thread_list_failed";
+pub const ERROR_THREAD_LIST_FAILED: ProtocolErrorCode = ProtocolErrorCode::ThreadListFailed;
 /// Error code returned when thread spawn admission or persistence fails.
-pub const ERROR_THREAD_SPAWN_FAILED: &str = "thread_spawn_failed";
+pub const ERROR_THREAD_SPAWN_FAILED: ProtocolErrorCode = ProtocolErrorCode::ThreadSpawnFailed;
 /// Error code returned when an admitted thread send cannot start its run.
-pub const ERROR_THREAD_SEND_FAILED: &str = "thread_send_failed";
+pub const ERROR_THREAD_SEND_FAILED: ProtocolErrorCode = ProtocolErrorCode::ThreadSendFailed;
 /// Error code returned when one thread status cannot be read.
-pub const ERROR_THREAD_STATUS_FAILED: &str = "thread_status_failed";
+pub const ERROR_THREAD_STATUS_FAILED: ProtocolErrorCode = ProtocolErrorCode::ThreadStatusFailed;
 /// Error code returned when a thread cannot be stopped and recorded.
-pub const ERROR_THREAD_STOP_FAILED: &str = "thread_stop_failed";
+pub const ERROR_THREAD_STOP_FAILED: ProtocolErrorCode = ProtocolErrorCode::ThreadStopFailed;
 /// Error code returned for an unknown method.
-pub const ERROR_UNSUPPORTED_METHOD: &str = "unsupported_method";
+pub const ERROR_UNSUPPORTED_METHOD: ProtocolErrorCode = ProtocolErrorCode::UnsupportedMethod;
 /// Error code returned for an unsupported protocol version.
-pub const ERROR_UNSUPPORTED_VERSION: &str = "unsupported_version";
+pub const ERROR_UNSUPPORTED_VERSION: ProtocolErrorCode = ProtocolErrorCode::UnsupportedVersion;
 /// Error code returned when client and daemon workspaces differ.
-pub const ERROR_WORKSPACE_MISMATCH: &str = "workspace_mismatch";
+pub const ERROR_WORKSPACE_MISMATCH: ProtocolErrorCode = ProtocolErrorCode::WorkspaceMismatch;
 /// Error code returned when a directory has not been registered as a workspace.
-pub const ERROR_WORKSPACE_UNREGISTERED: &str = "workspace_unregistered";
+pub const ERROR_WORKSPACE_UNREGISTERED: ProtocolErrorCode =
+    ProtocolErrorCode::WorkspaceUnregistered;
 /// Error code returned when a registered workspace directory has vanished.
-pub const ERROR_WORKSPACE_BROKEN: &str = "workspace_broken";
+pub const ERROR_WORKSPACE_BROKEN: ProtocolErrorCode = ProtocolErrorCode::WorkspaceBroken;
 
 /// Wire name for a daemon run lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -269,7 +484,7 @@ impl fmt::Display for RunStateName {
 }
 
 /// Kind discriminator for a protocol envelope.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvelopeKind {
     /// A client request.
@@ -282,9 +497,564 @@ pub enum EnvelopeKind {
     Error,
 }
 
-/// Top-level versioned protocol envelope.
+/// Closed protocol v1 method set shared by requests and responses.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub enum ProtocolMethod {
+    /// Initial daemon handshake.
+    #[serde(rename = "hello")]
+    Hello,
+    /// Start a fresh run.
+    #[serde(rename = "run.start")]
+    RunStart,
+    /// Append a message to a session.
+    #[serde(rename = "message.append")]
+    MessageAppend,
+    /// Start issue preparation.
+    #[serde(rename = "issue-prep.start")]
+    IssuePrepStart,
+    /// Stream buffered run events.
+    #[serde(rename = "events.stream")]
+    EventsStream,
+    /// Decide a pending approval.
+    #[serde(rename = "approval.decide")]
+    ApprovalDecide,
+    /// Request run cancellation.
+    #[serde(rename = "run.cancel")]
+    RunCancel,
+    /// List sessions.
+    #[serde(rename = "sessions.list")]
+    SessionsList,
+    /// Read a transcript.
+    #[serde(rename = "transcript.read")]
+    TranscriptRead,
+    /// Read authoritative daemon status.
+    #[serde(rename = "daemon.status")]
+    DaemonStatus,
+    /// Shut down an idle daemon.
+    #[serde(rename = "daemon.shutdown_if_idle")]
+    DaemonShutdownIfIdle,
+    /// Durably create a thread authority record.
+    #[serde(rename = "thread.spawn")]
+    ThreadSpawn,
+    /// List durable threads with live state.
+    #[serde(rename = "thread.list")]
+    ThreadList,
+    /// Read one durable thread with live state.
+    #[serde(rename = "thread.status")]
+    ThreadStatus,
+    /// Read one complete immutable thread authority record.
+    #[serde(rename = "thread.authority")]
+    ThreadAuthority,
+    /// Start or steer one daemon-owned thread turn.
+    #[serde(rename = "thread.send")]
+    ThreadSend,
+    /// Observe retained live thread events.
+    #[serde(rename = "thread.events")]
+    ThreadEvents,
+    /// Stop one durable thread and its active child process.
+    #[serde(rename = "thread.stop")]
+    ThreadStop,
+    /// Register one named workspace.
+    #[serde(rename = "workspace.create")]
+    WorkspaceCreate,
+    /// List every registered workspace.
+    #[serde(rename = "workspace.list")]
+    WorkspaceList,
+    /// Read one registered workspace.
+    #[serde(rename = "workspace.status")]
+    WorkspaceStatus,
+    /// Create one configured agent profile.
+    #[serde(rename = "agent.create")]
+    AgentCreate,
+    /// List every configured agent profile.
+    #[serde(rename = "agent.list")]
+    AgentList,
+    /// Read one configured agent profile.
+    #[serde(rename = "agent.status")]
+    AgentStatus,
+}
+
+impl ProtocolMethod {
+    /// Returns the exact method wire value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hello => "hello",
+            Self::RunStart => "run.start",
+            Self::MessageAppend => "message.append",
+            Self::IssuePrepStart => "issue-prep.start",
+            Self::EventsStream => "events.stream",
+            Self::ApprovalDecide => "approval.decide",
+            Self::RunCancel => "run.cancel",
+            Self::SessionsList => "sessions.list",
+            Self::TranscriptRead => "transcript.read",
+            Self::DaemonStatus => "daemon.status",
+            Self::DaemonShutdownIfIdle => "daemon.shutdown_if_idle",
+            Self::ThreadSpawn => "thread.spawn",
+            Self::ThreadList => "thread.list",
+            Self::ThreadStatus => "thread.status",
+            Self::ThreadAuthority => "thread.authority",
+            Self::ThreadSend => "thread.send",
+            Self::ThreadEvents => "thread.events",
+            Self::ThreadStop => "thread.stop",
+            Self::WorkspaceCreate => "workspace.create",
+            Self::WorkspaceList => "workspace.list",
+            Self::WorkspaceStatus => "workspace.status",
+            Self::AgentCreate => "agent.create",
+            Self::AgentList => "agent.list",
+            Self::AgentStatus => "agent.status",
+        }
+    }
+}
+
+impl fmt::Display for ProtocolMethod {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.pad(self.as_str())
+    }
+}
+
+impl std::ops::Deref for ProtocolMethod {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl From<&str> for ProtocolMethod {
+    fn from(value: &str) -> Self {
+        Self::parse(value).expect("known protocol method")
+    }
+}
+
+impl From<String> for ProtocolMethod {
+    fn from(value: String) -> Self {
+        Self::from(value.as_str())
+    }
+}
+
+impl ProtocolMethod {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "hello" => Some(Self::Hello),
+            "run.start" => Some(Self::RunStart),
+            "message.append" => Some(Self::MessageAppend),
+            "issue-prep.start" => Some(Self::IssuePrepStart),
+            "events.stream" => Some(Self::EventsStream),
+            "approval.decide" => Some(Self::ApprovalDecide),
+            "run.cancel" => Some(Self::RunCancel),
+            "sessions.list" => Some(Self::SessionsList),
+            "transcript.read" => Some(Self::TranscriptRead),
+            "daemon.status" => Some(Self::DaemonStatus),
+            "daemon.shutdown_if_idle" => Some(Self::DaemonShutdownIfIdle),
+            "thread.spawn" => Some(Self::ThreadSpawn),
+            "thread.list" => Some(Self::ThreadList),
+            "thread.status" => Some(Self::ThreadStatus),
+            "thread.authority" => Some(Self::ThreadAuthority),
+            "thread.send" => Some(Self::ThreadSend),
+            "thread.events" => Some(Self::ThreadEvents),
+            "thread.stop" => Some(Self::ThreadStop),
+            "workspace.create" => Some(Self::WorkspaceCreate),
+            "workspace.list" => Some(Self::WorkspaceList),
+            "workspace.status" => Some(Self::WorkspaceStatus),
+            "agent.create" => Some(Self::AgentCreate),
+            "agent.list" => Some(Self::AgentList),
+            "agent.status" => Some(Self::AgentStatus),
+            _ => None,
+        }
+    }
+}
+
+/// Closed protocol v1 request set with method-specific parameters.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "method", content = "params")]
+pub enum ProtocolRequest {
+    /// Initial daemon handshake.
+    #[serde(rename = "hello")]
+    Hello(HelloParams),
+    /// Start a fresh run.
+    #[serde(rename = "run.start")]
+    RunStart(RunStartParams),
+    /// Append a message to a session.
+    #[serde(rename = "message.append")]
+    MessageAppend(MessageAppendParams),
+    /// Start issue preparation.
+    #[serde(rename = "issue-prep.start")]
+    IssuePrepStart(IssuePrepStartParams),
+    /// Stream buffered run events.
+    #[serde(rename = "events.stream")]
+    EventsStream(EventsStreamParams),
+    /// Decide a pending approval.
+    #[serde(rename = "approval.decide")]
+    ApprovalDecide(ApprovalDecideParams),
+    /// Request run cancellation.
+    #[serde(rename = "run.cancel")]
+    RunCancel(RunCancelParams),
+    /// List sessions.
+    #[serde(rename = "sessions.list")]
+    SessionsList,
+    /// Read a transcript.
+    #[serde(rename = "transcript.read")]
+    TranscriptRead(TranscriptReadParams),
+    /// Read authoritative daemon status.
+    #[serde(rename = "daemon.status")]
+    DaemonStatus(DaemonStatusParams),
+    /// Shut down an idle daemon.
+    #[serde(rename = "daemon.shutdown_if_idle")]
+    DaemonShutdownIfIdle,
+    /// Durably create a thread authority record.
+    #[serde(rename = "thread.spawn")]
+    ThreadSpawn(ThreadSpawnParams),
+    /// List durable threads with live state.
+    #[serde(rename = "thread.list")]
+    ThreadList,
+    /// Read one durable thread with live state.
+    #[serde(rename = "thread.status")]
+    ThreadStatus(ThreadStatusParams),
+    /// Read one complete immutable thread authority record.
+    #[serde(rename = "thread.authority")]
+    ThreadAuthority(ThreadAuthorityParams),
+    /// Start or steer one daemon-owned thread turn.
+    #[serde(rename = "thread.send")]
+    ThreadSend(ThreadSendParams),
+    /// Observe retained live thread events.
+    #[serde(rename = "thread.events")]
+    ThreadEvents(ThreadEventsParams),
+    /// Stop one durable thread and its active child process.
+    #[serde(rename = "thread.stop")]
+    ThreadStop(ThreadStopParams),
+    /// Register one named workspace.
+    #[serde(rename = "workspace.create")]
+    WorkspaceCreate(WorkspaceCreateParams),
+    /// List every registered workspace.
+    #[serde(rename = "workspace.list")]
+    WorkspaceList(WorkspaceListParams),
+    /// Read one registered workspace.
+    #[serde(rename = "workspace.status")]
+    WorkspaceStatus(WorkspaceStatusParams),
+    /// Create one configured agent profile.
+    #[serde(rename = "agent.create")]
+    AgentCreate(AgentCreateParams),
+    /// List every configured agent profile.
+    #[serde(rename = "agent.list")]
+    AgentList(AgentListParams),
+    /// Read one configured agent profile.
+    #[serde(rename = "agent.status")]
+    AgentStatus(AgentStatusParams),
+}
+
+impl ProtocolRequest {
+    /// Returns this request's closed method discriminator.
+    pub const fn method(&self) -> ProtocolMethod {
+        match self {
+            Self::Hello(_) => ProtocolMethod::Hello,
+            Self::RunStart(_) => ProtocolMethod::RunStart,
+            Self::MessageAppend(_) => ProtocolMethod::MessageAppend,
+            Self::IssuePrepStart(_) => ProtocolMethod::IssuePrepStart,
+            Self::EventsStream(_) => ProtocolMethod::EventsStream,
+            Self::ApprovalDecide(_) => ProtocolMethod::ApprovalDecide,
+            Self::RunCancel(_) => ProtocolMethod::RunCancel,
+            Self::SessionsList => ProtocolMethod::SessionsList,
+            Self::TranscriptRead(_) => ProtocolMethod::TranscriptRead,
+            Self::DaemonStatus(_) => ProtocolMethod::DaemonStatus,
+            Self::DaemonShutdownIfIdle => ProtocolMethod::DaemonShutdownIfIdle,
+            Self::ThreadSpawn(_) => ProtocolMethod::ThreadSpawn,
+            Self::ThreadList => ProtocolMethod::ThreadList,
+            Self::ThreadStatus(_) => ProtocolMethod::ThreadStatus,
+            Self::ThreadAuthority(_) => ProtocolMethod::ThreadAuthority,
+            Self::ThreadSend(_) => ProtocolMethod::ThreadSend,
+            Self::ThreadEvents(_) => ProtocolMethod::ThreadEvents,
+            Self::ThreadStop(_) => ProtocolMethod::ThreadStop,
+            Self::WorkspaceCreate(_) => ProtocolMethod::WorkspaceCreate,
+            Self::WorkspaceList(_) => ProtocolMethod::WorkspaceList,
+            Self::WorkspaceStatus(_) => ProtocolMethod::WorkspaceStatus,
+            Self::AgentCreate(_) => ProtocolMethod::AgentCreate,
+            Self::AgentList(_) => ProtocolMethod::AgentList,
+            Self::AgentStatus(_) => ProtocolMethod::AgentStatus,
+        }
+    }
+
+    fn decode(method: ProtocolMethod, params: Option<Value>) -> serde_json::Result<Self> {
+        match method {
+            ProtocolMethod::Hello => decode_params(params, method).map(Self::Hello),
+            ProtocolMethod::RunStart => decode_params(params, method).map(Self::RunStart),
+            ProtocolMethod::MessageAppend => decode_params(params, method).map(Self::MessageAppend),
+            ProtocolMethod::IssuePrepStart => {
+                decode_params(params, method).map(Self::IssuePrepStart)
+            }
+            ProtocolMethod::EventsStream => decode_params(params, method).map(Self::EventsStream),
+            ProtocolMethod::ApprovalDecide => {
+                decode_params(params, method).map(Self::ApprovalDecide)
+            }
+            ProtocolMethod::RunCancel => decode_params(params, method).map(Self::RunCancel),
+            ProtocolMethod::SessionsList => {
+                decode_empty_params(params, method).map(|()| Self::SessionsList)
+            }
+            ProtocolMethod::TranscriptRead => {
+                decode_params(params, method).map(Self::TranscriptRead)
+            }
+            ProtocolMethod::DaemonStatus => decode_params(params, method).map(Self::DaemonStatus),
+            ProtocolMethod::DaemonShutdownIfIdle => {
+                decode_empty_params(params, method).map(|()| Self::DaemonShutdownIfIdle)
+            }
+            ProtocolMethod::ThreadSpawn => decode_params(params, method).map(Self::ThreadSpawn),
+            ProtocolMethod::ThreadList => {
+                decode_empty_params(params, method).map(|()| Self::ThreadList)
+            }
+            ProtocolMethod::ThreadStatus => decode_params(params, method).map(Self::ThreadStatus),
+            ProtocolMethod::ThreadAuthority => {
+                decode_params(params, method).map(Self::ThreadAuthority)
+            }
+            ProtocolMethod::ThreadSend => decode_params(params, method).map(Self::ThreadSend),
+            ProtocolMethod::ThreadEvents => decode_params(params, method).map(Self::ThreadEvents),
+            ProtocolMethod::ThreadStop => decode_params(params, method).map(Self::ThreadStop),
+            ProtocolMethod::WorkspaceCreate => {
+                decode_params(params, method).map(Self::WorkspaceCreate)
+            }
+            ProtocolMethod::WorkspaceList => decode_params(params, method).map(Self::WorkspaceList),
+            ProtocolMethod::WorkspaceStatus => {
+                decode_params(params, method).map(Self::WorkspaceStatus)
+            }
+            ProtocolMethod::AgentCreate => decode_params(params, method).map(Self::AgentCreate),
+            ProtocolMethod::AgentList => decode_params(params, method).map(Self::AgentList),
+            ProtocolMethod::AgentStatus => decode_params(params, method).map(Self::AgentStatus),
+        }
+    }
+
+    fn serialize_params<S>(&self, envelope: &mut S) -> Result<(), S::Error>
+    where
+        S: SerializeStruct,
+    {
+        match self {
+            Self::Hello(params) => serialize_sorted_field(envelope, "params", params),
+            Self::RunStart(params) => serialize_sorted_field(envelope, "params", params),
+            Self::MessageAppend(params) => serialize_sorted_field(envelope, "params", params),
+            Self::IssuePrepStart(params) => serialize_sorted_field(envelope, "params", params),
+            Self::EventsStream(params) => serialize_sorted_field(envelope, "params", params),
+            Self::ApprovalDecide(params) => serialize_sorted_field(envelope, "params", params),
+            Self::RunCancel(params) => serialize_sorted_field(envelope, "params", params),
+            Self::SessionsList => Ok(()),
+            Self::TranscriptRead(params) => serialize_sorted_field(envelope, "params", params),
+            Self::DaemonStatus(params) => serialize_sorted_field(envelope, "params", params),
+            Self::DaemonShutdownIfIdle => Ok(()),
+            Self::ThreadSpawn(params) => serialize_sorted_field(envelope, "params", params),
+            Self::ThreadList => Ok(()),
+            Self::ThreadStatus(params) => serialize_sorted_field(envelope, "params", params),
+            Self::ThreadAuthority(params) => serialize_sorted_field(envelope, "params", params),
+            Self::ThreadSend(params) => serialize_sorted_field(envelope, "params", params),
+            Self::ThreadEvents(params) => serialize_sorted_field(envelope, "params", params),
+            Self::ThreadStop(params) => serialize_sorted_field(envelope, "params", params),
+            Self::WorkspaceCreate(params) => serialize_sorted_field(envelope, "params", params),
+            Self::WorkspaceList(params) => serialize_sorted_field(envelope, "params", params),
+            Self::WorkspaceStatus(params) => serialize_sorted_field(envelope, "params", params),
+            Self::AgentCreate(params) => serialize_sorted_field(envelope, "params", params),
+            Self::AgentList(params) => serialize_sorted_field(envelope, "params", params),
+            Self::AgentStatus(params) => serialize_sorted_field(envelope, "params", params),
+        }
+    }
+}
+
+/// Closed protocol v1 response set with method-specific results.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(tag = "method", content = "result")]
+pub enum ProtocolResponse {
+    /// Initial daemon handshake result.
+    #[serde(rename = "hello")]
+    Hello(HelloResult),
+    /// Fresh-run result.
+    #[serde(rename = "run.start")]
+    RunStart(RunStartResult),
+    /// Session-append result.
+    #[serde(rename = "message.append")]
+    MessageAppend(RunStartResult),
+    /// Issue-preparation result.
+    #[serde(rename = "issue-prep.start")]
+    IssuePrepStart(IssuePrepStartResult),
+    /// Buffered run-event page.
+    #[serde(rename = "events.stream")]
+    EventsStream(EventsStreamResult),
+    /// Approval-decision receipt.
+    #[serde(rename = "approval.decide")]
+    ApprovalDecide(CommandAcceptedResult),
+    /// Cancellation receipt.
+    #[serde(rename = "run.cancel")]
+    RunCancel(CommandAcceptedResult),
+    /// Session list.
+    #[serde(rename = "sessions.list")]
+    SessionsList(SessionsListResult),
+    /// Transcript readback.
+    #[serde(rename = "transcript.read")]
+    TranscriptRead(TranscriptReadResult),
+    /// Authoritative daemon status.
+    #[serde(rename = "daemon.status")]
+    DaemonStatus(DaemonStatusResult),
+    /// Idle-shutdown result.
+    #[serde(rename = "daemon.shutdown_if_idle")]
+    DaemonShutdownIfIdle(ShutdownIfIdleResult),
+    /// Thread-spawn result.
+    #[serde(rename = "thread.spawn")]
+    ThreadSpawn(ThreadSpawnResult),
+    /// Durable thread list.
+    #[serde(rename = "thread.list")]
+    ThreadList(ThreadListResult),
+    /// Durable and live thread status.
+    #[serde(rename = "thread.status")]
+    ThreadStatus(ThreadStatusResult),
+    /// Immutable thread authority.
+    #[serde(rename = "thread.authority")]
+    ThreadAuthority(ThreadAuthorityResult),
+    /// Thread-send receipt.
+    #[serde(rename = "thread.send")]
+    ThreadSend(ThreadSendResult),
+    /// Retained thread-event page.
+    #[serde(rename = "thread.events")]
+    ThreadEvents(ThreadEventsResult),
+    /// Thread-stop result.
+    #[serde(rename = "thread.stop")]
+    ThreadStop(ThreadStopResult),
+    /// Workspace-creation result.
+    #[serde(rename = "workspace.create")]
+    WorkspaceCreate(WorkspaceCreateResult),
+    /// Workspace list.
+    #[serde(rename = "workspace.list")]
+    WorkspaceList(WorkspaceListResult),
+    /// Workspace status.
+    #[serde(rename = "workspace.status")]
+    WorkspaceStatus(WorkspaceStatusResult),
+    /// Agent-creation result.
+    #[serde(rename = "agent.create")]
+    AgentCreate(AgentCreateResult),
+    /// Agent list.
+    #[serde(rename = "agent.list")]
+    AgentList(AgentListResult),
+    /// Agent status.
+    #[serde(rename = "agent.status")]
+    AgentStatus(AgentStatusResult),
+}
+
+impl ProtocolResponse {
+    /// Returns this response's closed method discriminator.
+    pub const fn method(&self) -> ProtocolMethod {
+        match self {
+            Self::Hello(_) => ProtocolMethod::Hello,
+            Self::RunStart(_) => ProtocolMethod::RunStart,
+            Self::MessageAppend(_) => ProtocolMethod::MessageAppend,
+            Self::IssuePrepStart(_) => ProtocolMethod::IssuePrepStart,
+            Self::EventsStream(_) => ProtocolMethod::EventsStream,
+            Self::ApprovalDecide(_) => ProtocolMethod::ApprovalDecide,
+            Self::RunCancel(_) => ProtocolMethod::RunCancel,
+            Self::SessionsList(_) => ProtocolMethod::SessionsList,
+            Self::TranscriptRead(_) => ProtocolMethod::TranscriptRead,
+            Self::DaemonStatus(_) => ProtocolMethod::DaemonStatus,
+            Self::DaemonShutdownIfIdle(_) => ProtocolMethod::DaemonShutdownIfIdle,
+            Self::ThreadSpawn(_) => ProtocolMethod::ThreadSpawn,
+            Self::ThreadList(_) => ProtocolMethod::ThreadList,
+            Self::ThreadStatus(_) => ProtocolMethod::ThreadStatus,
+            Self::ThreadAuthority(_) => ProtocolMethod::ThreadAuthority,
+            Self::ThreadSend(_) => ProtocolMethod::ThreadSend,
+            Self::ThreadEvents(_) => ProtocolMethod::ThreadEvents,
+            Self::ThreadStop(_) => ProtocolMethod::ThreadStop,
+            Self::WorkspaceCreate(_) => ProtocolMethod::WorkspaceCreate,
+            Self::WorkspaceList(_) => ProtocolMethod::WorkspaceList,
+            Self::WorkspaceStatus(_) => ProtocolMethod::WorkspaceStatus,
+            Self::AgentCreate(_) => ProtocolMethod::AgentCreate,
+            Self::AgentList(_) => ProtocolMethod::AgentList,
+            Self::AgentStatus(_) => ProtocolMethod::AgentStatus,
+        }
+    }
+
+    fn decode(method: ProtocolMethod, result: Option<Value>) -> serde_json::Result<Self> {
+        match method {
+            ProtocolMethod::Hello => decode_result(result, method).map(Self::Hello),
+            ProtocolMethod::RunStart => decode_result(result, method).map(Self::RunStart),
+            ProtocolMethod::MessageAppend => decode_result(result, method).map(Self::MessageAppend),
+            ProtocolMethod::IssuePrepStart => {
+                decode_result(result, method).map(Self::IssuePrepStart)
+            }
+            ProtocolMethod::EventsStream => decode_result(result, method).map(Self::EventsStream),
+            ProtocolMethod::ApprovalDecide => {
+                decode_result(result, method).map(Self::ApprovalDecide)
+            }
+            ProtocolMethod::RunCancel => decode_result(result, method).map(Self::RunCancel),
+            ProtocolMethod::SessionsList => decode_result(result, method).map(Self::SessionsList),
+            ProtocolMethod::TranscriptRead => {
+                decode_result(result, method).map(Self::TranscriptRead)
+            }
+            ProtocolMethod::DaemonStatus => decode_result(result, method).map(Self::DaemonStatus),
+            ProtocolMethod::DaemonShutdownIfIdle => {
+                decode_result(result, method).map(Self::DaemonShutdownIfIdle)
+            }
+            ProtocolMethod::ThreadSpawn => decode_result(result, method).map(Self::ThreadSpawn),
+            ProtocolMethod::ThreadList => decode_result(result, method).map(Self::ThreadList),
+            ProtocolMethod::ThreadStatus => decode_result(result, method).map(Self::ThreadStatus),
+            ProtocolMethod::ThreadAuthority => {
+                decode_result(result, method).map(Self::ThreadAuthority)
+            }
+            ProtocolMethod::ThreadSend => decode_result(result, method).map(Self::ThreadSend),
+            ProtocolMethod::ThreadEvents => decode_result(result, method).map(Self::ThreadEvents),
+            ProtocolMethod::ThreadStop => decode_result(result, method).map(Self::ThreadStop),
+            ProtocolMethod::WorkspaceCreate => {
+                decode_result(result, method).map(Self::WorkspaceCreate)
+            }
+            ProtocolMethod::WorkspaceList => decode_result(result, method).map(Self::WorkspaceList),
+            ProtocolMethod::WorkspaceStatus => {
+                decode_result(result, method).map(Self::WorkspaceStatus)
+            }
+            ProtocolMethod::AgentCreate => decode_result(result, method).map(Self::AgentCreate),
+            ProtocolMethod::AgentList => decode_result(result, method).map(Self::AgentList),
+            ProtocolMethod::AgentStatus => decode_result(result, method).map(Self::AgentStatus),
+        }
+    }
+
+    fn serialize_result<S>(&self, envelope: &mut S) -> Result<(), S::Error>
+    where
+        S: SerializeStruct,
+    {
+        match self {
+            Self::Hello(result) => serialize_sorted_field(envelope, "result", result),
+            Self::RunStart(result) => serialize_sorted_field(envelope, "result", result),
+            Self::MessageAppend(result) => serialize_sorted_field(envelope, "result", result),
+            Self::IssuePrepStart(result) => serialize_sorted_field(envelope, "result", result),
+            Self::EventsStream(result) => serialize_sorted_field(envelope, "result", result),
+            Self::ApprovalDecide(result) => serialize_sorted_field(envelope, "result", result),
+            Self::RunCancel(result) => serialize_sorted_field(envelope, "result", result),
+            Self::SessionsList(result) => serialize_sorted_field(envelope, "result", result),
+            Self::TranscriptRead(result) => serialize_sorted_field(envelope, "result", result),
+            Self::DaemonStatus(result) => serialize_sorted_field(envelope, "result", result),
+            Self::DaemonShutdownIfIdle(result) => {
+                serialize_sorted_field(envelope, "result", result)
+            }
+            Self::ThreadSpawn(result) => serialize_sorted_field(envelope, "result", result),
+            Self::ThreadList(result) => serialize_sorted_field(envelope, "result", result),
+            Self::ThreadStatus(result) => serialize_sorted_field(envelope, "result", result),
+            Self::ThreadAuthority(result) => serialize_sorted_field(envelope, "result", result),
+            Self::ThreadSend(result) => serialize_sorted_field(envelope, "result", result),
+            Self::ThreadEvents(result) => serialize_sorted_field(envelope, "result", result),
+            Self::ThreadStop(result) => serialize_sorted_field(envelope, "result", result),
+            Self::WorkspaceCreate(result) => serialize_sorted_field(envelope, "result", result),
+            Self::WorkspaceList(result) => serialize_sorted_field(envelope, "result", result),
+            Self::WorkspaceStatus(result) => serialize_sorted_field(envelope, "result", result),
+            Self::AgentCreate(result) => serialize_sorted_field(envelope, "result", result),
+            Self::AgentList(result) => serialize_sorted_field(envelope, "result", result),
+            Self::AgentStatus(result) => serialize_sorted_field(envelope, "result", result),
+        }
+    }
+}
+
+fn serialize_sorted_field<S, T>(
+    envelope: &mut S,
+    name: &'static str,
+    value: &T,
+) -> Result<(), S::Error>
+where
+    S: SerializeStruct,
+    T: Serialize,
+{
+    let value = serde_json::to_value(value).map_err(serde::ser::Error::custom)?;
+    envelope.serialize_field(name, &value)
+}
+
+/// Top-level versioned protocol envelope.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Envelope {
     /// Protocol version.
     pub v: u32,
@@ -293,31 +1063,51 @@ pub struct Envelope {
     /// Envelope kind.
     pub kind: EnvelopeKind,
     /// Method name for requests and their responses.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub method: Option<String>,
-    /// Untyped request parameters decoded by the selected method.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub params: Option<Value>,
-    /// Untyped result encoded from the selected method's result type.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
+    pub method: Option<ProtocolMethod>,
+    /// Typed request selected by `method`.
+    pub params: Option<ProtocolRequest>,
+    /// Typed response selected by `method`.
+    pub result: Option<ProtocolResponse>,
     /// Structured protocol error for an error response.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ProtocolError>,
 }
 
 impl Envelope {
-    /// Builds a successful response around a JSON result.
-    pub fn response(id: Option<String>, method: Option<String>, result: Value) -> Self {
+    /// Builds a request around its typed method-specific parameters.
+    pub fn request(id: Option<String>, request: ProtocolRequest) -> Self {
+        let method = request.method();
+        Self {
+            v: PROTOCOL_VERSION,
+            id,
+            kind: EnvelopeKind::Request,
+            method: Some(method),
+            params: Some(request),
+            result: None,
+            error: None,
+        }
+    }
+
+    /// Builds a successful response around a typed method-specific result.
+    pub fn typed_response(id: Option<String>, response: ProtocolResponse) -> Self {
+        let method = response.method();
         Self {
             v: PROTOCOL_VERSION,
             id,
             kind: EnvelopeKind::Response,
-            method,
+            method: Some(method),
             params: None,
-            result: Some(result),
+            result: Some(response),
             error: None,
         }
+    }
+
+    /// Serializes a result through the closed response variant for `method`.
+    pub fn response<T: Serialize>(id: Option<String>, method: Option<String>, result: T) -> Self {
+        let method = ProtocolMethod::from(method.expect("response method is required"));
+        let result = serde_json::to_value(result).expect("protocol result serializes");
+        let response = ProtocolResponse::decode(method, Some(result))
+            .expect("result matches the response method");
+        Self::typed_response(id, response)
     }
 
     /// Serializes a typed result and builds a successful response.
@@ -326,29 +1116,25 @@ impl Envelope {
         method: Option<String>,
         result: T,
     ) -> Self {
-        Self::response(
-            id,
-            method,
-            serde_json::to_value(result).expect("protocol result serializes"),
-        )
+        Self::response(id, method, result)
     }
 
     /// Builds an error response with the supplied code and message.
     pub fn error(
         id: Option<String>,
         method: Option<String>,
-        code: impl Into<String>,
+        code: ProtocolErrorCode,
         message: impl Into<String>,
     ) -> Self {
         Self {
             v: PROTOCOL_VERSION,
             id,
             kind: EnvelopeKind::Error,
-            method,
+            method: method.map(ProtocolMethod::from),
             params: None,
             result: None,
             error: Some(ProtocolError {
-                code: code.into(),
+                code,
                 message: message.into(),
             }),
         }
@@ -361,9 +1147,176 @@ impl Envelope {
 #[serde(deny_unknown_fields)]
 pub struct ProtocolError {
     /// Stable machine-readable error code.
-    pub code: String,
+    pub code: ProtocolErrorCode,
     /// Human-readable error detail.
     pub message: String,
+}
+
+impl Serialize for Envelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut envelope = serializer.serialize_struct("Envelope", 7)?;
+        envelope.serialize_field("v", &self.v)?;
+        envelope.serialize_field("id", &self.id)?;
+        envelope.serialize_field("kind", &self.kind)?;
+        if let Some(method) = self.method {
+            envelope.serialize_field("method", &method)?;
+        }
+        if let Some(request) = &self.params {
+            request.serialize_params(&mut envelope)?;
+        }
+        if let Some(response) = &self.result {
+            response.serialize_result(&mut envelope)?;
+        }
+        if let Some(error) = &self.error {
+            envelope.serialize_field("error", error)?;
+        }
+        envelope.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Envelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        WireEnvelope::deserialize(deserializer)?
+            .into_envelope()
+            .map_err(D::Error::custom)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireEnvelope {
+    v: u32,
+    id: Option<String>,
+    kind: EnvelopeKind,
+    #[serde(default)]
+    method: Option<ProtocolMethod>,
+    #[serde(default)]
+    params: Option<Value>,
+    #[serde(default)]
+    result: Option<Value>,
+    #[serde(default)]
+    error: Option<ProtocolError>,
+}
+
+impl WireEnvelope {
+    fn into_envelope(self) -> serde_json::Result<Envelope> {
+        let Self {
+            v,
+            id,
+            kind,
+            method,
+            params,
+            result,
+            error,
+        } = self;
+        match kind {
+            EnvelopeKind::Request => {
+                let method = required_method(method)?;
+                reject_field(result.is_some(), "result", EnvelopeKind::Request)?;
+                reject_field(error.is_some(), "error", EnvelopeKind::Request)?;
+                let request = ProtocolRequest::decode(method, params)?;
+                Ok(Envelope {
+                    v,
+                    id,
+                    kind,
+                    method: Some(method),
+                    params: Some(request),
+                    result: None,
+                    error: None,
+                })
+            }
+            EnvelopeKind::Response => {
+                let method = required_method(method)?;
+                reject_field(params.is_some(), "params", EnvelopeKind::Response)?;
+                reject_field(error.is_some(), "error", EnvelopeKind::Response)?;
+                let response = ProtocolResponse::decode(method, result)?;
+                Ok(Envelope {
+                    v,
+                    id,
+                    kind,
+                    method: Some(method),
+                    params: None,
+                    result: Some(response),
+                    error: None,
+                })
+            }
+            EnvelopeKind::Error => {
+                reject_field(params.is_some(), "params", EnvelopeKind::Error)?;
+                reject_field(result.is_some(), "result", EnvelopeKind::Error)?;
+                let error = error.ok_or_else(|| serde_json::Error::custom("error is required"))?;
+                Ok(Envelope {
+                    v,
+                    id,
+                    kind,
+                    method,
+                    params: None,
+                    result: None,
+                    error: Some(error),
+                })
+            }
+            EnvelopeKind::Event => {
+                reject_field(params.is_some(), "params", EnvelopeKind::Event)?;
+                reject_field(result.is_some(), "result", EnvelopeKind::Event)?;
+                reject_field(error.is_some(), "error", EnvelopeKind::Event)?;
+                Ok(Envelope {
+                    v,
+                    id,
+                    kind,
+                    method,
+                    params: None,
+                    result: None,
+                    error: None,
+                })
+            }
+        }
+    }
+}
+
+fn required_method(method: Option<ProtocolMethod>) -> serde_json::Result<ProtocolMethod> {
+    method.ok_or_else(|| serde_json::Error::custom("method is required"))
+}
+
+fn reject_field(present: bool, field: &str, kind: EnvelopeKind) -> serde_json::Result<()> {
+    if present {
+        return Err(serde_json::Error::custom(format!(
+            "{field} is not valid for a {kind:?} envelope"
+        )));
+    }
+    Ok(())
+}
+
+fn decode_params<T>(params: Option<Value>, method: ProtocolMethod) -> serde_json::Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let params =
+        params.ok_or_else(|| serde_json::Error::custom(format!("{method} params are required")))?;
+    serde_json::from_value(params)
+}
+
+fn decode_empty_params(params: Option<Value>, method: ProtocolMethod) -> serde_json::Result<()> {
+    match params {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Object(fields)) if fields.is_empty() => Ok(()),
+        Some(_) => Err(serde_json::Error::custom(format!(
+            "{method} params must be empty"
+        ))),
+    }
+}
+
+fn decode_result<T>(result: Option<Value>, method: ProtocolMethod) -> serde_json::Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let result =
+        result.ok_or_else(|| serde_json::Error::custom(format!("{method} result is required")))?;
+    serde_json::from_value(result)
 }
 
 /// Parameters for the initial workspace handshake.
@@ -386,7 +1339,10 @@ pub struct HelloResult {
     /// Daemon-owned ledger path.
     pub ledger_path: String,
     /// Advertised protocol capabilities.
-    pub capabilities: Vec<String>,
+    pub capabilities: Vec<Capability>,
+    /// Daemon runtime scope, present for the host-wide server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_scope: Option<String>,
 }
 
 /// Parameters for one authoritative daemon status readback.
@@ -1733,7 +2689,7 @@ pub enum TypedTranscriptEntry {
 ///
 /// Validation failures are returned as ready-to-send protocol error envelopes.
 pub fn decode_request(line: &str) -> Result<Envelope, Box<Envelope>> {
-    let envelope = serde_json::from_str::<Envelope>(line).map_err(|error| {
+    let wire = serde_json::from_str::<WireEnvelope>(line).map_err(|error| {
         Box::new(Envelope::error(
             None,
             None,
@@ -1742,32 +2698,59 @@ pub fn decode_request(line: &str) -> Result<Envelope, Box<Envelope>> {
         ))
     })?;
 
-    if envelope.v != PROTOCOL_VERSION {
+    if wire.v != PROTOCOL_VERSION {
         return Err(Box::new(Envelope::error(
-            envelope.id,
-            envelope.method,
+            wire.id,
+            wire.method.map(|method| method.to_string()),
             ERROR_UNSUPPORTED_VERSION,
-            format!("unsupported protocol version: {}", envelope.v),
+            format!("unsupported protocol version: {}", wire.v),
         )));
     }
-    if envelope.kind != EnvelopeKind::Request {
+    if wire.kind != EnvelopeKind::Request {
         return Err(Box::new(Envelope::error(
-            envelope.id,
-            envelope.method,
+            wire.id,
+            wire.method.map(|method| method.to_string()),
             ERROR_MALFORMED_REQUEST,
             "envelope kind must be request",
         )));
     }
-    if envelope.method.is_none() {
+    let method = match wire.method {
+        Some(method) => method,
+        None => {
+            return Err(Box::new(Envelope::error(
+                wire.id,
+                None,
+                ERROR_MALFORMED_REQUEST,
+                "request method is required",
+            )));
+        }
+    };
+    if wire.result.is_some() || wire.error.is_some() {
         return Err(Box::new(Envelope::error(
-            envelope.id,
-            None,
+            wire.id,
+            Some(method.to_string()),
             ERROR_MALFORMED_REQUEST,
-            "request method is required",
+            "request contains a response-only field",
         )));
     }
+    let request = ProtocolRequest::decode(method, wire.params).map_err(|error| {
+        Box::new(Envelope::error(
+            wire.id.clone(),
+            Some(method.to_string()),
+            ERROR_MALFORMED_REQUEST,
+            format!("{method} params are invalid: {error}"),
+        ))
+    })?;
 
-    Ok(envelope)
+    Ok(Envelope {
+        v: wire.v,
+        id: wire.id,
+        kind: wire.kind,
+        method: Some(method),
+        params: Some(request),
+        result: None,
+        error: None,
+    })
 }
 
 #[cfg(test)]
@@ -1820,7 +2803,7 @@ mod tests {
     #[test]
     fn capability_names_and_error_codes_keep_exact_v1_literals() {
         assert_eq!(
-            CAPABILITIES,
+            CAPABILITIES.map(Capability::as_str),
             [
                 "hello",
                 "run.start",
@@ -1874,7 +2857,8 @@ mod tests {
                 ERROR_WORKSPACE_MISMATCH,
                 ERROR_WORKSPACE_UNREGISTERED,
                 ERROR_WORKSPACE_BROKEN,
-            ],
+            ]
+            .map(ProtocolErrorCode::as_str),
             [
                 "daemon_shutting_down",
                 "malformed_request",
@@ -1902,10 +2886,244 @@ mod tests {
         );
 
         let error = ProtocolError {
-            code: ERROR_RUN_FAILED.into(),
+            code: ERROR_RUN_FAILED,
             message: "synthetic failure".into(),
         };
         assert_eq!(error.to_string(), "run_failed: synthetic failure");
+    }
+
+    #[test]
+    fn every_current_method_keeps_exact_v1_request_and_response_bytes() {
+        const REQUESTS: &[(ProtocolMethod, &str)] = &[
+            (
+                ProtocolMethod::Hello,
+                r#"{"v":1,"id":"hello_1","kind":"request","method":"hello","params":{"workspace_id":"work-1","workspace_root":"/work"}}"#,
+            ),
+            (
+                ProtocolMethod::RunStart,
+                r#"{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{"config_path":null,"question":"hello","wait":false}}"#,
+            ),
+            (
+                ProtocolMethod::MessageAppend,
+                r#"{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{"config_path":null,"message":"again","session_id":"session-1","wait":false}}"#,
+            ),
+            (
+                ProtocolMethod::IssuePrepStart,
+                r#"{"v":1,"id":"prep_1","kind":"request","method":"issue-prep.start","params":{"config_path":null,"input":"rough issue"}}"#,
+            ),
+            (
+                ProtocolMethod::EventsStream,
+                r#"{"v":1,"id":"events_1","kind":"request","method":"events.stream","params":{"from_offset":0,"limit":64,"run_id":"run-1"}}"#,
+            ),
+            (
+                ProtocolMethod::ApprovalDecide,
+                r#"{"v":1,"id":"approval_1","kind":"request","method":"approval.decide","params":{"decision":"grant","reason":null,"run_id":"run-1","tool_call_id":"call-1"}}"#,
+            ),
+            (
+                ProtocolMethod::RunCancel,
+                r#"{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"run_id":"run-1"}}"#,
+            ),
+            (
+                ProtocolMethod::SessionsList,
+                r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#,
+            ),
+            (
+                ProtocolMethod::TranscriptRead,
+                r#"{"v":1,"id":"transcript_1","kind":"request","method":"transcript.read","params":{"run_id":"run-1","session_id":null}}"#,
+            ),
+            (
+                ProtocolMethod::DaemonStatus,
+                r#"{"v":1,"id":"status_1","kind":"request","method":"daemon.status","params":{"config_path":null,"session_id":null}}"#,
+            ),
+            (
+                ProtocolMethod::DaemonShutdownIfIdle,
+                r#"{"v":1,"id":"shutdown_1","kind":"request","method":"daemon.shutdown_if_idle"}"#,
+            ),
+            (
+                ProtocolMethod::ThreadSpawn,
+                r#"{"v":1,"id":"spawn_1","kind":"request","method":"thread.spawn","params":{"action":"start","approval_policy":"prompt","cwd":"/work","model":"gpt-5","parent_thread_id":null,"reasoning_effort":"high"}}"#,
+            ),
+            (
+                ProtocolMethod::ThreadList,
+                r#"{"v":1,"id":"threads_1","kind":"request","method":"thread.list"}"#,
+            ),
+            (
+                ProtocolMethod::ThreadStatus,
+                r#"{"v":1,"id":"thread_status_1","kind":"request","method":"thread.status","params":{"thread_id":"thread-1"}}"#,
+            ),
+            (
+                ProtocolMethod::ThreadAuthority,
+                r#"{"v":1,"id":"authority_1","kind":"request","method":"thread.authority","params":{"thread_id":"thread-1"}}"#,
+            ),
+            (
+                ProtocolMethod::ThreadSend,
+                r#"{"v":1,"id":"send_1","kind":"request","method":"thread.send","params":{"controller_id":"terminal","message":"inspect","thread_id":"thread-1"}}"#,
+            ),
+            (
+                ProtocolMethod::ThreadEvents,
+                r#"{"v":1,"id":"thread_events_1","kind":"request","method":"thread.events","params":{"from_offset":0,"limit":64,"thread_id":"thread-1","wait_ms":1000}}"#,
+            ),
+            (
+                ProtocolMethod::ThreadStop,
+                r#"{"v":1,"id":"stop_1","kind":"request","method":"thread.stop","params":{"actor":"terminal","thread_id":"thread-1"}}"#,
+            ),
+            (
+                ProtocolMethod::WorkspaceCreate,
+                r#"{"v":1,"id":"workspace_create_1","kind":"request","method":"workspace.create","params":{"name":"alpha","root":"/work"}}"#,
+            ),
+            (
+                ProtocolMethod::WorkspaceList,
+                r#"{"v":1,"id":"workspace_list_1","kind":"request","method":"workspace.list","params":{}}"#,
+            ),
+            (
+                ProtocolMethod::WorkspaceStatus,
+                r#"{"v":1,"id":"workspace_status_1","kind":"request","method":"workspace.status","params":{"workspace_id":"workspace-1"}}"#,
+            ),
+            (
+                ProtocolMethod::AgentCreate,
+                r#"{"v":1,"id":"agent_create_1","kind":"request","method":"agent.create","params":{"agent_id":"builder","approval_policy":"prompt","model":"gpt-5","reasoning_effort":"high","toolset":["file.read"],"workspace_id":"workspace-1"}}"#,
+            ),
+            (
+                ProtocolMethod::AgentList,
+                r#"{"v":1,"id":"agent_list_1","kind":"request","method":"agent.list","params":{}}"#,
+            ),
+            (
+                ProtocolMethod::AgentStatus,
+                r#"{"v":1,"id":"agent_status_1","kind":"request","method":"agent.status","params":{"agent_id":"builder"}}"#,
+            ),
+        ];
+        const RESPONSES: &[(ProtocolMethod, &str)] = &[
+            (
+                ProtocolMethod::Hello,
+                r#"{"v":1,"id":"hello_1","kind":"response","method":"hello","result":{"capabilities":["hello"],"daemon_version":"0.2.0 test test","ledger_path":"/state/agent.db","workspace_id":"work-1"}}"#,
+            ),
+            (
+                ProtocolMethod::RunStart,
+                r#"{"v":1,"id":"run_1","kind":"response","method":"run.start","result":{"final_answer":null,"ledger_path":"/state/agent.db","run_id":"run-1","session_id":"session-1","status":"running"}}"#,
+            ),
+            (
+                ProtocolMethod::MessageAppend,
+                r#"{"v":1,"id":"append_1","kind":"response","method":"message.append","result":{"final_answer":"done","ledger_path":"/state/agent.db","run_id":"run-2","session_id":"session-1","status":"finished"}}"#,
+            ),
+            (
+                ProtocolMethod::IssuePrepStart,
+                r#"{"v":1,"id":"prep_1","kind":"response","method":"issue-prep.start","result":{"outcome":{"markdown":"Prepared issue","status":"candidate"},"run_dir":"/work/.plato/issue-prep/run-1"}}"#,
+            ),
+            (
+                ProtocolMethod::EventsStream,
+                r#"{"v":1,"id":"events_1","kind":"response","method":"events.stream","result":{"events":[],"from_offset":0,"next_offset":0,"run_id":"run-1","status":"running"}}"#,
+            ),
+            (
+                ProtocolMethod::ApprovalDecide,
+                r#"{"v":1,"id":"approval_1","kind":"response","method":"approval.decide","result":{"run_id":"run-1","status":"running"}}"#,
+            ),
+            (
+                ProtocolMethod::RunCancel,
+                r#"{"v":1,"id":"cancel_1","kind":"response","method":"run.cancel","result":{"run_id":"run-1","status":"cancel_requested"}}"#,
+            ),
+            (
+                ProtocolMethod::SessionsList,
+                r#"{"v":1,"id":"sessions_1","kind":"response","method":"sessions.list","result":{"sessions":[]}}"#,
+            ),
+            (
+                ProtocolMethod::TranscriptRead,
+                r#"{"v":1,"id":"transcript_1","kind":"response","method":"transcript.read","result":{"final_answer":"done","run_id":"run-1","status":"finished","transcript":"[turn-1] assistant: done\n"}}"#,
+            ),
+            (
+                ProtocolMethod::DaemonStatus,
+                r#"{"v":1,"id":"status_1","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":null,"build_date_utc":null,"endpoint_path":"/tmp/agent.sock","package_version":"0.2.0","uptime_ms":0,"workspace_id":"work-1"},"model":{"key_present":false,"provider_kind":"open_ai","requested_alias":"gpt-5","served_model":null},"session":{"core_event_count":0,"human_turn_count":0,"latest_run_id":null,"ledger_path":"/state/agent.db","session_id":null},"trust":{"approval_denied_count":0,"approval_granted_count":0,"shell_session_grant":false},"usage":{"last_run":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0},"session":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0}}}}"#,
+            ),
+            (
+                ProtocolMethod::DaemonShutdownIfIdle,
+                r#"{"v":1,"id":"shutdown_1","kind":"response","method":"daemon.shutdown_if_idle","result":{"result":"shutdown"}}"#,
+            ),
+            (
+                ProtocolMethod::ThreadSpawn,
+                r#"{"v":1,"id":"spawn_1","kind":"response","method":"thread.spawn","result":{"actor":"terminal","reason":"denied","spawn_id":"spawn-1","status":"denied","thread_id":"thread-1"}}"#,
+            ),
+            (
+                ProtocolMethod::ThreadList,
+                r#"{"v":1,"id":"threads_1","kind":"response","method":"thread.list","result":{"threads":[]}}"#,
+            ),
+            (
+                ProtocolMethod::ThreadStatus,
+                r#"{"v":1,"id":"thread_status_1","kind":"response","method":"thread.status","result":{"thread":{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/work","model":"gpt-5","parent_thread_id":null,"reasoning_effort":"high","spawning_actor":"terminal","thread_id":"thread-1"},"live":{"current_turn_id":null,"loaded":false}}}}"#,
+            ),
+            (
+                ProtocolMethod::ThreadAuthority,
+                r#"{"v":1,"id":"authority_1","kind":"response","method":"thread.authority","result":{"authority":{"agent_id":"plato","approval_policy":"prompt","created_at_ms":42,"granted_paths":[{"path":"/work","writable":true}],"model":"gpt-5","network":false,"parent_thread_id":null,"reasoning_effort":"high","spawning_actor":"terminal","thread_id":"thread-1","toolset":["file.read"],"worktrees":[]}}}"#,
+            ),
+            (
+                ProtocolMethod::ThreadSend,
+                r#"{"v":1,"id":"send_1","kind":"response","method":"thread.send","result":{"status":"started","thread_id":"thread-1","turn_id":"turn-1"}}"#,
+            ),
+            (
+                ProtocolMethod::ThreadEvents,
+                r#"{"v":1,"id":"thread_events_1","kind":"response","method":"thread.events","result":{"current_turn_id":null,"events":[],"from_offset":0,"next_offset":0,"thread_id":"thread-1"}}"#,
+            ),
+            (
+                ProtocolMethod::ThreadStop,
+                r#"{"v":1,"id":"stop_1","kind":"response","method":"thread.stop","result":{"status":"stopped","stopped_at_ms":43,"stopped_turn_id":null,"thread_id":"thread-1"}}"#,
+            ),
+            (
+                ProtocolMethod::WorkspaceCreate,
+                r#"{"v":1,"id":"workspace_create_1","kind":"response","method":"workspace.create","result":{"workspace":{"created_at_ms":41,"health":"present","id":"workspace-1","ledger_path":"/state/agent.db","name":"alpha","root":"/work"}}}"#,
+            ),
+            (
+                ProtocolMethod::WorkspaceList,
+                r#"{"v":1,"id":"workspace_list_1","kind":"response","method":"workspace.list","result":{"workspaces":[]}}"#,
+            ),
+            (
+                ProtocolMethod::WorkspaceStatus,
+                r#"{"v":1,"id":"workspace_status_1","kind":"response","method":"workspace.status","result":{"workspace":{"created_at_ms":41,"health":"present","id":"workspace-1","ledger_path":"/state/agent.db","name":"alpha","root":"/work"}}}"#,
+            ),
+            (
+                ProtocolMethod::AgentCreate,
+                r#"{"v":1,"id":"agent_create_1","kind":"response","method":"agent.create","result":{"agent":{"approval_policy":"prompt","created_at_ms":42,"id":"builder","model":"gpt-5","reasoning_effort":"high","toolset":["file.read"],"workspace_id":"workspace-1"}}}"#,
+            ),
+            (
+                ProtocolMethod::AgentList,
+                r#"{"v":1,"id":"agent_list_1","kind":"response","method":"agent.list","result":{"agents":[]}}"#,
+            ),
+            (
+                ProtocolMethod::AgentStatus,
+                r#"{"v":1,"id":"agent_status_1","kind":"response","method":"agent.status","result":{"agent":{"approval_policy":"prompt","created_at_ms":42,"id":"builder","model":"gpt-5","reasoning_effort":"high","toolset":["file.read"],"workspace_id":"workspace-1"}}}"#,
+            ),
+        ];
+
+        assert_eq!(REQUESTS.len(), 24);
+        assert_eq!(RESPONSES.len(), REQUESTS.len());
+        for ((request_method, request_fixture), (response_method, response_fixture)) in
+            REQUESTS.iter().zip(RESPONSES)
+        {
+            assert_eq!(request_method, response_method);
+            let request = decode_request(request_fixture).unwrap();
+            assert_eq!(request.method.as_ref(), Some(request_method));
+            assert_eq!(serde_json::to_string(&request).unwrap(), *request_fixture);
+
+            let response: Envelope = serde_json::from_str(response_fixture).unwrap();
+            assert_eq!(response.method.as_ref(), Some(response_method));
+            assert_eq!(
+                response.result.as_ref().map(ProtocolResponse::method),
+                Some(*response_method)
+            );
+            assert_eq!(serde_json::to_string(&response).unwrap(), *response_fixture);
+        }
+    }
+
+    #[test]
+    fn unknown_methods_and_unknown_params_fail_at_the_envelope_boundary() {
+        let unknown_method =
+            r#"{"v":1,"id":"future_1","kind":"request","method":"future.run","params":{}}"#;
+        assert!(serde_json::from_str::<Envelope>(unknown_method).is_err());
+        let error = decode_request(unknown_method).unwrap_err();
+        assert_eq!(error.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+
+        let unknown_param = r#"{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"future":true,"run_id":"run-1"}}"#;
+        assert!(serde_json::from_str::<Envelope>(unknown_param).is_err());
+        let error = decode_request(unknown_param).unwrap_err();
+        assert_eq!(error.method, Some(ProtocolMethod::RunCancel));
+        assert_eq!(error.error.unwrap().code, ERROR_MALFORMED_REQUEST);
     }
 
     #[test]
@@ -1952,27 +3170,14 @@ mod tests {
             AGENT_STATUS_REQUEST,
         ] {
             let request = decode_request(fixture).unwrap();
-            let params = request.params.clone().unwrap();
-            match request.method.as_deref().unwrap() {
-                "workspace.create" => {
-                    serde_json::from_value::<WorkspaceCreateParams>(params).unwrap();
-                }
-                "workspace.list" => {
-                    serde_json::from_value::<WorkspaceListParams>(params).unwrap();
-                }
-                "workspace.status" => {
-                    serde_json::from_value::<WorkspaceStatusParams>(params).unwrap();
-                }
-                "agent.create" => {
-                    serde_json::from_value::<AgentCreateParams>(params).unwrap();
-                }
-                "agent.list" => {
-                    serde_json::from_value::<AgentListParams>(params).unwrap();
-                }
-                "agent.status" => {
-                    serde_json::from_value::<AgentStatusParams>(params).unwrap();
-                }
-                method => panic!("unexpected control method: {method}"),
+            match request.params.as_ref().unwrap() {
+                ProtocolRequest::WorkspaceCreate(_)
+                | ProtocolRequest::WorkspaceList(_)
+                | ProtocolRequest::WorkspaceStatus(_)
+                | ProtocolRequest::AgentCreate(_)
+                | ProtocolRequest::AgentList(_)
+                | ProtocolRequest::AgentStatus(_) => {}
+                request => panic!("unexpected control request: {request:?}"),
             }
             assert_eq!(serde_json::to_string(&request).unwrap(), fixture);
         }
@@ -2078,17 +3283,19 @@ mod tests {
 
         for fixture in [SPAWN_START_REQUEST, SPAWN_DECIDE_REQUEST] {
             let request = decode_request(fixture).unwrap();
-            let params =
-                serde_json::from_value::<ThreadSpawnParams>(request.params.clone().unwrap())
-                    .unwrap();
             assert_eq!(serde_json::to_string(&request).unwrap(), fixture);
             assert!(matches!(
-                params,
-                ThreadSpawnParams::Start { .. } | ThreadSpawnParams::Decide { .. }
+                request.params.as_ref(),
+                Some(ProtocolRequest::ThreadSpawn(
+                    ThreadSpawnParams::Start { .. } | ThreadSpawnParams::Decide { .. }
+                ))
             ));
         }
         let stop_request = decode_request(STOP_REQUEST).unwrap();
-        serde_json::from_value::<ThreadStopParams>(stop_request.params.clone().unwrap()).unwrap();
+        assert!(matches!(
+            stop_request.params.as_ref(),
+            Some(ProtocolRequest::ThreadStop(_))
+        ));
         assert_eq!(serde_json::to_string(&stop_request).unwrap(), STOP_REQUEST);
 
         let approval_required = Envelope::response(
@@ -2152,10 +3359,10 @@ mod tests {
         assert!(!legacy.network);
 
         let authority_request = decode_request(AUTHORITY_REQUEST).unwrap();
-        let params = serde_json::from_value::<ThreadAuthorityParams>(
-            authority_request.params.clone().unwrap(),
-        )
-        .unwrap();
+        let Some(ProtocolRequest::ThreadAuthority(params)) = authority_request.params.as_ref()
+        else {
+            panic!("expected thread.authority request")
+        };
         assert_eq!(params.thread_id, "thread_1");
         assert_eq!(
             serde_json::to_string(&authority_request).unwrap(),
@@ -2198,12 +3405,17 @@ mod tests {
 
         for fixture in [SEND_START_REQUEST, SEND_STEER_REQUEST] {
             let request = decode_request(fixture).unwrap();
-            serde_json::from_value::<ThreadSendParams>(request.params.clone().unwrap()).unwrap();
+            assert!(matches!(
+                request.params.as_ref(),
+                Some(ProtocolRequest::ThreadSend(_))
+            ));
             assert_eq!(serde_json::to_string(&request).unwrap(), fixture);
         }
         let events_request = decode_request(EVENTS_REQUEST).unwrap();
-        serde_json::from_value::<ThreadEventsParams>(events_request.params.clone().unwrap())
-            .unwrap();
+        assert!(matches!(
+            events_request.params.as_ref(),
+            Some(ProtocolRequest::ThreadEvents(_))
+        ));
         assert_eq!(
             serde_json::to_string(&events_request).unwrap(),
             EVENTS_REQUEST
@@ -2325,8 +3537,11 @@ mod tests {
         }
 
         let status_envelope: Envelope = serde_json::from_str(STATUS_RESPONSE).unwrap();
+        let Some(ProtocolResponse::ThreadStatus(status)) = status_envelope.result else {
+            panic!("expected thread.status response")
+        };
         let status: BaseV1StatusResult =
-            serde_json::from_value(status_envelope.result.unwrap()).unwrap();
+            serde_json::from_value(serde_json::to_value(status).unwrap()).unwrap();
         assert_eq!(
             status,
             BaseV1StatusResult {
@@ -2342,7 +3557,11 @@ mod tests {
         );
 
         let list_envelope: Envelope = serde_json::from_str(LIST_RESPONSE).unwrap();
-        let list: BaseV1ListResult = serde_json::from_value(list_envelope.result.unwrap()).unwrap();
+        let Some(ProtocolResponse::ThreadList(list)) = list_envelope.result else {
+            panic!("expected thread.list response")
+        };
+        let list: BaseV1ListResult =
+            serde_json::from_value(serde_json::to_value(list).unwrap()).unwrap();
         assert_eq!(
             list,
             BaseV1ListResult {
@@ -2433,17 +3652,20 @@ mod tests {
         const STATUS_UNKNOWN_RESPONSE: &str = r#"{"v":1,"id":"status_2","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":null,"build_date_utc":null,"endpoint_path":"/tmp/agent.sock","package_version":"0.1.0","uptime_ms":0,"workspace_id":"work-1234"},"model":{"key_present":false,"provider_kind":"open_ai","requested_alias":"gpt-5.5","served_model":null},"session":{"core_event_count":0,"human_turn_count":0,"latest_run_id":null,"ledger_path":"/tmp/agent.db","session_id":null},"trust":{"approval_denied_count":0,"approval_granted_count":0,"shell_session_grant":false},"usage":{"last_run":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0},"session":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0}}}}"#;
 
         let request = decode_request(STATUS_REQUEST).unwrap();
-        let params: DaemonStatusParams =
-            serde_json::from_value(request.params.clone().unwrap()).unwrap();
+        let Some(ProtocolRequest::DaemonStatus(params)) = request.params.as_ref() else {
+            panic!("expected daemon.status request")
+        };
         assert_eq!(params.session_id.as_deref(), Some("session_1"));
         assert_eq!(params.config_path.as_deref(), Some("config/plato.toml"));
         assert_eq!(serde_json::to_string(&request).unwrap(), STATUS_REQUEST);
 
         for fixture in [STATUS_KNOWN_RESPONSE, STATUS_UNKNOWN_RESPONSE] {
             let envelope: Envelope = serde_json::from_str(fixture).unwrap();
-            let result: DaemonStatusResult =
-                serde_json::from_value(envelope.result.clone().unwrap()).unwrap();
-            let rebuilt = Envelope::response_from(envelope.id, envelope.method, result);
+            let Some(ProtocolResponse::DaemonStatus(result)) = envelope.result else {
+                panic!("expected daemon.status response")
+            };
+            let rebuilt =
+                Envelope::typed_response(envelope.id, ProtocolResponse::DaemonStatus(result));
             assert_eq!(serde_json::to_string(&rebuilt).unwrap(), fixture);
         }
 
@@ -2737,10 +3959,7 @@ mod tests {
                 .unwrap_err();
 
         assert_eq!(error.kind, EnvelopeKind::Error);
-        assert_eq!(
-            error.error.unwrap().code,
-            ERROR_UNSUPPORTED_VERSION.to_string()
-        );
+        assert_eq!(error.error.unwrap().code, ERROR_UNSUPPORTED_VERSION);
     }
 
     #[test]
@@ -2748,7 +3967,13 @@ mod tests {
         let response = Envelope::response(
             Some("req_1".into()),
             Some("hello".into()),
-            serde_json::json!({"workspace_id":"work-1234"}),
+            HelloResult {
+                daemon_version: "0.2.0 test test".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![CAPABILITY_HELLO],
+                daemon_scope: None,
+            },
         );
 
         let raw = serde_json::to_string(&response).unwrap();

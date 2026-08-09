@@ -16,7 +16,7 @@ use super::{DiscordGatewayTimings, GatewayResult};
 use platonic_client::client::DaemonConnectionConfig;
 use platonic_protocol::{BufferedStreamEvent, RunOverrides};
 #[cfg(unix)]
-use platonic_protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION, RunStateName};
+use platonic_protocol::{ERROR_LAGGED, Envelope, ProtocolErrorCode, RunStateName};
 use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -66,6 +66,12 @@ pub(super) fn buffered_event_json(offset: u64, event: Value) -> Value {
 #[cfg(unix)]
 pub(super) fn ledger_event_json(offset: u64, event: Value) -> Value {
     serde_json::to_value(ledger_event(offset, event)).unwrap()
+}
+
+#[cfg(unix)]
+fn request_params_value(request: &Envelope) -> Value {
+    let request = serde_json::to_value(request.params.as_ref().unwrap()).unwrap();
+    request.get("params").cloned().unwrap()
 }
 
 #[cfg(unix)]
@@ -759,6 +765,7 @@ pub(super) fn spawn_finished_daemon(
         respond_hello(&mut reader, &mut writer);
         let request = read_daemon_request(&mut reader);
         assert_eq!(request.method.as_deref(), Some(method.as_str()));
+        let request_params = request_params_value(&request);
         write_daemon_response(
             &mut writer,
             request.id,
@@ -787,8 +794,9 @@ pub(super) fn spawn_finished_daemon(
         );
         let transcript = read_daemon_request(&mut reader);
         assert_eq!(transcript.method.as_deref(), Some("transcript.read"));
-        assert_eq!(transcript.params.as_ref().unwrap()["run_id"], "run_1");
-        assert!(transcript.params.as_ref().unwrap()["session_id"].is_null());
+        let transcript_params = request_params_value(&transcript);
+        assert_eq!(transcript_params["run_id"], "run_1");
+        assert!(transcript_params["session_id"].is_null());
         write_daemon_response(
             &mut writer,
             transcript.id,
@@ -800,7 +808,7 @@ pub(super) fn spawn_finished_daemon(
                 "transcript": "rendered text must not be parsed"
             }),
         );
-        request.params.unwrap()
+        request_params
     })
 }
 
@@ -1035,7 +1043,7 @@ pub(super) fn spawn_approval_daemon(socket_path: &Path) -> thread::JoinHandle<Ve
         let transcript = read_daemon_request(&mut reader);
         assert_eq!(transcript.method.as_deref(), Some("transcript.read"));
         methods.push("transcript.read");
-        assert_eq!(transcript.params.as_ref().unwrap()["run_id"], "run_1");
+        assert_eq!(request_params_value(&transcript)["run_id"], "run_1");
         write_daemon_response(
             &mut writer,
             transcript.id,
@@ -1151,7 +1159,7 @@ pub(super) fn spawn_failed_daemon(socket_path: &Path) -> thread::JoinHandle<()> 
             }),
         );
         let transcript = read_daemon_request(&mut reader);
-        assert_eq!(transcript.params.as_ref().unwrap()["run_id"], "run_1");
+        assert_eq!(request_params_value(&transcript)["run_id"], "run_1");
         write_daemon_response(
             &mut writer,
             transcript.id,
@@ -1480,14 +1488,7 @@ pub(super) fn spawn_reconnecting_pending_daemon(socket_path: &Path) -> thread::J
             }),
         );
         let running = read_daemon_request(&mut reader);
-        assert!(
-            running
-                .params
-                .as_ref()
-                .unwrap()
-                .get("from_offset")
-                .is_none()
-        );
+        assert!(request_params_value(&running).get("from_offset").is_none());
         write_daemon_response(
             &mut writer,
             running.id,
@@ -1552,7 +1553,7 @@ pub(super) fn spawn_lagged_daemon(socket_path: &Path, answer: &str) -> thread::J
             }),
         );
         let pending = read_daemon_request(&mut reader);
-        assert_eq!(pending.params.as_ref().unwrap()["from_offset"], 0);
+        assert_eq!(request_params_value(&pending)["from_offset"], 0);
         write_daemon_response(
             &mut writer,
             pending.id,
@@ -1574,17 +1575,10 @@ pub(super) fn spawn_lagged_daemon(socket_path: &Path, answer: &str) -> thread::J
             }),
         );
         let lagged = read_daemon_request(&mut reader);
-        assert_eq!(lagged.params.as_ref().unwrap()["from_offset"], 1);
-        write_daemon_error(&mut writer, lagged.id, "events.stream", "lagged");
+        assert_eq!(request_params_value(&lagged)["from_offset"], 1);
+        write_daemon_error(&mut writer, lagged.id, "events.stream", ERROR_LAGGED);
         let resumed = read_daemon_request(&mut reader);
-        assert!(
-            resumed
-                .params
-                .as_ref()
-                .unwrap()
-                .get("from_offset")
-                .is_none()
-        );
+        assert!(request_params_value(&resumed).get("from_offset").is_none());
         write_daemon_response(
             &mut writer,
             resumed.id,
@@ -1629,7 +1623,7 @@ pub(super) fn spawn_lagged_daemon(socket_path: &Path, answer: &str) -> thread::J
 fn respond_hello(reader: &mut BufReader<UnixStream>, writer: &mut UnixStream) {
     let hello = read_daemon_request(reader);
     assert_eq!(hello.method.as_deref(), Some("hello"));
-    let workspace_id = hello.params.as_ref().unwrap()["workspace_id"].clone();
+    let workspace_id = request_params_value(&hello)["workspace_id"].clone();
     write_daemon_response(
         writer,
         hello.id,
@@ -1654,15 +1648,7 @@ fn read_daemon_request(reader: &mut BufReader<UnixStream>) -> Envelope {
 fn write_daemon_response(writer: &mut UnixStream, id: Option<String>, method: &str, result: Value) {
     serde_json::to_writer(
         &mut *writer,
-        &Envelope {
-            v: PROTOCOL_VERSION,
-            id,
-            kind: EnvelopeKind::Response,
-            method: Some(method.into()),
-            params: None,
-            result: Some(result),
-            error: None,
-        },
+        &Envelope::response(id, Some(method.into()), result),
     )
     .unwrap();
     writer.write_all(b"\n").unwrap();
@@ -1670,7 +1656,12 @@ fn write_daemon_response(writer: &mut UnixStream, id: Option<String>, method: &s
 }
 
 #[cfg(unix)]
-fn write_daemon_error(writer: &mut UnixStream, id: Option<String>, method: &str, code: &str) {
+fn write_daemon_error(
+    writer: &mut UnixStream,
+    id: Option<String>,
+    method: &str,
+    code: ProtocolErrorCode,
+) {
     serde_json::to_writer(
         &mut *writer,
         &Envelope::error(id, Some(method.into()), code, "test error"),

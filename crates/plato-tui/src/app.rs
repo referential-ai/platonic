@@ -1464,10 +1464,10 @@ mod tests {
     use crate::TranscriptState;
     use platonic_client::ClientError;
     use platonic_protocol::{
-        BufferedStreamEvent, DaemonStatusResult, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
-        ERROR_WORKSPACE_MISMATCH, EventsStreamResult, HelloResult, IssuePrepResult,
-        IssuePrepStartResult, ModelIdentityStatus, ProtocolError, RunStartResult, SessionSummary,
-        TranscriptReadResult,
+        BufferedStreamEvent, DaemonStatusResult, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
+        ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION, ERROR_WORKSPACE_MISMATCH, EventsStreamResult,
+        HelloResult, IssuePrepResult, IssuePrepStartResult, ModelIdentityStatus, ProtocolError,
+        RunStartResult, SessionSummary, TranscriptReadResult,
     };
     use serde_json::json;
     #[cfg(unix)]
@@ -3395,7 +3395,7 @@ mod tests {
             .send(ClientEvent::Failed {
                 operation: ClientOperation::IssuePrepStart,
                 error: ClientError::DaemonResponse(ProtocolError {
-                    code: "issue_prep_failed".into(),
+                    code: ERROR_ISSUE_PREP_FAILED,
                     message: "provider failed".into(),
                 }),
             })
@@ -3477,7 +3477,7 @@ mod tests {
             .send(ClientEvent::Failed {
                 operation: ClientOperation::EventsStream,
                 error: ClientError::DaemonResponse(ProtocolError {
-                    code: "lagged".into(),
+                    code: ERROR_LAGGED,
                     message: "offset is no longer buffered".into(),
                 }),
             })
@@ -3553,19 +3553,19 @@ mod tests {
         )));
         assert!(is_connection_error(&ClientError::DaemonResponse(
             ProtocolError {
-                code: ERROR_UNSUPPORTED_VERSION.into(),
+                code: ERROR_UNSUPPORTED_VERSION,
                 message: "unsupported".into(),
             }
         )));
         assert!(is_connection_error(&ClientError::DaemonResponse(
             ProtocolError {
-                code: ERROR_WORKSPACE_MISMATCH.into(),
+                code: ERROR_WORKSPACE_MISMATCH,
                 message: "wrong workspace".into(),
             }
         )));
         assert!(!is_connection_error(&ClientError::DaemonResponse(
             ProtocolError {
-                code: ERROR_OVERLOAD.into(),
+                code: ERROR_OVERLOAD,
                 message: "busy".into(),
             }
         )));
@@ -3851,7 +3851,7 @@ mod tests {
             .send(ClientEvent::Failed {
                 operation: ClientOperation::ApprovalDecide,
                 error: ClientError::DaemonResponse(ProtocolError {
-                    code: "temporarily_unavailable".into(),
+                    code: ERROR_OVERLOAD,
                     message: "try the same decision again".into(),
                 }),
             })
@@ -4263,6 +4263,7 @@ mod tests {
                 workspace_id: "workspace-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,

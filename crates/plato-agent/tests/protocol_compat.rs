@@ -26,7 +26,7 @@ fn historical_protocol_and_model_paths_share_the_extracted_types() {
     );
 
     let error = AppError::DaemonResponse(ProtocolError {
-        code: ERROR_RUN_FAILED.into(),
+        code: ERROR_RUN_FAILED,
         message: "synthetic failure".into(),
     });
     assert_eq!(

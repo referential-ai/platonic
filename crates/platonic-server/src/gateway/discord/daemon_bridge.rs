@@ -6,7 +6,10 @@ use platonic_client::{
     paths,
 };
 use platonic_protocol::{
-    BufferedStreamEvent, HarnessEvent, HelloResult, RunStateName, StreamEvent, TranscriptReadResult,
+    BufferedStreamEvent, CAPABILITY_EVENTS_STREAM, CAPABILITY_HELLO, CAPABILITY_MESSAGE_APPEND,
+    CAPABILITY_RUN_START, CAPABILITY_SESSIONS_LIST, CAPABILITY_TRANSCRIPT_READ, Capability,
+    ERROR_LAGGED, ERROR_NOT_FOUND, HarnessEvent, HelloResult, RunStateName, StreamEvent,
+    TranscriptReadResult,
 };
 use std::{
     collections::HashMap,
@@ -23,13 +26,13 @@ pub(super) const SUCCESS_EMOJI: &str = "✅";
 pub(super) const FAILURE_EMOJI: &str = "❌";
 pub(super) const TYPING_INTERVAL: Duration = Duration::from_secs(8);
 const RECONNECT_ATTEMPTS: usize = 40;
-pub(super) const REQUIRED_CAPABILITIES: [&str; 6] = [
-    "hello",
-    "run.start",
-    "message.append",
-    "events.stream",
-    "sessions.list",
-    "transcript.read",
+pub(super) const REQUIRED_CAPABILITIES: [Capability; 6] = [
+    CAPABILITY_HELLO,
+    CAPABILITY_RUN_START,
+    CAPABILITY_MESSAGE_APPEND,
+    CAPABILITY_EVENTS_STREAM,
+    CAPABILITY_SESSIONS_LIST,
+    CAPABILITY_TRANSCRIPT_READ,
 ];
 
 impl DiscordGateway {
@@ -151,7 +154,7 @@ impl DiscordGateway {
                     }
                 }
                 Err(GatewayError::Client(ClientError::DaemonResponse(error)))
-                    if error.code == "lagged" =>
+                    if error.code == ERROR_LAGGED =>
                 {
                     next_offset = None;
                     approvals.clear();
@@ -251,7 +254,7 @@ pub(super) fn require_gateway_daemon_contract(
         !hello
             .capabilities
             .iter()
-            .any(|actual| actual == **capability)
+            .any(|actual| actual == *capability)
     }) {
         return Err(GatewayError::DaemonProtocol(format!(
             "daemon does not advertise required capability {capability}"
@@ -428,7 +431,7 @@ fn reconnectable(error: &GatewayError) -> bool {
             )
     ) || matches!(
         error,
-        GatewayError::Client(ClientError::DaemonResponse(error)) if error.code == "not_found"
+        GatewayError::Client(ClientError::DaemonResponse(error)) if error.code == ERROR_NOT_FOUND
     )
 }
 
