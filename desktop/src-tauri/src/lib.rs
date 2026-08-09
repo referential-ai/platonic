@@ -4,10 +4,13 @@ use platonic_client::{
     paths,
 };
 use platonic_protocol::{
-    ApprovalDecisionName, BufferedStreamEvent, CommandAcceptedResult, EventsStreamResult,
-    HarnessEvent, HelloResult, PendingApprovalSnapshot, PolicyDecision, RunStartResult,
-    RunStateName, SessionSummary, StreamEvent, TranscriptReadResult, TypedRun,
-    TypedTranscriptEntry,
+    ApprovalDecisionName, BufferedStreamEvent, CAPABILITY_APPROVAL_DECIDE,
+    CAPABILITY_EVENTS_STREAM, CAPABILITY_HELLO, CAPABILITY_MESSAGE_APPEND, CAPABILITY_RUN_CANCEL,
+    CAPABILITY_RUN_START, CAPABILITY_SESSIONS_LIST, CAPABILITY_TRANSCRIPT_READ,
+    CAPABILITY_TRANSCRIPT_READ_PENDING_APPROVAL, CAPABILITY_TRANSCRIPT_READ_TYPED, Capability,
+    CommandAcceptedResult, EventsStreamResult, HarnessEvent, HelloResult, PendingApprovalSnapshot,
+    PolicyDecision, RunStartResult, RunStateName, SessionSummary, StreamEvent,
+    TranscriptReadResult, TypedRun, TypedTranscriptEntry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,17 +34,17 @@ mod windows_installer_proof;
 #[cfg(all(test, windows))]
 mod windows_proof;
 
-const REQUIRED_CAPABILITIES: [&str; 10] = [
-    "hello",
-    "run.start",
-    "message.append",
-    "events.stream",
-    "approval.decide",
-    "run.cancel",
-    "sessions.list",
-    "transcript.read",
-    "transcript.read.typed",
-    "transcript.read.pending_approval",
+const REQUIRED_CAPABILITIES: [Capability; 10] = [
+    CAPABILITY_HELLO,
+    CAPABILITY_RUN_START,
+    CAPABILITY_MESSAGE_APPEND,
+    CAPABILITY_EVENTS_STREAM,
+    CAPABILITY_APPROVAL_DECIDE,
+    CAPABILITY_RUN_CANCEL,
+    CAPABILITY_SESSIONS_LIST,
+    CAPABILITY_TRANSCRIPT_READ,
+    CAPABILITY_TRANSCRIPT_READ_TYPED,
+    CAPABILITY_TRANSCRIPT_READ_PENDING_APPROVAL,
 ];
 const EVENT_PAGE_SIZE: usize = 128;
 const INPUT_PREVIEW_MAX_CHARS: usize = 2_000;
@@ -125,7 +128,7 @@ impl DesktopError {
 
     fn daemon(context: &str, error: impl Into<ClientError>) -> Self {
         match error.into() {
-            ClientError::DaemonResponse(error) => Self::new(error.code, error.message),
+            ClientError::DaemonResponse(error) => Self::new(error.code.to_string(), error.message),
             ClientError::DaemonProtocol(message) => {
                 Self::new("incompatible_daemon", format!("{context}: {message}"))
             }
@@ -1106,11 +1109,11 @@ fn validate_hello(workspace_root: &Path, hello: &HelloResult) -> Result<(), Desk
     require_capabilities(&hello.capabilities)
 }
 
-fn require_capabilities(capabilities: &[String]) -> Result<(), DesktopError> {
+fn require_capabilities(capabilities: &[Capability]) -> Result<(), DesktopError> {
     if let Some(missing) = REQUIRED_CAPABILITIES.iter().find(|required| {
         !capabilities
             .iter()
-            .any(|capability| capability == **required)
+            .any(|capability| capability == *required)
     }) {
         return Err(DesktopError::new(
             "incompatible_daemon",
@@ -1803,7 +1806,7 @@ pub fn run() {
 #[cfg(all(test, any(unix, windows)))]
 mod daemon_deadline_tests {
     use super::*;
-    use platonic_protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION};
+    use platonic_protocol::{Envelope, EnvelopeKind};
     use serde_json::json;
     use std::{
         io::{BufRead, BufReader, Write},
@@ -1817,6 +1820,11 @@ mod daemon_deadline_tests {
     const DEADLINE_LATE_TOLERANCE: Duration = Duration::from_secs(1);
     const NEAR_DEADLINE_DELAY: Duration = Duration::from_millis(2_500);
     const OUTER_WATCHDOG: Duration = Duration::from_secs(8);
+
+    fn request_params_value(request: &Envelope) -> Value {
+        let request = serde_json::to_value(request.params.as_ref().unwrap()).unwrap();
+        request.get("params").cloned().unwrap()
+    }
 
     #[test]
     fn normal_desktop_hello_byte_drip_cannot_extend_the_deadline() {
@@ -1885,7 +1893,7 @@ mod daemon_deadline_tests {
             answer_hello(&mut reader, &mut stream, &workspace_id, Duration::ZERO);
             let request = read_request(&mut reader);
             assert_eq!(request.method.as_deref(), Some("run.start"));
-            assert_eq!(request.params.as_ref().unwrap()["question"], "mutate once");
+            assert_eq!(request_params_value(&request)["question"], "mutate once");
             stream.write_all(b"{").unwrap();
             stream.flush().unwrap();
             released.recv_timeout(OUTER_WATCHDOG).unwrap();
@@ -2049,15 +2057,7 @@ mod daemon_deadline_tests {
     }
 
     fn write_response<W: Write>(writer: &mut W, id: Option<String>, method: &str, result: Value) {
-        let response = Envelope {
-            v: PROTOCOL_VERSION,
-            id,
-            kind: EnvelopeKind::Response,
-            method: Some(method.into()),
-            params: None,
-            result: Some(result),
-            error: None,
-        };
+        let response = Envelope::response(id, Some(method.into()), result);
         serde_json::to_writer(writer.by_ref(), &response).unwrap();
         writer.write_all(b"\n").unwrap();
         writer.flush().unwrap();
@@ -2163,7 +2163,7 @@ mod daemon_deadline_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use platonic_protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION};
+    use platonic_protocol::{ERROR_NOT_FOUND, Envelope, EnvelopeKind, ProtocolErrorCode};
     use serde_json::json;
     use std::{
         io::{BufRead, BufReader, Write},
@@ -2172,6 +2172,11 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    fn request_params_value(request: &Envelope) -> Value {
+        let request = serde_json::to_value(request.params.as_ref().unwrap()).unwrap();
+        request.get("params").cloned().unwrap()
+    }
 
     #[test]
     fn missing_invalid_and_persisted_workspaces_have_stable_states() {
@@ -2544,7 +2549,7 @@ mod tests {
                 }),
             );
             let transcript = read_request(&mut reader);
-            assert_eq!(transcript.params.unwrap()["run_id"], "run_1");
+            assert_eq!(request_params_value(&transcript)["run_id"], "run_1");
             write_response(
                 &mut writer,
                 transcript.id,
@@ -2596,7 +2601,7 @@ mod tests {
         let workspace_id = paths::workspace_id(workspace.path()).unwrap();
         let capabilities = REQUIRED_CAPABILITIES
             .iter()
-            .filter(|capability| **capability != "transcript.read.typed")
+            .filter(|capability| **capability != CAPABILITY_TRANSCRIPT_READ_TYPED)
             .copied()
             .collect::<Vec<_>>();
         let handle = thread::spawn(move || {
@@ -2642,10 +2647,8 @@ mod tests {
             daemon_version: "0.1.0".into(),
             workspace_id: "other-workspace".into(),
             ledger_path: "/secret/ledger.db".into(),
-            capabilities: REQUIRED_CAPABILITIES
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
+            capabilities: REQUIRED_CAPABILITIES.to_vec(),
+            daemon_scope: None,
         };
 
         let error = validate_hello(workspace.path(), &hello).unwrap_err();
@@ -3209,11 +3212,9 @@ mod tests {
 
             let transcript = read_request(&mut reader);
             assert_eq!(transcript.method.as_deref(), Some("transcript.read"));
-            assert_eq!(
-                transcript.params.as_ref().unwrap()["session_id"],
-                "session_1"
-            );
-            assert!(transcript.params.as_ref().unwrap()["run_id"].is_null());
+            let transcript_params = request_params_value(&transcript);
+            assert_eq!(transcript_params["session_id"], "session_1");
+            assert!(transcript_params["run_id"].is_null());
             write_response(
                 &mut writer,
                 transcript.id,
@@ -3268,7 +3269,7 @@ mod tests {
 
                 let request = read_request(&mut reader);
                 assert_eq!(request.method.as_deref(), Some(method));
-                let params = request.params.as_ref().unwrap();
+                let params = request_params_value(&request);
                 let message_field = if method == "run.start" {
                     "question"
                 } else {
@@ -3403,8 +3404,9 @@ mod tests {
 
             let request = read_request(&mut reader);
             assert_eq!(request.method.as_deref(), Some("events.stream"));
-            assert_eq!(request.params.as_ref().unwrap()["from_offset"], 0);
-            assert_eq!(request.params.as_ref().unwrap()["limit"], EVENT_PAGE_SIZE);
+            let request_params = request_params_value(&request);
+            assert_eq!(request_params["from_offset"], 0);
+            assert_eq!(request_params["limit"], EVENT_PAGE_SIZE);
             let events = (0..EVENT_PAGE_SIZE as u64)
                 .map(|offset| {
                     buffered_event(
@@ -3468,7 +3470,7 @@ mod tests {
 
             let anchor = read_request(&mut reader);
             assert_eq!(anchor.method.as_deref(), Some("events.stream"));
-            assert!(anchor.params.as_ref().unwrap()["from_offset"].is_null());
+            assert!(request_params_value(&anchor)["from_offset"].is_null());
             write_response(
                 &mut writer,
                 anchor.id,
@@ -3484,7 +3486,7 @@ mod tests {
 
             let transcript = read_request(&mut reader);
             assert_eq!(transcript.method.as_deref(), Some("transcript.read"));
-            assert_eq!(transcript.params.as_ref().unwrap()["run_id"], "run_1");
+            assert_eq!(request_params_value(&transcript)["run_id"], "run_1");
             write_response(
                 &mut writer,
                 transcript.id,
@@ -3508,7 +3510,7 @@ mod tests {
 
             let continued = read_request(&mut reader);
             assert_eq!(continued.method.as_deref(), Some("events.stream"));
-            assert_eq!(continued.params.as_ref().unwrap()["from_offset"], 4);
+            assert_eq!(request_params_value(&continued)["from_offset"], 4);
             write_response(
                 &mut writer,
                 continued.id,
@@ -3556,7 +3558,7 @@ mod tests {
         let error = DesktopError::daemon(
             "Unable to decide approval",
             ClientError::DaemonResponse(platonic_protocol::ProtocolError {
-                code: "not_found".into(),
+                code: ERROR_NOT_FOUND,
                 message: "pending approval not found: call_1".into(),
             }),
         );
@@ -3582,13 +3584,14 @@ mod tests {
             answer_hello(&mut reader, &mut writer, workspace_id.clone());
             let approval = read_request(&mut reader);
             assert_eq!(approval.method.as_deref(), Some("approval.decide"));
-            assert_eq!(approval.params.as_ref().unwrap()["run_id"], "run_1");
-            assert_eq!(approval.params.as_ref().unwrap()["tool_call_id"], "call_1");
+            let approval_params = request_params_value(&approval);
+            assert_eq!(approval_params["run_id"], "run_1");
+            assert_eq!(approval_params["tool_call_id"], "call_1");
             write_error(
                 &mut writer,
                 approval.id,
                 "approval.decide",
-                "not_found",
+                ERROR_NOT_FOUND,
                 "pending approval not found: call_1",
             );
 
@@ -3598,7 +3601,7 @@ mod tests {
             answer_hello(&mut reader, &mut writer, workspace_id);
             let cancel = read_request(&mut reader);
             assert_eq!(cancel.method.as_deref(), Some("run.cancel"));
-            assert_eq!(cancel.params.as_ref().unwrap()["run_id"], "run_1");
+            assert_eq!(request_params_value(&cancel)["run_id"], "run_1");
             write_response(
                 &mut writer,
                 cancel.id,
@@ -3758,15 +3761,7 @@ mod tests {
     }
 
     fn write_response(writer: &mut UnixStream, id: Option<String>, method: &str, result: Value) {
-        let response = Envelope {
-            v: PROTOCOL_VERSION,
-            id,
-            kind: EnvelopeKind::Response,
-            method: Some(method.into()),
-            params: None,
-            result: Some(result),
-            error: None,
-        };
+        let response = Envelope::response(id, Some(method.into()), result);
         serde_json::to_writer(writer.by_ref(), &response).unwrap();
         writer.write_all(b"\n").unwrap();
         writer.flush().unwrap();
@@ -3776,7 +3771,7 @@ mod tests {
         writer: &mut UnixStream,
         id: Option<String>,
         method: &str,
-        code: &str,
+        code: ProtocolErrorCode,
         message: &str,
     ) {
         let response = Envelope::error(id, Some(method.into()), code, message);

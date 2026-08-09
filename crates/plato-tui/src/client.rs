@@ -1215,7 +1215,7 @@ pub(super) fn is_connection_error(error: &ClientError) -> bool {
     match error {
         ClientError::Io(_) | ClientError::DaemonProtocol(_) => true,
         ClientError::DaemonResponse(error) => matches!(
-            error.code.as_str(),
+            error.code,
             ERROR_UNSUPPORTED_VERSION | ERROR_WORKSPACE_MISMATCH
         ),
         _ => false,
@@ -1228,8 +1228,8 @@ mod tests {
     use crate::{ConnectionState, TranscriptState, render_snapshot};
     use platonic_client::transport;
     use platonic_protocol::{
-        ERROR_ISSUE_PREP_FAILED, Envelope, EnvelopeKind, HelloResult, PROTOCOL_VERSION,
-        ProtocolError,
+        CAPABILITY_HELLO, CAPABILITY_ISSUE_PREP_START, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED,
+        Envelope, EnvelopeKind, HelloResult, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
     };
     use serde_json::json;
     use std::{
@@ -1245,6 +1245,11 @@ mod tests {
 
     const OUTER_WATCHDOG: Duration = Duration::from_secs(10);
     const DEADLINE_MARGIN: Duration = Duration::from_millis(100);
+
+    fn request_params_value(request: &Envelope) -> serde_json::Value {
+        let request = serde_json::to_value(request.params.as_ref().unwrap()).unwrap();
+        request.get("params").cloned().unwrap()
+    }
 
     #[test]
     fn thread_attachment_loads_exact_session_and_polls_from_live_tip() {
@@ -1327,7 +1332,7 @@ mod tests {
         let requests = harness.finish();
         assert_eq!(requests[1].method.as_deref(), Some("thread.status"));
         assert_eq!(
-            requests[1].params.as_ref().unwrap()["thread_id"],
+            request_params_value(&requests[1])["thread_id"],
             "thread_selected"
         );
     }
@@ -1494,12 +1499,10 @@ mod tests {
             .iter()
             .filter(|request| request.method.as_deref() == Some("transcript.read"))
             .map(|request| {
-                request
-                    .params
-                    .as_ref()
-                    .and_then(|params| params.get("session_id"))
-                    .and_then(serde_json::Value::as_str)
+                request_params_value(request)["session_id"]
+                    .as_str()
                     .unwrap()
+                    .to_owned()
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1624,7 +1627,7 @@ mod tests {
                 ClientEvent::Failed {
                     operation,
                     error: ClientError::DaemonResponse(ProtocolError {
-                        code: "test_failure".into(),
+                        code: ERROR_INTERNAL,
                         message: "expected failure".into(),
                     }),
                 },
@@ -1633,7 +1636,7 @@ mod tests {
             );
 
             let expected_status = format!(
-                "{} failed: daemon protocol error test_failure: expected failure",
+                "{} failed: daemon protocol error internal_error: expected failure",
                 operation.method()
             );
             assert_eq!(
@@ -1722,7 +1725,7 @@ mod tests {
                 hello_reply(workspace_id),
                 ScriptedReply::error(
                     "approval.decide",
-                    "temporarily_unavailable",
+                    ERROR_OVERLOAD,
                     "retry the exact decision",
                 ),
                 hello_reply(workspace_id),
@@ -1820,15 +1823,9 @@ mod tests {
             .filter(|request| request.method.as_deref() == Some("events.stream"))
             .collect::<Vec<_>>();
         assert_eq!(stream_requests.len(), 2);
-        assert_eq!(
-            stream_requests[0].params.as_ref().unwrap()["from_offset"],
-            0
-        );
+        assert_eq!(request_params_value(stream_requests[0])["from_offset"], 0);
         assert!(
-            stream_requests[1]
-                .params
-                .as_ref()
-                .unwrap()
+            request_params_value(stream_requests[1])
                 .get("from_offset")
                 .is_none(),
             "lag recovery must resume at the current tip"
@@ -1839,7 +1836,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(decisions.len(), 2);
         for request in decisions {
-            let params = request.params.as_ref().unwrap();
+            let params = request_params_value(request);
             assert_eq!(params["run_id"], "run_selected");
             assert_eq!(params["tool_call_id"], "call_selected");
             assert_eq!(params["decision"], if grant { "grant" } else { "deny" });
@@ -1955,7 +1952,8 @@ mod tests {
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
                 workspace_id: platonic_client::paths::workspace_id(&config.workspace_root).unwrap(),
                 ledger_path: "/work/agent.db".into(),
-                capabilities: vec!["hello".into(), "issue-prep.start".into()],
+                capabilities: vec![CAPABILITY_HELLO, CAPABILITY_ISSUE_PREP_START],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -1969,7 +1967,7 @@ mod tests {
         },
         Error {
             method: &'static str,
-            code: &'static str,
+            code: ProtocolErrorCode,
             message: &'static str,
         },
     }
@@ -1979,7 +1977,7 @@ mod tests {
             Self::Result { method, result }
         }
 
-        fn error(method: &'static str, code: &'static str, message: &'static str) -> Self {
+        fn error(method: &'static str, code: ProtocolErrorCode, message: &'static str) -> Self {
             Self::Error {
                 method,
                 code,
@@ -2144,7 +2142,7 @@ mod tests {
                 let issue_prep = read_request(&mut reader);
                 assert_eq!(issue_prep.method.as_deref(), Some("issue-prep.start"));
                 assert_eq!(
-                    issue_prep.params.as_ref().unwrap()["input"],
+                    request_params_value(&issue_prep)["input"],
                     "prepare a bounded issue"
                 );
                 request_seen_sender.send(()).unwrap();
@@ -2170,7 +2168,7 @@ mod tests {
                         params: None,
                         result: None,
                         error: Some(ProtocolError {
-                            code: ERROR_ISSUE_PREP_FAILED.into(),
+                            code: ERROR_ISSUE_PREP_FAILED,
                             message: "provider failed".into(),
                         }),
                     },

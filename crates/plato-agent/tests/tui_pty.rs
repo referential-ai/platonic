@@ -6,8 +6,8 @@ use platonic_client::{
     client::{DaemonClient, DaemonConnectionConfig},
 };
 use platonic_protocol::{
-    ERROR_LAGGED, ERROR_WORKSPACE_UNREGISTERED, Envelope, EnvelopeKind, PROTOCOL_VERSION,
-    RunStateName, ShutdownIfIdleResultName,
+    ERROR_LAGGED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_UNREGISTERED, Envelope, EnvelopeKind,
+    PROTOCOL_VERSION, ProtocolRequest, RunStateName, ShutdownIfIdleResultName,
 };
 use pty_process::{
     Size,
@@ -51,6 +51,11 @@ const STREAMING_SOURCE: &str = concat!(
     "| alpha | one |\n",
     "final mid-tok",
 );
+
+fn request_params_value(request: &Envelope) -> Value {
+    let request = serde_json::to_value(request.params.as_ref().unwrap()).unwrap();
+    request.get("params").cloned().unwrap()
+}
 const SCROLLBACK_SENTINEL: &str = "PLATO_NATIVE_SCROLLBACK_SENTINEL_377";
 const CONVERSATION_USER_TEXT: &str = concat!(
     "PLATO_NATIVE_SCROLLBACK_SENTINEL_377\n",
@@ -590,10 +595,9 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
     let daemon_output_at = shell.output_len();
     shell.write(b"\r");
     let run_start = fake.wait_for_request("run.start");
-    let question = run_start
-        .params
-        .as_ref()
-        .and_then(|params| params.get("question"))
+    let run_start_params = request_params_value(&run_start);
+    let question = run_start_params
+        .get("question")
         .and_then(Value::as_str)
         .expect("run.start.question should be a string");
     assert_eq!(question, visible_draft);
@@ -621,7 +625,7 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
 
     shell.write(b"\x03");
     let cancel = fake.wait_for_request("run.cancel");
-    assert_eq!(cancel.params.as_ref().unwrap()["run_id"], "run_tui_pty");
+    assert_eq!(request_params_value(&cancel)["run_id"], "run_tui_pty");
     shell.wait_for_screen_text_after(28, 90, stream_resize_at, "press Ctrl+C again to quit");
     shell.write(b"\x03");
     let after_termios = shell.wait_for_marker("POST");
@@ -772,10 +776,7 @@ fn composer_textarea_features_preserve_submit_queue_slash_and_history_contracts(
 
     shell.write(b"\r");
     let run_start = fake.wait_for_request("run.start");
-    assert_eq!(
-        run_start.params.as_ref().unwrap()["question"],
-        "alpha\nYbeta"
-    );
+    assert_eq!(request_params_value(&run_start)["question"], "alpha\nYbeta");
     shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Working");
 
     shell.write(b"next by tab\t");
@@ -803,6 +804,7 @@ fn composer_textarea_features_preserve_submit_queue_slash_and_history_contracts(
     );
 
     shell.write(b"\x15/c");
+    shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "show this help");
     let filtered = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "clear the visible");
     assert!(!filtered.contains("show this help"));
     shell.write(b"\t\r");
@@ -894,7 +896,7 @@ fn bare_plato_status_modal_sends_one_read_only_request_and_escape_closes() {
 
     shell.write(b"/status\r");
     let request = fake.wait_for_request("daemon.status");
-    let params = request.params.as_ref().unwrap();
+    let params = request_params_value(&request);
     assert!(params["session_id"].is_null());
     assert!(params["config_path"].is_null());
     let modal = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "TRUST");
@@ -988,15 +990,9 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
 
     fake.wait_for_request_count("events.stream", 2);
     let stream_requests = fake.requests_for("events.stream");
-    assert_eq!(
-        stream_requests[0].params.as_ref().unwrap()["from_offset"],
-        0
-    );
+    assert_eq!(request_params_value(&stream_requests[0])["from_offset"], 0);
     assert!(
-        stream_requests[1]
-            .params
-            .as_ref()
-            .unwrap()
+        request_params_value(&stream_requests[1])
             .get("from_offset")
             .is_none(),
         "lag recovery must request the current tip"
@@ -1005,7 +1001,7 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
     let deny_at = shell.output_len();
     shell.write(b"d");
     let decision = fake.wait_for_request("approval.decide");
-    let params = decision.params.as_ref().unwrap();
+    let params = request_params_value(&decision);
     assert_eq!(params["run_id"], PENDING_RUN_ID);
     assert_eq!(params["tool_call_id"], PENDING_CALL_ID);
     assert_eq!(params["decision"], "deny");
@@ -1592,7 +1588,7 @@ fn bare_plato_session_picker_resumes_exact_hidden_session_id() {
     fake.wait_for_request_count("transcript.read", 2);
     let transcript_requests = fake.requests_for("transcript.read");
     assert_eq!(
-        transcript_requests[1].params.as_ref().unwrap()["session_id"],
+        request_params_value(&transcript_requests[1])["session_id"],
         "session_pty_conversation"
     );
 
@@ -2742,7 +2738,7 @@ impl FakeDaemon {
             .lock()
             .unwrap()
             .iter()
-            .map(|request| request.method.clone())
+            .map(|request| request.method.map(|method| method.as_str().to_owned()))
             .collect()
     }
 
@@ -2875,16 +2871,13 @@ fn fake_response(
     }
     let result = match method {
         "hello" => {
-            let params = request
-                .params
-                .as_ref()
-                .ok_or_else(|| "hello omitted params".to_owned())?;
+            let Some(ProtocolRequest::Hello(params)) = request.params.as_ref() else {
+                return Err("hello omitted typed params".to_owned());
+            };
             let expected_root = workspace_root.to_string_lossy();
-            if params.get("workspace_root").and_then(Value::as_str) != Some(expected_root.as_ref())
-                || params.get("workspace_id").and_then(Value::as_str) != Some(workspace_id)
-            {
+            if params.workspace_root != expected_root || params.workspace_id != workspace_id {
                 return Err(format!(
-                    "hello did not identify the test workspace: {params}"
+                    "hello did not identify the test workspace: {params:?}"
                 ));
             }
             json!({
@@ -3073,12 +3066,10 @@ fn fake_response(
             }
         }),
         "events.stream" => {
-            let from_offset = request
-                .params
-                .as_ref()
-                .and_then(|params| params.get("from_offset"))
-                .and_then(Value::as_u64)
-                .unwrap_or(9);
+            let Some(ProtocolRequest::EventsStream(params)) = request.params.as_ref() else {
+                return Err("events.stream omitted typed params".to_owned());
+            };
+            let from_offset = params.from_offset.unwrap_or(9);
             let run_id = match scenario {
                 FakeScenario::PendingApproval => PENDING_RUN_ID,
                 FakeScenario::ConversationAudit => CONVERSATION_RUN_ID,
@@ -3224,7 +3215,7 @@ fn fake_response(
             return Ok(Envelope::error(
                 request.id.clone(),
                 Some(method.to_owned()),
-                "unsupported_method",
+                ERROR_UNSUPPORTED_METHOD,
                 format!("fake daemon does not support {method}"),
             ));
         }

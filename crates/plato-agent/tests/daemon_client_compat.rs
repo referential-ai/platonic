@@ -5,7 +5,7 @@ use platonic_client::{
     lock::{LOCK_VERSION, LockMetadata},
     paths, transport,
 };
-use platonic_protocol::ProtocolError;
+use platonic_protocol::{ERROR_NOT_FOUND, ProtocolError};
 use std::path::Path;
 
 #[test]
@@ -44,14 +44,14 @@ fn root_error_conversion_preserves_variants_and_display() {
     assert_eq!(protocol.to_string(), "daemon protocol error: bad response");
 
     let response: AppError = ClientError::DaemonResponse(ProtocolError {
-        code: "not_found".into(),
+        code: ERROR_NOT_FOUND,
         message: "missing".into(),
     })
     .into();
     assert!(matches!(
         response,
         AppError::DaemonResponse(ProtocolError { ref code, ref message })
-            if code == "not_found" && message == "missing"
+            if *code == ERROR_NOT_FOUND && message == "missing"
     ));
     assert_eq!(
         response.to_string(),

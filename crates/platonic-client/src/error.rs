@@ -1,3 +1,5 @@
+#[cfg(test)]
+use platonic_protocol::ERROR_NOT_FOUND;
 use platonic_protocol::ProtocolError;
 
 /// Result type returned by daemon client operations.
@@ -47,7 +49,7 @@ mod tests {
         );
         assert_eq!(
             ClientError::DaemonResponse(ProtocolError {
-                code: "not_found".into(),
+                code: ERROR_NOT_FOUND,
                 message: "missing".into(),
             })
             .to_string(),

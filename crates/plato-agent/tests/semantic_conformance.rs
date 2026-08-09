@@ -358,7 +358,7 @@ fn workspace_and_agent_six_method_control_plane_is_semantically_conformant() {
         CAPABILITY_AGENT_LIST,
         CAPABILITY_AGENT_STATUS,
     ] {
-        assert!(hello.capabilities.iter().any(|served| served == capability));
+        assert!(hello.capabilities.contains(&capability));
     }
 
     let second = proof._root.path().join("agent-control-workspace");
@@ -421,7 +421,10 @@ fn headless_one_shot_and_remote_never_prompt_or_register() {
             .unwrap();
         assert!(!output.status.success());
         let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(stderr.contains(ERROR_WORKSPACE_UNREGISTERED), "{stderr}");
+        assert!(
+            stderr.contains(ERROR_WORKSPACE_UNREGISTERED.as_str()),
+            "{stderr}"
+        );
         assert!(!stderr.contains("Workspace name ["), "{stderr}");
     }
 
@@ -455,7 +458,7 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
         CAPABILITY_THREAD_AUTHORITY,
         CAPABILITY_THREAD_STOP,
     ] {
-        assert!(hello.capabilities.iter().any(|served| served == capability));
+        assert!(hello.capabilities.contains(&capability));
     }
 
     let (spawn_id, root_thread_id) = match client
@@ -708,7 +711,7 @@ fn thread_send_and_three_observers_are_semantically_conformant_on_host_daemon() 
         CAPABILITY_THREAD_STATUS,
         CAPABILITY_THREAD_AUTHORITY,
     ] {
-        assert!(hello.capabilities.iter().any(|served| served == capability));
+        assert!(hello.capabilities.contains(&capability));
     }
     let (spawn_id, thread_id) = match controller_a
         .thread_spawn_start(

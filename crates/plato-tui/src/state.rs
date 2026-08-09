@@ -1292,6 +1292,7 @@ mod tests {
                     workspace_id: "workspace-1".into(),
                     ledger_path: "/tmp/agent.db".into(),
                     capabilities: vec![],
+                    daemon_scope: None,
                 },
                 vec![],
                 transcript,

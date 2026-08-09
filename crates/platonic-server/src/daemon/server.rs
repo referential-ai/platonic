@@ -8,7 +8,9 @@ use crate::{
         lock::WorkspaceLock,
         protocol::{
             ERROR_INTERNAL, ERROR_MALFORMED_REQUEST, ERROR_WORKSPACE_MISMATCH,
-            ERROR_WORKSPACE_UNREGISTERED, Envelope, EnvelopeKind, HelloParams, decode_request,
+            ERROR_WORKSPACE_UNREGISTERED, Envelope, EnvelopeKind, HelloParams, ProtocolErrorCode,
+            ProtocolMethod, ProtocolRequest, ProtocolResponse, ShutdownIfIdleResultName,
+            decode_request,
         },
         runtime::{DaemonRuntime, RuntimeState},
         transport,
@@ -225,7 +227,7 @@ impl HostRuntime {
     fn workspace_runtime(
         &self,
         params: &HelloParams,
-    ) -> Result<DaemonRuntime, (&'static str, String)> {
+    ) -> Result<DaemonRuntime, (ProtocolErrorCode, String)> {
         let workspace_root = PathBuf::from(&params.workspace_root)
             .canonicalize()
             .map_err(|error| {
@@ -680,41 +682,24 @@ fn handle_host_line(
         Ok(request) => request,
         Err(error) => return *error,
     };
-    if request.method.as_deref().is_some_and(is_control_method) {
+    if request.method.is_some_and(is_control_method) {
         return handle_request(&host.control_runtime, request);
     }
-    if request.method.as_deref() != Some("hello") {
-        let method = request.method.clone();
+    if request.method != Some(ProtocolMethod::Hello) {
+        let method = request.method;
         return Envelope::error(
             request.id,
-            method.clone(),
+            method.map(|method| method.to_string()),
             ERROR_MALFORMED_REQUEST,
             format!(
                 "host daemon requires hello before {}",
-                method.as_deref().unwrap_or("request")
+                method.map_or("request", ProtocolMethod::as_str)
             ),
         );
     }
     let params = match request.params.as_ref() {
-        Some(params) => match serde_json::from_value::<HelloParams>(params.clone()) {
-            Ok(params) => params,
-            Err(error) => {
-                return Envelope::error(
-                    request.id,
-                    Some("hello".into()),
-                    ERROR_MALFORMED_REQUEST,
-                    format!("hello params are invalid: {error}"),
-                );
-            }
-        },
-        None => {
-            return Envelope::error(
-                request.id,
-                Some("hello".into()),
-                ERROR_MALFORMED_REQUEST,
-                "hello params are required",
-            );
-        }
+        Some(ProtocolRequest::Hello(params)) => params.clone(),
+        _ => unreachable!("hello request carries hello params"),
     };
     let runtime = match host.workspace_runtime(&params) {
         Ok(runtime) => runtime,
@@ -729,27 +714,21 @@ fn handle_host_line(
     response
 }
 
-fn is_control_method(method: &str) -> bool {
+fn is_control_method(method: ProtocolMethod) -> bool {
     matches!(
         method,
-        "workspace.create"
-            | "workspace.list"
-            | "workspace.status"
-            | "agent.create"
-            | "agent.list"
-            | "agent.status"
+        ProtocolMethod::WorkspaceCreate
+            | ProtocolMethod::WorkspaceList
+            | ProtocolMethod::WorkspaceStatus
+            | ProtocolMethod::AgentCreate
+            | ProtocolMethod::AgentList
+            | ProtocolMethod::AgentStatus
     )
 }
 
 fn add_host_scope(mut response: Envelope) -> Envelope {
-    if response.kind == EnvelopeKind::Response
-        && response.method.as_deref() == Some("hello")
-        && let Some(result) = response
-            .result
-            .as_mut()
-            .and_then(serde_json::Value::as_object_mut)
-    {
-        result.insert("daemon_scope".into(), HOST_DAEMON_SCOPE.into());
+    if let Some(ProtocolResponse::Hello(result)) = response.result.as_mut() {
+        result.daemon_scope = Some(HOST_DAEMON_SCOPE.into());
     }
     response
 }
@@ -773,14 +752,11 @@ where
             continue;
         }
         let response = handle(&line);
-        let stop_after_response = response.method.as_deref() == Some("daemon.shutdown_if_idle")
-            && response.kind == crate::daemon::protocol::EnvelopeKind::Response
-            && response
-                .result
-                .as_ref()
-                .and_then(|result| result.get("result"))
-                .and_then(serde_json::Value::as_str)
-                == Some("shutdown");
+        let stop_after_response = matches!(
+            response.result,
+            Some(ProtocolResponse::DaemonShutdownIfIdle(ref result))
+                if result.result == ShutdownIfIdleResultName::Shutdown
+        );
         let write_result = (|| -> AppResult<()> {
             serde_json::to_writer(&mut writer, &response)?;
             writer.write_all(b"\n")?;
@@ -1096,6 +1072,15 @@ mod tests {
     };
 
     const FAKE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
+
+    fn response_value(response: &Envelope) -> serde_json::Value {
+        let response = serde_json::to_value(response.result.as_ref().unwrap()).unwrap();
+        response["result"].clone()
+    }
+
+    fn response_result<T: serde::de::DeserializeOwned>(response: &Envelope) -> T {
+        serde_json::from_value(response_value(response)).unwrap()
+    }
 
     fn pending_request(run_id: &str, call_id: &str) -> ApprovalRequest {
         ApprovalRequest {
@@ -1433,7 +1418,7 @@ mod tests {
         assert!(matches!(
             error,
             platonic_client::ClientError::DaemonResponse(ProtocolError { ref code, .. })
-                if code == ERROR_WORKSPACE_UNREGISTERED
+                if *code == ERROR_WORKSPACE_UNREGISTERED
         ));
         drop(unregistered);
 
@@ -1462,7 +1447,7 @@ mod tests {
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(response.id.as_deref(), Some("req_1"));
         assert_eq!(response.method.as_deref(), Some("hello"));
-        let result = response.result.unwrap();
+        let result = response_value(&response);
         assert_eq!(result["daemon_version"], platonic_protocol::BUILD_IDENTITY);
         assert_eq!(result["workspace_id"], paths.workspace_id);
         assert!(result.get("daemon_scope").is_none());
@@ -1523,7 +1508,7 @@ mod tests {
             assert!(matches!(
                 error,
                 platonic_client::ClientError::DaemonResponse(ProtocolError { ref code, ref message })
-                    if code == ERROR_WORKSPACE_UNREGISTERED
+                    if *code == ERROR_WORKSPACE_UNREGISTERED
                         && message.contains("platonic workspace create")
             ));
             drop(unregistered);
@@ -1548,7 +1533,7 @@ mod tests {
             let mut raw = String::new();
             attached.read_to_string(&mut raw).unwrap();
             let response: Envelope = serde_json::from_str(raw.trim()).unwrap();
-            let result = response.result.unwrap();
+            let result = response_value(&response);
             handle.join().unwrap();
 
             assert_eq!(response.kind, EnvelopeKind::Response);
@@ -1606,12 +1591,11 @@ base_url = "https://example.invalid/v1"
 
             let first = server.handle_line(&request("status_1", None, &config_path));
             let first_wire = serde_json::to_string(&first).unwrap();
-            let first: DaemonStatusResult = serde_json::from_value(first.result.unwrap()).unwrap();
+            let first: DaemonStatusResult = response_result(&first);
             thread::sleep(Duration::from_millis(5));
             let second = server.handle_line(&request("status_2", None, &config_path));
             let second_wire = serde_json::to_string(&second).unwrap();
-            let second: DaemonStatusResult =
-                serde_json::from_value(second.result.unwrap()).unwrap();
+            let second: DaemonStatusResult = response_result(&second);
 
             assert_eq!(first.model.requested_alias, "requested-status-alias");
             assert_eq!(first.model.served_model, None);
@@ -1740,7 +1724,7 @@ base_url = "https://example.invalid/v1"
             r#"{"v":1,"id":"shutdown_3","kind":"request","method":"daemon.shutdown_if_idle","params":{}}"#,
         );
         assert_eq!(response.kind, EnvelopeKind::Response);
-        assert_eq!(response.result.unwrap(), json!({"result": "shutdown"}));
+        assert_eq!(response_value(&response), json!({"result": "shutdown"}));
     }
 
     #[test]
@@ -1767,7 +1751,7 @@ base_url = "https://example.invalid/v1"
         )
         .unwrap();
         let response = read_envelope(&mut shutdown_reader);
-        assert_eq!(response.result.unwrap(), json!({"result": "shutdown"}));
+        assert_eq!(response_value(&response), json!({"result": "shutdown"}));
         assert!(socket_path.exists());
         assert!(lock_path.exists());
 
@@ -1876,7 +1860,10 @@ base_url = "https://example.invalid/v1"
         .unwrap();
         let refused = read_envelope(&mut reader);
         assert_eq!(refused.kind, EnvelopeKind::Response);
-        assert_eq!(refused.result.unwrap(), json!({"result": "refused_active"}));
+        assert_eq!(
+            response_value(&refused),
+            json!({"result": "refused_active"})
+        );
         assert!(socket_path.exists());
         assert!(paths.lock_path.exists());
 
@@ -1904,7 +1891,7 @@ base_url = "https://example.invalid/v1"
         .unwrap();
         let accepted = read_envelope(&mut reader);
         assert_eq!(accepted.kind, EnvelopeKind::Response);
-        assert_eq!(accepted.result.unwrap(), json!({"result": "shutdown"}));
+        assert_eq!(response_value(&accepted), json!({"result": "shutdown"}));
 
         handle.join().unwrap();
         assert!(!socket_path.exists());
@@ -1985,7 +1972,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"hello","config_path":"{}","wait":true}}}}"#,
             config_path.display()
         ));
-        let result = response.result.unwrap();
+        let result = response_value(&response);
         let request = http_request_json(&provider.handle.join().unwrap());
         let ledger = SqliteLedger::open_readonly(&server.paths().ledger_path).unwrap();
         let (_, records) = ledger.read_latest_run().unwrap();
@@ -2049,7 +2036,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         .unwrap();
         let response = read_envelope(&mut reader);
         assert_eq!(response.kind, EnvelopeKind::Response);
-        let result = response.result.unwrap();
+        let result = response_value(&response);
         assert_eq!(result["status"], "running");
         assert!(result["final_answer"].is_null());
         let run_id = result["run_id"].as_str().unwrap().to_string();
@@ -2064,7 +2051,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             .unwrap();
             let response = read_envelope(&mut reader);
             assert_eq!(response.kind, EnvelopeKind::Response);
-            let events = response.result.unwrap()["events"].clone();
+            let events = response_value(&response)["events"].clone();
             last_events = events.clone();
             approval_seen = events_contain_approval_request(&events);
             if approval_seen {
@@ -2084,7 +2071,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         .unwrap();
         let response = read_envelope(&mut reader);
         assert_eq!(response.kind, EnvelopeKind::Response);
-        let pending = response.result.unwrap()["pending_approval"].clone();
+        let pending = response_value(&response)["pending_approval"].clone();
         assert_eq!(pending["run_id"], run_id);
         assert_eq!(pending["tool_call_id"], "call_1");
         assert_eq!(pending["tool_name"], "file.write");
@@ -2103,7 +2090,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         .unwrap();
         let response = read_envelope(&mut reader);
         assert_eq!(response.kind, EnvelopeKind::Response);
-        assert_eq!(response.result.unwrap()["status"], "running");
+        assert_eq!(response_value(&response)["status"], "running");
 
         writeln!(
             stream,
@@ -2112,7 +2099,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         .unwrap();
         let response = read_envelope(&mut reader);
         assert_eq!(response.kind, EnvelopeKind::Response);
-        assert!(response.result.unwrap().get("pending_approval").is_none());
+        assert!(response_value(&response).get("pending_approval").is_none());
 
         stream.shutdown(std::net::Shutdown::Write).unwrap();
         handle.join().unwrap();
@@ -2159,7 +2146,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             config_path.display()
         ));
         assert_eq!(status.kind, EnvelopeKind::Response);
-        assert_eq!(status.result.unwrap()["trust"]["shell_session_grant"], true);
+        assert_eq!(
+            response_value(&status)["trust"]["shell_session_grant"],
+            true
+        );
 
         let repeated = append_test_run(&server, &config_path, &session_id, "repeat shell");
         assert_run_finishes_without_pending_approval(&server, &repeated.run_id);
@@ -2174,7 +2164,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         ));
         assert_eq!(other_status.kind, EnvelopeKind::Response);
         assert_eq!(
-            other_status.result.unwrap()["trust"]["shell_session_grant"],
+            response_value(&other_status)["trust"]["shell_session_grant"],
             false
         );
         let denied = server.handle_line(&format!(
@@ -2194,7 +2184,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{{"v":1,"id":"transcript_actors","kind":"request","method":"transcript.read","params":{{"session_id":"{session_id}"}}}}"#
         ));
         let typed: TypedTranscript =
-            serde_json::from_value(transcript.result.unwrap()["typed"].clone()).unwrap();
+            serde_json::from_value(response_value(&transcript)["typed"].clone()).unwrap();
         let actors = typed
             .runs
             .iter()
@@ -2228,7 +2218,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         ));
         assert_eq!(restarted_status.kind, EnvelopeKind::Response);
         assert_eq!(
-            restarted_status.result.unwrap()["trust"]["shell_session_grant"],
+            response_value(&restarted_status)["trust"]["shell_session_grant"],
             false
         );
         let denied = restarted.handle_line(&format!(
@@ -2267,7 +2257,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"write a file","config_path":"{}"}}}}"#,
             config_path.display()
         ));
-        let run_id = response.result.unwrap()["run_id"]
+        let run_id = response_value(&response)["run_id"]
             .as_str()
             .unwrap()
             .to_string();
@@ -2282,17 +2272,18 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
         ));
         assert_eq!(response.kind, EnvelopeKind::Response);
-        assert_eq!(
-            response.result.as_ref().unwrap()["status"],
-            "cancel_requested"
-        );
+        assert_eq!(response_value(&response)["status"], "cancel_requested");
         assert!(record.approvals.lock().unwrap().is_empty());
         assert_eq!(record.pending_approval(), None);
         let transcript = server.handle_line(&format!(
             r#"{{"v":1,"id":"transcript_1","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
         ));
         assert_eq!(transcript.kind, EnvelopeKind::Response);
-        assert!(transcript.result.unwrap().get("pending_approval").is_none());
+        assert!(
+            response_value(&transcript)
+                .get("pending_approval")
+                .is_none()
+        );
         let stale = server.handle_line(&format!(
             r#"{{"v":1,"id":"approval_1","kind":"request","method":"approval.decide","params":{{"run_id":"{run_id}","tool_call_id":"call_1","decision":"grant"}}}}"#
         ));
@@ -2380,7 +2371,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             config_path.display()
         ));
         assert_eq!(started.kind, EnvelopeKind::Response);
-        let started = started.result.unwrap();
+        let started = response_value(&started);
         let run_id = started["run_id"].as_str().unwrap().to_owned();
         let session_id = started["session_id"].as_str().unwrap().to_owned();
         let record = server.runtime.state.lock().unwrap().runs[&run_id].clone();
@@ -2393,7 +2384,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
         ));
         assert_eq!(cancel.kind, EnvelopeKind::Response);
-        assert_eq!(cancel.result.unwrap()["status"], "cancel_requested");
+        assert_eq!(response_value(&cancel)["status"], "cancel_requested");
 
         let accepted_at = Instant::now();
         while matches!(
@@ -2412,20 +2403,20 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{{"v":1,"id":"events_1","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0}}}}"#
         ));
         assert_eq!(events.kind, EnvelopeKind::Response);
-        assert_eq!(events.result.unwrap()["status"], "canceled");
+        assert_eq!(response_value(&events)["status"], "canceled");
         let sessions = server
             .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
         assert_eq!(sessions.kind, EnvelopeKind::Response);
-        let sessions = sessions.result.unwrap();
+        let sessions = response_value(&sessions);
         assert_eq!(sessions["sessions"][0]["session_id"], session_id);
         assert_eq!(sessions["sessions"][0]["status"], "canceled");
         let transcript = server.handle_line(&format!(
             r#"{{"v":1,"id":"transcript_1","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
         ));
         assert_eq!(transcript.kind, EnvelopeKind::Response);
-        assert_eq!(transcript.result.as_ref().unwrap()["status"], "canceled");
+        assert_eq!(response_value(&transcript)["status"], "canceled");
         assert!(
-            transcript.result.unwrap()["transcript"]
+            response_value(&transcript)["transcript"]
                 .as_str()
                 .unwrap()
                 .contains("run canceled")
@@ -2487,7 +2478,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             config_path.display()
         ));
         assert_eq!(first.kind, EnvelopeKind::Response, "{:?}", first.error);
-        let first = first.result.unwrap();
+        let first = response_value(&first);
         assert_eq!(first["status"], "running");
 
         let second = server.handle_line(&format!(
@@ -2495,7 +2486,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             config_path.display()
         ));
         assert_eq!(second.kind, EnvelopeKind::Response, "{:?}", second.error);
-        let second = second.result.unwrap();
+        let second = response_value(&second);
 
         let first_run = first["run_id"].as_str().unwrap();
         let first_session = first["session_id"].as_str().unwrap();
@@ -2574,9 +2565,11 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let admitted_run_ids = responses
             .iter()
             .filter(|response| response.kind == EnvelopeKind::Response)
-            .filter_map(|response| response.result.as_ref())
-            .filter_map(|result| result["run_id"].as_str())
-            .map(str::to_string)
+            .filter_map(|response| {
+                response_value(response)["run_id"]
+                    .as_str()
+                    .map(str::to_string)
+            })
             .collect::<Vec<_>>();
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2611,7 +2604,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
                 .iter()
                 .filter(|response| response.kind == EnvelopeKind::Error)
                 .filter(|response| {
-                    response.error.as_ref().map(|error| error.code.as_str()) == Some(ERROR_OVERLOAD)
+                    response.error.as_ref().map(|error| error.code) == Some(ERROR_OVERLOAD)
                 })
                 .count(),
             CLIENTS - 1
@@ -2667,7 +2660,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{"v":1,"id":"shutdown","kind":"request","method":"daemon.shutdown_if_idle"}"#,
         );
         assert_eq!(shutdown.kind, EnvelopeKind::Response);
-        assert_eq!(shutdown.result.unwrap(), json!({"result": "shutdown"}));
+        assert_eq!(response_value(&shutdown), json!({"result": "shutdown"}));
     }
 
     #[test]
@@ -2693,7 +2686,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let response = server.handle_line(
             r#"{"v":1,"id":"events_1","kind":"request","method":"events.stream","params":{"run_id":"run_1","from_offset":0,"limit":1}}"#,
         );
-        let result = response.result.unwrap();
+        let result = response_value(&response);
 
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(result["run_id"], "run_1");
@@ -2729,8 +2722,8 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{"v":1,"id":"events_2","kind":"request","method":"events.stream","params":{"run_id":"run_1","from_offset":1,"limit":1}}"#,
         );
 
-        let first = first.result.unwrap();
-        let second = second.result.unwrap();
+        let first = response_value(&first);
+        let second = response_value(&second);
         assert_eq!(first["next_offset"], 1);
         assert_eq!(first["events"][0]["event"]["kind"], "first");
         assert_eq!(second["next_offset"], 2);
@@ -2854,7 +2847,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{{"v":1,"id":"events_new","kind":"request","method":"events.stream","params":{{"run_id":"run_{MAX_TERMINAL_RUNS}"}}}}"#
         ));
         assert_eq!(retained.kind, EnvelopeKind::Response);
-        let retained = retained.result.unwrap();
+        let retained = response_value(&retained);
         assert_eq!(retained["from_offset"], 1);
         assert_eq!(retained["next_offset"], 1);
         assert_eq!(retained["events"], json!([]));
@@ -2864,14 +2857,14 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{"v":1,"id":"transcript","kind":"request","method":"transcript.read","params":{"run_id":"run_0"}}"#,
         );
         assert_eq!(transcript.kind, EnvelopeKind::Response);
-        let transcript = transcript.result.unwrap();
+        let transcript = response_value(&transcript);
         assert_eq!(transcript["status"], "finished");
         assert_eq!(transcript["final_answer"], "persisted answer");
 
         let sessions = server
             .handle_line(r#"{"v":1,"id":"sessions","kind":"request","method":"sessions.list"}"#);
         assert_eq!(sessions.kind, EnvelopeKind::Response);
-        assert_eq!(sessions.result.unwrap()["sessions"][0]["run_id"], "run_0");
+        assert_eq!(response_value(&sessions)["sessions"][0]["run_id"], "run_0");
     }
 
     #[test]
@@ -3047,7 +3040,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         );
         assert_eq!(run.kind, EnvelopeKind::Response);
         assert_eq!(
-            run.result.unwrap(),
+            response_value(&run),
             json!({
                 "run_id": "run_2",
                 "status": "finished",
@@ -3073,7 +3066,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         );
         assert_eq!(session.kind, EnvelopeKind::Response);
         assert_eq!(
-            session.result.unwrap(),
+            response_value(&session),
             json!({
                 "run_id": "run_2",
                 "status": "finished",
@@ -3305,7 +3298,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         let response = server
             .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
-        let result = response.result.unwrap();
+        let result = response_value(&response);
 
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(result["sessions"][0]["session_id"], "session_1");
@@ -3318,11 +3311,11 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"run_id":"run_1"}}"#,
         );
         assert_eq!(cancel.kind, EnvelopeKind::Response);
-        assert_eq!(cancel.result.unwrap()["status"], "cancel_requested");
+        assert_eq!(response_value(&cancel)["status"], "cancel_requested");
 
         let response = server
             .handle_line(r#"{"v":1,"id":"sessions_2","kind":"request","method":"sessions.list"}"#);
-        let result = response.result.unwrap();
+        let result = response_value(&response);
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(result["sessions"][0]["run_id"], "run_1");
         assert_eq!(result["sessions"][0]["status"], "cancel_requested");
@@ -3357,7 +3350,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let second_server = DaemonServer::bind(workspace.path(), Some(second_socket)).unwrap();
         let response = second_server
             .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
-        let result = response.result.unwrap();
+        let result = response_value(&response);
 
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(result["sessions"][0]["session_id"], "session_1");
@@ -3382,7 +3375,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         let response = server
             .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
-        let result = response.result.unwrap();
+        let result = response_value(&response);
 
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(result["sessions"].as_array().unwrap().len(), 0);
@@ -3422,7 +3415,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let second_server = DaemonServer::bind(workspace.path(), Some(second_socket)).unwrap();
         let response = second_server
             .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
-        let result = response.result.unwrap();
+        let result = response_value(&response);
 
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(result["sessions"][0]["session_id"], "session_1");
@@ -3476,7 +3469,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         let response = server
             .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
-        let result = response.result.unwrap();
+        let result = response_value(&response);
 
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(
@@ -3538,7 +3531,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             config_path.display()
         ));
         assert_eq!(response.kind, EnvelopeKind::Response);
-        let result = response.result.unwrap();
+        let result = response_value(&response);
         assert_eq!(result["status"], "running");
         let run_id = result["run_id"].as_str().unwrap().to_string();
 
@@ -3548,7 +3541,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
                 r#"{{"v":1,"id":"events_{attempt}","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":32}}}}"#
             ));
             assert_eq!(response.kind, EnvelopeKind::Response);
-            let events = response.result.unwrap()["events"].clone();
+            let events = response_value(&response)["events"].clone();
             approval_seen = events_contain_approval_request(&events);
             if approval_seen {
                 break;
@@ -3913,7 +3906,7 @@ enabled = ["{enabled_tool}"]
                 r#"{{"v":1,"id":"events","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":1}}}}"#
             ));
             assert_eq!(response.kind, EnvelopeKind::Response);
-            let result = response.result.unwrap();
+            let result = response_value(&response);
             match result["status"].as_str().unwrap() {
                 "finished" => return,
                 "running" => {}
@@ -3936,7 +3929,7 @@ enabled = ["{enabled_tool}"]
             config_path.display()
         ));
         assert_eq!(response.kind, EnvelopeKind::Response);
-        serde_json::from_value(response.result.unwrap()).unwrap()
+        response_result(&response)
     }
 
     fn append_test_run(
@@ -3950,7 +3943,7 @@ enabled = ["{enabled_tool}"]
             config_path.display()
         ));
         assert_eq!(response.kind, EnvelopeKind::Response);
-        serde_json::from_value(response.result.unwrap()).unwrap()
+        response_result(&response)
     }
 
     fn wait_for_pending_call(server: &DaemonServer, run_id: &str, call_id: &str) {
