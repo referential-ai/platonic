@@ -38,8 +38,8 @@ platform decisions of 2026-08-06/07.
 - Fallback rule: provider fallback is per-run ledger evidence. The process that computes it is mechanics; unrecorded fallback is forbidden.
 - Server noun: `platonic serve` is the persistent runtime. Gateways are ingress adapters and never own agent semantics.
 - TUI decision: `plato-tui` is a separate binary in this crate once it exists.
-- Server ownership: `platonic serve` owns the host endpoint, workspace event databases, and process lock. Unix uses a private UDS plus XDG runtime/state paths; Windows uses a current-user named pipe plus `LocalAppData` runtime/state paths.
-- Single-writer invariant: one live server owns a workspace store. A run child never opens the ledger or receives its path; it streams typed record operations to `platonic serve`, which remains the sole SQLite writer.
+- Server ownership: `platonic serve` owns the host endpoint, workspace ledgers, and process lock. Unix uses a private UDS plus XDG runtime/state paths; Windows uses a current-user named pipe plus `LocalAppData` runtime/state paths.
+- Single-writer invariant: one live server owns a workspace store. A run child never opens the ledger or receives its path; it streams typed record operations to `platonic serve`, which alone appends per-run JSONL and writes SQLite state.
 - Run-child boundary: every run executes in its own supervised child while the server remains authoritative. The parent supplies an explicit deadline and cancellation token, supervises the complete descendant tree, applies bounded grace and kill phases, drains child output with a bound, and asserts zero residual processes after every terminal path. One-shot clients use this same server-owned implementation.
 - Daemon API sketch: start run, append message, stream events, approve/deny, cancel, list sessions, read transcript. `run.start` and `message.append` default to async `wait: false`; explicit `wait: true` blocks until terminal result.
 - Live assistant text deltas are transient daemon/app events; final `model_responded` ledger messages remain the replay source of truth.

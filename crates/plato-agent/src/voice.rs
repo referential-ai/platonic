@@ -70,9 +70,6 @@ pub enum VoiceError {
     /// The voice session was explicitly shut down.
     #[error("voice session is closed")]
     SessionClosed,
-    /// Voice facts require the server-owned SQLite stream returned by the run.
-    #[error("narrated runs require a server-owned SQLite ledger")]
-    SqliteRequired,
 }
 
 /// Failures from the app run or its root-owned narration composition.
@@ -494,7 +491,6 @@ impl VoiceSession {
             next_interruption.as_ref(),
             worker,
         )?;
-        require_voice_sqlite(&outcome.run.ledger_path)?;
         outcome.voice_events = events
             .into_iter()
             .enumerate()
@@ -517,17 +513,6 @@ struct VoiceTurnEvidence {
     key: ResponseKey,
     audible_sequences: BTreeSet<u64>,
     interruption: Option<SpokenInterruption>,
-}
-
-fn require_voice_sqlite(ledger_path: &std::path::Path) -> Result<(), VoiceError> {
-    if ledger_path
-        .extension()
-        .is_some_and(|extension| extension == "db")
-    {
-        Ok(())
-    } else {
-        Err(VoiceError::SqliteRequired)
-    }
 }
 
 fn voice_events_for_run(
@@ -1213,15 +1198,6 @@ mod tests {
             ),
             Err(VoiceError::EventContract { .. })
         ));
-    }
-
-    #[test]
-    fn voice_fact_emission_rejects_jsonl_instead_of_claiming_durability() {
-        assert!(matches!(
-            require_voice_sqlite(std::path::Path::new("events.jsonl")),
-            Err(VoiceError::SqliteRequired)
-        ));
-        assert!(require_voice_sqlite(std::path::Path::new("events.db")).is_ok());
     }
 
     #[test]

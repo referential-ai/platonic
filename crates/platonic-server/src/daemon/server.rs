@@ -2096,7 +2096,13 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let result = response_value(&response);
         let request = http_request_json(&provider.handle.join().unwrap());
         let ledger = SqliteLedger::open_readonly(&server.paths().ledger_path).unwrap();
-        let (_, records) = ledger.read_latest_run().unwrap();
+        let records = ledger
+            .read_latest_session()
+            .unwrap()
+            .runs
+            .pop()
+            .unwrap()
+            .records;
         let context = records
             .iter()
             .find_map(|record| match &record.event {
@@ -2109,9 +2115,27 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             .iter()
             .filter(|fragment| fragment.lane == platonic_core::ContextLane::RetrievedContext)
             .collect::<Vec<_>>();
+        let run_id = result["run_id"].as_str().unwrap();
+        let run_log = server
+            .paths()
+            .ledger_path
+            .parent()
+            .unwrap()
+            .join("runs")
+            .join(format!("{run_id}.jsonl"));
+        let state = rusqlite::Connection::open(&server.paths().ledger_path).unwrap();
 
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(result["status"], "finished");
+        assert!(run_log.is_file());
+        for table in ["ledger_events", "voice_events"] {
+            let count: i64 = state
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "new daemon run wrote {table}");
+        }
         assert_eq!(
             request["messages"][0]["content"],
             format!("{}\n\n{memory}", crate::model::system_prompt())
@@ -2930,7 +2954,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
     }
 
     #[test]
-    fn evicted_terminal_run_loses_only_transient_event_readback() {
+    fn evicted_terminal_run_streams_durable_events_without_transient_events() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let server =
@@ -2958,10 +2982,20 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         }
 
         let evicted = server.handle_line(
-            r#"{"v":1,"id":"events_old","kind":"request","method":"events.stream","params":{"run_id":"run_0"}}"#,
+            r#"{"v":1,"id":"events_old","kind":"request","method":"events.stream","params":{"run_id":"run_0","from_offset":0}}"#,
         );
-        assert_eq!(evicted.kind, EnvelopeKind::Error);
-        assert_eq!(evicted.error.unwrap().code, ERROR_NOT_FOUND);
+        assert_eq!(evicted.kind, EnvelopeKind::Response);
+        let evicted = response_value(&evicted);
+        assert_eq!(evicted["from_offset"], 0);
+        assert_eq!(evicted["next_offset"], 5);
+        assert_eq!(evicted["status"], "finished");
+        let events = evicted["events"].as_array().unwrap();
+        assert_eq!(events.len(), 5);
+        assert!(
+            events
+                .iter()
+                .all(|event| event["event"]["kind"] == "ledger")
+        );
 
         let retained = server.handle_line(&format!(
             r#"{{"v":1,"id":"events_new","kind":"request","method":"events.stream","params":{{"run_id":"run_{MAX_TERMINAL_RUNS}"}}}}"#
@@ -3714,7 +3748,13 @@ enabled = ["file.read"]
         assert_eq!(response.kind, EnvelopeKind::Error);
 
         let ledger = SqliteLedger::open_readonly(&server.paths().ledger_path).unwrap();
-        let (_run_id, records) = ledger.read_latest_run().unwrap();
+        let records = ledger
+            .read_latest_session()
+            .unwrap()
+            .runs
+            .pop()
+            .unwrap()
+            .records;
         let recent_turns = records
             .iter()
             .find_map(|record| match &record.event {

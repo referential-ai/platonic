@@ -31,7 +31,7 @@ struct Cli {
         value_name = "PATH",
         num_args = 0..=1,
         require_equals = true,
-        help = "Select a SQLite ledger for offline replay; bare --db uses the workspace ledger"
+        help = "Select a workspace ledger for offline replay; bare --db uses the registered workspace ledger"
     )]
     db: Option<Option<PathBuf>>,
 
@@ -942,6 +942,39 @@ mod tests {
                     .unwrap()
                     .contains("final_phase: Failed")
             );
+
+            let run_log = ledger_path.parent().unwrap().join("runs/run_old.jsonl");
+            std::fs::create_dir_all(run_log.parent().unwrap()).unwrap();
+            let jsonl_records = [
+                RecordedEvent {
+                    seq: 0,
+                    occurred_at_ms: 0,
+                    event: HarnessEvent::RunStarted {
+                        run_id: run_id.clone(),
+                        agent_id: AgentId::new("agent_1").unwrap(),
+                    },
+                },
+                RecordedEvent {
+                    seq: 1,
+                    occurred_at_ms: 1,
+                    event: HarnessEvent::RunFailed {
+                        run_id,
+                        reason: "JSONL preferred proof".into(),
+                    },
+                },
+            ];
+            let jsonl = jsonl_records
+                .iter()
+                .map(|record| {
+                    serde_json::to_string(&serde_json::json!({"v": 2, "record": record})).unwrap()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            std::fs::write(&run_log, jsonl).unwrap();
+            let replay = offline::replay_sqlite(&ledger_path, Some("run_old")).unwrap();
+            assert!(replay.contains("JSONL preferred proof"));
+            assert!(!replay.contains("preserved proof"));
 
             let relocated = root.path().join("relocated");
             std::fs::rename(&workspace, &relocated).unwrap();

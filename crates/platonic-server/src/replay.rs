@@ -9,7 +9,16 @@ use std::path::Path;
 pub fn replay_file(path: &Path) -> AppResult<String> {
     let records = ledger::read_records(path)?;
     let readback = RunReadback::from_events(&records)?;
-    Ok(format_readback(&readback))
+    let mut output = format_readback(&readback);
+    let run_id = records
+        .first()
+        .map(|record| record.event.run_id().as_str())
+        .ok_or_else(|| AppError::Config("JSONL ledger contains no core events".into()))?;
+    for envelope in ledger::read_voice_events_from_jsonl(path, run_id)? {
+        output.push_str("\nvoice_event: ");
+        output.push_str(&serde_json::to_string(&envelope)?);
+    }
+    Ok(output)
 }
 
 pub fn replay_sqlite(path: &Path, run_id: Option<&str>) -> AppResult<String> {

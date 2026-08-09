@@ -69,7 +69,7 @@ enabled = ["file.read", "file.list", "file.write", "file.edit", "shell.exec", "w
 ```bash
 plato "list the files here and summarize what this project is"
 plato -c "name the most important file from that summary"
-plato replay        # audit the latest default SQLite session
+plato replay        # audit the latest default workspace session
 ```
 
 On the first local terminal invocation, `plato` asks for a workspace name and
@@ -81,7 +81,8 @@ only on its default local endpoint; `--socket` attachments and `--snapshot` do
 not.
 
 Live assistant text prints to stderr; the final answer prints to stdout. The
-complete run ledger lands in the default platform SQLite store for the workspace.
+complete run event log lands in one JSONL file under the workspace ledger
+directory. SQLite retains the session index and other queryable state.
 `-c` continues the latest workspace session through the same host server.
 
 ## 2. Test the approval boundary
@@ -106,7 +107,7 @@ addresses, revalidates immediately before each pinned connection, and returns
 only bounded UTF-8 text from the approved origin.
 Nothing escapes the workspace: `../`, absolute paths, and symlinks out are refused.
 
-## 3. Durable runs (SQLite)
+## 3. Durable runs
 
 ```bash
 plato "read Cargo.toml and name the package"
@@ -117,7 +118,9 @@ plato replay                # replays the latest session
 
 Explicit replay paths use the equals form: `--db=/tmp/run.db`. Prompts always
 use the server-owned workspace ledger. Replay is read-only and fully offline;
-it shows final assistant messages, not partial live deltas.
+it finds the selected per-run JSONL through the state database and shows final
+assistant messages, not partial live deltas. Runs created before the JSONL
+transition still replay from their SQLite event rows.
 
 ## 4. The full experience: TUI
 
@@ -273,11 +276,12 @@ PLATO_AUDIO_FIXTURE_KEY=local-proof \
 The model engine, native-rate resampling plan, and output stream open before
 timing. Both examples fail closed on artifact checksum, phonemizer, backend,
 device, PCM, worker, callback, sentence-order, gap, overlap, or teardown errors.
-`narrated_run` runs through the host server and reports its server-owned SQLite
-ledger path. Its proof JSON includes the exact revision-one `VoiceEvent`
+`narrated_run` runs through the host server and reports its server-owned
+workspace ledger path. Its proof JSON includes the exact revision-one `VoiceEvent`
 envelopes observed by the client. Offline `plato replay --db=/path/to/run.db
---run RUN_ID` reads the server-owned core ledger without starting or contacting
-the server.
+--run RUN_ID` reads the server-owned per-run log without starting or contacting
+the server. New voice companion streams use that same JSONL file; legacy runs
+remain readable from SQLite.
 
 `VoiceCaptured` stores only the final transcript's SHA-256 and UTF-8 byte
 length, transcript span, native and 16 kHz frame counts, VAD sample boundaries,
