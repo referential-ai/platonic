@@ -676,7 +676,7 @@ routing. Unknown identities are denied before channel lookup, content scanning,
 daemon access, session lookup, Discord response work, or effects. An admitted
 identity in an unmapped channel is ignored at the separate context gate.
 
-With the workspace daemon already running, start the gateway in an environment
+With the host daemon already running, start the gateway in an environment
 that contains the bot token but no provider credentials:
 
 ```bash
@@ -684,6 +684,9 @@ unset OPENAI_API_KEY OPENROUTER_API_KEY
 export DISCORD_BOT_TOKEN="$(cat /path/to/discord-bot-token)"
 platonic gateway discord --config ~/.config/plato/gateway.toml
 ```
+
+With no `--socket`, the gateway attaches to the host endpoint. An explicit
+socket remains a test/operator override during the endpoint migration.
 
 The server-owned gateway completes a bounded daemon `hello`, requires the exact
 workspace ID plus `hello`, `thread.authority`, `thread.status`, `thread.send`,

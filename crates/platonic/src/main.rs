@@ -157,6 +157,7 @@ enum GatewayCommand {
     Discord {
         #[arg(long, value_name = "DIR", default_value = ".")]
         workspace: PathBuf,
+        /// Override the host endpoint for testing or operations.
         #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
         #[arg(long, value_name = "FILE")]

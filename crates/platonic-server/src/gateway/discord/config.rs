@@ -3,14 +3,14 @@ use crate::{
     AppError, AppResult,
     config::{Config, DiscordGatewayConfig, resolve_config, server_discord_principals},
 };
-use platonic_client::client::DaemonConnectionConfig;
+use platonic_client::{client::DaemonConnectionConfig, paths};
 use std::{ffi::OsString, path::PathBuf};
 
 /// Server-owned inputs for one Discord gateway process.
 pub struct DiscordGatewayOptions {
     /// Workspace served by the gateway.
     pub workspace_root: PathBuf,
-    /// Optional explicit server endpoint.
+    /// Optional host endpoint override for testing or operations.
     pub socket_path: Option<PathBuf>,
     /// Optional authorized server configuration path.
     pub config_path: Option<PathBuf>,
@@ -34,7 +34,11 @@ fn resolve_discord_gateway_runtime(
         .ok_or_else(|| AppError::Config("gateway.discord configuration is required".into()))?;
     let principals = server_discord_principals()?;
     let token = gateway_token(&config, &discord, |name| std::env::var_os(name))?;
-    let daemon = DaemonConnectionConfig::resolve(&options.workspace_root, options.socket_path)?;
+    let socket_path = match options.socket_path {
+        Some(socket_path) => socket_path,
+        None => paths::host_socket_path()?,
+    };
+    let daemon = DaemonConnectionConfig::resolve(&options.workspace_root, Some(socket_path))?;
     Ok(DiscordGatewayRuntimeConfig::new(
         token,
         principals,
@@ -86,7 +90,18 @@ fn gateway_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::{
+        daemon::server::HostDaemonServer,
+        gateway::discord::{GatewayError, test_support::spawn_observed_rest},
+    };
+    #[cfg(unix)]
+    use platonic_client::ClientError;
+    #[cfg(unix)]
+    use platonic_protocol::{ERROR_WORKSPACE_UNREGISTERED, ProtocolError};
     use std::collections::HashMap;
+    #[cfg(unix)]
+    use std::{sync::Arc, thread};
 
     fn discord_config() -> DiscordGatewayConfig {
         DiscordGatewayConfig {
@@ -164,6 +179,83 @@ api_key_env = "DISCORD_BOT_TOKEN"
                     if message
                         == "workspace plato.toml cannot set [gateway]; use --config, PLATO_CONFIG, or user config"
             ));
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn default_host_endpoint_rejects_unregistered_workspace_before_discord_access() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("unregistered");
+        let home = root.path().join("home");
+        let explicit = root.path().join("gateway.toml");
+        let home_config = home.join(".config/plato/config.toml");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(home_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &explicit,
+            r#"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+
+[gateway.discord.channel_threads]
+"200" = "thread_news"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &home_config,
+            r#"
+[principals.discord."42"]
+name = "jerome"
+"#,
+        )
+        .unwrap();
+
+        crate::paths::with_test_xdg(root.path(), || {
+            temp_env::with_vars(
+                [
+                    ("HOME", Some(home.as_os_str())),
+                    ("PLATO_CONFIG", None::<&std::ffi::OsStr>),
+                    ("OPENAI_API_KEY", None::<&std::ffi::OsStr>),
+                    ("OPENROUTER_API_KEY", None::<&std::ffi::OsStr>),
+                    (
+                        "DISCORD_BOT_TOKEN",
+                        Some(std::ffi::OsStr::new("discord-secret")),
+                    ),
+                ],
+                || {
+                    let server = Arc::new(HostDaemonServer::bind().unwrap());
+                    let expected_socket = paths::host_socket_path().unwrap();
+                    let legacy_socket = paths::default_socket_path(&workspace).unwrap();
+                    let runner = Arc::clone(&server);
+                    let daemon = thread::spawn(move || runner.serve_next().unwrap());
+                    let rest = spawn_observed_rest(Vec::new());
+                    let mut runtime = resolve_discord_gateway_runtime(DiscordGatewayOptions {
+                        workspace_root: workspace.clone(),
+                        socket_path: None,
+                        config_path: Some(explicit.clone()),
+                    })
+                    .unwrap();
+
+                    assert_eq!(runtime.daemon.socket_path, expected_socket);
+                    assert_ne!(runtime.daemon.socket_path, legacy_socket);
+                    runtime.discord_api_base = rest.base_url.clone();
+
+                    let error = run_runtime(runtime).unwrap_err();
+
+                    daemon.join().unwrap();
+                    assert!(matches!(
+                        error,
+                        GatewayError::Client(ClientError::DaemonResponse(ProtocolError {
+                            code,
+                            ref message,
+                        })) if code == ERROR_WORKSPACE_UNREGISTERED
+                            && message.contains("platonic workspace create")
+                    ));
+                    assert!(rest.finish().is_empty());
+                },
+            );
         });
     }
 
@@ -272,6 +364,10 @@ name = "jerome"
                     platonic_protocol::ThreadApprovalPolicy::Prompt
                 );
                 assert_eq!(runtime.channel_thread_ids[&200], "thread_news");
+                assert_eq!(
+                    runtime.daemon.socket_path,
+                    workspace.path().join("daemon.sock")
+                );
             },
         );
     }
