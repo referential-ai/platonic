@@ -476,9 +476,15 @@ fn inspect_lock(lock_path: &Path) -> AppResult<LiveObservation> {
 
     let mut client = DaemonClient::connect_expected_server(&socket_path, metadata.pid)?;
     let hello = client.hello(&workspace_root)?;
-    if hello.workspace_id != metadata.workspace_id {
+    let minted_workspace_id = hello
+        .workspace_id
+        .strip_prefix("ws-")
+        .is_some_and(|suffix| {
+            suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    if hello.workspace_id != metadata.workspace_id && !minted_workspace_id {
         return Err(control_error(format!(
-            "daemon hello workspace mismatch: expected {}, got {}",
+            "daemon hello workspace mismatch: expected {} or a server-minted id, got {}",
             metadata.workspace_id, hello.workspace_id
         )));
     }

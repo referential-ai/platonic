@@ -32,16 +32,9 @@ pub fn host_lock_path() -> ClientResult<PathBuf> {
         .join("agent.lock"))
 }
 
-/// Returns the default server-owned SQLite ledger path for a workspace.
-///
-/// This path calculation is intentionally available to clients so offline
-/// replay can inspect a ledger without linking or starting the server.
-pub fn default_ledger_path(workspace_root: &Path) -> ClientResult<PathBuf> {
-    Ok(state_home()?
-        .join("platonic")
-        .join("workspaces")
-        .join(workspace_id(workspace_root)?)
-        .join("agent.db"))
+/// Returns the server-wide registry path for offline workspace resolution.
+pub fn server_db_path() -> ClientResult<PathBuf> {
+    Ok(state_home()?.join("platonic").join("server.db"))
 }
 
 /// Returns the default local daemon endpoint for a workspace.
@@ -199,6 +192,22 @@ mod tests {
         assert_eq!(id, "platonic-workspace-d9c8fc148a872529");
         #[cfg(windows)]
         assert_eq!(id, "platonic-workspace-bd545284429294c3");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_database_path_uses_the_server_state_root() {
+        let state_home = tempfile::tempdir().unwrap();
+        temp_env::with_var(
+            "XDG_STATE_HOME",
+            Some(state_home.path().as_os_str()),
+            || {
+                assert_eq!(
+                    server_db_path().unwrap(),
+                    state_home.path().join("platonic/server.db")
+                );
+            },
+        );
     }
 
     #[cfg(unix)]

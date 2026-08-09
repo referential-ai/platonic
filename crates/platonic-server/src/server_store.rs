@@ -14,6 +14,7 @@ use crate::thread_authority::legacy_status_authority;
 use crate::{
     AppError, AppResult,
     ledger::{row_u64, sqlite_i64},
+    paths,
     thread_authority::{
         ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, ThreadStopRecord,
         authority_working_directory, validate_child_authority, validate_complete_authority,
@@ -24,7 +25,10 @@ use platonic_protocol::{
     ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadGrantedPath, ThreadWorktree,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -109,6 +113,7 @@ impl DurableThreadAuthority {
 
 pub(crate) struct ServerStore {
     connection: Connection,
+    path: PathBuf,
 }
 
 impl ServerStore {
@@ -133,7 +138,10 @@ impl ServerStore {
         create_workspace_table(&connection)?;
         create_agent_table(&connection)?;
         create_tool_call_approval_table(&connection)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            path: path.to_path_buf(),
+        })
     }
 
     /// Open the store without the ability to write, and without creating it.
@@ -145,7 +153,10 @@ impl ServerStore {
         let connection =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            path: path.to_path_buf(),
+        })
     }
 
     /// Register a workspace while atomically excluding duplicate names and roots.
@@ -171,6 +182,7 @@ impl ServerStore {
                 )));
             }
         }
+        let store_path = self.path.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -208,7 +220,13 @@ impl ServerStore {
             ledger_path: ledger_path.to_owned(),
             created_at_ms: now_ms,
         };
-        transaction.execute(
+        let created_at_ms = sqlite_i64(now_ms, "workspace created_at_ms")?;
+        let adopted = paths::adopt_legacy_sqlite(
+            &store_path,
+            Path::new(&record.root),
+            Path::new(&record.ledger_path),
+        )?;
+        if let Err(error) = transaction.execute(
             "INSERT INTO workspaces (id, name, root, ledger_path, created_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -216,10 +234,17 @@ impl ServerStore {
                 record.name,
                 record.root,
                 record.ledger_path,
-                sqlite_i64(now_ms, "workspace created_at_ms")?
+                created_at_ms
             ],
-        )?;
-        transaction.commit()?;
+        ) {
+            drop(transaction);
+            restore_adopted_ledger(&store_path, &record, adopted, &error)?;
+            return Err(error.into());
+        }
+        if let Err(error) = transaction.commit() {
+            restore_adopted_ledger(&store_path, &record, adopted, &error)?;
+            return Err(error.into());
+        }
         Ok((record, true))
     }
 
@@ -228,9 +253,10 @@ impl ServerStore {
     /// Moving a workspace is a registry update, never a new workspace (P021).
     #[allow(dead_code)]
     pub(crate) fn relocate_workspace(&self, id: &str, root: &str) -> AppResult<bool> {
+        let root = Path::new(root).canonicalize()?;
         let changed = self.connection.execute(
             "UPDATE workspaces SET root = ?2 WHERE id = ?1",
-            params![id, root],
+            params![id, root.to_string_lossy()],
         )?;
         Ok(changed == 1)
     }
@@ -643,6 +669,27 @@ impl ServerStore {
     pub(crate) fn thread_stop(&self, thread_id: &str) -> AppResult<Option<ThreadStopRecord>> {
         thread_stop_from(&self.connection, thread_id)
     }
+}
+
+fn restore_adopted_ledger(
+    store_path: &Path,
+    record: &WorkspaceRecord,
+    adopted: bool,
+    registration_error: &rusqlite::Error,
+) -> AppResult<()> {
+    if !adopted {
+        return Ok(());
+    }
+    paths::restore_legacy_sqlite(
+        store_path,
+        Path::new(&record.root),
+        Path::new(&record.ledger_path),
+    )
+    .map_err(|rollback_error| {
+        AppError::Config(format!(
+            "workspace registration failed ({registration_error}) and ledger adoption rollback failed ({rollback_error})"
+        ))
+    })
 }
 
 fn thread_authority_from(
@@ -1684,9 +1731,16 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 let mut store = ServerStore::open_or_create(&server_db).unwrap();
+                let ledger_path = paths::workspace_sqlite_path(&server_db, &id).unwrap();
                 barrier.wait();
                 store
-                    .register_workspace(&id, &name, &root, &format!("{name}.db"), created_at_ms)
+                    .register_workspace(
+                        &id,
+                        &name,
+                        &root,
+                        &ledger_path.to_string_lossy(),
+                        created_at_ms,
+                    )
                     .unwrap()
             })
         });
@@ -1752,6 +1806,57 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn concurrent_workspace_registration_adopts_legacy_ledger_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_root = dir.path().join("workspace");
+        fs::create_dir(&workspace_root).unwrap();
+        let workspace_root = workspace_root
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let server_db = dir.path().join("state/platonic/server.db");
+        let legacy = paths::legacy_sqlite_path_at(&server_db, Path::new(&workspace_root)).unwrap();
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"legacy history").unwrap();
+
+        let registrations = run_workspace_registration_race(
+            server_db.clone(),
+            [
+                (
+                    "ws-alpha".into(),
+                    "alpha".into(),
+                    workspace_root.clone(),
+                    10,
+                ),
+                ("ws-beta".into(), "beta".into(), workspace_root, 20),
+            ],
+        );
+
+        assert_eq!(
+            registrations
+                .iter()
+                .filter(|(_, inserted)| *inserted)
+                .count(),
+            1
+        );
+        assert_eq!(registrations[0].0, registrations[1].0);
+        let record = &registrations[0].0;
+        assert_eq!(fs::read(&record.ledger_path).unwrap(), b"legacy history");
+        assert!(!legacy.exists());
+        let losing_id = if record.id == "ws-alpha" {
+            "ws-beta"
+        } else {
+            "ws-alpha"
+        };
+        assert!(
+            !paths::workspace_sqlite_path(&server_db, losing_id)
+                .unwrap()
+                .exists()
         );
     }
 

@@ -137,7 +137,7 @@ impl DaemonServer {
     }
 
     fn bind_inner(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<Self> {
-        let paths = DaemonPaths::resolve(workspace_root, socket_path)?;
+        let paths = DaemonPaths::provisional(workspace_root, socket_path)?;
         #[cfg(unix)]
         let reclaim_default_socket =
             paths.socket_path == crate::paths::default_socket_path(&paths.workspace_root)?;
@@ -147,7 +147,10 @@ impl DaemonServer {
         #[cfg(unix)]
         prepare_socket_parent(&paths::runtime_home_and_fallback().0, &paths.socket_path)?;
         let lock = WorkspaceLock::acquire_for_workspace(&paths.workspace_root, &paths.socket_path)?;
-        crate::ledger::interrupt_orphaned_default_sqlite_runs(&paths.default_ledger())?;
+        let paths = paths.resolve_workspace_record()?;
+        if paths.is_registered() {
+            crate::ledger::interrupt_orphaned_default_sqlite_runs(&paths.default_ledger())?;
+        }
         let endpoint = BoundEndpoint::bind(paths.socket_path.clone(), reclaim_default_socket)?;
         let runtime = DaemonRuntime::new(paths);
         Ok(Self {
@@ -181,7 +184,7 @@ impl DaemonServer {
 
     #[cfg(all(test, unix))]
     fn handle_line(&self, line: &str) -> crate::daemon::protocol::Envelope {
-        handle_line(&self.runtime, line)
+        handle_registered_line(&self.runtime, line)
     }
 }
 
@@ -236,18 +239,30 @@ impl HostRuntime {
                     format!("workspace_root cannot be resolved: {error}"),
                 )
             })?;
-        let workspace_id = crate::paths::workspace_id(&workspace_root).map_err(|error| {
+        let paths = DaemonPaths::resolve(&workspace_root, Some(self.socket_path.clone()))
+            .map_err(|error| (ERROR_INTERNAL, error.to_string()))?;
+        if !paths.is_registered() {
+            return Err((
+                ERROR_WORKSPACE_UNREGISTERED,
+                format!(
+                    "workspace is not registered: {}; run platonic workspace create <name> \"{}\"",
+                    workspace_root.display(),
+                    workspace_root.display()
+                ),
+            ));
+        }
+        let legacy_workspace_id = crate::paths::workspace_id(&workspace_root).map_err(|error| {
             (
                 ERROR_WORKSPACE_MISMATCH,
                 format!("workspace_id cannot be derived: {error}"),
             )
         })?;
-        if params.workspace_id != workspace_id {
+        if params.workspace_id != paths.workspace_id && params.workspace_id != legacy_workspace_id {
             return Err((
                 ERROR_WORKSPACE_MISMATCH,
                 format!(
-                    "workspace_id mismatch: expected {workspace_id}, got {}",
-                    params.workspace_id
+                    "workspace_id mismatch: expected {}, got {}",
+                    paths.workspace_id, params.workspace_id
                 ),
             ));
         }
@@ -260,26 +275,6 @@ impl HostRuntime {
             return Ok(workspace.runtime.clone());
         }
 
-        let paths = DaemonPaths::resolve(&workspace_root, Some(self.socket_path.clone()))
-            .map_err(|error| (ERROR_INTERNAL, error.to_string()))?;
-        let store = paths
-            .server_store()
-            .map_err(|error| (ERROR_INTERNAL, error.to_string()))?;
-        if store
-            .workspace_by_root(&workspace_root.to_string_lossy())
-            .map_err(|error| (ERROR_INTERNAL, error.to_string()))?
-            .is_none()
-        {
-            return Err((
-                ERROR_WORKSPACE_UNREGISTERED,
-                format!(
-                    "workspace is not registered: {}; run platonic workspace create <name> \"{}\"",
-                    workspace_root.display(),
-                    workspace_root.display()
-                ),
-            ));
-        }
-        drop(store);
         prepare_workspace_lock_parent(&paths)
             .map_err(|error| (ERROR_INTERNAL, error.to_string()))?;
         let workspace_lock =
@@ -648,12 +643,43 @@ fn handle_stream(runtime: DaemonRuntime, stream: transport::Stream) -> AppResult
         stream,
         stop_requested,
         socket_path,
-        move |line| handle_line(&runtime, line),
+        move |line| handle_registered_line(&runtime, line),
         move || {
             #[cfg(all(test, unix))]
             shutdown_runtime.wait_after_shutdown_flush();
         },
     )
+}
+
+fn handle_registered_line(runtime: &DaemonRuntime, line: &str) -> Envelope {
+    match runtime_with_registered_paths(runtime) {
+        Ok(runtime) => handle_line(&runtime, line),
+        Err(error) => match decode_request(line) {
+            Ok(request) => Envelope::error(
+                request.id,
+                request.method,
+                ERROR_INTERNAL,
+                error.to_string(),
+            ),
+            Err(error) => *error,
+        },
+    }
+}
+
+fn runtime_with_registered_paths(runtime: &DaemonRuntime) -> AppResult<DaemonRuntime> {
+    let store = runtime.paths.server_store()?;
+    let Some(record) = store.workspace_by_root(&runtime.paths.workspace_root.to_string_lossy())?
+    else {
+        return Ok(runtime.clone());
+    };
+    if runtime.paths.workspace_id == record.id
+        && runtime.paths.ledger_path == PathBuf::from(&record.ledger_path)
+    {
+        return Ok(runtime.clone());
+    }
+    let mut registered = runtime.clone();
+    registered.paths = runtime.paths.with_workspace_record(&record);
+    Ok(registered)
 }
 
 fn handle_host_stream(runtime: HostRuntime, stream: transport::Stream) -> AppResult<()> {
@@ -1095,7 +1121,16 @@ mod tests {
         }
     }
 
-    fn register_legacy_workspace(server: &DaemonServer) {
+    fn bind_test(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<DaemonServer> {
+        let mut server = DaemonServer::bind(workspace_root, socket_path)?;
+        register_legacy_workspace(&mut server);
+        Ok(server)
+    }
+
+    fn register_legacy_workspace(server: &mut DaemonServer) -> DaemonPaths {
+        if server.runtime.paths.is_registered() {
+            return server.runtime.paths.clone();
+        }
         let response = server.handle_line(
             &json!({
                 "v": 1,
@@ -1110,6 +1145,11 @@ mod tests {
             .to_string(),
         );
         assert_eq!(response.kind, EnvelopeKind::Response);
+        let paths = runtime_with_registered_paths(&server.runtime)
+            .unwrap()
+            .paths;
+        server.runtime.paths = paths.clone();
+        paths
     }
 
     #[test]
@@ -1119,7 +1159,7 @@ mod tests {
         let parent = socket_root.path().join("private").join("nested");
         let socket_path = parent.join("agent.sock");
 
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path.clone())).unwrap();
 
         assert_eq!(mode(&parent), PRIVATE_DIRECTORY_MODE);
         assert_eq!(mode(&socket_path), SOCKET_MODE);
@@ -1147,7 +1187,7 @@ mod tests {
         fs::set_permissions(&parent, Permissions::from_mode(0o755)).unwrap();
         let socket_path = parent.join("agent.sock");
 
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path.clone())).unwrap();
 
         assert_eq!(mode(&parent), PRIVATE_DIRECTORY_MODE);
         assert_eq!(mode(&socket_path), SOCKET_MODE);
@@ -1239,9 +1279,8 @@ mod tests {
             fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
             fs::write(&socket_path, b"rightful owner").unwrap();
 
-            let error =
-                DaemonServer::bind(workspace.path(), custom_socket.then(|| socket_path.clone()))
-                    .unwrap_err();
+            let error = bind_test(workspace.path(), custom_socket.then(|| socket_path.clone()))
+                .unwrap_err();
 
             assert_addr_in_use(error);
             assert_eq!(fs::read(&socket_path).unwrap(), b"rightful owner");
@@ -1264,9 +1303,8 @@ mod tests {
             fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
             symlink(&target, &socket_path).unwrap();
 
-            let error =
-                DaemonServer::bind(workspace.path(), custom_socket.then(|| socket_path.clone()))
-                    .unwrap_err();
+            let error = bind_test(workspace.path(), custom_socket.then(|| socket_path.clone()))
+                .unwrap_err();
 
             assert_addr_in_use(error);
             assert_eq!(fs::read_link(&socket_path).unwrap(), target);
@@ -1283,7 +1321,7 @@ mod tests {
         let stale_identity = socket_identity(&socket_path);
         drop(stale_listener);
 
-        let error = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap_err();
+        let error = bind_test(workspace.path(), Some(socket_path.clone())).unwrap_err();
 
         assert_addr_in_use(error);
         assert_eq!(socket_identity(&socket_path), stale_identity);
@@ -1295,18 +1333,16 @@ mod tests {
         let second_workspace = tempfile::tempdir().unwrap();
         let socket_root = tempfile::tempdir().unwrap();
         let socket_path = socket_root.path().join("agent.sock");
-        let first_server =
-            DaemonServer::bind(first_workspace.path(), Some(socket_path.clone())).unwrap();
-        register_legacy_workspace(&first_server);
+        let first_server = bind_test(first_workspace.path(), Some(socket_path.clone())).unwrap();
+        let first_paths = first_server.paths().clone();
         let first_identity = socket_identity(&socket_path);
 
-        let error =
-            DaemonServer::bind(second_workspace.path(), Some(socket_path.clone())).unwrap_err();
+        let error = bind_test(second_workspace.path(), Some(socket_path.clone())).unwrap_err();
 
         assert_addr_in_use(error);
         assert_eq!(socket_identity(&socket_path), first_identity);
 
-        let first_workspace_id = first_server.paths().workspace_id.clone();
+        let first_workspace_id = first_paths.workspace_id;
         let handle = thread::spawn(move || first_server.serve_next().unwrap());
         let mut client = DaemonClient::connect(&socket_path).unwrap();
         let hello = client.hello(first_workspace.path()).unwrap();
@@ -1338,13 +1374,11 @@ mod tests {
         let stale_listener = UnixListener::bind(&socket_path).unwrap();
         drop(stale_listener);
 
-        let server = DaemonServer::bind(
+        let server = bind_test(
             workspace.path(),
             explicit_default.then(|| socket_path.clone()),
         )
         .unwrap();
-        register_legacy_workspace(&server);
-
         assert_eq!(server.paths().socket_path, socket_path);
         assert_eq!(mode(&socket_path), SOCKET_MODE);
         let handle = thread::spawn(move || server.serve_next().unwrap());
@@ -1363,7 +1397,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let socket_root = tempfile::tempdir().unwrap();
         let socket_path = socket_root.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path.clone())).unwrap();
         let bound_identity = socket_identity(&socket_path);
         fs::remove_file(&socket_path).unwrap();
         let replacement = UnixListener::bind(&socket_path).unwrap();
@@ -1383,7 +1417,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let socket_root = tempfile::tempdir().unwrap();
         let socket_path = socket_root.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path.clone())).unwrap();
         assert_eq!(
             (server.endpoint.socket_device, server.endpoint.socket_inode),
             socket_identity(&socket_path)
@@ -1423,7 +1457,7 @@ mod tests {
         drop(unregistered);
 
         let mut control = DaemonClient::connect(&socket_path).unwrap();
-        control
+        let created = control
             .workspace_create("legacy".into(), workspace.path().to_path_buf())
             .unwrap();
         drop(control);
@@ -1449,7 +1483,8 @@ mod tests {
         assert_eq!(response.method.as_deref(), Some("hello"));
         let result = response_value(&response);
         assert_eq!(result["daemon_version"], platonic_protocol::BUILD_IDENTITY);
-        assert_eq!(result["workspace_id"], paths.workspace_id);
+        assert_eq!(result["workspace_id"], created.workspace.id);
+        assert_eq!(result["ledger_path"], created.workspace.ledger_path);
         assert!(result.get("daemon_scope").is_none());
         assert_eq!(
             result["capabilities"],
@@ -1492,7 +1527,7 @@ mod tests {
         paths::with_test_xdg(root.path(), || {
             let server = Arc::new(HostDaemonServer::bind().unwrap());
             let socket_path = server.socket_path().to_path_buf();
-            let workspace_id = paths::workspace_id(&workspace).unwrap();
+            let legacy_workspace_id = paths::workspace_id(&workspace).unwrap();
             assert_eq!(socket_path, paths::host_socket_path().unwrap());
             assert_ne!(socket_path, paths::default_socket_path(&workspace).unwrap());
 
@@ -1526,7 +1561,7 @@ mod tests {
                 attached,
                 r#"{{"v":1,"id":"host_hello","kind":"request","method":"hello","params":{{"workspace_root":"{}","workspace_id":"{}"}}}}"#,
                 workspace.display(),
-                workspace_id
+                legacy_workspace_id
             )
             .unwrap();
             attached.shutdown(std::net::Shutdown::Write).unwrap();
@@ -1539,10 +1574,85 @@ mod tests {
             assert_eq!(response.kind, EnvelopeKind::Response);
             assert_eq!(result["daemon_scope"], "host");
             assert_eq!(result["daemon_version"], platonic_protocol::BUILD_IDENTITY);
-            assert_eq!(result["workspace_id"], workspace_id);
+            assert_eq!(result["workspace_id"], created.workspace.id);
             assert_eq!(
                 Path::new(result["ledger_path"].as_str().unwrap()),
-                paths::default_sqlite_path(&workspace).unwrap()
+                Path::new(&created.workspace.ledger_path)
+            );
+        });
+    }
+
+    #[test]
+    fn host_adopts_legacy_history_and_relocation_preserves_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        paths::with_test_xdg(root.path(), || {
+            let legacy_ledger = paths::legacy_sqlite_path(&workspace).unwrap();
+            fs::create_dir_all(legacy_ledger.parent().unwrap()).unwrap();
+            seed_finished_session(
+                &legacy_ledger,
+                "run_legacy",
+                "session_legacy",
+                "preserved answer",
+            );
+            let server = Arc::new(HostDaemonServer::bind().unwrap());
+            let socket_path = server.socket_path().to_path_buf();
+            let runner = Arc::clone(&server);
+            let handle = thread::spawn(move || {
+                for _ in 0..3 {
+                    runner.serve_next().unwrap();
+                }
+            });
+
+            let mut control = DaemonClient::connect(&socket_path).unwrap();
+            let created = control
+                .workspace_create("adopted".into(), workspace.clone())
+                .unwrap()
+                .workspace;
+            drop(control);
+            let ledger_path = PathBuf::from(&created.ledger_path);
+            assert_eq!(
+                ledger_path,
+                paths::default_sqlite_path(&created.id).unwrap()
+            );
+            assert_eq!(ledger_path.file_name().unwrap(), "ledger.db");
+            assert!(ledger_path.is_file());
+            assert!(!legacy_ledger.exists());
+
+            let mut first = DaemonClient::connect(&socket_path).unwrap();
+            let first_hello = first.hello(&workspace).unwrap();
+            drop(first);
+            assert_eq!(first_hello.workspace_id, created.id);
+            assert_eq!(Path::new(&first_hello.ledger_path), ledger_path);
+            assert!(
+                crate::replay::replay_sqlite(&ledger_path, Some("run_legacy"))
+                    .unwrap()
+                    .contains("preserved answer")
+            );
+
+            let relocated = root.path().join("relocated");
+            fs::rename(&workspace, &relocated).unwrap();
+            let store =
+                crate::server_store::ServerStore::open_or_create(&paths::server_db_path().unwrap())
+                    .unwrap();
+            assert!(
+                store
+                    .relocate_workspace(&created.id, &relocated.to_string_lossy())
+                    .unwrap()
+            );
+            drop(store);
+
+            let mut moved = DaemonClient::connect(&socket_path).unwrap();
+            let moved_hello = moved.hello(&relocated).unwrap();
+            drop(moved);
+            handle.join().unwrap();
+            assert_eq!(moved_hello.workspace_id, created.id);
+            assert_eq!(Path::new(&moved_hello.ledger_path), ledger_path);
+            assert!(
+                crate::replay::replay_sqlite(&ledger_path, Some("run_legacy"))
+                    .unwrap()
+                    .contains("preserved answer")
             );
         });
     }
@@ -1569,7 +1679,7 @@ base_url = "https://example.invalid/v1"
                 ),
             )
             .unwrap();
-            let server = DaemonServer::bind(
+            let server = bind_test(
                 workspace.path(),
                 Some(socket_dir.path().join("status.sock")),
             )
@@ -1663,7 +1773,7 @@ base_url = "https://example.invalid/v1"
     fn shutdown_if_idle_keeps_the_exact_wire_contract() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
-        let server = DaemonServer::bind(
+        let server = bind_test(
             workspace.path(),
             Some(socket_dir.path().join("omitted.sock")),
         )
@@ -1700,16 +1810,14 @@ base_url = "https://example.invalid/v1"
         }
         assert!(server.runtime.state.lock().unwrap().runs.is_empty());
 
-        let empty_server =
-            DaemonServer::bind(workspace.path(), Some(socket_dir.path().join("empty.sock")));
+        let empty_server = bind_test(workspace.path(), Some(socket_dir.path().join("empty.sock")));
         assert!(
             empty_server.is_err(),
             "the first server still owns the lock"
         );
         drop(server);
         let empty_server =
-            DaemonServer::bind(workspace.path(), Some(socket_dir.path().join("empty.sock")))
-                .unwrap();
+            bind_test(workspace.path(), Some(socket_dir.path().join("empty.sock"))).unwrap();
         let invalid = empty_server.handle_line(
             r#"{"v":1,"id":"invalid","kind":"request","method":"daemon.shutdown_if_idle","params":{"force":true}}"#,
         );
@@ -1733,7 +1841,7 @@ base_url = "https://example.invalid/v1"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path.clone())).unwrap();
         let lock_path = server.paths().lock_path.clone();
         let barrier = Arc::new(Barrier::new(2));
         server.runtime.set_shutdown_flush_barrier(barrier.clone());
@@ -1791,10 +1899,9 @@ base_url = "https://example.invalid/v1"
         let socket_dir = tempfile::tempdir().unwrap();
         let first_socket = socket_dir.path().join("first.sock");
         let second_socket = socket_dir.path().join("second.sock");
-        let first_server =
-            DaemonServer::bind(first_workspace.path(), Some(first_socket.clone())).unwrap();
+        let first_server = bind_test(first_workspace.path(), Some(first_socket.clone())).unwrap();
         let second_server =
-            DaemonServer::bind(second_workspace.path(), Some(second_socket.clone())).unwrap();
+            bind_test(second_workspace.path(), Some(second_socket.clone())).unwrap();
         let first_lock = first_server.paths().lock_path.clone();
         let second_lock = second_server.paths().lock_path.clone();
         let first_handle = thread::spawn(move || {
@@ -1834,8 +1941,7 @@ base_url = "https://example.invalid/v1"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
-        register_legacy_workspace(&server);
+        let server = bind_test(workspace.path(), Some(socket_path.clone())).unwrap();
         let paths = server.paths().clone();
         let runtime = server.runtime.clone();
         let record = Arc::new(RunRecord::new(
@@ -1903,7 +2009,7 @@ base_url = "https://example.invalid/v1"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path.clone())).unwrap();
 
         let handle = thread::spawn(move || server.serve_next().unwrap());
 
@@ -1942,7 +2048,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 "#,
         )
         .unwrap();
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
 
         let response = server.handle_line(&format!(
             r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"hello","config_path":"{}","wait":true}}}}"#,
@@ -1966,7 +2072,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let socket_path = socket_dir.path().join("agent.sock");
         let config_path = workspace.path().join("plato.toml");
         write_provider_config(&config_path, &provider.base_url, "file.read");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
 
         let response = server.handle_line(&format!(
             r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"hello","config_path":"{}","wait":true}}}}"#,
@@ -2023,7 +2129,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let socket_path = socket_dir.path().join("agent.sock");
         let config_path = workspace.path().join("plato.toml");
         write_provider_config(&config_path, &provider.base_url, "file.write");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path.clone())).unwrap();
         let handle = thread::spawn(move || server.serve_next().unwrap());
         let mut stream = UnixStream::connect(&socket_path).unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -2120,7 +2226,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let socket_path = socket_dir.path().join("agent.sock");
         let config_path = workspace.path().join("plato.toml");
         write_provider_config(&config_path, &provider.base_url, SHELL_EXEC);
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path.clone())).unwrap();
 
         let first = start_test_run(&server, &config_path, "allow once");
         let session_id = first.session_id.clone();
@@ -2204,7 +2310,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert!(replay.contains("approval_granted call_1 by session_grant"));
 
         drop(server);
-        let restarted = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let restarted = bind_test(workspace.path(), Some(socket_path)).unwrap();
         let after_restart = append_test_run(
             &restarted,
             &config_path,
@@ -2251,7 +2357,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let socket_path = socket_dir.path().join("agent.sock");
         let config_path = workspace.path().join("plato.toml");
         write_provider_config(&config_path, &provider.base_url, "file.write");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
 
         let response = server.handle_line(&format!(
             r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"write a file","config_path":"{}"}}}}"#,
@@ -2314,7 +2420,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let socket_path = socket_dir.path().join("agent.sock");
         let config_path = workspace.path().join("plato.toml");
         write_provider_config(&config_path, &provider.base_url, "file.write");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
         let runtime = server.runtime.clone();
         let request = format!(
             r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"write a file","config_path":"{}","wait":true}}}}"#,
@@ -2364,7 +2470,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let socket_path = socket_dir.path().join("agent.sock");
         let config_path = workspace.path().join("plato.toml");
         write_provider_config(&config_path, &provider.base_url, "file.read");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
 
         let started = server.handle_line(&format!(
             r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"wait for an answer","config_path":"{}"}}}}"#,
@@ -2471,7 +2577,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let socket_path = socket_dir.path().join("agent.sock");
         let config_path = workspace.path().join("plato.toml");
         write_provider_config(&config_path, &provider.base_url, "file.read");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
 
         let first = server.handle_line(&format!(
             r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"question one","config_path":"{}"}}}}"#,
@@ -2536,7 +2642,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let socket_path = socket_dir.path().join("agent.sock");
         let config_path = workspace.path().join("plato.toml");
         write_provider_config(&config_path, &provider.base_url, "file.write");
-        let server = Arc::new(DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap());
+        let server = Arc::new(bind_test(workspace.path(), Some(socket_path)).unwrap());
         seed_finished_session(
             &server.paths().ledger_path,
             "seed_run",
@@ -2616,7 +2722,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
 
         let response = server.handle_line(
             r#"{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{}}"#,
@@ -2634,7 +2740,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let socket_path = socket_dir.path().join("agent.sock");
         let config_path = workspace.path().join("test-plato.toml");
         std::fs::write(&config_path, "").unwrap();
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
         let request = serde_json::to_string(&json!({
             "v": 1,
             "id": "issue_prep_1",
@@ -2668,7 +2774,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
         let record = Arc::new(RunRecord::new(
             "run_1".into(),
             "session_1".into(),
@@ -2699,7 +2805,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
         let record = Arc::new(RunRecord::new(
             "run_1".into(),
             "session_1".into(),
@@ -2735,7 +2841,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
         let record = Arc::new(RunRecord::new(
             "run_1".into(),
             "session_1".into(),
@@ -2769,7 +2875,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path.clone())).unwrap();
         seed_finished_session(&server.paths().ledger_path, "run_1", "session_1", "done");
         let record = Arc::new(RunRecord::new(
             "run_1".into(),
@@ -2813,8 +2919,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let server =
-            DaemonServer::bind(workspace.path(), Some(socket_dir.path().join("agent.sock")))
-                .unwrap();
+            bind_test(workspace.path(), Some(socket_dir.path().join("agent.sock"))).unwrap();
         seed_finished_session(
             &server.paths().ledger_path,
             "run_0",
@@ -2875,7 +2980,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let socket_path = socket_dir.path().join("agent.sock");
         let config_path = workspace.path().join("plato.toml");
         write_provider_config(&config_path, &provider.base_url, "file.write");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path.clone())).unwrap();
         let runtime = server.runtime.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
         let server_shutdown = Arc::clone(&shutdown);
@@ -2983,7 +3088,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let first_socket = socket_dir.path().join("agent-1.sock");
-        let first_server = DaemonServer::bind(workspace.path(), Some(first_socket)).unwrap();
+        let first_server = bind_test(workspace.path(), Some(first_socket)).unwrap();
         seed_finished_session(
             &first_server.paths().ledger_path,
             "run_1",
@@ -2993,8 +3098,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         drop(first_server);
 
         let second_socket = socket_dir.path().join("agent-2.sock");
-        let second_server =
-            DaemonServer::bind(workspace.path(), Some(second_socket.clone())).unwrap();
+        let second_server = bind_test(workspace.path(), Some(second_socket.clone())).unwrap();
         let handle = thread::spawn(move || second_server.serve_next().unwrap());
         let mut client = DaemonClient::connect(&second_socket).unwrap();
 
@@ -3016,8 +3120,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let server =
-            DaemonServer::bind(workspace.path(), Some(socket_dir.path().join("agent.sock")))
-                .unwrap();
+            bind_test(workspace.path(), Some(socket_dir.path().join("agent.sock"))).unwrap();
         seed_finished_session_run(
             &server.paths().ledger_path,
             "run_1",
@@ -3114,10 +3217,8 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
     fn transcript_read_distinguishes_missing_from_internal_failures() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
-        let mut server =
-            DaemonServer::bind(workspace.path(), Some(socket_dir.path().join("agent.sock")))
-                .unwrap();
-        server.runtime.paths.ledger_path = workspace.path().join("agent.db");
+        let server =
+            bind_test(workspace.path(), Some(socket_dir.path().join("agent.sock"))).unwrap();
 
         let missing = server.handle_line(
             r#"{"v":1,"id":"transcript_1","kind":"request","method":"transcript.read","params":{"run_id":"run_missing"}}"#,
@@ -3125,6 +3226,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(missing.kind, EnvelopeKind::Error);
         assert_eq!(missing.error.unwrap().code, ERROR_NOT_FOUND);
 
+        std::fs::create_dir_all(server.paths().ledger_path.parent().unwrap()).unwrap();
         std::fs::write(&server.paths().ledger_path, b"not a sqlite database").unwrap();
         let corrupt = server.handle_line(
             r#"{"v":1,"id":"transcript_2","kind":"request","method":"transcript.read","params":{"run_id":"run_missing"}}"#,
@@ -3138,7 +3240,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
         let record = Arc::new(RunRecord::new(
             "run_1".into(),
             "session_1".into(),
@@ -3234,7 +3336,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let server = Arc::new(DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap());
+        let server = Arc::new(bind_test(workspace.path(), Some(socket_path)).unwrap());
         let record = Arc::new(RunRecord::new(
             "run_1".into(),
             "session_1".into(),
@@ -3282,7 +3384,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
         let record = Arc::new(RunRecord::new(
             "run_1".into(),
             "session_1".into(),
@@ -3326,7 +3428,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let first_socket = socket_dir.path().join("agent-1.sock");
-        let first_server = DaemonServer::bind(workspace.path(), Some(first_socket)).unwrap();
+        let first_server = bind_test(workspace.path(), Some(first_socket)).unwrap();
         let ledger_path = first_server.paths().ledger_path.clone();
         seed_finished_session_run(
             &ledger_path,
@@ -3347,7 +3449,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         drop(first_server);
 
         let second_socket = socket_dir.path().join("agent-2.sock");
-        let second_server = DaemonServer::bind(workspace.path(), Some(second_socket)).unwrap();
+        let second_server = bind_test(workspace.path(), Some(second_socket)).unwrap();
         let response = second_server
             .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
         let result = response_value(&response);
@@ -3369,7 +3471,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
         let ledger_path = server.paths().ledger_path.clone();
         assert!(!ledger_path.exists());
 
@@ -3387,7 +3489,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
         let ledger_path = &server.paths().ledger_path;
         std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
         std::fs::write(ledger_path, "not a sqlite database").unwrap();
@@ -3406,13 +3508,13 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let first_socket = socket_dir.path().join("agent-1.sock");
-        let first_server = DaemonServer::bind(workspace.path(), Some(first_socket)).unwrap();
+        let first_server = bind_test(workspace.path(), Some(first_socket)).unwrap();
         let ledger_path = first_server.paths().ledger_path.clone();
         seed_running_session(&ledger_path, "run_1", "session_1", "first question");
         drop(first_server);
 
         let second_socket = socket_dir.path().join("agent-2.sock");
-        let second_server = DaemonServer::bind(workspace.path(), Some(second_socket)).unwrap();
+        let second_server = bind_test(workspace.path(), Some(second_socket)).unwrap();
         let response = second_server
             .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
         let result = response_value(&response);
@@ -3428,13 +3530,13 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let first_socket = socket_dir.path().join("agent-1.sock");
-        let first_server = DaemonServer::bind(workspace.path(), Some(first_socket)).unwrap();
+        let first_server = bind_test(workspace.path(), Some(first_socket)).unwrap();
         let ledger_path = first_server.paths().ledger_path.clone();
         seed_running_session(&ledger_path, "run_1", "session_1", "first question");
         drop(first_server);
 
         let second_socket = socket_dir.path().join("agent-2.sock");
-        let _second_server = DaemonServer::bind(workspace.path(), Some(second_socket)).unwrap();
+        let _second_server = bind_test(workspace.path(), Some(second_socket)).unwrap();
         let mut ledger = SqliteLedger::open_or_create(&ledger_path).unwrap();
 
         assert_eq!(
@@ -3456,7 +3558,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
         let long_question = format!("{}\nsecond line", "x".repeat(130));
         seed_finished_session_run(
             &server.paths().ledger_path,
@@ -3484,7 +3586,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
         let record = Arc::new(RunRecord::new(
             "run_1".into(),
             "session_1".into(),
@@ -3516,7 +3618,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let socket_path = socket_dir.path().join("agent.sock");
         let config_path = workspace.path().join("plato.toml");
         write_provider_config(&config_path, &provider.base_url, "file.write");
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
         seed_finished_session_run(
             &server.paths().ledger_path,
             "run_prior",
@@ -3580,7 +3682,7 @@ enabled = ["file.read"]
 "#,
         )
         .unwrap();
-        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
         seed_finished_session_run(
             &server.paths().ledger_path,
             "run_prior",

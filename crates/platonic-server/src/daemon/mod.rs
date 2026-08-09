@@ -30,17 +30,50 @@ pub struct DaemonPaths {
 
 impl DaemonPaths {
     pub fn resolve(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<Self> {
+        Self::provisional(workspace_root, socket_path)?.resolve_workspace_record()
+    }
+
+    pub(crate) fn provisional(
+        workspace_root: &Path,
+        socket_path: Option<PathBuf>,
+    ) -> AppResult<Self> {
         let workspace_root = workspace_root.canonicalize()?;
-        let workspace_id = paths::workspace_id(&workspace_root)?;
         let socket_path = socket_path.unwrap_or(paths::default_socket_path(&workspace_root)?);
         Ok(Self {
             lock_path: paths::default_lock_path(&workspace_root)?,
-            ledger_path: paths::default_sqlite_path(&workspace_root)?,
+            ledger_path: PathBuf::new(),
             server_db_path: paths::server_db_path()?,
+            workspace_id: paths::workspace_id(&workspace_root)?,
             workspace_root,
-            workspace_id,
             socket_path,
         })
+    }
+
+    pub(crate) fn resolve_workspace_record(self) -> AppResult<Self> {
+        let store = self.server_store()?;
+        let record = store.workspace_by_root(&self.workspace_root.to_string_lossy())?;
+        match record {
+            Some(record) => Ok(self.with_workspace_record(&record)),
+            None => Ok(self),
+        }
+    }
+
+    pub(crate) fn with_workspace_record(
+        &self,
+        record: &crate::server_store::WorkspaceRecord,
+    ) -> Self {
+        Self {
+            workspace_root: self.workspace_root.clone(),
+            workspace_id: record.id.clone(),
+            socket_path: self.socket_path.clone(),
+            lock_path: self.lock_path.clone(),
+            ledger_path: PathBuf::from(&record.ledger_path),
+            server_db_path: self.server_db_path.clone(),
+        }
+    }
+
+    pub(crate) fn is_registered(&self) -> bool {
+        !self.ledger_path.as_os_str().is_empty()
     }
 
     pub(crate) fn default_ledger(&self) -> paths::DefaultSqlitePath {

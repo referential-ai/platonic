@@ -243,10 +243,16 @@ pub(super) fn require_gateway_daemon_contract(
     workspace_root: &Path,
     hello: &HelloResult,
 ) -> GatewayResult<()> {
-    let expected_workspace_id = paths::workspace_id(workspace_root)?;
-    if hello.workspace_id != expected_workspace_id {
+    let legacy_workspace_id = paths::workspace_id(workspace_root)?;
+    let minted_workspace_id = hello
+        .workspace_id
+        .strip_prefix("ws-")
+        .is_some_and(|suffix| {
+            suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    if hello.workspace_id != legacy_workspace_id && !minted_workspace_id {
         return Err(GatewayError::DaemonProtocol(format!(
-            "hello workspace_id mismatch: expected {expected_workspace_id}, got {}",
+            "hello workspace_id mismatch: expected {legacy_workspace_id} or a server-minted id, got {}",
             hello.workspace_id
         )));
     }

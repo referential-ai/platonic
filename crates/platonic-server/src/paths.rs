@@ -65,17 +65,154 @@ pub fn server_db_path() -> AppResult<PathBuf> {
     Ok(server_state_root()?.join("server.db"))
 }
 
-pub fn default_sqlite_path(workspace_root: &Path) -> AppResult<PathBuf> {
-    Ok(default_sqlite(workspace_root)?.path)
+pub fn default_sqlite_path(workspace_id: &str) -> AppResult<PathBuf> {
+    Ok(default_sqlite(workspace_id)?.path)
 }
 
-pub fn default_sqlite(workspace_root: &Path) -> AppResult<DefaultSqlitePath> {
-    let state_root = server_state_root()?;
-    let path = state_root
+pub fn default_sqlite(workspace_id: &str) -> AppResult<DefaultSqlitePath> {
+    let path = server_state_root()?
+        .join("workspaces")
+        .join(workspace_id)
+        .join("ledger.db");
+    Ok(DefaultSqlitePath { path })
+}
+
+pub(crate) fn workspace_sqlite_path(
+    server_db_path: &Path,
+    workspace_id: &str,
+) -> AppResult<PathBuf> {
+    let state_root = server_db_path.parent().ok_or_else(|| {
+        AppError::Config(format!(
+            "server database has no state root: {}",
+            server_db_path.display()
+        ))
+    })?;
+    Ok(state_root
+        .join("workspaces")
+        .join(workspace_id)
+        .join("ledger.db"))
+}
+
+/// Path used by the pre-registry, path-derived ledger layout.
+#[cfg(test)]
+pub(crate) fn legacy_sqlite_path(workspace_root: &Path) -> AppResult<PathBuf> {
+    legacy_sqlite_path_at(&server_db_path()?, workspace_root)
+}
+
+pub(crate) fn legacy_sqlite_path_at(
+    server_db_path: &Path,
+    workspace_root: &Path,
+) -> AppResult<PathBuf> {
+    let state_root = server_db_path.parent().ok_or_else(|| {
+        AppError::Config(format!(
+            "server database has no state root: {}",
+            server_db_path.display()
+        ))
+    })?;
+    Ok(state_root
         .join("workspaces")
         .join(workspace_id(workspace_root)?)
-        .join("agent.db");
-    Ok(DefaultSqlitePath { path })
+        .join("agent.db"))
+}
+
+/// Move a legacy SQLite database and any sidecars to its minted-id location.
+pub(crate) fn adopt_legacy_sqlite(
+    server_db_path: &Path,
+    workspace_root: &Path,
+    destination: &Path,
+) -> AppResult<bool> {
+    move_sqlite_files(
+        &legacy_sqlite_path_at(server_db_path, workspace_root)?,
+        destination,
+    )
+}
+
+/// Put an adopted database back if registry insertion does not commit.
+pub(crate) fn restore_legacy_sqlite(
+    server_db_path: &Path,
+    workspace_root: &Path,
+    destination: &Path,
+) -> AppResult<()> {
+    let legacy = legacy_sqlite_path_at(server_db_path, workspace_root)?;
+    if move_sqlite_files(destination, &legacy)? {
+        Ok(())
+    } else {
+        Err(AppError::Config(format!(
+            "adopted ledger vanished before registry rollback: {}",
+            destination.display()
+        )))
+    }
+}
+
+fn move_sqlite_files(source: &Path, destination: &Path) -> AppResult<bool> {
+    match std::fs::symlink_metadata(source) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(AppError::Config(format!(
+                "workspace ledger is not a regular file: {}",
+                source.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+
+    let mut moves = Vec::new();
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let source = sqlite_companion(source, suffix);
+        let destination = sqlite_companion(destination, suffix);
+        match std::fs::symlink_metadata(&source) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(AppError::Config(format!(
+                    "workspace ledger companion is not a regular file: {}",
+                    source.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        }
+        match std::fs::symlink_metadata(&destination) {
+            Ok(_) => {
+                return Err(AppError::Config(format!(
+                    "workspace ledger destination already exists: {}",
+                    destination.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        moves.push((source, destination));
+    }
+
+    let parent = destination.parent().ok_or_else(|| {
+        AppError::Config(format!(
+            "workspace ledger destination has no parent: {}",
+            destination.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let mut moved = Vec::new();
+    for (source, destination) in moves {
+        if let Err(error) = std::fs::rename(&source, &destination) {
+            for (source, destination) in moved.into_iter().rev() {
+                if let Err(rollback) = std::fs::rename(&destination, &source) {
+                    return Err(AppError::Config(format!(
+                        "ledger adoption failed ({error}) and rollback failed ({rollback})"
+                    )));
+                }
+            }
+            return Err(error.into());
+        }
+        moved.push((source, destination));
+    }
+    Ok(true)
+}
+
+fn sqlite_companion(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 #[cfg(unix)]
@@ -162,20 +299,52 @@ mod tests {
     }
 
     #[test]
-    fn default_sqlite_path_uses_workspace_directory() {
+    fn default_sqlite_path_uses_minted_workspace_id() {
         let dir = tempfile::tempdir().unwrap();
         with_test_xdg(dir.path(), || {
-            let path = default_sqlite_path(dir.path()).unwrap();
+            let path = default_sqlite_path("ws-1234").unwrap();
 
-            assert!(
-                path.components()
-                    .any(|component| component.as_os_str() == "platonic")
+            assert_eq!(
+                path,
+                dir.path()
+                    .join("xdg-state/platonic/workspaces/ws-1234/ledger.db")
             );
-            assert!(
-                path.components()
-                    .any(|component| component.as_os_str() == "workspaces")
+        });
+    }
+
+    #[test]
+    fn legacy_sqlite_is_adopted_with_sidecars_and_can_be_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        with_test_xdg(dir.path(), || {
+            let legacy = legacy_sqlite_path(&workspace).unwrap();
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, b"ledger").unwrap();
+            std::fs::write(sqlite_companion(&legacy, "-wal"), b"wal").unwrap();
+            let destination = default_sqlite_path("ws-1234").unwrap();
+
+            let server_db = server_db_path().unwrap();
+            assert!(adopt_legacy_sqlite(&server_db, &workspace, &destination).unwrap());
+            assert_eq!(std::fs::read(&destination).unwrap(), b"ledger");
+            assert_eq!(
+                std::fs::read(sqlite_companion(&destination, "-wal")).unwrap(),
+                b"wal"
             );
-            assert_eq!(path.file_name().unwrap(), "agent.db");
+            assert!(!legacy.exists());
+
+            restore_legacy_sqlite(&server_db, &workspace, &destination).unwrap();
+            assert_eq!(std::fs::read(&legacy).unwrap(), b"ledger");
+            assert_eq!(
+                std::fs::read(sqlite_companion(&legacy, "-wal")).unwrap(),
+                b"wal"
+            );
+            assert!(!destination.exists());
+
+            std::fs::write(&destination, b"occupied").unwrap();
+            assert!(adopt_legacy_sqlite(&server_db, &workspace, &destination).is_err());
+            assert_eq!(std::fs::read(&legacy).unwrap(), b"ledger");
+            assert_eq!(std::fs::read(&destination).unwrap(), b"occupied");
         });
     }
 
@@ -228,8 +397,8 @@ mod tests {
                     workspace_dir.join("agent.lock")
                 );
                 assert_eq!(
-                    default_sqlite_path(workspace.path()).unwrap(),
-                    workspace_dir.join("agent.db")
+                    default_sqlite_path(&workspace_id).unwrap(),
+                    workspace_dir.join("ledger.db")
                 );
             },
         );
