@@ -42,6 +42,15 @@ const EXPECTED_DRAFT: &str = "ask hello café pasted text";
 const PENDING_RUN_ID: &str = "run_pty_pending";
 const PENDING_CALL_ID: &str = "call_pty_pending";
 const CONVERSATION_RUN_ID: &str = "run_pty_conversation_full_identifier";
+const STREAMING_RUN_ID: &str = "run_pty_streaming_384";
+const STREAMING_SOURCE: &str = concat!(
+    "Burst line one.\n",
+    "quiet partial\n",
+    "| Name | Value |\n",
+    "| --- | --- |\n",
+    "| alpha | one |\n",
+    "final mid-tok",
+);
 const SCROLLBACK_SENTINEL: &str = "PLATO_NATIVE_SCROLLBACK_SENTINEL_377";
 const CONVERSATION_USER_TEXT: &str = concat!(
     "PLATO_NATIVE_SCROLLBACK_SENTINEL_377\n",
@@ -1444,6 +1453,104 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
 
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
+fn streamed_markdown_smooths_holds_tables_and_survives_reload_and_resize() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+
+    let workspace_id = paths::workspace_id(&workspace).unwrap();
+    let endpoint = runtime
+        .join("platonic")
+        .join("workspaces")
+        .join(&workspace_id)
+        .join("agent.sock");
+    let ledger = state.join("fake-agent.db");
+    let fake = FakeDaemon::bind_streaming(&endpoint, &workspace, &workspace_id, &ledger);
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        br#""$PLATO_BIN"; printf '\n%sSTATUS:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Try \"read README.md and summarize it\"",
+    );
+    let stream_at = shell.output_len();
+    shell.write(b"stream the answer\r");
+    fake.wait_for_request("run.start");
+
+    shell.wait_for_current_screen_text_after(stream_at, "Burst line one.");
+    shell.wait_for_current_screen_text_after(stream_at, "quiet partial");
+    fake.wait_for_request_count("events.stream", 2);
+    thread::sleep(Duration::from_millis(50));
+    let output = shell.output.lock().unwrap().clone();
+    let resizes = shell.resizes.lock().unwrap().clone();
+    let during_table = parsed_terminal(&output, &resizes, 0).screen().contents();
+    assert!(!during_table.contains("Name"), "{during_table}");
+    assert!(!during_table.contains("alpha"), "{during_table}");
+
+    let finalized = shell.wait_for_current_screen_text_after(stream_at, "final mid-tok");
+    assert!(finalized.contains("Name"));
+    assert!(finalized.contains("alpha"));
+    fake.wait_for_request_count("transcript.read", 1);
+    assert_eq!(fake.requests_for("transcript.read").len(), 1);
+
+    shell.write(b"v");
+    let loaded_run = format!("run {STREAMING_RUN_ID}");
+    let audit = shell.wait_for_current_screen_text(&loaded_run);
+    assert!(audit.contains("| Name | Value |"));
+    assert!(audit.contains("| alpha | one |"));
+    assert!(audit.contains("final mid-tok"));
+    shell.write(b"v");
+    shell.wait_for_current_screen_text("final mid-tok");
+
+    shell.write(b"/sessions\r");
+    shell.wait_for_current_screen_text("Sessions");
+    shell.write(b"\r");
+    fake.wait_for_request_count("transcript.read", 2);
+    let reloaded = shell.wait_for_current_screen_text("final mid-tok");
+    assert!(reloaded.contains("Name"));
+    assert!(reloaded.contains("alpha"));
+    assert_eq!(reloaded.matches("final mid-tok").count(), 1);
+
+    let commits_before_resize = inline_scrollback_count(&shell.output_since(0));
+    assert!(commits_before_resize > 0);
+    for width in [120, 40, 120] {
+        let resize_at = shell.output_len();
+        shell.resize(INITIAL_ROWS, width);
+        let resized = shell.wait_for_current_screen_text_after(resize_at, "? shortcuts");
+        assert_eq!(resized.matches("final mid-tok").count(), 1, "width {width}");
+        assert_eq!(
+            inline_scrollback_count(&shell.output_since(0)),
+            commits_before_resize,
+            "width {width} recommitted the durable transcript"
+        );
+    }
+
+    shell.write(b"q");
+    assert_eq!(shell.wait_for_marker("STATUS"), "0");
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+
+    let requests = fake.finish();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method.as_deref() == Some("transcript.read"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_session_picker_resumes_exact_hidden_session_id() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -2305,6 +2412,14 @@ fn assert_inline_scrollback_sequence(output: &[u8]) {
     );
 }
 
+fn inline_scrollback_count(output: &[u8]) -> usize {
+    const SCROLL_INLINE_REGION_START: &[u8] = b"\x1b[1;12r";
+    output
+        .windows(SCROLL_INLINE_REGION_START.len())
+        .filter(|bytes| *bytes == SCROLL_INLINE_REGION_START)
+        .count()
+}
+
 struct PtyShellSequenceProvider {
     base_url: String,
     handle: JoinHandle<usize>,
@@ -2469,6 +2584,7 @@ enum FakeScenario {
     FreshRun,
     PendingApproval,
     ConversationAudit,
+    Streaming,
 }
 
 struct FakeDaemon {
@@ -2515,6 +2631,21 @@ impl FakeDaemon {
             workspace_id,
             ledger,
             FakeScenario::ConversationAudit,
+        )
+    }
+
+    fn bind_streaming(
+        endpoint: &Path,
+        workspace: &Path,
+        workspace_id: &str,
+        ledger: &Path,
+    ) -> Self {
+        Self::bind_scenario(
+            endpoint,
+            workspace,
+            workspace_id,
+            ledger,
+            FakeScenario::Streaming,
         )
     }
 
@@ -2691,19 +2822,19 @@ fn handle_connection(
         if request.v != PROTOCOL_VERSION || request.kind != EnvelopeKind::Request {
             return Err(format!("invalid daemon envelope: {request:?}"));
         }
-        let first_stream_request = request.method.as_deref() == Some("events.stream")
-            && !requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|request| request.method.as_deref() == Some("events.stream"));
+        let request_index = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|recorded| recorded.method == request.method)
+            .count();
         let response = fake_response(
             &request,
             workspace_root,
             workspace_id,
             ledger,
             scenario,
-            first_stream_request,
+            request_index,
         )?;
         let mut response = serde_json::to_vec(&response)
             .map_err(|error| format!("fake daemon response failed: {error}"))?;
@@ -2727,15 +2858,13 @@ fn fake_response(
     workspace_id: &str,
     ledger: &Path,
     scenario: FakeScenario,
-    first_stream_request: bool,
+    request_index: usize,
 ) -> Result<Envelope, String> {
     let method = request
         .method
         .as_deref()
         .ok_or_else(|| "daemon request omitted method".to_owned())?;
-    if scenario == FakeScenario::PendingApproval
-        && method == "events.stream"
-        && first_stream_request
+    if scenario == FakeScenario::PendingApproval && method == "events.stream" && request_index == 0
     {
         return Ok(Envelope::error(
             request.id.clone(),
@@ -2811,6 +2940,18 @@ fn fake_response(
                     "ledger_path": ledger.to_string_lossy()
                 }]
             }),
+            FakeScenario::Streaming if request_index == 0 => json!({"sessions": []}),
+            FakeScenario::Streaming => json!({
+                "sessions": [{
+                    "session_id": "session_pty_streaming_384",
+                    "run_id": STREAMING_RUN_ID,
+                    "status": "finished",
+                    "latest_question": "stream the answer",
+                    "first_question": "stream the answer",
+                    "updated_at_ms": 1_785_638_400_000_u64,
+                    "ledger_path": ledger.to_string_lossy()
+                }]
+            }),
         },
         "transcript.read" if scenario == FakeScenario::PendingApproval => json!({
             "run_id": PENDING_RUN_ID,
@@ -2858,8 +2999,31 @@ fn fake_response(
                 }]
             }
         }),
+        "transcript.read" if scenario == FakeScenario::Streaming => json!({
+            "run_id": STREAMING_RUN_ID,
+            "status": "finished",
+            "final_answer": STREAMING_SOURCE,
+            "transcript": format!(
+                "run_id: {STREAMING_RUN_ID}\n[turn_384] user: stream the answer\n[turn_384] assistant: {STREAMING_SOURCE}\n"
+            ),
+            "typed": {
+                "runs": [{
+                    "run_id": STREAMING_RUN_ID,
+                    "session_index": 0,
+                    "status": "finished",
+                    "entries": [
+                        {"kind": "user", "text": "stream the answer"},
+                        {"kind": "assistant", "text": STREAMING_SOURCE}
+                    ]
+                }]
+            }
+        }),
         "run.start" => json!({
-            "run_id": "run_tui_pty",
+            "run_id": if scenario == FakeScenario::Streaming {
+                STREAMING_RUN_ID
+            } else {
+                "run_tui_pty"
+            },
             "session_id": "session_tui_pty",
             "ledger_path": ledger.to_string_lossy(),
             "status": "running",
@@ -2919,18 +3083,136 @@ fn fake_response(
                 FakeScenario::PendingApproval => PENDING_RUN_ID,
                 FakeScenario::ConversationAudit => CONVERSATION_RUN_ID,
                 FakeScenario::FreshRun => "run_tui_pty",
+                FakeScenario::Streaming => STREAMING_RUN_ID,
             };
-            let (next_offset, events) =
-                if scenario == FakeScenario::ConversationAudit && first_stream_request {
-                    (8, json!([{"offset": 7, "event": {"kind": "model_stage"}}]))
-                } else {
-                    (from_offset, json!([]))
-                };
+            let (next_offset, status, events) = match (scenario, request_index) {
+                (FakeScenario::ConversationAudit, 0) => (
+                    8,
+                    "running",
+                    json!([{"offset": 7, "event": {"kind": "model_stage"}}]),
+                ),
+                (FakeScenario::Streaming, 0) => (
+                    2,
+                    "running",
+                    json!([
+                        {
+                            "offset": 0,
+                            "event": {
+                                "kind": "assistant_delta",
+                                "run_id": STREAMING_RUN_ID,
+                                "turn_id": "turn_384",
+                                "step": 0,
+                                "delta_index": 0,
+                                "text": "Burst line one.\n"
+                            }
+                        },
+                        {
+                            "offset": 1,
+                            "event": {
+                                "kind": "assistant_delta",
+                                "run_id": STREAMING_RUN_ID,
+                                "turn_id": "turn_384",
+                                "step": 0,
+                                "delta_index": 1,
+                                "text": "quiet partial"
+                            }
+                        }
+                    ]),
+                ),
+                (FakeScenario::Streaming, 1) => (
+                    5,
+                    "running",
+                    json!([
+                        {
+                            "offset": 2,
+                            "event": {
+                                "kind": "assistant_delta",
+                                "run_id": STREAMING_RUN_ID,
+                                "turn_id": "turn_384",
+                                "step": 0,
+                                "delta_index": 2,
+                                "text": "\n| Name | Value |\n"
+                            }
+                        },
+                        {
+                            "offset": 3,
+                            "event": {
+                                "kind": "assistant_delta",
+                                "run_id": STREAMING_RUN_ID,
+                                "turn_id": "turn_384",
+                                "step": 0,
+                                "delta_index": 3,
+                                "text": "| --- | --- |\n"
+                            }
+                        },
+                        {
+                            "offset": 4,
+                            "event": {
+                                "kind": "assistant_delta",
+                                "run_id": STREAMING_RUN_ID,
+                                "turn_id": "turn_384",
+                                "step": 0,
+                                "delta_index": 4,
+                                "text": "| alpha | one"
+                            }
+                        }
+                    ]),
+                ),
+                (FakeScenario::Streaming, _) => (
+                    8,
+                    "finished",
+                    json!([
+                        {
+                            "offset": 5,
+                            "event": {
+                                "kind": "assistant_delta",
+                                "run_id": STREAMING_RUN_ID,
+                                "turn_id": "turn_384",
+                                "step": 0,
+                                "delta_index": 5,
+                                "text": " |\nfinal mid-tok"
+                            }
+                        },
+                        {
+                            "offset": 6,
+                            "event": {
+                                "kind": "ledger",
+                                "record": {
+                                    "seq": 6,
+                                    "occurred_at_ms": 6,
+                                    "event": {
+                                        "event": "model_responded",
+                                        "run_id": STREAMING_RUN_ID,
+                                        "turn_id": "turn_384",
+                                        "step": 0,
+                                        "output": {"role": "assistant", "content": STREAMING_SOURCE},
+                                        "proposed_calls": [],
+                                        "served_model": "test/streaming",
+                                        "usage": null
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "offset": 7,
+                            "event": {
+                                "kind": "ledger",
+                                "record": {
+                                    "seq": 7,
+                                    "occurred_at_ms": 7,
+                                    "event": {"event": "run_finished", "run_id": STREAMING_RUN_ID}
+                                }
+                            }
+                        }
+                    ]),
+                ),
+                _ => (from_offset, "running", json!([])),
+            };
             json!({
                 "run_id": run_id,
                 "from_offset": from_offset,
                 "next_offset": next_offset,
-                "status": "running",
+                "status": status,
                 "events": events
             })
         }

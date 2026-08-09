@@ -22,7 +22,7 @@ use std::{
 use std::sync::mpsc::Receiver;
 
 use super::{
-    app::{UiEvent, push_live_event, send_command, start_next_queued},
+    app::{UiEvent, push_live_event, push_live_event_at, send_command, start_next_queued},
     state::approval_from_snapshot,
 };
 
@@ -857,6 +857,7 @@ pub(super) fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
         }
         if loaded.live_events.is_empty() {
             loaded.live_events = std::mem::take(&mut state.live_events);
+            loaded.streaming = std::mem::take(&mut state.streaming);
             loaded.history_rows.live_events = std::mem::take(&mut state.history_rows.live_events);
         }
         if loaded.active_model.is_none() {
@@ -984,6 +985,7 @@ pub(super) fn apply_events_result(
     if needs_catch_up {
         maybe_poll_events_now(runtime, commands);
     } else if !active {
+        state.finalize_streaming(Some(&result.run_id));
         state.active_run_elapsed_secs = runtime
             .active_timer
             .elapsed_at(Instant::now())
@@ -1026,6 +1028,7 @@ fn apply_thread_events_result(
             status,
             RunStateName::Finished | RunStateName::Failed | RunStateName::Canceled
         ) {
+            state.finalize_streaming(Some(&run_id));
             state.active_run_elapsed_secs = runtime
                 .active_timer
                 .elapsed_at(Instant::now())
@@ -1045,6 +1048,7 @@ fn apply_buffered_stream_events(
     events: Vec<BufferedStreamEvent>,
     fallback_run_id: Option<&str>,
 ) -> Option<(String, RunStateName)> {
+    let arrived_at = Instant::now();
     let mut observed_run = None;
     for buffered in events {
         let event = &buffered.event;
@@ -1081,7 +1085,7 @@ fn apply_buffered_stream_events(
             Some(run_id) if line.run_id.is_none() => line.with_run_id(run_id),
             _ => line,
         };
-        push_live_event(state, line);
+        push_live_event_at(state, line, arrived_at);
     }
     observed_run
 }
@@ -1518,6 +1522,12 @@ mod tests {
         ));
         let mut runtime = UiRuntime::from_state(&state, None);
         let (commands, command_receiver) = mpsc::channel();
+        push_live_event_at(
+            &mut state,
+            crate::LiveEventLine::assistant_delta(Some(1), "partial cancel mid-tok")
+                .with_run_id("run_canceling"),
+            Instant::now(),
+        );
 
         assert!(runtime.polling);
         apply_events_result(
@@ -1556,6 +1566,8 @@ mod tests {
 
         assert!(!runtime.polling);
         assert!(!runtime.active_timer.is_active());
+        assert_eq!(state.live_events.len(), 1);
+        assert_eq!(state.live_events[0].text, "partial cancel mid-tok");
         assert!(matches!(
             command_receiver.try_recv().unwrap(),
             ClientCommand::Load {
