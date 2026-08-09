@@ -205,6 +205,7 @@ impl DaemonRuntime {
         &self,
         spawn_id: String,
         draft: ThreadAuthorityDraft,
+        max_spawn_depth: u32,
     ) -> Result<(), ThreadSpawnAdmissionError> {
         let mut state = self.state.lock().expect("runtime state lock poisoned");
         if state.shutdown_accepted {
@@ -225,6 +226,7 @@ impl DaemonRuntime {
                 spawn_id,
                 workspace_id: self.paths.workspace_id.clone(),
                 draft,
+                max_spawn_depth,
                 decision_in_progress: false,
             },
         );
@@ -696,6 +698,7 @@ pub(super) struct PendingThreadSpawn {
     pub(super) spawn_id: String,
     pub(super) workspace_id: String,
     pub(super) draft: ThreadAuthorityDraft,
+    pub(super) max_spawn_depth: u32,
     decision_in_progress: bool,
 }
 
@@ -1462,7 +1465,7 @@ mod tests {
         })
         .unwrap();
         runtime
-            .reserve_thread_spawn("spawn_1".into(), draft)
+            .reserve_thread_spawn("spawn_1".into(), draft, 1)
             .unwrap();
 
         assert_eq!(

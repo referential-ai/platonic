@@ -11,11 +11,12 @@ use crate::{
     },
     paths::DefaultSqlitePath,
     provider::openai_compat::{OpenAiCompatibleClient, TokenLimitField},
-    tool_catalog::{SHELL_EXEC, ToolSpec, WEB_FETCH, effect_for_tool, tool_specs},
+    tool_catalog::{SHELL_EXEC, THREAD_SPAWN, ToolSpec, WEB_FETCH, effect_for_tool, tool_specs},
     tools::{
-        ApprovalOutcome, PLATONIC_MEMORY_FILENAME, PLATONIC_MEMORY_MAX_BYTES, ToolExecutionContext,
-        approval_command_preview, approval_diff_preview, approval_input_preview, ask_for_approval,
-        execute_tool_with_context, targets_platonic_memory,
+        ApprovalOutcome, PLATONIC_MEMORY_FILENAME, PLATONIC_MEMORY_MAX_BYTES,
+        ThreadSpawnToolHandler, ToolExecutionContext, approval_command_preview,
+        approval_diff_preview, approval_input_preview, ask_for_approval, execute_tool_with_context,
+        targets_platonic_memory,
     },
 };
 use platonic_core::{
@@ -260,6 +261,7 @@ pub(crate) struct PreparedRun {
     workspace_root: PathBuf,
     voice_interruption_context: Option<String>,
     config: RunConfigSnapshot,
+    agent_id: AgentId,
     run_id: RunId,
     session_hydration: Option<SessionHydration>,
     messages: Vec<ModelMessage>,
@@ -501,10 +503,38 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         options.event_sender,
         options.stream_to_stderr,
         options.cancel,
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn run_question_for_thread(
+    options: RunOptions,
+    agent_id: AgentId,
+    toolset: &[String],
+    thread_spawn: ThreadSpawnToolHandler,
+) -> AppResult<RunOutcome> {
+    let (prepared, mut recorder) = prepare_run_for_thread(&options, Some(agent_id), Some(toolset))?;
+    run_prepared_question(
+        prepared,
+        &mut recorder,
+        options.approval_mode,
+        options.event_sender,
+        options.stream_to_stderr,
+        options.cancel,
+        Some(thread_spawn),
     )
 }
 
 pub(crate) fn prepare_run(options: &RunOptions) -> AppResult<(PreparedRun, EventRecorder)> {
+    prepare_run_for_thread(options, None, None)
+}
+
+pub(crate) fn prepare_run_for_thread(
+    options: &RunOptions,
+    agent_id: Option<AgentId>,
+    toolset: Option<&[String]>,
+) -> AppResult<(PreparedRun, EventRecorder)> {
     if options.question.trim().is_empty() {
         return Err(AppError::EmptyQuestion);
     }
@@ -518,6 +548,9 @@ pub(crate) fn prepare_run(options: &RunOptions) -> AppResult<(PreparedRun, Event
     let mut config = Config::load(&options.workspace_root, options.config_path.as_deref())?;
     if let Some(model) = &options.overrides.model {
         config.provider.model = model.clone();
+    }
+    if let Some(toolset) = toolset {
+        config.tools.enabled = toolset.to_vec();
     }
     let run_id = match options.run_id.clone() {
         Some(run_id) => run_id,
@@ -582,6 +615,7 @@ pub(crate) fn prepare_run(options: &RunOptions) -> AppResult<(PreparedRun, Event
                 limits: config.limits,
                 tools: config.tools,
             },
+            agent_id: agent_id.unwrap_or(AgentId::new("plato")?),
             run_id,
             session_hydration,
             messages,
@@ -600,6 +634,7 @@ pub(crate) fn run_prepared_question(
     event_sender: Option<Sender<RunEvent>>,
     stream_to_stderr: bool,
     cancel: Option<Arc<AtomicBool>>,
+    thread_spawn: Option<ThreadSpawnToolHandler>,
 ) -> AppResult<RunOutcome> {
     let PreparedRun {
         question,
@@ -607,6 +642,7 @@ pub(crate) fn run_prepared_question(
         workspace_root,
         voice_interruption_context,
         config,
+        agent_id,
         run_id,
         session_hydration,
         mut messages,
@@ -644,7 +680,6 @@ pub(crate) fn run_prepared_question(
         token_limit_field(&config.provider.kind),
     )?;
     let tools = tool_specs(&config.tools.enabled);
-    let agent_id = AgentId::new("plato")?;
     let model = ModelName::new(config.provider.model.clone())?;
     let stdin_actor_id = ActorId::new("stdin")?;
 
@@ -913,9 +948,15 @@ pub(crate) fn run_prepared_question(
         )?;
 
         let tool_message = match policy {
-            PolicyDecision::Allow => {
-                execute_and_record_tool(recorder, &options, &config, &run_id, call.clone())?
-            }
+            PolicyDecision::Allow => execute_and_record_tool(
+                recorder,
+                &options,
+                &config,
+                &run_id,
+                call.clone(),
+                None,
+                thread_spawn.as_ref(),
+            )?,
             PolicyDecision::RequireApproval { ref reason } => {
                 if let Some(actor) =
                     options
@@ -932,7 +973,15 @@ pub(crate) fn run_prepared_question(
                             actor_id,
                         },
                     )?;
-                    execute_and_record_tool(recorder, &options, &config, &run_id, call.clone())?
+                    execute_and_record_tool(
+                        recorder,
+                        &options,
+                        &config,
+                        &run_id,
+                        call.clone(),
+                        Some(actor),
+                        thread_spawn.as_ref(),
+                    )?
                 } else if let Some(actor) = options.approval_mode.deny_actor(&policy) {
                     let reason =
                         format!("approval required but no approval channel is available: {reason}");
@@ -989,6 +1038,8 @@ pub(crate) fn run_prepared_question(
                                         &config,
                                         &run_id,
                                         call.clone(),
+                                        Some(actor),
+                                        thread_spawn.as_ref(),
                                     )?
                                 }
                                 ExternalApprovalOutcome::Denied { actor, reason } => {
@@ -1042,6 +1093,8 @@ pub(crate) fn run_prepared_question(
                                         &config,
                                         &run_id,
                                         call.clone(),
+                                        Some("stdin"),
+                                        thread_spawn.as_ref(),
                                     )?
                                 }
                                 ApprovalOutcome::Denied { reason } => {
@@ -1314,6 +1367,8 @@ fn execute_and_record_tool(
     config: &Config,
     run_id: &RunId,
     call: ToolCall,
+    approving_actor: Option<&str>,
+    thread_spawn: Option<&ThreadSpawnToolHandler>,
 ) -> AppResult<ToolMessage> {
     check_cancel(recorder, options, run_id)?;
     let ToolCall {
@@ -1335,6 +1390,8 @@ fn execute_and_record_tool(
         workspace_root: &options.workspace_root,
         provider_api_key_env: Some(&config.provider.api_key_env),
         cancel: options.cancel.as_deref(),
+        thread_spawn,
+        approving_actor,
     };
     match execute_tool_with_context(context, call_id.clone(), tool.as_str(), input) {
         Ok(result) => {
@@ -1370,11 +1427,13 @@ fn execute_and_record_tool(
 }
 
 fn tool_result_is_error(tool_name: &str, result: &platonic_core::ToolResult) -> bool {
-    tool_name == SHELL_EXEC
+    (tool_name == SHELL_EXEC
         && result
             .data
             .get("exit_code")
-            .is_some_and(|exit_code| exit_code.as_i64() != Some(0))
+            .is_some_and(|exit_code| exit_code.as_i64() != Some(0)))
+        || (tool_name == THREAD_SPAWN
+            && result.data.get("status").and_then(Value::as_str) == Some("rejected"))
 }
 
 fn proposals_from_response(response: &ModelResponse) -> AppResult<Vec<ToolProposal>> {
@@ -1579,6 +1638,52 @@ mod tests {
 
         assert_ne!(first_run, second_run);
         assert_ne!(first_session, second_session);
+    }
+
+    #[test]
+    fn thread_preparation_projects_immutable_agent_and_toolset() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_path = workspace.path().join("authorized.toml");
+        fs::write(
+            &config_path,
+            r#"[provider]
+api_key_env = "PATH"
+
+[tools]
+enabled = ["file.read", "file.write"]
+"#,
+        )
+        .unwrap();
+        let options = RunOptions {
+            question: "coordinate one worker".into(),
+            config_path: Some(config_path),
+            overrides: RunOverrides::default(),
+            ledger: RunLedger::Jsonl(workspace.path().join("ledger.jsonl")),
+            workspace_root: workspace.path().to_path_buf(),
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(RunId::new("run_thread_projection").unwrap()),
+            session: None,
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: None,
+            voice_interruption_context: None,
+        };
+        let agent_id = AgentId::new("coordinator").unwrap();
+        let resolved_toolset = vec!["file.read".into(), THREAD_SPAWN.into()];
+
+        let (prepared, _) =
+            prepare_run_for_thread(&options, Some(agent_id.clone()), Some(&resolved_toolset))
+                .unwrap();
+
+        assert_eq!(prepared.agent_id, agent_id);
+        assert_eq!(prepared.config.tools.enabled, resolved_toolset);
+        assert_eq!(
+            tool_specs(&prepared.config.tools.enabled)
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            ["file_read", "thread_spawn"]
+        );
     }
 
     #[test]

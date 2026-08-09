@@ -95,8 +95,14 @@ pub(crate) enum ThreadAuthorityError {
     },
     #[error("child cwd {child} is outside parent cwd {parent}")]
     WorkingDirectory { parent: String, child: String },
+    #[error("child writable path {child} exceeds parent path authority")]
+    WritablePath { child: String },
     #[error("child toolset exceeds parent toolset: {excess:?}")]
     Toolset { excess: Vec<String> },
+    #[error("child network authority exceeds parent network authority")]
+    Network,
+    #[error("child spawn depth exceeds server maximum {maximum}")]
+    SpawnDepth { maximum: u32 },
 }
 
 impl ThreadAuthorityDraft {
@@ -259,19 +265,45 @@ pub(crate) fn validate_child_authority(
     if !excess.is_empty() {
         return Err(ThreadAuthorityError::Toolset { excess });
     }
-    let child_cwd = Path::new(&child.cwd);
-    if !parent
+    if child.network && !parent.network {
+        return Err(ThreadAuthorityError::Network);
+    }
+    validate_child_path(parent, &child.cwd, !child.worktrees.is_empty())?;
+    for worktree in &child.worktrees {
+        validate_child_path(parent, &worktree.path, true)?;
+    }
+    for grant in &child.granted_paths {
+        validate_child_path(parent, &grant.path, grant.writable)?;
+    }
+    Ok(())
+}
+
+fn validate_child_path(
+    parent: &ThreadAuthorityRecord,
+    child_path: &str,
+    writable: bool,
+) -> Result<(), ThreadAuthorityError> {
+    let child = Path::new(child_path);
+    let worktree_match = parent
         .worktrees
         .iter()
-        .map(|worktree| worktree.path.as_str())
-        .chain(parent.granted_paths.iter().map(|grant| grant.path.as_str()))
-        .any(|path| child_cwd.starts_with(Path::new(path)))
-    {
+        .any(|worktree| child.starts_with(Path::new(&worktree.path)));
+    let grant_matches = parent
+        .granted_paths
+        .iter()
+        .filter(|grant| child.starts_with(Path::new(&grant.path)))
+        .collect::<Vec<_>>();
+    if !worktree_match && grant_matches.is_empty() {
         return Err(ThreadAuthorityError::WorkingDirectory {
             parent: authority_working_directory(parent)
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "<no granted path>".into()),
-            child: child.cwd.clone(),
+            child: child_path.into(),
+        });
+    }
+    if writable && !worktree_match && !grant_matches.iter().any(|grant| grant.writable) {
+        return Err(ThreadAuthorityError::WritablePath {
+            child: child_path.into(),
         });
     }
     Ok(())
@@ -541,5 +573,47 @@ mod tests {
             .unwrap();
             assert_eq!(validate_child_authority(&parent, &child), expected);
         }
+    }
+
+    #[test]
+    fn child_authority_never_expands_writable_or_network_grants() {
+        let root = tempfile::tempdir().unwrap();
+        let mut parent = authority(root.path(), ThreadApprovalPolicy::Yolo);
+        parent.granted_paths[0].writable = false;
+        parent.toolset.push("web.fetch".into());
+
+        let writable = ThreadAuthorityDraft::new(ThreadAuthorityDraftParams {
+            parent_thread_id: Some("thread_parent".into()),
+            cwd: root.path(),
+            model: "gpt-child".into(),
+            reasoning_effort: ReasoningEffort::High,
+            approval_policy: ThreadApprovalPolicy::Prompt,
+            agent_id: AgentId::new("plato").unwrap(),
+            toolset: vec!["file.write".into()],
+            writable: true,
+            network: false,
+        })
+        .unwrap();
+        assert!(matches!(
+            validate_child_authority(&parent, &writable),
+            Err(ThreadAuthorityError::WritablePath { .. })
+        ));
+
+        let network = ThreadAuthorityDraft::new(ThreadAuthorityDraftParams {
+            parent_thread_id: Some("thread_parent".into()),
+            cwd: root.path(),
+            model: "gpt-child".into(),
+            reasoning_effort: ReasoningEffort::High,
+            approval_policy: ThreadApprovalPolicy::Prompt,
+            agent_id: AgentId::new("plato").unwrap(),
+            toolset: vec!["web.fetch".into()],
+            writable: false,
+            network: true,
+        })
+        .unwrap();
+        assert_eq!(
+            validate_child_authority(&parent, &network),
+            Err(ThreadAuthorityError::Network)
+        );
     }
 }

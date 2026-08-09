@@ -50,7 +50,8 @@ use crate::{
         authority_working_directory, legacy_status_authority, new_spawn_id, new_thread_turn_id,
         now_ms, thread_spawn_effect, validate_child_authority,
     },
-    tool_catalog::{SHELL_EXEC, effect_for_tool, is_known_tool},
+    tool_catalog::{FILE_EDIT, FILE_WRITE, SHELL_EXEC, effect_for_tool, is_known_tool},
+    tools::{ThreadSpawnToolHandler, ThreadSpawnToolInput, ThreadSpawnToolOutput},
 };
 use platonic_core::{
     ActorId, AgentId, EffectClass, HarnessEvent, ReadbackEntry, RecordedEvent, RunReadback, TurnId,
@@ -336,6 +337,7 @@ enum ThreadSpawnFailure {
     Unregistered(String),
     NotFound(String),
     WorkspaceBroken(String),
+    WorkspaceMismatch(String),
     Authority(ThreadAuthorityError),
     Overload(String),
     Conflict(String),
@@ -372,6 +374,12 @@ fn handle_thread_spawn(
             request.id,
             Some("thread.spawn".into()),
             ERROR_WORKSPACE_BROKEN,
+            message,
+        ),
+        Err(ThreadSpawnFailure::WorkspaceMismatch(message)) => Envelope::error(
+            request.id,
+            Some("thread.spawn".into()),
+            ERROR_WORKSPACE_MISMATCH,
             message,
         ),
         Err(ThreadSpawnFailure::Authority(error)) => Envelope::error(
@@ -466,17 +474,8 @@ fn start_thread_spawn(
     }
     let config = Config::load(cwd, None)
         .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
-    let writable = config.tools.enabled.iter().any(|tool| {
-        matches!(
-            effect_for_tool(tool),
-            EffectClass::WorkspaceWrite | EffectClass::ExternalSideEffect
-        )
-    });
-    let network = config
-        .tools
-        .enabled
-        .iter()
-        .any(|tool| matches!(effect_for_tool(tool), EffectClass::Network));
+    let max_spawn_depth = config.limits.max_spawn_depth;
+    let toolset = config.tools.enabled;
     let draft = ThreadAuthorityDraft::new(ThreadAuthorityDraftParams {
         parent_thread_id,
         cwd,
@@ -485,18 +484,28 @@ fn start_thread_spawn(
         approval_policy,
         agent_id: AgentId::new("plato")
             .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?,
-        toolset: config.tools.enabled,
-        writable,
-        network,
+        writable: toolset_requires_writable_path(&toolset),
+        network: toolset_has_effect(&toolset, EffectClass::Network),
+        toolset,
     })
     .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
-    let parent = read_live_parent(runtime, &store, &draft)?;
+    start_thread_spawn_draft(runtime, &mut store, draft, max_spawn_depth, "yolo")
+}
+
+fn start_thread_spawn_draft(
+    runtime: &DaemonRuntime,
+    store: &mut ServerStore,
+    draft: ThreadAuthorityDraft,
+    max_spawn_depth: u32,
+    auto_grant_actor: &str,
+) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
+    let parent = read_live_parent(runtime, store, &draft, max_spawn_depth)?;
     let auto_grant = parent.as_ref().is_some_and(|parent| {
         parent.approval_policy == crate::daemon::protocol::ThreadApprovalPolicy::Yolo
     });
     let spawn_id = new_spawn_id();
     runtime
-        .reserve_thread_spawn(spawn_id.clone(), draft.clone())
+        .reserve_thread_spawn(spawn_id.clone(), draft.clone(), max_spawn_depth)
         .map_err(|error| match error {
             ThreadSpawnAdmissionError::ShuttingDown => ThreadSpawnFailure::ShuttingDown,
             ThreadSpawnAdmissionError::Duplicate => {
@@ -510,10 +519,10 @@ fn start_thread_spawn(
             .expect("newly reserved thread spawn can be claimed");
         return resolve_thread_spawn(
             runtime,
-            &mut store,
+            store,
             pending,
             ThreadSpawnDecision::Grant {
-                actor: "yolo".into(),
+                actor: auto_grant_actor.into(),
             },
         );
     }
@@ -524,6 +533,157 @@ fn start_thread_spawn(
         effect: thread_spawn_effect(),
         reason: THREAD_SPAWN_APPROVAL_REASON.into(),
     })
+}
+
+fn toolset_requires_writable_path(toolset: &[String]) -> bool {
+    toolset
+        .iter()
+        .any(|tool| matches!(tool.as_str(), FILE_WRITE | FILE_EDIT | SHELL_EXEC))
+}
+
+fn toolset_has_effect(toolset: &[String], effect: EffectClass) -> bool {
+    toolset.iter().any(|tool| effect_for_tool(tool) == effect)
+}
+
+fn model_thread_spawn_handler(
+    runtime: DaemonRuntime,
+    parent_thread_id: String,
+) -> ThreadSpawnToolHandler {
+    ThreadSpawnToolHandler::new(move |input, approving_actor| {
+        model_thread_spawn(&runtime, &parent_thread_id, input, approving_actor)
+    })
+}
+
+fn model_thread_spawn(
+    runtime: &DaemonRuntime,
+    parent_thread_id: &str,
+    input: ThreadSpawnToolInput,
+    approving_actor: String,
+) -> AppResult<ThreadSpawnToolOutput> {
+    match model_thread_spawn_inner(runtime, parent_thread_id, input, approving_actor) {
+        Ok(thread_id) => Ok(ThreadSpawnToolOutput::Spawned { thread_id }),
+        Err(ThreadSpawnFailure::Persistence) => {
+            Err(AppError::Tool("thread spawn could not be persisted".into()))
+        }
+        Err(error) => {
+            let (code, reason) = thread_spawn_rejection(error);
+            Ok(ThreadSpawnToolOutput::Rejected { code, reason })
+        }
+    }
+}
+
+fn model_thread_spawn_inner(
+    runtime: &DaemonRuntime,
+    parent_thread_id: &str,
+    input: ThreadSpawnToolInput,
+    approving_actor: String,
+) -> Result<String, ThreadSpawnFailure> {
+    if runtime.shutdown_accepted() {
+        return Err(ThreadSpawnFailure::ShuttingDown);
+    }
+    if !Path::new(&input.cwd).is_absolute() {
+        return Err(ThreadSpawnFailure::Malformed(
+            "thread cwd must be an absolute path".into(),
+        ));
+    }
+    let agent_id = AgentId::new(input.agent_id)
+        .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
+    let mut store = runtime
+        .paths
+        .server_store()
+        .map_err(|_| ThreadSpawnFailure::Persistence)?;
+    let agent = store
+        .agent(&agent_id)
+        .map_err(|_| ThreadSpawnFailure::Persistence)?
+        .ok_or_else(|| ThreadSpawnFailure::NotFound(format!("agent not found: {agent_id}")))?;
+    if agent.workspace_id != runtime.paths.workspace_id {
+        return Err(ThreadSpawnFailure::WorkspaceMismatch(format!(
+            "agent {agent_id} belongs to workspace {}, not {}",
+            agent.workspace_id, runtime.paths.workspace_id
+        )));
+    }
+
+    let toolset = input.toolset.unwrap_or_else(|| agent.toolset.clone());
+    let excess = toolset
+        .iter()
+        .filter(|tool| !agent.toolset.contains(tool))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !excess.is_empty() {
+        return Err(ThreadSpawnFailure::Authority(
+            ThreadAuthorityError::Toolset { excess },
+        ));
+    }
+    let draft = ThreadAuthorityDraft::new(ThreadAuthorityDraftParams {
+        parent_thread_id: Some(parent_thread_id.into()),
+        cwd: Path::new(&input.cwd),
+        model: input.model.unwrap_or(agent.model),
+        reasoning_effort: input.reasoning_effort.unwrap_or(agent.reasoning_effort),
+        approval_policy: input.approval_policy.unwrap_or(agent.approval_policy),
+        agent_id,
+        writable: toolset_requires_writable_path(&toolset),
+        network: toolset_has_effect(&toolset, EffectClass::Network),
+        toolset,
+    })
+    .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
+    let max_spawn_depth = Config::load(&runtime.paths.workspace_root, None)
+        .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?
+        .limits
+        .max_spawn_depth;
+    let result = start_thread_spawn_draft(
+        runtime,
+        &mut store,
+        draft,
+        max_spawn_depth,
+        &approving_actor,
+    )?;
+    let result = match result {
+        ThreadSpawnResult::ApprovalRequired { spawn_id, .. } => decide_thread_spawn(
+            runtime,
+            &spawn_id,
+            ThreadSpawnDecision::Grant {
+                actor: approving_actor,
+            },
+        )?,
+        result => result,
+    };
+    match result {
+        ThreadSpawnResult::Spawned { thread } => Ok(thread.authority.thread_id),
+        ThreadSpawnResult::ApprovalRequired { .. } => Err(ThreadSpawnFailure::Conflict(
+            "approved coordinator spawn remained pending".into(),
+        )),
+        ThreadSpawnResult::Denied { .. } | ThreadSpawnResult::Canceled { .. } => Err(
+            ThreadSpawnFailure::Conflict("approved coordinator spawn was not granted".into()),
+        ),
+    }
+}
+
+fn thread_spawn_rejection(error: ThreadSpawnFailure) -> (String, String) {
+    match error {
+        ThreadSpawnFailure::ShuttingDown => (
+            ERROR_DAEMON_SHUTTING_DOWN.to_string(),
+            "daemon shutdown is already in progress".into(),
+        ),
+        ThreadSpawnFailure::Malformed(reason) => (ERROR_MALFORMED_REQUEST.to_string(), reason),
+        ThreadSpawnFailure::Unregistered(reason) => {
+            (ERROR_WORKSPACE_UNREGISTERED.to_string(), reason)
+        }
+        ThreadSpawnFailure::NotFound(reason) => (ERROR_NOT_FOUND.to_string(), reason),
+        ThreadSpawnFailure::WorkspaceBroken(reason) => (ERROR_WORKSPACE_BROKEN.to_string(), reason),
+        ThreadSpawnFailure::WorkspaceMismatch(reason) => {
+            (ERROR_WORKSPACE_MISMATCH.to_string(), reason)
+        }
+        ThreadSpawnFailure::Authority(error) => (
+            ERROR_THREAD_AUTHORITY_EXCEEDED.to_string(),
+            error.to_string(),
+        ),
+        ThreadSpawnFailure::Overload(reason) => (ERROR_OVERLOAD.to_string(), reason),
+        ThreadSpawnFailure::Conflict(reason) => (ERROR_THREAD_SPAWN_FAILED.to_string(), reason),
+        ThreadSpawnFailure::Persistence => (
+            ERROR_THREAD_SPAWN_FAILED.to_string(),
+            "thread spawn could not be persisted".into(),
+        ),
+    }
 }
 
 fn decide_thread_spawn(
@@ -589,7 +749,7 @@ fn resolve_thread_spawn_inner(
     .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
     match decision {
         ThreadSpawnDecision::Grant { actor } => {
-            read_live_parent(runtime, store, &pending.draft)?;
+            read_live_parent(runtime, store, &pending.draft, pending.max_spawn_depth)?;
             let authority = pending
                 .draft
                 .complete(actor, decided_at_ms)
@@ -672,10 +832,12 @@ fn read_live_parent(
     runtime: &DaemonRuntime,
     store: &ServerStore,
     draft: &ThreadAuthorityDraft,
+    max_spawn_depth: u32,
 ) -> Result<Option<crate::daemon::protocol::ThreadAuthorityRecord>, ThreadSpawnFailure> {
     let Some(parent_thread_id) = draft.parent_thread_id.as_deref() else {
         return Ok(None);
     };
+    validate_spawn_depth(store, parent_thread_id, max_spawn_depth)?;
     let parent = store
         .thread_authority(parent_thread_id)
         .map_err(|_| ThreadSpawnFailure::Persistence)?
@@ -691,6 +853,33 @@ fn read_live_parent(
     }
     validate_child_authority(&parent, draft).map_err(ThreadSpawnFailure::Authority)?;
     Ok(Some(parent))
+}
+
+fn validate_spawn_depth(
+    store: &ServerStore,
+    parent_thread_id: &str,
+    maximum: u32,
+) -> Result<(), ThreadSpawnFailure> {
+    let mut next = Some(parent_thread_id.to_owned());
+    let mut depth = 0_u32;
+    while let Some(thread_id) = next {
+        depth = depth.saturating_add(1);
+        if depth > maximum {
+            return Err(ThreadSpawnFailure::Authority(
+                ThreadAuthorityError::SpawnDepth { maximum },
+            ));
+        }
+        next = store
+            .thread_authority(&thread_id)
+            .map_err(|_| ThreadSpawnFailure::Persistence)?
+            .ok_or_else(|| {
+                ThreadSpawnFailure::NotFound(format!(
+                    "parent thread authority not found: {thread_id}"
+                ))
+            })?
+            .parent_thread_id;
+    }
+    Ok(())
 }
 
 fn handle_thread_list(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
@@ -882,6 +1071,10 @@ fn handle_thread_send(
     let context = ThreadRunContext {
         workspace_root,
         approval_policy: authority.approval_policy,
+        agent_id: authority
+            .agent_id
+            .unwrap_or_else(|| AgentId::new("plato").expect("static agent id is valid")),
+        toolset: authority.toolset,
         turn: turn.clone(),
     };
     let response = start_run(
@@ -1322,6 +1515,8 @@ fn handle_issue_prep_start(
 struct ThreadRunContext {
     workspace_root: PathBuf,
     approval_policy: ThreadApprovalPolicy,
+    agent_id: AgentId,
+    toolset: Vec<String>,
     turn: ThreadTurnBinding,
 }
 
@@ -1462,9 +1657,26 @@ fn start_run(
         cancel: Some(record.cancel.clone()),
         voice_interruption_context: None,
     };
+    let run_agent_id = thread_context
+        .as_ref()
+        .map(|context| context.agent_id.clone());
+    let run_toolset = thread_context
+        .as_ref()
+        .map(|context| context.toolset.clone());
+    let thread_spawn = thread_context
+        .as_ref()
+        .map(|context| model_thread_spawn_handler(runtime.clone(), context.turn.thread_id.clone()));
 
     if wait.unwrap_or(false) {
-        match run_to_completion(runtime, &record, options, event_collector) {
+        match run_to_completion(
+            runtime,
+            &record,
+            options,
+            event_collector,
+            run_agent_id,
+            run_toolset,
+            thread_spawn,
+        ) {
             Ok(_) => Ok(run_start_result(&record)),
             Err(error) => Err(Box::new(Envelope::error(
                 request_id,
@@ -1500,6 +1712,9 @@ fn start_run(
                         &worker_record,
                         options,
                         event_collector,
+                        run_agent_id,
+                        run_toolset,
+                        thread_spawn,
                     );
                 });
             }
@@ -1515,7 +1730,21 @@ fn drive_thread_turn(
     event_collector: thread::JoinHandle<()>,
     driver: ThreadTurnDriver,
 ) {
-    let _ = run_to_completion(&runtime, &record, options, event_collector);
+    let agent_id = Some(driver.context.agent_id.clone());
+    let toolset = Some(driver.context.toolset.clone());
+    let thread_spawn = Some(model_thread_spawn_handler(
+        runtime.clone(),
+        driver.context.turn.thread_id.clone(),
+    ));
+    let _ = run_to_completion(
+        &runtime,
+        &record,
+        options,
+        event_collector,
+        agent_id,
+        toolset,
+        thread_spawn,
+    );
     while let Some(message) = runtime.next_thread_message(&driver.context.turn) {
         let _ = start_run(
             &runtime,
@@ -1540,33 +1769,46 @@ fn run_to_completion(
     record: &RunRecord,
     options: RunOptions,
     event_collector: thread::JoinHandle<()>,
+    agent_id: Option<AgentId>,
+    toolset: Option<Vec<String>>,
+    thread_spawn: Option<ThreadSpawnToolHandler>,
 ) -> AppResult<RunOutcome> {
     #[cfg(test)]
-    let completion = RunCompletion::Published(crate::run_question(options));
-    #[cfg(not(test))]
-    let completion = match crate::app::prepare_run(&options) {
-        Ok((prepared, recorder)) => {
-            let approval_mode = options.approval_mode;
-            match (options.event_sender, options.cancel) {
-                (Some(event_sender), Some(cancel)) => {
-                    RunCompletion::Supervised(Box::new(crate::daemon::run_child::run_supervised(
-                        prepared,
-                        recorder,
-                        approval_mode,
-                        event_sender,
-                        cancel,
-                    )))
-                }
-                (None, _) => RunCompletion::Published(Err(AppError::SupervisedRun(
-                    "daemon run omitted its event transport".into(),
-                ))),
-                (_, None) => RunCompletion::Published(Err(AppError::SupervisedRun(
-                    "daemon run omitted its cancellation token".into(),
-                ))),
-            }
+    let completion = RunCompletion::Published(match (agent_id, toolset, thread_spawn) {
+        (Some(agent_id), Some(toolset), Some(thread_spawn)) => {
+            crate::app::run_question_for_thread(options, agent_id, &toolset, thread_spawn)
         }
-        Err(error) => RunCompletion::Published(Err(error)),
-    };
+        (None, None, None) => crate::run_question(options),
+        _ => Err(AppError::RunFailed(
+            "thread run authority projection is incomplete".into(),
+        )),
+    });
+    #[cfg(not(test))]
+    let completion =
+        match crate::app::prepare_run_for_thread(&options, agent_id, toolset.as_deref()) {
+            Ok((prepared, recorder)) => {
+                let approval_mode = options.approval_mode;
+                match (options.event_sender, options.cancel) {
+                    (Some(event_sender), Some(cancel)) => RunCompletion::Supervised(Box::new(
+                        crate::daemon::run_child::run_supervised(
+                            prepared,
+                            recorder,
+                            approval_mode,
+                            event_sender,
+                            cancel,
+                            thread_spawn,
+                        ),
+                    )),
+                    (None, _) => RunCompletion::Published(Err(AppError::SupervisedRun(
+                        "daemon run omitted its event transport".into(),
+                    ))),
+                    (_, None) => RunCompletion::Published(Err(AppError::SupervisedRun(
+                        "daemon run omitted its cancellation token".into(),
+                    ))),
+                }
+            }
+            Err(error) => RunCompletion::Published(Err(error)),
+        };
     finish_run_after_event_collection(runtime, record, completion, event_collector)
 }
 
@@ -3326,6 +3568,251 @@ mod tests {
         }
     }
 
+    fn register_test_agent(
+        runtime: &DaemonRuntime,
+        id: &str,
+        policy: ThreadApprovalPolicy,
+        toolset: Vec<String>,
+    ) {
+        runtime
+            .paths
+            .server_store()
+            .unwrap()
+            .register_agent(&AgentRecord {
+                id: platonic_core::AgentId::new(id).unwrap(),
+                workspace_id: runtime.paths.workspace_id.clone(),
+                model: "worker-model".into(),
+                reasoning_effort: crate::daemon::protocol::ReasoningEffort::High,
+                approval_policy: policy,
+                toolset,
+                created_at_ms: 1,
+            })
+            .unwrap();
+    }
+
+    fn coordinator_root(runtime: &DaemonRuntime) -> String {
+        std::fs::write(
+            runtime.paths.workspace_root.join("plato.toml"),
+            "[tools]\nenabled = [\"file.read\", \"thread.spawn\"]\n",
+        )
+        .unwrap();
+        let (spawn_id, thread_id) = pending_spawn(
+            start_thread(
+                runtime,
+                None,
+                &runtime.paths.workspace_root,
+                ThreadApprovalPolicy::Prompt,
+            )
+            .unwrap(),
+        );
+        grant_thread(runtime, &spawn_id, "root_approver");
+        thread_id
+    }
+
+    fn model_spawn_input(
+        runtime: &DaemonRuntime,
+        agent_id: &str,
+        toolset: Option<Vec<String>>,
+        approval_policy: Option<ThreadApprovalPolicy>,
+    ) -> ThreadSpawnToolInput {
+        ThreadSpawnToolInput {
+            agent_id: agent_id.into(),
+            cwd: runtime.paths.workspace_root.to_string_lossy().into_owned(),
+            model: None,
+            reasoning_effort: None,
+            approval_policy,
+            toolset,
+        }
+    }
+
+    #[test]
+    fn model_spawn_reuses_durable_admission_and_records_the_approving_actor() {
+        let (_root, runtime) = thread_test_runtime();
+        let parent_thread_id = coordinator_root(&runtime);
+        register_test_agent(
+            &runtime,
+            "worker",
+            ThreadApprovalPolicy::Prompt,
+            vec!["file.read".into()],
+        );
+
+        let output = model_thread_spawn(
+            &runtime,
+            &parent_thread_id,
+            model_spawn_input(&runtime, "worker", None, None),
+            "daemon".into(),
+        )
+        .unwrap();
+        let child_thread_id = match output {
+            ThreadSpawnToolOutput::Spawned { thread_id } => thread_id,
+            output => panic!("expected spawned worker, got {output:?}"),
+        };
+
+        let store = runtime.paths.server_store().unwrap();
+        let child = store.thread_authority(&child_thread_id).unwrap().unwrap();
+        assert_eq!(
+            child.parent_thread_id.as_deref(),
+            Some(parent_thread_id.as_str())
+        );
+        assert_eq!(child.spawning_actor, "daemon");
+        assert_eq!(
+            child.agent_id,
+            Some(platonic_core::AgentId::new("worker").unwrap())
+        );
+        assert_eq!(child.model, "worker-model");
+        assert_eq!(child.toolset, ["file.read"]);
+        assert!(!child.granted_paths[0].writable);
+        assert!(!child.network);
+        assert!(runtime.thread_is_loaded(&child_thread_id));
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&runtime.paths.server_db_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT decision, actor FROM thread_spawn_approvals WHERE thread_id = ?1",
+                    [&child_thread_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            ("granted".into(), "daemon".into())
+        );
+    }
+
+    #[test]
+    fn model_spawn_returns_typed_rejections_for_authority_escalation() {
+        let (_root, runtime) = thread_test_runtime();
+        let parent_thread_id = coordinator_root(&runtime);
+        register_test_agent(
+            &runtime,
+            "broad-worker",
+            ThreadApprovalPolicy::Prompt,
+            vec![
+                "file.read".into(),
+                "file.write".into(),
+                "web.fetch".into(),
+                "thread.spawn".into(),
+            ],
+        );
+        register_test_agent(
+            &runtime,
+            "narrow-worker",
+            ThreadApprovalPolicy::Prompt,
+            vec!["file.read".into()],
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        for (label, input) in [
+            (
+                "parent toolset",
+                model_spawn_input(
+                    &runtime,
+                    "broad-worker",
+                    Some(vec!["file.read".into(), "web.fetch".into()]),
+                    None,
+                ),
+            ),
+            (
+                "parent policy",
+                model_spawn_input(
+                    &runtime,
+                    "broad-worker",
+                    Some(vec!["file.read".into()]),
+                    Some(ThreadApprovalPolicy::Yolo),
+                ),
+            ),
+            (
+                "agent toolset",
+                model_spawn_input(
+                    &runtime,
+                    "narrow-worker",
+                    Some(vec!["file.write".into()]),
+                    None,
+                ),
+            ),
+            (
+                "cwd",
+                ThreadSpawnToolInput {
+                    cwd: outside.path().to_string_lossy().into_owned(),
+                    ..model_spawn_input(
+                        &runtime,
+                        "broad-worker",
+                        Some(vec!["file.read".into()]),
+                        None,
+                    )
+                },
+            ),
+        ] {
+            let output =
+                model_thread_spawn(&runtime, &parent_thread_id, input, "daemon".into()).unwrap();
+            assert!(
+                matches!(
+                    output,
+                    ThreadSpawnToolOutput::Rejected { ref code, .. }
+                        if code == ERROR_THREAD_AUTHORITY_EXCEEDED.as_str()
+                ),
+                "{label} escalation was not rejected: {output:?}"
+            );
+        }
+        assert_eq!(
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .thread_authorities()
+                .unwrap()
+                .len(),
+            1,
+            "typed escalation rejections must not create child authority"
+        );
+
+        let first_child = match model_thread_spawn(
+            &runtime,
+            &parent_thread_id,
+            model_spawn_input(
+                &runtime,
+                "broad-worker",
+                Some(vec!["file.read".into(), "thread.spawn".into()]),
+                None,
+            ),
+            "daemon".into(),
+        )
+        .unwrap()
+        {
+            ThreadSpawnToolOutput::Spawned { thread_id } => thread_id,
+            output => panic!("expected first bounded child, got {output:?}"),
+        };
+        let depth = model_thread_spawn(
+            &runtime,
+            &first_child,
+            model_spawn_input(
+                &runtime,
+                "broad-worker",
+                Some(vec!["file.read".into()]),
+                None,
+            ),
+            "daemon".into(),
+        )
+        .unwrap();
+        assert!(matches!(
+            depth,
+            ThreadSpawnToolOutput::Rejected { code, reason }
+                if code == ERROR_THREAD_AUTHORITY_EXCEEDED.as_str()
+                    && reason.contains("spawn depth")
+        ));
+        assert_eq!(
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .thread_authorities()
+                .unwrap()
+                .len(),
+            2,
+            "depth rejection must not create a grandchild authority"
+        );
+    }
+
     fn stop_thread(runtime: &DaemonRuntime, thread_id: &str, actor: &str) -> Envelope {
         handle_line(
             runtime,
@@ -3782,6 +4269,7 @@ IFS= read -r _
                 ApprovalMode::Deny { actor: "test" },
                 event_sender,
                 worker_cancel,
+                None,
                 SupervisedTestLaunch {
                     executable: fixture,
                     ready_child: ready_sender,
@@ -5296,6 +5784,7 @@ IFS= read -r _
                 ApprovalMode::Deny { actor: "test" },
                 event_sender,
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
                 SupervisedTestLaunch {
                     executable: fixture,
                     ready_child: ready_sender,

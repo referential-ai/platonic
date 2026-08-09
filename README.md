@@ -65,6 +65,12 @@ max_turns = 8
 enabled = ["file.read", "file.list", "file.write", "file.edit", "shell.exec", "web.fetch"]
 ```
 
+`thread.spawn` is available but not enabled by default. Add it only to a
+coordinator's resolved toolset. The server-owned `limits.max_spawn_depth`
+defaults to `1`, must be positive, and may be set only by `--config`,
+`PLATO_CONFIG`, or user config; a workspace `plato.toml` cannot raise or lower
+the host-wide bound.
+
 OpenAI-compatible direct OpenAI config remains available:
 
 ```toml
@@ -294,6 +300,17 @@ stdin. A child spawn is evaluated by its loaded parent's immutable policy:
 effect. A child cwd must remain within its parent's granted paths, its toolset
 must be a subset of the parent's, and its policy can never be more permissive.
 Every final approval decision and actor is stored in the server store.
+
+A coordinator with `thread.spawn` in its immutable resolved toolset can ask the
+model to dispatch a configured agent by id, with optional narrowing overrides
+for model, reasoning effort, approval policy, and toolset. The proposal has the
+`WorkspaceWrite` effect and traverses the normal tool policy and approval gate.
+After approval, the server reuses the same durable spawn admission path as the
+typed client command; the tool result reports the durable worker thread id and
+is wrapped as untrusted provider input. Target-agent defaults and the parent's
+toolset, policy, cwd/path grants, network grant, and server spawn-depth bound
+are all ceilings. An attempted expansion returns a typed
+`thread_authority_exceeded` tool result and creates no child authority.
 
 A grant atomically stores the twelve immutable authority fields before the
 thread becomes loaded. The current compatibility spawn resolves agent `plato`,

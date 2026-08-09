@@ -14,6 +14,7 @@ const DEFAULT_OPENROUTER_MODEL: &str = "~openai/gpt-latest";
 const DEFAULT_TOKEN_BUDGET: u32 = 4_000;
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 1_024;
 const DEFAULT_MAX_TURNS: u32 = 8;
+const DEFAULT_MAX_SPAWN_DEPTH: u32 = 1;
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 120_000;
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -22,6 +23,7 @@ const PLATO_CONFIG_ENV: &str = "PLATO_CONFIG";
 const WORKSPACE_PROVIDER_OVERRIDE_ERROR: &str = "workspace plato.toml cannot set provider.api_key_env or provider.base_url; use --config, PLATO_CONFIG, or user config";
 const WORKSPACE_GATEWAY_ERROR: &str =
     "workspace plato.toml cannot set [gateway]; use --config, PLATO_CONFIG, or user config";
+const WORKSPACE_SPAWN_DEPTH_ERROR: &str = "workspace plato.toml cannot set limits.max_spawn_depth; use --config, PLATO_CONFIG, or user config";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolvedConfigPath {
@@ -87,6 +89,7 @@ pub struct LimitsConfig {
     pub token_budget: u32,
     pub max_output_tokens: u32,
     pub max_turns: u32,
+    pub max_spawn_depth: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -138,6 +141,7 @@ struct RawLimitsConfig {
     token_budget: Option<u32>,
     max_output_tokens: Option<u32>,
     max_turns: Option<u32>,
+    max_spawn_depth: Option<u32>,
 }
 
 #[derive(Default, Debug, Deserialize)]
@@ -159,6 +163,14 @@ impl Config {
         let raw = Self::read_raw(resolved.path())?;
         if matches!(resolved, ResolvedConfigPath::Workspace(_)) && raw.gateway.is_some() {
             return Err(AppError::Config(WORKSPACE_GATEWAY_ERROR.into()));
+        }
+        if matches!(resolved, ResolvedConfigPath::Workspace(_))
+            && raw
+                .limits
+                .as_ref()
+                .is_some_and(|limits| limits.max_spawn_depth.is_some())
+        {
+            return Err(AppError::Config(WORKSPACE_SPAWN_DEPTH_ERROR.into()));
         }
         if matches!(resolved, ResolvedConfigPath::Workspace(_))
             && raw.provider.as_ref().is_some_and(|provider| {
@@ -193,6 +205,10 @@ impl Config {
         let max_turns = positive(
             limits.max_turns.unwrap_or(DEFAULT_MAX_TURNS),
             "limits.max_turns",
+        )?;
+        let max_spawn_depth = positive(
+            limits.max_spawn_depth.unwrap_or(DEFAULT_MAX_SPAWN_DEPTH),
+            "limits.max_spawn_depth",
         )?;
         let connect_timeout_ms = positive(
             provider
@@ -244,6 +260,7 @@ impl Config {
                 token_budget,
                 max_output_tokens,
                 max_turns,
+                max_spawn_depth,
             },
             tools: ToolsConfig { enabled },
             gateway,
@@ -269,6 +286,7 @@ impl Default for Config {
                 token_budget: DEFAULT_TOKEN_BUDGET,
                 max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
                 max_turns: DEFAULT_MAX_TURNS,
+                max_spawn_depth: DEFAULT_MAX_SPAWN_DEPTH,
             },
             tools: ToolsConfig {
                 enabled: default_enabled_tools(),
@@ -516,6 +534,7 @@ mod tests {
             DEFAULT_STREAM_IDLE_TIMEOUT_MS
         );
         assert_eq!(config.limits.max_turns, 8);
+        assert_eq!(config.limits.max_spawn_depth, 1);
         assert!(config.gateway.is_none());
         assert_eq!(
             config.tools.enabled,
@@ -724,6 +743,29 @@ owner_user_ids = [42]
     }
 
     #[test]
+    fn spawn_depth_is_authorized_config_only() {
+        let root = tempfile::tempdir().unwrap();
+        let authorized_path = root.path().join("authorized.toml");
+        std::fs::write(&authorized_path, "[limits]\nmax_spawn_depth = 3\n").unwrap();
+        let authorized = ResolvedConfigPath::Authorized(authorized_path);
+        assert_eq!(
+            Config::load_resolved(Some(&authorized))
+                .unwrap()
+                .limits
+                .max_spawn_depth,
+            3
+        );
+
+        let workspace_path = root.path().join("plato.toml");
+        std::fs::write(&workspace_path, "[limits]\nmax_spawn_depth = 2\n").unwrap();
+        let workspace = ResolvedConfigPath::Workspace(workspace_path);
+        assert!(matches!(
+            Config::load_resolved(Some(&workspace)),
+            Err(AppError::Config(message)) if message == WORKSPACE_SPAWN_DEPTH_ERROR
+        ));
+    }
+
+    #[test]
     fn auto_workspace_config_allows_other_fields() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -831,6 +873,7 @@ owner_user_ids = [42]
                 token_budget: Some(0),
                 max_output_tokens: None,
                 max_turns: None,
+                max_spawn_depth: None,
             }),
             tools: None,
             gateway: None,
@@ -847,6 +890,7 @@ owner_user_ids = [42]
                 token_budget: None,
                 max_output_tokens: Some(0),
                 max_turns: None,
+                max_spawn_depth: None,
             }),
             tools: None,
             gateway: None,
@@ -882,6 +926,7 @@ owner_user_ids = [42]
                 token_budget: None,
                 max_output_tokens: None,
                 max_turns: Some(0),
+                max_spawn_depth: None,
             }),
             tools: None,
             gateway: None,
@@ -898,12 +943,30 @@ owner_user_ids = [42]
                 token_budget: None,
                 max_output_tokens: None,
                 max_turns: Some(3),
+                max_spawn_depth: None,
             }),
             tools: None,
             gateway: None,
         };
 
         assert_eq!(Config::from_raw(raw).unwrap().limits.max_turns, 3);
+    }
+
+    #[test]
+    fn rejects_zero_max_spawn_depth() {
+        let raw = RawConfig {
+            provider: None,
+            limits: Some(RawLimitsConfig {
+                token_budget: None,
+                max_output_tokens: None,
+                max_turns: None,
+                max_spawn_depth: Some(0),
+            }),
+            tools: None,
+            gateway: None,
+        };
+
+        assert!(matches!(Config::from_raw(raw), Err(AppError::Config(_))));
     }
 
     #[test]
