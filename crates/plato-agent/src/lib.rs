@@ -21,6 +21,7 @@ pub use run::{
     ensure_server, ensure_server_interactive, run_question,
 };
 pub use voice::{
-    CapturedRunOutcome, NarratedRunOutcome, NarratedSentenceReport, NarrationReport, VoiceError,
-    VoiceRunError, VoiceSession, VoiceSessionShutdown,
+    CapturedRunOutcome, NarratedRunOutcome, NarratedSentenceReport, NarrationReport,
+    VoiceActivation, VoiceActivationChange, VoiceActivationError, VoiceConfig, VoiceConfigError,
+    VoiceError, VoiceGrant, VoiceRunError, VoiceSession, VoiceSessionShutdown,
 };

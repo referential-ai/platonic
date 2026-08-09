@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, Write},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -13,23 +14,258 @@ use std::{
 
 use plato_audio::{
     BargeInMetrics, CaptureConfig, CaptureDeviceInfo, CaptureError, CaptureMetrics, CapturePartial,
-    CaptureReport, CaptureWorker, CaptureWorkerShutdown, KokoroConfig, KokoroMetrics,
-    KokoroMetricsReader, KokoroProvenance, KokoroSynthesizer, OrtRuntime, OrtRuntimeError,
-    OrtRuntimeMetrics, OrtRuntimeMetricsReader, PlaybackConfig, PlaybackDeviceInfo,
-    PlaybackMetrics, PlaybackReport, Sentence, SentenceCutter, SileroConfig, SileroMetrics,
-    SileroMetricsReader, SileroProvenance, SileroVad, SpeechSource, SpokenInterruption, SttError,
-    SynthError, SynthWorker, SynthWorkerError, SynthWorkerShutdown, SynthWorkerStartError,
-    Transcript, VadError, WhisperConfig, WhisperMetrics, WhisperMetricsReader, WhisperProvenance,
-    WhisperRecognizer,
+    CaptureReport, CaptureWorker, CaptureWorkerShutdown, InputDeviceSelection, KokoroConfig,
+    KokoroMetrics, KokoroMetricsReader, KokoroProvenance, KokoroSynthesizer, OrtRuntime,
+    OrtRuntimeError, OrtRuntimeMetrics, OrtRuntimeMetricsReader, OutputDeviceSelection,
+    PlaybackConfig, PlaybackDeviceInfo, PlaybackMetrics, PlaybackReport, Sentence, SentenceCutter,
+    SileroConfig, SileroMetrics, SileroMetricsReader, SileroProvenance, SileroVad, SpeechSource,
+    SpokenInterruption, SttError, SynthError, SynthWorker, SynthWorkerError, SynthWorkerShutdown,
+    SynthWorkerStartError, Transcript, VadError, WhisperConfig, WhisperMetrics,
+    WhisperMetricsReader, WhisperProvenance, WhisperRecognizer,
 };
 use platonic_core::{HarnessEvent, RunId, TurnId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
     AppError, AssistantDeltaEvent, RunEvent, RunOptions, RunOutcome, VoiceEvent, VoiceEventEnvelope,
 };
+
+/// Fail-closed diagnostics for the one client-owned voice configuration.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum VoiceConfigError {
+    /// The trusted document did not define voice at all.
+    #[error("voice configuration is unavailable: missing [voice]")]
+    MissingTable,
+    /// One required explicit artifact path was absent.
+    #[error("voice configuration is incomplete: missing voice.{field}")]
+    MissingField {
+        /// Exact field name from the voice table.
+        field: &'static str,
+    },
+    /// An explicit path or device identifier was empty.
+    #[error("voice configuration field voice.{field} must not be empty")]
+    EmptyField {
+        /// Exact field name from the voice table.
+        field: &'static str,
+    },
+    /// The trusted TOML document or voice table had the wrong shape.
+    #[error("voice configuration is invalid: {reason}")]
+    InvalidDocument {
+        /// TOML diagnostic; no file contents are included.
+        reason: String,
+    },
+}
+
+/// Explicit local model paths and device choices for one client voice session.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VoiceConfig {
+    kokoro: KokoroConfig,
+    whisper: WhisperConfig,
+    silero: SileroConfig,
+    capture: CaptureConfig,
+    playback: PlaybackConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct VoiceConfigDocument {
+    voice: Option<RawVoiceConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawVoiceConfig {
+    kokoro_model: Option<String>,
+    whisper_model: Option<String>,
+    silero_model: Option<String>,
+    capture_device: Option<String>,
+    playback_device: Option<String>,
+}
+
+impl VoiceConfig {
+    /// Parses only caller-vetted TOML text; this performs no discovery or environment lookup.
+    pub fn from_trusted_toml(document: &str, config_dir: &Path) -> Result<Self, VoiceConfigError> {
+        let document = toml::from_str::<VoiceConfigDocument>(document).map_err(|error| {
+            VoiceConfigError::InvalidDocument {
+                reason: error.to_string(),
+            }
+        })?;
+        let raw = document.voice.ok_or(VoiceConfigError::MissingTable)?;
+        let kokoro_model = required_path(raw.kokoro_model, "kokoro_model", config_dir)?;
+        let whisper_model = required_path(raw.whisper_model, "whisper_model", config_dir)?;
+        let silero_model = required_path(raw.silero_model, "silero_model", config_dir)?;
+        let capture =
+            CaptureConfig::for_device(match optional_id(raw.capture_device, "capture_device")? {
+                Some(device) => InputDeviceSelection::Id(device),
+                None => InputDeviceSelection::Default,
+            });
+        let playback = PlaybackConfig::for_device(
+            match optional_id(raw.playback_device, "playback_device")? {
+                Some(device) => OutputDeviceSelection::Id(device),
+                None => OutputDeviceSelection::Default,
+            },
+        );
+        Ok(Self {
+            kokoro: KokoroConfig::from_model_dir(kokoro_model),
+            whisper: WhisperConfig::new(whisper_model),
+            silero: SileroConfig::new(silero_model),
+            capture,
+            playback,
+        })
+    }
+
+    /// Returns the exact local Kokoro artifact selection.
+    pub fn kokoro(&self) -> &KokoroConfig {
+        &self.kokoro
+    }
+
+    /// Returns the exact local Whisper artifact selection.
+    pub fn whisper(&self) -> &WhisperConfig {
+        &self.whisper
+    }
+
+    /// Returns the exact local Silero artifact selection.
+    pub fn silero(&self) -> &SileroConfig {
+        &self.silero
+    }
+
+    /// Returns the explicit or host-default capture-device selection.
+    pub fn capture(&self) -> &CaptureConfig {
+        &self.capture
+    }
+
+    /// Returns the explicit or host-default playback-device selection.
+    pub fn playback(&self) -> &PlaybackConfig {
+        &self.playback
+    }
+}
+
+fn required_path(
+    value: Option<String>,
+    field: &'static str,
+    config_dir: &Path,
+) -> Result<PathBuf, VoiceConfigError> {
+    let value = value.ok_or(VoiceConfigError::MissingField { field })?;
+    let value = nonempty(value, field)?;
+    let path = PathBuf::from(value);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        config_dir.join(path)
+    })
+}
+
+fn optional_id(
+    value: Option<String>,
+    field: &'static str,
+) -> Result<Option<String>, VoiceConfigError> {
+    value.map(|value| nonempty(value, field)).transpose()
+}
+
+fn nonempty(value: String, field: &'static str) -> Result<String, VoiceConfigError> {
+    if value.trim().is_empty() {
+        Err(VoiceConfigError::EmptyField { field })
+    } else {
+        Ok(value)
+    }
+}
+
+/// The one local user decision accepted before a client opens audio devices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VoiceGrant {
+    /// The user explicitly allowed voice for this client session.
+    Granted,
+    /// The user declined voice; no model or device may be opened.
+    Denied,
+}
+
+/// Observable result of an idempotent client voice transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VoiceActivationChange {
+    /// The explicit grant opened one new voice session.
+    Enabled,
+    /// Voice was already enabled and no second session was opened.
+    AlreadyEnabled,
+    /// The explicit grant was denied and voice remained off.
+    Denied,
+    /// One live voice session was stopped and closed.
+    Disabled,
+    /// Voice was already off and no teardown ran.
+    AlreadyDisabled,
+}
+
+/// Failures while validating configuration or opening/stopping client audio.
+#[derive(Debug, Error)]
+pub enum VoiceActivationError {
+    /// The explicit client configuration was absent, incomplete, or malformed.
+    #[error(transparent)]
+    Config(#[from] VoiceConfigError),
+    /// The existing concrete voice session could not open or stop cleanly.
+    #[error(transparent)]
+    Session(#[from] VoiceError),
+}
+
+/// Client-session-local voice activation and device ownership.
+pub struct VoiceActivation {
+    config: Result<VoiceConfig, VoiceConfigError>,
+    session: Option<VoiceSession>,
+}
+
+impl VoiceActivation {
+    /// Creates an off session from caller-vetted TOML without discovering any config or model.
+    pub fn from_trusted_toml(document: &str, config_dir: &Path) -> Self {
+        Self {
+            config: VoiceConfig::from_trusted_toml(document, config_dir),
+            session: None,
+        }
+    }
+
+    /// Reports whether this client currently owns open voice devices.
+    pub fn is_enabled(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// Opens one concrete voice session only after the explicit local grant.
+    pub fn enable(
+        &mut self,
+        grant: VoiceGrant,
+    ) -> Result<VoiceActivationChange, VoiceActivationError> {
+        if self.session.is_some() {
+            return Ok(VoiceActivationChange::AlreadyEnabled);
+        }
+        if grant == VoiceGrant::Denied {
+            return Ok(VoiceActivationChange::Denied);
+        }
+        let config = self.config.as_ref().map_err(Clone::clone)?;
+        let session = VoiceSession::open_with_capture(
+            config.kokoro.clone(),
+            config.playback.clone(),
+            config.whisper.clone(),
+            config.silero.clone(),
+            config.capture.clone(),
+        )?;
+        self.session = Some(session);
+        Ok(VoiceActivationChange::Enabled)
+    }
+
+    /// Revokes the grant and stops, drains, joins, and closes at most one session.
+    pub fn disable(&mut self) -> Result<VoiceActivationChange, VoiceActivationError> {
+        let Some(mut session) = self.session.take() else {
+            return Ok(VoiceActivationChange::AlreadyDisabled);
+        };
+        let _ = session.close()?;
+        Ok(VoiceActivationChange::Disabled)
+    }
+}
+
+impl Drop for VoiceActivation {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            let _ = session.close();
+        }
+    }
+}
 
 /// Root composition failures while interpreting existing run events.
 #[derive(Debug, Error)]
@@ -273,16 +509,20 @@ impl VoiceSession {
             .barge_in_metrics()
     }
 
-    /// Closes admission, drains accepted audio, and joins the synth worker.
-    pub fn shutdown(mut self) -> Result<VoiceSessionShutdown, VoiceError> {
+    fn close(&mut self) -> Result<Option<VoiceSessionShutdown>, VoiceError> {
+        let Some(worker) = self.worker.take() else {
+            return Ok(None);
+        };
         let capture = self.capture.take().map(CaptureWorker::shutdown);
-        let synthesis = self
-            .worker
-            .take()
-            .ok_or(VoiceError::SessionClosed)?
+        let synthesis = worker
             .shutdown()
             .map_err(|failure| VoiceError::Worker(SynthWorkerError::Failed(failure)))?;
-        Ok(VoiceSessionShutdown { capture, synthesis })
+        Ok(Some(VoiceSessionShutdown { capture, synthesis }))
+    }
+
+    /// Closes admission, drains accepted audio, and joins the synth worker.
+    pub fn shutdown(mut self) -> Result<VoiceSessionShutdown, VoiceError> {
+        self.close()?.ok_or(VoiceError::SessionClosed)
     }
 
     /// Presents replaceable partials, commits one final question, then starts one run.
@@ -499,6 +739,12 @@ impl VoiceSession {
             })
             .collect();
         Ok(outcome)
+    }
+}
+
+impl Drop for VoiceSession {
+    fn drop(&mut self) {
+        let _ = self.close();
     }
 }
 
@@ -989,6 +1235,130 @@ mod timing_tests;
 mod tests {
     use super::*;
     use platonic_core::{Message, MessageRole, RecordedEvent};
+
+    #[test]
+    fn trusted_voice_config_resolves_exact_artifacts_and_devices() {
+        let config = VoiceConfig::from_trusted_toml(
+            r#"
+[provider]
+model = "ignored-by-client-voice"
+
+[voice]
+kokoro_model = "models/kokoro"
+whisper_model = "models/whisper.bin"
+silero_model = "/opt/models/silero.onnx"
+capture_device = "cpal:input-7"
+playback_device = "cpal:output-9"
+"#,
+            Path::new("/trusted/config"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.kokoro().model_path(),
+            Path::new("/trusted/config/models/kokoro/model.onnx")
+        );
+        assert_eq!(
+            config.whisper().model_path(),
+            Path::new("/trusted/config/models/whisper.bin")
+        );
+        assert_eq!(
+            config.silero().model_path(),
+            Path::new("/opt/models/silero.onnx")
+        );
+        assert_eq!(
+            config.capture().device(),
+            &InputDeviceSelection::Id("cpal:input-7".to_owned())
+        );
+        assert_eq!(
+            config.playback().device(),
+            &OutputDeviceSelection::Id("cpal:output-9".to_owned())
+        );
+    }
+
+    #[test]
+    fn voice_config_is_typed_and_fail_closed_for_absent_or_incomplete_input() {
+        assert_eq!(
+            VoiceConfig::from_trusted_toml("[provider]\nmodel = 'gpt-test'", Path::new("/tmp"))
+                .unwrap_err(),
+            VoiceConfigError::MissingTable
+        );
+
+        let cases = [
+            (
+                "kokoro_model",
+                "[voice]\nwhisper_model='w'\nsilero_model='s'\n",
+            ),
+            (
+                "whisper_model",
+                "[voice]\nkokoro_model='k'\nsilero_model='s'\n",
+            ),
+            (
+                "silero_model",
+                "[voice]\nkokoro_model='k'\nwhisper_model='w'\n",
+            ),
+        ];
+        for (field, document) in cases {
+            assert_eq!(
+                VoiceConfig::from_trusted_toml(document, Path::new("/tmp")).unwrap_err(),
+                VoiceConfigError::MissingField { field }
+            );
+        }
+
+        assert_eq!(
+            VoiceConfig::from_trusted_toml(
+                "[voice]\nkokoro_model='k'\nwhisper_model='w'\nsilero_model='  '\n",
+                Path::new("/tmp"),
+            )
+            .unwrap_err(),
+            VoiceConfigError::EmptyField {
+                field: "silero_model"
+            }
+        );
+        assert!(matches!(
+            VoiceConfig::from_trusted_toml(
+                "[voice]\nkokoro_model='k'\nwhisper_model='w'\nsilero_model='s'\nauto_download=true\n",
+                Path::new("/tmp"),
+            ),
+            Err(VoiceConfigError::InvalidDocument { .. })
+        ));
+    }
+
+    #[test]
+    fn omitted_devices_use_host_defaults_without_discovery() {
+        let config = VoiceConfig::from_trusted_toml(
+            "[voice]\nkokoro_model='k'\nwhisper_model='w'\nsilero_model='s'\n",
+            Path::new("/trusted"),
+        )
+        .unwrap();
+
+        assert_eq!(config.capture().device(), &InputDeviceSelection::Default);
+        assert_eq!(config.playback().device(), &OutputDeviceSelection::Default);
+    }
+
+    #[test]
+    fn activation_starts_off_and_denial_or_missing_config_never_opens_devices() {
+        let mut activation = VoiceActivation::from_trusted_toml("", Path::new("/trusted"));
+
+        assert!(!activation.is_enabled());
+        assert_eq!(
+            activation.enable(VoiceGrant::Denied).unwrap(),
+            VoiceActivationChange::Denied
+        );
+        assert!(!activation.is_enabled());
+        assert!(matches!(
+            activation.enable(VoiceGrant::Granted),
+            Err(VoiceActivationError::Config(VoiceConfigError::MissingTable))
+        ));
+        assert_eq!(
+            activation.disable().unwrap(),
+            VoiceActivationChange::AlreadyDisabled
+        );
+        assert_eq!(
+            activation.disable().unwrap(),
+            VoiceActivationChange::AlreadyDisabled
+        );
+    }
 
     #[test]
     fn options_for_transcript_replaces_only_the_question_and_requires_a_final_transcript() {
