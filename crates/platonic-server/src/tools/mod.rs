@@ -845,6 +845,27 @@ fn shell_child_env(provider_api_key_env: Option<&str>) -> Vec<(String, String)> 
     shell_child_env_from(env::vars(), provider_api_key_env)
 }
 
+pub(crate) fn supervised_run_child_env(
+    provider_api_key_env: &str,
+) -> AppResult<Vec<(String, String)>> {
+    supervised_run_child_env_from(env::vars(), provider_api_key_env)
+}
+
+fn supervised_run_child_env_from(
+    vars: impl IntoIterator<Item = (String, String)>,
+    provider_api_key_env: &str,
+) -> AppResult<Vec<(String, String)>> {
+    let vars = vars.into_iter().collect::<Vec<_>>();
+    let provider_api_key = vars
+        .iter()
+        .find(|(name, _)| shell_env_names_equal(provider_api_key_env, name))
+        .map(|(_, value)| value.clone())
+        .ok_or_else(|| AppError::MissingApiKey(provider_api_key_env.into()))?;
+    let mut child_env = shell_child_env_from(vars, Some(provider_api_key_env));
+    child_env.push((provider_api_key_env.into(), provider_api_key));
+    Ok(child_env)
+}
+
 fn shell_child_env_from(
     vars: impl IntoIterator<Item = (String, String)>,
     provider_api_key_env: Option<&str>,
@@ -2016,6 +2037,130 @@ mod tests {
                 ("HOME".into(), "/home/user".into()),
                 ("RUSTUP_HOME".into(), "/rustup".into())
             ]
+        );
+    }
+
+    #[test]
+    fn supervised_run_child_env_keeps_baseline_and_exact_configured_provider() {
+        let mut vars = SHELL_ENV_ALLOWLIST
+            .iter()
+            .map(|name| ((*name).into(), format!("baseline-{name}")))
+            .collect::<Vec<_>>();
+        #[cfg(windows)]
+        vars.extend(
+            WINDOWS_SHELL_ENV_ALLOWLIST
+                .iter()
+                .map(|name| ((*name).into(), format!("baseline-{name}"))),
+        );
+        vars.extend([
+            (
+                "PLATONIC_CUSTOM_PROVIDER".into(),
+                "provider-sentinel".into(),
+            ),
+            ("OPENAI_API_KEY".into(), "openai-sentinel".into()),
+            ("GITHUB_TOKEN".into(), "github-sentinel".into()),
+            ("AWS_ACCESS_KEY_ID".into(), "aws-id-sentinel".into()),
+            ("AWS_SECRET_ACCESS_KEY".into(), "aws-secret-sentinel".into()),
+            (
+                "GOOGLE_APPLICATION_CREDENTIALS".into(),
+                "google-sentinel".into(),
+            ),
+            ("AZURE_CLIENT_SECRET".into(), "azure-sentinel".into()),
+            ("NPM_TOKEN".into(), "npm-sentinel".into()),
+            (
+                "CARGO_REGISTRIES_CRATES_IO_TOKEN".into(),
+                "cargo-sentinel".into(),
+            ),
+            ("SSH_AUTH_SOCK".into(), "/tmp/agent-sentinel".into()),
+            ("UNKNOWN_PARENT_SETTING".into(), "unknown-sentinel".into()),
+        ]);
+
+        let env = supervised_run_child_env_from(vars, "PLATONIC_CUSTOM_PROVIDER").unwrap();
+        let mut expected = SHELL_ENV_ALLOWLIST
+            .iter()
+            .map(|name| ((*name).into(), format!("baseline-{name}")))
+            .collect::<Vec<_>>();
+        #[cfg(windows)]
+        expected.extend(
+            WINDOWS_SHELL_ENV_ALLOWLIST
+                .iter()
+                .map(|name| ((*name).into(), format!("baseline-{name}"))),
+        );
+        expected.push((
+            "PLATONIC_CUSTOM_PROVIDER".into(),
+            "provider-sentinel".into(),
+        ));
+
+        assert_eq!(env, expected);
+    }
+
+    #[test]
+    fn supervised_run_child_env_fails_typed_when_configured_provider_is_missing() {
+        let error = supervised_run_child_env_from(
+            [("PATH".into(), "/bin".into())],
+            "PLATONIC_MISSING_PROVIDER",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::MissingApiKey(name) if name == "PLATONIC_MISSING_PROVIDER"
+        ));
+    }
+
+    #[test]
+    fn supervised_run_child_env_injects_allowlisted_provider_name_once() {
+        let env = supervised_run_child_env_from(
+            [
+                ("PATH".into(), "/runtime-and-provider".into()),
+                ("HOME".into(), "/home/user".into()),
+            ],
+            "PATH",
+        )
+        .unwrap();
+
+        assert_eq!(
+            env,
+            [
+                ("HOME".into(), "/home/user".into()),
+                ("PATH".into(), "/runtime-and-provider".into())
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervised_run_child_env_matches_unix_provider_names_case_sensitively() {
+        let error = supervised_run_child_env_from(
+            [(
+                "Platonic_Custom_Provider".into(),
+                "provider-sentinel".into(),
+            )],
+            "PLATONIC_CUSTOM_PROVIDER",
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, AppError::MissingApiKey(_)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn supervised_run_child_env_matches_windows_provider_names_case_insensitively() {
+        let env = supervised_run_child_env_from(
+            [(
+                "Platonic_Custom_Provider".into(),
+                "provider-sentinel".into(),
+            )],
+            "PLATONIC_CUSTOM_PROVIDER",
+        )
+        .unwrap();
+
+        assert_eq!(
+            env,
+            [(
+                "PLATONIC_CUSTOM_PROVIDER".into(),
+                "provider-sentinel".into()
+            )]
         );
     }
 
