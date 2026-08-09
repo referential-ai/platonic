@@ -1333,7 +1333,9 @@ fn read_run_from(
 ) -> AppResult<Vec<RecordedEvent>> {
     let jsonl_path = run_jsonl_path(sqlite_path, run_id)?;
     let records = if jsonl_path.exists() {
-        read_records(&jsonl_path)?
+        let records = read_records(&jsonl_path)?;
+        validate_record_run_ids(&records, run_id)?;
+        records
     } else {
         read_run_records_from(connection, run_id)?
     };
@@ -1342,6 +1344,19 @@ fn read_run_from(
     } else {
         Ok(records)
     }
+}
+
+fn validate_record_run_ids(records: &[RecordedEvent], selected_run_id: &str) -> AppResult<()> {
+    for record in records {
+        let actual = record.event.run_id().as_str();
+        if actual != selected_run_id {
+            return Err(AppError::Core(platonic_core::Error::RunIdMismatch {
+                expected: selected_run_id.into(),
+                actual: actual.into(),
+            }));
+        }
+    }
+    Ok(())
 }
 
 fn read_run_records_from(connection: &Connection, run_id: &str) -> AppResult<Vec<RecordedEvent>> {
@@ -2242,13 +2257,7 @@ fn read_ledger_lines(path: &Path) -> AppResult<Vec<PersistedLedgerLine>> {
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |index| index + 1);
-    let mut lines = parse_ledger_lines(&bytes[..committed_len])?;
-    if committed_len < bytes.len()
-        && serde_json::from_slice::<serde_json::Value>(&bytes[committed_len..]).is_ok()
-    {
-        lines.append(&mut parse_ledger_lines(&bytes[committed_len..])?);
-    }
-    Ok(lines)
+    parse_ledger_lines(&bytes[..committed_len])
 }
 
 fn validate_voice_envelopes(envelopes: &[VoiceEventEnvelope]) -> AppResult<()> {
@@ -2259,6 +2268,12 @@ fn validate_voice_envelopes(envelopes: &[VoiceEventEnvelope]) -> AppResult<()> {
             let expected = u64::try_from(index).map_err(|_| {
                 AppError::VoiceEventContract("voice event sequence overflowed u64".into())
             })?;
+            if envelope.v != VOICE_EVENT_VERSION {
+                return Err(AppError::VoiceEventVersion {
+                    expected: VOICE_EVENT_VERSION,
+                    actual: envelope.v,
+                });
+            }
             if envelope.sequence != expected {
                 return Err(AppError::VoiceEventContract(format!(
                     "voice event sequence was {}, expected {expected}",
@@ -2279,19 +2294,24 @@ pub(crate) fn read_voice_events_from_jsonl(
     path: &Path,
     selected_run_id: &str,
 ) -> AppResult<Vec<VoiceEventEnvelope>> {
+    let mut records = Vec::new();
     let mut envelopes = Vec::new();
     let mut batch_seen = false;
     for line in read_ledger_lines(path)? {
-        if let PersistedLedgerLine::Voice(line) = line {
-            if batch_seen {
-                return Err(AppError::VoiceEventContract(format!(
-                    "run {selected_run_id} contains multiple voice event batches"
-                )));
+        match line {
+            PersistedLedgerLine::Record(line) => records.push(line.record),
+            PersistedLedgerLine::Voice(line) => {
+                if batch_seen {
+                    return Err(AppError::VoiceEventContract(format!(
+                        "run {selected_run_id} contains multiple voice event batches"
+                    )));
+                }
+                batch_seen = true;
+                envelopes = line.voice_events;
             }
-            batch_seen = true;
-            envelopes = line.voice_events;
         }
     }
+    validate_record_run_ids(&records, selected_run_id)?;
     for envelope in &envelopes {
         if envelope.event.run_id().as_str() != selected_run_id {
             return Err(AppError::VoiceEventContract(format!(
@@ -2301,6 +2321,9 @@ pub(crate) fn read_voice_events_from_jsonl(
         }
     }
     validate_voice_envelopes(&envelopes)?;
+    if !envelopes.is_empty() {
+        validate_voice_event_keys(&records, selected_run_id, &envelopes)?;
+    }
     Ok(envelopes)
 }
 
@@ -2542,6 +2565,36 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    fn write_jsonl_core_keys(sqlite_path: &Path, run_id: &RunId, turn_id: &str) -> PathBuf {
+        let jsonl_path = run_jsonl_path(sqlite_path, run_id.as_str()).unwrap();
+        fs::create_dir_all(jsonl_path.parent().unwrap()).unwrap();
+        let mut recorder = JsonlEventRecorder::create(&jsonl_path).unwrap();
+        recorder
+            .record(HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: AgentId::new("plato").unwrap(),
+            })
+            .unwrap();
+        recorder
+            .record(HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id: TurnId::new(turn_id).unwrap(),
+                context: ContextPack {
+                    fragments: vec![],
+                    token_budget: 4_000,
+                },
+            })
+            .unwrap();
+        jsonl_path
+    }
+
+    fn append_jsonl_value(path: &Path, value: &Value) {
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        serde_json::to_writer(&mut file, value).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.flush().unwrap();
     }
 
     #[test]
@@ -2891,6 +2944,40 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_readers_ignore_a_valid_unterminated_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let run_id = RunId::new("run_tail").unwrap();
+        let mut recorder = JsonlEventRecorder::create(&path).unwrap();
+        let committed = recorder
+            .record(HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: AgentId::new("plato").unwrap(),
+            })
+            .unwrap();
+        drop(recorder);
+
+        let uncommitted = LedgerLine {
+            v: LEDGER_VERSION,
+            record: RecordedEvent {
+                seq: 1,
+                occurred_at_ms: 1,
+                event: HarnessEvent::RunFailed {
+                    run_id,
+                    reason: "complete JSON without commit marker".into(),
+                },
+            },
+        };
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&serde_json::to_vec(&uncommitted).unwrap())
+            .unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        assert_eq!(read_records(&path).unwrap(), vec![committed]);
+    }
+
+    #[test]
     fn an_open_tail_descriptor_reads_each_acknowledged_record() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
@@ -3089,7 +3176,7 @@ mod tests {
     fn rejects_wrong_ledger_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
-        std::fs::write(&path, r#"{"v":3,"record":{"seq":0,"occurred_at_ms":0,"event":{"event":"run_started","run_id":"run_1","agent_id":"plato"}}}"#).unwrap();
+        std::fs::write(&path, concat!(r#"{"v":3,"record":{"seq":0,"occurred_at_ms":0,"event":{"event":"run_started","run_id":"run_1","agent_id":"plato"}}}"#, "\n")).unwrap();
 
         assert!(matches!(
             read_records(&path),
@@ -3097,6 +3184,33 @@ mod tests {
                 expected: LEDGER_VERSION,
                 actual: 3
             })
+        ));
+    }
+
+    #[test]
+    fn selected_run_jsonl_rejects_records_for_another_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite_path = dir.path().join("ledger.db");
+        let selected_run = RunId::new("run_selected").unwrap();
+        let actual_run = RunId::new("run_other").unwrap();
+        let jsonl_path = run_jsonl_path(&sqlite_path, selected_run.as_str()).unwrap();
+        fs::create_dir_all(jsonl_path.parent().unwrap()).unwrap();
+        let mut recorder = JsonlEventRecorder::create(&jsonl_path).unwrap();
+        recorder
+            .record(HarnessEvent::RunStarted {
+                run_id: actual_run.clone(),
+                agent_id: AgentId::new("plato").unwrap(),
+            })
+            .unwrap();
+        drop(recorder);
+        let ledger = SqliteLedger::open_or_create(&sqlite_path).unwrap();
+
+        assert!(matches!(
+            ledger.read_run(selected_run.as_str()),
+            Err(AppError::Core(platonic_core::Error::RunIdMismatch {
+                expected,
+                actual
+            })) if expected == selected_run.as_str() && actual == actual_run.as_str()
         ));
     }
 
@@ -3329,6 +3443,63 @@ mod tests {
         }
         let replay = crate::replay::replay_file(&jsonl_path).unwrap();
         assert_eq!(replay.matches("voice_event:").count(), committed.len());
+    }
+
+    #[test]
+    fn jsonl_voice_read_rejects_version_unknown_fields_and_missing_core_turn() {
+        let run_id = RunId::new("run_voice_corrupt").unwrap();
+        let missing_turn = TurnId::new("turn_missing").unwrap();
+        let event = VoiceEvent::VoiceSpoken {
+            run_id: run_id.clone(),
+            turn_id: missing_turn.clone(),
+            ttfa_ms: 1,
+            sentence_count: 1,
+            interrupted_at: None,
+        };
+        let mut future_envelope = VoiceEventEnvelope::revision_one(0, event.clone());
+        future_envelope.v = VOICE_EVENT_VERSION + 1;
+        assert!(matches!(
+            validate_voice_envelopes(&[future_envelope]),
+            Err(AppError::VoiceEventVersion {
+                expected: VOICE_EVENT_VERSION,
+                actual: 2
+            })
+        ));
+
+        let envelope = VoiceEventEnvelope::revision_one(0, event);
+        let valid_voice = serde_json::json!({"voice_events": [envelope]});
+        let mut future_version = valid_voice.clone();
+        future_version["voice_events"][0]["v"] = serde_json::json!(2);
+        let mut unknown_field = valid_voice.clone();
+        unknown_field["unexpected"] = serde_json::json!(true);
+
+        for (name, corruption) in [
+            ("future-version", future_version),
+            ("unknown-field", unknown_field),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let sqlite_path = dir.path().join(format!("{name}.db"));
+            let jsonl_path = write_jsonl_core_keys(&sqlite_path, &run_id, "turn_1");
+            append_jsonl_value(&jsonl_path, &corruption);
+
+            let ledger = SqliteLedger::open_or_create(&sqlite_path).unwrap();
+            assert!(matches!(
+                ledger.read_voice_events(run_id.as_str()),
+                Err(AppError::Json(_))
+            ));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite_path = dir.path().join("missing-turn.db");
+        let jsonl_path = write_jsonl_core_keys(&sqlite_path, &run_id, "turn_1");
+        append_jsonl_value(&jsonl_path, &valid_voice);
+
+        let ledger = SqliteLedger::open_or_create(&sqlite_path).unwrap();
+        assert!(matches!(
+            ledger.read_voice_events(run_id.as_str()),
+            Err(AppError::VoiceEventContract(message))
+                if message.contains("turn_missing is absent from core run run_voice_corrupt")
+        ));
     }
 
     #[test]
