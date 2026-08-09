@@ -1,11 +1,13 @@
 use super::*;
 use platonic_client::lock::LockMetadata;
-use platonic_protocol::{RunStateName, ShutdownIfIdleResultName};
+use platonic_protocol::{
+    ProtocolErrorCode, RunStateName, ShutdownIfIdleResultName, TypedTranscriptEntry,
+};
 use serde_json::json;
 use std::{
     env, fs,
     io::{BufRead, BufReader, Read, Write},
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{Arc, Barrier, Mutex, mpsc},
     thread,
@@ -15,6 +17,8 @@ use std::{
 const PROOF_TIMEOUT: Duration = Duration::from_secs(15);
 const PROOF_KEY_ENV: &str = "PLATO_APPIMAGE_PROOF_KEY";
 const PROOF_KEY_VALUE: &str = "appimage-proof-dummy";
+const PATH_COMMAND_ENV: &str = "PLATO_PACKAGED_PATH_COMMAND";
+const PATH_OUTPUT_ENV: &str = "PLATO_PACKAGED_PATH_OUTPUT";
 
 #[test]
 #[ignore = "requires provisioned PLATO_APPIMAGE_TEST_DAEMON"]
@@ -27,6 +31,30 @@ fn provisioned_unix_sidecar_lifecycle() {
     shell_exit_detaches_active_daemon(&daemon);
     crash_reconnect_recovers_lock_in_place(&daemon);
     concurrent_starters_attach_to_one_winner(&daemon);
+}
+
+#[test]
+#[ignore = "requires a provisioned sidecar and PATH-only command"]
+fn provisioned_unix_path_only_shell_exec() {
+    let daemon = proof_executable("PLATO_APPIMAGE_TEST_DAEMON");
+    let command = env::var(PATH_COMMAND_ENV)
+        .unwrap_or_else(|_| panic!("{PATH_COMMAND_ENV} must name the PATH-only command"));
+    let executable = command
+        .split_ascii_whitespace()
+        .next()
+        .expect("PATH-only command must not be empty");
+    let expected_output = env::var(PATH_OUTPUT_ENV)
+        .unwrap_or_else(|_| panic!("{PATH_OUTPUT_ENV} must name the expected command output"));
+    assert!(!expected_output.is_empty());
+    let executable_is_available = env::var_os("PATH").is_some_and(|path| {
+        env::split_paths(&path).any(|directory| directory.join(executable).is_file())
+    });
+    assert!(
+        !executable_is_available,
+        "{executable} is already available in the desktop test process PATH"
+    );
+
+    path_only_shell_exec_uses_desktop_approval(&daemon, &command, &expected_output);
 }
 
 fn shell_exit_detaches_active_daemon(daemon: &Path) {
@@ -47,6 +75,7 @@ fn shell_exit_detaches_active_daemon(daemon: &Path) {
     let view =
         bootstrap_and_register_workspace(&workspace_file, &lifecycle, &launch, &workspace_root);
     assert!(matches!(view, BootstrapView::Ready { .. }));
+    assert_socket(&socket_path);
 
     let mut run_client = connect_hello_bounded(&socket_path, &workspace_root);
     run_client.set_timeout(PROOF_TIMEOUT).unwrap();
@@ -58,7 +87,7 @@ fn shell_exit_detaches_active_daemon(daemon: &Path) {
         )
         .unwrap();
     assert_eq!(started.status, RunStateName::Running);
-    provider.wait_for_request();
+    provider.wait_for_request(&mut run_client, &started.run_id);
     run_client.set_timeout(PROOF_TIMEOUT).unwrap();
     assert_eq!(
         run_client.transcript_read(&started.run_id).unwrap().status,
@@ -97,6 +126,100 @@ fn shell_exit_detaches_active_daemon(daemon: &Path) {
         ShutdownIfIdleResultName::Shutdown
     );
     drop(fresh_client);
+    wait_for_socket_removal_with_persistent_lock(&socket_path, &lock_path);
+}
+
+fn path_only_shell_exec_uses_desktop_approval(daemon: &Path, command: &str, expected_output: &str) {
+    let workspace = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let workspace_root = canonical_workspace(workspace.path()).unwrap();
+    let workspace_file = state.path().join("workspace.json");
+    persist_canonical_workspace(&workspace_file, &workspace_root).unwrap();
+    let socket_path = paths::host_socket_path().unwrap();
+    let lock_path = paths::host_lock_path().unwrap();
+    let config_path = workspace_root.join("plato.toml");
+    let provider = ShellExecProvider::start(command, expected_output);
+    write_shell_provider_config(&config_path, &provider.base_url);
+
+    let lifecycle = Mutex::new(DesktopLifecycle::default());
+    let launch = test_launch(daemon.to_path_buf());
+    let view =
+        bootstrap_and_register_workspace(&workspace_file, &lifecycle, &launch, &workspace_root);
+    assert!(matches!(view, BootstrapView::Ready { .. }));
+    assert_socket(&socket_path);
+
+    let mut client = connect_hello_bounded(&socket_path, &workspace_root);
+    client.set_timeout(PROOF_TIMEOUT).unwrap();
+    let started = client
+        .run_start(
+            "run the PATH-only packaged desktop proof".into(),
+            Some(config_path.to_string_lossy().into_owned()),
+            false,
+        )
+        .unwrap();
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    let pending = loop {
+        client.set_timeout(PROOF_TIMEOUT).unwrap();
+        let transcript = match client.transcript_read(&started.run_id) {
+            Ok(transcript) => transcript,
+            Err(ClientError::DaemonResponse(error))
+                if error.code == ProtocolErrorCode::NotFound =>
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "shell.exec run never appeared in the ledger"
+                );
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            Err(error) => panic!("unable to read shell.exec proof transcript: {error}"),
+        };
+        if let Some(pending) = transcript.pending_approval {
+            break pending;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "shell.exec approval did not appear"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(pending.tool_name, "shell.exec");
+
+    let decided = decide_approval_from_workspace(
+        &workspace_root,
+        &started.run_id,
+        &pending.tool_call_id,
+        DesktopApprovalDecision::Grant,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(decided.run_id, started.run_id);
+    assert_eq!(decided.status, RunStateName::Running);
+
+    let transcript = wait_for_terminal_transcript(&mut client, &started.run_id);
+    assert_eq!(transcript.status, RunStateName::Finished);
+    assert_eq!(
+        transcript.final_answer.as_deref(),
+        Some("PATH-only shell.exec completed")
+    );
+    let typed = transcript.typed.expect("typed PATH proof transcript");
+    assert!(typed.runs.iter().flat_map(|run| &run.entries).any(|entry| {
+        matches!(
+            entry,
+            TypedTranscriptEntry::ToolResult { call_id, summary }
+                if call_id == &pending.tool_call_id && summary.starts_with("shell.exec exited 0")
+        )
+    }));
+    provider.handle.join().unwrap();
+
+    client.set_timeout(PROOF_TIMEOUT).unwrap();
+    assert_eq!(
+        client.shutdown_if_idle().unwrap().result,
+        ShutdownIfIdleResultName::Shutdown
+    );
+    drop(client);
+    drop(lifecycle);
     wait_for_socket_removal_with_persistent_lock(&socket_path, &lock_path);
 }
 
@@ -285,6 +408,14 @@ fn connect_hello_bounded(socket_path: &Path, workspace_root: &Path) -> DaemonCli
     }
 }
 
+fn assert_socket(path: &Path) {
+    assert!(
+        fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_socket()),
+        "{} is not a Unix socket",
+        path.display()
+    );
+}
+
 fn wait_for_terminal_transcript(
     client: &mut DaemonClient,
     run_id: &str,
@@ -365,7 +496,7 @@ impl PausedFakeProvider {
         let (release, release_rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let authorization = read_http_request(&mut stream);
+            let authorization = read_http_request(&mut stream).authorization;
             assert_eq!(
                 authorization,
                 Some(format!("Bearer {PROOF_KEY_VALUE}")),
@@ -403,8 +534,12 @@ impl PausedFakeProvider {
         }
     }
 
-    fn wait_for_request(&self) {
-        self.requested.recv_timeout(PROOF_TIMEOUT).unwrap();
+    fn wait_for_request(&self, client: &mut DaemonClient, run_id: &str) {
+        if let Err(error) = self.requested.recv_timeout(PROOF_TIMEOUT) {
+            client.set_timeout(PROOF_TIMEOUT).unwrap();
+            let transcript = client.transcript_read(run_id);
+            panic!("provider did not receive a request ({error}); transcript: {transcript:?}");
+        }
     }
 
     fn release(self) {
@@ -413,7 +548,92 @@ impl PausedFakeProvider {
     }
 }
 
-fn read_http_request(stream: &mut std::net::TcpStream) -> Option<String> {
+struct ShellExecProvider {
+    base_url: String,
+    handle: thread::JoinHandle<()>,
+}
+
+impl ShellExecProvider {
+    fn start(command: &str, expected_output: &str) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let command = command.to_owned();
+        let expected_output = expected_output.to_owned();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert_eq!(
+                read_http_request(&mut stream).authorization,
+                Some(format!("Bearer {PROOF_KEY_VALUE}"))
+            );
+            let tool_delta = json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "path_only_call",
+                            "function": {
+                                "name": "shell_exec",
+                                "arguments": json!({"command": command}).to_string()
+                            }
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            });
+            let tool_finish = json!({
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+            });
+            write_event_stream(&mut stream, &tool_delta, &tool_finish);
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert_eq!(
+                request.authorization,
+                Some(format!("Bearer {PROOF_KEY_VALUE}"))
+            );
+            assert!(
+                String::from_utf8(request.body)
+                    .unwrap()
+                    .contains(&expected_output),
+                "the provider continuation did not contain the PATH-only command output"
+            );
+            let answer = json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": "PATH-only shell.exec completed"},
+                    "finish_reason": null
+                }]
+            });
+            let finish = json!({
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            });
+            write_event_stream(&mut stream, &answer, &finish);
+        });
+        Self { base_url, handle }
+    }
+}
+
+fn write_event_stream(
+    stream: &mut std::net::TcpStream,
+    first: &serde_json::Value,
+    second: &serde_json::Value,
+) {
+    let body = format!("data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n");
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+}
+
+struct HttpRequest {
+    authorization: Option<String>,
+    body: Vec<u8>,
+}
+
+fn read_http_request(stream: &mut std::net::TcpStream) -> HttpRequest {
     stream.set_read_timeout(Some(PROOF_TIMEOUT)).unwrap();
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut content_length = 0;
@@ -434,7 +654,10 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> Option<String> {
     }
     let mut body = vec![0; content_length];
     reader.read_exact(&mut body).unwrap();
-    authorization
+    HttpRequest {
+        authorization,
+        body,
+    }
 }
 
 fn write_provider_config(path: &Path, base_url: &str) {
@@ -455,6 +678,30 @@ max_turns = 1
 
 [tools]
 enabled = ["file.read"]
+"#
+        ),
+    )
+    .unwrap();
+}
+
+fn write_shell_provider_config(path: &Path, base_url: &str) {
+    fs::write(
+        path,
+        format!(
+            r#"[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "{PROOF_KEY_ENV}"
+base_url = "{base_url}"
+timeout_ms = 15000
+
+[limits]
+token_budget = 4000
+max_output_tokens = 32
+max_turns = 2
+
+[tools]
+enabled = ["shell.exec"]
 "#
         ),
     )
