@@ -265,6 +265,8 @@ pub(crate) struct ThreadSpawnToolInput {
     pub(crate) reasoning_effort: Option<platonic_protocol::ReasoningEffort>,
     pub(crate) approval_policy: Option<platonic_protocol::ThreadApprovalPolicy>,
     pub(crate) toolset: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repositories: Option<Vec<platonic_protocol::ThreadRepositoryRequest>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

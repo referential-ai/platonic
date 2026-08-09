@@ -315,13 +315,30 @@ are all ceilings. An attempted expansion returns a typed
 `thread_authority_exceeded` tool result and creates no child authority.
 
 A grant atomically stores the twelve immutable authority fields before the
-thread becomes loaded. The current compatibility spawn resolves agent `plato`,
-the configured toolset, no worktrees, the requested cwd as one granted path,
-and network access when a network tool is enabled. New rows leave the legacy
-`cwd` column null. Migrated eight-field rows remain enumerable without
-backfill: agent, toolset, and worktrees default absent or empty, the recorded
-cwd becomes one writable granted path, and network defaults denied. Denial,
-cancellation, or persistence failure creates no thread authority.
+thread becomes loaded. A spawn can name one or more workspace-relative Git
+repositories and existing branches; an empty list infers the repository that
+contains `cwd`. The server claims each `(workspace, repository, branch)` before
+creating a private-ref repository beneath
+`$XDG_STATE_HOME/platonic/worktrees/<thread-id>/`. Each private repository has
+its own refs and index, reads objects through an alternate to the server-owned
+shared Git store, and disables automatic GC. Omitting a branch creates the
+fresh `thread/<thread-id>` branch from the source HEAD. A second live claim for
+the same branch fails with `thread_branch_claim_conflict`.
+
+On Linux, repository-backed thread children are write-confined with Landlock
+to their private repositories and scratch directory. Unsupported hosts record
+`confinement: "none"`; set `[confinement] require = true` in the user config to
+refuse those spawns. `thread.authority` reports the immutable confinement fact
+alongside the repository, branch, and path authority. On stop, or during
+startup reconciliation after a crash, the server fetches the claimed branch
+into shared storage and removes only its owned private repository and claim.
+It never changes or deletes the user's repository.
+
+New rows leave the legacy `cwd` column null. Migrated eight-field rows remain
+enumerable without backfill: agent, toolset, and worktrees default absent or
+empty, the recorded cwd becomes one writable granted path, and network
+defaults denied. Denial, cancellation, or persistence failure creates no
+thread authority.
 
 Protocol-v1 `thread.list` and `thread.status` keep their original eight-field
 authority projection, including `cwd`, so compiled v1 clients continue to

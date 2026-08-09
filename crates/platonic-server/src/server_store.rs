@@ -22,7 +22,8 @@ use crate::{
 };
 use platonic_core::{AgentId, EffectClass};
 use platonic_protocol::{
-    ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadGrantedPath, ThreadWorktree,
+    ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadConfinement,
+    ThreadGrantedPath, ThreadWorktree,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use std::{
@@ -111,6 +112,23 @@ impl DurableThreadAuthority {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BranchClaimRecord {
+    pub(crate) workspace_id: String,
+    pub(crate) repo: String,
+    pub(crate) branch: String,
+    pub(crate) thread_id: String,
+    pub(crate) claimed_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("branch {branch} in repository {repo} is already claimed by live thread {thread_id}")]
+pub(crate) struct BranchClaimConflict {
+    pub(crate) repo: String,
+    pub(crate) branch: String,
+    pub(crate) thread_id: String,
+}
+
 pub(crate) struct ServerStore {
     connection: Connection,
     path: PathBuf,
@@ -135,6 +153,7 @@ impl ServerStore {
         connection.pragma_update(None, "synchronous", "FULL")?;
         create_thread_authority_tables(&mut connection)?;
         create_thread_stop_table(&connection)?;
+        create_thread_repository_tables(&connection)?;
         create_workspace_table(&connection)?;
         create_agent_table(&connection)?;
         create_tool_call_approval_table(&connection)?;
@@ -563,7 +582,13 @@ impl ServerStore {
         &mut self,
         approval: &ThreadSpawnApprovalRecord,
         authority: Option<&ThreadAuthorityRecord>,
+        confinement: Option<ThreadConfinement>,
     ) -> AppResult<Option<DurableThreadAuthority>> {
+        if authority.is_none() && confinement.is_some() {
+            return Err(AppError::Config(
+                "thread confinement requires a granted authority record".into(),
+            ));
+        }
         if let Some(authority) = authority {
             validate_complete_authority(authority)?;
             if authority.spawning_actor != approval.actor {
@@ -618,6 +643,13 @@ impl ServerStore {
                     )));
                 }
             }
+            let durable_confinement = thread_confinement_from(&transaction, &approval.thread_id)?;
+            if confinement.is_some() && confinement != durable_confinement {
+                return Err(AppError::Config(format!(
+                    "thread confinement conflicts with durable thread {}",
+                    approval.thread_id
+                )));
+            }
             transaction.commit()?;
             return Ok(authority.cloned().map(DurableThreadAuthority));
         }
@@ -647,6 +679,7 @@ impl ServerStore {
                 approval_policy: authority.approval_policy,
                 toolset: authority.toolset.clone(),
                 worktrees: authority.worktrees.clone(),
+                repositories: Vec::new(),
                 granted_paths: authority.granted_paths.clone(),
                 network: authority.network,
             };
@@ -696,6 +729,17 @@ impl ServerStore {
                     sqlite_i64(authority.created_at_ms, "thread created_at_ms")?
                 ],
             )?;
+            if let Some(confinement) = confinement {
+                transaction.execute(
+                    "INSERT INTO thread_confinements (thread_id, backend, recorded_at_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        authority.thread_id,
+                        confinement.as_str(),
+                        sqlite_i64(approval.occurred_at_ms, "thread confinement recorded_at_ms")?
+                    ],
+                )?;
+            }
         }
         transaction.commit()?;
         Ok(authority.cloned().map(DurableThreadAuthority))
@@ -728,6 +772,86 @@ impl ServerStore {
         thread_spawn_approval_from(&self.connection, spawn_id)
     }
 
+    pub(crate) fn thread_confinement(
+        &self,
+        thread_id: &str,
+    ) -> AppResult<Option<ThreadConfinement>> {
+        thread_confinement_from(&self.connection, thread_id)
+    }
+
+    pub(crate) fn claim_thread_branches(
+        &mut self,
+        workspace_id: &str,
+        thread_id: &str,
+        claims: &[(String, String)],
+        claimed_at_ms: u64,
+    ) -> AppResult<Option<BranchClaimConflict>> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (repo, branch) in claims {
+            let existing = transaction
+                .query_row(
+                    "SELECT thread_id FROM thread_branch_claims
+                     WHERE workspace_id = ?1 AND repo = ?2 AND branch = ?3",
+                    params![workspace_id, repo, branch],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                if existing != thread_id {
+                    return Ok(Some(BranchClaimConflict {
+                        repo: repo.clone(),
+                        branch: branch.clone(),
+                        thread_id: existing,
+                    }));
+                }
+                continue;
+            }
+            transaction.execute(
+                "INSERT INTO thread_branch_claims
+                   (workspace_id, repo, branch, thread_id, claimed_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    workspace_id,
+                    repo,
+                    branch,
+                    thread_id,
+                    sqlite_i64(claimed_at_ms, "branch claim claimed_at_ms")?
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(None)
+    }
+
+    pub(crate) fn branch_claims(&self) -> AppResult<Vec<BranchClaimRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT workspace_id, repo, branch, thread_id, claimed_at_ms
+             FROM thread_branch_claims
+             ORDER BY claimed_at_ms, workspace_id, repo, branch",
+        )?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok(BranchClaimRecord {
+                    workspace_id: row.get(0)?,
+                    repo: row.get(1)?,
+                    branch: row.get(2)?,
+                    thread_id: row.get(3)?,
+                    claimed_at_ms: row_u64(row, 4, "branch claim claimed_at_ms")?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn release_thread_claims(&mut self, thread_id: &str) -> AppResult<()> {
+        self.connection.execute(
+            "DELETE FROM thread_branch_claims WHERE thread_id = ?1",
+            params![thread_id],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn persist_thread_stop(
         &mut self,
         stop: &ThreadStopRecord,
@@ -754,6 +878,10 @@ impl ServerStore {
                 stop.stopped_turn_id,
                 sqlite_i64(stop.occurred_at_ms, "thread stop occurred_at_ms")?
             ],
+        )?;
+        transaction.execute(
+            "DELETE FROM thread_branch_claims WHERE thread_id = ?1",
+            params![stop.thread_id],
         )?;
         transaction.commit()?;
         Ok((stop.clone(), true))
@@ -905,6 +1033,26 @@ fn thread_spawn_approval_from(
             },
         )
         .optional()?)
+}
+
+fn thread_confinement_from(
+    connection: &Connection,
+    thread_id: &str,
+) -> AppResult<Option<ThreadConfinement>> {
+    let value = connection
+        .query_row(
+            "SELECT backend FROM thread_confinements WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    value
+        .map(|value| {
+            ThreadConfinement::parse(&value).ok_or_else(|| {
+                AppError::Config(format!("unknown thread confinement backend: {value}"))
+            })
+        })
+        .transpose()
 }
 
 fn thread_stop_from(
@@ -1305,6 +1453,47 @@ fn create_thread_stop_table(connection: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+fn create_thread_repository_tables(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS thread_branch_claims (
+          workspace_id TEXT NOT NULL,
+          repo TEXT NOT NULL,
+          branch TEXT NOT NULL,
+          thread_id TEXT NOT NULL,
+          claimed_at_ms INTEGER NOT NULL,
+          PRIMARY KEY (workspace_id, repo, branch),
+          UNIQUE (thread_id, repo)
+        );
+
+        CREATE TRIGGER IF NOT EXISTS thread_branch_claims_no_update
+        BEFORE UPDATE ON thread_branch_claims
+        BEGIN
+          SELECT RAISE(ABORT, 'thread branch claims cannot be reassigned');
+        END;
+
+        CREATE TABLE IF NOT EXISTS thread_confinements (
+          thread_id TEXT PRIMARY KEY,
+          backend TEXT NOT NULL,
+          recorded_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TRIGGER IF NOT EXISTS thread_confinements_no_update
+        BEFORE UPDATE ON thread_confinements
+        BEGIN
+          SELECT RAISE(ABORT, 'thread confinement facts are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS thread_confinements_no_delete
+        BEFORE DELETE ON thread_confinements
+        BEGIN
+          SELECT RAISE(ABORT, 'thread confinement facts are immutable');
+        END;
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Read one thread's authority without holding a store open.
 ///
 /// These mirror the store's methods for callers that read a single record.
@@ -1319,6 +1508,13 @@ pub(crate) fn thread_authority(
     thread_id: &str,
 ) -> AppResult<Option<ThreadAuthorityRecord>> {
     ServerStore::open_or_create(path)?.thread_authority(thread_id)
+}
+
+pub(crate) fn thread_confinement(
+    path: &Path,
+    thread_id: &str,
+) -> AppResult<Option<ThreadConfinement>> {
+    ServerStore::open_or_create(path)?.thread_confinement(thread_id)
 }
 
 pub(crate) fn thread_stop(path: &Path, thread_id: &str) -> AppResult<Option<ThreadStopRecord>> {
@@ -1454,7 +1650,7 @@ mod tests {
             42,
         );
         let durable = ledger
-            .persist_thread_spawn(&approval, Some(&authority))
+            .persist_thread_spawn(&approval, Some(&authority), None)
             .unwrap()
             .unwrap();
         assert_eq!(durable.record(), &authority);
@@ -1544,7 +1740,7 @@ mod tests {
             42,
         );
         ledger
-            .persist_thread_spawn(&approval, Some(&authority))
+            .persist_thread_spawn(&approval, Some(&authority), None)
             .unwrap();
         let stop = ThreadStopRecord::new(
             "thread_stop_target".into(),
@@ -1762,7 +1958,7 @@ mod tests {
                 30 + index as u64,
             );
             store
-                .persist_thread_spawn(&approval, Some(&authority))
+                .persist_thread_spawn(&approval, Some(&authority), None)
                 .unwrap()
                 .unwrap();
         }
@@ -2341,7 +2537,7 @@ mod tests {
         ] {
             assert!(
                 ledger
-                    .persist_thread_spawn(&approval, None)
+                    .persist_thread_spawn(&approval, None, None)
                     .unwrap()
                     .is_none()
             );
@@ -2391,7 +2587,7 @@ mod tests {
 
         assert!(
             ledger
-                .persist_thread_spawn(&approval, Some(&authority))
+                .persist_thread_spawn(&approval, Some(&authority), None)
                 .is_err()
         );
         assert!(
@@ -2425,11 +2621,11 @@ mod tests {
             30,
         );
         ledger
-            .persist_thread_spawn(&approval, Some(&authority))
+            .persist_thread_spawn(&approval, Some(&authority), None)
             .unwrap();
         assert_eq!(
             ledger
-                .persist_thread_spawn(&approval, Some(&authority))
+                .persist_thread_spawn(&approval, Some(&authority), None)
                 .unwrap()
                 .unwrap()
                 .record(),
@@ -2451,7 +2647,8 @@ mod tests {
         assert!(matches!(
             ledger.persist_thread_spawn(
                 &conflicting_approval,
-                Some(&conflicting_authority)
+                Some(&conflicting_authority),
+                None,
             ),
             Err(AppError::Config(message)) if message.contains("conflicts")
         ));
@@ -2470,7 +2667,7 @@ mod tests {
             31,
         );
         assert!(matches!(
-            ledger.persist_thread_spawn(&other_approval, Some(&mismatched_actor)),
+            ledger.persist_thread_spawn(&other_approval, Some(&mismatched_actor), None),
             Err(AppError::Config(message)) if message.contains("actor")
         ));
     }
@@ -2500,7 +2697,7 @@ mod tests {
             1,
         );
         ledger
-            .persist_thread_spawn(&parent_approval, Some(&parent))
+            .persist_thread_spawn(&parent_approval, Some(&parent), None)
             .unwrap();
 
         for (spawn_id, thread_id, cwd, policy) in [
@@ -2529,7 +2726,7 @@ mod tests {
             );
             assert!(
                 ledger
-                    .persist_thread_spawn(&approval, Some(&authority))
+                    .persist_thread_spawn(&approval, Some(&authority), None)
                     .is_err()
             );
             assert!(ledger.thread_spawn_approval(spawn_id).unwrap().is_none());
@@ -2554,7 +2751,7 @@ mod tests {
             2,
         );
         assert!(matches!(
-            ledger.persist_thread_spawn(&approval, Some(&authority)),
+            ledger.persist_thread_spawn(&approval, Some(&authority), None),
             Err(AppError::Config(message)) if message.contains("toolset")
         ));
         assert!(
@@ -2568,6 +2765,113 @@ mod tests {
                 .thread_authority("thread_toolset_expansion")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn concurrent_branch_claims_conflict_once_and_disjoint_repositories_both_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claims.db");
+        ServerStore::open_or_create(&path).unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let contenders = ["thread_a", "thread_b"].map(|thread_id| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut store = ServerStore::open_or_create(&path).unwrap();
+                barrier.wait();
+                store
+                    .claim_thread_branches(
+                        "workspace",
+                        thread_id,
+                        &[("repo".into(), "main".into())],
+                        1,
+                    )
+                    .unwrap()
+            })
+        });
+        barrier.wait();
+        let results = contenders.map(|worker| worker.join().unwrap());
+        assert_eq!(results.iter().filter(|result| result.is_none()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_some()).count(), 1);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let disjoint = [("thread_c", "repo-c"), ("thread_d", "repo-d")].map(|(thread_id, repo)| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut store = ServerStore::open_or_create(&path).unwrap();
+                barrier.wait();
+                store
+                    .claim_thread_branches(
+                        "workspace",
+                        thread_id,
+                        &[(repo.into(), "main".into())],
+                        2,
+                    )
+                    .unwrap()
+            })
+        });
+        barrier.wait();
+        for worker in disjoint {
+            assert!(worker.join().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn confinement_fact_is_immutable_and_stop_releases_the_live_branch_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("confinement.db");
+        let mut store = ServerStore::open_or_create(&path).unwrap();
+        let authority = thread_authority(
+            "thread_confined",
+            None,
+            "stdin",
+            dir.path(),
+            ThreadApprovalPolicy::Prompt,
+            42,
+        );
+        let approval = thread_approval(
+            "spawn_confined",
+            "thread_confined",
+            ThreadSpawnDecisionName::Granted,
+            "stdin",
+            None,
+            42,
+        );
+        store
+            .claim_thread_branches(
+                "workspace",
+                "thread_confined",
+                &[("repo".into(), "main".into())],
+                42,
+            )
+            .unwrap();
+        store
+            .persist_thread_spawn(&approval, Some(&authority), Some(ThreadConfinement::None))
+            .unwrap();
+        assert_eq!(
+            store.thread_confinement("thread_confined").unwrap(),
+            Some(ThreadConfinement::None)
+        );
+        for statement in [
+            "UPDATE thread_confinements SET backend = 'landlock' WHERE thread_id = 'thread_confined'",
+            "DELETE FROM thread_confinements WHERE thread_id = 'thread_confined'",
+        ] {
+            let error = store.connection.execute(statement, []).unwrap_err();
+            assert!(error.to_string().contains("immutable"));
+        }
+
+        store
+            .persist_thread_stop(
+                &ThreadStopRecord::new("thread_confined".into(), "test".into(), None, 43).unwrap(),
+            )
+            .unwrap();
+        assert!(store.branch_claims().unwrap().is_empty());
+        assert_eq!(
+            store.thread_confinement("thread_confined").unwrap(),
+            Some(ThreadConfinement::None)
         );
     }
 }

@@ -5,6 +5,7 @@ use crate::thread_authority::ThreadAuthorityDraftParams;
 use crate::{
     AppError, AppResult, ApprovalRequest, AssistantDeltaEvent,
     app::ExternalApprovalOutcome,
+    confinement::ConfinementSupport,
     daemon::{
         DaemonPaths,
         protocol::{
@@ -18,6 +19,7 @@ use crate::{
     tool_catalog::SHELL_EXEC,
 };
 use platonic_core::{EffectClass, RecordedEvent};
+use platonic_protocol::ThreadConfinement;
 #[cfg(test)]
 use std::sync::Barrier;
 use std::{
@@ -42,6 +44,8 @@ type SessionGrantInstallBarriers = Option<(Arc<Barrier>, Arc<Barrier>)>;
 pub(super) struct DaemonRuntime {
     pub(super) paths: DaemonPaths,
     max_spawn_depth: u32,
+    require_confinement: bool,
+    confinement_support: ConfinementSupport,
     started_at: Instant,
     pub(super) state: Arc<Mutex<RuntimeState>>,
     session_tool_grants: Arc<Mutex<HashSet<(String, String)>>>,
@@ -150,10 +154,27 @@ impl DaemonRuntime {
         Self::new_with_max_spawn_depth(paths, Config::default().limits.max_spawn_depth)
     }
 
+    #[cfg(test)]
     pub(super) fn new_with_max_spawn_depth(paths: DaemonPaths, max_spawn_depth: u32) -> Self {
+        Self::new_with_server_policy(
+            paths,
+            max_spawn_depth,
+            false,
+            crate::confinement::detect_support(),
+        )
+    }
+
+    pub(super) fn new_with_server_policy(
+        paths: DaemonPaths,
+        max_spawn_depth: u32,
+        require_confinement: bool,
+        confinement_support: ConfinementSupport,
+    ) -> Self {
         Self::new_shared(
             paths,
             max_spawn_depth,
+            require_confinement,
+            confinement_support,
             Instant::now(),
             Arc::new(Mutex::new(RuntimeState::default())),
             Arc::new(AtomicBool::new(false)),
@@ -163,6 +184,8 @@ impl DaemonRuntime {
     pub(super) fn new_shared(
         paths: DaemonPaths,
         max_spawn_depth: u32,
+        require_confinement: bool,
+        confinement_support: ConfinementSupport,
         started_at: Instant,
         state: Arc<Mutex<RuntimeState>>,
         stop_requested: Arc<AtomicBool>,
@@ -170,6 +193,8 @@ impl DaemonRuntime {
         Self {
             paths,
             max_spawn_depth,
+            require_confinement,
+            confinement_support,
             started_at,
             state,
             session_tool_grants: Arc::new(Mutex::new(HashSet::new())),
@@ -183,6 +208,25 @@ impl DaemonRuntime {
 
     pub(super) fn max_spawn_depth(&self) -> u32 {
         self.max_spawn_depth
+    }
+
+    pub(super) fn require_confinement(&self) -> bool {
+        self.require_confinement
+    }
+
+    pub(super) fn confinement_support(&self) -> ConfinementSupport {
+        self.confinement_support
+    }
+
+    pub(super) fn thread_confinement(
+        &self,
+        has_private_repositories: bool,
+    ) -> Result<ThreadConfinement, ()> {
+        match (has_private_repositories, self.confinement_support) {
+            (true, ConfinementSupport::Landlock) => Ok(ThreadConfinement::Landlock),
+            _ if self.require_confinement => Err(()),
+            _ => Ok(ThreadConfinement::None),
+        }
     }
 
     pub(super) fn uptime_ms(&self) -> u64 {
@@ -1447,6 +1491,42 @@ mod tests {
             format!("session_{index}"),
             PathBuf::from("/tmp/agent.db"),
         ))
+    }
+
+    #[test]
+    fn confinement_support_and_require_policy_matrix_is_typed() {
+        for (support, require, has_repositories, expected) in [
+            (
+                ConfinementSupport::Landlock,
+                false,
+                true,
+                Ok(ThreadConfinement::Landlock),
+            ),
+            (
+                ConfinementSupport::Landlock,
+                true,
+                true,
+                Ok(ThreadConfinement::Landlock),
+            ),
+            (
+                ConfinementSupport::None,
+                false,
+                true,
+                Ok(ThreadConfinement::None),
+            ),
+            (
+                ConfinementSupport::None,
+                false,
+                false,
+                Ok(ThreadConfinement::None),
+            ),
+            (ConfinementSupport::None, true, true, Err(())),
+            (ConfinementSupport::Landlock, true, false, Err(())),
+        ] {
+            let runtime =
+                DaemonRuntime::new_with_server_policy(runtime().paths, 1, require, support);
+            assert_eq!(runtime.thread_confinement(has_repositories), expected);
+        }
     }
 
     #[test]

@@ -9,6 +9,7 @@
 
 pub mod app;
 pub mod config;
+mod confinement;
 pub mod daemon;
 pub mod error;
 pub mod gateway;
@@ -19,6 +20,7 @@ pub mod provider;
 pub mod replay;
 mod server_store;
 mod thread_authority;
+mod thread_repository;
 pub mod tool_catalog;
 pub mod tools;
 
