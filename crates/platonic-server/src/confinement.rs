@@ -6,6 +6,7 @@ const CHILD_WRITABLE_PATHS_ENV: &str = "PLATONIC_CHILD_WRITABLE_PATHS";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConfinementSupport {
+    #[cfg(any(target_os = "linux", test))]
     Landlock,
     None,
 }

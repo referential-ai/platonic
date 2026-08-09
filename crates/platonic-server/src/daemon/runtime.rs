@@ -223,6 +223,7 @@ impl DaemonRuntime {
         has_private_repositories: bool,
     ) -> Result<ThreadConfinement, ()> {
         match (has_private_repositories, self.confinement_support) {
+            #[cfg(any(target_os = "linux", test))]
             (true, ConfinementSupport::Landlock) => Ok(ThreadConfinement::Landlock),
             _ if self.require_confinement => Err(()),
             _ => Ok(ThreadConfinement::None),
