@@ -1,4 +1,6 @@
 #[cfg(test)]
+use crate::config::Config;
+#[cfg(test)]
 use crate::thread_authority::ThreadAuthorityDraftParams;
 use crate::{
     AppError, AppResult, ApprovalRequest, AssistantDeltaEvent,
@@ -39,6 +41,7 @@ type SessionGrantInstallBarriers = Option<(Arc<Barrier>, Arc<Barrier>)>;
 #[derive(Clone, Debug)]
 pub(super) struct DaemonRuntime {
     pub(super) paths: DaemonPaths,
+    max_spawn_depth: u32,
     started_at: Instant,
     pub(super) state: Arc<Mutex<RuntimeState>>,
     session_tool_grants: Arc<Mutex<HashSet<(String, String)>>>,
@@ -142,9 +145,15 @@ pub(super) enum ShutdownIfIdleDecision {
 }
 
 impl DaemonRuntime {
+    #[cfg(test)]
     pub(super) fn new(paths: DaemonPaths) -> Self {
+        Self::new_with_max_spawn_depth(paths, Config::default().limits.max_spawn_depth)
+    }
+
+    pub(super) fn new_with_max_spawn_depth(paths: DaemonPaths, max_spawn_depth: u32) -> Self {
         Self::new_shared(
             paths,
+            max_spawn_depth,
             Instant::now(),
             Arc::new(Mutex::new(RuntimeState::default())),
             Arc::new(AtomicBool::new(false)),
@@ -153,12 +162,14 @@ impl DaemonRuntime {
 
     pub(super) fn new_shared(
         paths: DaemonPaths,
+        max_spawn_depth: u32,
         started_at: Instant,
         state: Arc<Mutex<RuntimeState>>,
         stop_requested: Arc<AtomicBool>,
     ) -> Self {
         Self {
             paths,
+            max_spawn_depth,
             started_at,
             state,
             session_tool_grants: Arc::new(Mutex::new(HashSet::new())),
@@ -168,6 +179,10 @@ impl DaemonRuntime {
             #[cfg(all(test, unix))]
             shutdown_flush_barrier: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(super) fn max_spawn_depth(&self) -> u32 {
+        self.max_spawn_depth
     }
 
     pub(super) fn uptime_ms(&self) -> u64 {

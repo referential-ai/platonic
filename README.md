@@ -67,9 +67,11 @@ enabled = ["file.read", "file.list", "file.write", "file.edit", "shell.exec", "w
 
 `thread.spawn` is available but not enabled by default. Add it only to a
 coordinator's resolved toolset. The server-owned `limits.max_spawn_depth`
-defaults to `1`, must be positive, and may be set only by `--config`,
-`PLATO_CONFIG`, or user config; a workspace `plato.toml` cannot raise or lower
-the host-wide bound.
+defaults to `1` and must be positive. At `platonic serve` startup, the bound is
+resolved once from the user config (`~/.config/plato/config.toml` on Unix or
+`%APPDATA%\plato\config.toml` on Windows), then the built-in default. Per-run
+`--config`, `PLATO_CONFIG`, and workspace `plato.toml` do not configure the
+host bound, and later file changes take effect only after a server restart.
 
 OpenAI-compatible direct OpenAI config remains available:
 

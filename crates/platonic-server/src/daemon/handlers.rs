@@ -476,7 +476,6 @@ fn start_thread_spawn(
     }
     let config = Config::load(cwd, None)
         .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
-    let max_spawn_depth = config.limits.max_spawn_depth;
     let toolset = config.tools.enabled;
     let draft = ThreadAuthorityDraft::new(ThreadAuthorityDraftParams {
         parent_thread_id,
@@ -491,7 +490,13 @@ fn start_thread_spawn(
         toolset,
     })
     .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
-    start_thread_spawn_draft(runtime, &mut store, draft, max_spawn_depth, "yolo")
+    start_thread_spawn_draft(
+        runtime,
+        &mut store,
+        draft,
+        runtime.max_spawn_depth(),
+        "yolo",
+    )
 }
 
 fn start_thread_spawn_draft(
@@ -639,15 +644,11 @@ fn model_thread_spawn_inner(
         toolset,
     })
     .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
-    let max_spawn_depth = Config::load(&runtime.paths.workspace_root, None)
-        .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?
-        .limits
-        .max_spawn_depth;
     let result = start_thread_spawn_draft(
         runtime,
         &mut store,
         draft,
-        max_spawn_depth,
+        runtime.max_spawn_depth(),
         &approving_actor,
     )?;
     let result = match result {
@@ -3011,6 +3012,12 @@ mod tests {
     }
 
     fn bare_thread_test_runtime() -> (tempfile::TempDir, DaemonRuntime) {
+        bare_thread_test_runtime_with_max_spawn_depth(1)
+    }
+
+    fn bare_thread_test_runtime_with_max_spawn_depth(
+        max_spawn_depth: u32,
+    ) -> (tempfile::TempDir, DaemonRuntime) {
         let root = tempfile::tempdir().unwrap();
         let workspace_root = root.path().join("workspace");
         std::fs::create_dir(&workspace_root).unwrap();
@@ -3021,19 +3028,28 @@ mod tests {
             .join("workspaces")
             .join("thread-tests")
             .join("ledger.db");
-        let runtime = DaemonRuntime::new(crate::daemon::server::DaemonPaths {
-            workspace_root: workspace_root.canonicalize().unwrap(),
-            workspace_id: "thread-tests".into(),
-            socket_path: root.path().join("agent.sock"),
-            lock_path: root.path().join("agent.lock"),
-            server_db_path: root.path().join("state/platonic/server.db"),
-            ledger_path,
-        });
+        let runtime = DaemonRuntime::new_with_max_spawn_depth(
+            crate::daemon::server::DaemonPaths {
+                workspace_root: workspace_root.canonicalize().unwrap(),
+                workspace_id: "thread-tests".into(),
+                socket_path: root.path().join("agent.sock"),
+                lock_path: root.path().join("agent.lock"),
+                server_db_path: root.path().join("state/platonic/server.db"),
+                ledger_path,
+            },
+            max_spawn_depth,
+        );
         (root, runtime)
     }
 
     fn thread_test_runtime() -> (tempfile::TempDir, DaemonRuntime) {
-        let (root, runtime) = bare_thread_test_runtime();
+        thread_test_runtime_with_max_spawn_depth(1)
+    }
+
+    fn thread_test_runtime_with_max_spawn_depth(
+        max_spawn_depth: u32,
+    ) -> (tempfile::TempDir, DaemonRuntime) {
+        let (root, runtime) = bare_thread_test_runtime_with_max_spawn_depth(max_spawn_depth);
         runtime
             .paths
             .server_store()
@@ -3820,6 +3836,138 @@ mod tests {
                 .len(),
             2,
             "depth rejection must not create a grandchild authority"
+        );
+    }
+
+    #[test]
+    fn model_spawn_enforces_frozen_server_depth_after_workspace_mutation() {
+        let (_root, runtime) = thread_test_runtime_with_max_spawn_depth(1);
+        let parent_thread_id = coordinator_root(&runtime);
+        register_test_agent(
+            &runtime,
+            "worker",
+            ThreadApprovalPolicy::Prompt,
+            vec!["file.read".into(), "thread.spawn".into()],
+        );
+
+        std::fs::write(
+            runtime.paths.workspace_root.join("plato.toml"),
+            "[limits]\nmax_spawn_depth = 99\n\n[tools]\nenabled = [\"file.read\", \"thread.spawn\"]\n",
+        )
+        .unwrap();
+
+        let child_thread_id = match model_thread_spawn(
+            &runtime,
+            &parent_thread_id,
+            model_spawn_input(
+                &runtime,
+                "worker",
+                Some(vec!["file.read".into(), "thread.spawn".into()]),
+                None,
+            ),
+            "daemon".into(),
+        )
+        .unwrap()
+        {
+            ThreadSpawnToolOutput::Spawned { thread_id } => thread_id,
+            output => panic!("expected first bounded child, got {output:?}"),
+        };
+        let rejected = model_thread_spawn(
+            &runtime,
+            &child_thread_id,
+            model_spawn_input(&runtime, "worker", Some(vec!["file.read".into()]), None),
+            "daemon".into(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            rejected,
+            ThreadSpawnToolOutput::Rejected { code, reason }
+                if code == ERROR_THREAD_AUTHORITY_EXCEEDED.as_str()
+                    && reason == "child spawn depth exceeds server maximum 1"
+        ));
+        assert_eq!(runtime.max_spawn_depth(), 1);
+        assert_eq!(
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .thread_authorities()
+                .unwrap()
+                .len(),
+            2,
+            "workspace mutation must not admit a grandchild authority"
+        );
+    }
+
+    #[test]
+    fn model_spawn_enforces_configured_server_depth_at_admission() {
+        let (_root, runtime) = thread_test_runtime_with_max_spawn_depth(2);
+        let parent_thread_id = coordinator_root(&runtime);
+        register_test_agent(
+            &runtime,
+            "worker",
+            ThreadApprovalPolicy::Prompt,
+            vec!["file.read".into(), "thread.spawn".into()],
+        );
+
+        let child_thread_id = match model_thread_spawn(
+            &runtime,
+            &parent_thread_id,
+            model_spawn_input(
+                &runtime,
+                "worker",
+                Some(vec!["file.read".into(), "thread.spawn".into()]),
+                None,
+            ),
+            "daemon".into(),
+        )
+        .unwrap()
+        {
+            ThreadSpawnToolOutput::Spawned { thread_id } => thread_id,
+            output => panic!("expected depth-one child, got {output:?}"),
+        };
+        let grandchild_thread_id = match model_thread_spawn(
+            &runtime,
+            &child_thread_id,
+            model_spawn_input(
+                &runtime,
+                "worker",
+                Some(vec!["file.read".into(), "thread.spawn".into()]),
+                None,
+            ),
+            "daemon".into(),
+        )
+        .unwrap()
+        {
+            ThreadSpawnToolOutput::Spawned { thread_id } => thread_id,
+            output => panic!("expected depth-two grandchild, got {output:?}"),
+        };
+        let rejected = model_thread_spawn(
+            &runtime,
+            &grandchild_thread_id,
+            model_spawn_input(&runtime, "worker", Some(vec!["file.read".into()]), None),
+            "daemon".into(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            rejected,
+            ThreadSpawnToolOutput::Rejected { code, reason }
+                if code == ERROR_THREAD_AUTHORITY_EXCEEDED.as_str()
+                    && reason == "child spawn depth exceeds server maximum 2"
+        ));
+        assert_eq!(runtime.max_spawn_depth(), 2);
+        assert_eq!(
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .thread_authorities()
+                .unwrap()
+                .len(),
+            3,
+            "configured depth two must admit exactly two descendant authorities"
         );
     }
 

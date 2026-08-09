@@ -23,7 +23,7 @@ const PLATO_CONFIG_ENV: &str = "PLATO_CONFIG";
 const WORKSPACE_PROVIDER_OVERRIDE_ERROR: &str = "workspace plato.toml cannot set provider.api_key_env or provider.base_url; use --config, PLATO_CONFIG, or user config";
 const WORKSPACE_GATEWAY_ERROR: &str =
     "workspace plato.toml cannot set [gateway]; use --config, PLATO_CONFIG, or user config";
-const WORKSPACE_SPAWN_DEPTH_ERROR: &str = "workspace plato.toml cannot set limits.max_spawn_depth; use --config, PLATO_CONFIG, or user config";
+const WORKSPACE_SPAWN_DEPTH_ERROR: &str = "workspace plato.toml cannot set limits.max_spawn_depth; use the user config and restart the server";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolvedConfigPath {
@@ -404,6 +404,14 @@ pub fn resolve_config(
     )
 }
 
+pub(crate) fn server_max_spawn_depth() -> AppResult<u32> {
+    let home = user_home();
+    let resolved = resolve_server_config_with(user_config_path(home.as_deref()));
+    Ok(Config::load_resolved(resolved.as_ref())?
+        .limits
+        .max_spawn_depth)
+}
+
 #[cfg(test)]
 fn resolve_config_path_with(
     workspace_root: &Path,
@@ -446,6 +454,15 @@ fn resolve_config_with(
     }
 
     Ok(None)
+}
+
+fn resolve_server_config_with(user_config: Option<PathBuf>) -> Option<ResolvedConfigPath> {
+    if let Some(user_config) = user_config
+        && user_config.exists()
+    {
+        return Some(ResolvedConfigPath::Authorized(user_config));
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -743,7 +760,7 @@ owner_user_ids = [42]
     }
 
     #[test]
-    fn spawn_depth_is_authorized_config_only() {
+    fn workspace_config_cannot_set_server_spawn_depth() {
         let root = tempfile::tempdir().unwrap();
         let authorized_path = root.path().join("authorized.toml");
         std::fs::write(&authorized_path, "[limits]\nmax_spawn_depth = 3\n").unwrap();
@@ -761,8 +778,99 @@ owner_user_ids = [42]
         let workspace = ResolvedConfigPath::Workspace(workspace_path);
         assert!(matches!(
             Config::load_resolved(Some(&workspace)),
-            Err(AppError::Config(message)) if message == WORKSPACE_SPAWN_DEPTH_ERROR
+            Err(AppError::Config(message))
+                if message
+                    == "workspace plato.toml cannot set limits.max_spawn_depth; use the user config and restart the server"
         ));
+    }
+
+    #[test]
+    fn server_spawn_depth_uses_user_config_even_when_workspace_config_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let home = root.path().join("home");
+        let explicit_config = root.path().join("per-run.toml");
+        #[cfg(unix)]
+        let user_config = home.join(".config/plato/config.toml");
+        #[cfg(windows)]
+        let user_config = root.path().join("roaming/plato/config.toml");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            workspace.join("plato.toml"),
+            "[limits]\nmax_spawn_depth = 99\n",
+        )
+        .unwrap();
+        std::fs::write(&explicit_config, "[limits]\nmax_spawn_depth = 9\n").unwrap();
+        std::fs::write(&user_config, "[limits]\nmax_spawn_depth = 2\n").unwrap();
+
+        let explicit_run = resolve_config_with(
+            &workspace,
+            Some(explicit_config.clone()),
+            None,
+            Some(home.clone()),
+            Some(user_config.clone()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            explicit_run,
+            ResolvedConfigPath::Authorized(explicit_config.clone())
+        );
+        assert_eq!(
+            Config::load_resolved(Some(&explicit_run))
+                .unwrap()
+                .limits
+                .max_spawn_depth,
+            9
+        );
+
+        let workspace_run = resolve_config_with(
+            &workspace,
+            None,
+            None,
+            Some(home.clone()),
+            Some(user_config.clone()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            workspace_run,
+            ResolvedConfigPath::Workspace(workspace.join("plato.toml"))
+        );
+
+        let user = resolve_server_config_with(Some(user_config.clone())).unwrap();
+        assert_eq!(user, ResolvedConfigPath::Authorized(user_config.clone()));
+        assert_eq!(
+            Config::load_resolved(Some(&user))
+                .unwrap()
+                .limits
+                .max_spawn_depth,
+            2
+        );
+
+        #[cfg(unix)]
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.as_os_str())),
+                (PLATO_CONFIG_ENV, Some(explicit_config.as_os_str())),
+            ],
+            || assert_eq!(server_max_spawn_depth().unwrap(), 2),
+        );
+        #[cfg(windows)]
+        temp_env::with_vars(
+            [
+                (
+                    "APPDATA",
+                    user_config.parent().unwrap().parent().map(Path::as_os_str),
+                ),
+                ("USERPROFILE", Some(home.as_os_str())),
+                (PLATO_CONFIG_ENV, Some(explicit_config.as_os_str())),
+            ],
+            || assert_eq!(server_max_spawn_depth().unwrap(), 2),
+        );
+
+        assert_eq!(resolve_server_config_with(None), None);
     }
 
     #[test]
