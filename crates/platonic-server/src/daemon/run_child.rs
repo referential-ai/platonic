@@ -86,45 +86,11 @@ enum ParentMessage {
     Cancel,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ApprovalActor {
-    Daemon,
-    SessionGrant,
-    TuiSessionGrant,
-}
-
-impl ApprovalActor {
-    fn from_static(actor: &'static str) -> AppResult<Self> {
-        match actor {
-            "daemon" => Ok(Self::Daemon),
-            "session_grant" => Ok(Self::SessionGrant),
-            "tui_session_grant" => Ok(Self::TuiSessionGrant),
-            _ => Err(AppError::SupervisedRun(format!(
-                "run child cannot transport approval actor {actor}"
-            ))),
-        }
-    }
-
-    fn as_static(self) -> &'static str {
-        match self {
-            Self::Daemon => "daemon",
-            Self::SessionGrant => "session_grant",
-            Self::TuiSessionGrant => "tui_session_grant",
-        }
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "decision")]
 enum ApprovalReply {
-    Granted {
-        actor: ApprovalActor,
-    },
-    Denied {
-        actor: ApprovalActor,
-        reason: String,
-    },
+    Granted { actor: String },
+    Denied { actor: String, reason: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -851,14 +817,11 @@ fn run_supervised_with_limits(
                     } => {
                         let outcome = approval_mode.decide_external(request)?;
                         let outcome = match outcome {
-                            ExternalApprovalOutcome::Granted { actor } => ApprovalReply::Granted {
-                                actor: ApprovalActor::from_static(actor)?,
-                            },
+                            ExternalApprovalOutcome::Granted { actor } => {
+                                ApprovalReply::Granted { actor }
+                            }
                             ExternalApprovalOutcome::Denied { actor, reason } => {
-                                ApprovalReply::Denied {
-                                    actor: ApprovalActor::from_static(actor)?,
-                                    reason,
-                                }
+                                ApprovalReply::Denied { actor, reason }
                             }
                         };
                         child.write(&ParentMessage::Approval {
@@ -1268,13 +1231,10 @@ impl ChildRpc {
         })?;
         match self.next_reply(request_id)? {
             ParentMessage::Approval { outcome, .. } => match outcome {
-                ApprovalReply::Granted { actor } => Ok(ExternalApprovalOutcome::Granted {
-                    actor: actor.as_static(),
-                }),
-                ApprovalReply::Denied { actor, reason } => Ok(ExternalApprovalOutcome::Denied {
-                    actor: actor.as_static(),
-                    reason,
-                }),
+                ApprovalReply::Granted { actor } => Ok(ExternalApprovalOutcome::Granted { actor }),
+                ApprovalReply::Denied { actor, reason } => {
+                    Ok(ExternalApprovalOutcome::Denied { actor, reason })
+                }
             },
             _ => Err(AppError::SupervisedRun(
                 "parent sent a non-approval reply to an approval request".into(),
@@ -1553,13 +1513,16 @@ mod tests {
     }
 
     #[test]
-    fn approval_actor_transport_preserves_all_daemon_identities() {
-        for actor in ["daemon", "session_grant", "tui_session_grant"] {
-            let encoded =
-                serde_json::to_string(&ApprovalActor::from_static(actor).unwrap()).unwrap();
-            let decoded: ApprovalActor = serde_json::from_str(&encoded).unwrap();
-            assert_eq!(decoded.as_static(), actor);
-        }
+    fn approval_actor_transport_preserves_named_principals() {
+        let reply = ApprovalReply::Granted {
+            actor: "jerome".into(),
+        };
+        let encoded = serde_json::to_string(&reply).unwrap();
+        let decoded: ApprovalReply = serde_json::from_str(&encoded).unwrap();
+        assert!(matches!(
+            decoded,
+            ApprovalReply::Granted { actor } if actor == "jerome"
+        ));
     }
 
     #[test]
@@ -1804,7 +1767,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn post_ready_parent_transport_error_cleans_tree_and_leaves_next_run_healthy() {
+    fn post_ready_approval_error_cleans_tree_and_leaves_next_run_healthy() {
         temp_env::with_var(
             "PLATO_RUN_CHILD_TRANSPORT_TEST_KEY",
             Some("test-key"),
@@ -1903,9 +1866,9 @@ while :; do :; done
                     prepared,
                     recorder,
                     ApprovalMode::external_with_actor("test", |_| {
-                        Ok(ExternalApprovalOutcome::Granted {
-                            actor: "unsupported_test_actor",
-                        })
+                        Err(AppError::SupervisedRun(
+                            "test approval authority rejected the request".into(),
+                        ))
                     }),
                     event_sender,
                     Arc::new(AtomicBool::new(false)),
@@ -1933,7 +1896,7 @@ while :; do :; done
                 assert!(matches!(
                     result,
                     Err(AppError::SupervisedRun(reason))
-                        if reason == "run child cannot transport approval actor unsupported_test_actor"
+                        if reason == "test approval authority rejected the request"
                 ));
                 assert!(!Path::new(&format!("/proc/{child_pid}")).exists());
                 assert!(!Path::new(&format!("/proc/{descendant_pid}")).exists());
@@ -1945,7 +1908,7 @@ while :; do :; done
                 assert!(matches!(
                     records.last().map(|record| &record.event),
                     Some(HarnessEvent::RunFailed { reason, .. })
-                        if reason == "run child cannot transport approval actor unsupported_test_actor"
+                        if reason == "test approval authority rejected the request"
                 ));
                 assert_eq!(
                     event_receiver

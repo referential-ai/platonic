@@ -1069,6 +1069,7 @@ mod tests {
     use super::*;
     use crate::{
         AppError, ApprovalRequest,
+        app::ExternalApprovalOutcome,
         daemon::{
             client::DaemonClient,
             protocol::{
@@ -3364,6 +3365,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         for invalid_params in [
             r#"{"run_id":"run_1","tool_call_id":"call_1","decision":"granted"}"#,
             r#"{"run_id":"run_1","tool_call_id":"call_1","decision":"grant","extra":true}"#,
+            r#"{"run_id":"run_1","tool_call_id":"call_1","decision":"grant","actor":""}"#,
         ] {
             let response = server.handle_line(&format!(
                 r#"{{"v":1,"id":"invalid","kind":"request","method":"approval.decide","params":{invalid_params}}}"#
@@ -3375,8 +3377,20 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             assert!(record.pending_approval().is_some());
         }
 
+        for unauthorized in [
+            r#"{"run_id":"run_missing","tool_call_id":"call_1","decision":"grant","actor":"jerome"}"#,
+            r#"{"run_id":"run_1","tool_call_id":"call_missing","decision":"grant","actor":"jerome"}"#,
+        ] {
+            let response = server.handle_line(&format!(
+                r#"{{"v":1,"id":"unauthorized","kind":"request","method":"approval.decide","params":{unauthorized}}}"#
+            ));
+            assert_eq!(response.kind, EnvelopeKind::Error);
+            assert_eq!(response.error.unwrap().code, ERROR_NOT_FOUND);
+            assert!(record.pending_approval().is_some());
+        }
+
         let response = server.handle_line(
-            r#"{"v":1,"id":"approval_1","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"grant"}}"#,
+            r#"{"v":1,"id":"approval_1","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"grant","actor":"jerome"}}"#,
         );
 
         assert_eq!(response.kind, EnvelopeKind::Response);
@@ -3388,12 +3402,26 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             Some(crate::daemon::protocol::ApprovalDecision::Grant)
         );
         assert_eq!(record.pending_approval(), None);
+        assert!(matches!(
+            &record.approvals.lock().unwrap()["call_1"]
+                .decision
+                .as_ref()
+                .unwrap()
+                .outcome,
+            ExternalApprovalOutcome::Granted { actor } if actor == "jerome"
+        ));
 
         let duplicate = server.handle_line(
-            r#"{"v":1,"id":"approval_duplicate","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"grant"}}"#,
+            r#"{"v":1,"id":"approval_duplicate","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"grant","actor":"jerome"}}"#,
         );
         assert_eq!(duplicate.kind, EnvelopeKind::Response);
         assert_eq!(server.runtime.session_tool_grant_count(), 0);
+
+        let substituted_actor = server.handle_line(
+            r#"{"v":1,"id":"approval_substitution","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"grant","actor":"mallory"}}"#,
+        );
+        assert_eq!(substituted_actor.kind, EnvelopeKind::Error);
+        assert_eq!(substituted_actor.error.unwrap().code, ERROR_NOT_FOUND);
 
         let stale = server.handle_line(
             r#"{"v":1,"id":"approval_2","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"deny","reason":"too late"}}"#,

@@ -818,7 +818,9 @@ fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
                     "coordinator requested duplicate approval"
                 );
                 approval = Some((run_id.clone(), tool_call_id.clone()));
-                client.approval_grant(run_id, tool_call_id).unwrap();
+                client
+                    .approval_grant_as(run_id, tool_call_id, "jerome".into())
+                    .unwrap();
             }
         }
         let empty = page.events.is_empty();
@@ -857,7 +859,7 @@ fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
         worker.parent_thread_id.as_deref(),
         Some(coordinator_thread_id.as_str())
     );
-    assert_eq!(worker.spawning_actor, "daemon");
+    assert_eq!(worker.spawning_actor, "jerome");
     assert_eq!(
         worker.agent_id,
         Some(AgentId::new("bounded-worker").unwrap())
@@ -889,7 +891,7 @@ fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
             "thread.spawn".into(),
             "workspace_write".into(),
             "granted".into(),
-            "daemon".into(),
+            "jerome".into(),
         )
     );
     assert_eq!(
@@ -900,7 +902,7 @@ fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .unwrap(),
-        ("granted".into(), "daemon".into())
+        ("granted".into(), "jerome".into())
     );
     assert_eq!(
         connection

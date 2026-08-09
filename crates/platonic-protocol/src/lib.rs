@@ -2454,6 +2454,9 @@ pub struct ApprovalDecideParams {
     /// Optional human reason for the decision.
     #[serde(default)]
     pub reason: Option<String>,
+    /// Attributed actor supplied by the already-trusted local client boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
 }
 
 /// Parameters for requesting run cancellation.
@@ -3869,8 +3872,14 @@ mod tests {
         ] {
             let params: ApprovalDecideParams = serde_json::from_str(fixture).unwrap();
             assert_eq!(params.decision, expected);
+            assert_eq!(params.actor, None);
             assert_eq!(serde_json::to_string(&params).unwrap(), fixture);
         }
+        let attributed: ApprovalDecideParams = serde_json::from_str(
+            r#"{"run_id":"run_1","tool_call_id":"call_1","decision":"grant","reason":null,"actor":"jerome"}"#,
+        )
+        .unwrap();
+        assert_eq!(attributed.actor.as_deref(), Some("jerome"));
         for unknown in ["allow", "grant_network", "grant_tool"] {
             assert!(
                 serde_json::from_value::<ApprovalDecision>(json!(unknown)).is_err(),

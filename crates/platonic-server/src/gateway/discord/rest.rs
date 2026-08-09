@@ -357,6 +357,9 @@ impl DiscordRateLimits {
 
 pub(super) fn discord_http_error(operation: &str, error: ureq::Error) -> GatewayError {
     match error {
+        ureq::Error::Status(status @ (401 | 403), _) => GatewayError::Discord(format!(
+            "discord {operation} authentication failed with HTTP {status}; check the configured bot token and Discord application permissions"
+        )),
         ureq::Error::Status(status, _) => {
             GatewayError::Discord(format!("discord {operation} returned HTTP {status}"))
         }
@@ -818,5 +821,24 @@ mod tests {
         rest.handle.join().unwrap();
 
         assert!(!error.to_string().contains("secret-token"));
+    }
+
+    #[test]
+    fn stale_bot_authentication_fails_closed_with_startup_action() {
+        for status in [401, 403] {
+            let rest = spawn_fake_rest(1, status, None);
+            let client = DiscordRestClient::new(&rest.base_url, "stale-secret".into());
+
+            let error = client.application_id().unwrap_err();
+            rest.handle.join().unwrap();
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "provider error: discord application lookup authentication failed with HTTP {status}; check the configured bot token and Discord application permissions"
+                )
+            );
+            assert!(!error.to_string().contains("stale-secret"));
+        }
     }
 }
