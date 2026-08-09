@@ -6,6 +6,7 @@ use plato_agent::{
 use platonic_client::{
     ClientError,
     client::{DaemonClient, DaemonConnectionConfig},
+    paths,
 };
 use std::{
     io::{self, IsTerminal},
@@ -63,7 +64,11 @@ fn run() -> plato_agent::AppResult<()> {
         io::stdout().is_terminal(),
         io::stderr().is_terminal(),
     );
-    let config = DaemonConnectionConfig::resolve(&cli.workspace, cli.socket.clone())?;
+    let socket = match cli.socket {
+        Some(socket) => socket,
+        None => paths::host_socket_path()?,
+    };
+    let config = DaemonConnectionConfig::resolve(&cli.workspace, Some(socket.clone()))?;
     match DaemonClient::connect_with_timeout(&config.socket_path, LOCAL_ENDPOINT_PROBE_TIMEOUT) {
         Ok(mut client) => {
             if local_interactive {
@@ -83,7 +88,7 @@ fn run() -> plato_agent::AppResult<()> {
     }
     run_tui(TuiOptions {
         workspace: cli.workspace,
-        socket: cli.socket,
+        socket: Some(socket),
         run: cli.run,
         config: cli.config,
         snapshot: cli.snapshot,

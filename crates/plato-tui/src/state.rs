@@ -4,8 +4,8 @@ use nucleo::{
 };
 use platonic_core::EffectClass;
 use platonic_protocol::{
-    DaemonStatusResult, HelloResult, ModelIdentityStatus, PendingApprovalSnapshot, RunStateName,
-    SessionSummary, TranscriptReadResult, TypedTranscript,
+    ApprovalProfile, DaemonStatusResult, HelloResult, ModelIdentityStatus, PendingApprovalSnapshot,
+    RunStateName, SessionSummary, TranscriptReadResult, TypedTranscript,
 };
 use ratatui::text::Line;
 use std::{
@@ -58,6 +58,8 @@ pub struct TuiState {
     pub sessions: Vec<SessionSummary>,
     /// Session selected for display and continuation.
     pub selected_session_id: Option<String>,
+    /// Current selected-session profile, or the next fresh session's profile.
+    pub approval_profile: ApprovalProfile,
     /// Selected transcript state.
     pub transcript: TranscriptState,
     /// Run currently active in the selected session.
@@ -111,6 +113,7 @@ impl PartialEq for TuiState {
             && self.connection == other.connection
             && self.sessions == other.sessions
             && self.selected_session_id == other.selected_session_id
+            && self.approval_profile == other.approval_profile
             && self.transcript == other.transcript
             && self.active_run == other.active_run
             && self.live_events == other.live_events
@@ -219,6 +222,7 @@ impl TuiState {
             connection,
             sessions: Vec::new(),
             selected_session_id: None,
+            approval_profile: ApprovalProfile::Prompt,
             transcript: TranscriptState::None,
             active_run: None,
             live_events: Vec::new(),

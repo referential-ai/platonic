@@ -44,6 +44,7 @@ pub fn approval_from_event(
         reason,
         approval_preview,
         diff_preview,
+        ..
     } = event
     else {
         return None;

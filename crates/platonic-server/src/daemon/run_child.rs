@@ -1857,6 +1857,7 @@ enabled = ["file.read"]
                         input_preview: Some("{}".into()),
                         approval_preview: None,
                         diff_preview: None,
+                        yolo_eligible: false,
                     },
                 })
                 .unwrap();

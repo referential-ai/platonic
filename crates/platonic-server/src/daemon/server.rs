@@ -1373,6 +1373,7 @@ mod tests {
             input_preview: Some(r#"{"path":"out.txt"}"#.into()),
             approval_preview: None,
             diff_preview: None,
+            yolo_eligible: false,
         }
     }
 
@@ -1756,6 +1757,7 @@ mod tests {
                 "transcript.read.typed",
                 "transcript.read.pending_approval",
                 "daemon.status",
+                "session.approval_profile.set",
                 "daemon.shutdown_if_idle",
                 "thread.spawn",
                 "thread.list",
