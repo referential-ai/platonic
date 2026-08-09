@@ -8,6 +8,7 @@ pub const FILE_WRITE: &str = "file.write";
 pub const FILE_EDIT: &str = "file.edit";
 pub const SHELL_EXEC: &str = "shell.exec";
 pub const WEB_FETCH: &str = "web.fetch";
+pub const THREAD_SPAWN: &str = "thread.spawn";
 
 const PROVIDER_FILE_READ: &str = "file_read";
 const PROVIDER_FILE_LIST: &str = "file_list";
@@ -15,6 +16,7 @@ const PROVIDER_FILE_WRITE: &str = "file_write";
 const PROVIDER_FILE_EDIT: &str = "file_edit";
 const PROVIDER_SHELL_EXEC: &str = "shell_exec";
 const PROVIDER_WEB_FETCH: &str = "web_fetch";
+const PROVIDER_THREAD_SPAWN: &str = "thread_spawn";
 
 const BOOTSTRAP_TOOLS: &[ToolDefinition] = &[
     ToolDefinition {
@@ -59,6 +61,13 @@ const BOOTSTRAP_TOOLS: &[ToolDefinition] = &[
         description: "Fetch bounded UTF-8 text from one approved public HTTP(S) URL.",
         input_schema: ToolInputSchema::WebFetch,
     },
+    ToolDefinition {
+        internal_name: THREAD_SPAWN,
+        provider_name: PROVIDER_THREAD_SPAWN,
+        effect: EffectClass::WorkspaceWrite,
+        description: "Spawn one bounded worker thread from a configured agent after approval.",
+        input_schema: ToolInputSchema::ThreadSpawn,
+    },
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,6 +86,7 @@ enum ToolInputSchema {
     Write,
     ShellExec,
     WebFetch,
+    ThreadSpawn,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -94,6 +104,7 @@ pub fn bootstrap_tools() -> &'static [ToolDefinition] {
 pub fn default_enabled_tools() -> Vec<String> {
     BOOTSTRAP_TOOLS
         .iter()
+        .filter(|tool| tool.internal_name != THREAD_SPAWN)
         .map(|tool| tool.internal_name.into())
         .collect()
 }
@@ -212,6 +223,41 @@ impl ToolInputSchema {
                 "required": ["url"],
                 "additionalProperties": false
             }),
+            Self::ThreadSpawn => json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Configured target agent in the coordinator's workspace."
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Absolute worker directory within the coordinator's granted paths."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional model override."
+                    },
+                    "reasoning_effort": {
+                        "type": "string",
+                        "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                        "description": "Optional reasoning-effort override."
+                    },
+                    "approval_policy": {
+                        "type": "string",
+                        "enum": ["prompt", "yolo"],
+                        "description": "Optional worker approval-policy override."
+                    },
+                    "toolset": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "uniqueItems": true,
+                        "description": "Optional narrowing override of the target agent's default toolset."
+                    }
+                },
+                "required": ["agent_id", "cwd"],
+                "additionalProperties": false
+            }),
         }
     }
 }
@@ -236,6 +282,7 @@ mod tests {
                 (FILE_EDIT, EffectClass::WorkspaceWrite),
                 (SHELL_EXEC, EffectClass::ExternalSideEffect),
                 (WEB_FETCH, EffectClass::Network),
+                (THREAD_SPAWN, EffectClass::WorkspaceWrite),
             ]
         );
 
@@ -252,6 +299,7 @@ mod tests {
                 PROVIDER_FILE_EDIT,
                 PROVIDER_SHELL_EXEC,
                 PROVIDER_WEB_FETCH,
+                PROVIDER_THREAD_SPAWN,
             ]
         );
     }
@@ -273,15 +321,17 @@ mod tests {
             FILE_EDIT.into(),
             SHELL_EXEC.into(),
             WEB_FETCH.into(),
+            THREAD_SPAWN.into(),
         ]);
 
-        assert_eq!(specs.len(), 6);
+        assert_eq!(specs.len(), 7);
         assert_eq!(specs[0].name, PROVIDER_FILE_READ);
         assert_eq!(specs[1].name, PROVIDER_FILE_LIST);
         assert_eq!(specs[2].name, PROVIDER_FILE_WRITE);
         assert_eq!(specs[3].name, PROVIDER_FILE_EDIT);
         assert_eq!(specs[4].name, PROVIDER_SHELL_EXEC);
         assert_eq!(specs[5].name, PROVIDER_WEB_FETCH);
+        assert_eq!(specs[6].name, PROVIDER_THREAD_SPAWN);
         assert_eq!(
             specs[4].input_schema,
             json!({
@@ -317,5 +367,44 @@ mod tests {
                 "additionalProperties": false
             })
         );
+        assert_eq!(
+            specs[6].input_schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Configured target agent in the coordinator's workspace."
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Absolute worker directory within the coordinator's granted paths."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional model override."
+                    },
+                    "reasoning_effort": {
+                        "type": "string",
+                        "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                        "description": "Optional reasoning-effort override."
+                    },
+                    "approval_policy": {
+                        "type": "string",
+                        "enum": ["prompt", "yolo"],
+                        "description": "Optional worker approval-policy override."
+                    },
+                    "toolset": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "uniqueItems": true,
+                        "description": "Optional narrowing override of the target agent's default toolset."
+                    }
+                },
+                "required": ["agent_id", "cwd"],
+                "additionalProperties": false
+            })
+        );
+        assert!(!default_enabled_tools().contains(&THREAD_SPAWN.to_owned()));
     }
 }

@@ -715,6 +715,219 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
 
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
+fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
+    let _serial = SCENARIO_SERIAL.lock().unwrap();
+    let proof = ProofContext::new();
+    let worker_cwd = proof.workspace.join("worker");
+    fs::create_dir(&worker_cwd).unwrap();
+    let provider = CoordinatorProvider::start(worker_cwd.canonicalize().unwrap());
+    write_coordinator_config(&proof.config_path, &provider.base_url);
+    let host = ProofDaemon::start_host(&proof);
+    let mut client = host.connect();
+    client.hello(&proof.workspace).unwrap();
+    let workspace_id = client
+        .workspace_list()
+        .unwrap()
+        .workspaces
+        .into_iter()
+        .find(|workspace| Path::new(&workspace.root) == proof.workspace.canonicalize().unwrap())
+        .unwrap()
+        .id;
+    client
+        .agent_create(
+            AgentId::new("bounded-worker").unwrap(),
+            workspace_id,
+            "worker-model".into(),
+            ReasoningEffort::High,
+            ThreadApprovalPolicy::Prompt,
+            vec!["file.read".into()],
+        )
+        .unwrap();
+
+    let (spawn_id, coordinator_thread_id) = match client
+        .thread_spawn_start(
+            None,
+            proof
+                .workspace
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "test-model".into(),
+            ReasoningEffort::High,
+            ThreadApprovalPolicy::Prompt,
+        )
+        .unwrap()
+    {
+        ThreadSpawnResult::ApprovalRequired {
+            spawn_id,
+            thread_id,
+            effect,
+            ..
+        } => {
+            assert_eq!(effect, EffectClass::WorkspaceWrite);
+            (spawn_id, thread_id)
+        }
+        result => panic!("expected coordinator approval, got {result:?}"),
+    };
+    assert!(matches!(
+        client
+            .thread_spawn_decide(
+                spawn_id,
+                ThreadSpawnDecision::Grant {
+                    actor: "semantic_fixture".into(),
+                },
+            )
+            .unwrap(),
+        ThreadSpawnResult::Spawned { .. }
+    ));
+    assert!(matches!(
+        client
+            .thread_send(
+                coordinator_thread_id.clone(),
+                "semantic_controller".into(),
+                None,
+                "Dispatch exactly one bounded worker and report its durable thread id.".into(),
+            )
+            .unwrap(),
+        ThreadSendResult::Started { .. }
+    ));
+
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    let mut offset = 0;
+    let mut events = Vec::new();
+    let mut approval = None;
+    loop {
+        let page = client
+            .thread_events(coordinator_thread_id.clone(), Some(offset), 128, 1_000)
+            .unwrap();
+        offset = page.next_offset;
+        for event in &page.events {
+            if let StreamEvent::ApprovalRequested {
+                run_id,
+                tool_call_id,
+                tool_name,
+                effect,
+                ..
+            } = &event.event
+            {
+                assert_eq!(tool_name, "thread.spawn");
+                assert_eq!(*effect, EffectClass::WorkspaceWrite);
+                assert!(
+                    approval.is_none(),
+                    "coordinator requested duplicate approval"
+                );
+                approval = Some((run_id.clone(), tool_call_id.clone()));
+                client.approval_grant(run_id, tool_call_id).unwrap();
+            }
+        }
+        let empty = page.events.is_empty();
+        events.extend(page.events);
+        if approval.is_some() && page.current_turn_id.is_none() && empty {
+            break;
+        }
+        assert!(Instant::now() < deadline, "coordinator turn did not finish");
+    }
+
+    let (run_id, tool_call_id) = approval.expect("coordinator did not request spawn approval");
+    let spawned_thread_id = events
+        .iter()
+        .find_map(|event| match &event.event {
+            StreamEvent::Ledger { record } => match &record.event {
+                HarnessEvent::ToolFinished { result, .. } if result.data["status"] == "spawned" => {
+                    result.data["thread_id"].as_str().map(str::to_owned)
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("coordinator did not receive a spawned thread result");
+    let transcript = client.transcript_read(&run_id).unwrap();
+    let expected_answer = format!("Dispatched bounded worker {spawned_thread_id}.");
+    assert_eq!(
+        transcript.final_answer.as_deref(),
+        Some(expected_answer.as_str())
+    );
+
+    let worker = client
+        .thread_authority(spawned_thread_id.clone())
+        .unwrap()
+        .authority;
+    assert_eq!(
+        worker.parent_thread_id.as_deref(),
+        Some(coordinator_thread_id.as_str())
+    );
+    assert_eq!(worker.spawning_actor, "daemon");
+    assert_eq!(
+        worker.agent_id,
+        Some(AgentId::new("bounded-worker").unwrap())
+    );
+    assert_eq!(worker.toolset, ["file.read"]);
+    assert_eq!(worker.approval_policy, ThreadApprovalPolicy::Prompt);
+    assert_eq!(worker.granted_paths.len(), 1);
+    assert!(!worker.granted_paths[0].writable);
+    assert!(!worker.network);
+
+    let connection = Connection::open(&proof.server_db_path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT tool_name, effect, decision, decided_by
+                   FROM tool_call_approvals WHERE run_id = ?1 AND call_id = ?2",
+                params![run_id, tool_call_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap(),
+        (
+            "thread.spawn".into(),
+            "workspace_write".into(),
+            "granted".into(),
+            "daemon".into(),
+        )
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT decision, actor FROM thread_spawn_approvals WHERE thread_id = ?1",
+                [&spawned_thread_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+        ("granted".into(), "daemon".into())
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM thread_authorities WHERE parent_thread_id = ?1",
+                [&coordinator_thread_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+
+    let provider_proof = provider.join();
+    assert_eq!(provider_proof.thread_id, spawned_thread_id);
+    assert!(
+        provider_proof
+            .wrapped_result
+            .starts_with("<tool_output name=\"thread.spawn\" trust=\"untrusted\">\n")
+    );
+    assert!(provider_proof.wrapped_result.ends_with("\n</tool_output>"));
+    assert_eq!(provider_proof.request_count, 2);
+    host.stop(client);
+}
+
+#[test]
+#[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
 fn thread_send_and_three_observers_are_semantically_conformant_on_host_daemon() {
     const INITIAL_MESSAGE: &str = "begin the controlled thread proof";
     const STEERED_MESSAGE: &str = "include the exact steered phrase in the continuation";
@@ -2394,6 +2607,96 @@ struct ControlledThreadProvider {
     handle: Option<thread::JoinHandle<Vec<Value>>>,
 }
 
+struct CoordinatorProvider {
+    base_url: String,
+    handle: Option<thread::JoinHandle<CoordinatorProviderProof>>,
+}
+
+struct CoordinatorProviderProof {
+    thread_id: String,
+    wrapped_result: String,
+    request_count: usize,
+}
+
+impl CoordinatorProvider {
+    fn start(worker_cwd: PathBuf) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let mut first = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let first_request = read_http_request(&mut first);
+            assert!(
+                first_request["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "thread_spawn"),
+                "coordinator authority did not project thread.spawn into provider tools"
+            );
+            write_http_response(
+                &mut first,
+                &ProviderReply::tool_call(
+                    "thread_spawn",
+                    json!({
+                        "agent_id": "bounded-worker",
+                        "cwd": worker_cwd.to_string_lossy(),
+                        "toolset": ["file.read"]
+                    }),
+                    UsageFixture::Known(8, 3),
+                )
+                .body,
+            );
+
+            let mut second = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let second_request = read_http_request(&mut second);
+            let wrapped_result = second_request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "tool")
+                .and_then(|message| message["content"].as_str())
+                .expect("provider did not receive a tool result")
+                .to_owned();
+            let body = wrapped_result
+                .strip_prefix("<tool_output name=\"thread.spawn\" trust=\"untrusted\">\n")
+                .and_then(|body| body.strip_suffix("\n</tool_output>"))
+                .expect("thread.spawn result was not wrapped as untrusted tool output");
+            let output: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(output["status"], "spawned");
+            let thread_id = output["thread_id"].as_str().unwrap().to_owned();
+            let answer = format!("Dispatched bounded worker {thread_id}.");
+            write_http_response(
+                &mut second,
+                &ProviderReply::answer(&answer, UsageFixture::Known(12, 4)).body,
+            );
+
+            CoordinatorProviderProof {
+                thread_id,
+                wrapped_result,
+                request_count: 2,
+            }
+        });
+        Self {
+            base_url,
+            handle: Some(handle),
+        }
+    }
+
+    fn join(mut self) -> CoordinatorProviderProof {
+        self.handle.take().unwrap().join().unwrap()
+    }
+}
+
+impl Drop for CoordinatorProvider {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 impl ControlledThreadProvider {
     fn start(continuation_answer: &'static str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2689,6 +2992,32 @@ max_turns = 2
 
 [tools]
 enabled = ["file.read", "file.write"]
+"#
+        ),
+    )
+    .unwrap();
+}
+
+fn write_coordinator_config(path: &Path, base_url: &str) {
+    fs::write(
+        path,
+        format!(
+            r#"[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "{API_KEY_ENV}"
+base_url = "{base_url}"
+connect_timeout_ms = 5000
+stream_idle_timeout_ms = 5000
+
+[limits]
+token_budget = 4000
+max_output_tokens = 64
+max_turns = 2
+max_spawn_depth = 1
+
+[tools]
+enabled = ["file.read", "thread.spawn"]
 "#
         ),
     )

@@ -1,7 +1,9 @@
 pub mod github;
 pub mod web;
 
-use crate::tool_catalog::{FILE_EDIT, FILE_LIST, FILE_READ, FILE_WRITE, SHELL_EXEC, WEB_FETCH};
+use crate::tool_catalog::{
+    FILE_EDIT, FILE_LIST, FILE_READ, FILE_WRITE, SHELL_EXEC, THREAD_SPAWN, WEB_FETCH,
+};
 use crate::{AppError, AppResult};
 use platonic_core::{ResultVisibility, ToolResult};
 use serde::{Deserialize, Serialize};
@@ -11,7 +13,10 @@ use std::{
     io::{self, ErrorKind, Read, Write},
     path::{Component, Path, PathBuf},
     process::{ChildStderr, ChildStdout, Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -251,6 +256,65 @@ struct ShellExecInput {
     timeout_seconds: Option<u64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ThreadSpawnToolInput {
+    pub(crate) agent_id: String,
+    pub(crate) cwd: String,
+    pub(crate) model: Option<String>,
+    pub(crate) reasoning_effort: Option<platonic_protocol::ReasoningEffort>,
+    pub(crate) approval_policy: Option<platonic_protocol::ThreadApprovalPolicy>,
+    pub(crate) toolset: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub(crate) enum ThreadSpawnToolOutput {
+    Spawned { thread_id: String },
+    Rejected { code: String, reason: String },
+}
+
+impl ThreadSpawnToolOutput {
+    pub(crate) fn is_rejected(&self) -> bool {
+        matches!(self, Self::Rejected { .. })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ThreadSpawnToolHandler {
+    execute:
+        Arc<dyn Fn(ThreadSpawnToolInput, String) -> AppResult<ThreadSpawnToolOutput> + Send + Sync>,
+}
+
+impl std::fmt::Debug for ThreadSpawnToolHandler {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ThreadSpawnToolHandler")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ThreadSpawnToolHandler {
+    pub(crate) fn new(
+        execute: impl Fn(ThreadSpawnToolInput, String) -> AppResult<ThreadSpawnToolOutput>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            execute: Arc::new(execute),
+        }
+    }
+
+    pub(crate) fn execute(
+        &self,
+        input: ThreadSpawnToolInput,
+        approving_actor: String,
+    ) -> AppResult<ThreadSpawnToolOutput> {
+        (self.execute)(input, approving_actor)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApprovalOutcome {
     Granted,
@@ -262,6 +326,8 @@ pub struct ToolExecutionContext<'a> {
     pub workspace_root: &'a Path,
     pub provider_api_key_env: Option<&'a str>,
     pub cancel: Option<&'a AtomicBool>,
+    pub(crate) thread_spawn: Option<&'a ThreadSpawnToolHandler>,
+    pub(crate) approving_actor: Option<&'a str>,
 }
 
 impl<'a> ToolExecutionContext<'a> {
@@ -270,6 +336,8 @@ impl<'a> ToolExecutionContext<'a> {
             workspace_root,
             provider_api_key_env: None,
             cancel: None,
+            thread_spawn: None,
+            approving_actor: None,
         }
     }
 }
@@ -314,8 +382,36 @@ pub fn execute_tool_with_context(
         FILE_EDIT => write_file(context.workspace_root, call_id, input, "edited", "at"),
         SHELL_EXEC => shell_exec(context, call_id, input),
         WEB_FETCH => web::fetch(call_id, input, context.cancel),
+        THREAD_SPAWN => spawn_thread(context, call_id, input),
         _ => Err(AppError::Tool(format!("unknown tool: {tool_name}"))),
     }
+}
+
+fn spawn_thread(
+    context: ToolExecutionContext<'_>,
+    call_id: platonic_core::ToolCallId,
+    input: Value,
+) -> AppResult<ToolResult> {
+    let input: ThreadSpawnToolInput = serde_json::from_value(input)?;
+    let handler = context
+        .thread_spawn
+        .ok_or_else(|| AppError::Tool("thread.spawn requires a coordinator thread".into()))?;
+    let actor = context
+        .approving_actor
+        .ok_or_else(|| AppError::Tool("thread.spawn requires an approving actor".into()))?;
+    let output = handler.execute(input, actor.into())?;
+    let rejected = output.is_rejected();
+    Ok(ToolResult {
+        call_id,
+        summary: if rejected {
+            "thread spawn rejected".into()
+        } else {
+            "spawned worker thread".into()
+        },
+        data: serde_json::to_value(output)?,
+        artifacts: vec![],
+        visibility: ResultVisibility::Both,
+    })
 }
 
 pub fn ask_for_approval(
@@ -1108,11 +1204,65 @@ impl DiffPreview {
 mod tests {
     use super::*;
     use platonic_core::ToolCallId;
+    use std::sync::Mutex;
 
     #[cfg(windows)]
     const WINDOWS_PROCESS_REPEAT_COUNT: usize = 25;
     #[cfg(windows)]
     const WINDOWS_DESCENDANT_TIMEOUT_SECONDS: u64 = 5;
+
+    #[test]
+    fn thread_spawn_executes_only_with_host_handler_and_approving_actor() {
+        let root = tempfile::tempdir().unwrap();
+        let observed = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&observed);
+        let handler = ThreadSpawnToolHandler::new(move |input, actor| {
+            *captured.lock().unwrap() = Some((input, actor));
+            Ok(ThreadSpawnToolOutput::Spawned {
+                thread_id: "thread_worker".into(),
+            })
+        });
+        let result = execute_tool_with_context(
+            ToolExecutionContext {
+                workspace_root: root.path(),
+                provider_api_key_env: None,
+                cancel: None,
+                thread_spawn: Some(&handler),
+                approving_actor: Some("reviewer"),
+            },
+            ToolCallId::new("call_spawn").unwrap(),
+            THREAD_SPAWN,
+            json!({"agent_id": "worker", "cwd": root.path()}),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.data,
+            json!({"status": "spawned", "thread_id": "thread_worker"})
+        );
+        let (input, actor) = observed.lock().unwrap().clone().unwrap();
+        assert_eq!(input.agent_id, "worker");
+        assert_eq!(input.cwd, root.path().to_string_lossy());
+        assert_eq!(actor, "reviewer");
+
+        let error = execute_tool_with_context(
+            ToolExecutionContext {
+                workspace_root: root.path(),
+                provider_api_key_env: None,
+                cancel: None,
+                thread_spawn: Some(&handler),
+                approving_actor: None,
+            },
+            ToolCallId::new("call_without_actor").unwrap(),
+            THREAD_SPAWN,
+            json!({"agent_id": "worker", "cwd": root.path()}),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Tool(message) if message.contains("approving actor")
+        ));
+    }
 
     struct InstrumentedReader {
         bytes: Vec<u8>,
@@ -2077,6 +2227,8 @@ mod tests {
                 workspace_root: dir.path(),
                 provider_api_key_env: None,
                 cancel: Some(&cancel),
+                thread_spawn: None,
+                approving_actor: None,
             },
             ToolCallId::new("call_1").unwrap(),
             SHELL_EXEC,
@@ -2262,6 +2414,8 @@ mod tests {
                 workspace_root: dir.path(),
                 provider_api_key_env: None,
                 cancel: Some(cancel.as_ref()),
+                thread_spawn: None,
+                approving_actor: None,
             },
             ToolCallId::new("call_1").unwrap(),
             SHELL_EXEC,

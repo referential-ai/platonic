@@ -137,6 +137,7 @@ impl DaemonServer {
     }
 
     fn bind_inner(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<Self> {
+        let max_spawn_depth = crate::config::server_max_spawn_depth()?;
         let paths = DaemonPaths::provisional(workspace_root, socket_path)?;
         #[cfg(unix)]
         let reclaim_default_socket =
@@ -152,7 +153,7 @@ impl DaemonServer {
             crate::ledger::interrupt_orphaned_default_sqlite_runs(&paths.default_ledger())?;
         }
         let endpoint = BoundEndpoint::bind(paths.socket_path.clone(), reclaim_default_socket)?;
-        let runtime = DaemonRuntime::new(paths);
+        let runtime = DaemonRuntime::new_with_max_spawn_depth(paths, max_spawn_depth);
         Ok(Self {
             endpoint,
             runtime,
@@ -206,6 +207,7 @@ struct HostRuntime {
 
 impl HostRuntime {
     fn new(socket_path: PathBuf) -> AppResult<Self> {
+        let max_spawn_depth = crate::config::server_max_spawn_depth()?;
         let started_at = Instant::now();
         let state = Arc::new(Mutex::new(RuntimeState::default()));
         let stop_requested = Arc::new(AtomicBool::new(false));
@@ -213,6 +215,7 @@ impl HostRuntime {
             DaemonPaths::resolve(&std::env::current_dir()?, Some(socket_path.clone()))?;
         let control_runtime = DaemonRuntime::new_shared(
             control_paths,
+            max_spawn_depth,
             started_at,
             Arc::clone(&state),
             Arc::clone(&stop_requested),
@@ -284,6 +287,7 @@ impl HostRuntime {
             .map_err(|error| (ERROR_INTERNAL, error.to_string()))?;
         let runtime = DaemonRuntime::new_shared(
             paths,
+            self.control_runtime.max_spawn_depth(),
             self.started_at,
             Arc::clone(&self.state),
             Arc::clone(&self.stop_requested),
@@ -1107,6 +1111,55 @@ mod tests {
 
     fn response_result<T: serde::de::DeserializeOwned>(response: &Envelope) -> T {
         serde_json::from_value(response_value(response)).unwrap()
+    }
+
+    #[test]
+    fn host_runtime_freezes_and_carries_configured_spawn_depth() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let config_path = home.join(".config/plato/config.toml");
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, "[limits]\nmax_spawn_depth = 2\n").unwrap();
+
+        temp_env::with_vars(
+            [("HOME", Some(home.as_os_str())), ("PLATO_CONFIG", None)],
+            || {
+                paths::with_test_xdg(root.path(), || {
+                    let host = HostRuntime::new(root.path().join("host.sock")).unwrap();
+                    assert_eq!(host.control_runtime.max_spawn_depth(), 2);
+
+                    fs::write(&config_path, "[limits]\nmax_spawn_depth = 99\n").unwrap();
+                    fs::write(
+                        workspace.join("plato.toml"),
+                        "[limits]\nmax_spawn_depth = 77\n",
+                    )
+                    .unwrap();
+                    host.control_runtime
+                        .paths
+                        .server_store()
+                        .unwrap()
+                        .register_workspace(
+                            "ws-host-depth",
+                            "host-depth",
+                            &workspace.canonicalize().unwrap().to_string_lossy(),
+                            &root.path().join("ledger.db").to_string_lossy(),
+                            1,
+                        )
+                        .unwrap();
+                    let workspace_runtime = host
+                        .workspace_runtime(&HelloParams {
+                            workspace_root: workspace.to_string_lossy().into_owned(),
+                            workspace_id: "ws-host-depth".into(),
+                        })
+                        .unwrap();
+
+                    assert_eq!(host.control_runtime.max_spawn_depth(), 2);
+                    assert_eq!(workspace_runtime.max_spawn_depth(), 2);
+                });
+            },
+        );
     }
 
     fn pending_request(run_id: &str, call_id: &str) -> ApprovalRequest {

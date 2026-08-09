@@ -3,6 +3,8 @@ use crate::{
     app::{ExternalApprovalOutcome, PreparedRun, run_prepared_question},
     daemon::child_process::ProcessTreeChild,
     ledger::{EventRecorder, RUN_CANCELED_REASON, RunEventRecorder},
+    tool_catalog::THREAD_SPAWN,
+    tools::{ThreadSpawnToolHandler, ThreadSpawnToolInput, ThreadSpawnToolOutput},
 };
 use platonic_core::{HarnessEvent, RecordedEvent, RunId};
 use serde::{Deserialize, Serialize};
@@ -77,6 +79,10 @@ enum ParentMessage {
         request_id: u64,
         outcome: ApprovalReply,
     },
+    ThreadSpawn {
+        request_id: u64,
+        output: ThreadSpawnToolOutput,
+    },
     Cancel,
 }
 
@@ -139,6 +145,11 @@ enum ChildMessage {
     Approval {
         request_id: u64,
         request: ApprovalRequest,
+    },
+    ThreadSpawn {
+        request_id: u64,
+        input: ThreadSpawnToolInput,
+        approving_actor: String,
     },
     Result {
         request_id: u64,
@@ -614,6 +625,7 @@ pub(super) fn run_supervised(
     approval_mode: ApprovalMode,
     event_sender: mpsc::Sender<RunEvent>,
     cancel: Arc<AtomicBool>,
+    thread_spawn: Option<ThreadSpawnToolHandler>,
 ) -> SupervisedRunCompletion {
     let executable = match resolve_run_child_executable() {
         Ok(executable) => executable,
@@ -628,6 +640,7 @@ pub(super) fn run_supervised(
         approval_mode,
         event_sender,
         cancel,
+        thread_spawn,
         ChildLaunch {
             limits: ChildLifecycleLimits::default(),
             executable,
@@ -645,6 +658,7 @@ pub(super) fn run_supervised_for_test(
     approval_mode: ApprovalMode,
     event_sender: mpsc::Sender<RunEvent>,
     cancel: Arc<AtomicBool>,
+    thread_spawn: Option<ThreadSpawnToolHandler>,
     launch: SupervisedTestLaunch,
 ) -> SupervisedRunCompletion {
     run_supervised_with_limits(
@@ -653,6 +667,7 @@ pub(super) fn run_supervised_for_test(
         approval_mode,
         event_sender,
         cancel,
+        thread_spawn,
         ChildLaunch {
             limits: ChildLifecycleLimits::default(),
             executable: launch.executable,
@@ -715,6 +730,7 @@ fn run_supervised_with_limits(
     approval_mode: ApprovalMode,
     event_sender: mpsc::Sender<RunEvent>,
     cancel: Arc<AtomicBool>,
+    thread_spawn: Option<ThreadSpawnToolHandler>,
     launch: ChildLaunch,
 ) -> SupervisedRunCompletion {
     let ChildLaunch {
@@ -850,6 +866,25 @@ fn run_supervised_with_limits(
                             outcome,
                         })?;
                     }
+                    ChildMessage::ThreadSpawn {
+                        request_id,
+                        input,
+                        approving_actor,
+                    } => match thread_spawn.as_ref() {
+                        Some(handler) => match handler.execute(input, approving_actor) {
+                            Ok(output) => {
+                                child.write(&ParentMessage::ThreadSpawn { request_id, output })?
+                            }
+                            Err(error) => child.write(&ParentMessage::Reject {
+                                request_id,
+                                error: error.to_string(),
+                            })?,
+                        },
+                        None => child.write(&ParentMessage::Reject {
+                            request_id,
+                            error: "thread.spawn requires a coordinator thread".into(),
+                        })?,
+                    },
                     ChildMessage::Result {
                         request_id,
                         result: child_result,
@@ -1110,6 +1145,12 @@ pub fn run_stdio_child() -> AppResult<()> {
         )
     });
     let approval_rpc = rpc.clone();
+    let thread_spawn = prepared.has_tool(THREAD_SPAWN).then(|| {
+        let thread_spawn_rpc = rpc.clone();
+        ThreadSpawnToolHandler::new(move |input, approving_actor| {
+            thread_spawn_rpc.thread_spawn(input, approving_actor)
+        })
+    });
     let outcome = run_prepared_question(
         prepared,
         &mut recorder,
@@ -1117,6 +1158,7 @@ pub fn run_stdio_child() -> AppResult<()> {
         Some(event_sender),
         false,
         Some(cancel),
+        thread_spawn,
     );
     event_forwarder
         .join()
@@ -1240,6 +1282,26 @@ impl ChildRpc {
         }
     }
 
+    fn thread_spawn(
+        &self,
+        input: ThreadSpawnToolInput,
+        approving_actor: String,
+    ) -> AppResult<ThreadSpawnToolOutput> {
+        let _transaction = self.transaction.lock().expect("child RPC lock poisoned");
+        let request_id = self.next_request_id();
+        self.send(&ChildMessage::ThreadSpawn {
+            request_id,
+            input,
+            approving_actor,
+        })?;
+        match self.next_reply(request_id)? {
+            ParentMessage::ThreadSpawn { output, .. } => Ok(output),
+            _ => Err(AppError::SupervisedRun(
+                "parent sent a non-spawn reply to a thread.spawn request".into(),
+            )),
+        }
+    }
+
     fn result(&self, result: ChildRunResult) -> AppResult<()> {
         let _transaction = self.transaction.lock().expect("child RPC lock poisoned");
         let request_id = self.next_request_id();
@@ -1282,6 +1344,10 @@ impl ChildRpc {
                 ..
             }
             | ParentMessage::Approval {
+                request_id: reply_id,
+                ..
+            }
+            | ParentMessage::ThreadSpawn {
                 request_id: reply_id,
                 ..
             } if *reply_id == request_id => {}
@@ -1493,6 +1559,56 @@ mod tests {
                 serde_json::to_string(&ApprovalActor::from_static(actor).unwrap()).unwrap();
             let decoded: ApprovalActor = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded.as_static(), actor);
+        }
+    }
+
+    #[test]
+    fn thread_spawn_rpc_preserves_input_actor_and_typed_result() {
+        let child = ChildMessage::ThreadSpawn {
+            request_id: 7,
+            input: ThreadSpawnToolInput {
+                agent_id: "worker".into(),
+                cwd: "/tmp/workspace".into(),
+                model: None,
+                reasoning_effort: None,
+                approval_policy: None,
+                toolset: Some(vec!["file.read".into()]),
+            },
+            approving_actor: "daemon".into(),
+        };
+        let encoded = serde_json::to_string(&child).unwrap();
+        match serde_json::from_str::<ChildMessage>(&encoded).unwrap() {
+            ChildMessage::ThreadSpawn {
+                request_id,
+                input,
+                approving_actor,
+            } => {
+                assert_eq!(request_id, 7);
+                assert_eq!(input.agent_id, "worker");
+                assert_eq!(input.toolset.unwrap(), ["file.read"]);
+                assert_eq!(approving_actor, "daemon");
+            }
+            message => panic!("unexpected child RPC message: {message:?}"),
+        }
+
+        let parent = ParentMessage::ThreadSpawn {
+            request_id: 7,
+            output: ThreadSpawnToolOutput::Spawned {
+                thread_id: "thread_worker".into(),
+            },
+        };
+        let encoded = serde_json::to_string(&parent).unwrap();
+        match serde_json::from_str::<ParentMessage>(&encoded).unwrap() {
+            ParentMessage::ThreadSpawn { request_id, output } => {
+                assert_eq!(request_id, 7);
+                assert_eq!(
+                    output,
+                    ThreadSpawnToolOutput::Spawned {
+                        thread_id: "thread_worker".into()
+                    }
+                );
+            }
+            message => panic!("unexpected parent RPC message: {message:?}"),
         }
     }
 
@@ -1793,6 +1909,7 @@ while :; do :; done
                     }),
                     event_sender,
                     Arc::new(AtomicBool::new(false)),
+                    None,
                     ChildLaunch {
                         limits: ChildLifecycleLimits {
                             deadline: Duration::from_secs(5),
@@ -1909,6 +2026,7 @@ IFS= read -r _
                     ApprovalMode::Deny { actor: "test" },
                     healthy_event_sender,
                     Arc::new(AtomicBool::new(false)),
+                    None,
                     ChildLaunch {
                         limits: ChildLifecycleLimits::default(),
                         executable: healthy_fixture,
@@ -2059,6 +2177,7 @@ while :; do :; done
                     ApprovalMode::Deny { actor: "test" },
                     event_sender,
                     cancel,
+                    None,
                     ChildLaunch {
                         limits: ChildLifecycleLimits {
                             deadline,
