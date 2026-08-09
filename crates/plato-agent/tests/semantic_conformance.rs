@@ -471,8 +471,6 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
         "[tools]\nenabled = [\"file.read\", \"file.list\", \"file.write\", \"file.edit\", \"shell.exec\", \"web.fetch\"]\n",
     )
     .unwrap();
-    let child_cwd = proof.workspace.join("child");
-    fs::create_dir(&child_cwd).unwrap();
     let host = ProofDaemon::start_host(&proof);
     let mut client = host.connect();
     let hello = client.hello(&proof.workspace).unwrap();
@@ -527,19 +525,17 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     assert_eq!(root_status.authority.thread_id, root_thread_id);
     assert_eq!(root_status.authority.parent_thread_id, None);
     assert_eq!(root_status.authority.spawning_actor, "semantic_fixture");
-    assert_eq!(
-        Path::new(&root_status.authority.cwd),
-        proof.workspace.canonicalize().unwrap()
-    );
     let root = client
         .thread_authority(root_thread_id.clone())
         .unwrap()
         .authority;
     assert_eq!(root.agent_id, Some(AgentId::new("plato").unwrap()));
+    assert_eq!(root.worktrees.len(), 1);
     assert_eq!(
-        Path::new(&root.granted_paths[0].path),
-        proof.workspace.canonicalize().unwrap()
+        Path::new(&root_status.authority.cwd),
+        Path::new(&root.worktrees[0].path)
     );
+    assert_eq!(root.granted_paths.len(), 1);
     assert!(root.granted_paths[0].writable);
     assert_eq!(
         root.toolset,
@@ -552,7 +548,6 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
             "web.fetch",
         ]
     );
-    assert!(root.worktrees.is_empty());
     assert!(root.network);
     assert_eq!(root.model, "gpt-5.6-sol");
     assert_eq!(root.reasoning_effort, ReasoningEffort::Xhigh);
@@ -564,6 +559,8 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
         root_status.live.last_activity_at_ms,
         Some(root.created_at_ms)
     );
+    let child_cwd = PathBuf::from(&root.worktrees[0].path).join("child");
+    fs::create_dir(&child_cwd).unwrap();
 
     let child_status = match client
         .thread_spawn_start(
@@ -583,14 +580,15 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
         unexpected => panic!("expected yolo auto-grant, got {unexpected:?}"),
     };
     let child_thread_id = child_status.authority.thread_id.clone();
-    assert_eq!(
-        Path::new(&child_status.authority.cwd),
-        child_cwd.canonicalize().unwrap()
-    );
     let child = client
         .thread_authority(child_thread_id.clone())
         .unwrap()
         .authority;
+    assert_eq!(child.worktrees.len(), 1);
+    assert_eq!(
+        Path::new(&child_status.authority.cwd),
+        Path::new(&child.worktrees[0].path)
+    );
     assert_eq!(
         child.parent_thread_id.as_deref(),
         Some(root_thread_id.as_str())
@@ -680,12 +678,12 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
         .thread_stop(child_thread_id.clone(), "restart_fixture".into())
         .unwrap();
     let child_stopped_at_ms = match child_stop {
-        ThreadStopResult::Stopped {
+        ThreadStopResult::AlreadyStopped {
             stopped_at_ms,
             stopped_turn_id: None,
             ..
         } => stopped_at_ms,
-        unexpected => panic!("expected stopped unloaded child, got {unexpected:?}"),
+        unexpected => panic!("expected reconciled stopped child, got {unexpected:?}"),
     };
     assert_eq!(
         restarted_client
@@ -700,7 +698,7 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     let stale_parent = restarted_client
         .thread_spawn_start(
             Some(root_thread_id),
-            child_cwd.to_string_lossy().into_owned(),
+            proof.workspace.to_string_lossy().into_owned(),
             "gpt-5.6-sol".into(),
             ReasoningEffort::High,
             ThreadApprovalPolicy::Prompt,
@@ -718,9 +716,8 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
 fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     let proof = ProofContext::new();
-    let worker_cwd = proof.workspace.join("worker");
-    fs::create_dir(&worker_cwd).unwrap();
-    let provider = CoordinatorProvider::start(worker_cwd.canonicalize().unwrap());
+    let worker_cwd = Arc::new(Mutex::new(proof.workspace.clone()));
+    let provider = CoordinatorProvider::start(Arc::clone(&worker_cwd));
     write_coordinator_config(&proof.config_path, &provider.base_url);
     let host = ProofDaemon::start_host(&proof);
     let mut client = host.connect();
@@ -781,6 +778,13 @@ fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
             .unwrap(),
         ThreadSpawnResult::Spawned { .. }
     ));
+    let coordinator = client
+        .thread_authority(coordinator_thread_id.clone())
+        .unwrap()
+        .authority;
+    let private_worker_cwd = PathBuf::from(&coordinator.worktrees[0].path).join("worker");
+    fs::create_dir(&private_worker_cwd).unwrap();
+    *worker_cwd.lock().unwrap() = private_worker_cwd.canonicalize().unwrap();
     assert!(matches!(
         client
             .thread_send(
@@ -866,8 +870,9 @@ fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
     );
     assert_eq!(worker.toolset, ["file.read"]);
     assert_eq!(worker.approval_policy, ThreadApprovalPolicy::Prompt);
+    assert_eq!(worker.worktrees.len(), 1);
     assert_eq!(worker.granted_paths.len(), 1);
-    assert!(!worker.granted_paths[0].writable);
+    assert!(worker.granted_paths[0].writable);
     assert!(!worker.network);
 
     let connection = Connection::open(&proof.server_db_path).unwrap();
@@ -1988,6 +1993,7 @@ impl ProofContext {
     fn in_root(root: Arc<tempfile::TempDir>, workspace_name: &str) -> Self {
         let workspace = root.path().join(workspace_name);
         fs::create_dir(&workspace).unwrap();
+        init_git_repository(&workspace);
         let workspace_id = paths::workspace_id(&workspace).unwrap();
 
         #[cfg(unix)]
@@ -2170,6 +2176,29 @@ impl ProofContext {
             "{stage}: daemon socket unexpectedly exists"
         );
     }
+}
+
+fn init_git_repository(path: &Path) {
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(path)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--quiet", "--initial-branch", "main"]);
+    git(&["config", "user.name", "Platonic Test"]);
+    git(&["config", "user.email", "platonic@example.invalid"]);
+    fs::write(path.join(".gitkeep"), "").unwrap();
+    git(&["add", ".gitkeep"]);
+    git(&["commit", "--quiet", "-m", "initial"]);
 }
 
 fn workspace_binary(name: &str) -> PathBuf {
@@ -2621,7 +2650,7 @@ struct CoordinatorProviderProof {
 }
 
 impl CoordinatorProvider {
-    fn start(worker_cwd: PathBuf) -> Self {
+    fn start(worker_cwd: Arc<Mutex<PathBuf>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -2642,7 +2671,7 @@ impl CoordinatorProvider {
                     "thread_spawn",
                     json!({
                         "agent_id": "bounded-worker",
-                        "cwd": worker_cwd.to_string_lossy(),
+                        "cwd": worker_cwd.lock().unwrap().to_string_lossy(),
                         "toolset": ["file.read"]
                     }),
                     UsageFixture::Known(8, 3),

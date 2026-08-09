@@ -806,7 +806,7 @@ fn resolve_thread_spawn_inner(
         ThreadSpawnDecision::Grant { actor } => {
             read_live_parent(runtime, store, &pending.draft, pending.max_spawn_depth)?;
             let confinement = runtime
-                .thread_confinement(!pending.draft.repositories.is_empty())
+                .thread_confinement()
                 .map_err(|()| ThreadSpawnFailure::ConfinementUnavailable)?;
             let claims = pending
                 .draft
@@ -3258,6 +3258,14 @@ mod tests {
     fn thread_test_runtime_with_max_spawn_depth(
         max_spawn_depth: u32,
     ) -> (tempfile::TempDir, DaemonRuntime) {
+        let (root, runtime) = repositoryless_thread_test_runtime(max_spawn_depth);
+        init_git_repository(&runtime.paths.workspace_root);
+        (root, runtime)
+    }
+
+    fn repositoryless_thread_test_runtime(
+        max_spawn_depth: u32,
+    ) -> (tempfile::TempDir, DaemonRuntime) {
         let (root, runtime) = bare_thread_test_runtime_with_max_spawn_depth(max_spawn_depth);
         runtime
             .paths
@@ -3793,6 +3801,9 @@ mod tests {
     }
 
     fn init_git_repository(path: &Path) -> String {
+        if path.join(".git").is_dir() {
+            return git(path, &["rev-parse", "HEAD"]);
+        }
         git(path, &["init", "--quiet", "--initial-branch", "main"]);
         git(path, &["config", "user.name", "Platonic Test"]);
         git(path, &["config", "user.email", "platonic@example.invalid"]);
@@ -3890,19 +3901,38 @@ mod tests {
 
     fn model_spawn_input(
         runtime: &DaemonRuntime,
+        parent_thread_id: &str,
         agent_id: &str,
         toolset: Option<Vec<String>>,
         approval_policy: Option<ThreadApprovalPolicy>,
     ) -> ThreadSpawnToolInput {
+        let cwd = thread_worktree(runtime, parent_thread_id)
+            .to_string_lossy()
+            .into_owned();
         ThreadSpawnToolInput {
             agent_id: agent_id.into(),
-            cwd: runtime.paths.workspace_root.to_string_lossy().into_owned(),
+            cwd,
             model: None,
             reasoning_effort: None,
             approval_policy,
             toolset,
             repositories: None,
         }
+    }
+
+    fn thread_worktree(runtime: &DaemonRuntime, thread_id: &str) -> PathBuf {
+        PathBuf::from(
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .thread_authority(thread_id)
+                .unwrap()
+                .unwrap()
+                .worktrees[0]
+                .path
+                .clone(),
+        )
     }
 
     #[test]
@@ -3919,7 +3949,7 @@ mod tests {
         let output = model_thread_spawn(
             &runtime,
             &parent_thread_id,
-            model_spawn_input(&runtime, "worker", None, None),
+            model_spawn_input(&runtime, &parent_thread_id, "worker", None, None),
             "daemon".into(),
         )
         .unwrap();
@@ -3941,7 +3971,9 @@ mod tests {
         );
         assert_eq!(child.model, "worker-model");
         assert_eq!(child.toolset, ["file.read"]);
-        assert!(!child.granted_paths[0].writable);
+        assert_eq!(child.worktrees.len(), 1);
+        assert_eq!(child.granted_paths.len(), 1);
+        assert!(child.granted_paths[0].writable);
         assert!(!child.network);
         assert!(runtime.thread_is_loaded(&child_thread_id));
         drop(store);
@@ -3987,6 +4019,7 @@ mod tests {
                 "parent toolset",
                 model_spawn_input(
                     &runtime,
+                    &parent_thread_id,
                     "broad-worker",
                     Some(vec!["file.read".into(), "web.fetch".into()]),
                     None,
@@ -3996,6 +4029,7 @@ mod tests {
                 "parent policy",
                 model_spawn_input(
                     &runtime,
+                    &parent_thread_id,
                     "broad-worker",
                     Some(vec!["file.read".into()]),
                     Some(ThreadApprovalPolicy::Yolo),
@@ -4005,6 +4039,7 @@ mod tests {
                 "agent toolset",
                 model_spawn_input(
                     &runtime,
+                    &parent_thread_id,
                     "narrow-worker",
                     Some(vec!["file.write".into()]),
                     None,
@@ -4014,8 +4049,13 @@ mod tests {
                 "cwd",
                 ThreadSpawnToolInput {
                     cwd: outside.path().to_string_lossy().into_owned(),
+                    repositories: Some(vec![ThreadRepositoryRequest {
+                        repo: ".".into(),
+                        branch: None,
+                    }]),
                     ..model_spawn_input(
                         &runtime,
+                        &parent_thread_id,
                         "broad-worker",
                         Some(vec!["file.read".into()]),
                         None,
@@ -4051,6 +4091,7 @@ mod tests {
             &parent_thread_id,
             model_spawn_input(
                 &runtime,
+                &parent_thread_id,
                 "broad-worker",
                 Some(vec!["file.read".into(), "thread.spawn".into()]),
                 None,
@@ -4067,6 +4108,7 @@ mod tests {
             &first_child,
             model_spawn_input(
                 &runtime,
+                &first_child,
                 "broad-worker",
                 Some(vec!["file.read".into()]),
                 None,
@@ -4115,6 +4157,7 @@ mod tests {
             &parent_thread_id,
             model_spawn_input(
                 &runtime,
+                &parent_thread_id,
                 "worker",
                 Some(vec!["file.read".into(), "thread.spawn".into()]),
                 None,
@@ -4129,7 +4172,13 @@ mod tests {
         let rejected = model_thread_spawn(
             &runtime,
             &child_thread_id,
-            model_spawn_input(&runtime, "worker", Some(vec!["file.read".into()]), None),
+            model_spawn_input(
+                &runtime,
+                &child_thread_id,
+                "worker",
+                Some(vec!["file.read".into()]),
+                None,
+            ),
             "daemon".into(),
         )
         .unwrap();
@@ -4170,6 +4219,7 @@ mod tests {
             &parent_thread_id,
             model_spawn_input(
                 &runtime,
+                &parent_thread_id,
                 "worker",
                 Some(vec!["file.read".into(), "thread.spawn".into()]),
                 None,
@@ -4186,6 +4236,7 @@ mod tests {
             &child_thread_id,
             model_spawn_input(
                 &runtime,
+                &child_thread_id,
                 "worker",
                 Some(vec!["file.read".into(), "thread.spawn".into()]),
                 None,
@@ -4200,7 +4251,13 @@ mod tests {
         let rejected = model_thread_spawn(
             &runtime,
             &grandchild_thread_id,
-            model_spawn_input(&runtime, "worker", Some(vec!["file.read".into()]), None),
+            model_spawn_input(
+                &runtime,
+                &grandchild_thread_id,
+                "worker",
+                Some(vec!["file.read".into()]),
+                None,
+            ),
             "daemon".into(),
         )
         .unwrap();
@@ -4255,10 +4312,6 @@ mod tests {
         assert_eq!(status.authority.thread_id, thread_id);
         assert_eq!(status.authority.spawning_actor, "stdin");
         assert_eq!(status.authority.parent_thread_id, None);
-        assert_eq!(
-            status.authority.cwd,
-            runtime.paths.workspace_root.to_string_lossy()
-        );
         let authority_response = handle_line(
             &runtime,
             &format!(
@@ -4266,16 +4319,19 @@ mod tests {
             ),
         );
         let authority: ThreadAuthorityResult = response_result(&authority_response);
-        assert_eq!(authority.confinement, Some(ThreadConfinement::None));
+        let expected_confinement = match runtime.confinement_support() {
+            crate::confinement::ConfinementSupport::Landlock => ThreadConfinement::Landlock,
+            crate::confinement::ConfinementSupport::None => ThreadConfinement::None,
+        };
+        assert_eq!(authority.confinement, Some(expected_confinement));
         let authority = authority.authority;
         assert_eq!(authority.agent_id, Some(AgentId::new("plato").unwrap()));
-        assert_eq!(
-            authority.granted_paths,
-            vec![crate::daemon::protocol::ThreadGrantedPath {
-                path: runtime.paths.workspace_root.to_string_lossy().into_owned(),
-                writable: true,
-            }]
-        );
+        assert_eq!(authority.worktrees.len(), 1);
+        assert_eq!(authority.worktrees[0].repo, ".");
+        assert_eq!(authority.worktrees[0].branch, format!("thread/{thread_id}"));
+        assert_eq!(status.authority.cwd, authority.worktrees[0].path);
+        assert_eq!(authority.granted_paths.len(), 1);
+        assert!(authority.granted_paths[0].writable);
         assert_eq!(
             authority.toolset,
             [
@@ -4287,7 +4343,6 @@ mod tests {
                 "web.fetch",
             ]
         );
-        assert!(authority.worktrees.is_empty());
         assert!(authority.network);
         assert_eq!(status.authority.model, "gpt-5.6-sol");
         assert_eq!(
@@ -4312,6 +4367,68 @@ mod tests {
         let approval = store.thread_spawn_approval(&spawn_id).unwrap().unwrap();
         assert_eq!(approval.decision, ThreadSpawnDecisionName::Granted);
         assert_eq!(approval.actor, status.authority.spawning_actor);
+    }
+
+    #[test]
+    fn repositoryless_spawn_is_rejected_before_admission_or_server_owned_state() {
+        let (_root, runtime) = repositoryless_thread_test_runtime(1);
+
+        let error = start_thread(
+            &runtime,
+            None,
+            &runtime.paths.workspace_root,
+            ThreadApprovalPolicy::Prompt,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                ThreadSpawnFailure::Malformed(message)
+                    if message.contains("thread spawn requires a named Git repository and claimed branch")
+            ),
+            "unexpected repository-less spawn failure: {error:?}"
+        );
+        let store = runtime.paths.server_store().unwrap();
+        assert!(store.thread_authorities().unwrap().is_empty());
+        assert!(store.branch_claims().unwrap().is_empty());
+        assert!(
+            !crate::paths::thread_repositories_root(&runtime.paths.server_db_path)
+                .unwrap()
+                .exists()
+        );
+    }
+
+    #[test]
+    fn landlock_support_is_always_recorded_for_an_admitted_spawn() {
+        let (_root, base) = thread_test_runtime();
+        let runtime = DaemonRuntime::new_with_server_policy(
+            base.paths,
+            1,
+            false,
+            crate::confinement::ConfinementSupport::Landlock,
+        );
+        let (spawn_id, thread_id) = pending_spawn(
+            start_thread(
+                &runtime,
+                None,
+                &runtime.paths.workspace_root,
+                ThreadApprovalPolicy::Prompt,
+            )
+            .unwrap(),
+        );
+
+        grant_thread(&runtime, &spawn_id, "stdin");
+
+        assert_eq!(
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .thread_confinement(&thread_id)
+                .unwrap(),
+            Some(ThreadConfinement::Landlock)
+        );
     }
 
     #[test]
@@ -5053,8 +5170,6 @@ IFS= read -r _
     #[test]
     fn spawned_thread_never_exceeds_parent_policy_or_cwd_authority() {
         let (root, runtime) = thread_test_runtime();
-        let child_dir = runtime.paths.workspace_root.join("child");
-        std::fs::create_dir(&child_dir).unwrap();
         let outside_dir = root.path().join("outside");
         std::fs::create_dir(&outside_dir).unwrap();
         let (spawn_id, _) = pending_spawn(
@@ -5067,6 +5182,8 @@ IFS= read -r _
             .unwrap(),
         );
         let parent = grant_thread(&runtime, &spawn_id, "stdin");
+        let child_dir = thread_worktree(&runtime, &parent.authority.thread_id).join("child");
+        std::fs::create_dir(&child_dir).unwrap();
 
         assert!(matches!(
             start_thread(
@@ -5080,11 +5197,19 @@ IFS= read -r _
             ))
         ));
         assert!(matches!(
-            start_thread(
+            thread_spawn(
                 &runtime,
-                Some(parent.authority.thread_id),
-                &outside_dir,
-                crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+                ThreadSpawnParams::Start {
+                    parent_thread_id: Some(parent.authority.thread_id),
+                    cwd: outside_dir.to_string_lossy().into_owned(),
+                    model: "gpt-5.6-sol".into(),
+                    reasoning_effort: crate::daemon::protocol::ReasoningEffort::Xhigh,
+                    approval_policy: crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
+                    repositories: vec![ThreadRepositoryRequest {
+                        repo: ".".into(),
+                        branch: None,
+                    }],
+                },
             ),
             Err(ThreadSpawnFailure::Authority(
                 ThreadAuthorityError::WorkingDirectory { .. }
@@ -5097,16 +5222,9 @@ IFS= read -r _
     #[test]
     fn spawned_thread_rejects_a_toolset_superset_at_the_typed_gate() {
         let (_root, runtime) = thread_test_runtime();
-        let child_dir = runtime.paths.workspace_root.join("child");
-        std::fs::create_dir(&child_dir).unwrap();
         std::fs::write(
             runtime.paths.workspace_root.join("plato.toml"),
             "[tools]\nenabled = [\"file.read\"]\n",
-        )
-        .unwrap();
-        std::fs::write(
-            child_dir.join("plato.toml"),
-            "[tools]\nenabled = [\"file.read\", \"file.write\"]\n",
         )
         .unwrap();
         let (spawn_id, _) = pending_spawn(
@@ -5119,6 +5237,13 @@ IFS= read -r _
             .unwrap(),
         );
         let parent = grant_thread(&runtime, &spawn_id, "stdin");
+        let child_dir = thread_worktree(&runtime, &parent.authority.thread_id).join("child");
+        std::fs::create_dir(&child_dir).unwrap();
+        std::fs::write(
+            child_dir.join("plato.toml"),
+            "[tools]\nenabled = [\"file.read\", \"file.write\"]\n",
+        )
+        .unwrap();
 
         assert!(matches!(
             start_thread(
@@ -5146,8 +5271,6 @@ IFS= read -r _
     #[test]
     fn yolo_parent_auto_grants_child_with_exact_actor() {
         let (_root, runtime) = thread_test_runtime();
-        let child_dir = runtime.paths.workspace_root.join("child");
-        std::fs::create_dir(&child_dir).unwrap();
         let (spawn_id, _) = pending_spawn(
             start_thread(
                 &runtime,
@@ -5158,6 +5281,8 @@ IFS= read -r _
             .unwrap(),
         );
         let parent = grant_thread(&runtime, &spawn_id, "stdin");
+        let child_dir = thread_worktree(&runtime, &parent.authority.thread_id).join("child");
+        std::fs::create_dir(&child_dir).unwrap();
         let child = match start_thread(
             &runtime,
             Some(parent.authority.thread_id),
@@ -5184,8 +5309,6 @@ IFS= read -r _
     #[test]
     fn thread_list_and_status_keep_clientless_orphans_after_restart() {
         let (_root, runtime) = thread_test_runtime();
-        let child_dir = runtime.paths.workspace_root.join("child");
-        std::fs::create_dir(&child_dir).unwrap();
         let (spawn_id, _) = pending_spawn(
             start_thread(
                 &runtime,
@@ -5196,6 +5319,8 @@ IFS= read -r _
             .unwrap(),
         );
         let parent = grant_thread(&runtime, &spawn_id, "stdin");
+        let child_dir = thread_worktree(&runtime, &parent.authority.thread_id).join("child");
+        std::fs::create_dir(&child_dir).unwrap();
         let child = match start_thread(
             &runtime,
             Some(parent.authority.thread_id.clone()),

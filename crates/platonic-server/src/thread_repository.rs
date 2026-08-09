@@ -41,6 +41,11 @@ pub(crate) fn resolve(
             .map(|request| resolve_request(workspace_root, parent, request))
             .collect::<AppResult<Vec<_>>>()?
     };
+    if resolved.is_empty() {
+        return Err(AppError::Config(
+            "thread spawn requires a named Git repository and claimed branch".into(),
+        ));
+    }
     let mut seen = HashSet::new();
     resolved
         .into_iter()

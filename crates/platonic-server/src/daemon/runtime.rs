@@ -218,13 +218,10 @@ impl DaemonRuntime {
         self.confinement_support
     }
 
-    pub(super) fn thread_confinement(
-        &self,
-        has_private_repositories: bool,
-    ) -> Result<ThreadConfinement, ()> {
-        match (has_private_repositories, self.confinement_support) {
+    pub(super) fn thread_confinement(&self) -> Result<ThreadConfinement, ()> {
+        match self.confinement_support {
             #[cfg(any(target_os = "linux", test))]
-            (true, ConfinementSupport::Landlock) => Ok(ThreadConfinement::Landlock),
+            ConfinementSupport::Landlock => Ok(ThreadConfinement::Landlock),
             _ if self.require_confinement => Err(()),
             _ => Ok(ThreadConfinement::None),
         }
@@ -1496,37 +1493,23 @@ mod tests {
 
     #[test]
     fn confinement_support_and_require_policy_matrix_is_typed() {
-        for (support, require, has_repositories, expected) in [
+        for (support, require, expected) in [
             (
                 ConfinementSupport::Landlock,
                 false,
-                true,
                 Ok(ThreadConfinement::Landlock),
             ),
             (
                 ConfinementSupport::Landlock,
                 true,
-                true,
                 Ok(ThreadConfinement::Landlock),
             ),
-            (
-                ConfinementSupport::None,
-                false,
-                true,
-                Ok(ThreadConfinement::None),
-            ),
-            (
-                ConfinementSupport::None,
-                false,
-                false,
-                Ok(ThreadConfinement::None),
-            ),
-            (ConfinementSupport::None, true, true, Err(())),
-            (ConfinementSupport::Landlock, true, false, Err(())),
+            (ConfinementSupport::None, false, Ok(ThreadConfinement::None)),
+            (ConfinementSupport::None, true, Err(())),
         ] {
             let runtime =
                 DaemonRuntime::new_with_server_policy(runtime().paths, 1, require, support);
-            assert_eq!(runtime.thread_confinement(has_repositories), expected);
+            assert_eq!(runtime.thread_confinement(), expected);
         }
     }
 
