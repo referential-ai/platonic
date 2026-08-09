@@ -8,9 +8,9 @@ use crate::{
     daemon::{
         DaemonPaths,
         protocol::{
-            ApprovalDecision, BufferedStreamEvent, BufferedThreadEvent, PendingApprovalSnapshot,
-            RunStateName, StreamEvent, ThreadEventsResult, ThreadLiveState,
-            ThreadSendRejectedReason, ThreadSendResult,
+            ApprovalDecision, ApprovalProfile, BufferedStreamEvent, BufferedThreadEvent,
+            PendingApprovalSnapshot, RunStateName, StreamEvent, ThreadEventsResult,
+            ThreadLiveState, ThreadSendRejectedReason, ThreadSendResult,
         },
     },
     server_store::DurableThreadAuthority,
@@ -37,6 +37,8 @@ const MAX_PENDING_THREAD_STEERS: usize = 32;
 
 #[cfg(test)]
 type SessionGrantInstallBarriers = Option<(Arc<Barrier>, Arc<Barrier>)>;
+#[cfg(test)]
+type ApprovalProfileDecisionBarriers = Option<(Arc<Barrier>, Arc<Barrier>)>;
 
 #[derive(Clone, Debug)]
 pub(super) struct DaemonRuntime {
@@ -48,6 +50,8 @@ pub(super) struct DaemonRuntime {
     pub(super) stop_requested: Arc<AtomicBool>,
     #[cfg(test)]
     session_grant_install_barriers: Arc<Mutex<SessionGrantInstallBarriers>>,
+    #[cfg(test)]
+    approval_profile_decision_barriers: Arc<Mutex<ApprovalProfileDecisionBarriers>>,
     #[cfg(all(test, unix))]
     shutdown_flush_barrier: Arc<Mutex<Option<Arc<Barrier>>>>,
 }
@@ -63,6 +67,7 @@ pub(super) struct RuntimeState {
     terminal_runs: VecDeque<String>,
     shutdown_accepted: bool,
     issue_prep_active: bool,
+    approval_profiles: HashMap<String, ApprovalProfile>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,6 +181,8 @@ impl DaemonRuntime {
             stop_requested,
             #[cfg(test)]
             session_grant_install_barriers: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            approval_profile_decision_barriers: Arc::new(Mutex::new(None)),
             #[cfg(all(test, unix))]
             shutdown_flush_barrier: Arc::new(Mutex::new(None)),
         }
@@ -193,7 +200,16 @@ impl DaemonRuntime {
             .unwrap_or(u64::MAX)
     }
 
+    #[cfg(test)]
     pub(super) fn reserve_run(&self, record: Arc<RunRecord>) -> Result<(), RunAdmissionError> {
+        self.reserve_run_with_profile(record, None)
+    }
+
+    pub(super) fn reserve_run_with_profile(
+        &self,
+        record: Arc<RunRecord>,
+        profile: Option<ApprovalProfile>,
+    ) -> Result<(), RunAdmissionError> {
         let mut state = self.state.lock().expect("runtime state lock poisoned");
         if state.shutdown_accepted {
             return Err(RunAdmissionError::ShuttingDown);
@@ -211,6 +227,11 @@ impl DaemonRuntime {
             .map(|active| active.run_id.clone())
         {
             return Err(RunAdmissionError::SessionActive { run_id });
+        }
+        if let Some(profile) = profile {
+            state
+                .approval_profiles
+                .insert(record.session_id.clone(), profile);
         }
         state.runs.insert(record.run_id.clone(), record);
         Ok(())
@@ -651,6 +672,72 @@ impl DaemonRuntime {
             .lock()
             .expect("session tool grants lock poisoned")
             .contains(&(session_id.to_owned(), SHELL_EXEC.to_owned()))
+    }
+
+    pub(super) fn approval_profile(&self, session_id: &str) -> ApprovalProfile {
+        self.state
+            .lock()
+            .expect("runtime state lock poisoned")
+            .approval_profiles
+            .get(session_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn set_approval_profile(&self, session_id: &str, profile: ApprovalProfile) {
+        self.state
+            .lock()
+            .expect("runtime state lock poisoned")
+            .approval_profiles
+            .insert(session_id.into(), profile);
+    }
+
+    pub(super) fn has_runtime_session(&self, session_id: &str) -> bool {
+        let state = self.state.lock().expect("runtime state lock poisoned");
+        state
+            .runs
+            .values()
+            .any(|record| record.session_id == session_id)
+            || state.live_threads.keys().any(|thread_id| {
+                session_id
+                    .strip_prefix("session_")
+                    .is_some_and(|candidate| candidate == thread_id)
+            })
+    }
+
+    fn session_yolo_enabled_for_decision(&self, session_id: &str) -> bool {
+        let state = self.state.lock().expect("runtime state lock poisoned");
+        let enabled = state
+            .approval_profiles
+            .get(session_id)
+            .copied()
+            .unwrap_or_default()
+            == ApprovalProfile::Yolo;
+        #[cfg(test)]
+        {
+            let barriers = self
+                .approval_profile_decision_barriers
+                .lock()
+                .expect("approval profile barrier lock poisoned")
+                .take();
+            if let Some((reached, release)) = barriers {
+                reached.wait();
+                release.wait();
+            }
+        }
+        enabled
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_approval_profile_decision_barriers(
+        &self,
+        reached: Arc<Barrier>,
+        release: Arc<Barrier>,
+    ) {
+        *self
+            .approval_profile_decision_barriers
+            .lock()
+            .expect("approval profile barrier lock poisoned") = Some((reached, release));
     }
 
     #[cfg(test)]
@@ -1313,6 +1400,11 @@ pub(super) fn approval_handler(
                 reason: "run is no longer active".into(),
             });
         }
+        if request.yolo_eligible && runtime.session_yolo_enabled_for_decision(&record.session_id) {
+            return Ok(ExternalApprovalOutcome::Granted {
+                actor: "tui_yolo".into(),
+            });
+        }
         if request.tool_name == SHELL_EXEC
             && request.effect == EffectClass::ExternalSideEffect
             && runtime.has_shell_session_grant(&record.session_id)
@@ -1421,6 +1513,7 @@ fn approval_requested_event(request: &ApprovalRequest) -> StreamEvent {
         reason: request.reason.clone(),
         diff_preview: request.diff_preview.clone(),
         approval_preview: request.approval_preview.clone(),
+        yolo_eligible: request.yolo_eligible,
     }
 }
 
@@ -1447,6 +1540,20 @@ mod tests {
             format!("session_{index}"),
             PathBuf::from("/tmp/agent.db"),
         ))
+    }
+
+    fn yolo_request(run_id: &str, call_id: &str, eligible: bool) -> ApprovalRequest {
+        ApprovalRequest {
+            run_id: RunId::new(run_id).unwrap(),
+            call_id: ToolCallId::new(call_id).unwrap(),
+            tool_name: "file.write".into(),
+            effect: EffectClass::WorkspaceWrite,
+            reason: "file.write requires approval".into(),
+            input_preview: Some(r#"{"path":"out.txt"}"#.into()),
+            approval_preview: None,
+            diff_preview: None,
+            yolo_eligible: eligible,
+        }
     }
 
     #[test]
@@ -1920,6 +2027,7 @@ mod tests {
                     input_preview: None,
                     approval_preview: None,
                     diff_preview: None,
+                    yolo_eligible: false,
                 },
             ),
         );
@@ -2127,6 +2235,7 @@ mod tests {
                     input_preview: None,
                     approval_preview: None,
                     diff_preview: None,
+                    yolo_eligible: false,
                 },
             ),
         );
@@ -2163,6 +2272,7 @@ mod tests {
             input_preview: None,
             approval_preview: None,
             diff_preview: Some("--- a/note.txt\n+++ b/note.txt\n".into()),
+            yolo_eligible: true,
         }))
         .unwrap();
 
@@ -2181,6 +2291,7 @@ mod tests {
             input_preview: None,
             approval_preview: None,
             diff_preview: None,
+            yolo_eligible: true,
         }))
         .unwrap();
 
@@ -2198,6 +2309,7 @@ mod tests {
             input_preview: None,
             approval_preview: Some("command: cargo test\ncwd: /tmp/work".into()),
             diff_preview: None,
+            yolo_eligible: true,
         }))
         .unwrap();
 
@@ -2205,6 +2317,263 @@ mod tests {
             event["approval_preview"],
             "command: cargo test\ncwd: /tmp/work"
         );
+    }
+
+    #[test]
+    fn approval_profiles_are_daemon_lifetime_and_session_isolated() {
+        let runtime = runtime();
+        assert_eq!(
+            runtime.approval_profile("session_1"),
+            ApprovalProfile::Prompt
+        );
+
+        runtime.set_approval_profile("session_1", ApprovalProfile::Yolo);
+        assert_eq!(runtime.approval_profile("session_1"), ApprovalProfile::Yolo);
+        assert_eq!(
+            runtime.approval_profile("session_2"),
+            ApprovalProfile::Prompt
+        );
+        let restarted = self::runtime();
+        assert_eq!(
+            restarted.approval_profile("session_1"),
+            ApprovalProfile::Prompt
+        );
+    }
+
+    #[test]
+    fn rejected_run_admission_does_not_mutate_the_session_profile() {
+        let runtime = runtime();
+        let active = run_record(1);
+        runtime.reserve_run(active).unwrap();
+
+        let rejected = Arc::new(RunRecord::new(
+            "run_2".into(),
+            "session_1".into(),
+            PathBuf::from("/tmp/agent.db"),
+        ));
+        assert!(matches!(
+            runtime.reserve_run_with_profile(rejected, Some(ApprovalProfile::Yolo)),
+            Err(RunAdmissionError::SessionActive { .. })
+        ));
+        assert_eq!(
+            runtime.approval_profile("session_1"),
+            ApprovalProfile::Prompt
+        );
+    }
+
+    #[test]
+    fn run_admission_preserves_omitted_profiles_and_applies_explicit_fresh_defaults() {
+        let runtime = runtime();
+        runtime.set_approval_profile("session_1", ApprovalProfile::Yolo);
+        runtime
+            .reserve_run_with_profile(run_record(1), None)
+            .unwrap();
+        assert_eq!(runtime.approval_profile("session_1"), ApprovalProfile::Yolo);
+
+        runtime
+            .reserve_run_with_profile(run_record(2), Some(ApprovalProfile::Prompt))
+            .unwrap();
+        assert_eq!(
+            runtime.approval_profile("session_2"),
+            ApprovalProfile::Prompt
+        );
+        assert_eq!(runtime.approval_profile("session_1"), ApprovalProfile::Yolo);
+    }
+
+    #[test]
+    fn yolo_eligible_approval_is_granted_without_pending_state() {
+        let runtime = runtime();
+        runtime.set_approval_profile("session_1", ApprovalProfile::Yolo);
+        let record = run_record(1);
+        let outcome =
+            approval_handler(runtime, record.clone())(yolo_request("run_1", "call_1", true))
+                .unwrap();
+
+        assert_eq!(
+            outcome,
+            ExternalApprovalOutcome::Granted {
+                actor: "tui_yolo".into()
+            }
+        );
+        assert!(record.approvals.lock().unwrap().is_empty());
+        assert!(record.events.lock().unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn profile_toggle_after_yolo_decision_does_not_revoke_the_grant() {
+        let runtime = runtime();
+        runtime.set_approval_profile("session_1", ApprovalProfile::Yolo);
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        runtime.set_approval_profile_decision_barriers(reached.clone(), release.clone());
+        let record = run_record(1);
+        let decide = approval_handler(runtime.clone(), record);
+        let worker = thread::spawn(move || decide(yolo_request("run_1", "call_1", true)).unwrap());
+
+        reached.wait();
+        let toggled_runtime = runtime.clone();
+        let toggle = thread::spawn(move || {
+            toggled_runtime.set_approval_profile("session_1", ApprovalProfile::Prompt);
+        });
+        release.wait();
+
+        assert_eq!(
+            worker.join().unwrap(),
+            ExternalApprovalOutcome::Granted {
+                actor: "tui_yolo".into()
+            }
+        );
+        toggle.join().unwrap();
+        assert_eq!(
+            runtime.approval_profile("session_1"),
+            ApprovalProfile::Prompt
+        );
+    }
+
+    #[test]
+    fn profile_toggle_after_prompt_decision_does_not_grant_the_pending_ask() {
+        let runtime = runtime();
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        runtime.set_approval_profile_decision_barriers(reached.clone(), release.clone());
+        let record = run_record(1);
+        let decide = approval_handler(runtime.clone(), record.clone());
+        let worker = thread::spawn(move || decide(yolo_request("run_1", "call_1", true)).unwrap());
+
+        reached.wait();
+        let toggled_runtime = runtime.clone();
+        let toggle = thread::spawn(move || {
+            toggled_runtime.set_approval_profile("session_1", ApprovalProfile::Yolo);
+        });
+        release.wait();
+        toggle.join().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while record.events.lock().unwrap().events.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "approval event was not published"
+            );
+            thread::yield_now();
+        }
+        let mut approvals = record.approvals.lock().unwrap();
+        approvals.get_mut("call_1").unwrap().decision = Some(PendingApprovalDecision {
+            decision: ApprovalDecision::Deny,
+            outcome: ExternalApprovalOutcome::Denied {
+                actor: "tester".into(),
+                reason: "test complete".into(),
+            },
+        });
+        record.approval_changed.notify_all();
+        drop(approvals);
+
+        assert_eq!(
+            worker.join().unwrap(),
+            ExternalApprovalOutcome::Denied {
+                actor: "tester".into(),
+                reason: "test complete".into()
+            }
+        );
+        assert_eq!(runtime.approval_profile("session_1"), ApprovalProfile::Yolo);
+    }
+
+    #[test]
+    fn yolo_decision_linearizes_before_concurrent_cancel() {
+        let runtime = runtime();
+        runtime.set_approval_profile("session_1", ApprovalProfile::Yolo);
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        runtime.set_approval_profile_decision_barriers(reached.clone(), release.clone());
+        let record = run_record(1);
+        let decide = approval_handler(runtime, record.clone());
+        let decision =
+            thread::spawn(move || decide(yolo_request("run_1", "call_1", true)).unwrap());
+
+        reached.wait();
+        let canceled_record = record.clone();
+        let (canceled_sender, canceled_receiver) = std::sync::mpsc::channel();
+        let cancel = thread::spawn(move || {
+            canceled_sender
+                .send(canceled_record.request_cancel())
+                .unwrap();
+        });
+        assert!(matches!(
+            canceled_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        release.wait();
+
+        assert_eq!(
+            decision.join().unwrap(),
+            ExternalApprovalOutcome::Granted {
+                actor: "tui_yolo".into()
+            }
+        );
+        assert_eq!(
+            canceled_receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(Some(RunStateName::CancelRequested))
+        );
+        cancel.join().unwrap();
+    }
+
+    #[test]
+    fn yolo_decision_linearizes_before_concurrent_terminal_transition() {
+        let runtime = runtime();
+        runtime.set_approval_profile("session_1", ApprovalProfile::Yolo);
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        runtime.set_approval_profile_decision_barriers(reached.clone(), release.clone());
+        let record = run_record(1);
+        let decide = approval_handler(runtime.clone(), record.clone());
+        let decision =
+            thread::spawn(move || decide(yolo_request("run_1", "call_1", true)).unwrap());
+
+        reached.wait();
+        let finished_runtime = runtime.clone();
+        let finished_record = record.clone();
+        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+        let finish = thread::spawn(move || {
+            finished_runtime.finish_run(&finished_record, "done".into(), None);
+            finished_sender.send(()).unwrap();
+        });
+        assert!(matches!(
+            finished_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        release.wait();
+
+        assert_eq!(
+            decision.join().unwrap(),
+            ExternalApprovalOutcome::Granted {
+                actor: "tui_yolo".into()
+            }
+        );
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        finish.join().unwrap();
+        assert_eq!(record.status().state, RunStateName::Finished);
+    }
+
+    #[test]
+    fn terminal_run_does_not_yolo_grant_a_late_approval() {
+        let runtime = runtime();
+        runtime.set_approval_profile("session_1", ApprovalProfile::Yolo);
+        let record = run_record(1);
+        record.status.lock().unwrap().state = RunStateName::Finished;
+
+        let outcome =
+            approval_handler(runtime, record.clone())(yolo_request("run_1", "call_1", true))
+                .unwrap();
+
+        assert_eq!(
+            outcome,
+            ExternalApprovalOutcome::Denied {
+                actor: "daemon".into(),
+                reason: "run is no longer active".into()
+            }
+        );
+        assert!(record.approvals.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2226,6 +2595,7 @@ mod tests {
             input_preview: Some(r#"{"path":"out.txt"}"#.into()),
             approval_preview: None,
             diff_preview: None,
+            yolo_eligible: true,
         })
         .unwrap();
 
@@ -2258,6 +2628,7 @@ mod tests {
                 input_preview: Some(r#"{"path":"out.txt"}"#.into()),
                 approval_preview: None,
                 diff_preview: None,
+                yolo_eligible: true,
             })
             .unwrap()
         });

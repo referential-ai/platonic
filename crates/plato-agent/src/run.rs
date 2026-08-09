@@ -32,7 +32,7 @@ pub enum ApprovalMode {
     /// Ask on stdin before deciding an effect.
     #[default]
     Prompt,
-    /// Grant each requested effect.
+    /// Grant only server-classified yolo-eligible requests.
     AutoApprove,
     /// Deny each requested effect without prompting.
     Deny,
@@ -350,6 +350,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                     tool_call_id,
                     tool_name,
                     reason,
+                    yolo_eligible,
                     ..
                 } => decide_approval(
                     &mut client,
@@ -358,6 +359,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                     &tool_call_id,
                     &tool_name,
                     &reason,
+                    yolo_eligible,
                 )?,
                 StreamEvent::Canceled { .. }
                 | StreamEvent::CompletionClaimed { .. }
@@ -407,11 +409,12 @@ fn decide_approval(
     tool_call_id: &str,
     tool_name: &str,
     reason: &str,
+    yolo_eligible: bool,
 ) -> AppResult<()> {
+    let yolo_grant = mode == ApprovalMode::AutoApprove && yolo_eligible;
     let decision = match mode {
-        ApprovalMode::AutoApprove => ApprovalDecision::Grant,
-        ApprovalMode::Deny => ApprovalDecision::Deny,
-        ApprovalMode::Prompt => {
+        ApprovalMode::AutoApprove if yolo_grant => ApprovalDecision::Grant,
+        ApprovalMode::AutoApprove | ApprovalMode::Prompt => {
             eprint!("approve {tool_name} ({reason})? [y/N] ");
             io::stderr().flush()?;
             let mut answer = String::new();
@@ -422,8 +425,12 @@ fn decide_approval(
                 ApprovalDecision::Deny
             }
         }
+        ApprovalMode::Deny => ApprovalDecision::Deny,
     };
     match decision {
+        ApprovalDecision::Grant if yolo_grant => {
+            client.approval_grant_as(run_id, tool_call_id, "yolo".into())?;
+        }
         ApprovalDecision::Grant => {
             client.approval_grant(run_id, tool_call_id)?;
         }

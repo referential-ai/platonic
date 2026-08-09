@@ -6,8 +6,9 @@ use platonic_client::{
     client::{DaemonClient, DaemonConnectionConfig},
 };
 use platonic_protocol::{
-    ERROR_LAGGED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_UNREGISTERED, Envelope, EnvelopeKind,
-    PROTOCOL_VERSION, ProtocolRequest, RunStateName, ShutdownIfIdleResultName,
+    ApprovalProfile, ERROR_LAGGED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_UNREGISTERED,
+    Envelope, EnvelopeKind, PROTOCOL_VERSION, ProtocolRequest, RunStateName,
+    ShutdownIfIdleResultName,
 };
 use pty_process::{
     Size,
@@ -76,7 +77,7 @@ const DISABLE_ALTERNATE_SCROLL: &[u8] = b"\x1b[?1007l";
 const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
 
 #[test]
-fn plato_tui_cold_starts_host_thread_and_remote_reuses_it() {
+fn plato_tui_yolo_cold_starts_host_thread_and_remote_reuses_it() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
     let runtime = root.path().join("runtime");
@@ -94,7 +95,7 @@ fn plato_tui_cold_starts_host_thread_and_remote_reuses_it() {
     let mut local = PtyShell::spawn(&workspace, &runtime, &state, &home);
 
     local.write(
-        br#""$PLATO_ROOT_BIN" --tui; printf '\n%sLOCAL_STATUS:%s\n' "$PTY_MARK" "$?"
+        br#""$PLATO_ROOT_BIN" --tui --yolo; printf '\n%sLOCAL_STATUS:%s\n' "$PTY_MARK" "$?"
 "#,
     );
     local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Workspace name [workspace]");
@@ -102,6 +103,8 @@ fn plato_tui_cold_starts_host_thread_and_remote_reuses_it() {
     local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Approve thread.spawn?");
     local.write(b"y\r");
     local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Plato Agent");
+    let local_screen = local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "yolo ·");
+    assert!(local_screen.contains("Plato Agent"));
 
     let mut client = connect_pty_daemon(&config);
     client.hello(&workspace).unwrap();
@@ -112,6 +115,14 @@ fn plato_tui_cold_starts_host_thread_and_remote_reuses_it() {
     assert_eq!(thread.authority.spawning_actor, "local_tui");
     assert_eq!(thread.authority.cwd, workspace.to_string_lossy());
     let thread_id = thread.authority.thread_id.clone();
+    assert_eq!(
+        client
+            .daemon_status(Some(format!("session_{thread_id}")), None)
+            .unwrap()
+            .trust
+            .approval_profile,
+        ApprovalProfile::Yolo
+    );
     let authority = client
         .thread_authority(thread_id.clone())
         .unwrap()
@@ -936,6 +947,58 @@ fn bare_plato_status_modal_sends_one_read_only_request_and_escape_closes() {
         request.method.as_deref(),
         Some("run.start" | "message.append" | "approval.decide" | "run.cancel")
     )));
+}
+
+#[test]
+#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
+fn bare_plato_yolo_slash_command_round_trips_typed_session_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+
+    let workspace_id = paths::workspace_id(&workspace).unwrap();
+    let endpoint = runtime
+        .join("platonic")
+        .join("workspaces")
+        .join(&workspace_id)
+        .join("agent.sock");
+    let ledger = state.join("fake-agent.db");
+    let fake = FakeDaemon::bind_conversation_audit(&endpoint, &workspace, &workspace_id, &ledger);
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        br#""$PLATO_BIN"; printf '\n%sSTATUS:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Conversation-first PTY answer");
+
+    shell.write(b"/yolo on\r");
+    fake.wait_for_request_count("session.approval_profile.set", 1);
+    let on = fake.requests_for("session.approval_profile.set");
+    let on = request_params_value(&on[0]);
+    assert_eq!(on["session_id"], "session_pty_conversation");
+    assert_eq!(on["profile"], "yolo");
+    let enabled = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "yolo ·");
+    assert!(enabled.contains("yolo ·"));
+
+    shell.write(b"/yolo off\r");
+    fake.wait_for_request_count("session.approval_profile.set", 2);
+    let off = fake.requests_for("session.approval_profile.set");
+    let off = request_params_value(&off[1]);
+    assert_eq!(off["session_id"], "session_pty_conversation");
+    assert_eq!(off["profile"], "prompt");
+    shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "yolo ·");
+
+    shell.write(b"q");
+    assert_eq!(shell.wait_for_marker("STATUS"), "0");
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+    fake.finish();
 }
 
 #[test]
@@ -2894,6 +2957,7 @@ fn fake_response(
                     "transcript.read.typed",
                     "transcript.read.pending_approval",
                     "daemon.status",
+                    "session.approval_profile.set",
                     "approval.decide"
                 ]
             })
@@ -3065,6 +3129,16 @@ fn fake_response(
                 "approval_denied_count": 0
             }
         }),
+        "session.approval_profile.set" => {
+            let Some(ProtocolRequest::SessionApprovalProfileSet(params)) = request.params.as_ref()
+            else {
+                return Err("session.approval_profile.set omitted typed params".to_owned());
+            };
+            json!({
+                "session_id": params.session_id,
+                "profile": params.profile
+            })
+        }
         "events.stream" => {
             let Some(ProtocolRequest::EventsStream(params)) = request.params.as_ref() else {
                 return Err("events.stream omitted typed params".to_owned());

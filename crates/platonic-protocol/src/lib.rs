@@ -143,6 +143,9 @@ pub enum Capability {
     /// Read authoritative daemon status.
     #[serde(rename = "daemon.status")]
     DaemonStatus,
+    /// Set one daemon-lifetime session approval profile.
+    #[serde(rename = "session.approval_profile.set")]
+    SessionApprovalProfileSet,
     /// Shut down an idle daemon.
     #[serde(rename = "daemon.shutdown_if_idle")]
     DaemonShutdownIfIdle,
@@ -203,6 +206,7 @@ impl Capability {
             Self::TranscriptReadTyped => "transcript.read.typed",
             Self::TranscriptReadPendingApproval => "transcript.read.pending_approval",
             Self::DaemonStatus => "daemon.status",
+            Self::SessionApprovalProfileSet => "session.approval_profile.set",
             Self::DaemonShutdownIfIdle => "daemon.shutdown_if_idle",
             Self::ThreadSpawn => "thread.spawn",
             Self::ThreadList => "thread.list",
@@ -252,6 +256,9 @@ pub const CAPABILITY_TRANSCRIPT_READ_PENDING_APPROVAL: Capability =
     Capability::TranscriptReadPendingApproval;
 /// Capability name for authoritative daemon status readback.
 pub const CAPABILITY_DAEMON_STATUS: Capability = Capability::DaemonStatus;
+/// Capability name for setting one daemon-lifetime session approval profile.
+pub const CAPABILITY_SESSION_APPROVAL_PROFILE_SET: Capability =
+    Capability::SessionApprovalProfileSet;
 /// Capability name for shutting down an idle daemon.
 pub const CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE: Capability = Capability::DaemonShutdownIfIdle;
 /// Capability name for durably creating a thread authority record.
@@ -282,7 +289,7 @@ pub const CAPABILITY_AGENT_LIST: Capability = Capability::AgentList;
 pub const CAPABILITY_AGENT_STATUS: Capability = Capability::AgentStatus;
 
 /// Capabilities advertised by a protocol v1 daemon, in wire order.
-pub const CAPABILITIES: [Capability; 26] = [
+pub const CAPABILITIES: [Capability; 27] = [
     CAPABILITY_HELLO,
     CAPABILITY_RUN_START,
     CAPABILITY_MESSAGE_APPEND,
@@ -295,6 +302,7 @@ pub const CAPABILITIES: [Capability; 26] = [
     CAPABILITY_TRANSCRIPT_READ_TYPED,
     CAPABILITY_TRANSCRIPT_READ_PENDING_APPROVAL,
     CAPABILITY_DAEMON_STATUS,
+    CAPABILITY_SESSION_APPROVAL_PROFILE_SET,
     CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE,
     CAPABILITY_THREAD_SPAWN,
     CAPABILITY_THREAD_LIST,
@@ -530,6 +538,9 @@ pub enum ProtocolMethod {
     /// Read authoritative daemon status.
     #[serde(rename = "daemon.status")]
     DaemonStatus,
+    /// Set one daemon-lifetime session approval profile.
+    #[serde(rename = "session.approval_profile.set")]
+    SessionApprovalProfileSet,
     /// Shut down an idle daemon.
     #[serde(rename = "daemon.shutdown_if_idle")]
     DaemonShutdownIfIdle,
@@ -588,6 +599,7 @@ impl ProtocolMethod {
             Self::SessionsList => "sessions.list",
             Self::TranscriptRead => "transcript.read",
             Self::DaemonStatus => "daemon.status",
+            Self::SessionApprovalProfileSet => "session.approval_profile.set",
             Self::DaemonShutdownIfIdle => "daemon.shutdown_if_idle",
             Self::ThreadSpawn => "thread.spawn",
             Self::ThreadList => "thread.list",
@@ -645,6 +657,7 @@ impl ProtocolMethod {
             "sessions.list" => Some(Self::SessionsList),
             "transcript.read" => Some(Self::TranscriptRead),
             "daemon.status" => Some(Self::DaemonStatus),
+            "session.approval_profile.set" => Some(Self::SessionApprovalProfileSet),
             "daemon.shutdown_if_idle" => Some(Self::DaemonShutdownIfIdle),
             "thread.spawn" => Some(Self::ThreadSpawn),
             "thread.list" => Some(Self::ThreadList),
@@ -698,6 +711,9 @@ pub enum ProtocolRequest {
     /// Read authoritative daemon status.
     #[serde(rename = "daemon.status")]
     DaemonStatus(DaemonStatusParams),
+    /// Set one daemon-lifetime session approval profile.
+    #[serde(rename = "session.approval_profile.set")]
+    SessionApprovalProfileSet(SessionApprovalProfileSetParams),
     /// Shut down an idle daemon.
     #[serde(rename = "daemon.shutdown_if_idle")]
     DaemonShutdownIfIdle,
@@ -756,6 +772,7 @@ impl ProtocolRequest {
             Self::SessionsList => ProtocolMethod::SessionsList,
             Self::TranscriptRead(_) => ProtocolMethod::TranscriptRead,
             Self::DaemonStatus(_) => ProtocolMethod::DaemonStatus,
+            Self::SessionApprovalProfileSet(_) => ProtocolMethod::SessionApprovalProfileSet,
             Self::DaemonShutdownIfIdle => ProtocolMethod::DaemonShutdownIfIdle,
             Self::ThreadSpawn(_) => ProtocolMethod::ThreadSpawn,
             Self::ThreadList => ProtocolMethod::ThreadList,
@@ -793,6 +810,9 @@ impl ProtocolRequest {
                 decode_params(params, method).map(Self::TranscriptRead)
             }
             ProtocolMethod::DaemonStatus => decode_params(params, method).map(Self::DaemonStatus),
+            ProtocolMethod::SessionApprovalProfileSet => {
+                decode_params(params, method).map(Self::SessionApprovalProfileSet)
+            }
             ProtocolMethod::DaemonShutdownIfIdle => {
                 decode_empty_params(params, method).map(|()| Self::DaemonShutdownIfIdle)
             }
@@ -835,6 +855,9 @@ impl ProtocolRequest {
             Self::SessionsList => Ok(()),
             Self::TranscriptRead(params) => serialize_sorted_field(envelope, "params", params),
             Self::DaemonStatus(params) => serialize_sorted_field(envelope, "params", params),
+            Self::SessionApprovalProfileSet(params) => {
+                serialize_sorted_field(envelope, "params", params)
+            }
             Self::DaemonShutdownIfIdle => Ok(()),
             Self::ThreadSpawn(params) => serialize_sorted_field(envelope, "params", params),
             Self::ThreadList => Ok(()),
@@ -887,6 +910,9 @@ pub enum ProtocolResponse {
     /// Authoritative daemon status.
     #[serde(rename = "daemon.status")]
     DaemonStatus(DaemonStatusResult),
+    /// Updated daemon-lifetime session approval profile.
+    #[serde(rename = "session.approval_profile.set")]
+    SessionApprovalProfileSet(SessionApprovalProfileSetResult),
     /// Idle-shutdown result.
     #[serde(rename = "daemon.shutdown_if_idle")]
     DaemonShutdownIfIdle(ShutdownIfIdleResult),
@@ -945,6 +971,7 @@ impl ProtocolResponse {
             Self::SessionsList(_) => ProtocolMethod::SessionsList,
             Self::TranscriptRead(_) => ProtocolMethod::TranscriptRead,
             Self::DaemonStatus(_) => ProtocolMethod::DaemonStatus,
+            Self::SessionApprovalProfileSet(_) => ProtocolMethod::SessionApprovalProfileSet,
             Self::DaemonShutdownIfIdle(_) => ProtocolMethod::DaemonShutdownIfIdle,
             Self::ThreadSpawn(_) => ProtocolMethod::ThreadSpawn,
             Self::ThreadList(_) => ProtocolMethod::ThreadList,
@@ -980,6 +1007,9 @@ impl ProtocolResponse {
                 decode_result(result, method).map(Self::TranscriptRead)
             }
             ProtocolMethod::DaemonStatus => decode_result(result, method).map(Self::DaemonStatus),
+            ProtocolMethod::SessionApprovalProfileSet => {
+                decode_result(result, method).map(Self::SessionApprovalProfileSet)
+            }
             ProtocolMethod::DaemonShutdownIfIdle => {
                 decode_result(result, method).map(Self::DaemonShutdownIfIdle)
             }
@@ -1020,6 +1050,9 @@ impl ProtocolResponse {
             Self::SessionsList(result) => serialize_sorted_field(envelope, "result", result),
             Self::TranscriptRead(result) => serialize_sorted_field(envelope, "result", result),
             Self::DaemonStatus(result) => serialize_sorted_field(envelope, "result", result),
+            Self::SessionApprovalProfileSet(result) => {
+                serialize_sorted_field(envelope, "result", result)
+            }
             Self::DaemonShutdownIfIdle(result) => {
                 serialize_sorted_field(envelope, "result", result)
             }
@@ -1051,6 +1084,14 @@ where
 {
     let value = serde_json::to_value(value).map_err(serde::ser::Error::custom)?;
     envelope.serialize_field(name, &value)
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn approval_profile_is_prompt(profile: &ApprovalProfile) -> bool {
+    *profile == ApprovalProfile::Prompt
 }
 
 /// Top-level versioned protocol envelope.
@@ -1345,6 +1386,33 @@ pub struct HelloResult {
     pub daemon_scope: Option<String>,
 }
 
+/// Daemon-lifetime approval posture for one local session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalProfile {
+    /// Effects requiring approval pause for an explicit actor decision.
+    #[default]
+    Prompt,
+    /// Eligible workspace writes and exact `shell.exec` calls are auto-granted.
+    Yolo,
+}
+
+impl ApprovalProfile {
+    /// Returns the exact approval-profile wire value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prompt => "prompt",
+            Self::Yolo => "yolo",
+        }
+    }
+}
+
+impl fmt::Display for ApprovalProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.pad(self.as_str())
+    }
+}
+
 /// Parameters for one authoritative daemon status readback.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1355,6 +1423,26 @@ pub struct DaemonStatusParams {
     /// Optional explicit configuration path resolved under the run-start rules.
     #[serde(default)]
     pub config_path: Option<String>,
+}
+
+/// Parameters for setting one daemon-lifetime session approval profile.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionApprovalProfileSetParams {
+    /// Exact session whose live profile changes.
+    pub session_id: String,
+    /// New live approval profile.
+    pub profile: ApprovalProfile,
+}
+
+/// Result of setting one daemon-lifetime session approval profile.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionApprovalProfileSetResult {
+    /// Exact session whose live profile changed.
+    pub session_id: String,
+    /// Authoritative live approval profile after the mutation.
+    pub profile: ApprovalProfile,
 }
 
 /// Authoritative read-only status returned by `daemon.status`.
@@ -1480,6 +1568,9 @@ pub struct DaemonStatusTrust {
     /// Whether the selected session has a live daemon-lifetime `shell.exec` grant.
     #[serde(default)]
     pub shell_session_grant: bool,
+    /// Live daemon-lifetime approval profile for the selected session.
+    #[serde(default, skip_serializing_if = "approval_profile_is_prompt")]
+    pub approval_profile: ApprovalProfile,
 }
 
 /// Immutable startup approval policy carried by a thread authority record.
@@ -2063,6 +2154,9 @@ pub struct RunStartParams {
     /// Optional model settings for this run.
     #[serde(default, skip_serializing_if = "RunOverrides::is_empty")]
     pub overrides: RunOverrides,
+    /// Optional approval profile applied atomically to the fresh session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_profile: Option<ApprovalProfile>,
     /// Whether the request waits for the run's terminal result.
     #[serde(default)]
     pub wait: Option<bool>,
@@ -2141,6 +2235,9 @@ pub struct MessageAppendParams {
     /// Optional model settings for the continued run.
     #[serde(default, skip_serializing_if = "RunOverrides::is_empty")]
     pub overrides: RunOverrides,
+    /// Optional approval profile replacing the existing session's live profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_profile: Option<ApprovalProfile>,
     /// Whether the request waits for the run's terminal result.
     #[serde(default)]
     pub wait: Option<bool>,
@@ -2244,6 +2341,8 @@ pub enum StreamEvent {
         diff_preview: Option<String>,
         /// Optional concise approval summary.
         approval_preview: Option<String>,
+        /// Whether the server's exact yolo predicate permits this call.
+        yolo_eligible: bool,
     },
     /// Cancellation observation for a run.
     Canceled {
@@ -2284,6 +2383,8 @@ enum KnownStreamEvent {
         diff_preview: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         approval_preview: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        yolo_eligible: bool,
     },
     Canceled {
         run_id: String,
@@ -2328,6 +2429,7 @@ impl Serialize for StreamEvent {
                 reason,
                 diff_preview,
                 approval_preview,
+                yolo_eligible,
             } => KnownStreamEvent::ApprovalRequested {
                 run_id: run_id.clone(),
                 tool_call_id: tool_call_id.clone(),
@@ -2336,6 +2438,7 @@ impl Serialize for StreamEvent {
                 reason: reason.clone(),
                 diff_preview: diff_preview.clone(),
                 approval_preview: approval_preview.clone(),
+                yolo_eligible: *yolo_eligible,
             }
             .serialize(serializer),
             Self::Canceled { run_id } => KnownStreamEvent::Canceled {
@@ -2397,6 +2500,7 @@ impl From<KnownStreamEvent> for StreamEvent {
                 reason,
                 diff_preview,
                 approval_preview,
+                yolo_eligible,
             } => Self::ApprovalRequested {
                 run_id,
                 tool_call_id,
@@ -2405,6 +2509,7 @@ impl From<KnownStreamEvent> for StreamEvent {
                 reason,
                 diff_preview,
                 approval_preview,
+                yolo_eligible,
             },
             KnownStreamEvent::Canceled { run_id } => Self::Canceled { run_id },
             KnownStreamEvent::CompletionClaimed { run_id, claim } => {
@@ -2820,6 +2925,7 @@ mod tests {
                 "transcript.read.typed",
                 "transcript.read.pending_approval",
                 "daemon.status",
+                "session.approval_profile.set",
                 "daemon.shutdown_if_idle",
                 "thread.spawn",
                 "thread.list",
@@ -2939,6 +3045,10 @@ mod tests {
                 r#"{"v":1,"id":"status_1","kind":"request","method":"daemon.status","params":{"config_path":null,"session_id":null}}"#,
             ),
             (
+                ProtocolMethod::SessionApprovalProfileSet,
+                r#"{"v":1,"id":"profile_1","kind":"request","method":"session.approval_profile.set","params":{"profile":"yolo","session_id":"session-1"}}"#,
+            ),
+            (
                 ProtocolMethod::DaemonShutdownIfIdle,
                 r#"{"v":1,"id":"shutdown_1","kind":"request","method":"daemon.shutdown_if_idle"}"#,
             ),
@@ -3037,6 +3147,10 @@ mod tests {
                 r#"{"v":1,"id":"status_1","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":null,"build_date_utc":null,"endpoint_path":"/tmp/agent.sock","package_version":"0.2.0","uptime_ms":0,"workspace_id":"work-1"},"model":{"key_present":false,"provider_kind":"open_ai","requested_alias":"gpt-5","served_model":null},"session":{"core_event_count":0,"human_turn_count":0,"latest_run_id":null,"ledger_path":"/state/agent.db","session_id":null},"trust":{"approval_denied_count":0,"approval_granted_count":0,"shell_session_grant":false},"usage":{"last_run":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0},"session":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0}}}}"#,
             ),
             (
+                ProtocolMethod::SessionApprovalProfileSet,
+                r#"{"v":1,"id":"profile_1","kind":"response","method":"session.approval_profile.set","result":{"profile":"yolo","session_id":"session-1"}}"#,
+            ),
+            (
                 ProtocolMethod::DaemonShutdownIfIdle,
                 r#"{"v":1,"id":"shutdown_1","kind":"response","method":"daemon.shutdown_if_idle","result":{"result":"shutdown"}}"#,
             ),
@@ -3094,7 +3208,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(REQUESTS.len(), 24);
+        assert_eq!(REQUESTS.len(), 25);
         assert_eq!(RESPONSES.len(), REQUESTS.len());
         for ((request_method, request_fixture), (response_method, response_fixture)) in
             REQUESTS.iter().zip(RESPONSES)
@@ -3770,6 +3884,11 @@ mod tests {
             "session_id": "session_1",
             "future": true
         }));
+        assert_unknown_field_rejected::<SessionApprovalProfileSetParams>(json!({
+            "session_id": "session_1",
+            "profile": "yolo",
+            "future": true
+        }));
         assert_unknown_field_rejected::<DaemonStatusResult>(json!({
             "model": {
                 "requested_alias": "gpt-5.5",
@@ -3855,6 +3974,25 @@ mod tests {
     }
 
     #[test]
+    fn approval_profiles_keep_exact_closed_wire_values() {
+        for (profile, wire_value) in [
+            (ApprovalProfile::Prompt, "prompt"),
+            (ApprovalProfile::Yolo, "yolo"),
+        ] {
+            assert_eq!(profile.as_str(), wire_value);
+            assert_eq!(profile.to_string(), wire_value);
+            assert_eq!(serde_json::to_value(profile).unwrap(), wire_value);
+            assert_eq!(
+                serde_json::from_value::<ApprovalProfile>(wire_value.into()).unwrap(),
+                profile
+            );
+        }
+        for unknown in ["auto", "on", "off", "YOLO"] {
+            assert!(serde_json::from_value::<ApprovalProfile>(json!(unknown)).is_err());
+        }
+    }
+
+    #[test]
     fn approval_decide_params_keep_literal_v1_compatible_fixtures() {
         for (fixture, expected) in [
             (
@@ -3896,6 +4034,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy.overrides, RunOverrides::default());
+        assert_eq!(legacy.approval_profile, None);
         assert!(
             serde_json::to_value(legacy)
                 .unwrap()
@@ -3910,6 +4049,7 @@ mod tests {
                 model: Some("openai/gpt-5".into()),
                 reasoning_effort: Some(ReasoningEffort::High),
             },
+            approval_profile: None,
             wait: Some(false),
         };
         assert_eq!(
@@ -3918,6 +4058,63 @@ mod tests {
                 "model": "openai/gpt-5",
                 "reasoning_effort": "high"
             })
+        );
+    }
+
+    #[test]
+    fn approval_profiles_are_additive_on_start_and_append() {
+        let start: RunStartParams = serde_json::from_value(json!({
+            "question": "hello",
+            "approval_profile": "yolo"
+        }))
+        .unwrap();
+        assert_eq!(start.approval_profile, Some(ApprovalProfile::Yolo));
+
+        let legacy_append: MessageAppendParams = serde_json::from_value(json!({
+            "message": "again",
+            "session_id": "session_1"
+        }))
+        .unwrap();
+        assert_eq!(legacy_append.approval_profile, None);
+        assert!(
+            serde_json::to_value(legacy_append)
+                .unwrap()
+                .get("approval_profile")
+                .is_none()
+        );
+
+        let append: MessageAppendParams = serde_json::from_value(json!({
+            "message": "again",
+            "session_id": "session_1",
+            "approval_profile": "prompt"
+        }))
+        .unwrap();
+        assert_eq!(append.approval_profile, Some(ApprovalProfile::Prompt));
+    }
+
+    #[test]
+    fn daemon_status_trust_defaults_legacy_profiles_to_prompt() {
+        let legacy: DaemonStatusTrust = serde_json::from_value(json!({
+            "approval_granted_count": 0,
+            "approval_denied_count": 0,
+            "shell_session_grant": false
+        }))
+        .unwrap();
+        assert_eq!(legacy.approval_profile, ApprovalProfile::Prompt);
+        assert!(
+            serde_json::to_value(legacy)
+                .unwrap()
+                .get("approval_profile")
+                .is_none()
+        );
+
+        let yolo = DaemonStatusTrust {
+            approval_profile: ApprovalProfile::Yolo,
+            ..DaemonStatusTrust::default()
+        };
+        assert_eq!(
+            serde_json::to_value(yolo).unwrap()["approval_profile"],
+            "yolo"
         );
     }
 
@@ -4372,6 +4569,15 @@ mod tests {
                 "tool_name": "file.write",
                 "effect": "workspace_write",
                 "reason": "approval required"
+            }),
+            json!({
+                "kind": "approval_requested",
+                "run_id": "run_1",
+                "tool_call_id": "call_3",
+                "tool_name": "shell.exec",
+                "effect": "external_side_effect",
+                "reason": "approval required",
+                "yolo_eligible": true
             }),
             json!({
                 "kind": "canceled",

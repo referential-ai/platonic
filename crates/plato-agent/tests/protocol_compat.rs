@@ -18,6 +18,7 @@ fn historical_protocol_and_model_paths_share_the_extracted_types() {
         question: "hello".into(),
         config_path: None,
         overrides,
+        approval_profile: None,
         wait: Some(false),
     };
     assert_eq!(

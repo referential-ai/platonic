@@ -6,8 +6,8 @@ use plato_agent::{
 };
 use platonic_client::{client::DaemonClient, paths};
 use platonic_protocol::{
-    CompletionOutcome, IssuePrepResult, ReasoningEffort, RunOverrides, ThreadApprovalPolicy,
-    ThreadSendResult, ThreadSpawnDecision, ThreadSpawnResult, ThreadStatus,
+    ApprovalProfile, CompletionOutcome, IssuePrepResult, ReasoningEffort, RunOverrides,
+    ThreadApprovalPolicy, ThreadSendResult, ThreadSpawnDecision, ThreadSpawnResult, ThreadStatus,
 };
 use std::{
     io::{self, BufRead, IsTerminal, Read, Write},
@@ -441,6 +441,7 @@ fn run_tui_mode(cli: Cli, workspace_root: PathBuf, local_interactive: bool) -> A
     options.socket = Some(paths::host_socket_path()?);
     options.config = cli.config.clone();
     options.reduced_motion = cli.reduced_motion;
+    let yolo = cli.yolo;
     let thread_id = match cli.remote {
         Some(thread_id) => client.thread_status(thread_id)?.thread.authority.thread_id,
         None => spawn_local_tui_thread(
@@ -451,6 +452,10 @@ fn run_tui_mode(cli: Cli, workspace_root: PathBuf, local_interactive: bool) -> A
             &mut io::stderr(),
         )?,
     };
+    if yolo {
+        client
+            .session_approval_profile_set(format!("session_{thread_id}"), ApprovalProfile::Yolo)?;
+    }
     options.thread = Some(ThreadAttachment {
         thread_id,
         controller_id: new_tui_controller_id(),
@@ -507,9 +512,14 @@ fn validate_tui_cli(cli: &Cli) -> AppResult<()> {
             "plato --tui cannot be combined with a question".into(),
         ));
     }
-    if cli.db.is_some() || cli.yolo || cli.continue_session {
+    if cli.db.is_some() || cli.continue_session {
         return Err(AppError::Config(
-            "plato --tui cannot be combined with --db, --yolo, or -c".into(),
+            "plato --tui cannot be combined with --db or -c".into(),
+        ));
+    }
+    if cli.remote.is_some() && cli.yolo {
+        return Err(AppError::Config(
+            "plato --tui --yolo cannot be combined with --remote".into(),
         ));
     }
     Ok(())
@@ -812,9 +822,9 @@ mod tests {
     }
 
     #[test]
-    fn tui_flag_rejects_one_shot_only_options() {
+    fn tui_flag_accepts_yolo() {
         let cli = Cli::try_parse_from(["plato", "--tui", "--yolo"]).unwrap();
-        assert!(validate_tui_cli(&cli).is_err());
+        assert!(validate_tui_cli(&cli).is_ok());
     }
 
     #[test]

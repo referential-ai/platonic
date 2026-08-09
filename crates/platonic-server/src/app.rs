@@ -164,6 +164,7 @@ pub struct ApprovalRequest {
     pub input_preview: Option<String>,
     pub approval_preview: Option<String>,
     pub diff_preview: Option<String>,
+    pub yolo_eligible: bool,
 }
 
 impl ApprovalMode {
@@ -181,15 +182,8 @@ impl ApprovalMode {
         call: &ToolCall,
         policy: &PolicyDecision,
     ) -> Option<&'static str> {
-        match (self, policy) {
-            (Self::AutoApprove, PolicyDecision::RequireApproval { .. })
-                if call.effect == EffectClass::WorkspaceWrite =>
-            {
-                (!targets_platonic_memory(workspace_root, call.tool.as_str(), &call.input))
-                    .then_some("yolo")
-            }
-            _ => None,
-        }
+        (matches!(self, Self::AutoApprove) && yolo_eligible(workspace_root, call, policy))
+            .then_some("yolo")
     }
 
     fn deny_actor(&self, policy: &PolicyDecision) -> Option<&'static str> {
@@ -235,6 +229,13 @@ impl ApprovalMode {
             )),
         }
     }
+}
+
+fn yolo_eligible(workspace_root: &Path, call: &ToolCall, policy: &PolicyDecision) -> bool {
+    matches!(policy, PolicyDecision::RequireApproval { .. })
+        && (call.tool.as_str() == SHELL_EXEC && call.effect == EffectClass::ExternalSideEffect
+            || call.effect == EffectClass::WorkspaceWrite
+                && !targets_platonic_memory(workspace_root, call.tool.as_str(), &call.input))
 }
 
 const SESSION_TRUNCATION_MARKER: &str = "[older session turns omitted to fit the context budget]";
@@ -1026,6 +1027,11 @@ pub(crate) fn run_prepared_question(
                                     &options.workspace_root,
                                     call.tool.as_str(),
                                     &call.input,
+                                ),
+                                yolo_eligible: yolo_eligible(
+                                    &options.workspace_root,
+                                    &call,
+                                    &policy,
                                 ),
                             };
                             match (handler.decide)(request)? {
@@ -1983,7 +1989,7 @@ enabled = ["file.read", "file.write"]
     }
 
     #[test]
-    fn yolo_does_not_auto_grant_shell_exec() {
+    fn yolo_auto_grants_exact_shell_exec() {
         let policy = PolicyDecision::RequireApproval {
             reason: "requires approval".into(),
         };
@@ -1996,7 +2002,7 @@ enabled = ["file.read", "file.write"]
 
         assert_eq!(
             ApprovalMode::AutoApprove.auto_grant_actor(Path::new("."), &call, &policy),
-            None
+            Some("yolo")
         );
     }
 
@@ -2025,17 +2031,23 @@ enabled = ["file.read", "file.write"]
         let policy = PolicyDecision::RequireApproval {
             reason: "requires approval".into(),
         };
-        for effect in [EffectClass::ExternalSideEffect, EffectClass::SecretAccess] {
+        for (tool, effect) in [
+            ("computer.use", EffectClass::ExternalSideEffect),
+            ("browser.act", EffectClass::ExternalSideEffect),
+            ("custom.secret", EffectClass::SecretAccess),
+            ("custom.network", EffectClass::Network),
+        ] {
             let call = ToolCall {
                 id: ToolCallId::new("call_1").unwrap(),
-                tool: ToolName::new("custom.effect").unwrap(),
+                tool: ToolName::new(tool).unwrap(),
                 effect,
                 input: json!({}),
             };
 
             assert_eq!(
                 ApprovalMode::AutoApprove.auto_grant_actor(Path::new("."), &call, &policy),
-                None
+                None,
+                "{tool} was auto-granted"
             );
         }
     }
@@ -2068,6 +2080,19 @@ enabled = ["file.read", "file.write"]
 
         assert_eq!(
             ApprovalMode::AutoApprove.auto_grant_actor(Path::new("."), &call, &policy),
+            None
+        );
+
+        let unknown = tool_call(
+            ToolCallId::new("call_unknown").unwrap(),
+            "unknown.tool",
+            json!({}),
+        )
+        .unwrap();
+        let unknown_policy = evaluate_policy(&["unknown.tool".into()], &unknown);
+        assert!(matches!(unknown_policy, PolicyDecision::Deny { .. }));
+        assert_eq!(
+            ApprovalMode::AutoApprove.auto_grant_actor(Path::new("."), &unknown, &unknown_policy),
             None
         );
     }
@@ -3129,6 +3154,65 @@ base_url = "http://{}"
     }
 
     #[test]
+    fn tui_yolo_keeps_required_policy_and_one_attributed_durable_grant() {
+        let provider = spawn_provider_sequence(vec![
+            mutation_tool_response("provider_write", "file_write", "out.txt", "hello"),
+            provider_stop_response(),
+        ]);
+        let workspace = tempfile::tempdir().unwrap();
+        let config_path = workspace.path().join("plato.toml");
+        let ledger_path = workspace.path().join("events.jsonl");
+        write_mutation_test_config(&config_path, &provider.base_url, 2);
+
+        let outcome = run_question(mutation_test_options(
+            workspace.path(),
+            &config_path,
+            &ledger_path,
+            ApprovalMode::external_with_actor("daemon", |request| {
+                assert!(request.yolo_eligible);
+                Ok(ExternalApprovalOutcome::Granted {
+                    actor: "tui_yolo".into(),
+                })
+            }),
+            "run_tui_yolo_ledger",
+        ))
+        .unwrap();
+        provider.handle.join().unwrap();
+
+        assert_eq!(outcome.final_answer, "done");
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("out.txt")).unwrap(),
+            "hello"
+        );
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(
+                    record.event,
+                    HarnessEvent::PolicyEvaluated {
+                        decision: PolicyDecision::RequireApproval { .. },
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    HarnessEvent::ApprovalGranted {
+                        call_id, actor_id, ..
+                    } => Some((call_id.as_str(), actor_id.as_str())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [("call_1", "tui_yolo")]
+        );
+    }
+
+    #[test]
     fn private_external_approval_actors_preserve_per_call_policy_ledger_and_replay() {
         let shell_response = |provider_call_id: &str, command: &str| {
             let arguments = json!({"command": command}).to_string();
@@ -3660,6 +3744,18 @@ enabled = ["file.write"]
                 .filter(|record| matches!(record.event, HarnessEvent::PolicyEvaluated { .. }))
                 .count(),
             1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    HarnessEvent::ApprovalGranted {
+                        call_id, actor_id, ..
+                    } => Some((call_id.as_str(), actor_id.as_str())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [("call_1", "yolo")]
         );
         assert_eq!(
             records

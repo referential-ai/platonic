@@ -7,6 +7,7 @@ use nucleo::{
 pub(crate) enum SlashCommandAction {
     Help,
     Status,
+    Yolo,
     Clear,
     Sessions,
     NewSession,
@@ -52,6 +53,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "status",
         description: "show authoritative runtime status",
         action: SlashCommandAction::Status,
+    },
+    SlashCommandSpec {
+        name: "yolo",
+        description: "set session yolo on or off",
+        action: SlashCommandAction::Yolo,
     },
     SlashCommandSpec {
         name: "reconnect",

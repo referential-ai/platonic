@@ -17,7 +17,7 @@ use crossterm::{
     },
 };
 use platonic_client::{ClientResult, client::DaemonConnectionConfig};
-use platonic_protocol::RunStateName;
+use platonic_protocol::{ApprovalProfile, RunStateName};
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
@@ -903,7 +903,12 @@ fn submit_composer(
         return true;
     }
     push_live_event(state, crate::LiveEventLine::user(message.clone()));
-    let command = submit_message_command(message, state.selected_session_id.clone(), config_path);
+    let command = submit_message_command(
+        message,
+        state.selected_session_id.clone(),
+        config_path,
+        state.approval_profile,
+    );
     state.status_message = Some("submitted to daemon".into());
     send_command(commands, command, state);
     true
@@ -977,6 +982,10 @@ fn dispatch_slash_command(
             );
             true
         }
+        SlashCommandAction::Yolo => {
+            set_yolo_profile(commands, state, message);
+            true
+        }
         SlashCommandAction::Clear => {
             clear_visible_transcript(state);
             state.status_message = Some("visible transcript cleared".into());
@@ -1014,11 +1023,38 @@ fn clear_visible_transcript(state: &mut TuiState) {
 
 fn start_fresh_session(state: &mut TuiState) {
     state.selected_session_id = None;
+    state.approval_profile = ApprovalProfile::Prompt;
     state.replace_transcript(TranscriptState::None);
     state.clear_live_events();
     state.stream_warning = None;
     state.session_picker = None;
     state.status_message = Some("new session selected".into());
+}
+
+fn set_yolo_profile(commands: &Sender<ClientCommand>, state: &mut TuiState, message: &str) {
+    let mut parts = message.split_whitespace();
+    let profile = match (parts.next(), parts.next(), parts.next()) {
+        (Some("/yolo"), Some("on"), None) => ApprovalProfile::Yolo,
+        (Some("/yolo"), Some("off"), None) => ApprovalProfile::Prompt,
+        _ => {
+            state.status_message = Some("usage: /yolo on|off".into());
+            return;
+        }
+    };
+    let Some(session_id) = state.selected_session_id.clone() else {
+        state.approval_profile = profile;
+        state.status_message = Some(format!("next session approval profile: {profile}"));
+        return;
+    };
+    state.status_message = Some(format!("setting session approval profile: {profile}"));
+    send_command(
+        commands,
+        ClientCommand::ApprovalProfileSet {
+            session_id,
+            profile,
+        },
+        state,
+    );
 }
 
 fn start_issue_prep(
@@ -1083,6 +1119,7 @@ pub(super) fn start_next_queued(
         message,
         state.selected_session_id.clone(),
         runtime.config_path.clone(),
+        state.approval_profile,
     );
     runtime.polling = true;
     runtime.poll_in_flight = false;
@@ -1098,16 +1135,19 @@ fn submit_message_command(
     message: String,
     selected_session_id: Option<String>,
     config_path: Option<String>,
+    approval_profile: ApprovalProfile,
 ) -> ClientCommand {
     match selected_session_id {
         Some(session_id) => ClientCommand::MessageAppend {
             message,
             session_id,
             config_path,
+            approval_profile: None,
         },
         None => ClientCommand::RunStart {
             question: message,
             config_path,
+            approval_profile,
         },
     }
 }
@@ -1467,7 +1507,7 @@ mod tests {
         BufferedStreamEvent, DaemonStatusResult, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
         ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION, ERROR_WORKSPACE_MISMATCH, EventsStreamResult,
         HelloResult, IssuePrepResult, IssuePrepStartResult, ModelIdentityStatus, ProtocolError,
-        RunStartResult, SessionSummary, TranscriptReadResult,
+        RunStartResult, SessionApprovalProfileSetResult, SessionSummary, TranscriptReadResult,
     };
     use serde_json::json;
     #[cfg(unix)]
@@ -1593,9 +1633,11 @@ mod tests {
             ClientCommand::RunStart {
                 question,
                 config_path,
+                approval_profile,
             } => {
                 assert_eq!(question, "start work");
                 assert_eq!(config_path.as_deref(), Some("plato.toml"));
+                assert_eq!(approval_profile, ApprovalProfile::Prompt);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1623,10 +1665,12 @@ mod tests {
                 message,
                 session_id,
                 config_path,
+                approval_profile,
             } => {
                 assert_eq!(message, "continue work");
                 assert_eq!(session_id, "session_1");
                 assert_eq!(config_path.as_deref(), Some("plato.toml"));
+                assert_eq!(approval_profile, None);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1888,6 +1932,133 @@ mod tests {
         assert_eq!(modal.model.requested_alias, "refreshed-alias");
         assert_eq!(modal.daemon.uptime_ms, 99);
         assert!(state.live_events.is_empty());
+    }
+
+    #[test]
+    fn yolo_command_sets_next_session_profile_before_a_session_exists() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.selected_session_id = None;
+        state.set_composer_text("/yolo on");
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+        assert_eq!(state.approval_profile, ApprovalProfile::Yolo);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("next session approval profile: yolo")
+        );
+        assert!(receiver.try_recv().is_err());
+
+        state.set_composer_text("start boldly");
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+        match receiver.try_recv().unwrap() {
+            ClientCommand::RunStart {
+                approval_profile, ..
+            } => assert_eq!(approval_profile, ApprovalProfile::Yolo),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn yolo_command_mutates_selected_session_only_after_daemon_ack() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.selected_session_id = Some("session_1".into());
+        state.set_composer_text("/yolo on");
+        let mut runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+        assert_eq!(state.approval_profile, ApprovalProfile::Prompt);
+        match receiver.try_recv().unwrap() {
+            ClientCommand::ApprovalProfileSet {
+                session_id,
+                profile,
+            } => {
+                assert_eq!(session_id, "session_1");
+                assert_eq!(profile, ApprovalProfile::Yolo);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::ApprovalProfileSet(SessionApprovalProfileSetResult {
+                session_id: "session_1".into(),
+                profile: ApprovalProfile::Yolo,
+            }),
+            &sender,
+        );
+        assert_eq!(state.approval_profile, ApprovalProfile::Yolo);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("session approval profile: yolo")
+        );
+    }
+
+    #[test]
+    fn stale_daemon_profile_readbacks_do_not_replace_the_visible_session_profile() {
+        let (sender, _) = mpsc::channel();
+        let mut state = test_state();
+        state.selected_session_id = Some("session_2".into());
+        state.approval_profile = ApprovalProfile::Prompt;
+        let mut runtime = UiRuntime::from_state(&state, None);
+
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::ApprovalProfileSet(SessionApprovalProfileSetResult {
+                session_id: "session_1".into(),
+                profile: ApprovalProfile::Yolo,
+            }),
+            &sender,
+        );
+        assert_eq!(state.approval_profile, ApprovalProfile::Prompt);
+
+        let mut stale_status = status_fixture();
+        stale_status.trust.approval_profile = ApprovalProfile::Yolo;
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::StatusLoaded(Box::new(stale_status)),
+            &sender,
+        );
+        assert_eq!(state.approval_profile, ApprovalProfile::Prompt);
+    }
+
+    #[test]
+    fn status_without_a_session_preserves_the_next_run_profile() {
+        let (sender, _) = mpsc::channel();
+        let mut state = test_state();
+        state.selected_session_id = None;
+        state.approval_profile = ApprovalProfile::Yolo;
+        let mut runtime = UiRuntime::from_state(&state, None);
+        let mut status = status_fixture();
+        status.session.session_id = None;
+
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::StatusLoaded(Box::new(status)),
+            &sender,
+        );
+
+        assert_eq!(state.approval_profile, ApprovalProfile::Yolo);
+    }
+
+    #[test]
+    fn yolo_command_rejects_nonliteral_modes_locally() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        for command in ["/yolo", "/yolo yes", "/yolo off now"] {
+            state.set_composer_text(command);
+            assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+            assert_eq!(state.status_message.as_deref(), Some("usage: /yolo on|off"));
+            assert!(receiver.try_recv().is_err());
+        }
     }
 
     #[test]
@@ -2295,6 +2466,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
         state.selected_session_id = Some("session_1".into());
+        state.approval_profile = ApprovalProfile::Yolo;
         state.replace_transcript(loaded_transcript("run_1", "[turn_1] user: old\n"));
         state.live_events = vec![crate::LiveEventLine::assistant(None, "old")];
         state.set_composer_text("/new");
@@ -2305,6 +2477,7 @@ mod tests {
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
 
         assert!(state.selected_session_id.is_none());
+        assert_eq!(state.approval_profile, ApprovalProfile::Prompt);
         assert!(state.live_events.is_empty());
         assert_cached_rows(&state, false, false);
         assert_eq!(
@@ -3293,9 +3466,11 @@ mod tests {
             ClientCommand::RunStart {
                 question,
                 config_path,
+                approval_profile,
             } => {
                 assert_eq!(question, "next turn");
                 assert_eq!(config_path.as_deref(), Some("plato.toml"));
+                assert_eq!(approval_profile, ApprovalProfile::Prompt);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -3341,10 +3516,12 @@ mod tests {
                 message,
                 session_id,
                 config_path,
+                approval_profile,
             } => {
                 assert_eq!(message, "next turn");
                 assert_eq!(session_id, "session_1");
                 assert_eq!(config_path.as_deref(), Some("plato.toml"));
+                assert_eq!(approval_profile, None);
             }
             other => panic!("unexpected command: {other:?}"),
         }

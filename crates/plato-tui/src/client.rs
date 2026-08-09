@@ -6,10 +6,11 @@ use platonic_client::{
     client::{DaemonClient, DaemonConnectionConfig},
 };
 use platonic_protocol::{
-    ApprovalDecisionName, BufferedStreamEvent, CommandAcceptedResult, DaemonStatusResult,
-    ERROR_LAGGED, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION, ERROR_WORKSPACE_MISMATCH,
-    EventsStreamResult, HarnessEvent, IssuePrepResult, IssuePrepStartResult, RunStartResult,
-    RunStateName, StreamEvent, ThreadEventsResult, ThreadSendResult,
+    ApprovalDecisionName, ApprovalProfile, BufferedStreamEvent, CommandAcceptedResult,
+    DaemonStatusResult, ERROR_LAGGED, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
+    ERROR_WORKSPACE_MISMATCH, EventsStreamResult, HarnessEvent, IssuePrepResult,
+    IssuePrepStartResult, RunOverrides, RunStartResult, RunStateName,
+    SessionApprovalProfileSetResult, StreamEvent, ThreadEventsResult, ThreadSendResult,
 };
 use std::{
     collections::HashMap,
@@ -64,6 +65,10 @@ fn load_connected_thread_state(
     let status = client.thread_status(attachment.thread_id.clone())?;
     let sessions = client.sessions_list()?;
     let session_id = format!("session_{}", attachment.thread_id);
+    let approval_profile = client
+        .daemon_status(Some(session_id.clone()), None)?
+        .trust
+        .approval_profile;
     let (transcript, approval) = if sessions
         .iter()
         .any(|session| session.session_id == session_id)
@@ -89,6 +94,7 @@ fn load_connected_thread_state(
         transcript,
     );
     state.selected_session_id = Some(session_id.clone());
+    state.approval_profile = approval_profile;
     state.approval = approval;
     state.status_message = Some(format!("attached to thread {}", attachment.thread_id));
     if status.thread.live.current_turn_id.is_some()
@@ -156,6 +162,15 @@ fn load_connected_state(
         transcript,
     );
     state.selected_session_id = selected_session_id;
+    state.approval_profile = match state.selected_session_id.as_deref() {
+        Some(session_id) => {
+            client
+                .daemon_status(Some(session_id.into()), None)?
+                .trust
+                .approval_profile
+        }
+        None => ApprovalProfile::Prompt,
+    };
     state.approval = approval;
     let active_session = state.selected_session_id.as_deref().and_then(|session_id| {
         state.sessions.iter().find(|session| {
@@ -365,11 +380,17 @@ pub(super) enum ClientCommand {
     RunStart {
         question: String,
         config_path: Option<String>,
+        approval_profile: ApprovalProfile,
     },
     MessageAppend {
         message: String,
         session_id: String,
         config_path: Option<String>,
+        approval_profile: Option<ApprovalProfile>,
+    },
+    ApprovalProfileSet {
+        session_id: String,
+        profile: ApprovalProfile,
     },
     ThreadSend {
         thread_id: String,
@@ -411,6 +432,7 @@ pub(super) enum ClientCommand {
 pub(super) enum ClientEvent {
     Loaded(Box<TuiState>),
     StatusLoaded(Box<DaemonStatusResult>),
+    ApprovalProfileSet(SessionApprovalProfileSetResult),
     RunStarted(RunStartResult),
     ThreadSent(ThreadSendResult),
     IssuePrepFinished(IssuePrepStartResult),
@@ -431,6 +453,7 @@ pub(super) enum ClientEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ClientOperation {
     DaemonStatus,
+    ApprovalProfileSet,
     RunStart,
     MessageAppend,
     ThreadSend,
@@ -445,6 +468,7 @@ impl ClientOperation {
     fn method(self) -> &'static str {
         match self {
             Self::DaemonStatus => "daemon.status",
+            Self::ApprovalProfileSet => "session.approval_profile.set",
             Self::RunStart => "run.start",
             Self::MessageAppend => "message.append",
             Self::ThreadSend => "thread.send",
@@ -516,8 +540,15 @@ fn handle_client_command(
         ClientCommand::RunStart {
             question,
             config_path,
+            approval_profile,
         } => with_client(config, |client| {
-            client.run_start(question, config_path, false)
+            client.run_start_with_overrides_and_profile(
+                question,
+                config_path,
+                RunOverrides::default(),
+                Some(approval_profile),
+                false,
+            )
         })
         .map_or_else(
             failed_event(ClientOperation::RunStart),
@@ -527,12 +558,30 @@ fn handle_client_command(
             message,
             session_id,
             config_path,
+            approval_profile,
         } => with_client(config, |client| {
-            client.message_append_to_session(message, Some(session_id), config_path, false)
+            client.message_append_to_session_with_overrides_and_profile(
+                message,
+                Some(session_id),
+                config_path,
+                RunOverrides::default(),
+                approval_profile,
+                false,
+            )
         })
         .map_or_else(
             failed_event(ClientOperation::MessageAppend),
             ClientEvent::RunStarted,
+        ),
+        ClientCommand::ApprovalProfileSet {
+            session_id,
+            profile,
+        } => with_client(config, |client| {
+            client.session_approval_profile_set(session_id, profile)
+        })
+        .map_or_else(
+            failed_event(ClientOperation::ApprovalProfileSet),
+            ClientEvent::ApprovalProfileSet,
         ),
         ClientCommand::ThreadSend {
             thread_id,
@@ -677,8 +726,25 @@ pub(super) fn apply_client_event(
             runtime.sync_from_state(state);
         }
         ClientEvent::StatusLoaded(status) => {
+            if state.selected_session_id.is_some()
+                && status.session.session_id == state.selected_session_id
+            {
+                state.approval_profile = status.trust.approval_profile;
+            }
             state.status_modal = Some(*status);
             state.status_message = Some("status opened".into());
+        }
+        ClientEvent::ApprovalProfileSet(result) => {
+            if state.selected_session_id.as_deref() == Some(result.session_id.as_str()) {
+                state.approval_profile = result.profile;
+                state.status_message =
+                    Some(format!("session approval profile: {}", result.profile));
+            } else {
+                state.status_message = Some(format!(
+                    "session {} approval profile: {}",
+                    result.session_id, result.profile
+                ));
+            }
         }
         ClientEvent::RunStarted(result) => {
             apply_run_response(state, runtime, result, "run started")
@@ -811,6 +877,7 @@ pub(super) fn apply_client_event(
                     }
                     ClientOperation::RunStart
                     | ClientOperation::MessageAppend
+                    | ClientOperation::ApprovalProfileSet
                     | ClientOperation::ThreadSend
                     | ClientOperation::EventsStream
                     | ClientOperation::ThreadEvents
@@ -1292,6 +1359,7 @@ mod tests {
                         }]
                     }),
                 ),
+                daemon_status_reply("session_thread_selected"),
                 ScriptedReply::result(
                     "transcript.read",
                     json!({
@@ -1421,6 +1489,7 @@ mod tests {
                                        [turn_finished] assistant: selected answer\n"
                     }),
                 ),
+                daemon_status_reply("session_finished"),
                 hello_reply(workspace_id),
                 ScriptedReply::result(
                     "sessions.list",
@@ -1452,6 +1521,7 @@ mod tests {
                         "transcript": "[turn_running] user: other running\n"
                     }),
                 ),
+                daemon_status_reply("session_running"),
             ]
         });
 
@@ -1705,6 +1775,7 @@ mod tests {
                         }
                     }),
                 ),
+                daemon_status_reply("session_selected"),
                 hello_reply(workspace_id),
                 ScriptedReply::error(
                     "events.stream",
@@ -2020,6 +2091,53 @@ mod tests {
                     "events.stream",
                     "approval.decide"
                 ]
+            }),
+        )
+    }
+
+    fn daemon_status_reply(session_id: &str) -> ScriptedReply {
+        ScriptedReply::result(
+            "daemon.status",
+            json!({
+                "model": {
+                    "requested_alias": "test-model",
+                    "served_model": null,
+                    "provider_kind": "open_ai",
+                    "key_present": false
+                },
+                "daemon": {
+                    "package_version": env!("CARGO_PKG_VERSION"),
+                    "build_commit": null,
+                    "build_date_utc": null,
+                    "uptime_ms": 1,
+                    "endpoint_path": "/tmp/agent.sock",
+                    "workspace_id": "test-workspace"
+                },
+                "session": {
+                    "session_id": session_id,
+                    "latest_run_id": null,
+                    "human_turn_count": 0,
+                    "ledger_path": "/work/agent.db",
+                    "core_event_count": 0
+                },
+                "usage": {
+                    "last_run": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "unknown_response_count": 0
+                    },
+                    "session": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "unknown_response_count": 0
+                    }
+                },
+                "trust": {
+                    "approval_granted_count": 0,
+                    "approval_denied_count": 0,
+                    "shell_session_grant": false,
+                    "approval_profile": "prompt"
+                }
             }),
         )
     }

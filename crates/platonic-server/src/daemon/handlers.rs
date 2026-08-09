@@ -6,9 +6,9 @@ use crate::{
         protocol::{
             AgentCreateParams, AgentCreateResult, AgentListParams, AgentListResult,
             AgentStatusParams, AgentStatusResult, AgentSummary, ApprovalDecideParams,
-            ApprovalDecision, ApprovalDecisionName, BufferedStreamEvent, CAPABILITIES,
-            CommandAcceptedResult, DaemonStatusDaemon, DaemonStatusModel, DaemonStatusParams,
-            DaemonStatusProviderKind, DaemonStatusResult, DaemonStatusSession,
+            ApprovalDecision, ApprovalDecisionName, ApprovalProfile, BufferedStreamEvent,
+            CAPABILITIES, CommandAcceptedResult, DaemonStatusDaemon, DaemonStatusModel,
+            DaemonStatusParams, DaemonStatusProviderKind, DaemonStatusResult, DaemonStatusSession,
             DaemonStatusTokenUsage, DaemonStatusTrust, DaemonStatusUsage,
             ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
             ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
@@ -20,15 +20,15 @@ use crate::{
             HelloParams, HelloResult, IssuePrepResult, IssuePrepStartParams, IssuePrepStartResult,
             MessageAppendParams, ModelIdentityStatus, ProtocolErrorCode, ProtocolRequest,
             ProtocolResponse, RunCancelParams, RunStartParams, RunStartResult, RunStateName,
-            SessionSummary, SessionsListResult, ShutdownIfIdleResult, ShutdownIfIdleResultName,
-            StreamEvent, ThreadApprovalPolicy, ThreadAuthorityParams, ThreadAuthorityResult,
-            ThreadEventsParams, ThreadListResult, ThreadSendParams, ThreadSpawnDecision,
-            ThreadSpawnParams, ThreadSpawnResult, ThreadStatus, ThreadStatusParams,
-            ThreadStatusResult, ThreadStopParams, ThreadStopResult, TranscriptReadParams,
-            TranscriptReadResult, TypedRun, TypedTranscript, TypedTranscriptEntry,
-            WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceHealthName, WorkspaceListParams,
-            WorkspaceListResult, WorkspaceStatusParams, WorkspaceStatusResult, WorkspaceSummary,
-            decode_request,
+            SessionApprovalProfileSetParams, SessionApprovalProfileSetResult, SessionSummary,
+            SessionsListResult, ShutdownIfIdleResult, ShutdownIfIdleResultName, StreamEvent,
+            ThreadApprovalPolicy, ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams,
+            ThreadListResult, ThreadSendParams, ThreadSpawnDecision, ThreadSpawnParams,
+            ThreadSpawnResult, ThreadStatus, ThreadStatusParams, ThreadStatusResult,
+            ThreadStopParams, ThreadStopResult, TranscriptReadParams, TranscriptReadResult,
+            TypedRun, TypedTranscript, TypedTranscriptEntry, WorkspaceCreateParams,
+            WorkspaceCreateResult, WorkspaceHealthName, WorkspaceListParams, WorkspaceListResult,
+            WorkspaceStatusParams, WorkspaceStatusResult, WorkspaceSummary, decode_request,
         },
         runtime::{
             DaemonRuntime, IssuePrepAdmissionError, RunAdmissionError, RunRecord,
@@ -97,6 +97,9 @@ pub(super) fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Enve
         ProtocolRequest::SessionsList => handle_sessions_list(runtime, request),
         ProtocolRequest::TranscriptRead(params) => handle_transcript_read(runtime, request, params),
         ProtocolRequest::DaemonStatus(params) => handle_daemon_status(runtime, request, params),
+        ProtocolRequest::SessionApprovalProfileSet(params) => {
+            handle_session_approval_profile_set(runtime, request, params)
+        }
         ProtocolRequest::DaemonShutdownIfIdle => handle_shutdown_if_idle(runtime, request),
         ProtocolRequest::ThreadSpawn(params) => handle_thread_spawn(runtime, request, params),
         ProtocolRequest::ThreadList => handle_thread_list(runtime, request),
@@ -236,6 +239,58 @@ fn handle_daemon_status(
     }
 }
 
+fn handle_session_approval_profile_set(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: SessionApprovalProfileSetParams,
+) -> Envelope {
+    if runtime.shutdown_accepted() {
+        return shutting_down_response(request.id, "session.approval_profile.set");
+    }
+    let exists = if runtime.has_runtime_session(&params.session_id) {
+        Ok(true)
+    } else {
+        crate::ledger::default_sqlite_session_status(
+            &runtime.paths.default_ledger(),
+            Some(&params.session_id),
+        )
+        .map(|status| status.is_some())
+        .or_else(|error| match error {
+            AppError::SessionNotFound(_) | AppError::NoSqliteRuns | AppError::NoSqliteSessions => {
+                Ok(false)
+            }
+            error => Err(error),
+        })
+    };
+    match exists {
+        Ok(true) => {}
+        Ok(false) => {
+            return Envelope::error(
+                request.id,
+                Some("session.approval_profile.set".into()),
+                ERROR_NOT_FOUND,
+                format!("session not found: {}", params.session_id),
+            );
+        }
+        Err(_) => {
+            return Envelope::error(
+                request.id,
+                Some("session.approval_profile.set".into()),
+                ERROR_INTERNAL,
+                "session approval profile could not be updated",
+            );
+        }
+    }
+    runtime.set_approval_profile(&params.session_id, params.profile);
+    Envelope::typed_response(
+        request.id,
+        ProtocolResponse::SessionApprovalProfileSet(SessionApprovalProfileSetResult {
+            session_id: params.session_id,
+            profile: params.profile,
+        }),
+    )
+}
+
 fn daemon_status(
     runtime: &DaemonRuntime,
     params: DaemonStatusParams,
@@ -244,10 +299,20 @@ fn daemon_status(
         &runtime.paths.workspace_root,
         params.config_path.as_deref().map(Path::new),
     )?;
-    let persisted = crate::ledger::default_sqlite_session_status(
+    let requested_session_id = params.session_id.clone();
+    let persisted = match crate::ledger::default_sqlite_session_status(
         &runtime.paths.default_ledger(),
-        params.session_id.as_deref(),
-    )?;
+        requested_session_id.as_deref(),
+    ) {
+        Err(AppError::SessionNotFound(_))
+            if requested_session_id
+                .as_deref()
+                .is_some_and(|session_id| runtime.has_runtime_session(session_id)) =>
+        {
+            None
+        }
+        result => result?,
+    };
     let ledger_path = runtime.paths.ledger_path.to_string_lossy().into_owned();
     let (served_model, session, usage, trust) = match persisted {
         Some(status) => {
@@ -259,6 +324,7 @@ fn daemon_status(
                 approval_granted_count: status.approval_granted_count,
                 approval_denied_count: status.approval_denied_count,
                 shell_session_grant: runtime.has_shell_session_grant(&status.session_id),
+                approval_profile: runtime.approval_profile(&status.session_id),
             };
             let session = DaemonStatusSession {
                 session_id: Some(status.session_id),
@@ -269,21 +335,33 @@ fn daemon_status(
             };
             (status.served_model, session, usage, trust)
         }
-        None => (
-            None,
-            DaemonStatusSession {
-                session_id: None,
-                latest_run_id: None,
-                human_turn_count: 0,
-                ledger_path,
-                core_event_count: 0,
-            },
-            DaemonStatusUsage {
-                last_run: DaemonStatusTokenUsage::default(),
-                session: DaemonStatusTokenUsage::default(),
-            },
-            DaemonStatusTrust::default(),
-        ),
+        None => {
+            let live_session_id =
+                requested_session_id.filter(|session_id| runtime.has_runtime_session(session_id));
+            let trust =
+                live_session_id
+                    .as_deref()
+                    .map_or_else(DaemonStatusTrust::default, |session_id| DaemonStatusTrust {
+                        shell_session_grant: runtime.has_shell_session_grant(session_id),
+                        approval_profile: runtime.approval_profile(session_id),
+                        ..DaemonStatusTrust::default()
+                    });
+            (
+                None,
+                DaemonStatusSession {
+                    session_id: live_session_id,
+                    latest_run_id: None,
+                    human_turn_count: 0,
+                    ledger_path,
+                    core_event_count: 0,
+                },
+                DaemonStatusUsage {
+                    last_run: DaemonStatusTokenUsage::default(),
+                    session: DaemonStatusTokenUsage::default(),
+                },
+                trust,
+            )
+        }
     };
     let (package_version, build_commit, build_date_utc) = build_identity_parts();
     let provider_kind = match config.provider.kind {
@@ -1102,6 +1180,7 @@ fn handle_thread_send(
                 model: Some(authority.model),
                 reasoning_effort: Some(authority.reasoning_effort),
             },
+            approval_profile: None,
             wait: Some(false),
             thread_context: Some(context),
         },
@@ -1407,6 +1486,7 @@ fn handle_run_start(
             },
             config_path: params.config_path,
             overrides: params.overrides,
+            approval_profile: Some(params.approval_profile.unwrap_or_default()),
             wait: params.wait,
             thread_context: None,
         },
@@ -1450,6 +1530,7 @@ fn handle_message_append(
             session: RunSession::Continue { session_id },
             config_path: params.config_path,
             overrides: params.overrides,
+            approval_profile: params.approval_profile,
             wait: params.wait,
             thread_context: None,
         },
@@ -1540,6 +1621,7 @@ struct StartRunRequest {
     session: RunSession,
     config_path: Option<String>,
     overrides: RunOverrides,
+    approval_profile: Option<ApprovalProfile>,
     wait: Option<bool>,
     thread_context: Option<ThreadRunContext>,
 }
@@ -1561,6 +1643,7 @@ fn start_run(
         session,
         config_path,
         overrides,
+        approval_profile,
         wait,
         thread_context,
     } = request;
@@ -1600,7 +1683,7 @@ fn start_run(
             runtime.paths.ledger_path.clone(),
         ),
     });
-    match runtime.reserve_run(record.clone()) {
+    match runtime.reserve_run_with_profile(record.clone(), approval_profile) {
         Ok(()) => {}
         Err(RunAdmissionError::ShuttingDown) => {
             return Err(Box::new(shutting_down_response(request_id, method)));
@@ -1767,6 +1850,7 @@ fn drive_thread_turn(
                 },
                 config_path: driver.config_path.clone(),
                 overrides: driver.overrides.clone(),
+                approval_profile: None,
                 wait: Some(true),
                 thread_context: Some(driver.context.clone()),
             },
@@ -3121,6 +3205,54 @@ mod tests {
             })
             .to_string(),
         )
+    }
+
+    #[test]
+    fn session_profile_mutation_and_status_use_the_exact_live_session() {
+        let (_root, runtime) = thread_test_runtime();
+        let record = test_run_record("profile");
+        runtime.reserve_run(record.clone()).unwrap();
+
+        let updated = handle_request(
+            &runtime,
+            workspace_request(
+                "profile-on",
+                "session.approval_profile.set",
+                json!({"session_id": record.session_id, "profile": "yolo"}),
+            ),
+        );
+        let updated: SessionApprovalProfileSetResult = response_result(&updated);
+        assert_eq!(updated.session_id, record.session_id);
+        assert_eq!(updated.profile, ApprovalProfile::Yolo);
+
+        let status = handle_request(
+            &runtime,
+            workspace_request(
+                "profile-status",
+                "daemon.status",
+                json!({"session_id": record.session_id, "config_path": null}),
+            ),
+        );
+        let status: DaemonStatusResult = response_result(&status);
+        assert_eq!(
+            status.session.session_id.as_deref(),
+            Some(record.session_id.as_str())
+        );
+        assert_eq!(status.trust.approval_profile, ApprovalProfile::Yolo);
+        assert_eq!(
+            runtime.approval_profile("session_other"),
+            ApprovalProfile::Prompt
+        );
+
+        let missing = handle_request(
+            &runtime,
+            workspace_request(
+                "profile-missing",
+                "session.approval_profile.set",
+                json!({"session_id": "session_missing", "profile": "yolo"}),
+            ),
+        );
+        assert_eq!(missing.error.unwrap().code, ERROR_NOT_FOUND);
     }
 
     /// A workspace can be created, listed and inspected end to end, keeps a
@@ -5756,6 +5888,7 @@ IFS= read -r _
             input_preview: Some("{}".into()),
             approval_preview: None,
             diff_preview: None,
+            yolo_eligible: false,
         }
     }
 
