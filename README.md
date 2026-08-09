@@ -115,11 +115,11 @@ In the TUI, a pending `shell.exec` can be allowed once or allowed for the
 selected session until the daemon process exits. Later shell calls in that
 session retain their approval policy and ledger facts but do not prompt again;
 other sessions and restarted daemons prompt normally.
-Use `--yolo` to auto-approve enabled workspace-write tools that would otherwise
-prompt. Yolo mode does not enable disabled or unknown tools, approve network
-tools, permit deny-class effects such as external side effects or secret access,
-approve `shell.exec`, auto-approve direct changes to root `PLATONIC.md`, or
-bypass workspace path checks.
+Use `--yolo` to auto-approve enabled workspace-write tools and exact
+`shell.exec` calls that would otherwise prompt. Yolo mode does not enable
+disabled or unknown tools, approve network or secret-access tools, permit any
+other external side effect, auto-approve direct changes to root `PLATONIC.md`,
+or bypass workspace path checks.
 
 ## Workspace Memory
 
@@ -809,8 +809,15 @@ or alias. After the response is durable, it labels the provider-reported served
 model, or `served unknown` when the provider omits that identity.
 Use `/status` for one authoritative daemon readback of the effective model,
 daemon identity, selected session, reported token usage, persisted approval
-facts, and the selected session's live shell grant. The read-only modal does
-not invoke a model or change the session.
+facts, and the selected session's live shell grant and approval profile. The
+read-only modal does not invoke a model or change the session.
+
+`plato --tui --yolo` starts the local TUI thread in yolo mode. Within the TUI,
+`/yolo on` and `/yolo off` change only the selected session until the daemon
+exits. Before a session exists, the command selects the profile for the next
+fresh run. A persistent footer warning distinguishes current-session yolo from
+next-session yolo. Auto-grants retain the normal require-approval policy fact
+and record actor `tui_yolo`.
 
 ```bash
 cargo run --bin platonic -- serve
@@ -840,6 +847,8 @@ Keys:
   `Esc` closes. With no matches, `Enter` keeps the picker open.
 - `/status`: request one authoritative runtime readback; `Esc` closes the
   read-only modal.
+- `/yolo on|off`: change the selected session's daemon-lifetime approval
+  profile, or the next fresh run's profile when no session is selected.
 - `/new`: clear the selected session so the next submitted message starts fresh.
 - `/issue-prep <rough issue>`: prepare and review an implementation issue.
   It is unavailable while another run or issue-prep command is active, and the

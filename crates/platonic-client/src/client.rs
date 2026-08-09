@@ -7,12 +7,13 @@ use crate::{
 };
 use platonic_protocol::{
     AgentCreateParams, AgentCreateResult, AgentId, AgentListParams, AgentListResult,
-    AgentStatusParams, AgentStatusResult, ApprovalDecideParams, ApprovalDecision,
+    AgentStatusParams, AgentStatusResult, ApprovalDecideParams, ApprovalDecision, ApprovalProfile,
     CommandAcceptedResult, DaemonStatusParams, DaemonStatusResult, Envelope, EnvelopeKind,
     EventsStreamParams, EventsStreamResult, HelloParams, HelloResult, IssuePrepStartParams,
     IssuePrepStartResult, MessageAppendParams, PROTOCOL_VERSION, ProtocolMethod, ProtocolRequest,
     ProtocolResponse, ReasoningEffort, RunCancelParams, RunOverrides, RunStartParams,
-    RunStartResult, SessionSummary, SessionsListResult, ShutdownIfIdleResult, ThreadApprovalPolicy,
+    RunStartResult, SessionApprovalProfileSetParams, SessionApprovalProfileSetResult,
+    SessionSummary, SessionsListResult, ShutdownIfIdleResult, ThreadApprovalPolicy,
     ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams, ThreadEventsResult,
     ThreadListResult, ThreadSendParams, ThreadSendResult, ThreadSpawnDecision, ThreadSpawnParams,
     ThreadSpawnResult, ThreadStatusParams, ThreadStatusResult, ThreadStopParams, ThreadStopResult,
@@ -290,6 +291,20 @@ impl DaemonClient {
         }))
     }
 
+    /// Sets one daemon-lifetime approval profile for an existing session.
+    pub fn session_approval_profile_set(
+        &mut self,
+        session_id: String,
+        profile: ApprovalProfile,
+    ) -> ClientResult<SessionApprovalProfileSetResult> {
+        self.request(ProtocolRequest::SessionApprovalProfileSet(
+            SessionApprovalProfileSetParams {
+                session_id,
+                profile,
+            },
+        ))
+    }
+
     /// Requests daemon shutdown when no run or approval is active.
     pub fn shutdown_if_idle(&mut self) -> ClientResult<ShutdownIfIdleResult> {
         self.request(ProtocolRequest::DaemonShutdownIfIdle)
@@ -332,10 +347,23 @@ impl DaemonClient {
         overrides: RunOverrides,
         wait: bool,
     ) -> ClientResult<RunStartResult> {
+        self.run_start_with_overrides_and_profile(question, config_path, overrides, None, wait)
+    }
+
+    /// Starts a new daemon run with explicit model overrides and approval profile.
+    pub fn run_start_with_overrides_and_profile(
+        &mut self,
+        question: String,
+        config_path: Option<String>,
+        overrides: RunOverrides,
+        approval_profile: Option<ApprovalProfile>,
+        wait: bool,
+    ) -> ClientResult<RunStartResult> {
         self.request(ProtocolRequest::RunStart(RunStartParams {
             question,
             config_path,
             overrides,
+            approval_profile,
             wait: Some(wait),
         }))
     }
@@ -376,11 +404,32 @@ impl DaemonClient {
         overrides: RunOverrides,
         wait: bool,
     ) -> ClientResult<RunStartResult> {
+        self.message_append_to_session_with_overrides_and_profile(
+            message,
+            session_id,
+            config_path,
+            overrides,
+            None,
+            wait,
+        )
+    }
+
+    /// Appends a message with explicit model overrides and an optional profile replacement.
+    pub fn message_append_to_session_with_overrides_and_profile(
+        &mut self,
+        message: String,
+        session_id: Option<String>,
+        config_path: Option<String>,
+        overrides: RunOverrides,
+        approval_profile: Option<ApprovalProfile>,
+        wait: bool,
+    ) -> ClientResult<RunStartResult> {
         self.request(ProtocolRequest::MessageAppend(MessageAppendParams {
             message,
             session_id,
             config_path,
             overrides,
+            approval_profile,
             wait: Some(wait),
         }))
     }
@@ -724,6 +773,7 @@ fn response_result_value(response: ProtocolResponse) -> serde_json::Result<Value
         ProtocolResponse::SessionsList(result) => serde_json::to_value(result),
         ProtocolResponse::TranscriptRead(result) => serde_json::to_value(result),
         ProtocolResponse::DaemonStatus(result) => serde_json::to_value(result),
+        ProtocolResponse::SessionApprovalProfileSet(result) => serde_json::to_value(result),
         ProtocolResponse::DaemonShutdownIfIdle(result) => serde_json::to_value(result),
         ProtocolResponse::ThreadSpawn(result) => serde_json::to_value(result),
         ProtocolResponse::ThreadList(result) => serde_json::to_value(result),

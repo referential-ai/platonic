@@ -98,10 +98,11 @@ plato "run cargo test --locked and summarize the result"
 # -> Approve shell.exec?   press y to run the command
 ```
 
-Reads and listings never prompt. Workspace writes prompt unless `--yolo`.
-Yolo does not approve network tools or `shell.exec`. `shell.exec` always
-prompts and runs with a scrubbed environment that does not inherit provider
-credentials.
+Reads and listings never prompt. Workspace writes and exact `shell.exec` calls
+prompt unless `--yolo`; direct root `PLATONIC.md` changes still prompt. Yolo
+never approves network, secret-access, unknown, disabled, or other
+external-side-effect tools. `shell.exec` runs with a scrubbed environment that
+does not inherit provider credentials.
 `web.fetch` always prompts with its normalized public origin and validated
 addresses, revalidates immediately before each pinned connection, and returns
 only bounded UTF-8 text from the approved origin.
@@ -128,6 +129,8 @@ One terminal, same workspace:
 
 ```bash
 plato
+# Start the TUI's local session in yolo mode instead:
+plato --tui --yolo
 ```
 
 This ensures the host-scoped `platonic serve`, asks once to register an unknown
@@ -186,6 +189,9 @@ switches to a second-press quit hint after cancel and to
 model and workspace context; below 120 columns that right-side context drops,
 below 80 the queue hint drops, and below 40 the remaining `?` hint truncates
 without wrapping.
+When yolo is active, the footer shows `yolo` for the selected session or `yolo
+next` before a fresh session exists. Use `/yolo on|off` to change that
+daemon-lifetime local profile; `/status` reads it back authoritatively.
 
 | Key | Does |
 | --- | --- |

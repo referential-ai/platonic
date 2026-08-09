@@ -25,8 +25,8 @@ use crate::{
     },
 };
 use platonic_protocol::{
-    DaemonStatusResult, DaemonStatusTokenUsage, ModelIdentityStatus, RunStateName, TypedRun,
-    TypedTranscriptEntry,
+    ApprovalProfile, DaemonStatusResult, DaemonStatusTokenUsage, ModelIdentityStatus, RunStateName,
+    TypedRun, TypedTranscriptEntry,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthChar;
@@ -1133,7 +1133,18 @@ fn contextual_footer(
     key_map: KeyMap<'_>,
     platform: KeyLabelPlatform,
 ) -> Line<'static> {
-    let mut spans = footer_hint_spans(
+    let mut spans = Vec::new();
+    if state.approval_profile == ApprovalProfile::Yolo {
+        spans.push(Span::styled(
+            if state.selected_session_id.is_some() {
+                "yolo"
+            } else {
+                "yolo next"
+            },
+            semantic_style(SemanticRole::Warning).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let hints = footer_hint_spans(
         key_map.bindings().iter().filter(|binding| {
             binding.footer.is_some_and(|hint| {
                 hint.priority == FooterHintPriority::Essential
@@ -1143,6 +1154,10 @@ fn contextual_footer(
         state,
         platform,
     );
+    if !spans.is_empty() && !hints.is_empty() {
+        push_footer_separator(&mut spans);
+    }
+    spans.extend(hints);
     if width < FOOTER_HELP_WIDTH {
         return Line::from(spans);
     }
@@ -1784,6 +1799,7 @@ fn render_status_modal(frame: &mut Frame<'_>, area: Rect, status: &DaemonStatusR
                 "not granted"
             }
         )),
+        Line::from(format!("profile         {}", status.trust.approval_profile)),
         Line::from("Esc close"),
     ];
     frame.render_widget(Clear, area);
@@ -1795,7 +1811,7 @@ fn render_status_modal(frame: &mut Frame<'_>, area: Rect, status: &DaemonStatusR
 
 fn status_modal_rect(area: Rect) -> Rect {
     let width = (area.width.saturating_mul(92) / 100).max(1);
-    let height = area.height.clamp(1, 23);
+    let height = area.height.clamp(1, 24);
     Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 2,
@@ -2204,6 +2220,24 @@ mod tests {
         assert_eq!(approval.height, 0);
         assert_eq!(composer.height, 1);
         assert_eq!(footer.height, 1);
+    }
+
+    #[test]
+    fn yolo_footer_signal_is_stable_for_current_and_next_sessions() {
+        let mut state = conversation_fixture();
+        state.approval_profile = ApprovalProfile::Yolo;
+        state.selected_session_id = Some("session_1".into());
+        assert!(footer_line(&state, 40).to_string().starts_with("yolo · "));
+
+        state.selected_session_id = None;
+        assert!(
+            footer_line(&state, 40)
+                .to_string()
+                .starts_with("yolo next · ")
+        );
+        for width in [0, 4, 8, 16, 24, 40, 80, 120] {
+            assert!(footer_line(&state, width).width() <= usize::from(width));
+        }
     }
 
     #[test]
@@ -3418,6 +3452,7 @@ mod tests {
         assert!(normal.contains("session   input 17    output 8    unknown 2"));
         assert!(normal.contains("granted         2    denied 1"));
         assert!(normal.contains("shell session   granted"));
+        assert!(normal.contains("profile         yolo"));
     }
 
     #[test]
@@ -4088,7 +4123,8 @@ mod tests {
             "trust": {
                 "approval_granted_count": 2,
                 "approval_denied_count": 1,
-                "shell_session_grant": true
+                "shell_session_grant": true,
+                "approval_profile": "yolo"
             }
         }))
         .unwrap()
