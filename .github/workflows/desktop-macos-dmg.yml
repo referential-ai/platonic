@@ -86,9 +86,11 @@ jobs:
         working-directory: desktop
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
 
-      - name: Run native desktop Rust tests
+      # Shared macOS runner test execution is nondeterministic under #465.
+      # Compile every test here; the protected Wikus job executes them serially.
+      - name: Compile native desktop Rust tests
         working-directory: desktop
-        run: cargo test --manifest-path src-tauri/Cargo.toml --locked -- --test-threads=1
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --no-run
 
       - name: Run native desktop Rust clippy
         working-directory: desktop
@@ -212,6 +214,10 @@ jobs:
           test -n "$identity"
           grep -Fq -- "\"$APPLE_SIGNING_IDENTITY\"" <<< "$identity"
           printf 'APPLE_API_KEY_PATH=%s\n' "$api_key_path" >> "$GITHUB_ENV"
+
+      - name: Run native desktop Rust tests on Wikus
+        working-directory: desktop
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked -- --test-threads=1
 
       - name: Build, sign, and notarize the app and signed DMG
         working-directory: desktop
