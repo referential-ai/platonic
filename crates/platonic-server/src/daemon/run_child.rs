@@ -2289,6 +2289,14 @@ while :; do :; done
             .unwrap();
 
         assert!(output.status.success(), "environment driver fixture failed");
+        for captured in [&output.stdout, &output.stderr] {
+            assert!(
+                !captured
+                    .windows(RUN_CHILD_PROVIDER_SENTINEL.len())
+                    .any(|window| window == RUN_CHILD_PROVIDER_SENTINEL.as_bytes()),
+                "provider credential reached captured child output"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2444,6 +2452,8 @@ done
         }
         assert_eq!(outcome.final_answer, "done");
         assert_eq!(event_records.len() + 1, records.len());
+        let live = serde_json::to_string(&event_records).unwrap();
+        assert!(!live.contains(RUN_CHILD_PROVIDER_SENTINEL));
         let durable = serde_json::to_string(&records).unwrap();
         assert!(durable.contains("runtime-and-scrub-ok"));
         assert!(!durable.contains(RUN_CHILD_PROVIDER_SENTINEL));
