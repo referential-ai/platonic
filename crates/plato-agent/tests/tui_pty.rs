@@ -804,6 +804,7 @@ fn composer_textarea_features_preserve_submit_queue_slash_and_history_contracts(
     );
 
     shell.write(b"\x15/c");
+    shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "show this help");
     let filtered = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "clear the visible");
     assert!(!filtered.contains("show this help"));
     shell.write(b"\t\r");
