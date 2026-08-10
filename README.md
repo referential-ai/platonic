@@ -798,7 +798,11 @@ cargo run --bin plato-tui -- --workspace "$PWD"
 
 Use `--socket <path>` when connecting to a non-default socket, `--config <path>`
 to pass a config file to daemon-started runs, and `--run <run_id>` to open a
-specific transcript.
+specific transcript. `--voice-config <path>` selects a separate client-only
+file with one strict `[voice]` table; the server never receives or parses it.
+The table requires explicit `kokoro_model`, `whisper_model`, and `silero_model`
+paths and optionally accepts exact `capture_device` and `playback_device` IDs.
+No model or device discovery or download occurs.
 
 Keys:
 
@@ -821,7 +825,11 @@ Keys:
   read-only modal.
 - `/yolo on|off`: change the selected session's daemon-lifetime approval
   profile, or the next fresh run's profile when no session is selected.
-- `/new`: clear the selected session so the next submitted message starts fresh.
+- `/voice on|off`: grant or revoke local audio for this client session. Voice
+  starts off, invalid configuration fails closed, and off drains and closes the
+  current devices idempotently.
+- `/new`: turn voice off and clear the selected session so the next submitted
+  message starts fresh.
 - `/issue-prep <rough issue>`: prepare and review an implementation issue.
   It is unavailable while another run or issue-prep command is active, and the
   TUI waits for it before exiting.

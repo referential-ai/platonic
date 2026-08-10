@@ -809,9 +809,11 @@ fn conversation_live_event_lines(
                     && ((event.kind == LiveEventKind::Warning
                         && (event.text.starts_with("issue prep")
                             || event.text.starts_with("issue-prep")
-                            || event.text.starts_with("thread send rejected:")))
+                            || event.text.starts_with("thread send rejected:")
+                            || event.text.starts_with("voice ")))
                         || (event.kind == LiveEventKind::Status
-                            && event.text.starts_with("issue-prep artifacts:"))) =>
+                            && (event.text.starts_with("issue-prep artifacts:")
+                                || event.text.starts_with("voice ")))) =>
             {
                 let role = if event.kind == LiveEventKind::Warning {
                     SemanticRole::Error
@@ -3059,7 +3061,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_renders_only_unoffset_thread_send_rejection_warnings() {
+    fn conversation_renders_only_admitted_unoffset_client_notices() {
         let mut state = TuiState::connected(
             "/tmp/work".into(),
             "/tmp/agent.sock".into(),
@@ -3075,6 +3077,8 @@ mod tests {
         );
         state.live_events = vec![
             LiveEventLine::warning(None, "thread send rejected: controller_owned"),
+            LiveEventLine::warning(None, "voice configuration is unavailable: missing [voice]"),
+            LiveEventLine::status(None, "voice enabled"),
             LiveEventLine::warning(None, "generic warning remains hidden"),
             LiveEventLine::warning(
                 Some(7),
@@ -3086,6 +3090,8 @@ mod tests {
 
         assert!(output.contains("Notice"));
         assert!(output.contains("thread send rejected: controller_owned"));
+        assert!(output.contains("voice configuration is unavailable: missing [voice]"));
+        assert!(output.contains("voice enabled"));
         assert!(!output.contains("generic warning remains hidden"));
         assert!(!output.contains("offset warning remains hidden"));
     }

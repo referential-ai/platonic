@@ -204,14 +204,34 @@ typing indicator while active, then ✅ or ❌; canceled and interrupted runs
 remove 👀 without a terminal reaction. The bot needs Add Reactions and Read
 Message History, plus Send Messages in Threads when threads are used.
 
-## 5. Local voice proof (developer MVP)
+## 5. Local voice activation and device proof
 
-AU2 voice-out and AU4 explicit voice-in are exposed through focused examples,
-not a general CLI or ambient listener. Install espeak-ng, CUDA, and the native
+TUI voice is opt-in through a dedicated client file that the server never reads.
+Choose every local model explicitly; Plato does not search for or download
+artifacts. Relative model paths resolve from the voice file's directory.
+
+```toml
+[voice]
+kokoro_model = "/models/kokoro-82m"
+whisper_model = "/models/ggml-large-v3-turbo.bin"
+silero_model = "/models/silero_vad.onnx"
+# capture_device = "exact cpal input device ID"
+# playback_device = "exact cpal output device ID"
+```
+
+```bash
+plato --tui --voice-config /path/to/voice.toml
+# In the TUI, /voice on is the one session-local device grant.
+# /voice off stops capture, drains accepted speech, and closes both devices.
+```
+
+Missing, unreadable, incomplete, or unknown configuration fails closed in the
+TUI status line. Voice starts off after every client restart and `/new` turns it
+off before selecting a fresh session. Install espeak-ng, CUDA, and the native
 cpal backend headers, then place the pinned Kokoro, Silero v6.2.1, and
 large-v3-turbo artifacts described in
 [`../crates/plato-audio/README.md`](../crates/plato-audio/README.md) outside the
-repository.
+repository for the focused device proofs below.
 
 ```bash
 export PLATO_AUDIO_KOKORO_DIR="$HOME/.cache/plato-audio/kokoro-82m-v1.0-onnx-1939ad2a8e416c0acfeecc08a694d14ef25f2231"

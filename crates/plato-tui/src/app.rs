@@ -1,5 +1,5 @@
 use crate::{
-    ApprovalModalView, TranscriptState, TranscriptView, TuiState,
+    ApprovalModalView, TranscriptState, TranscriptView, TuiState, VoiceControl,
     color::{self, TerminalColors},
     render::{committed_transcript_lines, render_main, render_overlay},
     render_snapshot,
@@ -128,6 +128,8 @@ pub struct TuiOptions {
     pub reduced_motion: bool,
     /// Optional durable thread selected on the host daemon.
     pub thread: Option<ThreadAttachment>,
+    /// Optional client-owned voice activation worker for this TUI session.
+    pub voice: Option<VoiceControl>,
 }
 
 impl TuiOptions {
@@ -141,6 +143,7 @@ impl TuiOptions {
             snapshot: false,
             reduced_motion: false,
             thread: None,
+            voice: None,
         }
     }
 }
@@ -164,8 +167,12 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
     let (event_sender, events) = mpsc::channel();
-    let commands =
-        spawn_client_worker_to(config.clone(), options.thread.clone(), event_sender.clone());
+    let commands = spawn_client_worker_to(
+        config.clone(),
+        options.thread.clone(),
+        options.voice.clone(),
+        event_sender.clone(),
+    );
     let mut runtime = UiRuntime::from_state(&state, config_path.clone());
     runtime.attach_thread(options.thread.clone());
     let mut terminal = TerminalSession::enter(&state)?;
@@ -986,6 +993,10 @@ fn dispatch_slash_command(
             set_yolo_profile(commands, state, message);
             true
         }
+        SlashCommandAction::Voice => {
+            set_voice_activation(commands, state, message);
+            true
+        }
         SlashCommandAction::Clear => {
             clear_visible_transcript(state);
             state.status_message = Some("visible transcript cleared".into());
@@ -996,7 +1007,7 @@ fn dispatch_slash_command(
             true
         }
         SlashCommandAction::NewSession => {
-            start_fresh_session(state);
+            request_fresh_session(commands, state);
             true
         }
         SlashCommandAction::IssuePrep => {
@@ -1021,7 +1032,12 @@ fn clear_visible_transcript(state: &mut TuiState) {
     state.stream_warning = None;
 }
 
-fn start_fresh_session(state: &mut TuiState) {
+fn request_fresh_session(commands: &Sender<ClientCommand>, state: &mut TuiState) {
+    state.status_message = Some("turning voice off for new session".into());
+    send_command(commands, ClientCommand::VoiceResetForNewSession, state);
+}
+
+pub(super) fn select_fresh_session(state: &mut TuiState) {
     state.selected_session_id = None;
     state.approval_profile = ApprovalProfile::Prompt;
     state.replace_transcript(TranscriptState::None);
@@ -1029,6 +1045,27 @@ fn start_fresh_session(state: &mut TuiState) {
     state.stream_warning = None;
     state.session_picker = None;
     state.status_message = Some("new session selected".into());
+}
+
+fn set_voice_activation(commands: &Sender<ClientCommand>, state: &mut TuiState, message: &str) {
+    let mut parts = message.split_whitespace();
+    let enabled = match (parts.next(), parts.next(), parts.next()) {
+        (Some("/voice"), Some("on"), None) => true,
+        (Some("/voice"), Some("off"), None) => false,
+        _ => {
+            state.status_message = Some("usage: /voice on|off".into());
+            return;
+        }
+    };
+    state.status_message = Some(
+        if enabled {
+            "enabling voice"
+        } else {
+            "disabling voice"
+        }
+        .into(),
+    );
+    send_command(commands, ClientCommand::VoiceSet { enabled }, state);
 }
 
 fn set_yolo_profile(commands: &Sender<ClientCommand>, state: &mut TuiState, message: &str) {
@@ -1961,6 +1998,82 @@ mod tests {
     }
 
     #[test]
+    fn voice_command_sends_only_the_exact_client_activation_request() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let mut runtime = UiRuntime::from_state(&state, None);
+
+        state.set_composer_text("/voice on");
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ClientCommand::VoiceSet { enabled: true }
+        ));
+        assert_eq!(state.status_message.as_deref(), Some("enabling voice"));
+
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::VoiceSet(crate::VoiceControlResponse::Enabled),
+            &sender,
+        );
+        assert_eq!(state.status_message.as_deref(), Some("voice enabled"));
+
+        state.set_composer_text("/voice off");
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ClientCommand::VoiceSet { enabled: false }
+        ));
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::VoiceSet(crate::VoiceControlResponse::AlreadyDisabled),
+            &sender,
+        );
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("voice already disabled")
+        );
+    }
+
+    #[test]
+    fn voice_command_rejects_nonliteral_modes_without_a_worker_request() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        for command in ["/voice", "/voice yes", "/voice off now"] {
+            state.set_composer_text(command);
+            assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+            assert_eq!(
+                state.status_message.as_deref(),
+                Some("usage: /voice on|off")
+            );
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn voice_activation_failure_is_reported_without_daemon_state() {
+        let (sender, _) = mpsc::channel();
+        let mut state = test_state();
+        let mut runtime = UiRuntime::from_state(&state, None);
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::VoiceSet(crate::VoiceControlResponse::Failed(
+                "voice configuration is incomplete: missing voice.whisper_model".into(),
+            )),
+            &sender,
+        );
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("voice configuration is incomplete: missing voice.whisper_model")
+        );
+    }
+
+    #[test]
     fn yolo_command_mutates_selected_session_only_after_daemon_ack() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
@@ -2470,12 +2583,41 @@ mod tests {
         state.replace_transcript(loaded_transcript("run_1", "[turn_1] user: old\n"));
         state.live_events = vec![crate::LiveEventLine::assistant(None, "old")];
         state.set_composer_text("/new");
-        let runtime = UiRuntime::from_state(&state, None);
+        let mut runtime = UiRuntime::from_state(&state, None);
         render_snapshot(&state, 100, 24).unwrap();
         assert_cached_rows(&state, true, true);
 
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
 
+        assert_eq!(state.selected_session_id.as_deref(), Some("session_1"));
+        assert_eq!(state.approval_profile, ApprovalProfile::Yolo);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("turning voice off for new session")
+        );
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientCommand::VoiceResetForNewSession
+        ));
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::VoiceResetForNewSession(crate::VoiceControlResponse::Failed(
+                "voice shutdown failed".into(),
+            )),
+            &sender,
+        );
+        assert_eq!(state.selected_session_id.as_deref(), Some("session_1"));
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("voice shutdown failed")
+        );
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::VoiceResetForNewSession(crate::VoiceControlResponse::AlreadyDisabled),
+            &sender,
+        );
         assert!(state.selected_session_id.is_none());
         assert_eq!(state.approval_profile, ApprovalProfile::Prompt);
         assert!(state.live_events.is_empty());
@@ -3407,7 +3549,7 @@ mod tests {
         state = selected_state("session_1", "run_1", "restored transcript");
         audit_scroll.sync(&state);
         audit_scroll.offset = SCROLL_PAGE_LINES;
-        start_fresh_session(&mut state);
+        select_fresh_session(&mut state);
         audit_scroll.sync(&state);
         assert_eq!(audit_scroll.offset, 0);
 
