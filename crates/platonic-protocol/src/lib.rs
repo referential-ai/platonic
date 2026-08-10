@@ -95,14 +95,29 @@ impl RunOverrides {
 /// Current daemon protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Package version, full source commit, and UTC build date embedded at compile time.
+/// Plato Agent package version and optional build provenance embedded at compile time.
 ///
 /// Repository builds that do not provide deploy provenance remain visibly
 /// unknown instead of resembling a dated release build.
-pub const BUILD_IDENTITY: &str = match option_env!("PLATO_BUILD_IDENTITY") {
+pub const PLATO_BUILD_IDENTITY: &str = match option_env!("PLATO_BUILD_IDENTITY") {
     Some(identity) => identity,
     None => concat!(env!("CARGO_PKG_VERSION"), " unknown unknown"),
 };
+
+/// Platonic product version, independent of workspace crate versions.
+pub const PLATONIC_PRODUCT_VERSION: &str = env!("PLATONIC_PRODUCT_VERSION");
+
+/// Exact source commit embedded in the Platonic product build.
+pub const PLATONIC_BUILD_COMMIT: &str = env!("PLATONIC_BUILD_COMMIT");
+
+/// UTC build date embedded in the Platonic product build.
+pub const PLATONIC_BUILD_DATE: &str = env!("PLATONIC_BUILD_DATE");
+
+/// Platonic product version and provenance as accepted by the server CLI.
+pub const PLATONIC_BUILD_IDENTITY: &str = env!("PLATONIC_BUILD_IDENTITY");
+
+/// Locked Platonic diagnostic identity, including the product command name.
+pub const PLATONIC_DIAGNOSTIC_IDENTITY: &str = env!("PLATONIC_DIAGNOSTIC_IDENTITY");
 
 /// One capability advertised during the protocol v1 handshake.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -1385,7 +1400,7 @@ pub struct HelloParams {
 /// Daemon identity and capability readback returned by `hello`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HelloResult {
-    /// Daemon package version and build provenance.
+    /// Platonic product identity and build provenance.
     pub daemon_version: String,
     /// Workspace identifier served by the daemon.
     pub workspace_id: String,
@@ -1517,7 +1532,7 @@ impl fmt::Display for DaemonStatusProviderKind {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonStatusDaemon {
-    /// Daemon package version.
+    /// Platonic product release version.
     pub package_version: String,
     /// Full source commit from build provenance, when known.
     pub build_commit: Option<String>,
@@ -2924,6 +2939,22 @@ mod tests {
     use super::*;
     use serde::de::DeserializeOwned;
     use serde_json::json;
+
+    #[test]
+    fn product_and_client_build_identities_remain_distinct_and_truthful() {
+        assert_eq!(
+            PLATONIC_BUILD_IDENTITY,
+            format!("{PLATONIC_PRODUCT_VERSION} ({PLATONIC_BUILD_COMMIT}, {PLATONIC_BUILD_DATE})")
+        );
+        assert_eq!(
+            PLATONIC_DIAGNOSTIC_IDENTITY,
+            format!("platonic {PLATONIC_BUILD_IDENTITY}")
+        );
+        assert_eq!(
+            PLATO_BUILD_IDENTITY.split_whitespace().next(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
 
     #[test]
     fn run_state_names_keep_wire_values() {

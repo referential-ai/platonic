@@ -2155,7 +2155,9 @@ mod tests {
     }
 
     #[test]
-    fn daemon_identity_keeps_unknown_provenance_explicit() {
+    fn daemon_identity_preserves_release_and_unknown_provenance() {
+        let release = "platonic 0.1.0 (0123456789abcdef0123456789abcdef01234567, 2026-08-01)";
+        assert_eq!(daemon_identity_label(release), release);
         assert_eq!(
             daemon_identity_label("0.1.0 unknown unknown"),
             "0.1.0 unknown unknown"

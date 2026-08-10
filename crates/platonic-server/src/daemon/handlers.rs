@@ -209,7 +209,7 @@ fn handle_hello(runtime: &DaemonRuntime, request: Envelope, params: HelloParams)
     Envelope::typed_response(
         request.id,
         ProtocolResponse::Hello(HelloResult {
-            daemon_version: platonic_protocol::BUILD_IDENTITY.into(),
+            daemon_version: platonic_protocol::PLATONIC_DIAGNOSTIC_IDENTITY.into(),
             workspace_id: runtime.paths.workspace_id.clone(),
             ledger_path: runtime.paths.ledger_path.to_string_lossy().into_owned(),
             capabilities: CAPABILITIES.to_vec(),
@@ -402,10 +402,9 @@ fn protocol_usage(usage: PersistedTokenUsage) -> DaemonStatusTokenUsage {
 }
 
 fn build_identity_parts() -> (String, Option<String>, Option<String>) {
-    let mut parts = platonic_protocol::BUILD_IDENTITY.split_whitespace();
-    let package_version = parts.next().unwrap_or("unknown").into();
-    let build_commit = known_build_part(parts.next());
-    let build_date_utc = known_build_part(parts.next());
+    let package_version = platonic_protocol::PLATONIC_PRODUCT_VERSION.into();
+    let build_commit = known_build_part(Some(platonic_protocol::PLATONIC_BUILD_COMMIT));
+    let build_date_utc = known_build_part(Some(platonic_protocol::PLATONIC_BUILD_DATE));
     (package_version, build_commit, build_date_utc)
 }
 
