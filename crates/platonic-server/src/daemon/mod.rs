@@ -21,7 +21,6 @@ pub struct DaemonPaths {
     pub workspace_root: PathBuf,
     pub workspace_id: String,
     pub socket_path: PathBuf,
-    pub lock_path: PathBuf,
     pub ledger_path: PathBuf,
     /// The host's server-wide store. One per host, not one per workspace —
     /// D005 requires threads to be enumerable from outside their workspace.
@@ -38,9 +37,11 @@ impl DaemonPaths {
         socket_path: Option<PathBuf>,
     ) -> AppResult<Self> {
         let workspace_root = workspace_root.canonicalize()?;
-        let socket_path = socket_path.unwrap_or(paths::default_socket_path(&workspace_root)?);
+        let socket_path = match socket_path {
+            Some(socket_path) => socket_path,
+            None => paths::host_socket_path()?,
+        };
         Ok(Self {
-            lock_path: paths::default_lock_path(&workspace_root)?,
             ledger_path: PathBuf::new(),
             server_db_path: paths::server_db_path()?,
             workspace_id: paths::workspace_id(&workspace_root)?,
@@ -66,7 +67,6 @@ impl DaemonPaths {
             workspace_root: self.workspace_root.clone(),
             workspace_id: record.id.clone(),
             socket_path: self.socket_path.clone(),
-            lock_path: self.lock_path.clone(),
             ledger_path: PathBuf::from(&record.ledger_path),
             server_db_path: self.server_db_path.clone(),
         }

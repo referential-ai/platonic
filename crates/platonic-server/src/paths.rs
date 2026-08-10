@@ -3,9 +3,7 @@ use crate::{AppError, AppResult};
 pub(crate) use platonic_client::paths::runtime_home;
 #[cfg(unix)]
 pub(crate) use platonic_client::paths::runtime_home_and_fallback;
-pub use platonic_client::paths::{
-    default_lock_path, default_socket_path, host_lock_path, host_socket_path, workspace_id,
-};
+pub use platonic_client::paths::{host_lock_path, host_socket_path, workspace_id};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -389,89 +387,6 @@ mod tests {
             assert_eq!(std::fs::read(&destination_wal).unwrap(), b"wal");
             assert!(!legacy.exists());
             assert!(!legacy_wal.exists());
-        });
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn default_socket_and_lock_paths_use_workspace_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        with_test_xdg(dir.path(), || {
-            let socket_path = default_socket_path(dir.path()).unwrap();
-            let lock_path = default_lock_path(dir.path()).unwrap();
-
-            assert!(
-                socket_path
-                    .components()
-                    .any(|component| component.as_os_str() == "platonic")
-            );
-            assert!(
-                socket_path
-                    .components()
-                    .any(|component| component.as_os_str() == "workspaces")
-            );
-            assert_eq!(socket_path.file_name().unwrap(), "agent.sock");
-            assert_eq!(lock_path.file_name().unwrap(), "agent.lock");
-            assert_eq!(socket_path.parent(), lock_path.parent());
-        });
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_paths_use_local_app_data_and_workspace_pipe() {
-        let workspace = tempfile::tempdir().unwrap();
-        let local_app_data = tempfile::tempdir().unwrap();
-        temp_env::with_var(
-            "LOCALAPPDATA",
-            Some(local_app_data.path().as_os_str()),
-            || {
-                let workspace_id = workspace_id(workspace.path()).unwrap();
-                let workspace_dir = local_app_data
-                    .path()
-                    .join("platonic")
-                    .join("workspaces")
-                    .join(&workspace_id);
-
-                assert_eq!(
-                    default_socket_path(workspace.path()).unwrap(),
-                    PathBuf::from(format!(r"\\.\pipe\plato-agent-{workspace_id}"))
-                );
-                assert_eq!(
-                    default_lock_path(workspace.path()).unwrap(),
-                    workspace_dir.join("agent.lock")
-                );
-                assert_eq!(
-                    default_sqlite_path(&workspace_id).unwrap(),
-                    workspace_dir.join("ledger.db")
-                );
-            },
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_pipe_endpoint_is_bounded_for_long_workspace_names() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace-".repeat(20));
-        std::fs::create_dir(&workspace).unwrap();
-
-        let endpoint = default_socket_path(&workspace).unwrap();
-        let endpoint = endpoint.to_string_lossy();
-        let workspace_id = workspace_id(&workspace).unwrap();
-
-        assert_eq!(endpoint, format!(r"\\.\pipe\plato-agent-{workspace_id}"));
-        assert!(endpoint.encode_utf16().count() <= 102);
-        assert!(workspace_id.len() <= 81);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_paths_require_local_app_data() {
-        let workspace = tempfile::tempdir().unwrap();
-        temp_env::with_var_unset("LOCALAPPDATA", || {
-            let error = default_lock_path(workspace.path()).unwrap_err();
-
-            assert!(error.to_string().contains("LOCALAPPDATA"));
         });
     }
 }

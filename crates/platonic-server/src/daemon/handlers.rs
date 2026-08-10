@@ -3327,7 +3327,6 @@ mod tests {
                 workspace_root: workspace_root.canonicalize().unwrap(),
                 workspace_id: "thread-tests".into(),
                 socket_path: root.path().join("agent.sock"),
-                lock_path: root.path().join("agent.lock"),
                 server_db_path: root.path().join("state/platonic/server.db"),
                 ledger_path,
             },
@@ -6507,7 +6506,6 @@ enabled = ["file.read"]
             workspace_root: workspace.canonicalize().unwrap(),
             workspace_id: "terminal-order".into(),
             socket_path: root.path().join("a.sock"),
-            lock_path: root.path().join("a.lock"),
             ledger_path: root
                 .path()
                 .join("state/platonic/workspaces/terminal-order/ledger.db"),
@@ -6798,7 +6796,6 @@ IFS= read -r _
             workspace_root: PathBuf::from("/tmp/workspace"),
             workspace_id: "workspace-1".into(),
             socket_path: PathBuf::from("/tmp/agent.sock"),
-            lock_path: PathBuf::from("/tmp/agent.lock"),
             ledger_path: PathBuf::from("/tmp/agent.db"),
             server_db_path: PathBuf::from("/tmp/platonic-server.db"),
         })
@@ -6931,7 +6928,6 @@ IFS= read -r _
             workspace_root: PathBuf::from("/tmp/workspace"),
             workspace_id: "workspace-1".into(),
             socket_path: PathBuf::from("/tmp/agent.sock"),
-            lock_path: PathBuf::from("/tmp/agent.lock"),
             ledger_path: PathBuf::from("/tmp/agent.db"),
             server_db_path: PathBuf::from("/tmp/platonic-server.db"),
         });

@@ -802,15 +802,18 @@ fn request_params_value(envelope: &Envelope) -> Option<Value> {
 pub struct DaemonConnectionConfig {
     /// Canonical workspace root supplied during `hello`.
     pub workspace_root: PathBuf,
-    /// Explicit or discovered local daemon endpoint.
+    /// Explicit test endpoint or the stable host endpoint.
     pub socket_path: PathBuf,
 }
 
 impl DaemonConnectionConfig {
-    /// Resolves a canonical workspace root and optional endpoint override.
+    /// Resolves a canonical workspace root and optional test endpoint override.
     pub fn resolve(workspace_root: &Path, socket_path: Option<PathBuf>) -> ClientResult<Self> {
         let workspace_root = workspace_root.canonicalize()?;
-        let socket_path = socket_path.unwrap_or(paths::default_socket_path(&workspace_root)?);
+        let socket_path = match socket_path {
+            Some(socket_path) => socket_path,
+            None => paths::host_socket_path()?,
+        };
         Ok(Self {
             workspace_root,
             socket_path,
@@ -833,6 +836,31 @@ mod timeout_tests {
     };
 
     const REQUEST_TIMEOUT: Duration = Duration::from_millis(150);
+
+    #[cfg(unix)]
+    #[test]
+    fn connection_config_defaults_every_workspace_to_the_host_endpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+
+        temp_env::with_var("XDG_RUNTIME_DIR", Some(runtime.as_os_str()), || {
+            let first = DaemonConnectionConfig::resolve(&first, None).unwrap();
+            let second = DaemonConnectionConfig::resolve(&second, None).unwrap();
+
+            assert_eq!(first.socket_path, paths::host_socket_path().unwrap());
+            assert_eq!(second.socket_path, first.socket_path);
+            assert!(
+                !first.socket_path.components().any(|component| {
+                    component.as_os_str() == std::ffi::OsStr::new("workspaces")
+                })
+            );
+        });
+    }
 
     #[test]
     fn timed_client_stops_when_response_has_no_newline() {

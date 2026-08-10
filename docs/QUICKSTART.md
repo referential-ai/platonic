@@ -155,18 +155,6 @@ Both clients observe the same live output. Exactly one controller owns an
 active turn; another client is refused until that turn is idle, then can drive
 the next turn. Remote attachment does not create a duplicate thread.
 
-The explicit legacy workspace-daemon mode still works:
-
-```bash
-platonic serve --workspace "$PWD"                    # terminal A
-platonic workspace create example "$PWD" \
-  --socket <socket-path-printed-by-terminal-A>         # terminal B
-plato-tui --workspace "$PWD" --config plato.toml \
-  --socket <socket-path-printed-by-terminal-A>         # terminal B
-```
-
-`platonic serve --workspace` stays in the foreground. Ctrl-C shuts it down
-cleanly (socket and lock removed).
 Quitting either TUI form never stops the daemon.
 
 Start the optional Discord connector from a separate environment:
@@ -180,7 +168,7 @@ platonic gateway discord --config ~/.config/plato/gateway.toml
 The gateway attaches to the host endpoint and requires a successful `hello` for
 the selected workspace. Probe failures start no connector; the gateway never
 starts a server with its Discord environment. An explicit `--socket` remains a
-test/operator override during the endpoint migration.
+test/operator override.
 
 The TUI footer is contextual by default and moves model and workspace context
 out of the transcript. Press `?` for the shared shortcut overlay. The footer

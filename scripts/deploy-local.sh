@@ -187,7 +187,6 @@ daemon_rpc() {
   local expected_pid="$4"
   local action="$5"
   python3 - "$socket_path" "$workspace_root" "$expected_identity" "$expected_pid" "$action" <<'PY'
-import hashlib
 import json
 import os
 import socket
@@ -197,23 +196,6 @@ import sys
 socket_path, workspace_root, expected_identity, expected_pid, action = sys.argv[1:]
 workspace_root = os.path.realpath(workspace_root)
 expected_pid = int(expected_pid)
-
-def workspace_id(path):
-    basename = os.path.basename(path) or "workspace"
-    output = []
-    last_dash = False
-    for character in basename.lower():
-        if character.isascii() and character.isalnum():
-            output.append(character)
-            last_dash = False
-        elif output and not last_dash:
-            output.append("-")
-            last_dash = True
-    while output and output[-1] == "-":
-        output.pop()
-    slug = "".join(output) or "workspace"
-    digest = hashlib.sha256(os.fsencode(path)).hexdigest()[:16]
-    return f"{slug}-{digest}"
 
 def request(stream, request_id, method, params=None):
     payload = {"v": 1, "id": request_id, "kind": "request", "method": method}
@@ -238,32 +220,49 @@ def request(stream, request_id, method, params=None):
 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
     stream.settimeout(3)
     stream.connect(socket_path)
-    peer_pid, peer_uid, _ = struct.unpack("3i", stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    peer_pid, peer_uid, _ = struct.unpack(
+        "3i", stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+    )
     if peer_pid != expected_pid or peer_uid != os.getuid():
         raise RuntimeError(f"daemon peer identity mismatch: pid={peer_pid} uid={peer_uid}")
-    identity = workspace_id(workspace_root)
-    hello = request(stream, "deploy_hello", "hello", {
-        "workspace_root": workspace_root,
-        "workspace_id": identity,
-    })
-    if not isinstance(hello, dict) or hello.get("workspace_id") != identity:
-        raise RuntimeError(f"daemon hello workspace mismatch: {hello}")
-    if hello.get("daemon_version") != expected_identity:
-        raise RuntimeError(
-            f"daemon provenance mismatch: expected {expected_identity!r}, got {hello.get('daemon_version')!r}"
-        )
-    if action == "hello":
-        print(json.dumps(hello, sort_keys=True))
-    elif action == "shutdown":
-        capabilities = hello.get("capabilities", [])
-        if "daemon.shutdown_if_idle" not in capabilities:
-            raise RuntimeError("daemon does not advertise daemon.shutdown_if_idle")
+
+    if action == "shutdown":
         result = request(stream, "deploy_shutdown", "daemon.shutdown_if_idle")
         if not isinstance(result, dict) or result.get("result") != "shutdown":
             raise RuntimeError(f"daemon refused idle shutdown: {result}")
         print("shutdown")
-    else:
+        raise SystemExit(0)
+    if action != "hello":
         raise RuntimeError(f"unsupported action: {action}")
+
+    listed = request(stream, "deploy_workspace_list", "workspace.list", {})
+    workspaces = listed.get("workspaces", []) if isinstance(listed, dict) else []
+    workspace = next(
+        (entry for entry in workspaces if os.path.realpath(entry.get("root", "")) == workspace_root),
+        None,
+    )
+    if workspace is None:
+        created = request(stream, "deploy_workspace_create", "workspace.create", {
+            "name": "deploy-readback",
+            "root": workspace_root,
+        })
+        workspace = created.get("workspace") if isinstance(created, dict) else None
+    if not isinstance(workspace, dict) or not isinstance(workspace.get("id"), str):
+        raise RuntimeError(f"daemon did not return a registered workspace: {workspace}")
+
+    hello = request(stream, "deploy_hello", "hello", {
+        "workspace_root": workspace_root,
+        "workspace_id": workspace["id"],
+    })
+    if not isinstance(hello, dict) or hello.get("workspace_id") != workspace["id"]:
+        raise RuntimeError(f"daemon hello workspace mismatch: {hello}")
+    if hello.get("daemon_scope") != "host":
+        raise RuntimeError(f"daemon hello scope mismatch: {hello}")
+    if hello.get("daemon_version") != expected_identity:
+        raise RuntimeError(
+            f"daemon provenance mismatch: expected {expected_identity!r}, got {hello.get('daemon_version')!r}"
+        )
+    print(json.dumps(hello, sort_keys=True))
 PY
 }
 
@@ -272,7 +271,6 @@ retire_installed_daemons() {
   local scan_installed_daemon="$2"
   python3 - "$scan_runtime_root" "$scan_installed_daemon" <<'PY'
 import fcntl
-import hashlib
 import json
 import os
 import socket
@@ -286,34 +284,17 @@ uid = os.getuid()
 installed_daemon = os.path.abspath(installed_daemon)
 host_directory = os.path.join(runtime_root, "platonic", "host")
 host_lock = os.path.join(host_directory, "agent.lock")
+host_endpoint = os.path.join(host_directory, "agent.sock")
 maximum_lock_bytes = 16 * 1024
 
 def fail(message):
     raise RuntimeError(message)
 
-def workspace_id(path):
-    basename = os.path.basename(path) or "workspace"
-    output = []
-    last_dash = False
-    for character in basename.lower():
-        if character.isascii() and character.isalnum():
-            output.append(character)
-            last_dash = False
-        elif output and not last_dash:
-            output.append("-")
-            last_dash = True
-    while output and output[-1] == "-":
-        output.pop()
-    slug = "".join(output) or "workspace"
-    return f"{slug}-{hashlib.sha256(os.fsencode(path)).hexdigest()[:16]}"
-
 def process_identity(pid):
-    status_path = f"/proc/{pid}/status"
-    stat_path = f"/proc/{pid}/stat"
     try:
-        status_text = open(status_path, encoding="utf-8").read()
-        stat_text = open(stat_path, encoding="utf-8").read()
-        executable_link = os.readlink(f"/proc/{pid}/exe")
+        status_text = open(f"/proc/{pid}/status", encoding="utf-8").read()
+        stat_text = open(f"/proc/{pid}/stat", encoding="utf-8").read()
+        executable_link = os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)")
         executable_stat = os.stat(f"/proc/{pid}/exe")
     except (FileNotFoundError, ProcessLookupError):
         fail(f"daemon lock has stale pid {pid}")
@@ -327,9 +308,13 @@ def process_identity(pid):
     fields = stat_text[close + 2:].split()
     if close < 0 or len(fields) <= 19:
         fail(f"daemon pid {pid} has unreadable process identity")
-    return fields[19], executable_link.removesuffix(" (deleted)"), executable_stat
+    return fields[19], executable_link, executable_stat
 
-def read_response(stream, request_id, method):
+def request(stream, request_id, method, params=None):
+    payload = {"v": 1, "id": request_id, "kind": "request", "method": method}
+    if params is not None:
+        payload["params"] = params
+    stream.sendall(json.dumps(payload, separators=(",", ":")).encode() + b"\n")
     data = bytearray()
     while not data.endswith(b"\n"):
         chunk = stream.recv(4096)
@@ -345,143 +330,134 @@ def read_response(stream, request_id, method):
         fail(f"daemon rejected {method}: {response}")
     return response.get("result")
 
-def request(stream, request_id, method, params=None):
-    payload = {"v": 1, "id": request_id, "kind": "request", "method": method}
-    if params is not None:
-        payload["params"] = params
-    stream.sendall(json.dumps(payload, separators=(",", ":")).encode() + b"\n")
-    return read_response(stream, request_id, method)
-
 if not os.path.exists(host_lock):
     print("old daemon not running")
     raise SystemExit(0)
 host_stat = os.lstat(host_directory)
 if not stat.S_ISDIR(host_stat.st_mode) or host_stat.st_uid != uid or stat.S_IMODE(host_stat.st_mode) != 0o700:
     fail(f"daemon host namespace has invalid type, ownership, or mode: {host_directory}")
+lock_stat = os.lstat(host_lock)
+if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != uid or stat.S_IMODE(lock_stat.st_mode) != 0o600:
+    fail(f"daemon lock has invalid type, owner, or mode: {host_lock}")
+flags = os.O_RDWR | os.O_CLOEXEC
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+descriptor = os.open(host_lock, flags)
+opened_stat = os.fstat(descriptor)
+if (opened_stat.st_dev, opened_stat.st_ino) != (lock_stat.st_dev, lock_stat.st_ino):
+    os.close(descriptor)
+    fail(f"daemon lock changed while opening: {host_lock}")
+try:
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    pass
+else:
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
+    os.close(descriptor)
+    print("old daemon not running")
+    raise SystemExit(0)
 
-live = []
-for lock_path in [host_lock]:
-    try:
-        lock_stat = os.lstat(lock_path)
-    except FileNotFoundError:
-        continue
-    if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != uid or stat.S_IMODE(lock_stat.st_mode) != 0o600:
-        fail(f"daemon lock has invalid type, owner, or mode: {lock_path}")
-    flags = os.O_RDWR | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(lock_path, flags)
-    opened_stat = os.fstat(descriptor)
-    if (opened_stat.st_dev, opened_stat.st_ino) != (lock_stat.st_dev, lock_stat.st_ino):
-        os.close(descriptor)
-        fail(f"daemon lock changed while opening: {lock_path}")
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        pass
-    else:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
-        continue
+stream = None
+try:
     raw = os.pread(descriptor, maximum_lock_bytes + 1, 0)
     if len(raw) > maximum_lock_bytes:
-        fail(f"daemon lock exceeds {maximum_lock_bytes} bytes: {lock_path}")
+        fail(f"daemon lock exceeds {maximum_lock_bytes} bytes: {host_lock}")
     metadata = json.loads(raw)
-    expected_keys = {"v", "pid", "executable", "workspace_root", "workspace_id", "socket_path"}
-    if not isinstance(metadata, dict) or set(metadata) != expected_keys or metadata.get("v") != 1:
-        fail(f"daemon lock metadata is invalid: {lock_path}")
+    v1_keys = {"v", "pid", "executable", "workspace_root", "workspace_id", "socket_path"}
+    v2_keys = {"v", "pid", "executable", "endpoint"}
+    if not isinstance(metadata, dict):
+        fail(f"daemon lock metadata is invalid: {host_lock}")
+    if metadata.get("v") == 1 and set(metadata) == v1_keys:
+        if metadata.get("workspace_root") != "host" or metadata.get("workspace_id") != "host":
+            fail(f"daemon host identity mismatch: {host_lock}")
+        endpoint = metadata.get("socket_path")
+    elif metadata.get("v") == 2 and set(metadata) == v2_keys:
+        endpoint = metadata.get("endpoint")
+    else:
+        fail(f"daemon lock metadata is invalid: {host_lock}")
+    if endpoint != host_endpoint:
+        fail(f"installed daemon endpoint is not the host endpoint: {endpoint}")
+
     pid = metadata.get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        fail(f"daemon lock pid is invalid: {lock_path}")
-    if metadata.get("workspace_root") != "host" or metadata.get("workspace_id") != "host":
-        fail(f"daemon host identity mismatch: {lock_path}")
+        fail(f"daemon lock pid is invalid: {host_lock}")
     executable = metadata.get("executable")
     if not isinstance(executable, str) or not os.path.isabs(executable):
-        fail(f"daemon executable identity is missing: {lock_path}")
+        fail(f"daemon executable identity is missing: {host_lock}")
     start_time, process_executable, process_stat = process_identity(pid)
     metadata_executable = os.path.realpath(executable)
-    candidate = metadata_executable == installed_daemon or process_executable == installed_daemon
-    if not candidate:
-        os.close(descriptor)
-        continue
+    if metadata_executable != installed_daemon and process_executable != installed_daemon:
+        fail(f"host daemon pid {pid} is not the installed daemon executable")
     if os.path.exists(executable):
         executable_stat = os.stat(executable)
         if (executable_stat.st_dev, executable_stat.st_ino) != (process_stat.st_dev, process_stat.st_ino):
             fail(f"daemon lock executable does not match pid {pid}")
     elif process_executable != metadata_executable:
         fail(f"daemon executable disappeared during validation: {executable}")
-    socket_path = metadata.get("socket_path")
-    if not isinstance(socket_path, str) or not os.path.isabs(socket_path):
-        fail(f"installed daemon socket path is invalid: {lock_path}")
-    socket_stat = os.lstat(socket_path)
-    if not stat.S_ISSOCK(socket_stat.st_mode) or socket_stat.st_uid != uid or stat.S_IMODE(socket_stat.st_mode) != 0o600:
-        fail(f"installed daemon socket has invalid type, owner, or mode: {socket_path}")
+
+    endpoint_stat = os.lstat(endpoint)
+    if not stat.S_ISSOCK(endpoint_stat.st_mode) or endpoint_stat.st_uid != uid or stat.S_IMODE(endpoint_stat.st_mode) != 0o600:
+        fail(f"installed daemon endpoint has invalid type, owner, or mode: {endpoint}")
     stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     stream.settimeout(3)
-    stream.connect(socket_path)
-    peer_pid, peer_uid, _ = struct.unpack("3i", stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    stream.connect(endpoint)
+    peer_pid, peer_uid, _ = struct.unpack(
+        "3i", stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+    )
     if peer_pid != pid or peer_uid != uid:
         fail(f"installed daemon peer identity mismatch: pid={peer_pid} uid={peer_uid}")
-    canonical_workspace = os.path.realpath(os.path.dirname(installed_daemon))
-    expected_workspace_id = workspace_id(canonical_workspace)
-    hello = request(stream, f"deploy_hello_{pid}", "hello", {
-        "workspace_root": canonical_workspace,
-        "workspace_id": expected_workspace_id,
-    })
-    if not isinstance(hello, dict) or hello.get("workspace_id") != expected_workspace_id:
-        fail(f"installed daemon hello identity mismatch: pid={pid}")
-    if "daemon.shutdown_if_idle" not in hello.get("capabilities", []):
-        fail(f"installed daemon lacks daemon.shutdown_if_idle: pid={pid}")
+
+    listed = request(stream, "deploy_workspace_list", "workspace.list", {})
+    if not isinstance(listed, dict) or not isinstance(listed.get("workspaces"), list):
+        fail(f"installed daemon returned an invalid workspace list: pid={pid}")
+    workspaces = listed["workspaces"]
+    provenance = "control-only"
+    if workspaces:
+        workspace = workspaces[0]
+        if not isinstance(workspace, dict):
+            fail(f"installed daemon returned an invalid workspace: pid={pid}")
+        hello = request(stream, "deploy_hello", "hello", {
+            "workspace_root": workspace.get("root"),
+            "workspace_id": workspace.get("id"),
+        })
+        if not isinstance(hello, dict) or hello.get("daemon_scope") != "host":
+            fail(f"installed daemon hello scope mismatch: pid={pid}")
+        if "daemon.shutdown_if_idle" not in hello.get("capabilities", []):
+            fail(f"installed daemon lacks daemon.shutdown_if_idle: pid={pid}")
+        provenance = hello.get("daemon_version")
     if os.pread(descriptor, maximum_lock_bytes + 1, 0) != raw:
-        fail(f"installed daemon lock changed during validation: {lock_path}")
+        fail(f"installed daemon lock changed during validation: {host_lock}")
     current_start, current_executable, _ = process_identity(pid)
     if current_start != start_time or current_executable != process_executable:
         fail(f"installed daemon process changed during validation: pid={pid}")
-    live.append((descriptor, raw, metadata, start_time, process_executable, stream, hello.get("daemon_version")))
 
-if not live:
-    print("old daemon not running")
-    raise SystemExit(0)
+    print(f"old daemon pid={pid} provenance={provenance}")
+    result = request(stream, "deploy_shutdown", "daemon.shutdown_if_idle")
+    if not isinstance(result, dict) or result.get("result") != "shutdown":
+        fail(f"installed daemon pid {pid} refused shutdown because it is active")
+    stream.close()
+    stream = None
 
-errors = []
-for descriptor, raw, metadata, start_time, process_executable, stream, version in live:
-    pid = metadata["pid"]
-    print(f"old daemon pid={pid} provenance={version}")
-    try:
-        if os.pread(descriptor, maximum_lock_bytes + 1, 0) != raw:
-            fail(f"installed daemon lock changed before shutdown: pid={pid}")
-        current_start, current_executable, _ = process_identity(pid)
-        if current_start != start_time or current_executable != process_executable:
-            fail(f"installed daemon process changed before shutdown: pid={pid}")
-        result = request(stream, f"deploy_shutdown_{pid}", "daemon.shutdown_if_idle")
-        if not isinstance(result, dict) or result.get("result") != "shutdown":
-            errors.append(f"installed daemon pid {pid} refused shutdown because it is active")
-            continue
-        stream.close()
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            process_gone = not os.path.exists(f"/proc/{pid}/stat")
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                unlocked = False
-            else:
-                unlocked = True
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            if process_gone and unlocked and not os.path.exists(metadata["socket_path"]):
-                print(f"old daemon pid={pid} shutdown=acknowledged")
-                break
-            time.sleep(0.05)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        process_gone = not os.path.exists(f"/proc/{pid}/stat")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            unlocked = False
         else:
-            errors.append(f"installed daemon pid {pid} did not exit after shutdown acknowledgement")
-    except Exception as error:
-        errors.append(str(error))
-    finally:
+            unlocked = True
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        if process_gone and unlocked and not os.path.exists(endpoint):
+            print(f"old daemon pid={pid} shutdown=acknowledged")
+            break
+        time.sleep(0.05)
+    else:
+        fail(f"installed daemon pid {pid} did not exit after shutdown acknowledgement")
+finally:
+    if stream is not None:
         stream.close()
-        os.close(descriptor)
-
-if errors:
-    fail("; ".join(errors))
+    os.close(descriptor)
 PY
 }
 
@@ -739,10 +715,13 @@ for index in "${!BUILD_BINARIES[@]}"; do
     || die "installed binary provenance mismatch: $installed_binary reported $version_output"
 done
 
-proof_root="$(mktemp -d "${TMPDIR:-/tmp}/plato-deploy-proof.XXXXXX")"
+proof_root="$(mktemp -d /tmp/p408.XXXXXX)"
+chmod 0700 "$proof_root"
 mkdir -- "$proof_root/home" "$proof_root/runtime" "$proof_root/state" "$proof_root/workspace"
 chmod 0700 "$proof_root/home" "$proof_root/runtime" "$proof_root/state" "$proof_root/workspace"
-proof_socket="$proof_root/runtime/proof.sock"
+proof_socket="$proof_root/runtime/platonic/host/agent.sock"
+printf 'proof endpoint: %s (%s bytes)\n' "$proof_socket" "${#proof_socket}"
+((${#proof_socket} < 100)) || die 'new readback daemon endpoint exceeds 99 bytes'
 (
   cd -- "$proof_root/workspace"
   exec env -i \
@@ -750,7 +729,7 @@ proof_socket="$proof_root/runtime/proof.sock"
     PATH="$PATH" \
     XDG_RUNTIME_DIR="$proof_root/runtime" \
     XDG_STATE_HOME="$proof_root/state" \
-    "$installed_daemon" serve --workspace "$proof_root/workspace" --socket "$proof_socket"
+    "$installed_daemon" serve
 ) >"$proof_root/daemon.stdout" 2>"$proof_root/daemon.stderr" &
 proof_pid=$!
 
@@ -766,6 +745,13 @@ done
 [[ -S "$proof_socket" ]] || die 'new readback daemon did not create its socket within five seconds'
 [[ "$(stat -Lc '%d:%i' -- "/proc/$proof_pid/exe")" == "$(stat -Lc '%d:%i' -- "$installed_daemon")" ]] \
   || die 'new readback process is not running the installed daemon executable'
+proof_lock="$proof_root/runtime/platonic/host/agent.lock"
+jq -e \
+  --arg endpoint "$proof_socket" \
+  --argjson pid "$proof_pid" \
+  'keys == ["endpoint", "executable", "pid", "v"] and .v == 2 and .pid == $pid and .endpoint == $endpoint' \
+  "$proof_lock" >/dev/null \
+  || die 'new readback daemon did not publish exact host lock metadata'
 
 hello_json="$(daemon_rpc "$proof_socket" "$proof_root/workspace" "$build_identity" "$proof_pid" hello)"
 [[ "$(jq -er '.daemon_version' <<<"$hello_json")" == "$build_identity" ]] \
@@ -778,7 +764,6 @@ env -i \
   XDG_STATE_HOME="$proof_root/state" \
   "$install_dir/plato-tui-real" \
   --workspace "$proof_root/workspace" \
-  --socket "$proof_socket" \
   --snapshot >"$proof_root/tui.snapshot"
 readonly short_commit="${source_commit:0:7}"
 grep -F -- "$package_version $short_commit $build_date" "$proof_root/tui.snapshot" >/dev/null \

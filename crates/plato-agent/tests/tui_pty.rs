@@ -354,69 +354,6 @@ fn standalone_tui_default_local_endpoint_decline_stays_unregistered() {
 }
 
 #[test]
-fn standalone_tui_custom_socket_never_prompts_or_registers() {
-    let root = tempfile::tempdir().unwrap();
-    let workspace = root.path().join("workspace");
-    let runtime = root.path().join("runtime");
-    let state = root.path().join("state");
-    let home = root.path().join("home");
-    for directory in [&workspace, &runtime, &state, &home] {
-        fs::create_dir(directory).unwrap();
-    }
-    let endpoint = runtime.join("custom.sock");
-    let config = DaemonConnectionConfig::resolve(&workspace, Some(endpoint.clone())).unwrap();
-    let mut daemon = std::process::Command::new(workspace_binary("platonic"))
-        .arg("serve")
-        .arg("--workspace")
-        .arg(&workspace)
-        .arg("--socket")
-        .arg(&endpoint)
-        .current_dir(&workspace)
-        .env("HOME", &home)
-        .env("XDG_RUNTIME_DIR", &runtime)
-        .env("XDG_STATE_HOME", &state)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    wait_for_unregistered_daemon(&config, &mut daemon);
-    let _daemon_cleanup = HostDaemonCleanup {
-        config: config.clone(),
-        endpoint: endpoint.clone(),
-    };
-    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
-
-    shell.write(
-        format!(
-            "\"$PLATO_BIN\" --socket \"{}\"; printf '\\n%sSTATUS:%s\\n' \"$PTY_MARK\" \"$?\"\n",
-            endpoint.display()
-        )
-        .as_bytes(),
-    );
-    assert_ne!(shell.wait_for_marker("STATUS"), "0");
-    assert!(
-        !String::from_utf8_lossy(&shell.output.lock().unwrap())
-            .contains("Workspace name [workspace]")
-    );
-    assert!(
-        String::from_utf8_lossy(&shell.output.lock().unwrap()).contains("workspace_unregistered")
-    );
-
-    let mut control = DaemonClient::connect(&endpoint).unwrap();
-    assert!(control.workspace_list().unwrap().workspaces.is_empty());
-    shell.write(b"exit\r");
-    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
-    assert_eq!(
-        control.shutdown_if_idle().unwrap().result,
-        ShutdownIfIdleResultName::Shutdown
-    );
-    drop(control);
-    wait_for_endpoint_removal(&endpoint);
-    assert!(wait_for_daemon_exit(&mut daemon).success());
-}
-
-#[test]
 fn standalone_tui_snapshot_returns_typed_unregistered_without_prompting() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");

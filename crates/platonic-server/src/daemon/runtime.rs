@@ -169,6 +169,7 @@ impl DaemonRuntime {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn new_with_server_policy(
         paths: DaemonPaths,
         max_spawn_depth: u32,
@@ -1570,7 +1571,6 @@ mod tests {
             workspace_root: PathBuf::from("/tmp/workspace"),
             workspace_id: "workspace-1".into(),
             socket_path: PathBuf::from("/tmp/agent.sock"),
-            lock_path: PathBuf::from("/tmp/agent.lock"),
             ledger_path: PathBuf::from("/tmp/agent.db"),
             server_db_path: PathBuf::from("/tmp/platonic-server.db"),
         })

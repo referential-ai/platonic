@@ -8,8 +8,8 @@ successful provider-backed run. The
 description of gateway behavior; this page is the setup walkthrough.
 
 The commands below assume Bash on Unix. Use a test server where you can install
-an app, and use the same empty workspace directory for the daemon, gateway, TUI,
-and replay commands.
+an app, register one empty workspace with the host server, and use that same
+directory for the gateway, TUI, and replay commands.
 
 ## 1. Create and install the Discord bot
 
@@ -184,9 +184,9 @@ Typing approval language as ordinary message content has no effect.
 
 ## 6. Replay the reply
 
-After the reply is complete, stop the gateway with `Ctrl-C`, unset
-`DISCORD_BOT_TOKEN` in that terminal, and stop the daemon with `Ctrl-C`. Replay
-is an offline direct read, so the daemon must release its workspace lock first.
+After the reply is complete, stop the gateway with `Ctrl-C` and unset
+`DISCORD_BOT_TOKEN` in that terminal. Replay is an offline direct read and does
+not require stopping the host server.
 
 From the same scratch workspace:
 
