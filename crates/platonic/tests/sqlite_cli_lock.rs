@@ -310,8 +310,6 @@ struct ProofContext {
     runtime_root: PathBuf,
     #[cfg(unix)]
     state_root: PathBuf,
-    #[cfg(windows)]
-    local_app_data: PathBuf,
 }
 
 impl ProofContext {
@@ -334,12 +332,6 @@ impl ProofContext {
             )
         };
 
-        #[cfg(windows)]
-        let (socket_path, local_app_data) = {
-            let local_app_data = root.path().join("local-app-data");
-            (PathBuf::from(r"\\.\pipe\plato-agent-host"), local_app_data)
-        };
-
         Self {
             _root: root,
             workspace,
@@ -348,8 +340,6 @@ impl ProofContext {
             runtime_root,
             #[cfg(unix)]
             state_root,
-            #[cfg(windows)]
-            local_app_data,
         }
     }
 
@@ -358,8 +348,6 @@ impl ProofContext {
         command
             .env("XDG_RUNTIME_DIR", &self.runtime_root)
             .env("XDG_STATE_HOME", &self.state_root);
-        #[cfg(windows)]
-        command.env("LOCALAPPDATA", &self.local_app_data);
         command.env(API_KEY_ENV, "test-key");
     }
 
@@ -394,13 +382,6 @@ impl ProofContext {
                 .join("host")
                 .join("agent.lock")
         }
-        #[cfg(windows)]
-        {
-            self.local_app_data
-                .join("platonic")
-                .join("host")
-                .join("agent.lock")
-        }
     }
 
     fn host_socket_path(&self) -> PathBuf {
@@ -410,10 +391,6 @@ impl ProofContext {
                 .join("platonic")
                 .join("host")
                 .join("agent.sock")
-        }
-        #[cfg(windows)]
-        {
-            PathBuf::from(r"\\.\pipe\plato-agent-host")
         }
     }
 
@@ -491,11 +468,6 @@ impl ProofDaemon {
             &self.workspace,
             self.child.as_mut().unwrap(),
         );
-    }
-
-    #[cfg(windows)]
-    fn id(&self) -> u32 {
-        self.child.as_ref().unwrap().id()
     }
 
     fn stop(mut self) {

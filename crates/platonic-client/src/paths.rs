@@ -1,7 +1,5 @@
 //! Host endpoint discovery and compatibility workspace identity.
 
-#[cfg(windows)]
-use crate::ClientError;
 use crate::ClientResult;
 use sha2::{Digest, Sha256};
 use std::{
@@ -16,12 +14,6 @@ pub fn host_socket_path() -> ClientResult<PathBuf> {
         .join("platonic")
         .join("host")
         .join("agent.sock"))
-}
-
-/// Returns the stable host-scoped local daemon endpoint.
-#[cfg(windows)]
-pub fn host_socket_path() -> ClientResult<PathBuf> {
-    Ok(PathBuf::from(r"\\.\pipe\plato-agent-host"))
 }
 
 /// Returns the stable host-scoped daemon lock path.
@@ -49,8 +41,6 @@ fn workspace_id_from_canonical_path(path: &Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("workspace");
     let slug = slug(basename);
-    #[cfg(windows)]
-    let slug: String = slug.chars().take(64).collect();
     format!("{slug}-{}", hash16(path))
 }
 
@@ -91,16 +81,6 @@ fn path_bytes(path: &Path) -> &[u8] {
     path.as_os_str().as_bytes()
 }
 
-#[cfg(windows)]
-fn path_bytes(path: &Path) -> Vec<u8> {
-    use std::os::windows::ffi::OsStrExt;
-
-    path.as_os_str()
-        .encode_wide()
-        .flat_map(u16::to_le_bytes)
-        .collect()
-}
-
 /// Returns the platform daemon runtime home.
 #[cfg(unix)]
 pub fn runtime_home() -> ClientResult<PathBuf> {
@@ -133,25 +113,6 @@ pub fn runtime_home_and_fallback() -> (PathBuf, bool) {
     }
 }
 
-/// Returns the Windows daemon runtime home.
-#[cfg(windows)]
-pub fn runtime_home() -> ClientResult<PathBuf> {
-    local_app_data("default daemon runtime path")
-}
-
-#[cfg(windows)]
-fn state_home() -> ClientResult<PathBuf> {
-    local_app_data("default ledger replay path")
-}
-
-#[cfg(windows)]
-fn local_app_data(purpose: &str) -> ClientResult<PathBuf> {
-    let value = std::env::var_os("LOCALAPPDATA")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ClientError::Config(format!("LOCALAPPDATA is required for {purpose}")))?;
-    Ok(PathBuf::from(value))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,8 +123,6 @@ mod tests {
 
         #[cfg(unix)]
         assert_eq!(id, "platonic-workspace-d9c8fc148a872529");
-        #[cfg(windows)]
-        assert_eq!(id, "platonic-workspace-bd545284429294c3");
     }
 
     #[cfg(unix)]
@@ -206,30 +165,6 @@ mod tests {
                     !socket_path
                         .components()
                         .any(|part| part.as_os_str() == "workspaces")
-                );
-            },
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_host_paths_are_stable_and_outside_workspace_directories() {
-        let local_app_data = tempfile::tempdir().unwrap();
-        temp_env::with_var(
-            "LOCALAPPDATA",
-            Some(local_app_data.path().as_os_str()),
-            || {
-                assert_eq!(
-                    host_socket_path().unwrap(),
-                    PathBuf::from(r"\\.\pipe\plato-agent-host")
-                );
-                assert_eq!(
-                    host_lock_path().unwrap(),
-                    local_app_data
-                        .path()
-                        .join("platonic")
-                        .join("host")
-                        .join("agent.lock")
                 );
             },
         );

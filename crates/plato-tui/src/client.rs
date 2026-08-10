@@ -2469,16 +2469,6 @@ mod tests {
                     _directory: Some(directory),
                 }
             }
-            #[cfg(windows)]
-            {
-                Self {
-                    path: PathBuf::from(format!(
-                        r"\\.\pipe\plato-agent-tui-{name}-{}",
-                        std::process::id()
-                    )),
-                    _directory: None,
-                }
-            }
         }
     }
 }

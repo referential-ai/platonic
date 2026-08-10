@@ -1540,7 +1540,7 @@ pub struct DaemonStatusDaemon {
     pub build_date_utc: Option<String>,
     /// Monotonic process uptime in milliseconds.
     pub uptime_ms: u64,
-    /// Daemon socket or named-pipe endpoint path.
+    /// Daemon socket endpoint path.
     pub endpoint_path: String,
     /// Workspace identifier served by the daemon.
     pub workspace_id: String,

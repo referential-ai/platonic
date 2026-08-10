@@ -396,10 +396,6 @@ fn shell_quote(value: &str) -> String {
     {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
-    #[cfg(windows)]
-    {
-        format!("\"{}\"", value.replace('"', "\\\""))
-    }
 }
 
 fn run_issue_prep_cli(

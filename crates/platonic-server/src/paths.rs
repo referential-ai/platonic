@@ -1,6 +1,4 @@
 use crate::{AppError, AppResult};
-#[cfg(windows)]
-pub(crate) use platonic_client::paths::runtime_home;
 #[cfg(unix)]
 pub(crate) use platonic_client::paths::runtime_home_and_fallback;
 pub use platonic_client::paths::{host_lock_path, host_socket_path, workspace_id};
@@ -248,19 +246,6 @@ fn state_home() -> AppResult<PathBuf> {
     Ok(PathBuf::from(home).join(".local").join("state"))
 }
 
-#[cfg(windows)]
-fn state_home() -> AppResult<PathBuf> {
-    local_app_data("default --db path")
-}
-
-#[cfg(windows)]
-fn local_app_data(purpose: &str) -> AppResult<PathBuf> {
-    let value = std::env::var_os("LOCALAPPDATA")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::Config(format!("LOCALAPPDATA is required for {purpose}")))?;
-    Ok(PathBuf::from(value))
-}
-
 #[cfg(test)]
 pub(crate) fn with_test_xdg<T>(root: &Path, run: impl FnOnce() -> T) -> T {
     #[cfg(unix)]
@@ -274,11 +259,6 @@ pub(crate) fn with_test_xdg<T>(root: &Path, run: impl FnOnce() -> T) -> T {
             ],
             run,
         )
-    }
-    #[cfg(windows)]
-    {
-        let local_app_data = root.join("local-app-data");
-        temp_env::with_var("LOCALAPPDATA", Some(local_app_data.as_os_str()), run)
     }
 }
 
