@@ -70,6 +70,7 @@ jobs:
           if [[ -n "$RELEASE_TAG" ]]; then
             expected_tag="platonic-v$product_version"
             test "$RELEASE_TAG" = "$expected_tag"
+            test "$GITHUB_SHA" = "$SOURCE_COMMIT"
             git fetch --force --no-tags origin \
               refs/heads/main:refs/remotes/origin/main
             git fetch --force origin \
@@ -201,7 +202,9 @@ jobs:
       - build
     runs-on: ubuntu-24.04
     permissions:
+      attestations: write
       contents: write
+      id-token: write
     env:
       GH_TOKEN: ${{ github.token }}
       PRODUCT_VERSION: ${{ needs.validate.outputs.product_version }}
@@ -224,6 +227,7 @@ jobs:
             "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
           tagged_commit=$(git rev-parse --verify "$RELEASE_TAG^{commit}")
           main_commit=$(git rev-parse --verify 'refs/remotes/origin/main^{commit}')
+          test "$GITHUB_SHA" = "$SOURCE_COMMIT"
           test "$tagged_commit" = "$SOURCE_COMMIT"
           ./scripts/check-release-contract.sh tag \
             "$RELEASE_TAG" "$tagged_commit" "$main_commit"
@@ -272,9 +276,23 @@ jobs:
             --dir "$verify"
           mapfile -t downloaded < <(find "$verify" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
           diff -u <(printf '%s\n' "${expected[@]}") <(printf '%s\n' "${downloaded[@]}")
+          for payload in "${expected[@]}"; do
+            cmp -- "incoming/$payload" "$verify/$payload"
+          done
           (
             cd "$verify"
             sha256sum -c "platonic-$PRODUCT_VERSION-linux-x86_64.sha256"
             sha256sum -c "platonic-$PRODUCT_VERSION-macos-arm64.sha256"
           )
           test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+
+      - name: Attest the published release payloads
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            incoming/platonic-${{ needs.validate.outputs.product_version }}-linux-x86_64.files
+            incoming/platonic-${{ needs.validate.outputs.product_version }}-linux-x86_64.sha256
+            incoming/platonic-${{ needs.validate.outputs.product_version }}-linux-x86_64.tar.gz
+            incoming/platonic-${{ needs.validate.outputs.product_version }}-macos-arm64.files
+            incoming/platonic-${{ needs.validate.outputs.product_version }}-macos-arm64.sha256
+            incoming/platonic-${{ needs.validate.outputs.product_version }}-macos-arm64.tar.gz

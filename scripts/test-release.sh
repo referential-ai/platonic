@@ -21,6 +21,59 @@ source_commit="$(git -C "$repo_root" rev-parse --verify 'HEAD^{commit}')"
 readonly release_tag client_version source_commit
 readonly build_date="2026-08-09"
 
+workflow="$repo_root/.github/workflows/platonic-release.yml"
+readonly workflow
+action_count=0
+while IFS= read -r action; do
+  [[ "$action" =~ ^[[:space:]]*uses:[[:space:]][^@[:space:]]+@[0-9a-f]{40}([[:space:]]+#[[:space:]].*)?$ ]] \
+    || die "release workflow action is not full-SHA pinned: $action"
+  action_count=$((action_count + 1))
+done < <(grep -E '^[[:space:]]+uses:' "$workflow")
+[[ "$action_count" -gt 0 ]] || die 'release workflow has no actions to audit'
+
+attestation_action='        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2'
+publish_job="$(sed -n '/^  publish:$/,$p' "$workflow")"
+readonly attestation_action publish_job
+[[ "$(grep -Fxc "$attestation_action" "$workflow")" -eq 1 ]] \
+  || die 'release workflow must use the approved artifact-attestation action exactly once'
+[[ "$(grep -Fxc "$attestation_action" <<<"$publish_job")" -eq 1 ]] \
+  || die 'artifact attestation must remain inside the publish job'
+[[ "$(grep -Fxc '  contents: read' "$workflow")" -eq 1 ]] \
+  || die 'release workflow must retain its read-only default permission'
+[[ "$(grep -Fxc '      contents: write' "$workflow")" -eq 1 ]] \
+  || die 'release contents write permission must exist only on the publish job'
+[[ "$(grep -Fxc '      contents: write' <<<"$publish_job")" -eq 1 ]] \
+  || die 'release contents write permission must remain on the publish job'
+[[ "$(grep -Fxc '      attestations: write' "$workflow")" -eq 1 ]] \
+  || die 'attestations write permission must exist only on the publish job'
+[[ "$(grep -Fxc '      attestations: write' <<<"$publish_job")" -eq 1 ]] \
+  || die 'attestations write permission must remain on the publish job'
+[[ "$(grep -Fxc '      id-token: write' "$workflow")" -eq 1 ]] \
+  || die 'OIDC write permission must exist only on the publish job'
+[[ "$(grep -Fxc '      id-token: write' <<<"$publish_job")" -eq 1 ]] \
+  || die 'OIDC write permission must remain on the publish job'
+[[ "$(grep -Fxc "    if: \${{ github.event_name == 'workflow_dispatch' && needs.validate.outputs.release_tag != '' }}" <<<"$publish_job")" -eq 1 ]] \
+  || die 'publish permissions must remain unavailable to pull-request code'
+[[ "$(grep -Fc 'test "$GITHUB_SHA" = "$SOURCE_COMMIT"' "$workflow")" -eq 2 ]] \
+  || die 'tagged publication must bind the workflow run to the exact source commit'
+
+mapfile -t attested_payloads < <(
+  sed -n '/actions\/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8/,$p' "$workflow" \
+    | sed -n 's/^[[:space:]]*\(incoming\/platonic-.*\)$/\1/p'
+)
+expected_attested_payloads=(
+  'incoming/platonic-${{ needs.validate.outputs.product_version }}-linux-x86_64.files'
+  'incoming/platonic-${{ needs.validate.outputs.product_version }}-linux-x86_64.sha256'
+  'incoming/platonic-${{ needs.validate.outputs.product_version }}-linux-x86_64.tar.gz'
+  'incoming/platonic-${{ needs.validate.outputs.product_version }}-macos-arm64.files'
+  'incoming/platonic-${{ needs.validate.outputs.product_version }}-macos-arm64.sha256'
+  'incoming/platonic-${{ needs.validate.outputs.product_version }}-macos-arm64.tar.gz'
+)
+diff -u \
+  <(printf '%s\n' "${expected_attested_payloads[@]}") \
+  <(printf '%s\n' "${attested_payloads[@]}") \
+  || die 'release workflow must attest exactly the six locked payloads'
+
 if output="$("$script_dir/check-release-contract.sh" tag "$release_tag" "$source_commit" 0000000000000000000000000000000000000000 2>&1)"; then
   die 'non-main release tag passed validation'
 fi
@@ -84,4 +137,4 @@ for target in linux-x86_64 macos-arm64; do
   diff -u "$expected_archive" "$proof_root/$target.actual"
 done
 
-printf 'release contract tests: two target shapes, deterministic lists/manifests, and rejection paths passed\n'
+printf 'release contract tests: workflow permissions/attestations, two target shapes, deterministic lists/manifests, and rejection paths passed\n'

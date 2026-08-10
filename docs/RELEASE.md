@@ -74,6 +74,16 @@ sha256sum --check platonic-0.1.0-linux-x86_64.sha256
 shasum -a 256 --check platonic-0.1.0-macos-arm64.sha256
 ```
 
+For releases produced by the attestation-enabled workflow, verify each
+downloaded `.tar.gz`, `.sha256`, and `.files` payload with GitHub CLI:
+
+```bash
+gh attestation verify <downloaded-file> --repo referential-ai/platonic
+```
+
+The already-published Platonic 0.1.0 payloads predate this support and are not
+backfilled with attestations.
+
 ## Workflow
 
 `Platonic release` is manual so dry runs, tags, and artifact publication stay
