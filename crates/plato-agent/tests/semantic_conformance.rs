@@ -1,14 +1,15 @@
 use platonic_client::{ClientError, client::DaemonClient};
 use platonic_core::{AgentId, EffectClass, HarnessEvent};
+#[cfg(any(target_os = "linux", windows))]
+use platonic_protocol::RunStateName;
 use platonic_protocol::{
     BufferedThreadEvent, CAPABILITY_AGENT_CREATE, CAPABILITY_AGENT_LIST, CAPABILITY_AGENT_STATUS,
     CAPABILITY_THREAD_AUTHORITY, CAPABILITY_THREAD_EVENTS, CAPABILITY_THREAD_LIST,
     CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_SPAWN, CAPABILITY_THREAD_STATUS,
     CAPABILITY_THREAD_STOP, CAPABILITY_WORKSPACE_CREATE, CAPABILITY_WORKSPACE_LIST,
     CAPABILITY_WORKSPACE_STATUS, ERROR_NOT_FOUND, ERROR_WORKSPACE_UNREGISTERED, ReasoningEffort,
-    RunStateName, ShutdownIfIdleResultName, StreamEvent, ThreadApprovalPolicy,
-    ThreadSendRejectedReason, ThreadSendResult, ThreadSpawnDecision, ThreadSpawnResult,
-    ThreadStopResult,
+    ShutdownIfIdleResultName, StreamEvent, ThreadApprovalPolicy, ThreadSendRejectedReason,
+    ThreadSendResult, ThreadSpawnDecision, ThreadSpawnResult, ThreadStopResult,
 };
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
@@ -1362,6 +1363,7 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> ExitStatus {
     }
 }
 
+#[cfg(any(target_os = "linux", windows))]
 fn wait_for_terminal_status(client: &mut DaemonClient, run_id: &str) -> RunStateName {
     let deadline = Instant::now() + PROOF_TIMEOUT;
     loop {
@@ -1538,6 +1540,7 @@ fn read_pipe(pipe: Option<impl Read>) -> String {
 #[derive(Clone, Copy, Debug)]
 enum UsageFixture {
     Known(u32, u32),
+    #[cfg(any(target_os = "linux", windows))]
     Unknown,
 }
 
@@ -1603,18 +1606,22 @@ fn event_stream(events: [Value; 2], usage: UsageFixture) -> String {
         event["model"] = json!(SERVED_MODEL);
         body.push_str(&format!("data: {event}\n\n"));
     }
-    if let UsageFixture::Known(prompt_tokens, completion_tokens) = usage {
-        body.push_str(&format!(
-            "data: {}\n\n",
-            json!({
-                "model": SERVED_MODEL,
-                "choices": [],
-                "usage": {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens
-                }
-            })
-        ));
+    match usage {
+        UsageFixture::Known(prompt_tokens, completion_tokens) => {
+            body.push_str(&format!(
+                "data: {}\n\n",
+                json!({
+                    "model": SERVED_MODEL,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens
+                    }
+                })
+            ));
+        }
+        #[cfg(any(target_os = "linux", windows))]
+        UsageFixture::Unknown => {}
     }
     body.push_str("data: [DONE]\n\n");
     body

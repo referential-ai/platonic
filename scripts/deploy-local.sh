@@ -408,32 +408,30 @@ try:
         fail(f"installed daemon peer identity mismatch: pid={peer_pid} uid={peer_uid}")
 
     listed = request(stream, "deploy_workspace_list", "workspace.list", {})
-    workspaces = listed.get("workspaces", []) if isinstance(listed, dict) else []
-    workspace = workspaces[0] if workspaces else None
-    if workspace is None:
-        control_root = os.path.realpath(os.path.dirname(installed_daemon))
-        created = request(stream, "deploy_workspace_create", "workspace.create", {
-            "name": "deploy-replacement",
-            "root": control_root,
+    if not isinstance(listed, dict) or not isinstance(listed.get("workspaces"), list):
+        fail(f"installed daemon returned an invalid workspace list: pid={pid}")
+    workspaces = listed["workspaces"]
+    provenance = "control-only"
+    if workspaces:
+        workspace = workspaces[0]
+        if not isinstance(workspace, dict):
+            fail(f"installed daemon returned an invalid workspace: pid={pid}")
+        hello = request(stream, "deploy_hello", "hello", {
+            "workspace_root": workspace.get("root"),
+            "workspace_id": workspace.get("id"),
         })
-        workspace = created.get("workspace") if isinstance(created, dict) else None
-    if not isinstance(workspace, dict):
-        fail(f"installed daemon did not return a workspace: pid={pid}")
-    hello = request(stream, "deploy_hello", "hello", {
-        "workspace_root": workspace.get("root"),
-        "workspace_id": workspace.get("id"),
-    })
-    if not isinstance(hello, dict) or hello.get("daemon_scope") != "host":
-        fail(f"installed daemon hello scope mismatch: pid={pid}")
-    if "daemon.shutdown_if_idle" not in hello.get("capabilities", []):
-        fail(f"installed daemon lacks daemon.shutdown_if_idle: pid={pid}")
+        if not isinstance(hello, dict) or hello.get("daemon_scope") != "host":
+            fail(f"installed daemon hello scope mismatch: pid={pid}")
+        if "daemon.shutdown_if_idle" not in hello.get("capabilities", []):
+            fail(f"installed daemon lacks daemon.shutdown_if_idle: pid={pid}")
+        provenance = hello.get("daemon_version")
     if os.pread(descriptor, maximum_lock_bytes + 1, 0) != raw:
         fail(f"installed daemon lock changed during validation: {host_lock}")
     current_start, current_executable, _ = process_identity(pid)
     if current_start != start_time or current_executable != process_executable:
         fail(f"installed daemon process changed during validation: pid={pid}")
 
-    print(f"old daemon pid={pid} provenance={hello.get('daemon_version')}")
+    print(f"old daemon pid={pid} provenance={provenance}")
     result = request(stream, "deploy_shutdown", "daemon.shutdown_if_idle")
     if not isinstance(result, dict) or result.get("result") != "shutdown":
         fail(f"installed daemon pid {pid} refused shutdown because it is active")
