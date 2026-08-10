@@ -1,6 +1,6 @@
 use crate::{
     AppError, AppResult, ApprovalMode, RunEvent, RunLedger, RunOptions, RunOutcome, RunSession,
-    app::ExternalApprovalOutcome,
+    app::{ExternalApprovalOutcome, PreparedRun},
     config::{Config, ProviderKind},
     confinement::ChildConfinement,
     daemon::{
@@ -41,7 +41,7 @@ use crate::{
         },
     },
     issue_prep::{IssuePrepOptions, IssuePrepOutcome, run_issue_prep},
-    ledger::{PersistedTokenUsage, SessionRunRecords, SqliteLedger},
+    ledger::{EventRecorder, PersistedTokenUsage, SessionRunRecords, SqliteLedger},
     model::RunOverrides,
     new_run_id, new_session_id,
     paths::DefaultSqlitePath,
@@ -63,7 +63,11 @@ use platonic_core::{
 };
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, atomic::Ordering, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
@@ -1811,6 +1815,16 @@ struct RunAuthorityProjection {
     confinement: ChildConfinement,
 }
 
+struct AdmittedRun {
+    prepared: PreparedRun,
+    recorder: EventRecorder,
+    approval_mode: ApprovalMode,
+    event_sender: mpsc::Sender<RunEvent>,
+    cancel: Arc<AtomicBool>,
+    event_collector: thread::JoinHandle<()>,
+    authority: RunAuthorityProjection,
+}
+
 fn start_run(
     runtime: &DaemonRuntime,
     request: StartRunRequest,
@@ -1902,8 +1916,6 @@ fn start_run(
         }));
     }
 
-    let (event_sender, event_receiver) = mpsc::channel::<RunEvent>();
-    let event_collector = spawn_event_collector(record.clone(), event_receiver);
     let continuation_config_path = config_path.clone();
     let continuation_overrides = overrides.clone();
     let options = RunOptions {
@@ -1927,9 +1939,9 @@ fn start_run(
         },
         run_id: Some(run_id),
         session: Some(session),
-        event_sender: Some(event_sender),
+        event_sender: None,
         stream_to_stderr: false,
-        cancel: Some(record.cancel.clone()),
+        cancel: None,
         voice_interruption_context: None,
     };
     let run_agent_id = thread_context
@@ -1953,8 +1965,39 @@ fn start_run(
         confinement: child_confinement,
     };
 
+    let (prepared, recorder) = match crate::app::prepare_run_for_thread(
+        &options,
+        authority.agent_id.clone(),
+        authority.toolset.as_deref(),
+    ) {
+        Ok(admission) => admission,
+        Err(error) => {
+            runtime.release_run_reservation(&record);
+            if let Some(context) = thread_context.as_ref() {
+                runtime.abort_thread_turn(&context.turn);
+            }
+            return Err(Box::new(Envelope::error(
+                request_id,
+                Some(method.into()),
+                error_code,
+                error.to_string(),
+            )));
+        }
+    };
+    let (event_sender, event_receiver) = mpsc::channel::<RunEvent>();
+    let event_collector = spawn_event_collector(record.clone(), event_receiver);
+    let admitted = AdmittedRun {
+        prepared,
+        recorder,
+        approval_mode: options.approval_mode,
+        event_sender,
+        cancel: record.cancel.clone(),
+        event_collector,
+        authority,
+    };
+
     if wait.unwrap_or(false) {
-        match run_to_completion(runtime, &record, options, event_collector, authority) {
+        match run_to_completion(runtime, &record, admitted) {
             Ok(_) => Ok(run_start_result(&record)),
             Err(error) => Err(Box::new(Envelope::error(
                 request_id,
@@ -1966,53 +2009,107 @@ fn start_run(
     } else {
         let worker_runtime = runtime.clone();
         let worker_record = record.clone();
-        match thread_context {
-            Some(context) => {
-                thread::spawn(move || {
-                    drive_thread_turn(
-                        worker_runtime,
-                        worker_record,
-                        options,
-                        event_collector,
-                        ThreadTurnDriver {
-                            context,
-                            session_id,
-                            config_path: continuation_config_path,
-                            overrides: continuation_overrides,
-                        },
-                    );
-                });
+        let worker_context = thread_context.clone();
+        let driver = thread_context.map(|context| ThreadTurnDriver {
+            context,
+            session_id,
+            config_path: continuation_config_path,
+            overrides: continuation_overrides,
+        });
+        let (handoff_sender, handoff_receiver) = mpsc::sync_channel(0);
+        #[cfg(test)]
+        let fail_handoff = runtime.take_run_handoff_failure();
+        let worker = thread::Builder::new().spawn(move || {
+            #[cfg(test)]
+            if fail_handoff {
+                return;
             }
-            None => {
-                thread::spawn(move || {
-                    let _ = run_to_completion(
-                        &worker_runtime,
-                        &worker_record,
-                        options,
-                        event_collector,
-                        authority,
-                    );
-                });
+            let Ok(admitted) = handoff_receiver.recv() else {
+                return;
+            };
+            #[cfg(test)]
+            worker_runtime.wait_before_run_execution();
+            match driver {
+                Some(driver) => {
+                    drive_thread_turn(worker_runtime, worker_record, admitted, driver);
+                }
+                None => {
+                    let _ = run_to_completion(&worker_runtime, &worker_record, admitted);
+                }
             }
+        });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                let cleanup =
+                    discard_unstarted_run(runtime, &record, worker_context.as_ref(), admitted);
+                return Err(Box::new(Envelope::error(
+                    request_id,
+                    Some(method.into()),
+                    error_code,
+                    handoff_error(error.to_string(), cleanup),
+                )));
+            }
+        };
+        if let Err(error) = handoff_sender.send(admitted) {
+            let _ = worker.join();
+            let cleanup = discard_unstarted_run(runtime, &record, worker_context.as_ref(), error.0);
+            return Err(Box::new(Envelope::error(
+                request_id,
+                Some(method.into()),
+                error_code,
+                handoff_error("run execution handoff failed".into(), cleanup),
+            )));
         }
+        drop(worker);
         Ok(run_start_result(&record))
+    }
+}
+
+fn discard_unstarted_run(
+    runtime: &DaemonRuntime,
+    record: &RunRecord,
+    thread_context: Option<&ThreadRunContext>,
+    admitted: AdmittedRun,
+) -> AppResult<()> {
+    runtime.release_run_reservation(record);
+    if let Some(context) = thread_context {
+        runtime.abort_thread_turn(&context.turn);
+    }
+    let AdmittedRun {
+        recorder,
+        event_sender,
+        event_collector,
+        ..
+    } = admitted;
+    drop(event_sender);
+    let collector = event_collector
+        .join()
+        .map_err(|_| AppError::RunFailed(EVENT_COLLECTOR_PANIC.into()));
+    let admission = recorder.discard_empty_session_admission();
+    match (collector, admission) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(collector), Err(admission)) => Err(AppError::Config(format!(
+            "{collector}; failed to discard run admission: {admission}"
+        ))),
+    }
+}
+
+fn handoff_error(error: String, cleanup: AppResult<()>) -> String {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup) => format!("{error}; run admission cleanup failed: {cleanup}"),
     }
 }
 
 fn drive_thread_turn(
     runtime: DaemonRuntime,
     record: Arc<RunRecord>,
-    options: RunOptions,
-    event_collector: thread::JoinHandle<()>,
+    admitted: AdmittedRun,
     driver: ThreadTurnDriver,
 ) {
-    let authority = RunAuthorityProjection {
-        agent_id: Some(driver.context.agent_id.clone()),
-        toolset: Some(driver.context.toolset.clone()),
-        thread_spawn: projected_thread_spawn_handler(&runtime, &driver.context),
-        confinement: driver.context.confinement.clone(),
-    };
-    let _ = run_to_completion(&runtime, &record, options, event_collector, authority);
+    let _ = run_to_completion(&runtime, &record, admitted);
     while let Some(message) = runtime.next_thread_message(&driver.context.turn) {
         let _ = start_run(
             &runtime,
@@ -2036,55 +2133,46 @@ fn drive_thread_turn(
 fn run_to_completion(
     runtime: &DaemonRuntime,
     record: &RunRecord,
-    options: RunOptions,
-    event_collector: thread::JoinHandle<()>,
-    authority: RunAuthorityProjection,
+    admitted: AdmittedRun,
 ) -> AppResult<RunOutcome> {
+    let AdmittedRun {
+        prepared,
+        recorder,
+        approval_mode,
+        event_sender,
+        cancel,
+        event_collector,
+        authority,
+    } = admitted;
     let RunAuthorityProjection {
-        agent_id,
-        toolset,
         thread_spawn,
         confinement,
+        ..
     } = authority;
     #[cfg(test)]
     let _ = &confinement;
     #[cfg(test)]
-    let completion = RunCompletion::Published(match (agent_id, toolset, thread_spawn) {
-        (Some(agent_id), Some(toolset), thread_spawn) => {
-            crate::app::run_question_for_thread(options, agent_id, &toolset, thread_spawn)
-        }
-        (None, None, None) => crate::run_question(options),
-        _ => Err(AppError::RunFailed(
-            "thread run authority projection is incomplete".into(),
-        )),
-    });
+    let mut recorder = recorder;
+    #[cfg(test)]
+    let completion = RunCompletion::Published(crate::app::run_prepared_question(
+        prepared,
+        &mut recorder,
+        approval_mode,
+        Some(event_sender),
+        false,
+        Some(cancel),
+        thread_spawn,
+    ));
     #[cfg(not(test))]
-    let completion =
-        match crate::app::prepare_run_for_thread(&options, agent_id, toolset.as_deref()) {
-            Ok((prepared, recorder)) => {
-                let approval_mode = options.approval_mode;
-                match (options.event_sender, options.cancel) {
-                    (Some(event_sender), Some(cancel)) => RunCompletion::Supervised(Box::new(
-                        crate::daemon::run_child::run_supervised(
-                            prepared,
-                            recorder,
-                            approval_mode,
-                            event_sender,
-                            cancel,
-                            thread_spawn,
-                            confinement,
-                        ),
-                    )),
-                    (None, _) => RunCompletion::Published(Err(AppError::SupervisedRun(
-                        "daemon run omitted its event transport".into(),
-                    ))),
-                    (_, None) => RunCompletion::Published(Err(AppError::SupervisedRun(
-                        "daemon run omitted its cancellation token".into(),
-                    ))),
-                }
-            }
-            Err(error) => RunCompletion::Published(Err(error)),
-        };
+    let completion = RunCompletion::Supervised(Box::new(crate::daemon::run_child::run_supervised(
+        prepared,
+        recorder,
+        approval_mode,
+        event_sender,
+        cancel,
+        thread_spawn,
+        confinement,
+    )));
     finish_run_after_event_collection(runtime, record, completion, event_collector)
 }
 
@@ -3182,7 +3270,7 @@ mod tests {
     use super::*;
     use crate::{
         ApprovalRequest, AssistantDeltaEvent,
-        daemon::protocol::StreamEvent,
+        daemon::protocol::{EnvelopeKind, StreamEvent, ThreadSendResult},
         daemon::runtime::{PendingApproval, PendingApprovalDecision},
     };
     use platonic_core::{
@@ -3203,6 +3291,111 @@ mod tests {
     fn response_result<T: serde::de::DeserializeOwned>(response: &Envelope) -> T {
         let response = serde_json::to_value(response.result.as_ref().unwrap()).unwrap();
         serde_json::from_value(response["result"].clone()).unwrap()
+    }
+
+    fn write_admission_test_config(workspace_root: &Path) -> PathBuf {
+        let path = workspace_root.join("admission-test.toml");
+        std::fs::write(
+            &path,
+            r#"[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "http://127.0.0.1:1"
+connect_timeout_ms = 50
+stream_idle_timeout_ms = 50
+
+[limits]
+token_budget = 4000
+max_output_tokens = 32
+max_turns = 1
+
+[tools]
+enabled = ["file.read"]
+"#,
+        )
+        .unwrap();
+        path
+    }
+
+    fn assert_running_admission(
+        runtime: &DaemonRuntime,
+        run_id: &str,
+        session_id: &str,
+        question: &str,
+    ) {
+        let log_path = crate::ledger::run_jsonl_path(&runtime.paths.ledger_path, run_id).unwrap();
+        assert!(log_path.is_file());
+        assert_eq!(std::fs::metadata(log_path).unwrap().len(), 0);
+        let connection = rusqlite::Connection::open(&runtime.paths.ledger_path).unwrap();
+        let (stored_session, stored_question, stored_status) = connection
+            .query_row(
+                "SELECT session_id, question, status FROM session_runs WHERE run_id = ?1",
+                rusqlite::params![run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(stored_session, session_id);
+        assert_eq!(stored_question, question);
+        assert_eq!(stored_status, RunStateName::Running.as_str());
+        let session_runs = connection
+            .query_row(
+                "SELECT COUNT(*) FROM session_runs WHERE session_id = ?1",
+                rusqlite::params![session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(session_runs, 1);
+    }
+
+    fn wait_for_run_terminal(runtime: &DaemonRuntime, run_id: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let record = runtime
+                .state
+                .lock()
+                .unwrap()
+                .runs
+                .get(run_id)
+                .cloned()
+                .expect("admitted run remains visible until terminal retention");
+            if !matches!(
+                record.status().state,
+                RunStateName::Running | RunStateName::CancelRequested
+            ) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run {run_id} did not become terminal"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn cancel_admitted_run(runtime: &DaemonRuntime, run_id: &str) {
+        runtime
+            .state
+            .lock()
+            .unwrap()
+            .runs
+            .get(run_id)
+            .unwrap()
+            .cancel
+            .store(true, Ordering::SeqCst);
+    }
+
+    fn session_run_count(runtime: &DaemonRuntime) -> i64 {
+        let connection = rusqlite::Connection::open(&runtime.paths.ledger_path).unwrap();
+        connection
+            .query_row("SELECT COUNT(*) FROM session_runs", [], |row| row.get(0))
+            .unwrap()
     }
 
     #[test]
@@ -5640,6 +5833,259 @@ IFS= read -r _
                 })
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn all_async_entry_methods_admit_jsonl_and_session_row_before_receipt() {
+        let (_root, runtime) = thread_test_runtime();
+        let config_path = write_admission_test_config(&runtime.paths.workspace_root);
+
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        runtime.set_run_execution_barriers(reached.clone(), release.clone());
+        let response = handle_line(
+            &runtime,
+            &format!(
+                r#"{{"v":1,"id":"start","kind":"request","method":"run.start","params":{{"question":"first question","config_path":"{}"}}}}"#,
+                config_path.display()
+            ),
+        );
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        let started: RunStartResult = response_result(&response);
+        reached.wait();
+        assert_running_admission(
+            &runtime,
+            &started.run_id,
+            &started.session_id,
+            "first question",
+        );
+        cancel_admitted_run(&runtime, &started.run_id);
+        release.wait();
+        wait_for_run_terminal(&runtime, &started.run_id);
+
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        runtime.set_run_execution_barriers(reached.clone(), release.clone());
+        let response = handle_line(
+            &runtime,
+            &format!(
+                r#"{{"v":1,"id":"append","kind":"request","method":"message.append","params":{{"session_id":"{}","message":"follow up","config_path":"{}"}}}}"#,
+                started.session_id,
+                config_path.display()
+            ),
+        );
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        let appended: RunStartResult = response_result(&response);
+        reached.wait();
+        let connection = rusqlite::Connection::open(&runtime.paths.ledger_path).unwrap();
+        let (question, status) = connection
+            .query_row(
+                "SELECT question, status FROM session_runs WHERE run_id = ?1",
+                rusqlite::params![appended.run_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(question, "follow up");
+        assert_eq!(status, RunStateName::Running.as_str());
+        assert!(
+            crate::ledger::run_jsonl_path(&runtime.paths.ledger_path, &appended.run_id)
+                .unwrap()
+                .is_file()
+        );
+        cancel_admitted_run(&runtime, &appended.run_id);
+        release.wait();
+        wait_for_run_terminal(&runtime, &appended.run_id);
+
+        let (spawn_id, thread_id) = pending_spawn(
+            start_thread(
+                &runtime,
+                None,
+                &runtime.paths.workspace_root,
+                ThreadApprovalPolicy::Prompt,
+            )
+            .unwrap(),
+        );
+        grant_thread(&runtime, &spawn_id, "test");
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        runtime.set_run_execution_barriers(reached.clone(), release.clone());
+        let response = temp_env::with_var("OPENROUTER_API_KEY", Some("test-key"), || {
+            handle_line(
+                &runtime,
+                &format!(
+                    r#"{{"v":1,"id":"send","kind":"request","method":"thread.send","params":{{"thread_id":"{thread_id}","controller_id":"test","message":"thread question"}}}}"#
+                ),
+            )
+        });
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        assert!(matches!(
+            response_result::<ThreadSendResult>(&response),
+            ThreadSendResult::Started { .. }
+        ));
+        reached.wait();
+        let thread_session = thread_session_id(&thread_id);
+        let thread_run = runtime
+            .state
+            .lock()
+            .unwrap()
+            .runs
+            .values()
+            .find(|record| record.session_id == thread_session)
+            .cloned()
+            .expect("initial thread.send has one admitted run");
+        assert_running_admission(
+            &runtime,
+            &thread_run.run_id,
+            &thread_session,
+            "thread question",
+        );
+        cancel_admitted_run(&runtime, &thread_run.run_id);
+        release.wait();
+        wait_for_run_terminal(&runtime, &thread_run.run_id);
+    }
+
+    #[test]
+    fn admission_failures_remove_runtime_thread_and_empty_storage_reservations() {
+        let (_root, jsonl_runtime) = bare_thread_test_runtime();
+        let jsonl_config = write_admission_test_config(&jsonl_runtime.paths.workspace_root);
+        drop(SqliteLedger::open_or_create_default(&jsonl_runtime.paths.default_ledger()).unwrap());
+        let runs_path = jsonl_runtime
+            .paths
+            .ledger_path
+            .parent()
+            .unwrap()
+            .join("runs");
+        std::fs::write(&runs_path, "not a directory").unwrap();
+        let response = handle_line(
+            &jsonl_runtime,
+            &format!(
+                r#"{{"v":1,"id":"start","kind":"request","method":"run.start","params":{{"question":"cannot create log","config_path":"{}"}}}}"#,
+                jsonl_config.display()
+            ),
+        );
+        assert_eq!(response.error.unwrap().code, ERROR_RUN_FAILED);
+        assert!(jsonl_runtime.state.lock().unwrap().runs.is_empty());
+        assert_eq!(session_run_count(&jsonl_runtime), 0);
+
+        let (_root, sqlite_runtime) = bare_thread_test_runtime();
+        let sqlite_config = write_admission_test_config(&sqlite_runtime.paths.workspace_root);
+        let active_run = RunId::new("run_already_active").unwrap();
+        let mut ledger =
+            SqliteLedger::open_or_create_default(&sqlite_runtime.paths.default_ledger()).unwrap();
+        ledger
+            .begin_session_run("session_active", &active_run, "active", true)
+            .unwrap();
+        drop(ledger);
+        let response = handle_line(
+            &sqlite_runtime,
+            &format!(
+                r#"{{"v":1,"id":"append","kind":"request","method":"message.append","params":{{"session_id":"session_active","message":"rejected","config_path":"{}"}}}}"#,
+                sqlite_config.display()
+            ),
+        );
+        assert_eq!(response.error.unwrap().code, ERROR_RUN_FAILED);
+        assert!(sqlite_runtime.state.lock().unwrap().runs.is_empty());
+        assert_eq!(session_run_count(&sqlite_runtime), 1);
+        assert_eq!(
+            std::fs::read_dir(
+                sqlite_runtime
+                    .paths
+                    .ledger_path
+                    .parent()
+                    .unwrap()
+                    .join("runs")
+            )
+            .unwrap()
+            .count(),
+            0
+        );
+
+        let (_root, handoff_runtime) = thread_test_runtime();
+        let (spawn_id, thread_id) = pending_spawn(
+            start_thread(
+                &handoff_runtime,
+                None,
+                &handoff_runtime.paths.workspace_root,
+                ThreadApprovalPolicy::Prompt,
+            )
+            .unwrap(),
+        );
+        grant_thread(&handoff_runtime, &spawn_id, "test");
+        handoff_runtime.fail_next_run_handoff();
+        let response = temp_env::with_var("OPENROUTER_API_KEY", Some("test-key"), || {
+            handle_line(
+                &handoff_runtime,
+                &format!(
+                    r#"{{"v":1,"id":"send","kind":"request","method":"thread.send","params":{{"thread_id":"{thread_id}","controller_id":"test","message":"handoff fails"}}}}"#
+                ),
+            )
+        });
+        assert_eq!(response.error.unwrap().code, ERROR_THREAD_SEND_FAILED);
+        assert!(handoff_runtime.state.lock().unwrap().runs.is_empty());
+        assert!(!handoff_runtime.has_active_thread_run(&thread_id));
+        assert_eq!(
+            handoff_runtime
+                .thread_live_state(&thread_id)
+                .current_turn_id,
+            None
+        );
+        assert_eq!(session_run_count(&handoff_runtime), 0);
+        assert_eq!(
+            std::fs::read_dir(
+                handoff_runtime
+                    .paths
+                    .ledger_path
+                    .parent()
+                    .unwrap()
+                    .join("runs")
+            )
+            .unwrap()
+            .count(),
+            0
+        );
+        assert!(matches!(
+            SqliteLedger::open_default_readonly(&handoff_runtime.paths.default_ledger())
+                .unwrap()
+                .read_session(&thread_session_id(&thread_id)),
+            Err(AppError::SessionNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn wait_true_keeps_error_behavior_and_creates_one_admission() {
+        let (_root, runtime) = bare_thread_test_runtime();
+        let config_path = write_admission_test_config(&runtime.paths.workspace_root);
+        let response = handle_line(
+            &runtime,
+            &format!(
+                r#"{{"v":1,"id":"start","kind":"request","method":"run.start","params":{{"question":"synchronous question","config_path":"{}","wait":true}}}}"#,
+                config_path.display()
+            ),
+        );
+        assert_eq!(response.kind, EnvelopeKind::Error);
+        assert_eq!(response.error.unwrap().code, ERROR_RUN_FAILED);
+        assert_eq!(session_run_count(&runtime), 1);
+        let session = SqliteLedger::open_default_readonly(&runtime.paths.default_ledger())
+            .unwrap()
+            .read_latest_session()
+            .unwrap();
+        assert_eq!(session.runs.len(), 1);
+        assert_eq!(session.runs[0].question, "synchronous question");
+        assert_eq!(session.runs[0].status, RunStateName::Failed);
+        assert_eq!(
+            session.runs[0]
+                .records
+                .iter()
+                .filter(|record| matches!(record.event, HarnessEvent::RunStarted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_dir(runtime.paths.ledger_path.parent().unwrap().join("runs"))
+                .unwrap()
+                .count(),
+            1
         );
     }
 

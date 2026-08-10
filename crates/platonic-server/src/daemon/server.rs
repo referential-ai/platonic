@@ -1037,9 +1037,11 @@ mod tests {
         io::{BufRead, Read},
         net::TcpListener,
         os::unix::{
-            fs::{PermissionsExt, symlink},
+            fs::{FileTypeExt, PermissionsExt, symlink},
             net::{UnixListener, UnixStream},
+            process::ExitStatusExt,
         },
+        process::{Child, Command, Stdio},
         sync::{Arc, Barrier, mpsc},
         thread,
         time::{Duration, Instant},
@@ -1330,6 +1332,157 @@ mod tests {
         let mut server = TestDaemonServer::bind(workspace_root, socket_path)?;
         register_test_workspace(&mut server);
         Ok(server)
+    }
+
+    const P501_HELPER_MODE: &str = "PLATONIC_P501_HELPER_MODE";
+    const P501_HELPER_ROOT: &str = "PLATONIC_P501_HELPER_ROOT";
+
+    #[test]
+    fn p501_external_daemon_helper() {
+        let Ok(mode) = std::env::var(P501_HELPER_MODE) else {
+            return;
+        };
+        let root = PathBuf::from(std::env::var_os(P501_HELPER_ROOT).unwrap());
+        let workspace = root.join("workspace");
+        let socket_path = root.join("d.sock");
+        let config_path = workspace.join("platonic.toml");
+        fs::create_dir_all(&workspace).unwrap();
+        write_provider_config(&config_path, "http://127.0.0.1:1", SHELL_EXEC);
+
+        let server = bind_test(&workspace, Some(socket_path.clone())).unwrap();
+        if mode == "serve" {
+            let reached = Arc::new(Barrier::new(2));
+            let release = Arc::new(Barrier::new(2));
+            server
+                .runtime
+                .set_run_execution_barriers(reached.clone(), release);
+            thread::spawn(move || {
+                reached.wait();
+                println!("P501_EXECUTION_BLOCKED");
+                std::io::stdout().flush().unwrap();
+            });
+            println!(
+                "P501_READY socket={} socket_bytes={} config={} ledger={}",
+                socket_path.display(),
+                socket_path.as_os_str().as_encoded_bytes().len(),
+                config_path.display(),
+                server.paths().ledger_path.display()
+            );
+            std::io::stdout().flush().unwrap();
+            server
+                .serve_forever(Arc::new(AtomicBool::new(false)))
+                .unwrap();
+        } else if mode == "recover" {
+            println!(
+                "P501_RECOVERED ledger={}",
+                server.paths().ledger_path.display()
+            );
+            std::io::stdout().flush().unwrap();
+        } else {
+            panic!("unknown {P501_HELPER_MODE}: {mode}");
+        }
+    }
+
+    fn spawn_p501_helper(root: &Path, mode: &str) -> (Child, mpsc::Receiver<String>) {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon::server::tests::p501_external_daemon_helper",
+                "--nocapture",
+            ])
+            .env(P501_HELPER_MODE, mode)
+            .env(P501_HELPER_ROOT, root)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if sender.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        (child, receiver)
+    }
+
+    fn wait_for_p501_marker(receiver: &mpsc::Receiver<String>, marker: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let line = receiver
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| panic!("helper did not print {marker}: {error}"));
+            if line.starts_with(marker) {
+                return;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_receipt_sigkill_recovers_same_admitted_run_and_question() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let workspace = root.path().join("workspace");
+        let socket_path = root.path().join("d.sock");
+        let config_path = workspace.join("platonic.toml");
+        assert!(socket_path.as_os_str().as_encoded_bytes().len() < 100);
+
+        let (mut child, output) = spawn_p501_helper(root.path(), "serve");
+        wait_for_p501_marker(&output, "P501_READY");
+        assert!(
+            fs::symlink_metadata(&socket_path)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+
+        let mut client =
+            DaemonClient::connect_with_timeout(&socket_path, Duration::from_secs(5)).unwrap();
+        let hello = client.hello(&workspace).unwrap();
+        let status = client
+            .daemon_status(None, Some(config_path.to_string_lossy().into_owned()))
+            .unwrap();
+        assert_eq!(hello.ledger_path, status.session.ledger_path);
+        let question = "receipt survived process death";
+        let admitted = client
+            .run_start(
+                question.into(),
+                Some(config_path.to_string_lossy().into_owned()),
+                false,
+            )
+            .unwrap();
+        assert_eq!(admitted.status, RunStateName::Running);
+        wait_for_p501_marker(&output, "P501_EXECUTION_BLOCKED");
+
+        child.kill().unwrap();
+        let exit = child.wait().unwrap();
+        assert_eq!(exit.signal(), Some(9));
+        fs::remove_file(&socket_path).unwrap();
+
+        let (mut recovery, output) = spawn_p501_helper(root.path(), "recover");
+        wait_for_p501_marker(&output, "P501_RECOVERED");
+        assert!(recovery.wait().unwrap().success());
+
+        let location = crate::paths::DefaultSqlitePath::from_path(admitted.ledger_path.into());
+        let ledger = SqliteLedger::open_default_readonly(&location).unwrap();
+        let recovered = ledger.read_session_run(&admitted.run_id).unwrap();
+        assert_eq!(recovered.run_id, admitted.run_id);
+        assert_eq!(recovered.question, question);
+        assert_eq!(recovered.status, RunStateName::Interrupted);
+        assert_eq!(recovered.records.len(), 2);
+        assert!(matches!(
+            &recovered.records[0].event,
+            HarnessEvent::RunStarted { run_id, .. } if run_id.as_str() == admitted.run_id
+        ));
+        assert!(matches!(
+            &recovered.records[1].event,
+            HarnessEvent::RunFailed { run_id, reason }
+                if run_id.as_str() == admitted.run_id
+                    && reason == "daemon restarted before run completed"
+        ));
     }
 
     fn register_test_workspace(server: &mut TestDaemonServer) -> DaemonPaths {
