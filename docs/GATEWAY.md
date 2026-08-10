@@ -1,6 +1,6 @@
-# Discord gateway: first reply and replay
+# Platonic Discord gateway: first reply and replay
 
-This guide starts with a working Plato Agent installation and ends with a
+This guide starts with the Platonic command bundle installed and ends with a
 Discord reply recorded in the local ledger and read back with `plato replay`.
 Complete the [Quickstart](QUICKSTART.md#0-one-time-setup) first, including one
 successful provider-backed run. The
@@ -8,7 +8,7 @@ successful provider-backed run. The
 description of gateway behavior; this page is the setup walkthrough.
 
 The commands below assume Bash on Unix. Use a test server where you can install
-an app, register one empty workspace with the host server, and use that same
+an app, register one small Git workspace with the host server, and use that same
 directory for the gateway, TUI, and replay commands.
 
 ## 1. Create and install the Discord bot
@@ -79,7 +79,7 @@ principal that may control yolo threads.
 
 Create `~/.config/plato/gateway.toml` with the routing configuration selected
 explicitly by `--config`. Keep `thread_123` as a placeholder until the next
-step starts the daemon and creates the durable thread:
+step starts the server and creates the durable thread:
 
 ```toml
 [gateway.discord]
@@ -113,7 +113,7 @@ and provider settings. The
 behavior; do not place these settings in an auto-discovered workspace
 `plato.toml`.
 
-## 4. Start the daemon and gateway
+## 4. Start the server and gateway
 
 Create the scratch workspace once:
 
@@ -121,11 +121,14 @@ Create the scratch workspace once:
 export PLATO_DISCORD_WORKSPACE="$HOME/plato-discord-workspace"
 mkdir -p "$PLATO_DISCORD_WORKSPACE"
 cd "$PLATO_DISCORD_WORKSPACE"
+git init
+git -c user.name='Platonic Gateway' \
+  -c user.email='gateway@invalid' commit --allow-empty -m 'Initial workspace'
 ```
 
 In terminal 1, load the configured provider credential as shown in the
 [Quickstart](QUICKSTART.md#0-one-time-setup), make sure the Discord token is not
-present, and start the daemon:
+present, and start the one host server:
 
 ```bash
 cd "$HOME/plato-discord-workspace"
@@ -133,28 +136,31 @@ unset DISCORD_BOT_TOKEN
 platonic serve
 ```
 
-Leave it running. Provider credentials belong only in this daemon environment.
-The [runtime topology](ARCHITECTURE.md#runtime-topology) explains why the daemon,
-not the gateway, owns runs, tools, policy, approvals, and the ledger.
+Leave it running. Provider credentials belong only in this server environment.
+The [platform decision map](https://github.com/referential-ai/platonic-workspace/issues/83)
+owns the architecture: the server, not the gateway, owns runs, tools, policy,
+approvals, and the ledger.
 
-In terminal 2, use the configured provider credential to create the mapped
-thread, then remove provider credentials, expose only the Discord token, and
-start the gateway from the same workspace:
+In terminal 2, register the workspace, use the configured provider credential
+to create the mapped thread, then remove provider credentials, expose only the
+Discord token, and start the gateway:
 
 ```bash
 cd "$HOME/plato-discord-workspace"
+platonic workspace create discord "$PWD"
 # Approve the prompt, then replace thread_123 in gateway.toml with the printed id.
-plato thread spawn
+plato thread spawn --model '~openai/gpt-latest' --reasoning-effort none
 unset OPENAI_API_KEY OPENROUTER_API_KEY
 export DISCORD_BOT_TOKEN="$(tr -d '\r\n' < "$HOME/.config/plato/discord-bot-token")"
-platonic gateway discord --config "$HOME/.config/plato/gateway.toml"
+platonic gateway discord --workspace "$PWD" \
+  --config "$HOME/.config/plato/gateway.toml"
 ```
 
 Also unset any custom provider credential variable named by your config. The
 gateway fails closed if it can see a provider credential. Leave the gateway
 running. Before the first Discord REST request or WebSocket connection, both
-the wrapper and direct gateway require a bounded daemon `hello`, the exact
-workspace ID, all seven daemon capabilities consumed by the connector, and a
+the wrapper and direct gateway require a bounded server `hello`, the exact
+workspace ID, all seven server capabilities consumed by the connector, and a
 successful authority readback for every mapped thread.
 
 ## 5. Receive the first reply
@@ -199,20 +205,20 @@ plato replay
 The latest session readback should report `final_phase: Finished` and include
 the Discord user's message and the bot's final assistant message. Replay makes
 no provider request and executes no tool. The
-[SQLite ledger reference](../README.md#sqlite-ledgers) owns the other replay
+[run-event log reference](../README.md#workspace-ledgers) owns the other replay
 forms and ledger details.
 
 ## Troubleshooting
 
 ### Bot ignores the principal: wrong user ID
 
-An unlisted sender is denied before daemon access, so there is no reply and no
+An unlisted sender is denied before server access, so there is no reply and no
 new run to replay. Copy the sending human account's **User ID** again with
 Developer Mode enabled, replace the quoted key under `principals.discord` in
 the canonical home config, and restart the gateway. Do not substitute a display
 name or an application, bot, server, or channel ID.
 
-### Bot ignores the owner: channel is not mapped
+### Bot ignores the principal: channel is not mapped
 
 Messages and interactions are accepted only when their numeric channel ID is a
 key in `gateway.discord.channel_threads`. Add the text, Discord thread, or DM
@@ -221,7 +227,7 @@ then restart the gateway.
 
 ### Gateway closes with code 4014: Message Content intent is disabled
 
-Plato requests Discord's privileged Message Content intent. If it is disabled,
+Platonic requests Discord's privileged Message Content intent. If it is disabled,
 Discord can close the Gateway connection with fatal code `4014`; ordinary guild
 messages can also arrive without content and be ignored. On the application's
 **Bot** page, enable **Message Content Intent**, save, and restart the gateway.

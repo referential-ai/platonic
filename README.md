@@ -1,22 +1,30 @@
-# Plato Agent
-
-The reference agent runtime for the Platonic framework.
-
-**Platonic**
+# Platonic
 
 *by Referential.ai*
 
-Plato Agent is the named application built on the Platonic framework. It shows
-its work: every step is recorded, replayable, and auditable.
+Platonic is a self-hosted agent server. One host server runs many registered
+workspaces, agents, and durable threads while owning provider calls, tools,
+policy, approvals, and ledgers. Plato Agent is the client distribution built
+on Platonic.
+
+The public site is [referential.ai](https://referential.ai).
 
 The workspace [naming authority](https://github.com/referential-ai/platonic-workspace/blob/main/product/branding.md)
 owns the hierarchy and exact forms.
 
-**New here? Start with [docs/QUICKSTART.md](docs/QUICKSTART.md) — build, run, and test in five minutes.**
+**New here? Start with [docs/QUICKSTART.md](docs/QUICKSTART.md) to install the
+command bundle and run the server and client.**
+
+Platonic 0.1.0 launches with command bundles for Linux x86-64 and macOS Apple
+silicon. Windows server and client support is withdrawn. Additional targets
+are post-launch and proof-first. Downloadable bundles are the only Platonic
+product distribution; see [the release contract](docs/RELEASE.md).
 
 The bootstrap surface is intentionally small:
 
-- Bare `plato` in a terminal ensures the host daemon, asks once before registering an unknown directory, creates an approved durable thread, and opens the TUI on it.
+- `platonic serve` runs the one host server in the foreground.
+- `platonic workspace create <name> <directory>` registers a workspace explicitly.
+- Bare `plato` in a terminal ensures the host server, asks once before registering an unknown directory, creates an approved durable thread, and opens the TUI on it.
 - `plato --remote <thread-id>` opens another TUI on the same host socket and existing thread.
 - `plato "question"` ensures the host server and runs as a short-lived client.
 - `plato -c "follow-up"` continues the latest workspace session from the workspace ledger.
@@ -24,8 +32,8 @@ The bootstrap surface is intentionally small:
 - `plato replay [--run <id>]` replays the default workspace ledger; omitted `--run` selects the latest session.
 - `plato replay --db[=<path>] [--run <id>]` selects an explicit workspace state database and replays its run log.
 - `plato issue-prep start <run-dir>` runs the fixed issue preparation pipeline from Markdown on stdin.
-- `plato thread spawn|list|status|send|attach|stop` manages and observes durable threads on a serving host daemon.
-- `platonic serve|status|shutdown` runs and operates the server.
+- `plato thread spawn|list|status|send|attach|stop` manages and observes durable threads on a serving host server.
+- `platonic status|shutdown` inspects or stops the host server.
 - `platonic workspace create|list|status` manages registered workspaces.
 - `platonic agent create|list|status` manages configured agent profiles.
 - `platonic gateway discord` runs the server-owned Discord connector.
@@ -37,7 +45,7 @@ Config resolution order:
 1. `--config <path>`
 2. `$PLATO_CONFIG`
 3. `./plato.toml`
-4. `~/.config/plato/config.toml` on Unix or `%APPDATA%\plato\config.toml` on Windows
+4. `~/.config/plato/config.toml`
 5. built-in defaults
 
 Auto-discovered `./plato.toml` cannot set `provider.api_key_env`,
@@ -68,8 +76,8 @@ enabled = ["file.read", "file.list", "file.write", "file.edit", "shell.exec", "w
 `thread.spawn` is available but not enabled by default. Add it only to a
 coordinator's resolved toolset. The server-owned `limits.max_spawn_depth`
 defaults to `1` and must be positive. At `platonic serve` startup, the bound is
-resolved once from the user config (`~/.config/plato/config.toml` on Unix or
-`%APPDATA%\plato\config.toml` on Windows), then the built-in default. Per-run
+resolved once from the user config (`~/.config/plato/config.toml`), then the
+built-in default. Per-run
 `--config`, `PLATO_CONFIG`, and workspace `plato.toml` do not configure the
 host bound, and later file changes take effect only after a server restart.
 
@@ -109,8 +117,8 @@ answers for every same-origin hop, accepts supported UTF-8 text up to 1 MiB,
 and returns at most 48 KiB. HTML is converted to plain text; response bodies
 from errors are never returned. `shell.exec` runs from the workspace root with
 a scrubbed child environment, no provider credentials, bounded stdout/stderr,
-and a timeout. It uses `sh -c` on Unix and
-`cmd.exe /C` on Windows; timeout or cancellation terminates the full process tree.
+and a timeout. It uses `sh -c`; timeout or cancellation terminates the full
+process tree.
 In the TUI, a pending `shell.exec` can be allowed once or allowed for the
 selected session until the daemon process exits. Later shell calls in that
 session retain their approval policy and ledger facts but do not prompt again;
@@ -186,97 +194,74 @@ Every run uses this exact convention:
 
 ## Workspace Ledgers
 
-- Bare `plato "..."` writes to the default platform user-state path.
-- `plato -c "..."` continues the latest session from that store.
-- `--db[=<path>]` belongs to offline replay; one-shot runs always use the server-owned workspace ledger.
-- New run events are append-only `RecordedEvent` envelopes in
-  `<workspace-ledger-dir>/runs/<run-id>.jsonl`. SQLite retains the session
-  index and other queryable state.
-- On Unix, default ledger directories are `0700`; run logs, the state database,
-  and SQLite sidecars are `0600`.
-- Live assistant text, `run_id`, `ledger_path`, and replay hints print to stderr. Stdout remains only the final answer.
-- Replay shows final assistant messages, not partial streaming deltas.
-- Replay renders dropped oldest session turns as `[<turn_id>] context_compacted estimated_tokens=<before>-><after> dropped_turns=<start>..<end>`; the zero-based range has an exclusive end and the token values are host estimates of the complete context before and after compaction.
-- Ledger, approval, replay, and typed-transcript tool call ids are host-minted per run; provider ids remain provider-facing.
-- Streamed runs request provider usage chunks. Usage is recorded only when the
-  provider reports both token counts; reported zeros remain known, while
-  omitted or partial usage is recorded as unknown.
-- `plato replay` without arguments replays the latest session from the default workspace ledger.
-- `plato replay --run <id>` replays a single run.
-- A JSONL record is acknowledged only after the complete serialized envelope,
-  its newline commit marker, a flush, and `sync_data`. Write-open validates the
-  committed prefix and truncates an unterminated tail before appending. Readers
-  never expose a malformed tail. An already-open `tail -f` sees each record
-  after it commits.
-- Voice companion envelopes append as one synced batch in the same per-run
-  JSONL. New runs do not write `ledger_events` or `voice_events` rows.
-- Read-only SQLite replay reads `user_version` first: schema v1 uses only
-  `ledger_events`, v2 adds sessions, v3 adds voice companions, v4 adds
-  immutable thread authority, and v5 adds immutable thread-stop records. Newer
-  schemas fail without migration. Write-open
-  remains the sole migration path to the current schema.
-- Every prompt runs through the host server. Replay opens JSONL or SQLite
-  read-only and never starts or contacts the server.
-- Runs recorded before the JSONL transition remain readable from
-  `ledger_events` and `voice_events`. Readback prefers a run JSONL when present
-  and otherwise uses those legacy rows.
-- The server syncs a JSONL terminal event before updating its SQLite session
-  outcome. Daemon startup repairs a torn tail, reconciles an already committed
-  terminal event, or appends one interruption failure before closing a run
-  still marked running.
+Every prompt executes through the host server, which is the only ledger writer.
+New run events are append-only `RecordedEvent` envelopes in
+`<workspace-ledger-dir>/runs/<run-id>.jsonl`; SQLite retains the session index
+and other stateful tables. Default ledger directories are mode `0700`, and run
+logs, the database, and SQLite sidecars are mode `0600`.
 
-Replay forms:
+Replay is read-only and fully offline. It never starts or contacts the server,
+makes a provider request, or executes a tool. Readback prefers a run JSONL file
+when present and otherwise reads legacy `ledger_events` and `voice_events`
+rows, so runs recorded before the JSONL transition remain available. Replay
+shows durable final assistant messages rather than transient streaming deltas.
 
 ```bash
-cargo run --bin plato -- replay
-cargo run --bin plato -- replay --db
-cargo run --bin plato -- replay --db=/tmp/plato-agent.db
-cargo run --bin plato -- replay --db=/tmp/plato-agent.db --run run_123
+plato replay
+plato replay --run run_123
+plato replay events.jsonl
+plato replay --db
+plato replay --db=/tmp/platonic.db --run run_123
 ```
+
+A one-shot prints live assistant text, its run id, ledger path, and replay hint
+to stderr; stdout contains only the final answer. Server startup repairs an
+unterminated JSONL tail and closes a run left active by interruption.
 
 ## Server
 
-`platonic serve` is the local runtime for clients such as `plato`,
-`plato-tui`, and the desktop shell. The runtime topology and verb set are defined in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#runtime-topology) and issue
-[#11](https://github.com/referential-ai/plato-agent/issues/11).
+`platonic serve` is the local runtime for `plato`, `plato-tui`, the desktop
+shell, and gateways. The
+[platform decision map](https://github.com/referential-ai/platonic-workspace/issues/83)
+owns the architecture; this section covers operator behavior.
 
-Start the host server in the foreground:
+Start the one host server in the foreground:
 
 ```bash
 platonic serve
 ```
 
-Attaching never registers a directory implicitly. A local `plato` one-shot or
-TUI with terminal stdin, stdout, and stderr asks once for a workspace name,
-defaulting to the directory basename; pressing Enter creates it. Declining or
-EOF leaves it unregistered. Piped or otherwise headless one-shots,
-`plato --remote`, gateways, and desktop clients never ask or create: they fail
-with `workspace_unregistered` and name `platonic workspace create` as the
-operator action. Standalone `plato-tui` asks only on its default local endpoint;
-an explicit `--socket` attachment and `--snapshot` never ask or create.
-
-For scripts and services, register deliberately before attaching:
+From another terminal, register and inspect workspaces through that server:
 
 ```bash
 platonic workspace create example /path/to/workspace
+platonic workspace list
+platonic workspace status <workspace-id>
+platonic status --workspace /path/to/workspace
 ```
 
-Host mode uses `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/platonic/host/agent.sock`
-on Unix or `\\.\pipe\plato-agent-host` on Windows. Each connection selects its
-workspace through the existing `hello` request; the response adds
-`"daemon_scope":"host"` while retaining the existing build-provenance
-`daemon_version`. Bare `plato`, `plato "question"`, and `plato --tui` ensure
-this server and attach as clients. `platonic status`, `platonic shutdown`, and
-the `platonic workspace` commands operate it through the existing protocol.
+The server prints:
 
-Agent profiles are immutable data hard-bound to one registered, present
-workspace. Creation resolves model and tool defaults through the normal config
-order, with explicit CLI overrides, and refuses a missing configured provider
-key environment variable with the exact env/config action. The record contains
-only the agent id, workspace id, model, reasoning effort, approval policy,
-validated internal tool names, and creation time; provider keys are never sent
-or stored.
+```text
+daemon_scope: host
+socket_path: <daemon-endpoint>
+```
+
+On supported platforms the endpoint is
+`${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/platonic/host/agent.sock`.
+Every connection selects a registered workspace during `hello`. There is no
+workspace-owned server or workspace-derived endpoint.
+
+No directory becomes a workspace silently. An interactive local `plato`
+one-shot or TUI asks once before creating an unknown workspace. Piped or
+headless one-shots, `plato --remote`, gateways, desktop clients, explicit
+`--socket` attachments, and `plato-tui --snapshot` fail with
+`workspace_unregistered` and name `platonic workspace create` as the action.
+Bare `plato`, `plato "question"`, and `plato --tui` ensure the installed
+sibling server; standalone `plato-tui` and gateways never start it.
+
+Agent profiles are immutable data bound to one workspace. Provider keys are
+neither sent nor stored when a profile is created:
 
 ```bash
 platonic agent create builder <workspace-id> --reasoning-effort high
@@ -285,238 +270,54 @@ platonic agent list
 platonic agent status builder
 ```
 
-The `plato thread` commands connect only to this host endpoint. Spawn requires
-an explicit cwd, model, reasoning effort, and approval policy; cwd defaults to
-the current directory and policy defaults to `prompt`. A root spawn prompts on
-stdin. A child spawn is evaluated by its loaded parent's immutable policy:
-`prompt` asks for a decision and `yolo` auto-grants the workspace-write spawn
-effect. A child cwd must remain within its parent's granted paths, its toolset
-must be a subset of the parent's, and its policy can never be more permissive.
-Every final approval decision and actor is stored in the server store.
+Every admitted thread stores immutable authority before it becomes available.
+A child may narrow its parent's paths, repositories, toolset, model, reasoning
+effort, and approval policy, but cannot widen them. Each thread works in a
+server-owned private-ref copy of at least one Git repository; its branch claim
+lasts until stop, and the server never changes or deletes the user's repository.
+The decision map owns the complete authority contract.
 
-A coordinator with `thread.spawn` in its immutable resolved toolset can ask the
-model to dispatch a configured agent by id, with optional narrowing overrides
-for model, reasoning effort, approval policy, and toolset. The proposal has the
-`WorkspaceWrite` effect and traverses the normal tool policy and approval gate.
-After approval, the server reuses the same durable spawn admission path as the
-typed client command; the tool result reports the durable worker thread id and
-is wrapped as untrusted provider input. Target-agent defaults and the parent's
-toolset, policy, cwd/path grants, network grant, and server spawn-depth bound
-are all ceilings. An attempted expansion returns a typed
-`thread_authority_exceeded` tool result and creates no child authority.
-
-A grant atomically stores the twelve immutable authority fields before the
-thread becomes loaded. Every admitted spawn works in one or more private-ref
-repositories. A spawn can name workspace-relative Git repositories and
-existing branches; an empty list must infer the repository that contains
-`cwd`, or the spawn is rejected before admission. The server claims each
-`(workspace, repository, branch)` before creating a private-ref repository
-beneath
-`$XDG_STATE_HOME/platonic/worktrees/<thread-id>/`. Each private repository has
-its own refs and index, reads objects through an alternate to the server-owned
-shared Git store, and disables automatic GC. Omitting a branch creates the
-fresh `thread/<thread-id>` branch from the source HEAD. A second live claim for
-the same branch fails with `thread_branch_claim_conflict`.
-
-On hosts with Landlock support, every newly admitted thread child is
-write-confined to its private repositories and scratch directory. Unsupported
-hosts record `confinement: "none"`; set `[confinement] require = true` in the
-user config to refuse those spawns. `thread.authority` reports the immutable
-confinement fact alongside the repository, branch, and path authority. On
-stop, or during startup reconciliation after a crash, the server fetches the
-claimed branch into shared storage and removes only its owned private
-repository and claim. It never changes or deletes the user's repository.
-
-New rows leave the legacy `cwd` column null. Migrated eight-field rows remain
-enumerable without backfill: agent, toolset, and worktrees default absent or
-empty, the recorded cwd becomes one writable granted path, and network
-defaults denied. Denial, cancellation, or persistence failure creates no
-thread authority.
-
-Protocol-v1 `thread.list` and `thread.status` keep their original eight-field
-authority projection, including `cwd`, so compiled v1 clients continue to
-decode those responses byte-for-byte. New rows derive that compatibility cwd
-from the first recorded worktree or granted-path root; migrated rows retain
-their stored cwd. Daemons advertise `thread.authority` for a separate typed
-readback of the complete twelve-field immutable record.
+On Linux with Landlock support, thread children are write-confined to their
+private repositories and scratch directory. macOS and Linux hosts without
+Landlock record `confinement: "none"`. Set `[confinement] require = true` in
+the user config and restart the server to refuse unconfined spawns. The typed
+`thread.authority` protocol readback returns the complete immutable authority
+and durable confinement fact. `plato thread status` intentionally retains the
+protocol-v1 authority projection plus transient live state.
 
 ```bash
-# Terminal 1
-plato
-# approve the root thread.spawn prompt, then use the TUI normally
+# Create a root thread after the stdin approval.
+plato thread spawn --model gpt-5.6-sol --reasoning-effort xhigh
 
-# Terminal 2
 plato thread list
 plato thread status <thread-id>
-
-# Terminal 3: attach another interactive observer/controller
 plato --remote <thread-id>
-
-# The lower-level typed client remains available for scripting and proof
 plato thread send <thread-id> --controller terminal-2 "inspect the workspace"
-plato thread send <thread-id> --controller terminal-2 \
-  --turn <thread-turn-id> "also summarize the findings"
-plato thread attach <thread-id>
+plato thread attach <thread-id> --from-offset 0
 plato thread stop <thread-id>
 ```
 
-Spawn and status print one typed JSON object. List prints one object per durable
-thread. Each joins its immutable `authority` record with transient `live`
-fields (`loaded` and `current_turn_id`); liveness is never persisted. Restarted,
-clientless, and orphaned threads therefore remain enumerable with
-`loaded: false`.
+`plato --remote` opens another TUI on the same durable thread. The lower-level
+`thread attach` command prints ordered JSON events until interrupted. Any
+number of clients may observe a thread, but exactly one controller owns an
+active turn. Stopping a thread unloads it and releases its branch claim; it does
+not delete its durable authority.
 
-Send also prints a typed JSON receipt. An idle thread returns `started` with a
-daemon-minted turn id. The same controller can supply that exact id with
-`--turn` to queue a continuation and receive `steered`; another controller is
-typed-rejected for the entire turn. Accepted continuations keep the same turn
-id until their queue drains and the final run is terminal. Controller ownership
-is daemon-live state and is never added to the immutable authority record.
-Each TUI uses a distinct controller identity. A remote TUI observes the same
-live events, can steer a turn it owns, receives the typed controller-owned
-refusal while another client owns that turn, and can take the next idle turn.
-Attaching never creates another authority record or registry.
+Server-wide state is under
+`${XDG_STATE_HOME:-$HOME/.local/state}/platonic/server.db`. Each workspace
+ledger is under
+`${XDG_STATE_HOME:-$HOME/.local/state}/platonic/workspaces/<workspace-id>/ledger.db`.
+The host endpoint and lock are current-user-only. Do not delete a live lock;
+after shutdown the Unix lock file may remain, but it has no kernel lock owner.
 
-Attach prints one JSON event per line until interrupted. Any number of attach
-clients can read the same ordered thread-local offsets without becoming
-controllers. Omit `--from-offset` to start at the retained tip, or use
-`--from-offset 0` for a late attach that should replay everything still in the
-bounded live buffer. A lagged offset fails explicitly rather than skipping
-events; retained events and observer subscriptions are not persisted.
-
-The transient `live` fields also include monotone `last_activity_at_ms` while
-the thread is loaded; live activity is never copied into immutable authority
-storage. `thread stop` is the only management mutation: it records the
-requesting actor after the supervised child process tree reaches zero
-residuals, then unloads the thread. There is no pause or live approval-policy
-edit; changing authority requires stopping and spawning a new thread through
-the approval gate.
-
-On startup it prints:
-
-```text
-daemon_scope: host
-socket_path: <daemon-endpoint>
-```
-
-Default ledger paths are keyed by the server-minted workspace id stored in the
-registry. Moving a workspace updates its registry root without changing that
-id or its history:
-
-- Unix ledger: `${XDG_STATE_HOME:-$HOME/.local/state}/platonic/workspaces/<workspace-id>/ledger.db`
-- Windows ledger: `%LOCALAPPDATA%\platonic\workspaces\<workspace-id>\ledger.db`
-
-On first attach, a registered workspace that still points at the legacy
-path-derived `agent.db` is moved to this layout and its registry row is updated.
-
-Interactive `plato` uses the host endpoint above.
-One-shot `plato "question"` auto-ensures the host server and always uses its
-server-owned workspace ledger.
-
-Runtime directories are restricted to `0700` and the Unix host socket to
-`0600`. The server holds one host process lock at
-`${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/platonic/host/agent.lock`.
-It is a persistent current-user `0600` regular file guarded by a nonblocking
-exclusive kernel advisory lock. Version 2 diagnostic metadata contains only
-`v`, `pid`, `executable`, and `endpoint`; it carries no workspace identity.
-Startup validates the file without following symlinks and rewrites metadata
-only after acquiring the kernel lock. Normal and abrupt exits release the
-kernel lock but leave the file in place, so probes use kernel ownership rather
-than path existence. SIGINT and SIGTERM stop new connections and remove the
-host endpoint before exit. Do not remove the lock for a live server.
-Live assistant deltas are transient `events.stream` events and are not written
-to the ledger. After a `lagged` response, omitting `from_offset` resumes at the
-current tip; `transcript.read` returns ledger-backed status and final answer.
-The collector drains every queued run event into the contiguous-offset buffer
-before `finished`, `failed`, or `canceled` can be observed.
-An accepted `run.cancel` stores `cancel_requested` before replying. Repeated
-requests return that state without another cancellation event, while terminal
-runs reject cancellation.
-Each daemon run executes in a supervised child process while `platonic serve`
-stays alive and authoritative. The daemon is the only workspace-ledger writer;
-the child receives a prepared run snapshot without a ledger path and returns
-typed ledger operations, live deltas, approval requests, and its result over
-private stdio.
-Every child has an explicit 30-minute deadline. Cancellation or deadline expiry
-first sends the child cancellation token, then terminates its complete process
-tree after a bounded grace period, escalates to a kill when necessary, drains
-output for a bounded interval, and verifies that no child processes remain.
-The daemon retains event buffers for the newest 32 terminal runs in completion
-order. After eviction, `events.stream` replays durable ledger records from the
-run JSONL or legacy SQLite rows; transient deltas and approval notifications
-remain live-only. `transcript.read` and `sessions.list` remain ledger-backed.
-`hello` advertises `transcript.read.typed`. Successful `transcript.read`
-responses preserve the legacy `transcript` string and add ordered `typed.runs`
-with structured chat, tool, policy, and approval entries.
-`hello` also advertises `transcript.read.pending_approval`; while a run is
-paused, its transcript response includes the complete pending approval and
-omits it immediately after a decision or cancellation.
-`hello` advertises `daemon.shutdown_if_idle` for graceful control. The request
-omits `params` (an empty object is also accepted). It returns `refused_active`
-without changing the daemon while a run or approval is active; otherwise it
-closes run admission, returns `shutdown`, then exits and removes its socket and
-lock. Duplicate shutdown and run-admission requests dispatched before teardown
-fail with `daemon_shutting_down`; after the `shutdown` response, connection
-close is expected and lock removal confirms success.
-
-The product command exposes the protocol-backed operator surface directly:
+Stop the host server only when it has no active work:
 
 ```bash
-platonic status --workspace "$PWD"
-platonic workspace create example /path/to/workspace
-platonic workspace list
-platonic workspace status <workspace-id>
-platonic shutdown --workspace "$PWD"
+platonic shutdown --workspace /path/to/workspace
 ```
 
-The commands emit one typed JSON result. Shutdown reports `refused_active`
-without changing an active server, or `shutdown` before graceful process exit.
-
-Minimal NDJSON-over-Unix-socket check, using the `workspace_id` and
-`socket_path` printed by the daemon:
-
-```bash
-WORKSPACE_ROOT="$PWD" \
-WORKSPACE_ID="<workspace-id>" \
-SOCKET_PATH="<socket-path>" \
-python3 - <<'PY'
-import json
-import os
-import socket
-
-def send(file, request):
-    file.write(json.dumps(request) + "\n")
-    file.flush()
-    print(file.readline(), end="")
-
-with socket.socket(socket.AF_UNIX) as sock:
-    sock.connect(os.environ["SOCKET_PATH"])
-    file = sock.makefile("rw")
-    send(file, {
-        "v": 1,
-        "id": "hello_1",
-        "kind": "request",
-        "method": "hello",
-        "params": {
-            "workspace_root": os.environ["WORKSPACE_ROOT"],
-            "workspace_id": os.environ["WORKSPACE_ID"],
-        },
-    })
-    send(file, {
-        "v": 1,
-        "id": "sessions_1",
-        "kind": "request",
-        "method": "sessions.list",
-    })
-PY
-```
-
-NDJSON `run.start` and `message.append` default to `wait: false`, returning a
-`running` response immediately. Send `"wait": true` only when the connection can
-block until the run finishes.
-The TUI, desktop shell, one-shot CLI client, and Discord gateway bound
-daemon connects and each complete request to three seconds. The desktop uses a
-fresh budget for hello and every normal read or mutation.
+The command returns `refused_active` without changing an active server, or
+`shutdown` before the endpoint closes.
 
 ## Local Dogfood Deployment
 
@@ -548,15 +349,14 @@ outside the deploy command report `unknown` provenance explicitly.
 
 ## Desktop (Development)
 
-The Plato Agent workspace and desktop package require Rust 1.88. Platonic Core
-remains on Rust 1.85.
+This Cargo workspace and the desktop package require Rust 1.88. `platonic-core`
+remains on Rust 1.85. Desktop packages are development artifacts and are not
+part of the Platonic 0.1.0 command-bundle release.
 
 The desktop shell renders full typed session history, streams the selected run,
 and supports new or continued messages, approval decisions, and cancel.
-Provider credentials remain with the daemon. Linux development attaches to a
-manually started daemon. On Windows, the shell first attaches to a valid daemon
-for the selected workspace; when none is listening, it starts the absolute
-sibling `platonic.exe` sidecar and retries for a bounded interval.
+Provider credentials remain with the server. The desktop attaches to a
+manually started host server.
 
 ![Plato Agent desktop showing an exact-run transcript](docs/images/desktop-plato-agent.png)
 
@@ -570,63 +370,13 @@ npm ci
 npm run tauri:dev
 ```
 
-On first launch, choose the daemon workspace. The shell remembers its canonical
+On first launch, choose the server workspace. The shell remembers its canonical
 path as the next-launch seed and returns to the picker if that directory
 disappears; each running shell keeps its own selected root. **New chat** clears
 the selected session; otherwise the composer continues it. Switching chats does
-not cancel their active runs. Closing the Windows shell never stops a daemon or
-run. The ready shell checks daemon health without restarting it; a child crash
-shows the disconnected screen, and only **Reconnect** attempts one new start.
-The shell never removes a daemon lock, and reports the endpoint and lock paths
-when startup remains blocked. Only one Windows shell may own a workspace at a
-time. Linux development requires the
+not cancel their active runs. Closing the shell never stops the server or an
+active run. Linux development requires the
 [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/#linux).
-
-### Windows Installer (Unsigned Development)
-
-Phase A targets x64 Windows 10 22H2 or newer. Build the per-user NSIS installer
-on Windows:
-
-```powershell
-cd desktop
-npm ci
-npm run tauri:bundle:windows
-```
-
-The installer retains its technical `Plato` identity under `%LOCALAPPDATA%`,
-bundles the same-revision `platonic.exe`, and downloads the WebView2
-Evergreen bootstrapper when the runtime is absent. Upgrade and uninstall first
-close the desktop, block new installed-sidecar starts, and make one bounded
-`platonic shutdown` invocation. An active server aborts before installed
-binaries or user files change; idle servers exit cleanly. These unsigned artifacts are for
-development proof only and are not distributed.
-
-### Linux AppImage (Private Release)
-
-Linux releases target x86-64 Ubuntu 24.04 on the WebKitGTK 4.1 ABI. The
-AppImage contains the same-revision `platonic` sidecar. It first attaches
-to a valid workspace daemon; if none is available, it restores only the user's
-login-shell `PATH`, starts the bundled sidecar, and retries for a bounded
-interval. Closing Plato Agent detaches without stopping the daemon or active runs.
-Startup failures report the sidecar, socket, and lock paths and never delete a
-lock or fall back to a system daemon.
-
-Authenticated private-release download and integrity check:
-
-```bash
-gh auth status
-gh release download plato-desktop-v0.1.0 \
-  --repo referential-ai/platonic \
-  --pattern 'Plato-*-x86_64.AppImage*'
-sha256sum --check Plato-*-x86_64.AppImage.sha256
-chmod +x Plato-*-x86_64.AppImage
-./Plato-*-x86_64.AppImage
-```
-
-Ubuntu 24.04 needs its WebKitGTK 4.1 runtime and `libfuse2t64`; Rust, Node,
-and development packages are not runtime dependencies. These private artifacts
-are not a public community launch. Build the AppImage on Ubuntu 24.04 with
-`npm run tauri:bundle:linux -- --ci -- --locked` from `desktop/`.
 
 ## Discord Gateway
 
@@ -881,7 +631,7 @@ cat > "$tmp/plato.toml" <<'TOML'
 kind = "open_router"
 model = "~openai/gpt-latest"
 api_key_env = "OPENROUTER_API_KEY"
-http_referer = "https://example.invalid"
+http_referer = "https://referential.ai"
 app_title = "Plato Agent"
 
 [limits]
@@ -900,7 +650,8 @@ OPENROUTER_API_KEY="$(cat /path/to/your/openrouter-key)" \
 
 ## Boundary
 
-`platonic-core` remains pure. Provider calls, local tools, approval prompts, ledger files, SQLite, daemon runtime, TUI, and connectors belong in this repo.
+`platonic-core` remains pure. Platonic owns provider calls, tools, approvals,
+ledgers, policy, and gateways. Plato Agent owns the client commands and TUI.
 
 ## License
 

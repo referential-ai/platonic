@@ -8,6 +8,10 @@ Cargo's structured `workspace.metadata.platonic-release` and each package's
 `platonic-core` is the only publishable product-code crate. Internal and client
 crates are not product publication channels.
 
+Launch support is exactly Linux x86-64 and macOS Apple silicon. Windows server
+and client support is withdrawn; every additional target is post-launch and
+proof-first. Desktop packages are not Platonic 0.1.0 launch artifacts.
+
 ## Identity
 
 Release builds embed the exact source commit and the workflow's UTC build date.
@@ -42,8 +46,9 @@ The locked artifact set is:
 | Linux x86-64 | `x86_64-unknown-linux-gnu` | `platonic-0.1.0-linux-x86_64.tar.gz` |
 | macOS Apple silicon | `aarch64-apple-darwin` | `platonic-0.1.0-macos-arm64.tar.gz` |
 
-Each archive has one same-named root directory and exactly these ordered file
-list entries:
+Each archive has one root directory named after the archive stem. It contains
+the Platonic server command `platonic` and the Plato Agent client commands
+`plato` and `plato-tui`, with exactly these ordered file-list entries:
 
 ```text
 CHANGELOG.md
@@ -58,6 +63,16 @@ Each bundle is accompanied by a same-stem `.files` inventory and `.sha256`
 manifest. The manifest contains one GNU-compatible SHA-256 line for the
 archive. Archive paths, modes, owners, timestamps, gzip headers, and ordering
 are normalized by `scripts/package-release.py`.
+
+After downloading an archive and its manifest, verify it before extraction:
+
+```bash
+# Linux x86-64
+sha256sum --check platonic-0.1.0-linux-x86_64.sha256
+
+# macOS Apple silicon
+shasum -a 256 --check platonic-0.1.0-macos-arm64.sha256
+```
 
 ## Workflow
 
