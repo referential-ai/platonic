@@ -1676,7 +1676,10 @@ mod tests {
 
             assert_eq!(response.kind, EnvelopeKind::Response);
             assert_eq!(result["daemon_scope"], "host");
-            assert_eq!(result["daemon_version"], platonic_protocol::BUILD_IDENTITY);
+            assert_eq!(
+                result["daemon_version"],
+                platonic_protocol::PLATONIC_DIAGNOSTIC_IDENTITY
+            );
             assert_eq!(result["workspace_id"], created.workspace.id);
             assert_eq!(
                 Path::new(result["ledger_path"].as_str().unwrap()),
@@ -1833,15 +1836,19 @@ base_url = "https://example.invalid/v1"
                 paths.socket_path.to_string_lossy()
             );
             assert_eq!(first.daemon.workspace_id, paths.workspace_id);
-            let mut build_identity = platonic_protocol::BUILD_IDENTITY.split_whitespace();
-            assert_eq!(first.daemon.package_version, build_identity.next().unwrap());
+            assert_eq!(
+                first.daemon.package_version,
+                platonic_protocol::PLATONIC_PRODUCT_VERSION
+            );
             assert_eq!(
                 first.daemon.build_commit.as_deref(),
-                build_identity.next().filter(|part| *part != "unknown")
+                (platonic_protocol::PLATONIC_BUILD_COMMIT != "unknown")
+                    .then_some(platonic_protocol::PLATONIC_BUILD_COMMIT)
             );
             assert_eq!(
                 first.daemon.build_date_utc.as_deref(),
-                build_identity.next().filter(|part| *part != "unknown")
+                (platonic_protocol::PLATONIC_BUILD_DATE != "unknown")
+                    .then_some(platonic_protocol::PLATONIC_BUILD_DATE)
             );
             assert!(second.daemon.uptime_ms > first.daemon.uptime_ms);
             assert_eq!(first.session.session_id, None);

@@ -20,7 +20,7 @@ const THREAD_EVENT_PAGE: usize = 128;
 #[derive(Debug, Parser)]
 #[command(name = "plato")]
 #[command(about = "Plato Agent client")]
-#[command(version = platonic_protocol::BUILD_IDENTITY)]
+#[command(version = platonic_protocol::PLATO_BUILD_IDENTITY)]
 struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,

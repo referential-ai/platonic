@@ -64,6 +64,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check release identity and bundle contracts
+        run: ./scripts/test-release.sh
+
       - name: Check platonic-core MSRV
         run: cargo +1.85.0 check --locked -p platonic-core
 

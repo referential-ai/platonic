@@ -32,7 +32,7 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Debug, Parser)]
 #[command(name = "platonic")]
 #[command(about = "Platonic agent server")]
-#[command(version = platonic_protocol::BUILD_IDENTITY)]
+#[command(version = platonic_protocol::PLATONIC_BUILD_IDENTITY)]
 struct Cli {
     #[arg(long, hide = true)]
     run_child: bool,

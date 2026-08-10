@@ -19,7 +19,7 @@ const LOCAL_ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 #[derive(Debug, Parser)]
 #[command(name = "plato-tui")]
 #[command(about = "Plato Agent terminal client")]
-#[command(version = platonic_protocol::BUILD_IDENTITY)]
+#[command(version = platonic_protocol::PLATO_BUILD_IDENTITY)]
 struct Cli {
     #[arg(long, default_value = ".", help = "Workspace served by platonic")]
     workspace: PathBuf,

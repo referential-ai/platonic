@@ -8,6 +8,7 @@ Everything below is copy-pasteable. Companion docs: [`../README.md`](../README.m
 cd ~/projects/platonic-workspace/plato-agent
 
 head=$(git rev-parse --verify 'HEAD^{commit}')
+build_date=$(date -u +%Y-%m-%d)
 proof_root=$(mktemp -d)
 artifact="$proof_root/plato-agent-$head.tar.gz"
 source_root="$proof_root/source"
@@ -20,11 +21,15 @@ sha256sum "$artifact"
 mkdir "$source_root"
 tar -xzf "$artifact" -C "$source_root"
 test ! -e "$prefix"
-PLATO_BUILD_IDENTITY="0.2.0 $head $(date -u +%Y-%m-%d)" \
+PLATONIC_BUILD_COMMIT="$head" \
+  PLATONIC_BUILD_DATE="$build_date" \
+  PLATO_BUILD_IDENTITY="0.2.0 $head $build_date" \
   CARGO_TARGET_DIR="$proof_root/target" \
   cargo install --locked --root "$prefix" \
     --path "$source_root/plato-agent-$head/crates/plato-agent"
-PLATO_BUILD_IDENTITY="0.2.0 $head $(date -u +%Y-%m-%d)" \
+PLATONIC_BUILD_COMMIT="$head" \
+  PLATONIC_BUILD_DATE="$build_date" \
+  PLATO_BUILD_IDENTITY="0.2.0 $head $build_date" \
   CARGO_TARGET_DIR="$proof_root/target" \
   cargo install --locked --root "$prefix" \
     --path "$source_root/plato-agent-$head/crates/platonic"

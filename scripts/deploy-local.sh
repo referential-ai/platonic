@@ -26,6 +26,21 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command is unavailable: $1"
 }
 
+expected_version_output() {
+  local binary="$1"
+  case "$binary" in
+    platonic)
+      printf 'platonic %s\n' "$product_build_identity"
+      ;;
+    plato | plato-tui)
+      printf '%s %s\n' "$binary" "$client_build_identity"
+      ;;
+    *)
+      die "unknown build binary: $binary"
+      ;;
+  esac
+}
+
 path_uid() {
   stat -c '%u' -- "$1"
 }
@@ -477,7 +492,7 @@ wait_for_process_exit() {
 
 stop_proof_daemon() {
   if [[ -n "$proof_pid" && -e "/proc/$proof_pid/stat" && -S "$proof_socket" ]]; then
-    daemon_rpc "$proof_socket" "$proof_root/workspace" "$build_identity" "$proof_pid" shutdown \
+    daemon_rpc "$proof_socket" "$proof_root/workspace" "$product_diagnostic_identity" "$proof_pid" shutdown \
       >/dev/null 2>&1 || return 1
     wait_for_process_exit "$proof_pid" || return 1
   fi
@@ -619,12 +634,19 @@ readonly build_date
 prepare_install_parent
 
 metadata="$(cargo metadata --manifest-path "$repo_root/Cargo.toml" --locked --no-deps --format-version 1)"
-package_version="$(jq -er '.packages[] | select(.name == "plato-agent") | .version' <<<"$metadata")"
-readonly package_version
+client_package_version="$(jq -er '.packages[] | select(.name == "plato-agent") | .version' <<<"$metadata")"
+readonly client_package_version
+product_version="$(jq -er '.metadata["platonic-release"]["product-version"]' <<<"$metadata")"
+readonly product_version
 target_dir="$(jq -er '.target_directory' <<<"$metadata")"
 readonly target_dir
-[[ "$package_version" != *[[:space:]]* ]] || die "package version contains whitespace: $package_version"
-readonly build_identity="$package_version $source_commit $build_date"
+[[ "$client_package_version" != *[[:space:]]* ]] \
+  || die "client package version contains whitespace: $client_package_version"
+[[ "$product_version" != *[[:space:]]* ]] \
+  || die "product version contains whitespace: $product_version"
+readonly client_build_identity="$client_package_version $source_commit $build_date"
+readonly product_build_identity="$product_version ($source_commit, $build_date)"
+readonly product_diagnostic_identity="platonic $product_build_identity"
 
 if validate_set "$install_dir" yes; then
   installed_before="yes"
@@ -648,7 +670,10 @@ fi
 record_checksums before "$install_dir"
 
 printf 'build: commit=%s date=%s\n' "$source_commit" "$build_date"
-PLATO_BUILD_IDENTITY="$build_identity" cargo build \
+PLATONIC_BUILD_COMMIT="$source_commit" \
+PLATONIC_BUILD_DATE="$build_date" \
+PLATO_BUILD_IDENTITY="$client_build_identity" \
+cargo build \
   --manifest-path "$repo_root/Cargo.toml" \
   --package plato-agent \
   --package platonic \
@@ -667,7 +692,7 @@ for index in "${!BUILD_BINARIES[@]}"; do
   binary="$target_dir/release/${BUILD_BINARIES[$index]}"
   validate_binary_file "$binary"
   version_output="$($binary --version)"
-  [[ "$version_output" == "${BUILD_BINARIES[$index]} $build_identity" ]] \
+  [[ "$version_output" == "$(expected_version_output "${BUILD_BINARIES[$index]}")" ]] \
     || die "built binary provenance mismatch: $binary reported $version_output"
 done
 
@@ -690,7 +715,7 @@ for index in "${!BUILD_BINARIES[@]}"; do
   [[ "$(sha256_file "$staged_binary")" == "$(sha256_file "$source_binary")" ]] \
     || die "staged binary checksum mismatch: $staged_binary"
   version_output="$($staged_binary --version)"
-  [[ "$version_output" == "${BUILD_BINARIES[$index]} $build_identity" ]] \
+  [[ "$version_output" == "$(expected_version_output "${BUILD_BINARIES[$index]}")" ]] \
     || die "staged binary provenance mismatch: $staged_binary reported $version_output"
 done
 validate_set "$stage_dir" no
@@ -711,7 +736,7 @@ validate_set "$install_dir" no
 for index in "${!BUILD_BINARIES[@]}"; do
   installed_binary="$install_dir/${INSTALL_BINARIES[$index]}"
   version_output="$($installed_binary --version)"
-  [[ "$version_output" == "${BUILD_BINARIES[$index]} $build_identity" ]] \
+  [[ "$version_output" == "$(expected_version_output "${BUILD_BINARIES[$index]}")" ]] \
     || die "installed binary provenance mismatch: $installed_binary reported $version_output"
 done
 
@@ -753,8 +778,8 @@ jq -e \
   "$proof_lock" >/dev/null \
   || die 'new readback daemon did not publish exact host lock metadata'
 
-hello_json="$(daemon_rpc "$proof_socket" "$proof_root/workspace" "$build_identity" "$proof_pid" hello)"
-[[ "$(jq -er '.daemon_version' <<<"$hello_json")" == "$build_identity" ]] \
+hello_json="$(daemon_rpc "$proof_socket" "$proof_root/workspace" "$product_diagnostic_identity" "$proof_pid" hello)"
+[[ "$(jq -er '.daemon_version' <<<"$hello_json")" == "$product_diagnostic_identity" ]] \
   || die 'new daemon hello did not report exact provenance'
 
 env -i \
@@ -765,14 +790,13 @@ env -i \
   "$install_dir/plato-tui-real" \
   --workspace "$proof_root/workspace" \
   --snapshot >"$proof_root/tui.snapshot"
-readonly short_commit="${source_commit:0:7}"
-grep -F -- "$package_version $short_commit $build_date" "$proof_root/tui.snapshot" >/dev/null \
-  || die 'TUI snapshot did not render package version, short commit, and UTC build date'
+grep -F -- "$product_diagnostic_identity" "$proof_root/tui.snapshot" >/dev/null \
+  || die 'TUI snapshot did not render the exact product diagnostic identity'
 
-daemon_rpc "$proof_socket" "$proof_root/workspace" "$build_identity" "$proof_pid" shutdown >/dev/null
+daemon_rpc "$proof_socket" "$proof_root/workspace" "$product_diagnostic_identity" "$proof_pid" shutdown >/dev/null
 wait_for_process_exit "$proof_pid" || die 'new readback daemon did not exit after shutdown acknowledgement'
-printf 'readback: new_pid=%s hello=%s tui=%s %s %s\n' \
-  "$proof_pid" "$build_identity" "$package_version" "$short_commit" "$build_date"
+printf 'readback: new_pid=%s hello=%s tui=%s\n' \
+  "$proof_pid" "$product_diagnostic_identity" "$product_diagnostic_identity"
 proof_pid=""
 
 if [[ "$installed_before" == "yes" ]]; then
@@ -790,7 +814,8 @@ fi
 record_checksums after "$install_dir"
 record_checksums rollback "$rollback_dir"
 transaction="complete"
-printf 'deployed: %s\n' "$build_identity"
+printf 'deployed: %s\n' "$product_diagnostic_identity"
+printf 'clients: %s\n' "$client_build_identity"
 printf 'installed: %s\n' "$install_dir"
 if [[ "$installed_before" == "yes" ]]; then
   printf 'rollback: %s --rollback\n' "$repo_root/scripts/deploy-local.sh"
