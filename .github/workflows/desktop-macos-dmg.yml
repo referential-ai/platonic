@@ -188,17 +188,21 @@ jobs:
         working-directory: desktop
         run: npm ci
 
-      - name: Require the protected Developer ID identity and notarization credentials
+      - name: Create the disposable signing keychain and require protected credentials
         env:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
           for name in \
             APPLE_API_ISSUER \
             APPLE_API_KEY \
-            APPLE_API_KEY_P8
+            APPLE_API_KEY_P8 \
+            APPLE_CERTIFICATE_P12 \
+            APPLE_CERTIFICATE_PASSWORD
           do
             test -n "${!name:-}" || {
               echo "protected macos-release input $name is unavailable" >&2
@@ -207,9 +211,48 @@ jobs:
           done
 
           umask 077
+          signing_root="$RUNNER_TEMP/p167-signing"
+          test ! -e "$signing_root"
+          mkdir -m 700 "$signing_root"
+          touch "$signing_root/.owned-by-p167"
+
+          certificate_path="$signing_root/DeveloperID.p12"
+          certificate_password_path="$signing_root/certificate-password"
+          keychain_path="$signing_root/platonic-signing.keychain-db"
+          original_keychains_path="$signing_root/original-keychains"
           api_key_path="$RUNNER_TEMP/AuthKey.p8"
+
+          printf '%s' "$APPLE_CERTIFICATE_P12" | /usr/bin/base64 -D > "$certificate_path"
+          printf '%s' "$APPLE_CERTIFICATE_PASSWORD" > "$certificate_password_path"
           printf '%s' "$APPLE_API_KEY_P8" > "$api_key_path"
-          identity=$(security find-identity -v -p codesigning \
+
+          security list-keychains -d user \
+            | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//' \
+            > "$original_keychains_path"
+
+          security create-keychain -p "" "$keychain_path"
+          security unlock-keychain -p "" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          certificate_password=$(< "$certificate_password_path")
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$certificate_password" \
+            -T /usr/bin/codesign
+          unset certificate_password
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "" \
+            "$keychain_path" \
+            > /dev/null
+
+          keychains=("$keychain_path")
+          while IFS= read -r existing; do
+            test -n "$existing" && keychains+=("$existing")
+          done < "$original_keychains_path"
+          security list-keychains -d user -s "${keychains[@]}"
+
+          identity=$(security find-identity -v -p codesigning "$keychain_path" \
             | grep -F -- "$APPLE_SIGNING_CERT_SHA1" || true)
           test -n "$identity"
           grep -Fq -- "\"$APPLE_SIGNING_IDENTITY\"" <<< "$identity"
@@ -331,9 +374,32 @@ jobs:
       - name: Remove protected signing material
         if: always()
         run: |
+          set +e
+          cleanup_failed=0
           install_marker="$RUNNER_TEMP/p167-installed-app-owned"
           if test -f "$install_marker"; then
-            rm -rf "$HOME/Applications/Plato-p167.app"
-            rm -f "$install_marker"
+            rm -rf "$HOME/Applications/Plato-p167.app" || cleanup_failed=1
+            rm -f "$install_marker" || cleanup_failed=1
           fi
-          rm -f "$RUNNER_TEMP/AuthKey.p8"
+
+          signing_root="$RUNNER_TEMP/p167-signing"
+          if test -f "$signing_root/.owned-by-p167"; then
+            original_keychains_path="$signing_root/original-keychains"
+            keychain_path="$signing_root/platonic-signing.keychain-db"
+
+            if test -s "$original_keychains_path"; then
+              keychains=()
+              while IFS= read -r existing; do
+                test -n "$existing" && keychains+=("$existing")
+              done < "$original_keychains_path"
+              if test "${#keychains[@]}" -gt 0; then
+                security list-keychains -d user -s "${keychains[@]}" || cleanup_failed=1
+              fi
+            fi
+            if test -e "$keychain_path"; then
+              security delete-keychain "$keychain_path" || cleanup_failed=1
+            fi
+            rm -rf "$signing_root" || cleanup_failed=1
+          fi
+          rm -f "$RUNNER_TEMP/AuthKey.p8" || cleanup_failed=1
+          exit "$cleanup_failed"

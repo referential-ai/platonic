@@ -388,14 +388,15 @@ package.
 Pull requests run credential-free native arm64 packaging validation and never
 upload the unsigned DMG. The signed artifact path is only the protected/manual
 or reusable `macOS Desktop DMG` workflow with `signed: true`. The protected
-`macos-release` environment supplies the encrypted Developer ID identity and
-notarization credentials. The job imports the identity into a disposable
-keychain and removes all signing material on exit. Missing inputs fail before
-the build; there is no unsigned distribution fallback. The workflow signs and
-notarizes with Tauri, verifies the nested sidecar and app signatures, validates
-the stapled DMG with Gatekeeper, and uploads the DMG plus its SHA-256 file as a
-short-lived Actions artifact. It never creates a tag or GitHub Release. This is
-a direct-download,
+`macos-release` environment supplies `APPLE_CERTIFICATE_P12`,
+`APPLE_CERTIFICATE_PASSWORD`, `APPLE_API_ISSUER`, `APPLE_API_KEY`, and
+`APPLE_API_KEY_P8`. The job imports the encrypted Developer ID identity into a
+disposable keychain and removes all signing material on exit. Missing inputs
+fail before the build; there is no unsigned distribution fallback. The
+workflow signs and notarizes with Tauri, verifies the nested sidecar and app
+signatures, validates the stapled DMG with Gatekeeper, and uploads the DMG plus
+its SHA-256 file as a short-lived Actions artifact. It never creates a tag or
+GitHub Release. This is a direct-download,
 drag-to-Applications DMG only: it does not add a Mac App Store path, App Store
 sandboxing or receipts, or a `.pkg` installer.
 
