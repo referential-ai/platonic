@@ -45,7 +45,9 @@ server command `platonic` and the Plato Agent client commands `plato` and
 `plato-tui`. Linux x86-64 and macOS Apple silicon are the only launch targets;
 Windows server and client support is withdrawn. The
 [release contract](RELEASE.md) lists the exact archive contents and explains
-the independent `platonic-core` semver.
+the independent `platonic-core` semver. Platonic 0.1.0 predates artifact
+attestations; the release contract includes the GitHub CLI verification path
+for releases produced after attestation support.
 
 `plato` works without a local config when `OPENROUTER_API_KEY` is exported.
 Config is discovered in this order: `--config`, `PLATO_CONFIG`, `./plato.toml`,
