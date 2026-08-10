@@ -1,0 +1,11 @@
+[book]
+title = "Platonic"
+language = "en"
+src = "docs/book"
+
+[build]
+build-dir = "target/mdbook"
+create-missing = false
+
+[output.html]
+site-url = "/platonic/"
