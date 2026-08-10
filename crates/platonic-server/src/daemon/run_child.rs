@@ -717,9 +717,15 @@ fn run_supervised_with_limits(
         event_sender,
         terminal: None,
     };
+    let child_env = match crate::tools::supervised_run_child_env(prepared.provider_api_key_env()) {
+        Ok(child_env) => child_env,
+        Err(error) => return recorder.complete(&run_id, Err(error), false),
+    };
     let mut command = Command::new(executable);
     command
         .arg(CHILD_MODE_ARG)
+        .env_clear()
+        .envs(child_env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1506,6 +1512,13 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::sync::mpsc;
+    #[cfg(target_os = "linux")]
+    use std::{
+        collections::BTreeMap,
+        ffi::OsString,
+        net::{TcpListener, TcpStream},
+        os::unix::ffi::{OsStrExt, OsStringExt},
+    };
 
     #[test]
     fn resolver_keeps_exact_agentd_image() {
@@ -2195,6 +2208,433 @@ while :; do :; done
                 WedgedChildProof { result, records }
             },
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    const RUN_CHILD_PROVIDER_ENV: &str = "PLATONIC_RUN_CHILD_CUSTOM_PROVIDER";
+    #[cfg(target_os = "linux")]
+    const RUN_CHILD_PROVIDER_SENTINEL: &str = "non-secret-provider-sentinel";
+    #[cfg(target_os = "linux")]
+    const RUN_CHILD_ENV_DRIVER_FIXTURE: &str =
+        "daemon::run_child::tests::supervised_environment_driver_fixture";
+    #[cfg(target_os = "linux")]
+    const RUN_CHILD_BASELINE_NAMES: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "COLORTERM",
+        "NO_COLOR",
+        "LANG",
+        "LC_ALL",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+    ];
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervised_child_runs_with_minimal_env_and_shell_grandchild_stays_scrubbed() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let temp = root.path().join("tmp");
+        let cargo_home = root.path().join("cargo-home");
+        let rustup_home = root.path().join("rustup-home");
+        for path in [&home, &temp, &cargo_home, &rustup_home] {
+            fs::create_dir(path).unwrap();
+        }
+        let mut parent_env: Vec<(OsString, OsString)> = vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("HOME".into(), home.into_os_string()),
+            ("USER".into(), "platonic-test".into()),
+            ("LOGNAME".into(), "platonic-test".into()),
+            ("SHELL".into(), "/bin/sh".into()),
+            ("TERM".into(), "dumb".into()),
+            ("COLORTERM".into(), "none".into()),
+            ("NO_COLOR".into(), "1".into()),
+            ("LANG".into(), "C".into()),
+            ("LC_ALL".into(), "C".into()),
+            ("TMPDIR".into(), temp.into_os_string()),
+            ("TEMP".into(), "/tmp".into()),
+            ("TMP".into(), "/tmp".into()),
+            ("CARGO_HOME".into(), cargo_home.into_os_string()),
+            ("RUSTUP_HOME".into(), rustup_home.into_os_string()),
+        ];
+        parent_env.extend([
+            (
+                RUN_CHILD_PROVIDER_ENV.into(),
+                RUN_CHILD_PROVIDER_SENTINEL.into(),
+            ),
+            ("OPENAI_API_KEY".into(), "openai-sentinel".into()),
+            ("GITHUB_TOKEN".into(), "github-sentinel".into()),
+            ("AWS_SECRET_ACCESS_KEY".into(), "aws-secret-sentinel".into()),
+            ("NPM_TOKEN".into(), "npm-sentinel".into()),
+            (
+                "CARGO_REGISTRIES_CRATES_IO_TOKEN".into(),
+                "cargo-token-sentinel".into(),
+            ),
+            ("SSH_AUTH_SOCK".into(), "/tmp/agent-socket-sentinel".into()),
+            ("UNKNOWN_PARENT_SETTING".into(), "unknown-sentinel".into()),
+            (
+                "UNRELATED_NON_UTF8_VALUE".into(),
+                OsString::from_vec(b"value-\xff".to_vec()),
+            ),
+            (
+                OsString::from_vec(b"UNRELATED_NON_UTF8_NAME_\xff".to_vec()),
+                "name-sentinel".into(),
+            ),
+        ]);
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", RUN_CHILD_ENV_DRIVER_FIXTURE])
+            .env_clear()
+            .envs(parent_env.iter().map(|(name, value)| (name, value)))
+            .output()
+            .unwrap();
+
+        assert!(output.status.success(), "environment driver fixture failed");
+        for captured in [&output.stdout, &output.stderr] {
+            assert!(
+                !captured
+                    .windows(RUN_CHILD_PROVIDER_SENTINEL.len())
+                    .any(|window| window == RUN_CHILD_PROVIDER_SENTINEL.as_bytes()),
+                "provider credential reached captured child output"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "launched in an isolated sentinel-rich parent environment"]
+    fn supervised_environment_driver_fixture() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+
+        let (provider, base_url) = spawn_run_child_provider(RUN_CHILD_PROVIDER_SENTINEL);
+        fs::write(
+            workspace.join("plato.toml"),
+            format!(
+                r#"[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "{RUN_CHILD_PROVIDER_ENV}"
+base_url = "{base_url}"
+
+[limits]
+token_budget = 4000
+max_output_tokens = 64
+max_turns = 2
+
+[tools]
+enabled = ["shell.exec"]
+"#
+            ),
+        )
+        .unwrap();
+        let ledger_path = root.path().join("minimal-environment.db");
+        let run_id = RunId::new("run_minimal_child_environment").unwrap();
+        let test_binary = std::env::current_exe().unwrap();
+        let test_binary = test_binary.to_string_lossy().replace('\'', "'\\''");
+        let fixture = root.path().join("stdio-run-child");
+        fs::write(
+            &fixture,
+            format!(
+                r#"#!/bin/sh
+wrapper_pid=$$
+'{test_binary}' --ignored --exact daemon::run_child::tests::supervised_stdio_child_fixture --nocapture |
+while IFS= read -r line; do
+    case "$line" in
+        '{{"kind":"ready","request_id":'*)
+            printf '{{"kind":"ready","request_id":0,"pid":%s}}\n' "$wrapper_pid"
+            ;;
+        '{{'*)
+            printf '%s\n' "$line"
+            ;;
+    esac
+done
+"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let baseline = RUN_CHILD_BASELINE_NAMES
+            .iter()
+            .map(|name| (*name, std::env::var_os(name).unwrap()))
+            .collect::<Vec<_>>();
+
+        let (prepared, recorder) = prepare_run(&RunOptions {
+            question: "exercise the local provider and scrubbed shell".into(),
+            config_path: Some("plato.toml".into()),
+            overrides: Default::default(),
+            ledger: RunLedger::Sqlite(ledger_path.clone()),
+            workspace_root: workspace,
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(run_id.clone()),
+            session: Some(RunSession::Fresh {
+                session_id: "session_minimal_child_environment".into(),
+            }),
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: None,
+            voice_interruption_context: None,
+        })
+        .unwrap();
+        let start_message = serde_json::to_string(&ParentMessage::Start {
+            prepared: Box::new(prepared.clone()),
+        })
+        .unwrap();
+        assert!(!start_message.contains(RUN_CHILD_PROVIDER_SENTINEL));
+
+        let (event_sender, event_receiver) = mpsc::channel();
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let supervisor = thread::spawn(move || {
+            publish_for_test(run_supervised_with_limits(
+                prepared,
+                recorder,
+                ApprovalMode::external_with_actor("test", |_| {
+                    Ok(ExternalApprovalOutcome::Granted {
+                        actor: "test".into(),
+                    })
+                }),
+                event_sender,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                ChildLaunch {
+                    limits: ChildLifecycleLimits {
+                        deadline: Duration::from_secs(10),
+                        ..ChildLifecycleLimits::default()
+                    },
+                    executable: fixture,
+                    ready_child: Some(ready_sender),
+                    confinement: crate::confinement::ChildConfinement::None,
+                    terminal_stage_barriers: None,
+                },
+            ))
+        });
+        let child_pid = ready_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        let actual_env = read_proc_environment(child_pid);
+        provider.release_first_response.send(()).unwrap();
+
+        let outcome = supervisor.join().unwrap().unwrap();
+        let event_records = event_receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                RunEvent::Ledger(record) => Some(record),
+                RunEvent::AssistantDelta(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let records = SqliteLedger::open_readonly(&ledger_path)
+            .unwrap()
+            .read_run(run_id.as_str())
+            .unwrap();
+
+        let mut expected_env = baseline
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_bytes().to_vec(),
+                    value.as_os_str().as_bytes().to_vec(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        expected_env.insert(
+            RUN_CHILD_PROVIDER_ENV.as_bytes().to_vec(),
+            RUN_CHILD_PROVIDER_SENTINEL.as_bytes().to_vec(),
+        );
+        assert_eq!(
+            actual_env.keys().collect::<Vec<_>>(),
+            expected_env.keys().collect::<Vec<_>>()
+        );
+        for (name, expected_value) in expected_env {
+            assert!(
+                actual_env.get(&name) == Some(&expected_value),
+                "supervised child value differed for {}",
+                String::from_utf8_lossy(&name)
+            );
+        }
+        assert_eq!(outcome.final_answer, "done");
+        assert_eq!(event_records.len() + 1, records.len());
+        let live = serde_json::to_string(&event_records).unwrap();
+        assert!(!live.contains(RUN_CHILD_PROVIDER_SENTINEL));
+        let durable = serde_json::to_string(&records).unwrap();
+        assert!(durable.contains("runtime-and-scrub-ok"));
+        assert!(!durable.contains(RUN_CHILD_PROVIDER_SENTINEL));
+        let outcome = serde_json::to_string(&outcome).unwrap();
+        assert!(!outcome.contains(RUN_CHILD_PROVIDER_SENTINEL));
+
+        let provider_proof = provider.handle.join().unwrap();
+        assert_eq!(provider_proof.request_count, 2);
+        assert!(provider_proof.authorization_was_exact);
+        assert!(provider_proof.shell_reported_scrubbed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "launched through the supervised child transport fixture"]
+    fn supervised_stdio_child_fixture() {
+        run_stdio_child().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    struct RunChildProvider {
+        release_first_response: mpsc::Sender<()>,
+        handle: thread::JoinHandle<RunChildProviderProof>,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct RunChildProviderProof {
+        request_count: usize,
+        authorization_was_exact: bool,
+        shell_reported_scrubbed: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_run_child_provider(provider_sentinel: &'static str) -> (RunChildProvider, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (release_sender, release_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let shell_command = concat!(
+                "test -n \"$PATH\" && test -n \"$HOME\" && ",
+                "test -n \"$TMPDIR\" && test -n \"$CARGO_HOME\" && ",
+                "test -n \"$RUSTUP_HOME\" && ",
+                "test \"${PLATONIC_RUN_CHILD_CUSTOM_PROVIDER+x}\" != x && ",
+                "test \"${OPENAI_API_KEY+x}\" != x && ",
+                "test \"${GITHUB_TOKEN+x}\" != x && ",
+                "test \"${AWS_SECRET_ACCESS_KEY+x}\" != x && ",
+                "test \"${NPM_TOKEN+x}\" != x && ",
+                "test \"${CARGO_REGISTRIES_CRATES_IO_TOKEN+x}\" != x && ",
+                "test \"${SSH_AUTH_SOCK+x}\" != x && ",
+                "test \"${UNKNOWN_PARENT_SETTING+x}\" != x && ",
+                "printf runtime-and-scrub-ok"
+            );
+            let arguments = serde_json::to_string(&serde_json::json!({
+                "command": shell_command
+            }))
+            .unwrap();
+            let responses = [
+                format!(
+                    "data: {}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+                    serde_json::json!({
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": "provider_shell",
+                                    "function": {
+                                        "name": "shell_exec",
+                                        "arguments": arguments
+                                    }
+                                }]
+                            },
+                            "finish_reason": null
+                        }]
+                    })
+                ),
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .into(),
+            ];
+            let mut authorization_was_exact = true;
+            let mut shell_reported_scrubbed = false;
+            for (index, response) in responses.into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_run_child_provider_request(&mut stream);
+                authorization_was_exact &= request.lines().any(|line| {
+                    line.split_once(':').is_some_and(|(name, value)| {
+                        name.eq_ignore_ascii_case("authorization")
+                            && value.trim() == format!("Bearer {provider_sentinel}")
+                    })
+                });
+                if index == 0 {
+                    release_receiver
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                } else {
+                    shell_reported_scrubbed = request.contains("runtime-and-scrub-ok");
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .unwrap();
+            }
+            RunChildProviderProof {
+                request_count: 2,
+                authorization_was_exact,
+                shell_reported_scrubbed,
+            }
+        });
+        (
+            RunChildProvider {
+                release_first_response: release_sender,
+                handle,
+            },
+            base_url,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_run_child_provider_request(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let header_end = loop {
+            let read = stream.read(&mut buffer).unwrap();
+            assert_ne!(read, 0, "provider client closed before headers");
+            bytes.extend_from_slice(&buffer[..read]);
+            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+            })
+            .unwrap_or(0);
+        while bytes.len() < header_end + content_length {
+            let read = stream.read(&mut buffer).unwrap();
+            assert_ne!(read, 0, "provider client closed before body");
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_proc_environment(pid: u32) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        fs::read(format!("/proc/{pid}/environ"))
+            .unwrap()
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                let separator = entry
+                    .iter()
+                    .position(|byte| *byte == b'=')
+                    .expect("environment entry has a name and value");
+                let (name, value) = entry.split_at(separator);
+                (name.to_vec(), value[1..].to_vec())
+            })
+            .collect()
     }
 
     #[cfg(unix)]

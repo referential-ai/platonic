@@ -287,6 +287,10 @@ impl PreparedRun {
         &self.run_id
     }
 
+    pub(crate) fn provider_api_key_env(&self) -> &str {
+        &self.config.provider.api_key_env
+    }
+
     pub(crate) fn has_tool(&self, name: &str) -> bool {
         self.config.tools.enabled.iter().any(|tool| tool == name)
     }
