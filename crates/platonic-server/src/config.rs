@@ -583,24 +583,9 @@ fn user_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-#[cfg(windows)]
-fn user_home() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
 #[cfg(unix)]
 fn user_config_path(home: Option<&Path>) -> Option<PathBuf> {
     home.map(|home| home.join(".config").join("plato").join("config.toml"))
-}
-
-#[cfg(windows)]
-fn user_config_path(_home: Option<&Path>) -> Option<PathBuf> {
-    std::env::var_os("APPDATA")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(|root| root.join("plato").join("config.toml"))
 }
 
 fn resolve_explicit_config_path(
@@ -636,11 +621,6 @@ fn expand_leading_tilde(path: PathBuf, home: Option<&Path>) -> AppResult<PathBuf
 #[cfg(unix)]
 fn leading_tilde_rest(path: &str) -> Option<&str> {
     path.strip_prefix("~/")
-}
-
-#[cfg(windows)]
-fn leading_tilde_rest(path: &str) -> Option<&str> {
-    path.strip_prefix("~/").or(path.strip_prefix(r"~\"))
 }
 
 #[cfg(test)]
@@ -971,8 +951,6 @@ remote_ceiling = "yolo"
         let explicit_config = root.path().join("per-run.toml");
         #[cfg(unix)]
         let user_config = home.join(".config/plato/config.toml");
-        #[cfg(windows)]
-        let user_config = root.path().join("roaming/plato/config.toml");
         std::fs::create_dir(&workspace).unwrap();
         std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
         std::fs::write(
@@ -1036,19 +1014,6 @@ remote_ceiling = "yolo"
             ],
             || assert_eq!(server_max_spawn_depth().unwrap(), 2),
         );
-        #[cfg(windows)]
-        temp_env::with_vars(
-            [
-                (
-                    "APPDATA",
-                    user_config.parent().unwrap().parent().map(Path::as_os_str),
-                ),
-                ("USERPROFILE", Some(home.as_os_str())),
-                (PLATO_CONFIG_ENV, Some(explicit_config.as_os_str())),
-            ],
-            || assert_eq!(server_max_spawn_depth().unwrap(), 2),
-        );
-
         assert_eq!(resolve_server_config_with(None), None);
     }
 
@@ -1536,40 +1501,6 @@ stream_idle_timeout_ms = 9000
         assert_eq!(
             path,
             Some(workspace.path().join("config").join("plato.toml"))
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_config_uses_roaming_app_data_and_user_profile() {
-        let workspace = tempfile::tempdir().unwrap();
-        let roaming = tempfile::tempdir().unwrap();
-        let profile = tempfile::tempdir().unwrap();
-        let user_config = roaming.path().join("plato").join("config.toml");
-        std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
-        std::fs::write(&user_config, "").unwrap();
-
-        temp_env::with_vars(
-            [
-                (PLATO_CONFIG_ENV, None),
-                ("APPDATA", Some(roaming.path().as_os_str())),
-                ("USERPROFILE", Some(profile.path().as_os_str())),
-            ],
-            || {
-                assert_eq!(
-                    resolve_config_path(workspace.path(), None).unwrap(),
-                    Some(user_config)
-                );
-                assert_eq!(
-                    resolve_config_path(workspace.path(), Some(Path::new("~/plato.toml"))).unwrap(),
-                    Some(profile.path().join("plato.toml"))
-                );
-                assert_eq!(
-                    resolve_config_path(workspace.path(), Some(Path::new(r"~\plato.toml")))
-                        .unwrap(),
-                    Some(profile.path().join("plato.toml"))
-                );
-            },
         );
     }
 }

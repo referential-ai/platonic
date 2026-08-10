@@ -23,16 +23,10 @@ use std::{
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
-#[cfg(windows)]
-mod lifecycle;
 #[cfg(unix)]
 mod unix_lifecycle;
 #[cfg(all(test, unix))]
 mod unix_proof;
-#[cfg(all(test, windows))]
-mod windows_installer_proof;
-#[cfg(all(test, windows))]
-mod windows_proof;
 
 const REQUIRED_CAPABILITIES: [Capability; 10] = [
     CAPABILITY_HELLO,
@@ -48,11 +42,9 @@ const REQUIRED_CAPABILITIES: [Capability; 10] = [
 ];
 const EVENT_PAGE_SIZE: usize = 128;
 const INPUT_PREVIEW_MAX_CHARS: usize = 2_000;
-#[cfg(any(windows, unix))]
+#[cfg(unix)]
 const DAEMON_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-#[cfg(windows)]
-const DAEMON_ATTACH_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
-#[cfg(any(windows, unix))]
+#[cfg(unix)]
 const DAEMON_ATTACH_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 
 struct DesktopState {
@@ -63,18 +55,11 @@ struct DesktopState {
 
 #[derive(Clone, Debug, Default)]
 struct DaemonLaunch {
-    #[cfg(any(windows, unix))]
+    #[cfg(unix)]
     executable: Option<PathBuf>,
 }
 
 impl DaemonLaunch {
-    #[cfg(windows)]
-    fn installed() -> Result<Self, std::io::Error> {
-        Ok(Self {
-            executable: Some(lifecycle::sibling_daemon_executable()?),
-        })
-    }
-
     #[cfg(unix)]
     fn installed() -> Result<Self, std::io::Error> {
         Ok(Self {
@@ -82,7 +67,7 @@ impl DaemonLaunch {
         })
     }
 
-    #[cfg(not(any(windows, unix)))]
+    #[cfg(not(unix))]
     fn installed() -> Result<Self, std::io::Error> {
         Ok(Self::default())
     }
@@ -91,21 +76,15 @@ impl DaemonLaunch {
 #[derive(Default)]
 struct DesktopLifecycle {
     workspace_root: Option<PathBuf>,
-    #[cfg(windows)]
-    workspace_instance: Option<lifecycle::WorkspaceInstance>,
-    #[cfg(any(windows, unix))]
+    #[cfg(unix)]
     spawned_daemon: Option<SpawnedDaemon>,
 }
 
 struct PreparedWorkspace {
     workspace_root: PathBuf,
-    #[cfg(windows)]
-    workspace_id: String,
-    #[cfg(windows)]
-    instance: Option<lifecycle::WorkspaceInstance>,
 }
 
-#[cfg(any(windows, unix))]
+#[cfg(unix)]
 struct SpawnedDaemon {
     workspace_id: String,
     child: std::process::Child,
@@ -473,40 +452,6 @@ enum SavedWorkspaceState {
 
 impl DesktopLifecycle {
     fn prepare_workspace(&self, workspace_root: &Path) -> Result<PreparedWorkspace, DesktopError> {
-        #[cfg(windows)]
-        {
-            let workspace_id = paths::workspace_id(workspace_root)
-                .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
-            if self
-                .workspace_instance
-                .as_ref()
-                .is_some_and(|instance| instance.workspace_id() == workspace_id)
-            {
-                return Ok(PreparedWorkspace {
-                    workspace_root: workspace_root.to_path_buf(),
-                    workspace_id,
-                    instance: None,
-                });
-            }
-            let instance = lifecycle::WorkspaceInstance::acquire(&workspace_id).map_err(
-                |error| match error {
-                    lifecycle::WorkspaceInstanceError::AlreadyOpen { .. } => DesktopError::new(
-                        "desktop_already_open",
-                        "This workspace is already open in another Plato Agent desktop window",
-                    ),
-                    lifecycle::WorkspaceInstanceError::Io(error) => DesktopError::new(
-                        "desktop_single_instance_failed",
-                        format!("Unable to secure this desktop workspace: {error}"),
-                    ),
-                },
-            )?;
-            Ok(PreparedWorkspace {
-                workspace_root: workspace_root.to_path_buf(),
-                workspace_id,
-                instance: Some(instance),
-            })
-        }
-        #[cfg(not(windows))]
         {
             Ok(PreparedWorkspace {
                 workspace_root: workspace_root.to_path_buf(),
@@ -515,21 +460,10 @@ impl DesktopLifecycle {
     }
 
     fn commit_workspace(&mut self, prepared: PreparedWorkspace) {
-        #[cfg(any(windows, unix))]
+        #[cfg(unix)]
         if self.workspace_root.as_ref() != Some(&prepared.workspace_root) {
             #[cfg(unix)]
             reap_detached_daemon(self);
-            #[cfg(windows)]
-            {
-                self.spawned_daemon = None;
-            }
-        }
-        #[cfg(windows)]
-        {
-            if let Some(instance) = prepared.instance {
-                debug_assert_eq!(instance.workspace_id(), prepared.workspace_id);
-                self.workspace_instance = Some(instance);
-            }
         }
         self.workspace_root = Some(prepared.workspace_root);
     }
@@ -781,8 +715,6 @@ fn finish_attach_workspace(
     mut client: DaemonClient,
     deadline: Option<std::time::Instant>,
 ) -> Result<BootstrapView, DesktopError> {
-    #[cfg(windows)]
-    let _ = deadline;
     #[cfg(unix)]
     refresh_attach_timeout(config, &mut client, deadline)?;
     let hello = client
@@ -810,51 +742,6 @@ fn finish_attach_workspace(
             .collect(),
         selected_run,
     })
-}
-
-#[cfg(windows)]
-fn try_attach_workspace_until(
-    config: &DaemonConnectionConfig,
-    deadline: std::time::Instant,
-) -> Result<BootstrapView, DesktopError> {
-    let client = connect_client(config)?;
-    let worker_config = config.clone();
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let worker = std::thread::spawn(move || {
-        let _ = sender.send(finish_attach_workspace(&worker_config, client, None));
-    });
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    match receiver.recv_timeout(remaining) {
-        Ok(result) => {
-            worker.join().map_err(|_| attach_worker_error())?;
-            result
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            worker.join().map_err(|_| attach_worker_error())?;
-            Err(attach_worker_error())
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            let _ = lifecycle::cancel_synchronous_io(&worker);
-            match receiver.recv_timeout(DAEMON_ATTACH_CANCEL_GRACE) {
-                Ok(result) => {
-                    worker.join().map_err(|_| attach_worker_error())?;
-                    return result;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    worker.join().map_err(|_| attach_worker_error())?;
-                    return Err(attach_worker_error());
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            }
-            Err(DesktopError::new(
-                "daemon_unavailable",
-                format!(
-                    "Daemon attach timed out at {}",
-                    config.socket_path.display()
-                ),
-            ))
-        }
-    }
 }
 
 #[cfg(unix)]
@@ -899,11 +786,6 @@ fn refresh_attach_timeout(
         .map_err(|error| DesktopError::daemon("Unable to bound daemon attach", error))
 }
 
-#[cfg(windows)]
-fn attach_worker_error() -> DesktopError {
-    DesktopError::new("desktop_worker", "Daemon attach worker failed")
-}
-
 fn attach_or_spawn_workspace(
     workspace_root: &Path,
     socket_path: Option<PathBuf>,
@@ -921,11 +803,11 @@ fn attach_or_spawn_workspace(
             Ok(view)
         }
         Err(error) if error.code == "daemon_unavailable" => {
-            #[cfg(any(windows, unix))]
+            #[cfg(unix)]
             {
                 start_and_attach_workspace(&config, lifecycle, launch, error)
             }
-            #[cfg(not(any(windows, unix)))]
+            #[cfg(not(unix))]
             {
                 let _ = (lifecycle, launch);
                 Err(error)
@@ -935,7 +817,7 @@ fn attach_or_spawn_workspace(
     }
 }
 
-#[cfg(any(windows, unix))]
+#[cfg(unix)]
 fn start_and_attach_workspace(
     config: &DaemonConnectionConfig,
     lifecycle: &mut DesktopLifecycle,
@@ -966,15 +848,9 @@ fn start_and_attach_workspace(
     if should_spawn {
         #[cfg(unix)]
         reap_detached_daemon(lifecycle);
-        #[cfg(windows)]
-        {
-            lifecycle.spawned_daemon = None;
-        }
         let executable = launch.executable.as_deref().ok_or_else(|| {
             daemon_start_error(config, "the packaged daemon sidecar path is unavailable")
         })?;
-        #[cfg(windows)]
-        let child = lifecycle::spawn_detached_daemon(executable, &config.workspace_root);
         #[cfg(unix)]
         let child = {
             let user_path = unix_lifecycle::user_launch_path().map_err(|error| {
@@ -1040,10 +916,6 @@ fn start_and_attach_workspace(
                     child_status = Some(format!("unable to inspect daemon child: {error}"));
                     #[cfg(unix)]
                     reap_detached_daemon(lifecycle);
-                    #[cfg(windows)]
-                    {
-                        lifecycle.spawned_daemon = None;
-                    }
                 }
             }
         }
@@ -1062,7 +934,7 @@ fn reap_detached_daemon(lifecycle: &mut DesktopLifecycle) {
     });
 }
 
-#[cfg(any(windows, unix))]
+#[cfg(unix)]
 fn daemon_start_error(
     config: &DaemonConnectionConfig,
     detail: impl std::fmt::Display,
@@ -1425,16 +1297,6 @@ fn workspace_from_store(workspace_file: &Path) -> Result<PathBuf, DesktopError> 
     }
 }
 
-#[cfg(all(test, windows))]
-fn with_saved_client<T>(
-    workspace_file: &Path,
-    socket_path: Option<PathBuf>,
-    run: impl FnOnce(&mut DaemonClient) -> Result<T, DesktopError>,
-) -> Result<T, DesktopError> {
-    let workspace_root = workspace_from_store(workspace_file)?;
-    with_workspace_client(&workspace_root, socket_path, run)
-}
-
 #[cfg(all(test, unix))]
 fn read_session_from_store(
     workspace_file: &Path,
@@ -1765,23 +1627,11 @@ fn persist_canonical_workspace(
 }
 
 fn replace_workspace_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        lifecycle::replace_file(from, to)
-    }
-    #[cfg(not(windows))]
-    {
-        fs::rename(from, to)
-    }
+    fs::rename(from, to)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    #[cfg(windows)]
-    drop(
-        platonic_client::installer_gate::InstallerStartupGate::acquire()
-            .expect("Plato Agent installation or update is in progress"),
-    );
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -1809,7 +1659,7 @@ pub fn run() {
         .expect("error while running Plato Agent desktop");
 }
 
-#[cfg(all(test, any(unix, windows)))]
+#[cfg(all(test, unix))]
 mod daemon_deadline_tests {
     use super::*;
     use platonic_protocol::{Envelope, EnvelopeKind};
@@ -2106,16 +1956,6 @@ mod daemon_deadline_tests {
                     _directory: Some(directory),
                 }
             }
-            #[cfg(windows)]
-            {
-                Self {
-                    path: PathBuf::from(format!(
-                        r"\\.\pipe\plato-agent-desktop-{name}-{}",
-                        std::process::id()
-                    )),
-                    _directory: None,
-                }
-            }
         }
     }
 
@@ -2123,24 +1963,9 @@ mod daemon_deadline_tests {
     type TestListener = std::os::unix::net::UnixListener;
     #[cfg(unix)]
     type TestStream = std::os::unix::net::UnixStream;
-    #[cfg(windows)]
-    type TestListener = interprocess::local_socket::Listener;
-    #[cfg(windows)]
-    type TestStream = interprocess::local_socket::Stream;
-
     #[cfg(unix)]
     fn bind_endpoint(path: &Path) -> TestListener {
         TestListener::bind(path).unwrap()
-    }
-
-    #[cfg(windows)]
-    fn bind_endpoint(path: &Path) -> TestListener {
-        use interprocess::local_socket::{GenericFilePath, ListenerOptions, prelude::*};
-
-        ListenerOptions::new()
-            .name(path.as_os_str().to_fs_name::<GenericFilePath>().unwrap())
-            .create_sync()
-            .unwrap()
     }
 
     #[cfg(unix)]
@@ -2148,21 +1973,9 @@ mod daemon_deadline_tests {
         listener.accept().unwrap().0
     }
 
-    #[cfg(windows)]
-    fn accept_endpoint(listener: &TestListener) -> TestStream {
-        use interprocess::local_socket::prelude::*;
-
-        listener.accept().unwrap()
-    }
-
     #[cfg(unix)]
     fn clone_stream(stream: &TestStream) -> TestStream {
         stream.try_clone().unwrap()
-    }
-
-    #[cfg(windows)]
-    fn clone_stream(stream: &TestStream) -> TestStream {
-        interprocess::TryClone::try_clone(stream).unwrap()
     }
 }
 

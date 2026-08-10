@@ -29,8 +29,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(windows)]
-use std::fs;
 #[cfg(unix)]
 use std::{
     fs::{self, DirBuilder, Permissions},
@@ -130,8 +128,6 @@ impl BoundEndpoint {
     fn bind(socket_path: PathBuf, reclaim_default_socket: bool) -> AppResult<Self> {
         #[cfg(unix)]
         prepare_socket_for_bind(&socket_path, reclaim_default_socket)?;
-        #[cfg(windows)]
-        let _ = reclaim_default_socket;
         let listener = transport::bind(&socket_path)?;
         #[cfg(unix)]
         let (socket_device, socket_inode) = bound_socket_identity(&socket_path)?;
@@ -283,12 +279,6 @@ impl HostDaemonServer {
             prepare_runtime_path(&runtime_home, &lock_path)?;
             prepare_socket_parent(&runtime_home, &socket_path)?;
         }
-        #[cfg(windows)]
-        fs::create_dir_all(
-            lock_path
-                .parent()
-                .expect("default Windows host lock path has a parent"),
-        )?;
         let lock = HostProcessLock::acquire_for_host(lock_path, &socket_path)?;
         let endpoint = BoundEndpoint::bind(socket_path.clone(), true)?;
         Ok(Self {
@@ -978,31 +968,6 @@ mod connection_tests {
             .into_iter()
             .map(|errno| io::Error::from_raw_os_error(errno.raw_os_error())),
         );
-
-        #[cfg(windows)]
-        {
-            use windows_sys::Win32::Foundation::{
-                ERROR_COMMITMENT_LIMIT, ERROR_NO_SYSTEM_RESOURCES, ERROR_NONPAGED_SYSTEM_RESOURCES,
-                ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY,
-                ERROR_PAGED_SYSTEM_RESOURCES, ERROR_TOO_MANY_OPEN_FILES, ERROR_WORKING_SET_QUOTA,
-            };
-
-            errors.extend(
-                [
-                    ERROR_TOO_MANY_OPEN_FILES,
-                    ERROR_NOT_ENOUGH_MEMORY,
-                    ERROR_OUTOFMEMORY,
-                    ERROR_NO_SYSTEM_RESOURCES,
-                    ERROR_NONPAGED_SYSTEM_RESOURCES,
-                    ERROR_PAGED_SYSTEM_RESOURCES,
-                    ERROR_WORKING_SET_QUOTA,
-                    ERROR_COMMITMENT_LIMIT,
-                    ERROR_NOT_ENOUGH_QUOTA,
-                ]
-                .into_iter()
-                .map(|code| io::Error::from_raw_os_error(code as i32)),
-            );
-        }
 
         errors
     }

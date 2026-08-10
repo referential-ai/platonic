@@ -12,8 +12,6 @@
 		"tauri:build": "tauri build --no-bundle",
 		"stage:linux-sidecar": "node scripts/stage-linux-sidecar.mjs",
 		"tauri:bundle:linux": "npm run stage:linux-sidecar && tauri build --target x86_64-unknown-linux-gnu --bundles appimage --config src-tauri/tauri.linux-package.conf.json",
-		"stage:windows-sidecar": "node scripts/stage-windows-sidecar.mjs",
-		"tauri:bundle:windows": "npm run stage:windows-sidecar && tauri build --target x86_64-pc-windows-msvc --bundles nsis --config src-tauri/tauri.windows-package.conf.json --no-sign",
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",

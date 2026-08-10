@@ -215,8 +215,6 @@ impl CliEnvironment {
         command
             .env("XDG_RUNTIME_DIR", &self.runtime)
             .env("XDG_STATE_HOME", &self.state);
-        #[cfg(windows)]
-        command.env("LOCALAPPDATA", &self.state);
         command
     }
 }

@@ -279,7 +279,7 @@ remote_ceiling = "yolo"
         )
         .unwrap();
 
-        let home_env = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let home_env = "HOME";
         for through_environment in [false, true] {
             temp_env::with_vars(
                 [

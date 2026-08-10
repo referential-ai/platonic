@@ -1874,8 +1874,7 @@ mod tests {
                 assert!(
                     message.contains("timed out")
                         || message.contains("would block")
-                        || message.contains("temporarily unavailable")
-                        || (cfg!(windows) && message.contains("os error 10060")),
+                        || message.contains("temporarily unavailable"),
                     "unexpected provider error: {message}"
                 );
             }

@@ -1,6 +1,6 @@
 use platonic_client::{ClientError, client::DaemonClient};
 use platonic_core::{AgentId, EffectClass, HarnessEvent};
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(target_os = "linux")]
 use platonic_protocol::RunStateName;
 use platonic_protocol::{
     BufferedThreadEvent, CAPABILITY_AGENT_CREATE, CAPABILITY_AGENT_LIST, CAPABILITY_AGENT_STATUS,
@@ -32,7 +32,7 @@ const PROOF_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 static SCENARIO_SERIAL: Mutex<()> = Mutex::new(());
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(target_os = "linux")]
 #[test]
 fn killed_wedged_child_has_no_ledger_handle_and_other_run_stays_healthy() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
@@ -1064,8 +1064,6 @@ struct ProofContext {
     runtime_root: PathBuf,
     #[cfg(unix)]
     state_root: PathBuf,
-    #[cfg(windows)]
-    local_app_data: PathBuf,
 }
 
 #[cfg(unix)]
@@ -1124,15 +1122,10 @@ impl ProofContext {
             runtime_root.join("platonic/host/agent.sock").display()
         );
 
-        #[cfg(windows)]
-        let local_app_data = root.path().join("local-app-data");
-
         // The server store sits beside the workspaces directory, not inside
         // any one workspace.
         #[cfg(unix)]
         let server_db_path = state_root.join("platonic").join("server.db");
-        #[cfg(windows)]
-        let server_db_path = local_app_data.join("platonic").join("server.db");
 
         Self {
             config_path: workspace.join("plato.toml"),
@@ -1143,8 +1136,6 @@ impl ProofContext {
             runtime_root,
             #[cfg(unix)]
             state_root,
-            #[cfg(windows)]
-            local_app_data,
         }
     }
 
@@ -1170,10 +1161,6 @@ impl ProofContext {
                 .join("host")
                 .join("agent.sock")
         }
-        #[cfg(windows)]
-        {
-            PathBuf::from(r"\\.\pipe\plato-agent-host")
-        }
     }
 
     fn apply_environment(&self, command: &mut Command) {
@@ -1181,8 +1168,6 @@ impl ProofContext {
         command
             .env("XDG_RUNTIME_DIR", &self.runtime_root)
             .env("XDG_STATE_HOME", &self.state_root);
-        #[cfg(windows)]
-        command.env("LOCALAPPDATA", &self.local_app_data);
         command
             .env(API_KEY_ENV, "test-key")
             .env("PLATO_CONFIG", &self.config_path);
@@ -1363,7 +1348,7 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> ExitStatus {
     }
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(target_os = "linux")]
 fn wait_for_terminal_status(client: &mut DaemonClient, run_id: &str) -> RunStateName {
     let deadline = Instant::now() + PROOF_TIMEOUT;
     loop {
@@ -1428,107 +1413,6 @@ fn wait_for_platform_process_absence(pid: u32) {
     }
 }
 
-#[cfg(windows)]
-fn platform_direct_children(parent: u32) -> HashSet<u32> {
-    windows_processes()
-        .into_iter()
-        .filter_map(|(pid, process_parent)| (process_parent == parent).then_some(pid))
-        .collect()
-}
-
-#[cfg(windows)]
-fn kill_process_exact(pid: u32) {
-    windows_process_proof::kill(pid).unwrap();
-}
-
-#[cfg(windows)]
-fn wait_for_platform_process_absence(pid: u32) {
-    let deadline = Instant::now() + PROOF_TIMEOUT;
-    while windows_processes()
-        .into_iter()
-        .any(|(current, _)| current == pid)
-    {
-        assert!(
-            Instant::now() < deadline,
-            "run child process {pid} remained after lifecycle cleanup"
-        );
-        thread::yield_now();
-    }
-}
-
-#[cfg(windows)]
-fn windows_processes() -> Vec<(u32, u32)> {
-    windows_process_proof::list().unwrap()
-}
-
-#[cfg(windows)]
-mod windows_process_proof {
-    #![allow(unsafe_code)]
-
-    use std::{
-        io, mem,
-        os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
-    };
-    use windows_sys::Win32::{
-        Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
-        System::{
-            Diagnostics::ToolHelp::{
-                CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-                TH32CS_SNAPPROCESS,
-            },
-            Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess},
-        },
-    };
-
-    pub(super) fn list() -> io::Result<Vec<(u32, u32)>> {
-        // SAFETY: the snapshot handle is checked before ownership is assumed.
-        let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if raw == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: CreateToolhelp32Snapshot returned a new owned handle.
-        let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
-        let mut entry = PROCESSENTRY32W {
-            dwSize: mem::size_of::<PROCESSENTRY32W>()
-                .try_into()
-                .expect("PROCESSENTRY32W size fits u32"),
-            ..Default::default()
-        };
-        // SAFETY: snapshot is live and entry is initialized writable storage.
-        if unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut processes = Vec::new();
-        loop {
-            processes.push((entry.th32ProcessID, entry.th32ParentProcessID));
-            // SAFETY: snapshot and entry remain live for enumeration.
-            if unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) } == 0 {
-                let error = io::Error::last_os_error();
-                return if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
-                    Ok(processes)
-                } else {
-                    Err(error)
-                };
-            }
-        }
-    }
-
-    pub(super) fn kill(pid: u32) -> io::Result<()> {
-        // SAFETY: the returned process handle is checked before ownership is assumed.
-        let raw = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-        if raw.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: OpenProcess returned a new owned handle.
-        let process = unsafe { OwnedHandle::from_raw_handle(raw) };
-        // SAFETY: process is live and was opened with PROCESS_TERMINATE.
-        if unsafe { TerminateProcess(process.as_raw_handle(), 137) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-}
-
 fn read_pipe(pipe: Option<impl Read>) -> String {
     let mut output = String::new();
     if let Some(mut pipe) = pipe {
@@ -1540,7 +1424,7 @@ fn read_pipe(pipe: Option<impl Read>) -> String {
 #[derive(Clone, Copy, Debug)]
 enum UsageFixture {
     Known(u32, u32),
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     Unknown,
 }
 
@@ -1620,7 +1504,7 @@ fn event_stream(events: [Value; 2], usage: UsageFixture) -> String {
                 })
             ));
         }
-        #[cfg(any(target_os = "linux", windows))]
+        #[cfg(target_os = "linux")]
         UsageFixture::Unknown => {}
     }
     body.push_str("data: [DONE]\n\n");
@@ -1792,7 +1676,7 @@ impl Drop for ControlledThreadProvider {
     }
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(target_os = "linux")]
 struct KillIsolationProvider {
     base_url: String,
     first_requested: mpsc::Receiver<()>,
@@ -1801,7 +1685,7 @@ struct KillIsolationProvider {
     handle: thread::JoinHandle<()>,
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(target_os = "linux")]
 impl KillIsolationProvider {
     fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

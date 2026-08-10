@@ -246,9 +246,6 @@ fn server_binary() -> AppResult<PathBuf> {
     let parent = current
         .parent()
         .ok_or_else(|| AppError::Config(format!("cannot find sibling of {}", current.display())))?;
-    #[cfg(windows)]
-    let names = ["platonic.exe", "platonic-real.exe"];
-    #[cfg(not(windows))]
     let names = ["platonic", "platonic-real"];
     for name in names {
         let sibling = parent.join(name);

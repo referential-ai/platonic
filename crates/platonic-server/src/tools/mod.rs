@@ -24,8 +24,6 @@ use std::{
 };
 #[cfg(unix)]
 use std::{os::unix::process::CommandExt, process::Child};
-#[cfg(windows)]
-use {self::windows_shell::JobChild, std::os::windows::process::CommandExt};
 
 pub(crate) const PLATONIC_MEMORY_FILENAME: &str = "PLATONIC.md";
 pub(crate) const PLATONIC_MEMORY_MAX_BYTES: usize = 8_192;
@@ -57,180 +55,8 @@ const SHELL_ENV_ALLOWLIST: &[&str] = &[
     "CARGO_HOME",
     "RUSTUP_HOME",
 ];
-#[cfg(windows)]
-const WINDOWS_SHELL_ENV_ALLOWLIST: &[&str] = &[
-    "PATHEXT",
-    "SYSTEMROOT",
-    "COMSPEC",
-    "USERPROFILE",
-    "HOMEDRIVE",
-    "HOMEPATH",
-];
-
 #[cfg(unix)]
 type ShellChild = Child;
-#[cfg(windows)]
-type ShellChild = Option<JobChild>;
-
-#[cfg(windows)]
-mod windows_shell {
-    #![allow(unsafe_code)]
-
-    use std::{
-        io, mem,
-        os::windows::{
-            io::{AsRawHandle, FromRawHandle, OwnedHandle},
-            process::CommandExt,
-        },
-        process::{Child, Command, ExitStatus},
-        ptr,
-    };
-    use windows_sys::Win32::{
-        Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
-        System::{
-            Diagnostics::ToolHelp::{
-                CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
-                Thread32Next,
-            },
-            JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-                SetInformationJobObject,
-            },
-            Threading::{CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
-        },
-    };
-
-    pub(super) struct JobChild {
-        child: Child,
-        job: Option<OwnedHandle>,
-    }
-
-    impl JobChild {
-        pub(super) fn spawn(command: &mut Command) -> io::Result<Self> {
-            command.creation_flags(CREATE_SUSPENDED);
-            let job = create_kill_on_close_job()?;
-            let mut child = command.spawn()?;
-            if let Err(error) = assign_to_job(&child, &job) {
-                if child.kill().is_ok() {
-                    let _ = child.wait();
-                }
-                return Err(error);
-            }
-            if let Err(error) = resume_process(child.id()) {
-                drop(job);
-                let _ = child.wait();
-                return Err(error);
-            }
-            Ok(Self {
-                child,
-                job: Some(job),
-            })
-        }
-
-        pub(super) fn inner(&mut self) -> &mut Child {
-            &mut self.child
-        }
-
-        pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-            self.child.try_wait()
-        }
-    }
-
-    impl Drop for JobChild {
-        fn drop(&mut self) {
-            drop(self.job.take());
-        }
-    }
-
-    fn create_kill_on_close_job() -> io::Result<OwnedHandle> {
-        // SAFETY: null attributes/name request an unnamed, non-inheritable job.
-        let raw = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-        if raw.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: CreateJobObjectW returned a new owned handle.
-        let job = unsafe { OwnedHandle::from_raw_handle(raw) };
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        // SAFETY: job is live and limits points to the documented fixed-size structure.
-        if unsafe {
-            SetInformationJobObject(
-                job.as_raw_handle(),
-                JobObjectExtendedLimitInformation,
-                (&raw const limits).cast(),
-                mem::size_of_val(&limits)
-                    .try_into()
-                    .expect("job limits size fits u32"),
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(job)
-    }
-
-    fn assign_to_job(child: &Child, job: &OwnedHandle) -> io::Result<()> {
-        // SAFETY: both handles stay live through the assignment.
-        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    fn resume_process(process_id: u32) -> io::Result<()> {
-        // SAFETY: the snapshot handle is checked before ownership is assumed.
-        let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if raw == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: CreateToolhelp32Snapshot returned a new owned handle.
-        let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
-        let mut entry = THREADENTRY32 {
-            dwSize: mem::size_of::<THREADENTRY32>()
-                .try_into()
-                .expect("THREADENTRY32 size fits u32"),
-            ..Default::default()
-        };
-        // SAFETY: snapshot is live and entry points to initialized writable storage.
-        if unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        let mut resumed = false;
-        loop {
-            if entry.th32OwnerProcessID == process_id {
-                // SAFETY: the returned thread handle is checked before ownership is assumed.
-                let raw = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-                if raw.is_null() {
-                    return Err(io::Error::last_os_error());
-                }
-                // SAFETY: OpenThread returned a new owned handle.
-                let thread = unsafe { OwnedHandle::from_raw_handle(raw) };
-                // SAFETY: thread is live and was opened with THREAD_SUSPEND_RESUME.
-                if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
-                    return Err(io::Error::last_os_error());
-                }
-                resumed = true;
-            }
-
-            // SAFETY: snapshot and entry remain live for the enumeration.
-            if unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } == 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
-                    return Err(error);
-                }
-                break;
-            }
-        }
-        if !resumed {
-            return Err(io::Error::other(
-                "Windows shell process had no thread to resume",
-            ));
-        }
-        Ok(())
-    }
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -718,8 +544,6 @@ fn shell_exec(
         }
         thread::sleep(Duration::from_millis(20));
     };
-    #[cfg(windows)]
-    close_shell_job(&mut child);
     let stdout = join_output_reader(stdout_reader)?;
     let stderr = join_output_reader(stderr_reader)?;
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -770,28 +594,9 @@ fn spawn_shell(command: &str, cwd: &Path, env: Vec<(String, String)>) -> io::Res
         .spawn()
 }
 
-#[cfg(windows)]
-fn spawn_shell(command: &str, cwd: &Path, env: Vec<(String, String)>) -> io::Result<ShellChild> {
-    let mut process = Command::new(crate::windows_security::system_cmd_path()?);
-    process
-        .arg("/C")
-        .raw_arg(command)
-        .current_dir(cwd)
-        .env_clear()
-        .envs(env)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    JobChild::spawn(&mut process).map(Some)
-}
-
 #[cfg(unix)]
 fn take_shell_stdout(child: &mut ShellChild) -> Option<ChildStdout> {
     child.stdout.take()
-}
-
-#[cfg(windows)]
-fn take_shell_stdout(child: &mut ShellChild) -> Option<ChildStdout> {
-    child.as_mut()?.inner().stdout.take()
 }
 
 #[cfg(unix)]
@@ -799,22 +604,9 @@ fn take_shell_stderr(child: &mut ShellChild) -> Option<ChildStderr> {
     child.stderr.take()
 }
 
-#[cfg(windows)]
-fn take_shell_stderr(child: &mut ShellChild) -> Option<ChildStderr> {
-    child.as_mut()?.inner().stderr.take()
-}
-
 #[cfg(unix)]
 fn try_wait_shell(child: &mut ShellChild) -> io::Result<Option<std::process::ExitStatus>> {
     child.try_wait()
-}
-
-#[cfg(windows)]
-fn try_wait_shell(child: &mut ShellChild) -> io::Result<Option<std::process::ExitStatus>> {
-    child
-        .as_mut()
-        .expect("live shell job is present")
-        .try_wait()
 }
 
 #[cfg(unix)]
@@ -824,17 +616,6 @@ fn terminate_shell(child: &mut ShellChild) -> io::Result<Option<std::process::Ex
     }
     let _ = child.kill();
     child.wait().map(Some)
-}
-
-#[cfg(windows)]
-fn terminate_shell(child: &mut ShellChild) -> io::Result<Option<std::process::ExitStatus>> {
-    close_shell_job(child);
-    Ok(None)
-}
-
-#[cfg(windows)]
-fn close_shell_job(child: &mut ShellChild) {
-    drop(child.take());
 }
 
 fn normalize_timeout_seconds(timeout_seconds: Option<u64>) -> u64 {
@@ -895,23 +676,12 @@ fn shell_env_name_is_allowlisted(name: &str) -> bool {
     {
         SHELL_ENV_ALLOWLIST.contains(&name)
     }
-    #[cfg(windows)]
-    {
-        SHELL_ENV_ALLOWLIST
-            .iter()
-            .chain(WINDOWS_SHELL_ENV_ALLOWLIST)
-            .any(|allowed| allowed.eq_ignore_ascii_case(name))
-    }
 }
 
 fn shell_env_names_equal(left: &str, right: &str) -> bool {
     #[cfg(unix)]
     {
         left == right
-    }
-    #[cfg(windows)]
-    {
-        left.eq_ignore_ascii_case(right)
     }
 }
 
@@ -1241,11 +1011,6 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
     use std::sync::Mutex;
-
-    #[cfg(windows)]
-    const WINDOWS_PROCESS_REPEAT_COUNT: usize = 25;
-    #[cfg(windows)]
-    const WINDOWS_DESCENDANT_TIMEOUT_SECONDS: u64 = 5;
 
     #[test]
     fn thread_spawn_executes_only_with_host_handler_and_approving_actor() {
@@ -2059,12 +1824,6 @@ mod tests {
             .iter()
             .map(|name| ((*name).into(), format!("baseline-{name}").into()))
             .collect::<Vec<_>>();
-        #[cfg(windows)]
-        vars.extend(
-            WINDOWS_SHELL_ENV_ALLOWLIST
-                .iter()
-                .map(|name| ((*name).into(), format!("baseline-{name}").into())),
-        );
         vars.extend([
             (
                 "PLATONIC_CUSTOM_PROVIDER".into(),
@@ -2093,12 +1852,6 @@ mod tests {
             .iter()
             .map(|name| ((*name).into(), format!("baseline-{name}").into()))
             .collect::<Vec<_>>();
-        #[cfg(windows)]
-        expected.extend(
-            WINDOWS_SHELL_ENV_ALLOWLIST
-                .iter()
-                .map(|name| ((*name).into(), format!("baseline-{name}").into())),
-        );
         expected.push((
             "PLATONIC_CUSTOM_PROVIDER".into(),
             "provider-sentinel".into(),
@@ -2189,56 +1942,6 @@ mod tests {
                 )
             ]
         );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn supervised_run_child_env_matches_windows_provider_names_case_insensitively() {
-        let env = supervised_run_child_env_from(
-            [(
-                "Platonic_Custom_Provider".into(),
-                "provider-sentinel".into(),
-            )],
-            "PLATONIC_CUSTOM_PROVIDER",
-        )
-        .unwrap();
-
-        assert_eq!(
-            env,
-            [(
-                "PLATONIC_CUSTOM_PROVIDER".into(),
-                "provider-sentinel".into()
-            )]
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn shell_env_matches_windows_names_case_insensitively() {
-        let env = shell_child_env_from(
-            vec![
-                ("Path".into(), r"C:\Windows\System32".into()),
-                ("pathext".into(), ".COM;.EXE;.BAT;.CMD".into()),
-                ("systemroot".into(), r"C:\Windows".into()),
-                ("ComSpec".into(), r"C:\Windows\System32\cmd.exe".into()),
-                ("UserProfile".into(), r"C:\Users\runner".into()),
-                ("homeDrive".into(), "C:".into()),
-                ("homePath".into(), r"\Users\runner".into()),
-                ("temp".into(), r"C:\Temp".into()),
-                ("TmP".into(), r"C:\Temp".into()),
-                ("Home".into(), "provider-secret".into()),
-                ("OpenRouter_Api_Key".into(), "credential-secret".into()),
-            ],
-            Some("HOME"),
-        );
-
-        assert_eq!(env.len(), 9);
-        assert!(env.iter().any(|(name, _)| name == "Path"));
-        assert!(env.iter().any(|(name, _)| name == "pathext"));
-        assert!(env.iter().any(|(name, _)| name == "systemroot"));
-        assert!(env.iter().any(|(name, _)| name == "ComSpec"));
-        assert!(!env.iter().any(|(name, _)| name == "Home"));
-        assert!(!env.iter().any(|(name, _)| name == "OpenRouter_Api_Key"));
     }
 
     #[test]
@@ -2435,291 +2138,5 @@ mod tests {
             err,
             AppError::Tool(message) if message == "shell.exec canceled"
         ));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn shell_exec_uses_cmd_grammar_and_workspace_cwd() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("probe.cmd"),
-            "@echo off\r\necho batch-ok\r\n",
-        )
-        .unwrap();
-
-        let result = execute_tool(
-            dir.path(),
-            ToolCallId::new("call_1").unwrap(),
-            SHELL_EXEC,
-            json!({"command": "probe&&echo chained"}),
-        )
-        .unwrap();
-
-        assert_eq!(result.data["exit_code"], 0);
-        assert_eq!(
-            result.data["cwd"].as_str().unwrap(),
-            dir.path().canonicalize().unwrap().to_string_lossy()
-        );
-        let stdout = result.data["stdout"].as_str().unwrap();
-        assert!(stdout.contains("batch-ok"));
-        assert!(stdout.contains("chained"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn shell_exec_finds_cmd_files_on_user_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("user-bin");
-        fs::create_dir(&bin).unwrap();
-        fs::write(bin.join("cmd.exe"), "not a Windows executable").unwrap();
-        fs::write(
-            bin.join("user-probe.cmd"),
-            "@echo off\r\necho user-path-ok\r\n",
-        )
-        .unwrap();
-
-        let result = temp_env::with_vars(
-            [
-                ("PATH", Some(bin.as_os_str())),
-                ("PATHEXT", Some(std::ffi::OsStr::new(".EXE;.CMD"))),
-            ],
-            || {
-                execute_tool(
-                    dir.path(),
-                    ToolCallId::new("call_1").unwrap(),
-                    SHELL_EXEC,
-                    json!({"command": "user-probe"}),
-                )
-                .unwrap()
-            },
-        );
-
-        assert_eq!(result.data["exit_code"], 0);
-        assert!(
-            result.data["stdout"]
-                .as_str()
-                .unwrap()
-                .contains("user-path-ok")
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn shell_exec_records_windows_nonzero_exit() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = execute_tool(
-            dir.path(),
-            ToolCallId::new("call_1").unwrap(),
-            SHELL_EXEC,
-            json!({"command": "echo fail 1>&2&&exit /b 7"}),
-        )
-        .unwrap();
-
-        assert_eq!(result.data["exit_code"], 7);
-        assert!(result.data["stderr"].as_str().unwrap().contains("fail"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn shell_exec_timeout_kills_windows_descendants() {
-        for iteration in 1..=WINDOWS_PROCESS_REPEAT_COUNT {
-            eprintln!("shell timeout descendant proof {iteration}/{WINDOWS_PROCESS_REPEAT_COUNT}");
-            shell_exec_timeout_kills_windows_descendants_once();
-        }
-    }
-
-    #[cfg(windows)]
-    fn shell_exec_timeout_kills_windows_descendants_once() {
-        let dir = tempfile::tempdir().unwrap();
-        write_windows_descendant_probe(dir.path());
-        let path_without_ping = dir.path().join("path-without-ping");
-        fs::create_dir(&path_without_ping).unwrap();
-        let started_path = dir.path().join("descendant-started.txt");
-        let survived_path = dir.path().join("descendant-survived.txt");
-
-        let err = execute_tool(
-            dir.path(),
-            ToolCallId::new("call_1").unwrap(),
-            SHELL_EXEC,
-            json!({
-                "command": r#"set "PATH=path-without-ping"&&.\descendant-probe.cmd"#,
-                "timeout_seconds": WINDOWS_DESCENDANT_TIMEOUT_SECONDS
-            }),
-        )
-        .unwrap_err();
-        let expected_error =
-            format!("shell.exec timed out after {WINDOWS_DESCENDANT_TIMEOUT_SECONDS}s");
-
-        assert!(
-            matches!(
-                &err,
-                AppError::Tool(message) if message == &expected_error
-            ),
-            "descendant fixture {} returned {err}",
-            dir.path().display()
-        );
-        assert!(
-            started_path.exists(),
-            "descendant fixture did not record its pid at {}",
-            started_path.display()
-        );
-        assert_windows_descendant_stopped(&started_path);
-        assert!(
-            !survived_path.exists(),
-            "descendant fixture survived timeout and wrote {}",
-            survived_path.display()
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn shell_exec_cancel_kills_windows_descendants() {
-        for iteration in 1..=WINDOWS_PROCESS_REPEAT_COUNT {
-            eprintln!("shell cancel descendant proof {iteration}/{WINDOWS_PROCESS_REPEAT_COUNT}");
-            shell_exec_cancel_kills_windows_descendants_once();
-        }
-    }
-
-    #[cfg(windows)]
-    fn shell_exec_cancel_kills_windows_descendants_once() {
-        let dir = tempfile::tempdir().unwrap();
-        write_windows_descendant_probe(dir.path());
-        let path_without_ping = dir.path().join("path-without-ping");
-        fs::create_dir(&path_without_ping).unwrap();
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
-        let cancel_for_thread = std::sync::Arc::clone(&cancel);
-        let started_path = dir.path().join("descendant-started.txt");
-        let survived_path = dir.path().join("descendant-survived.txt");
-        let started_for_canceler = started_path.clone();
-        let canceler = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !started_for_canceler.exists() {
-                assert!(
-                    Instant::now() < deadline,
-                    "descendant fixture did not record its pid before cancel deadline at {}",
-                    started_for_canceler.display()
-                );
-                thread::sleep(Duration::from_millis(20));
-            }
-            cancel_for_thread.store(true, Ordering::SeqCst);
-        });
-
-        let err = execute_tool_with_context(
-            ToolExecutionContext {
-                workspace_root: dir.path(),
-                provider_api_key_env: None,
-                cancel: Some(cancel.as_ref()),
-                thread_spawn: None,
-                approving_actor: None,
-            },
-            ToolCallId::new("call_1").unwrap(),
-            SHELL_EXEC,
-            json!({
-                "command": r#"set "PATH=path-without-ping"&&.\descendant-probe.cmd"#,
-                "timeout_seconds": 10
-            }),
-        )
-        .unwrap_err();
-        canceler.join().unwrap();
-
-        assert!(
-            matches!(
-                &err,
-                AppError::Tool(message) if message == "shell.exec canceled"
-            ),
-            "descendant fixture {} returned {err}",
-            dir.path().display()
-        );
-        assert_windows_descendant_stopped(&started_path);
-        assert!(
-            !survived_path.exists(),
-            "descendant fixture survived cancellation and wrote {}",
-            survived_path.display()
-        );
-    }
-
-    #[cfg(windows)]
-    fn write_windows_descendant_probe(workspace: &Path) {
-        let helper = env::current_exe()
-            .unwrap_or_else(|error| panic!("failed to locate Windows descendant helper: {error}"));
-        let script = workspace.join("descendant-probe.cmd");
-        fs::write(
-            &script,
-            format!(
-                concat!(
-                    "@echo off\r\n",
-                    "\"{}\" ",
-                    "--exact tools::tests::windows_descendant_probe_child --ignored --nocapture\r\n",
-                ),
-                helper.display()
-            ),
-        )
-        .unwrap_or_else(|error| {
-            panic!(
-                "failed to write descendant command fixture {}: {error}",
-                script.display()
-            )
-        });
-    }
-
-    #[cfg(windows)]
-    fn assert_windows_descendant_stopped(started_path: &Path) {
-        let pid = fs::read_to_string(started_path)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "failed to read descendant pid fixture {}: {error}",
-                    started_path.display()
-                )
-            })
-            .trim()
-            .parse()
-            .unwrap_or_else(|error| {
-                panic!(
-                    "invalid descendant pid fixture {}: {error}",
-                    started_path.display()
-                )
-            });
-        let process =
-            crate::windows_security::CurrentUserProcess::open(pid).unwrap_or_else(|error| {
-                panic!(
-                    "failed to inspect descendant process {pid} from {}: {error}",
-                    started_path.display()
-                )
-            });
-        if let Some(process) = process {
-            assert!(
-                process
-                    .wait_until(Instant::now() + Duration::from_secs(5))
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "failed to wait for descendant process {pid} from {}: {error}",
-                            started_path.display()
-                        )
-                    }),
-                "descendant process {pid} from {} survived job termination",
-                started_path.display()
-            );
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "subprocess child for the Windows descendant termination proof"]
-    fn windows_descendant_probe_child() {
-        let started_path = Path::new("descendant-started.txt");
-        fs::write(started_path, std::process::id().to_string()).unwrap_or_else(|error| {
-            panic!(
-                "failed to write descendant pid fixture {}: {error}",
-                started_path.display()
-            )
-        });
-        thread::sleep(Duration::from_secs(30));
-        let survived_path = Path::new("descendant-survived.txt");
-        fs::write(survived_path, b"survived").unwrap_or_else(|error| {
-            panic!(
-                "failed to write descendant survival fixture {}: {error}",
-                survived_path.display()
-            )
-        });
     }
 }

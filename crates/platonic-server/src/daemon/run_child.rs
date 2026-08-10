@@ -1670,9 +1670,6 @@ mod tests {
     #[test]
     fn resolver_uses_the_platform_executable_name() {
         let name = format!("platonic{}", std::env::consts::EXE_SUFFIX);
-        #[cfg(windows)]
-        assert_eq!(name, "platonic.exe");
-        #[cfg(not(windows))]
         assert_eq!(name, "platonic");
     }
 

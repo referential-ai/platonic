@@ -26,9 +26,6 @@ pub mod tools;
 
 pub use tools::github::issues as issue_prep;
 
-#[cfg(windows)]
-mod windows_security;
-
 pub use app::{
     ApprovalMode, ApprovalRequest, AssistantDeltaEvent, RunEvent, RunLedger, RunOptions,
     RunOutcome, RunSession, new_run_id, new_session_id, run_question,

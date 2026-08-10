@@ -468,19 +468,6 @@ fn open_final_component_no_follow(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-#[cfg(windows)]
-fn open_final_component_no_follow(path: &Path) -> io::Result<File> {
-    crate::windows_security::open_file_for_identity(path)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_final_component_no_follow(_path: &Path) -> io::Result<File> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "opening workspace memory without following the final component is unsupported",
-    ))
-}
-
 fn provider_system_context(platonic_memory: Option<&str>) -> String {
     provider_system_context_with_interruption(platonic_memory, None)
 }
@@ -3292,12 +3279,6 @@ base_url = "http://{}"
                 }]
             })
         };
-        #[cfg(windows)]
-        let write_commands = (
-            r#"echo|set /p="first">session-grant.txt"#,
-            r#"echo|set /p="second">>session-grant.txt"#,
-        );
-        #[cfg(not(windows))]
         let write_commands = (
             "printf first > session-grant.txt",
             "printf second >> session-grant.txt",

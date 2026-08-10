@@ -207,13 +207,8 @@ fn run() -> AppResult<()> {
 }
 
 fn serve() -> AppResult<()> {
-    #[cfg(windows)]
-    let installer_gate =
-        platonic_client::installer_gate::InstallerStartupGate::acquire_for_daemon_startup()?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let server = HostDaemonServer::bind()?;
-    #[cfg(windows)]
-    drop(installer_gate);
     let socket_path = server.socket_path().to_path_buf();
     eprintln!("daemon_scope: host");
     eprintln!("socket_path: {}", socket_path.display());
@@ -324,16 +319,6 @@ fn install_shutdown_handler(shutdown: Arc<AtomicBool>, socket_path: PathBuf) -> 
             request_shutdown(&shutdown, &socket_path);
         }
     });
-    Ok(())
-}
-
-#[cfg(windows)]
-fn install_shutdown_handler(shutdown: Arc<AtomicBool>, socket_path: PathBuf) -> AppResult<()> {
-    ctrlc::set_handler(move || request_shutdown(&shutdown, &socket_path)).map_err(|error| {
-        std::io::Error::other(format!(
-            "failed to install console control handler: {error}"
-        ))
-    })?;
     Ok(())
 }
 

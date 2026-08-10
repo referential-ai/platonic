@@ -37,8 +37,6 @@ pub struct DaemonClient {
     request_timeout: Option<Duration>,
 }
 
-#[cfg(windows)]
-const CONTROL_RESPONSE_LIMIT: u64 = 64 * 1024;
 impl DaemonClient {
     /// Connects to a daemon endpoint using the platform's ordinary connect bound.
     pub fn connect(socket_path: &Path) -> ClientResult<Self> {
@@ -65,13 +63,6 @@ impl DaemonClient {
         transport::clear_deadline(&mut self.writer)?;
         self.request_timeout = None;
         Ok(())
-    }
-
-    #[cfg(windows)]
-    /// Connects to the named-pipe server identified by lock metadata.
-    pub fn connect_expected_server(socket_path: &Path, expected_pid: u32) -> ClientResult<Self> {
-        let writer = transport::connect_expected_server(socket_path, expected_pid)?;
-        Self::from_stream(writer, Some(CONTROL_RESPONSE_LIMIT), None)
     }
 
     fn from_stream(
@@ -556,11 +547,6 @@ impl DaemonClient {
         let mut request = serde_json::to_vec(&envelope)?;
         request.push(b'\n');
         let deadline = self.request_timeout.map(|timeout| Instant::now() + timeout);
-        #[cfg(windows)]
-        if deadline.is_none() && self.response_limit.is_some() {
-            transport::reset_deadline(self.reader.get_mut());
-            transport::reset_deadline(&mut self.writer);
-        }
         if let Some(deadline) = deadline {
             transport::set_deadline(self.reader.get_mut(), deadline)?;
             transport::set_deadline(&mut self.writer, deadline)?;
@@ -1035,16 +1021,6 @@ mod timeout_tests {
                 Self {
                     path,
                     _directory: Some(directory),
-                }
-            }
-            #[cfg(windows)]
-            {
-                Self {
-                    path: PathBuf::from(format!(
-                        r"\\.\pipe\plato-agent-client-{name}-{}",
-                        std::process::id()
-                    )),
-                    _directory: None,
                 }
             }
         }
