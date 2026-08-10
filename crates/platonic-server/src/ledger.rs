@@ -98,10 +98,26 @@ impl EventRecorder {
         Self::Sqlite(SqliteEventRecorder::from_session(ledger, run_id))
     }
 
-    pub(crate) fn with_session_jsonl(self, ledger: SqliteLedger, run_id: &RunId) -> Self {
+    pub(crate) fn with_session_jsonl_creation(
+        self,
+        ledger: SqliteLedger,
+        run_id: &RunId,
+        created_session: bool,
+    ) -> Self {
         match self {
-            Self::Jsonl(recorder) => Self::Jsonl(recorder.with_session(ledger, run_id)),
+            Self::Jsonl(recorder) => {
+                Self::Jsonl(recorder.with_session(ledger, run_id, created_session))
+            }
             Self::Sqlite(_) => unreachable!("only a JSONL recorder can attach JSONL session state"),
+        }
+    }
+
+    pub(crate) fn discard_empty_session_admission(self) -> AppResult<()> {
+        match self {
+            Self::Jsonl(recorder) => recorder.discard_empty_session_admission(),
+            Self::Sqlite(_) => Err(AppError::Config(
+                "only a JSONL session admission can be discarded".into(),
+            )),
         }
     }
 
@@ -165,6 +181,7 @@ pub struct JsonlEventRecorder {
 struct JsonlSession {
     ledger: SqliteLedger,
     run_id: RunId,
+    created_session: bool,
     open: bool,
     terminal_attempted: bool,
 }
@@ -210,14 +227,46 @@ impl JsonlEventRecorder {
         })
     }
 
-    fn with_session(mut self, ledger: SqliteLedger, run_id: &RunId) -> Self {
+    fn with_session(mut self, ledger: SqliteLedger, run_id: &RunId, created_session: bool) -> Self {
         self.session = Some(JsonlSession {
             ledger,
             run_id: run_id.clone(),
+            created_session,
             open: true,
             terminal_attempted: false,
         });
         self
+    }
+
+    fn discard_empty_session_admission(mut self) -> AppResult<()> {
+        if self.file.metadata()?.len() != 0 {
+            return Err(AppError::Config(
+                "cannot discard a JSONL session admission after recording events".into(),
+            ));
+        }
+        let mut session = self.session.take().ok_or_else(|| {
+            AppError::Config("cannot discard a JSONL recorder without session admission".into())
+        })?;
+        if !session.open || session.terminal_attempted {
+            return Err(AppError::Config(
+                "cannot discard a closed JSONL session admission".into(),
+            ));
+        }
+        let log_path = run_jsonl_path(&session.ledger.path, session.run_id.as_str())?;
+        let row_cleanup = session
+            .ledger
+            .discard_running_session_run(&session.run_id, session.created_session);
+        drop(self);
+        let log_cleanup = fs::remove_file(&log_path).map_err(AppError::Io);
+        match (row_cleanup, log_cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(row), Ok(())) => Err(row),
+            (Ok(()), Err(log)) => Err(log),
+            (Err(row), Err(log)) => Err(AppError::Config(format!(
+                "{row}; failed to remove uncommitted run log {}: {log}",
+                log_path.display()
+            ))),
+        }
     }
 
     pub fn record(&mut self, event: HarnessEvent) -> AppResult<RecordedEvent> {
@@ -802,6 +851,46 @@ impl SqliteLedger {
         touch_session(&transaction, session_id, now)?;
         transaction.commit()?;
         self.session_turns(session_id)
+    }
+
+    fn discard_running_session_run(
+        &mut self,
+        run_id: &RunId,
+        created_session: bool,
+    ) -> AppResult<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session_id = transaction
+            .query_row(
+                "SELECT session_id
+                 FROM session_runs
+                 WHERE run_id = ?1 AND status = ?2",
+                params![run_id.as_str(), RunStateName::Running.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                AppError::Config(format!(
+                    "running session admission is unavailable for cleanup: {run_id}"
+                ))
+            })?;
+        transaction.execute(
+            "DELETE FROM session_runs WHERE run_id = ?1 AND status = ?2",
+            params![run_id.as_str(), RunStateName::Running.as_str()],
+        )?;
+        if created_session {
+            transaction.execute(
+                "DELETE FROM sessions
+                 WHERE session_id = ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM session_runs WHERE session_id = ?1
+                   )",
+                params![session_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn finish_session_run(&mut self, run_id: &RunId, final_answer: &str) -> AppResult<()> {
@@ -3026,7 +3115,7 @@ mod tests {
             .unwrap();
         let mut recorder = JsonlEventRecorder::create(&path)
             .unwrap()
-            .with_session(ledger, &run_id);
+            .with_session(ledger, &run_id, true);
         recorder
             .record(HarnessEvent::RunStarted {
                 run_id: run_id.clone(),
@@ -3909,6 +3998,59 @@ mod tests {
                     .all(|record| record.event.run_id().as_str() == run_id)
             );
         }
+    }
+
+    #[test]
+    fn discarding_empty_jsonl_admission_removes_only_its_owned_session_state() {
+        let root = tempfile::tempdir().unwrap();
+        let location = default_location(root.path());
+        let fresh = RunId::new("run_discard_fresh").unwrap();
+        let mut ledger = SqliteLedger::open_or_create_default(&location).unwrap();
+        ledger
+            .begin_session_run("session_fresh", &fresh, "fresh question", true)
+            .unwrap();
+        let fresh_log = run_jsonl_path(location.as_path(), fresh.as_str()).unwrap();
+        let fresh_recorder = EventRecorder::create_default_jsonl(&location, &fresh)
+            .unwrap()
+            .with_session_jsonl_creation(ledger, &fresh, true);
+
+        fresh_recorder.discard_empty_session_admission().unwrap();
+
+        assert!(!fresh_log.exists());
+        assert!(matches!(
+            SqliteLedger::open_default_readonly(&location)
+                .unwrap()
+                .read_session("session_fresh"),
+            Err(AppError::SessionNotFound(_))
+        ));
+
+        let prior = RunId::new("run_prior").unwrap();
+        let continued = RunId::new("run_discard_continued").unwrap();
+        let mut ledger = SqliteLedger::open_or_create_default(&location).unwrap();
+        ledger
+            .begin_session_run("session_existing", &prior, "prior", true)
+            .unwrap();
+        append_response_prefix(&mut ledger, &prior, "answer", 1);
+        ledger.finish_session_run(&prior, "answer").unwrap();
+        ledger
+            .begin_session_run("session_existing", &continued, "discarded follow up", false)
+            .unwrap();
+        let continued_log = run_jsonl_path(location.as_path(), continued.as_str()).unwrap();
+        let continued_recorder = EventRecorder::create_default_jsonl(&location, &continued)
+            .unwrap()
+            .with_session_jsonl_creation(ledger, &continued, false);
+
+        continued_recorder
+            .discard_empty_session_admission()
+            .unwrap();
+
+        assert!(!continued_log.exists());
+        let session = SqliteLedger::open_default_readonly(&location)
+            .unwrap()
+            .read_session("session_existing")
+            .unwrap();
+        assert_eq!(session.runs.len(), 1);
+        assert_eq!(session.runs[0].run_id, prior.as_str());
     }
 
     #[test]

@@ -348,9 +348,16 @@ fn begin_default_jsonl_session_recorder(
             return Err(error);
         }
     };
-    let recorder = recorder.with_session_jsonl(ledger, run_id);
-    let hydration = hydrated_messages(&turns, question, config, tools, system_context)?;
-    Ok((recorder, hydration))
+    let recorder = recorder.with_session_jsonl_creation(ledger, run_id, session.create_session());
+    match hydrated_messages(&turns, question, config, tools, system_context) {
+        Ok(hydration) => Ok((recorder, hydration)),
+        Err(error) => match recorder.discard_empty_session_admission() {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(AppError::Config(format!(
+                "{error}; failed to discard uncommitted run admission: {cleanup}"
+            ))),
+        },
+    }
 }
 
 fn hydrated_messages(
@@ -516,25 +523,6 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         options.stream_to_stderr,
         options.cancel,
         None,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn run_question_for_thread(
-    options: RunOptions,
-    agent_id: AgentId,
-    toolset: &[String],
-    thread_spawn: Option<ThreadSpawnToolHandler>,
-) -> AppResult<RunOutcome> {
-    let (prepared, mut recorder) = prepare_run_for_thread(&options, Some(agent_id), Some(toolset))?;
-    run_prepared_question(
-        prepared,
-        &mut recorder,
-        options.approval_mode,
-        options.event_sender,
-        options.stream_to_stderr,
-        options.cancel,
-        thread_spawn,
     )
 }
 
@@ -2816,6 +2804,72 @@ base_url = "http://{}"
         assert_eq!(hydration.estimated_tokens_before, expected_before);
         assert_eq!(hydration.estimated_tokens_after, expected_after);
         assert_eq!(hydration.retained_messages, expected_after_messages);
+    }
+
+    #[test]
+    fn preparing_default_session_run_admits_both_storage_facts_before_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let config_path = workspace.join("plato.toml");
+        write_session_test_config(&config_path, "http://127.0.0.1:1", 4_000);
+        let location = DefaultSqlitePath::from_path(
+            root.path()
+                .join("state/platonic/workspaces/admission/ledger.db"),
+        );
+        let run_id = RunId::new("run_parent_admission").unwrap();
+        let options = RunOptions {
+            question: "admitted before execution".into(),
+            config_path: Some(config_path),
+            overrides: RunOverrides::default(),
+            ledger: RunLedger::DefaultSqlite(location.clone()),
+            workspace_root: workspace,
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(run_id.clone()),
+            session: Some(RunSession::Fresh {
+                session_id: "session_parent_admission".into(),
+            }),
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: None,
+            voice_interruption_context: None,
+        };
+
+        let (prepared, recorder) = prepare_run(&options).unwrap();
+        let log_path = run_jsonl_path(location.as_path(), run_id.as_str()).unwrap();
+        let connection = rusqlite::Connection::open(location.as_path()).unwrap();
+        let (session_id, question, status) = connection
+            .query_row(
+                "SELECT session_id, question, status FROM session_runs WHERE run_id = ?1",
+                rusqlite::params![run_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(prepared.run_id(), &run_id);
+        assert!(log_path.is_file());
+        assert_eq!(std::fs::metadata(&log_path).unwrap().len(), 0);
+        assert_eq!(session_id, "session_parent_admission");
+        assert_eq!(question, "admitted before execution");
+        assert_eq!(
+            status,
+            crate::daemon::protocol::RunStateName::Running.as_str()
+        );
+
+        recorder.discard_empty_session_admission().unwrap();
+        assert!(!log_path.exists());
+        assert!(matches!(
+            SqliteLedger::open_default_readonly(&location)
+                .unwrap()
+                .read_session("session_parent_admission"),
+            Err(AppError::SessionNotFound(_))
+        ));
     }
 
     #[test]

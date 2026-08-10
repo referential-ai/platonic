@@ -41,6 +41,8 @@ const MAX_PENDING_THREAD_STEERS: usize = 32;
 type SessionGrantInstallBarriers = Option<(Arc<Barrier>, Arc<Barrier>)>;
 #[cfg(test)]
 type ApprovalProfileDecisionBarriers = Option<(Arc<Barrier>, Arc<Barrier>)>;
+#[cfg(test)]
+type RunExecutionBarriers = Option<(Arc<Barrier>, Arc<Barrier>)>;
 
 #[derive(Clone, Debug)]
 pub(super) struct DaemonRuntime {
@@ -56,6 +58,10 @@ pub(super) struct DaemonRuntime {
     session_grant_install_barriers: Arc<Mutex<SessionGrantInstallBarriers>>,
     #[cfg(test)]
     approval_profile_decision_barriers: Arc<Mutex<ApprovalProfileDecisionBarriers>>,
+    #[cfg(test)]
+    run_execution_barriers: Arc<Mutex<RunExecutionBarriers>>,
+    #[cfg(test)]
+    fail_next_run_handoff: Arc<AtomicBool>,
     #[cfg(all(test, unix))]
     shutdown_flush_barrier: Arc<Mutex<Option<Arc<Barrier>>>>,
 }
@@ -209,6 +215,10 @@ impl DaemonRuntime {
             session_grant_install_barriers: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             approval_profile_decision_barriers: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            run_execution_barriers: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            fail_next_run_handoff: Arc::new(AtomicBool::new(false)),
             #[cfg(all(test, unix))]
             shutdown_flush_barrier: Arc::new(Mutex::new(None)),
         }
@@ -509,6 +519,9 @@ impl DaemonRuntime {
 
     pub(super) fn release_run_reservation(&self, record: &RunRecord) {
         let mut state = self.state.lock().expect("runtime state lock poisoned");
+        state
+            .active_thread_runs
+            .retain(|_, active| !std::ptr::eq(Arc::as_ptr(active), record));
         if state
             .runs
             .get(&record.run_id)
@@ -516,6 +529,39 @@ impl DaemonRuntime {
         {
             state.runs.remove(&record.run_id);
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_run_execution_barriers(&self, reached: Arc<Barrier>, release: Arc<Barrier>) {
+        *self.run_execution_barriers.lock().unwrap() = Some((reached, release));
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_before_run_execution(&self) {
+        let barriers = self.run_execution_barriers.lock().unwrap().take();
+        if let Some((reached, release)) = barriers {
+            reached.wait();
+            release.wait();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_run_handoff(&self) {
+        self.fail_next_run_handoff.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_active_thread_run(&self, thread_id: &str) -> bool {
+        self.state
+            .lock()
+            .expect("runtime state lock poisoned")
+            .active_thread_runs
+            .contains_key(thread_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_run_handoff_failure(&self) -> bool {
+        self.fail_next_run_handoff.swap(false, Ordering::SeqCst)
     }
 
     pub(super) fn begin_thread_stop(
