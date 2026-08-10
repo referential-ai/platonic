@@ -1517,7 +1517,7 @@ mod tests {
         collections::BTreeMap,
         ffi::OsString,
         net::{TcpListener, TcpStream},
-        os::unix::ffi::OsStrExt,
+        os::unix::ffi::{OsStrExt, OsStringExt},
     };
 
     #[test]
@@ -2247,7 +2247,7 @@ while :; do :; done
         for path in [&home, &temp, &cargo_home, &rustup_home] {
             fs::create_dir(path).unwrap();
         }
-        let mut parent_env: Vec<(String, OsString)> = vec![
+        let mut parent_env: Vec<(OsString, OsString)> = vec![
             ("PATH".into(), "/usr/bin:/bin".into()),
             ("HOME".into(), home.into_os_string()),
             ("USER".into(), "platonic-test".into()),
@@ -2279,6 +2279,14 @@ while :; do :; done
             ),
             ("SSH_AUTH_SOCK".into(), "/tmp/agent-socket-sentinel".into()),
             ("UNKNOWN_PARENT_SETTING".into(), "unknown-sentinel".into()),
+            (
+                "UNRELATED_NON_UTF8_VALUE".into(),
+                OsString::from_vec(b"value-\xff".to_vec()),
+            ),
+            (
+                OsString::from_vec(b"UNRELATED_NON_UTF8_NAME_\xff".to_vec()),
+                "name-sentinel".into(),
+            ),
         ]);
 
         let output = Command::new(std::env::current_exe().unwrap())

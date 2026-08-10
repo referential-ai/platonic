@@ -9,7 +9,9 @@ use platonic_core::{ResultVisibility, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::{self, ErrorKind, Read, Write},
     path::{Component, Path, PathBuf},
     process::{ChildStderr, ChildStdout, Command, Stdio},
@@ -847,21 +849,28 @@ fn shell_child_env(provider_api_key_env: Option<&str>) -> Vec<(String, String)> 
 
 pub(crate) fn supervised_run_child_env(
     provider_api_key_env: &str,
-) -> AppResult<Vec<(String, String)>> {
-    supervised_run_child_env_from(env::vars(), provider_api_key_env)
+) -> AppResult<Vec<(OsString, OsString)>> {
+    supervised_run_child_env_from(env::vars_os(), provider_api_key_env)
 }
 
 fn supervised_run_child_env_from(
-    vars: impl IntoIterator<Item = (String, String)>,
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
     provider_api_key_env: &str,
-) -> AppResult<Vec<(String, String)>> {
-    let vars = vars.into_iter().collect::<Vec<_>>();
-    let provider_api_key = vars
-        .iter()
-        .find(|(name, _)| shell_env_names_equal(provider_api_key_env, name))
-        .map(|(_, value)| value.clone())
-        .ok_or_else(|| AppError::MissingApiKey(provider_api_key_env.into()))?;
-    let mut child_env = shell_child_env_from(vars, Some(provider_api_key_env));
+) -> AppResult<Vec<(OsString, OsString)>> {
+    let mut child_env = Vec::new();
+    let mut provider_api_key = None;
+    for (name, value) in vars {
+        let Some(name_text) = name.to_str() else {
+            continue;
+        };
+        if shell_env_names_equal(provider_api_key_env, name_text) {
+            provider_api_key = Some(value);
+        } else if shell_child_env_name_is_allowed(name_text, Some(provider_api_key_env)) {
+            child_env.push((name, value));
+        }
+    }
+    let provider_api_key =
+        provider_api_key.ok_or_else(|| AppError::MissingApiKey(provider_api_key_env.into()))?;
     child_env.push((provider_api_key_env.into(), provider_api_key));
     Ok(child_env)
 }
@@ -871,12 +880,14 @@ fn shell_child_env_from(
     provider_api_key_env: Option<&str>,
 ) -> Vec<(String, String)> {
     vars.into_iter()
-        .filter(|(name, _)| shell_env_name_is_allowlisted(name))
-        .filter(|(name, _)| !is_credential_env_name(name))
-        .filter(|(name, _)| {
-            provider_api_key_env.is_none_or(|provider| !shell_env_names_equal(provider, name))
-        })
+        .filter(|(name, _)| shell_child_env_name_is_allowed(name, provider_api_key_env))
         .collect()
+}
+
+fn shell_child_env_name_is_allowed(name: &str, provider_api_key_env: Option<&str>) -> bool {
+    shell_env_name_is_allowlisted(name)
+        && !is_credential_env_name(name)
+        && provider_api_key_env.is_none_or(|provider| !shell_env_names_equal(provider, name))
 }
 
 fn shell_env_name_is_allowlisted(name: &str) -> bool {
@@ -1227,6 +1238,8 @@ impl DiffPreview {
 mod tests {
     use super::*;
     use platonic_core::ToolCallId;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
     use std::sync::Mutex;
 
     #[cfg(windows)]
@@ -2044,13 +2057,13 @@ mod tests {
     fn supervised_run_child_env_keeps_baseline_and_exact_configured_provider() {
         let mut vars = SHELL_ENV_ALLOWLIST
             .iter()
-            .map(|name| ((*name).into(), format!("baseline-{name}")))
+            .map(|name| ((*name).into(), format!("baseline-{name}").into()))
             .collect::<Vec<_>>();
         #[cfg(windows)]
         vars.extend(
             WINDOWS_SHELL_ENV_ALLOWLIST
                 .iter()
-                .map(|name| ((*name).into(), format!("baseline-{name}"))),
+                .map(|name| ((*name).into(), format!("baseline-{name}").into())),
         );
         vars.extend([
             (
@@ -2078,13 +2091,13 @@ mod tests {
         let env = supervised_run_child_env_from(vars, "PLATONIC_CUSTOM_PROVIDER").unwrap();
         let mut expected = SHELL_ENV_ALLOWLIST
             .iter()
-            .map(|name| ((*name).into(), format!("baseline-{name}")))
+            .map(|name| ((*name).into(), format!("baseline-{name}").into()))
             .collect::<Vec<_>>();
         #[cfg(windows)]
         expected.extend(
             WINDOWS_SHELL_ENV_ALLOWLIST
                 .iter()
-                .map(|name| ((*name).into(), format!("baseline-{name}"))),
+                .map(|name| ((*name).into(), format!("baseline-{name}").into())),
         );
         expected.push((
             "PLATONIC_CUSTOM_PROVIDER".into(),
@@ -2141,6 +2154,41 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, AppError::MissingApiKey(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervised_run_child_env_ignores_unrelated_non_utf8_names_and_values() {
+        let env = supervised_run_child_env_from(
+            [
+                (OsString::from("PATH"), OsString::from("/bin")),
+                (
+                    OsString::from("PLATONIC_CUSTOM_PROVIDER"),
+                    OsString::from("provider-sentinel"),
+                ),
+                (
+                    OsString::from("UNRELATED_NON_UTF8_VALUE"),
+                    OsString::from_vec(b"value-\xff".to_vec()),
+                ),
+                (
+                    OsString::from_vec(b"UNRELATED_NON_UTF8_NAME_\xff".to_vec()),
+                    OsString::from("name-sentinel"),
+                ),
+            ],
+            "PLATONIC_CUSTOM_PROVIDER",
+        )
+        .unwrap();
+
+        assert_eq!(
+            env,
+            [
+                (OsString::from("PATH"), OsString::from("/bin")),
+                (
+                    OsString::from("PLATONIC_CUSTOM_PROVIDER"),
+                    OsString::from("provider-sentinel"),
+                )
+            ]
+        );
     }
 
     #[cfg(windows)]
