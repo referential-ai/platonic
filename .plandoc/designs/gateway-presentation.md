@@ -3,6 +3,14 @@ title: Gateway In-Channel Presentation
 issue: https://github.com/referential-ai/plato-agent/issues/129
 ---
 
+> **PARTLY SUPERSEDED, 2026-08-07.** This design predates the platform
+> decisions of 2026-08-06/07. The
+> [platform decision map](https://github.com/referential-ai/platonic-workspace/issues/83)
+> supersedes it where they disagree, and the map wins.
+>
+> Gateways are reach onto the server (D006, P004) and never own sessions,
+> policy, approvals, or run semantics.
+
 # Gateway In-Channel Presentation (Reactions + Typing)
 
 Revision 6 — adds the bounded terminal-swap wait (S1) after real-Discord smoke (2026-07-12); revision 5 addressed F1–F10, R11–R13, C1–C3.

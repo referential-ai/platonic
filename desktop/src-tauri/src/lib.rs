@@ -1,13 +1,16 @@
-use plato_daemon_client::{
+use platonic_client::{
     ClientError,
     client::{DaemonClient, DaemonConnectionConfig},
     paths,
 };
-use plato_protocol::{
-    ApprovalDecisionName, BufferedStreamEvent, CommandAcceptedResult, EventsStreamResult,
-    HarnessEvent, HelloResult, PendingApprovalSnapshot, PolicyDecision, RunStartResult,
-    RunStateName, SessionSummary, StreamEvent, TranscriptReadResult, TypedRun,
-    TypedTranscriptEntry,
+use platonic_protocol::{
+    ApprovalDecisionName, BufferedStreamEvent, CAPABILITY_APPROVAL_DECIDE,
+    CAPABILITY_EVENTS_STREAM, CAPABILITY_HELLO, CAPABILITY_MESSAGE_APPEND, CAPABILITY_RUN_CANCEL,
+    CAPABILITY_RUN_START, CAPABILITY_SESSIONS_LIST, CAPABILITY_TRANSCRIPT_READ,
+    CAPABILITY_TRANSCRIPT_READ_PENDING_APPROVAL, CAPABILITY_TRANSCRIPT_READ_TYPED, Capability,
+    CommandAcceptedResult, EventsStreamResult, HarnessEvent, HelloResult, PendingApprovalSnapshot,
+    PolicyDecision, RunStartResult, RunStateName, SessionSummary, StreamEvent,
+    TranscriptReadResult, TypedRun, TypedTranscriptEntry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,17 +34,17 @@ mod windows_installer_proof;
 #[cfg(all(test, windows))]
 mod windows_proof;
 
-const REQUIRED_CAPABILITIES: [&str; 10] = [
-    "hello",
-    "run.start",
-    "message.append",
-    "events.stream",
-    "approval.decide",
-    "run.cancel",
-    "sessions.list",
-    "transcript.read",
-    "transcript.read.typed",
-    "transcript.read.pending_approval",
+const REQUIRED_CAPABILITIES: [Capability; 10] = [
+    CAPABILITY_HELLO,
+    CAPABILITY_RUN_START,
+    CAPABILITY_MESSAGE_APPEND,
+    CAPABILITY_EVENTS_STREAM,
+    CAPABILITY_APPROVAL_DECIDE,
+    CAPABILITY_RUN_CANCEL,
+    CAPABILITY_SESSIONS_LIST,
+    CAPABILITY_TRANSCRIPT_READ,
+    CAPABILITY_TRANSCRIPT_READ_TYPED,
+    CAPABILITY_TRANSCRIPT_READ_PENDING_APPROVAL,
 ];
 const EVENT_PAGE_SIZE: usize = 128;
 const INPUT_PREVIEW_MAX_CHARS: usize = 2_000;
@@ -125,7 +128,7 @@ impl DesktopError {
 
     fn daemon(context: &str, error: impl Into<ClientError>) -> Self {
         match error.into() {
-            ClientError::DaemonResponse(error) => Self::new(error.code, error.message),
+            ClientError::DaemonResponse(error) => Self::new(error.code.to_string(), error.message),
             ClientError::DaemonProtocol(message) => {
                 Self::new("incompatible_daemon", format!("{context}: {message}"))
             }
@@ -768,7 +771,7 @@ fn connect_workspace(
     workspace_root: &Path,
     socket_path: Option<PathBuf>,
 ) -> Result<BootstrapView, DesktopError> {
-    let config = DaemonConnectionConfig::resolve(workspace_root, socket_path)
+    let config = resolve_desktop_connection(workspace_root, socket_path)
         .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
     try_attach_workspace_until(&config, std::time::Instant::now() + DAEMON_ATTACH_TIMEOUT)
 }
@@ -870,7 +873,7 @@ fn try_attach_workspace_until(
         ));
     }
     let client = DaemonClient::connect_with_timeout(&config.socket_path, remaining)
-        .map_err(|error| DesktopError::daemon("Unable to connect to plato-agentd", error))?;
+        .map_err(|error| DesktopError::daemon("Unable to connect to Platonic", error))?;
     finish_attach_workspace(config, client, Some(deadline))
 }
 
@@ -907,7 +910,7 @@ fn attach_or_spawn_workspace(
     lifecycle: &mut DesktopLifecycle,
     launch: &DaemonLaunch,
 ) -> Result<BootstrapView, DesktopError> {
-    let config = DaemonConnectionConfig::resolve(workspace_root, socket_path)
+    let config = resolve_desktop_connection(workspace_root, socket_path)
         .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
     let initial =
         try_attach_workspace_until(&config, std::time::Instant::now() + DAEMON_ATTACH_TIMEOUT);
@@ -971,11 +974,7 @@ fn start_and_attach_workspace(
             daemon_start_error(config, "the packaged daemon sidecar path is unavailable")
         })?;
         #[cfg(windows)]
-        let child = lifecycle::spawn_detached_daemon(
-            executable,
-            &config.workspace_root,
-            Some(&config.socket_path),
-        );
+        let child = lifecycle::spawn_detached_daemon(executable, &config.workspace_root);
         #[cfg(unix)]
         let child = {
             let user_path = unix_lifecycle::user_launch_path().map_err(|error| {
@@ -987,12 +986,7 @@ fn start_and_attach_workspace(
                     ),
                 )
             })?;
-            unix_lifecycle::spawn_detached_daemon(
-                executable,
-                &config.workspace_root,
-                Some(&config.socket_path),
-                &user_path,
-            )
+            unix_lifecycle::spawn_detached_daemon(executable, &config.workspace_root, &user_path)
         };
         let child = child.map_err(|error| {
             daemon_start_error(
@@ -1073,13 +1067,13 @@ fn daemon_start_error(
     config: &DaemonConnectionConfig,
     detail: impl std::fmt::Display,
 ) -> DesktopError {
-    let lock = paths::default_lock_path(&config.workspace_root)
+    let lock = paths::host_lock_path()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|error| format!("<unresolved: {error}>"));
     DesktopError::new(
         "daemon_start_failed",
         format!(
-            "Unable to start plato-agentd: {detail}. Endpoint: {}. Lock: {lock}",
+            "Unable to start Platonic: {detail}. Endpoint: {}. Lock: {lock}",
             config.socket_path.display()
         ),
     )
@@ -1090,7 +1084,7 @@ fn read_run_from_workspace(
     run_id: &str,
     socket_path: Option<PathBuf>,
 ) -> Result<DesktopRun, DesktopError> {
-    let config = DaemonConnectionConfig::resolve(workspace_root, socket_path)
+    let config = resolve_desktop_connection(workspace_root, socket_path)
         .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
     let mut client = connect_client(&config)?;
     let hello = client
@@ -1101,13 +1095,19 @@ fn read_run_from_workspace(
 }
 
 fn validate_hello(workspace_root: &Path, hello: &HelloResult) -> Result<(), DesktopError> {
-    let expected_workspace_id = paths::workspace_id(workspace_root)
+    let legacy_workspace_id = paths::workspace_id(workspace_root)
         .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
-    if hello.workspace_id != expected_workspace_id {
+    let minted_workspace_id = hello
+        .workspace_id
+        .strip_prefix("ws-")
+        .is_some_and(|suffix| {
+            suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    if hello.workspace_id != legacy_workspace_id && !minted_workspace_id {
         return Err(DesktopError::new(
             "incompatible_daemon",
             format!(
-                "Incompatible daemon: expected workspace {expected_workspace_id}, got {}",
+                "Incompatible daemon: expected workspace {legacy_workspace_id} or a server-minted id, got {}",
                 hello.workspace_id
             ),
         ));
@@ -1115,11 +1115,11 @@ fn validate_hello(workspace_root: &Path, hello: &HelloResult) -> Result<(), Desk
     require_capabilities(&hello.capabilities)
 }
 
-fn require_capabilities(capabilities: &[String]) -> Result<(), DesktopError> {
+fn require_capabilities(capabilities: &[Capability]) -> Result<(), DesktopError> {
     if let Some(missing) = REQUIRED_CAPABILITIES.iter().find(|required| {
         !capabilities
             .iter()
-            .any(|capability| capability == **required)
+            .any(|capability| capability == *required)
     }) {
         return Err(DesktopError::new(
             "incompatible_daemon",
@@ -1179,7 +1179,18 @@ fn extract_typed_run(
 
 fn connect_client(config: &DaemonConnectionConfig) -> Result<DaemonClient, DesktopError> {
     DaemonClient::connect_with_timeout(&config.socket_path, DAEMON_ATTACH_TIMEOUT)
-        .map_err(|error| DesktopError::daemon("Unable to connect to plato-agentd", error))
+        .map_err(|error| DesktopError::daemon("Unable to connect to Platonic", error))
+}
+
+fn resolve_desktop_connection(
+    workspace_root: &Path,
+    socket_path: Option<PathBuf>,
+) -> Result<DaemonConnectionConfig, ClientError> {
+    let socket_path = match socket_path {
+        Some(path) => path,
+        None => paths::host_socket_path()?,
+    };
+    DaemonConnectionConfig::resolve(workspace_root, Some(socket_path))
 }
 
 fn with_workspace_client<T>(
@@ -1187,7 +1198,7 @@ fn with_workspace_client<T>(
     socket_path: Option<PathBuf>,
     run: impl FnOnce(&mut DaemonClient) -> Result<T, DesktopError>,
 ) -> Result<T, DesktopError> {
-    let config = DaemonConnectionConfig::resolve(workspace_root, socket_path)
+    let config = resolve_desktop_connection(workspace_root, socket_path)
         .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
     let mut client = connect_client(&config)?;
     let hello = client
@@ -1583,6 +1594,7 @@ fn buffered_event_into_desktop(buffered: BufferedStreamEvent) -> Option<DesktopE
         StreamEvent::Canceled { .. } => Some(DesktopEvent::CancelRequested { offset }),
         StreamEvent::Ledger { record } => ledger_event_into_desktop(record.event, offset),
         StreamEvent::Unknown(_) => None,
+        StreamEvent::CompletionClaimed { .. } => None,
     }
 }
 
@@ -1767,7 +1779,7 @@ fn replace_workspace_file(from: &Path, to: &Path) -> std::io::Result<()> {
 pub fn run() {
     #[cfg(windows)]
     drop(
-        plato_daemon_client::installer_gate::InstallerStartupGate::acquire()
+        platonic_client::installer_gate::InstallerStartupGate::acquire()
             .expect("Plato Agent installation or update is in progress"),
     );
     tauri::Builder::default()
@@ -1800,7 +1812,7 @@ pub fn run() {
 #[cfg(all(test, any(unix, windows)))]
 mod daemon_deadline_tests {
     use super::*;
-    use plato_protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION};
+    use platonic_protocol::{Envelope, EnvelopeKind};
     use serde_json::json;
     use std::{
         io::{BufRead, BufReader, Write},
@@ -1814,6 +1826,11 @@ mod daemon_deadline_tests {
     const DEADLINE_LATE_TOLERANCE: Duration = Duration::from_secs(1);
     const NEAR_DEADLINE_DELAY: Duration = Duration::from_millis(2_500);
     const OUTER_WATCHDOG: Duration = Duration::from_secs(8);
+
+    fn request_params_value(request: &Envelope) -> Value {
+        let request = serde_json::to_value(request.params.as_ref().unwrap()).unwrap();
+        request.get("params").cloned().unwrap()
+    }
 
     #[test]
     fn normal_desktop_hello_byte_drip_cannot_extend_the_deadline() {
@@ -1882,7 +1899,7 @@ mod daemon_deadline_tests {
             answer_hello(&mut reader, &mut stream, &workspace_id, Duration::ZERO);
             let request = read_request(&mut reader);
             assert_eq!(request.method.as_deref(), Some("run.start"));
-            assert_eq!(request.params.as_ref().unwrap()["question"], "mutate once");
+            assert_eq!(request_params_value(&request)["question"], "mutate once");
             stream.write_all(b"{").unwrap();
             stream.flush().unwrap();
             released.recv_timeout(OUTER_WATCHDOG).unwrap();
@@ -2046,15 +2063,7 @@ mod daemon_deadline_tests {
     }
 
     fn write_response<W: Write>(writer: &mut W, id: Option<String>, method: &str, result: Value) {
-        let response = Envelope {
-            v: PROTOCOL_VERSION,
-            id,
-            kind: EnvelopeKind::Response,
-            method: Some(method.into()),
-            params: None,
-            result: Some(result),
-            error: None,
-        };
+        let response = Envelope::response(id, Some(method.into()), result);
         serde_json::to_writer(writer.by_ref(), &response).unwrap();
         writer.write_all(b"\n").unwrap();
         writer.flush().unwrap();
@@ -2160,7 +2169,7 @@ mod daemon_deadline_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use plato_protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION};
+    use platonic_protocol::{ERROR_NOT_FOUND, Envelope, EnvelopeKind, ProtocolErrorCode};
     use serde_json::json;
     use std::{
         io::{BufRead, BufReader, Write},
@@ -2169,6 +2178,11 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    fn request_params_value(request: &Envelope) -> Value {
+        let request = serde_json::to_value(request.params.as_ref().unwrap()).unwrap();
+        request.get("params").cloned().unwrap()
+    }
 
     #[test]
     fn missing_invalid_and_persisted_workspaces_have_stable_states() {
@@ -2433,7 +2447,9 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
-        let missing = socket_dir.path().join("missing-plato-agentd");
+        let missing = socket_dir.path().join("missing-platonic");
+        let lock = paths::host_lock_path().unwrap();
+        let lock_existed = lock.exists();
         let launch = DaemonLaunch {
             executable: Some(missing.clone()),
         };
@@ -2453,10 +2469,9 @@ mod tests {
                 .message
                 .contains(socket_path.to_string_lossy().as_ref())
         );
-        let lock = paths::default_lock_path(workspace.path()).unwrap();
         assert!(error.message.contains(lock.to_string_lossy().as_ref()));
         assert!(!socket_path.exists());
-        assert!(!lock.exists());
+        assert_eq!(lock.exists(), lock_existed);
     }
 
     #[test]
@@ -2540,7 +2555,7 @@ mod tests {
                 }),
             );
             let transcript = read_request(&mut reader);
-            assert_eq!(transcript.params.unwrap()["run_id"], "run_1");
+            assert_eq!(request_params_value(&transcript)["run_id"], "run_1");
             write_response(
                 &mut writer,
                 transcript.id,
@@ -2592,7 +2607,7 @@ mod tests {
         let workspace_id = paths::workspace_id(workspace.path()).unwrap();
         let capabilities = REQUIRED_CAPABILITIES
             .iter()
-            .filter(|capability| **capability != "transcript.read.typed")
+            .filter(|capability| **capability != CAPABILITY_TRANSCRIPT_READ_TYPED)
             .copied()
             .collect::<Vec<_>>();
         let handle = thread::spawn(move || {
@@ -2632,16 +2647,28 @@ mod tests {
     }
 
     #[test]
-    fn hello_validation_rejects_a_different_workspace() {
+    fn hello_validation_accepts_the_registry_minted_workspace_id() {
+        let workspace = tempfile::tempdir().unwrap();
+        let hello = HelloResult {
+            daemon_version: "0.1.0".into(),
+            workspace_id: "ws-0123456789abcdef".into(),
+            ledger_path: "/secret/ledger.db".into(),
+            capabilities: REQUIRED_CAPABILITIES.to_vec(),
+            daemon_scope: None,
+        };
+
+        validate_hello(workspace.path(), &hello).unwrap();
+    }
+
+    #[test]
+    fn hello_validation_rejects_an_id_that_is_neither_legacy_nor_minted() {
         let workspace = tempfile::tempdir().unwrap();
         let hello = HelloResult {
             daemon_version: "0.1.0".into(),
             workspace_id: "other-workspace".into(),
             ledger_path: "/secret/ledger.db".into(),
-            capabilities: REQUIRED_CAPABILITIES
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
+            capabilities: REQUIRED_CAPABILITIES.to_vec(),
+            daemon_scope: None,
         };
 
         let error = validate_hello(workspace.path(), &hello).unwrap_err();
@@ -2652,7 +2679,8 @@ mod tests {
                 .message
                 .starts_with("Incompatible daemon: expected workspace ")
         );
-        assert!(error.message.ends_with(", got other-workspace"));
+        assert!(error.message.contains(" or a server-minted id, got "));
+        assert!(error.message.ends_with("other-workspace"));
         assert!(!error.message.contains("ledger.db"));
     }
 
@@ -2665,6 +2693,7 @@ mod tests {
             transcript: "legacy".into(),
             typed: None,
             pending_approval: None,
+            completion_claim: None,
         };
         assert_eq!(
             extract_typed_run("run_1", base.clone())
@@ -2674,7 +2703,7 @@ mod tests {
         );
 
         let mut multiple = base.clone();
-        multiple.typed = Some(plato_protocol::TypedTranscript {
+        multiple.typed = Some(platonic_protocol::TypedTranscript {
             runs: vec![typed_run("run_1"), typed_run("run_2")],
         });
         assert_eq!(
@@ -2683,7 +2712,7 @@ mod tests {
         );
 
         let mut wrong = base;
-        wrong.typed = Some(plato_protocol::TypedTranscript {
+        wrong.typed = Some(platonic_protocol::TypedTranscript {
             runs: vec![typed_run("run_2")],
         });
         assert_eq!(
@@ -3204,11 +3233,9 @@ mod tests {
 
             let transcript = read_request(&mut reader);
             assert_eq!(transcript.method.as_deref(), Some("transcript.read"));
-            assert_eq!(
-                transcript.params.as_ref().unwrap()["session_id"],
-                "session_1"
-            );
-            assert!(transcript.params.as_ref().unwrap()["run_id"].is_null());
+            let transcript_params = request_params_value(&transcript);
+            assert_eq!(transcript_params["session_id"], "session_1");
+            assert!(transcript_params["run_id"].is_null());
             write_response(
                 &mut writer,
                 transcript.id,
@@ -3263,7 +3290,7 @@ mod tests {
 
                 let request = read_request(&mut reader);
                 assert_eq!(request.method.as_deref(), Some(method));
-                let params = request.params.as_ref().unwrap();
+                let params = request_params_value(&request);
                 let message_field = if method == "run.start" {
                     "question"
                 } else {
@@ -3398,8 +3425,9 @@ mod tests {
 
             let request = read_request(&mut reader);
             assert_eq!(request.method.as_deref(), Some("events.stream"));
-            assert_eq!(request.params.as_ref().unwrap()["from_offset"], 0);
-            assert_eq!(request.params.as_ref().unwrap()["limit"], EVENT_PAGE_SIZE);
+            let request_params = request_params_value(&request);
+            assert_eq!(request_params["from_offset"], 0);
+            assert_eq!(request_params["limit"], EVENT_PAGE_SIZE);
             let events = (0..EVENT_PAGE_SIZE as u64)
                 .map(|offset| {
                     buffered_event(
@@ -3463,7 +3491,7 @@ mod tests {
 
             let anchor = read_request(&mut reader);
             assert_eq!(anchor.method.as_deref(), Some("events.stream"));
-            assert!(anchor.params.as_ref().unwrap()["from_offset"].is_null());
+            assert!(request_params_value(&anchor)["from_offset"].is_null());
             write_response(
                 &mut writer,
                 anchor.id,
@@ -3479,7 +3507,7 @@ mod tests {
 
             let transcript = read_request(&mut reader);
             assert_eq!(transcript.method.as_deref(), Some("transcript.read"));
-            assert_eq!(transcript.params.as_ref().unwrap()["run_id"], "run_1");
+            assert_eq!(request_params_value(&transcript)["run_id"], "run_1");
             write_response(
                 &mut writer,
                 transcript.id,
@@ -3503,7 +3531,7 @@ mod tests {
 
             let continued = read_request(&mut reader);
             assert_eq!(continued.method.as_deref(), Some("events.stream"));
-            assert_eq!(continued.params.as_ref().unwrap()["from_offset"], 4);
+            assert_eq!(request_params_value(&continued)["from_offset"], 4);
             write_response(
                 &mut writer,
                 continued.id,
@@ -3550,8 +3578,8 @@ mod tests {
     fn protocol_errors_keep_typed_code_and_message() {
         let error = DesktopError::daemon(
             "Unable to decide approval",
-            ClientError::DaemonResponse(plato_protocol::ProtocolError {
-                code: "not_found".into(),
+            ClientError::DaemonResponse(platonic_protocol::ProtocolError {
+                code: ERROR_NOT_FOUND,
                 message: "pending approval not found: call_1".into(),
             }),
         );
@@ -3577,13 +3605,14 @@ mod tests {
             answer_hello(&mut reader, &mut writer, workspace_id.clone());
             let approval = read_request(&mut reader);
             assert_eq!(approval.method.as_deref(), Some("approval.decide"));
-            assert_eq!(approval.params.as_ref().unwrap()["run_id"], "run_1");
-            assert_eq!(approval.params.as_ref().unwrap()["tool_call_id"], "call_1");
+            let approval_params = request_params_value(&approval);
+            assert_eq!(approval_params["run_id"], "run_1");
+            assert_eq!(approval_params["tool_call_id"], "call_1");
             write_error(
                 &mut writer,
                 approval.id,
                 "approval.decide",
-                "not_found",
+                ERROR_NOT_FOUND,
                 "pending approval not found: call_1",
             );
 
@@ -3593,7 +3622,7 @@ mod tests {
             answer_hello(&mut reader, &mut writer, workspace_id);
             let cancel = read_request(&mut reader);
             assert_eq!(cancel.method.as_deref(), Some("run.cancel"));
-            assert_eq!(cancel.params.as_ref().unwrap()["run_id"], "run_1");
+            assert_eq!(request_params_value(&cancel)["run_id"], "run_1");
             write_response(
                 &mut writer,
                 cancel.id,
@@ -3753,15 +3782,7 @@ mod tests {
     }
 
     fn write_response(writer: &mut UnixStream, id: Option<String>, method: &str, result: Value) {
-        let response = Envelope {
-            v: PROTOCOL_VERSION,
-            id,
-            kind: EnvelopeKind::Response,
-            method: Some(method.into()),
-            params: None,
-            result: Some(result),
-            error: None,
-        };
+        let response = Envelope::response(id, Some(method.into()), result);
         serde_json::to_writer(writer.by_ref(), &response).unwrap();
         writer.write_all(b"\n").unwrap();
         writer.flush().unwrap();
@@ -3771,7 +3792,7 @@ mod tests {
         writer: &mut UnixStream,
         id: Option<String>,
         method: &str,
-        code: &str,
+        code: ProtocolErrorCode,
         message: &str,
     ) {
         let response = Envelope::error(id, Some(method.into()), code, message);

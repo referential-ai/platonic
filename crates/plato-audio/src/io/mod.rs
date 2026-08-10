@@ -21,8 +21,8 @@ pub use kokoro::{
     KokoroProvenance, KokoroSynthesizer,
 };
 pub use playback::{
-    CPAL_RUNTIME_VERSION, DeviceBufferSize, PlaybackConfig, PlaybackDeviceInfo, PlaybackMetrics,
-    PlaybackReport, PlaybackUnderrun, RTRB_RUNTIME_VERSION,
+    CPAL_RUNTIME_VERSION, DeviceBufferSize, OutputDeviceSelection, PlaybackConfig,
+    PlaybackDeviceInfo, PlaybackMetrics, PlaybackReport, PlaybackUnderrun, RTRB_RUNTIME_VERSION,
 };
 pub use recognize::{
     SpeechRecognizer, Transcript, WHISPER_MODEL_REVISION, WHISPER_MODEL_SHA256,

@@ -1,20 +1,23 @@
 use crate::{
     ActiveRunView, ApprovalModalView, ThreadAttachment, TranscriptState, TranscriptView, TuiState,
+    VoiceControl, VoiceControlRequest, VoiceControlResponse,
 };
-use plato_daemon_client::{
+use platonic_client::{
     ClientError, ClientResult,
     client::{DaemonClient, DaemonConnectionConfig},
 };
-use plato_protocol::{
-    ApprovalDecisionName, BufferedStreamEvent, CommandAcceptedResult, DaemonStatusResult,
-    ERROR_LAGGED, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION, ERROR_WORKSPACE_MISMATCH,
-    EventsStreamResult, HarnessEvent, IssuePrepResult, IssuePrepStartResult, RunStartResult,
-    RunStateName, StreamEvent, ThreadEventsResult, ThreadSendResult,
+use platonic_protocol::{
+    ApprovalDecisionName, ApprovalProfile, BufferedStreamEvent, CommandAcceptedResult,
+    DaemonStatusResult, ERROR_LAGGED, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
+    ERROR_WORKSPACE_MISMATCH, EventsStreamResult, HarnessEvent, IssuePrepResult,
+    IssuePrepStartResult, RunOverrides, RunStartResult, RunStateName,
+    SessionApprovalProfileSetResult, StreamEvent, ThreadEventsResult, ThreadSendResult,
 };
 use std::{
     collections::HashMap,
+    ops::Deref,
     sync::mpsc::{self, Sender},
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -22,7 +25,10 @@ use std::{
 use std::sync::mpsc::Receiver;
 
 use super::{
-    app::{UiEvent, push_live_event, send_command, start_next_queued},
+    app::{
+        UiEvent, push_live_event, push_live_event_at, select_fresh_session, send_command,
+        start_next_queued,
+    },
     state::approval_from_snapshot,
 };
 
@@ -64,6 +70,10 @@ fn load_connected_thread_state(
     let status = client.thread_status(attachment.thread_id.clone())?;
     let sessions = client.sessions_list()?;
     let session_id = format!("session_{}", attachment.thread_id);
+    let approval_profile = client
+        .daemon_status(Some(session_id.clone()), None)?
+        .trust
+        .approval_profile;
     let (transcript, approval) = if sessions
         .iter()
         .any(|session| session.session_id == session_id)
@@ -89,6 +99,7 @@ fn load_connected_thread_state(
         transcript,
     );
     state.selected_session_id = Some(session_id.clone());
+    state.approval_profile = approval_profile;
     state.approval = approval;
     state.status_message = Some(format!("attached to thread {}", attachment.thread_id));
     if status.thread.live.current_turn_id.is_some()
@@ -156,6 +167,15 @@ fn load_connected_state(
         transcript,
     );
     state.selected_session_id = selected_session_id;
+    state.approval_profile = match state.selected_session_id.as_deref() {
+        Some(session_id) => {
+            client
+                .daemon_status(Some(session_id.into()), None)?
+                .trust
+                .approval_profile
+        }
+        None => ApprovalProfile::Prompt,
+    };
     state.approval = approval;
     let active_session = state.selected_session_id.as_deref().and_then(|session_id| {
         state.sessions.iter().find(|session| {
@@ -173,7 +193,7 @@ fn load_connected_state(
 }
 
 fn loaded_transcript_state(
-    transcript: plato_protocol::TranscriptReadResult,
+    transcript: platonic_protocol::TranscriptReadResult,
 ) -> (TranscriptState, Option<ApprovalModalView>) {
     let approval = transcript
         .pending_approval
@@ -365,12 +385,22 @@ pub(super) enum ClientCommand {
     RunStart {
         question: String,
         config_path: Option<String>,
+        approval_profile: ApprovalProfile,
     },
     MessageAppend {
         message: String,
         session_id: String,
         config_path: Option<String>,
+        approval_profile: Option<ApprovalProfile>,
     },
+    ApprovalProfileSet {
+        session_id: String,
+        profile: ApprovalProfile,
+    },
+    VoiceSet {
+        enabled: bool,
+    },
+    VoiceResetForNewSession,
     ThreadSend {
         thread_id: String,
         controller_id: String,
@@ -411,6 +441,9 @@ pub(super) enum ClientCommand {
 pub(super) enum ClientEvent {
     Loaded(Box<TuiState>),
     StatusLoaded(Box<DaemonStatusResult>),
+    ApprovalProfileSet(SessionApprovalProfileSetResult),
+    VoiceSet(VoiceControlResponse),
+    VoiceResetForNewSession(VoiceControlResponse),
     RunStarted(RunStartResult),
     ThreadSent(ThreadSendResult),
     IssuePrepFinished(IssuePrepStartResult),
@@ -431,6 +464,7 @@ pub(super) enum ClientEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ClientOperation {
     DaemonStatus,
+    ApprovalProfileSet,
     RunStart,
     MessageAppend,
     ThreadSend,
@@ -445,6 +479,7 @@ impl ClientOperation {
     fn method(self) -> &'static str {
         match self {
             Self::DaemonStatus => "daemon.status",
+            Self::ApprovalProfileSet => "session.approval_profile.set",
             Self::RunStart => "run.start",
             Self::MessageAppend => "message.append",
             Self::ThreadSend => "thread.send",
@@ -465,7 +500,7 @@ pub(super) fn spawn_client_worker(
     let (event_sender, event_receiver) = mpsc::channel();
     thread::spawn(move || {
         for command in command_receiver {
-            let event = handle_client_command(&config, None, command);
+            let event = handle_client_command(&config, None, None, command);
             if event_sender.send(event).is_err() {
                 break;
             }
@@ -477,23 +512,53 @@ pub(super) fn spawn_client_worker(
 pub(super) fn spawn_client_worker_to(
     config: DaemonConnectionConfig,
     attachment: Option<ThreadAttachment>,
+    voice: Option<VoiceControl>,
     event_sender: Sender<UiEvent>,
-) -> Sender<ClientCommand> {
+) -> ClientWorker {
     let (command_sender, command_receiver) = mpsc::channel();
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         for command in command_receiver {
-            let event = handle_client_command(&config, attachment.as_ref(), command);
-            if event_sender.send(UiEvent::Daemon(event)).is_err() {
+            let event =
+                handle_client_command(&config, attachment.as_ref(), voice.as_ref(), command);
+            if event_sender.send(UiEvent::Daemon(Box::new(event))).is_err() {
                 break;
             }
         }
     });
-    command_sender
+    ClientWorker {
+        commands: Some(command_sender),
+        worker: Some(worker),
+    }
+}
+
+pub(super) struct ClientWorker {
+    commands: Option<Sender<ClientCommand>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Deref for ClientWorker {
+    type Target = Sender<ClientCommand>;
+
+    fn deref(&self) -> &Self::Target {
+        self.commands
+            .as_ref()
+            .expect("live client worker retains its command sender")
+    }
+}
+
+impl Drop for ClientWorker {
+    fn drop(&mut self) {
+        self.commands.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 fn handle_client_command(
     config: &DaemonConnectionConfig,
     attachment: Option<&ThreadAttachment>,
+    voice: Option<&VoiceControl>,
     command: ClientCommand,
 ) -> ClientEvent {
     match command {
@@ -516,8 +581,15 @@ fn handle_client_command(
         ClientCommand::RunStart {
             question,
             config_path,
+            approval_profile,
         } => with_client(config, |client| {
-            client.run_start(question, config_path, false)
+            client.run_start_with_overrides_and_profile(
+                question,
+                config_path,
+                RunOverrides::default(),
+                Some(approval_profile),
+                false,
+            )
         })
         .map_or_else(
             failed_event(ClientOperation::RunStart),
@@ -527,13 +599,47 @@ fn handle_client_command(
             message,
             session_id,
             config_path,
+            approval_profile,
         } => with_client(config, |client| {
-            client.message_append_to_session(message, Some(session_id), config_path, false)
+            client.message_append_to_session_with_overrides_and_profile(
+                message,
+                Some(session_id),
+                config_path,
+                RunOverrides::default(),
+                approval_profile,
+                false,
+            )
         })
         .map_or_else(
             failed_event(ClientOperation::MessageAppend),
             ClientEvent::RunStarted,
         ),
+        ClientCommand::ApprovalProfileSet {
+            session_id,
+            profile,
+        } => with_client(config, |client| {
+            client.session_approval_profile_set(session_id, profile)
+        })
+        .map_or_else(
+            failed_event(ClientOperation::ApprovalProfileSet),
+            ClientEvent::ApprovalProfileSet,
+        ),
+        ClientCommand::VoiceSet { enabled } => ClientEvent::VoiceSet(match voice {
+            Some(voice) => voice.request(if enabled {
+                VoiceControlRequest::Enable
+            } else {
+                VoiceControlRequest::Disable
+            }),
+            None => VoiceControlResponse::Failed(
+                "voice configuration is unavailable: no client voice control".into(),
+            ),
+        }),
+        ClientCommand::VoiceResetForNewSession => {
+            ClientEvent::VoiceResetForNewSession(match voice {
+                Some(voice) => voice.request(VoiceControlRequest::Disable),
+                None => VoiceControlResponse::AlreadyDisabled,
+            })
+        }
         ClientCommand::ThreadSend {
             thread_id,
             controller_id,
@@ -677,9 +783,35 @@ pub(super) fn apply_client_event(
             runtime.sync_from_state(state);
         }
         ClientEvent::StatusLoaded(status) => {
+            if state.selected_session_id.is_some()
+                && status.session.session_id == state.selected_session_id
+            {
+                state.approval_profile = status.trust.approval_profile;
+            }
             state.status_modal = Some(*status);
             state.status_message = Some("status opened".into());
         }
+        ClientEvent::ApprovalProfileSet(result) => {
+            if state.selected_session_id.as_deref() == Some(result.session_id.as_str()) {
+                state.approval_profile = result.profile;
+                state.status_message =
+                    Some(format!("session approval profile: {}", result.profile));
+            } else {
+                state.status_message = Some(format!(
+                    "session {} approval profile: {}",
+                    result.session_id, result.profile
+                ));
+            }
+        }
+        ClientEvent::VoiceSet(response) => apply_voice_response(state, response),
+        ClientEvent::VoiceResetForNewSession(response) => match response {
+            VoiceControlResponse::Disabled | VoiceControlResponse::AlreadyDisabled => {
+                select_fresh_session(state);
+            }
+            response => {
+                apply_voice_response(state, response);
+            }
+        },
         ClientEvent::RunStarted(result) => {
             apply_run_response(state, runtime, result, "run started")
         }
@@ -722,7 +854,6 @@ pub(super) fn apply_client_event(
                     ));
                 }
             }
-            state.reset_scroll();
             start_next_queued(commands, state, runtime);
         }
         ClientEvent::EventsPolled(result) => apply_events_result(state, runtime, commands, result),
@@ -812,6 +943,7 @@ pub(super) fn apply_client_event(
                     }
                     ClientOperation::RunStart
                     | ClientOperation::MessageAppend
+                    | ClientOperation::ApprovalProfileSet
                     | ClientOperation::ThreadSend
                     | ClientOperation::EventsStream
                     | ClientOperation::ThreadEvents
@@ -821,6 +953,23 @@ pub(super) fn apply_client_event(
             }
         }
     }
+}
+
+fn apply_voice_response(state: &mut TuiState, response: VoiceControlResponse) {
+    let message: String = match response {
+        VoiceControlResponse::Enabled => "voice enabled".into(),
+        VoiceControlResponse::AlreadyEnabled => "voice already enabled".into(),
+        VoiceControlResponse::Disabled => "voice disabled".into(),
+        VoiceControlResponse::AlreadyDisabled => "voice already disabled".into(),
+        VoiceControlResponse::Denied => "voice grant denied".into(),
+        VoiceControlResponse::Failed(error) => {
+            state.status_message = Some(error.clone());
+            push_live_event(state, crate::LiveEventLine::warning(None, error));
+            return;
+        }
+    };
+    state.status_message = Some(message.clone());
+    push_live_event(state, crate::LiveEventLine::status(None, message));
 }
 
 pub(super) fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
@@ -858,11 +1007,9 @@ pub(super) fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
         }
         if loaded.live_events.is_empty() {
             loaded.live_events = std::mem::take(&mut state.live_events);
+            loaded.streaming = std::mem::take(&mut state.streaming);
             loaded.history_rows.live_events = std::mem::take(&mut state.history_rows.live_events);
         }
-        loaded.scroll_offset = state.scroll_offset;
-        loaded.conversation_scroll_offset = state.conversation_scroll_offset;
-        loaded.audit_scroll_offset = state.audit_scroll_offset;
         if loaded.active_model.is_none() {
             loaded.active_model = state.active_model.clone();
         }
@@ -922,7 +1069,6 @@ pub(super) fn apply_run_response(
         crate::LiveEventLine::status(None, format!("{message}: {run_id}"))
             .with_run_id(run_id.clone()),
     );
-    state.reset_scroll();
     runtime.active_run_id = Some(run_id);
     runtime.next_offset = 0;
     runtime.poll_in_flight = false;
@@ -989,6 +1135,7 @@ pub(super) fn apply_events_result(
     if needs_catch_up {
         maybe_poll_events_now(runtime, commands);
     } else if !active {
+        state.finalize_streaming(Some(&result.run_id));
         state.active_run_elapsed_secs = runtime
             .active_timer
             .elapsed_at(Instant::now())
@@ -1031,6 +1178,7 @@ fn apply_thread_events_result(
             status,
             RunStateName::Finished | RunStateName::Failed | RunStateName::Canceled
         ) {
+            state.finalize_streaming(Some(&run_id));
             state.active_run_elapsed_secs = runtime
                 .active_timer
                 .elapsed_at(Instant::now())
@@ -1050,6 +1198,7 @@ fn apply_buffered_stream_events(
     events: Vec<BufferedStreamEvent>,
     fallback_run_id: Option<&str>,
 ) -> Option<(String, RunStateName)> {
+    let arrived_at = Instant::now();
     let mut observed_run = None;
     for buffered in events {
         let event = &buffered.event;
@@ -1086,7 +1235,7 @@ fn apply_buffered_stream_events(
             Some(run_id) if line.run_id.is_none() => line.with_run_id(run_id),
             _ => line,
         };
-        push_live_event(state, line);
+        push_live_event_at(state, line, arrived_at);
     }
     observed_run
 }
@@ -1106,6 +1255,9 @@ fn run_state_from_event(event: &StreamEvent) -> Option<(String, RunStateName)> {
             Some((run_id.clone(), RunStateName::Running))
         }
         StreamEvent::Canceled { run_id } => Some((run_id.clone(), RunStateName::Canceled)),
+        StreamEvent::CompletionClaimed { run_id, .. } => {
+            Some((run_id.clone(), RunStateName::Running))
+        }
         StreamEvent::Unknown(_) => None,
     }
 }
@@ -1213,7 +1365,7 @@ pub(super) fn is_connection_error(error: &ClientError) -> bool {
     match error {
         ClientError::Io(_) | ClientError::DaemonProtocol(_) => true,
         ClientError::DaemonResponse(error) => matches!(
-            error.code.as_str(),
+            error.code,
             ERROR_UNSUPPORTED_VERSION | ERROR_WORKSPACE_MISMATCH
         ),
         _ => false,
@@ -1224,10 +1376,10 @@ pub(super) fn is_connection_error(error: &ClientError) -> bool {
 mod tests {
     use super::*;
     use crate::{ConnectionState, TranscriptState, render_snapshot};
-    use plato_daemon_client::transport;
-    use plato_protocol::{
-        ERROR_ISSUE_PREP_FAILED, Envelope, EnvelopeKind, HelloResult, PROTOCOL_VERSION,
-        ProtocolError,
+    use platonic_client::transport;
+    use platonic_protocol::{
+        CAPABILITY_HELLO, CAPABILITY_ISSUE_PREP_START, ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED,
+        Envelope, EnvelopeKind, HelloResult, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
     };
     use serde_json::json;
     use std::{
@@ -1243,6 +1395,43 @@ mod tests {
 
     const OUTER_WATCHDOG: Duration = Duration::from_secs(10);
     const DEADLINE_MARGIN: Duration = Duration::from_millis(100);
+
+    #[test]
+    fn client_worker_drop_waits_for_voice_shutdown() {
+        let (request_sender, requests) = mpsc::channel();
+        let (response_sender, responses) = mpsc::channel();
+        let (observed_sender, observed) = mpsc::channel();
+        let voice_worker = thread::spawn(move || {
+            let request = requests.recv().unwrap();
+            observed_sender.send(request).unwrap();
+            response_sender
+                .send(VoiceControlResponse::AlreadyDisabled)
+                .unwrap();
+        });
+        let voice = VoiceControl::new(request_sender, responses, voice_worker);
+        let workspace = tempfile::tempdir().unwrap();
+        let config = DaemonConnectionConfig::resolve(
+            workspace.path(),
+            Some(workspace.path().join("agent.sock")),
+        )
+        .unwrap();
+        let (event_sender, _) = mpsc::channel();
+
+        drop(spawn_client_worker_to(
+            config,
+            None,
+            Some(voice),
+            event_sender,
+        ));
+
+        assert_eq!(observed.recv().unwrap(), VoiceControlRequest::Shutdown);
+        assert!(observed.try_recv().is_err());
+    }
+
+    fn request_params_value(request: &Envelope) -> serde_json::Value {
+        let request = serde_json::to_value(request.params.as_ref().unwrap()).unwrap();
+        request.get("params").cloned().unwrap()
+    }
 
     #[test]
     fn thread_attachment_loads_exact_session_and_polls_from_live_tip() {
@@ -1285,6 +1474,7 @@ mod tests {
                         }]
                     }),
                 ),
+                daemon_status_reply("session_thread_selected"),
                 ScriptedReply::result(
                     "transcript.read",
                     json!({
@@ -1325,7 +1515,7 @@ mod tests {
         let requests = harness.finish();
         assert_eq!(requests[1].method.as_deref(), Some("thread.status"));
         assert_eq!(
-            requests[1].params.as_ref().unwrap()["thread_id"],
+            request_params_value(&requests[1])["thread_id"],
             "thread_selected"
         );
     }
@@ -1363,7 +1553,7 @@ mod tests {
             ThreadSendResult::Rejected {
                 thread_id: "thread_selected".into(),
                 turn_id: Some("thread_turn_active".into()),
-                reason: plato_protocol::ThreadSendRejectedReason::ControllerOwned,
+                reason: platonic_protocol::ThreadSendRejectedReason::ControllerOwned,
             },
         );
         assert_eq!(
@@ -1414,6 +1604,7 @@ mod tests {
                                        [turn_finished] assistant: selected answer\n"
                     }),
                 ),
+                daemon_status_reply("session_finished"),
                 hello_reply(workspace_id),
                 ScriptedReply::result(
                     "sessions.list",
@@ -1445,6 +1636,7 @@ mod tests {
                         "transcript": "[turn_running] user: other running\n"
                     }),
                 ),
+                daemon_status_reply("session_running"),
             ]
         });
 
@@ -1492,12 +1684,10 @@ mod tests {
             .iter()
             .filter(|request| request.method.as_deref() == Some("transcript.read"))
             .map(|request| {
-                request
-                    .params
-                    .as_ref()
-                    .and_then(|params| params.get("session_id"))
-                    .and_then(serde_json::Value::as_str)
+                request_params_value(request)["session_id"]
+                    .as_str()
                     .unwrap()
+                    .to_owned()
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1520,6 +1710,12 @@ mod tests {
         ));
         let mut runtime = UiRuntime::from_state(&state, None);
         let (commands, command_receiver) = mpsc::channel();
+        push_live_event_at(
+            &mut state,
+            crate::LiveEventLine::assistant_delta(Some(1), "partial cancel mid-tok")
+                .with_run_id("run_canceling"),
+            Instant::now(),
+        );
 
         assert!(runtime.polling);
         apply_events_result(
@@ -1558,6 +1754,8 @@ mod tests {
 
         assert!(!runtime.polling);
         assert!(!runtime.active_timer.is_active());
+        assert_eq!(state.live_events.len(), 1);
+        assert_eq!(state.live_events[0].text, "partial cancel mid-tok");
         assert!(matches!(
             command_receiver.try_recv().unwrap(),
             ClientCommand::Load {
@@ -1614,7 +1812,7 @@ mod tests {
                 ClientEvent::Failed {
                     operation,
                     error: ClientError::DaemonResponse(ProtocolError {
-                        code: "test_failure".into(),
+                        code: ERROR_INTERNAL,
                         message: "expected failure".into(),
                     }),
                 },
@@ -1623,7 +1821,7 @@ mod tests {
             );
 
             let expected_status = format!(
-                "{} failed: daemon protocol error test_failure: expected failure",
+                "{} failed: daemon protocol error internal_error: expected failure",
                 operation.method()
             );
             assert_eq!(
@@ -1692,6 +1890,7 @@ mod tests {
                         }
                     }),
                 ),
+                daemon_status_reply("session_selected"),
                 hello_reply(workspace_id),
                 ScriptedReply::error(
                     "events.stream",
@@ -1712,7 +1911,7 @@ mod tests {
                 hello_reply(workspace_id),
                 ScriptedReply::error(
                     "approval.decide",
-                    "temporarily_unavailable",
+                    ERROR_OVERLOAD,
                     "retry the exact decision",
                 ),
                 hello_reply(workspace_id),
@@ -1810,15 +2009,9 @@ mod tests {
             .filter(|request| request.method.as_deref() == Some("events.stream"))
             .collect::<Vec<_>>();
         assert_eq!(stream_requests.len(), 2);
-        assert_eq!(
-            stream_requests[0].params.as_ref().unwrap()["from_offset"],
-            0
-        );
+        assert_eq!(request_params_value(stream_requests[0])["from_offset"], 0);
         assert!(
-            stream_requests[1]
-                .params
-                .as_ref()
-                .unwrap()
+            request_params_value(stream_requests[1])
                 .get("from_offset")
                 .is_none(),
             "lag recovery must resume at the current tip"
@@ -1829,7 +2022,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(decisions.len(), 2);
         for request in decisions {
-            let params = request.params.as_ref().unwrap();
+            let params = request_params_value(request);
             assert_eq!(params["run_id"], "run_selected");
             assert_eq!(params["tool_call_id"], "call_selected");
             assert_eq!(params["decision"], if grant { "grant" } else { "deny" });
@@ -1943,10 +2136,10 @@ mod tests {
             config.socket_path.to_string_lossy().into_owned(),
             HelloResult {
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
-                workspace_id: plato_daemon_client::paths::workspace_id(&config.workspace_root)
-                    .unwrap(),
+                workspace_id: platonic_client::paths::workspace_id(&config.workspace_root).unwrap(),
                 ledger_path: "/work/agent.db".into(),
-                capabilities: vec!["hello".into(), "issue-prep.start".into()],
+                capabilities: vec![CAPABILITY_HELLO, CAPABILITY_ISSUE_PREP_START],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -1960,7 +2153,7 @@ mod tests {
         },
         Error {
             method: &'static str,
-            code: &'static str,
+            code: ProtocolErrorCode,
             message: &'static str,
         },
     }
@@ -1970,7 +2163,7 @@ mod tests {
             Self::Result { method, result }
         }
 
-        fn error(method: &'static str, code: &'static str, message: &'static str) -> Self {
+        fn error(method: &'static str, code: ProtocolErrorCode, message: &'static str) -> Self {
             Self::Error {
                 method,
                 code,
@@ -2017,6 +2210,53 @@ mod tests {
         )
     }
 
+    fn daemon_status_reply(session_id: &str) -> ScriptedReply {
+        ScriptedReply::result(
+            "daemon.status",
+            json!({
+                "model": {
+                    "requested_alias": "test-model",
+                    "served_model": null,
+                    "provider_kind": "open_ai",
+                    "key_present": false
+                },
+                "daemon": {
+                    "package_version": env!("CARGO_PKG_VERSION"),
+                    "build_commit": null,
+                    "build_date_utc": null,
+                    "uptime_ms": 1,
+                    "endpoint_path": "/tmp/agent.sock",
+                    "workspace_id": "test-workspace"
+                },
+                "session": {
+                    "session_id": session_id,
+                    "latest_run_id": null,
+                    "human_turn_count": 0,
+                    "ledger_path": "/work/agent.db",
+                    "core_event_count": 0
+                },
+                "usage": {
+                    "last_run": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "unknown_response_count": 0
+                    },
+                    "session": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "unknown_response_count": 0
+                    }
+                },
+                "trust": {
+                    "approval_granted_count": 0,
+                    "approval_denied_count": 0,
+                    "shell_session_grant": false,
+                    "approval_profile": "prompt"
+                }
+            }),
+        )
+    }
+
     struct ScriptedDaemon {
         config: DaemonConnectionConfig,
         requests: Arc<Mutex<Vec<Envelope>>>,
@@ -2034,7 +2274,7 @@ mod tests {
                 DaemonConnectionConfig::resolve(workspace.path(), Some(endpoint.path.clone()))
                     .unwrap();
             let workspace_id =
-                plato_daemon_client::paths::workspace_id(&config.workspace_root).unwrap();
+                platonic_client::paths::workspace_id(&config.workspace_root).unwrap();
             let replies = VecDeque::from(replies(&workspace_id));
             let requests = Arc::new(Mutex::new(Vec::new()));
             let server_requests = Arc::clone(&requests);
@@ -2107,7 +2347,7 @@ mod tests {
                 DaemonConnectionConfig::resolve(workspace.path(), Some(endpoint.path.clone()))
                     .unwrap();
             let workspace_id =
-                plato_daemon_client::paths::workspace_id(&config.workspace_root).unwrap();
+                platonic_client::paths::workspace_id(&config.workspace_root).unwrap();
             let (request_seen_sender, request_seen) = mpsc::channel();
             let (release, release_receiver) = mpsc::channel();
             let server = thread::spawn(move || {
@@ -2135,7 +2375,7 @@ mod tests {
                 let issue_prep = read_request(&mut reader);
                 assert_eq!(issue_prep.method.as_deref(), Some("issue-prep.start"));
                 assert_eq!(
-                    issue_prep.params.as_ref().unwrap()["input"],
+                    request_params_value(&issue_prep)["input"],
                     "prepare a bounded issue"
                 );
                 request_seen_sender.send(()).unwrap();
@@ -2161,7 +2401,7 @@ mod tests {
                         params: None,
                         result: None,
                         error: Some(ProtocolError {
-                            code: ERROR_ISSUE_PREP_FAILED.into(),
+                            code: ERROR_ISSUE_PREP_FAILED,
                             message: "provider failed".into(),
                         }),
                     },

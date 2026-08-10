@@ -34,7 +34,7 @@ use windows_sys::Win32::{
 };
 
 const MUTEX_PREFIX: &str = r"Global\plato-desktop-";
-const DAEMON_EXECUTABLE: &str = "plato-agentd.exe";
+const DAEMON_EXECUTABLE: &str = "platonic.exe";
 
 #[derive(Debug)]
 pub(crate) struct WorkspaceInstance {
@@ -134,7 +134,6 @@ pub(crate) fn sibling_daemon_executable() -> io::Result<PathBuf> {
 pub(crate) fn spawn_detached_daemon(
     executable: &Path,
     canonical_workspace_root: &Path,
-    socket_path: Option<&Path>,
 ) -> io::Result<Child> {
     if !executable.is_absolute() {
         return Err(io::Error::new(
@@ -151,15 +150,12 @@ pub(crate) fn spawn_detached_daemon(
 
     let mut command = Command::new(executable);
     command
-        .arg("--workspace")
-        .arg(canonical_workspace_root)
+        .arg("serve")
+        .current_dir(canonical_workspace_root)
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Some(socket_path) = socket_path {
-        command.arg("--socket").arg(socket_path);
-    }
     command.spawn()
 }
 

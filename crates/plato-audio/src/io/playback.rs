@@ -48,11 +48,22 @@ pub enum DeviceBufferSize {
     DefaultUnknown,
 }
 
+/// Output-device choice that never changes the host's default audio policy.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum OutputDeviceSelection {
+    /// Use the host's current default output device.
+    #[default]
+    Default,
+    /// Open exactly one backend-qualified cpal output device.
+    Id(String),
+}
+
 /// Bounded construction settings for the persistent output stream.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlaybackConfig {
     capacity_frames: usize,
     preferred_buffer_frames: u32,
+    device: OutputDeviceSelection,
 }
 
 impl Default for PlaybackConfig {
@@ -60,11 +71,20 @@ impl Default for PlaybackConfig {
         Self {
             capacity_frames: DEFAULT_CAPACITY_FRAMES,
             preferred_buffer_frames: DEFAULT_PREFERRED_BUFFER_FRAMES,
+            device: OutputDeviceSelection::Default,
         }
     }
 }
 
 impl PlaybackConfig {
+    /// Uses the default bounded ring and period with one explicit device choice.
+    pub fn for_device(device: OutputDeviceSelection) -> Self {
+        Self {
+            device,
+            ..Self::default()
+        }
+    }
+
     /// Constructs a configuration with a nonzero mono-frame ring capacity.
     pub fn new(capacity_frames: usize, preferred_buffer_frames: u32) -> Result<Self, DeviceError> {
         if capacity_frames == 0 || preferred_buffer_frames == 0 {
@@ -76,17 +96,23 @@ impl PlaybackConfig {
         Ok(Self {
             capacity_frames,
             preferred_buffer_frames,
+            device: OutputDeviceSelection::Default,
         })
     }
 
     /// Returns the exact mono f32 sample capacity of the PCM ring.
-    pub fn capacity_frames(self) -> usize {
+    pub fn capacity_frames(&self) -> usize {
         self.capacity_frames
     }
 
     /// Returns the desired callback period before device-range clamping.
-    pub fn preferred_buffer_frames(self) -> u32 {
+    pub fn preferred_buffer_frames(&self) -> u32 {
         self.preferred_buffer_frames
+    }
+
+    /// Returns the explicit or default device choice.
+    pub fn device(&self) -> &OutputDeviceSelection {
+        &self.device
     }
 }
 
@@ -97,7 +123,7 @@ pub struct PlaybackDeviceInfo {
     pub backend: String,
     /// Backend-qualified cpal device identifier.
     pub device_id: String,
-    /// Default output device name.
+    /// Selected output device name.
     pub device: String,
     /// Actual device stream format.
     pub format: AudioFormat,
@@ -205,9 +231,7 @@ impl PersistentPlayback {
     ) -> Result<(Self, PlaybackProducer), DeviceError> {
         let host = cpal::default_host();
         let backend = host.id().name().to_owned();
-        let device = host
-            .default_output_device()
-            .ok_or(DeviceError::NoOutputDevice)?;
+        let device = select_device(&host, &config.device)?;
         let device_id = device
             .id()
             .map_err(|error| DeviceError::DeviceQuery {
@@ -370,6 +394,38 @@ impl PersistentPlayback {
             },
             callback,
         )
+    }
+}
+
+fn select_device(
+    host: &cpal::Host,
+    selection: &OutputDeviceSelection,
+) -> Result<cpal::Device, DeviceError> {
+    match selection {
+        OutputDeviceSelection::Default => host
+            .default_output_device()
+            .ok_or(DeviceError::NoOutputDevice),
+        OutputDeviceSelection::Id(requested) => {
+            let devices = host
+                .output_devices()
+                .map_err(|error| DeviceError::DeviceQuery {
+                    reason: error.to_string(),
+                })?;
+            for device in devices {
+                let id = device
+                    .id()
+                    .map_err(|error| DeviceError::DeviceQuery {
+                        reason: error.to_string(),
+                    })?
+                    .to_string();
+                if id == *requested {
+                    return Ok(device);
+                }
+            }
+            Err(DeviceError::OutputDeviceNotFound {
+                device_id: requested.clone(),
+            })
+        }
     }
 }
 
@@ -708,6 +764,22 @@ mod tests {
                 preferred_buffer_frames: 0
             })
         ));
+    }
+
+    #[test]
+    fn playback_config_preserves_explicit_device_selection() {
+        let config =
+            PlaybackConfig::for_device(OutputDeviceSelection::Id("cpal:test-output".to_owned()));
+
+        assert_eq!(
+            config.device(),
+            &OutputDeviceSelection::Id("cpal:test-output".to_owned())
+        );
+        assert_eq!(config.capacity_frames(), DEFAULT_CAPACITY_FRAMES);
+        assert_eq!(
+            config.preferred_buffer_frames(),
+            DEFAULT_PREFERRED_BUFFER_FRAMES
+        );
     }
 
     #[test]

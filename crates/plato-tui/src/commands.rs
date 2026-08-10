@@ -1,7 +1,14 @@
+use nucleo::{
+    Config, Matcher, Utf32Str,
+    pattern::{Atom, AtomKind, CaseMatching, Normalization},
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlashCommandAction {
     Help,
     Status,
+    Voice,
+    Yolo,
     Clear,
     Sessions,
     NewSession,
@@ -47,6 +54,16 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "status",
         description: "show authoritative runtime status",
         action: SlashCommandAction::Status,
+    },
+    SlashCommandSpec {
+        name: "voice",
+        description: "set local voice on or off",
+        action: SlashCommandAction::Voice,
+    },
+    SlashCommandSpec {
+        name: "yolo",
+        description: "set session yolo on or off",
+        action: SlashCommandAction::Yolo,
     },
     SlashCommandSpec {
         name: "reconnect",
@@ -258,14 +275,54 @@ pub(crate) fn find_slash_command(name: &str) -> Option<&'static SlashCommandSpec
 }
 
 pub(crate) fn matching_slash_commands(filter: &str) -> Vec<&'static SlashCommandSpec> {
-    let filter = filter.trim().to_ascii_lowercase();
-    SLASH_COMMANDS
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return SLASH_COMMANDS.iter().collect();
+    }
+
+    let fuzzy = Atom::new(
+        filter,
+        CaseMatching::Ignore,
+        Normalization::Never,
+        AtomKind::Fuzzy,
+        false,
+    );
+    let prefix = Atom::new(
+        filter,
+        CaseMatching::Ignore,
+        Normalization::Never,
+        AtomKind::Prefix,
+        false,
+    );
+    let mut config = Config::DEFAULT;
+    config.prefer_prefix = true;
+    let mut matcher = Matcher::new(config);
+    let mut chars = Vec::new();
+    let mut matches: Vec<_> = SLASH_COMMANDS
         .iter()
-        .filter(|command| filter.is_empty() || command.name.starts_with(&filter))
+        .enumerate()
+        .filter_map(|(source_index, command)| {
+            let score = fuzzy.score(Utf32Str::new(command.name, &mut chars), &mut matcher)?;
+            let is_prefix = prefix
+                .score(Utf32Str::new(command.name, &mut chars), &mut matcher)
+                .is_some();
+            Some((source_index, is_prefix, score, command))
+        })
+        .collect();
+    matches.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    matches
+        .into_iter()
+        .map(|(_, _, _, command)| command)
         .collect()
 }
 
-pub(crate) fn has_slash_command_prefix(filter: &str) -> bool {
+pub(crate) fn has_slash_command_match(filter: &str) -> bool {
     !filter.contains('/') && matching_slash_commands(filter).into_iter().next().is_some()
 }
 
@@ -279,5 +336,31 @@ mod tests {
 
         assert_eq!(label.text(KeyLabelPlatform::MacOs), "⌥ enter");
         assert_eq!(label.text(KeyLabelPlatform::Other), "alt + enter");
+    }
+
+    #[test]
+    fn slash_commands_match_case_insensitive_subsequences_with_prefix_strength() {
+        let names = |filter| {
+            matching_slash_commands(filter)
+                .into_iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(has_slash_command_match("SP"));
+        assert!(names("SP").contains(&"issue-prep"));
+
+        let matches = names("s");
+        let subsequence = matches
+            .iter()
+            .position(|name| *name == "issue-prep")
+            .unwrap();
+        for prefix in ["sessions", "status"] {
+            assert!(matches.iter().position(|name| *name == prefix).unwrap() <= subsequence);
+        }
+
+        for _ in 0..32 {
+            assert_eq!(names("s"), matches);
+        }
     }
 }

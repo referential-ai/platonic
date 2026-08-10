@@ -168,7 +168,7 @@ impl PcmChunk {
     /// Constructs a chunk and validates its storage and frame alignment.
     pub fn new(format: AudioFormat, samples: PcmData) -> Result<Self, PcmError> {
         validate_storage(format, &samples)?;
-        if samples.len() % usize::from(format.channels()) != 0 {
+        if !samples.len().is_multiple_of(usize::from(format.channels())) {
             return Err(PcmError::IncompleteFrame {
                 samples: samples.len(),
                 channels: format.channels(),

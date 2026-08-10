@@ -1,5 +1,5 @@
-use plato_protocol::{BufferedStreamEvent, ModelIdentityStatus, StreamEvent};
 use platonic_core::HarnessEvent;
+use platonic_protocol::{BufferedStreamEvent, ModelIdentityStatus, StreamEvent};
 use serde_json::Value;
 
 use super::LiveEventLine;
@@ -44,6 +44,7 @@ pub fn approval_from_event(
         reason,
         approval_preview,
         diff_preview,
+        ..
     } = event
     else {
         return None;
@@ -90,7 +91,8 @@ pub fn live_event_line(buffered: &BufferedStreamEvent) -> LiveEventLine {
         StreamEvent::Ledger { record } => Some(record.event.run_id().to_string()),
         StreamEvent::AssistantDelta { run_id, .. }
         | StreamEvent::ApprovalRequested { run_id, .. }
-        | StreamEvent::Canceled { run_id } => Some(run_id.clone()),
+        | StreamEvent::Canceled { run_id }
+        | StreamEvent::CompletionClaimed { run_id, .. } => Some(run_id.clone()),
         StreamEvent::Unknown(event) => event
             .get("run_id")
             .and_then(Value::as_str)
@@ -109,6 +111,13 @@ pub fn live_event_line(buffered: &BufferedStreamEvent) -> LiveEventLine {
         }
         StreamEvent::AssistantDelta { text, .. } => LiveEventLine::assistant_delta(offset, text),
         StreamEvent::Canceled { .. } => LiveEventLine::status(offset, "canceled"),
+        StreamEvent::CompletionClaimed { claim, .. } => {
+            let label = match claim.outcome {
+                platonic_protocol::CompletionOutcome::Done => "claim done",
+                platonic_protocol::CompletionOutcome::Blocked { .. } => "claim blocked",
+            };
+            LiveEventLine::status(offset, label)
+        }
         StreamEvent::Unknown(event) => match event.get("kind").and_then(Value::as_str) {
             Some(kind) => LiveEventLine::status(offset, kind),
             None => LiveEventLine::status(

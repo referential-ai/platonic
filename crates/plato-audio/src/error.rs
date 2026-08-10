@@ -511,6 +511,12 @@ pub enum DeviceError {
         /// Backend-qualified cpal device identifier.
         device_id: String,
     },
+    /// An explicitly selected output device is not present.
+    #[error("output device is not available: {device_id}")]
+    OutputDeviceNotFound {
+        /// Backend-qualified cpal device identifier.
+        device_id: String,
+    },
     /// Device capabilities could not be queried.
     #[error("cannot query output device capabilities: {reason}")]
     DeviceQuery {

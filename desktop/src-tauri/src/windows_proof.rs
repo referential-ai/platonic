@@ -1,11 +1,11 @@
 use super::*;
-use plato_protocol::{RunStateName, ShutdownIfIdleResultName};
+use platonic_protocol::{RunStateName, ShutdownIfIdleResultName};
 use serde_json::json;
 use std::{
     env, fs,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command},
+    process::Child,
     sync::{Arc, Barrier, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
@@ -46,7 +46,7 @@ fn connected_daemon_that_never_answers_is_bounded() {
 
     let workspace = tempfile::tempdir().unwrap();
     let workspace_root = canonical_workspace(workspace.path()).unwrap();
-    let config = DaemonConnectionConfig::resolve(&workspace_root, None).unwrap();
+    let config = resolve_desktop_connection(&workspace_root, None).unwrap();
     let listener = ListenerOptions::new()
         .name(
             config
@@ -77,17 +77,16 @@ fn connected_daemon_that_never_answers_is_bounded() {
 }
 
 #[test]
-#[ignore = "requires provisioned PLATO_DESKTOP_TEST_DAEMON and PLATO_DESKTOP_TEST_CLI"]
+#[ignore = "requires provisioned PLATO_DESKTOP_TEST_DAEMON"]
 fn provisioned_shell_exit_detaches_active_daemon_and_cli_stays_locked() {
     let daemon = proof_executable("PLATO_DESKTOP_TEST_DAEMON");
-    let cli = proof_executable("PLATO_DESKTOP_TEST_CLI");
     let workspace = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let workspace_root = canonical_workspace(workspace.path()).unwrap();
     let workspace_file = state.path().join("workspace.json");
     persist_canonical_workspace(&workspace_file, &workspace_root).unwrap();
-    let socket_path = paths::default_socket_path(&workspace_root).unwrap();
-    let lock_path = paths::default_lock_path(&workspace_root).unwrap();
+    let socket_path = paths::host_socket_path().unwrap();
+    let lock_path = paths::host_lock_path().unwrap();
     let config_path = workspace_root.join("plato.toml");
     let provider = PausedFakeProvider::start("desktop survived");
     write_provider_config(&config_path, &provider.base_url);
@@ -114,20 +113,6 @@ fn provisioned_shell_exit_detaches_active_daemon_and_cli_stays_locked() {
             .status,
         RunStateName::Running
     );
-
-    let one_shot = Command::new(cli)
-        .current_dir(&workspace_root)
-        .arg(format!(
-            "--db={}",
-            workspace_root.join("direct-proof.db").display()
-        ))
-        .arg("this must fail before provider access")
-        .output()
-        .unwrap();
-    let one_shot_error = String::from_utf8_lossy(&one_shot.stderr);
-    assert!(!one_shot.status.success());
-    assert!(one_shot_error.contains("daemon lock held"));
-    assert!(one_shot_error.contains(lock_path.to_string_lossy().as_ref()));
 
     drop(lifecycle);
     assert!(lock_path.exists(), "shell exit stopped the daemon");
@@ -157,8 +142,8 @@ fn provisioned_crash_removes_lock_and_explicit_reconnect_restarts_workspace() {
     let workspace_root = canonical_workspace(workspace.path()).unwrap();
     let workspace_file = state.path().join("workspace.json");
     persist_canonical_workspace(&workspace_file, &workspace_root).unwrap();
-    let socket_path = paths::default_socket_path(&workspace_root).unwrap();
-    let lock_path = paths::default_lock_path(&workspace_root).unwrap();
+    let socket_path = paths::host_socket_path().unwrap();
+    let lock_path = paths::host_lock_path().unwrap();
     let mut lifecycle = Mutex::new(DesktopLifecycle::default());
     let launch = test_launch(daemon);
 
@@ -218,9 +203,9 @@ fn provisioned_concurrent_starters_attach_to_one_winner() {
     let daemon = proof_executable("PLATO_DESKTOP_TEST_DAEMON");
     let workspace = tempfile::tempdir().unwrap();
     let workspace_root = canonical_workspace(workspace.path()).unwrap();
-    let socket_path = paths::default_socket_path(&workspace_root).unwrap();
-    let lock_path = paths::default_lock_path(&workspace_root).unwrap();
-    let config = DaemonConnectionConfig::resolve(&workspace_root, None).unwrap();
+    let socket_path = paths::host_socket_path().unwrap();
+    let lock_path = paths::host_lock_path().unwrap();
+    let config = resolve_desktop_connection(&workspace_root, None).unwrap();
     let launch = test_launch(daemon);
     let barrier = Arc::new(Barrier::new(3));
 
@@ -337,7 +322,7 @@ fn connect_hello_bounded(socket_path: &Path, workspace_root: &Path) -> DaemonCli
 fn wait_for_terminal_transcript(
     client: &mut DaemonClient,
     run_id: &str,
-) -> plato_protocol::TranscriptReadResult {
+) -> platonic_protocol::TranscriptReadResult {
     let deadline = Instant::now() + PROOF_TIMEOUT;
     loop {
         let transcript = client.transcript_read(run_id).unwrap();

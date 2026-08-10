@@ -1,20 +1,28 @@
 use crate::{
-    ApprovalModalView, TranscriptState, TuiState,
+    ApprovalModalView, TranscriptState, TranscriptView, TuiState, VoiceControl,
     color::{self, TerminalColors},
-    render, render_snapshot,
+    render::{committed_transcript_lines, render_main, render_overlay},
+    render_snapshot,
 };
 use crossterm::{
     SynchronizedUpdate,
+    cursor::MoveTo,
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    },
 };
-use plato_daemon_client::{ClientResult, client::DaemonConnectionConfig};
-use plato_protocol::RunStateName;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use platonic_client::{ClientResult, client::DaemonConnectionConfig};
+use platonic_protocol::{ApprovalProfile, RunStateName};
+use ratatui::{
+    Terminal, TerminalOptions, Viewport,
+    backend::CrosstermBackend,
+    widgets::{Paragraph, Widget, Wrap},
+};
 use std::{
     env,
     io::{self, Stdout, Write},
@@ -31,17 +39,20 @@ use super::{
         maybe_poll_events_at, spawn_client_worker_to,
     },
     commands::{SlashCommandAction, find_slash_command},
-    state::{MotionMode, SessionPickerView},
+    state::{DisplayMode, MotionMode, SessionPickerView},
 };
 
 const SCROLL_PAGE_LINES: usize = 10;
+const INLINE_VIEWPORT_HEIGHT: u16 = 12;
+const ENABLE_ALTERNATE_SCROLL: &[u8] = b"\x1b[?1007h";
+const DISABLE_ALTERNATE_SCROLL: &[u8] = b"\x1b[?1007l";
 const MIN_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000_u64.div_ceil(120));
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 const REDUCED_MOTION_ENV: &str = "PLATO_REDUCED_MOTION";
 
 pub(super) enum UiEvent {
     Terminal(io::Result<Event>),
-    Daemon(ClientEvent),
+    Daemon(Box<ClientEvent>),
 }
 
 #[derive(Debug, Default)]
@@ -84,6 +95,11 @@ impl FrameScheduler {
     fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
+
+    fn frame_drawn_at(&mut self, now: Instant) {
+        self.deadline = None;
+        self.last_frame = Some(now);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,6 +128,8 @@ pub struct TuiOptions {
     pub reduced_motion: bool,
     /// Optional durable thread selected on the host daemon.
     pub thread: Option<ThreadAttachment>,
+    /// Optional client-owned voice activation worker for this TUI session.
+    pub voice: Option<VoiceControl>,
 }
 
 impl TuiOptions {
@@ -125,6 +143,7 @@ impl TuiOptions {
             snapshot: false,
             reduced_motion: false,
             thread: None,
+            voice: None,
         }
     }
 }
@@ -148,11 +167,15 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
     let (event_sender, events) = mpsc::channel();
-    let commands =
-        spawn_client_worker_to(config.clone(), options.thread.clone(), event_sender.clone());
+    let commands = spawn_client_worker_to(
+        config.clone(),
+        options.thread.clone(),
+        options.voice.clone(),
+        event_sender.clone(),
+    );
     let mut runtime = UiRuntime::from_state(&state, config_path.clone());
     runtime.attach_thread(options.thread.clone());
-    let mut terminal = TerminalSession::enter()?;
+    let mut terminal = TerminalSession::enter(&state)?;
     let background = startup_terminal_background(detected_colors);
     color::install(TerminalColors::detect(background));
     let mut terminal_events = TerminalEventReader::spawn(event_sender);
@@ -163,6 +186,9 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
         let now = Instant::now();
         maybe_poll_events_at(&mut runtime, &commands, now);
         update_elapsed_at(&mut state, &mut runtime, now);
+        if state.drain_streaming_at(now) {
+            frames.schedule_frame();
+        }
         if frames.take_due(now) {
             terminal.draw(&state)?;
             if let Some(delay) = next_animation_frame_in(&state) {
@@ -170,7 +196,10 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
             }
         }
 
-        let deadline = earliest_deadline(frames.deadline(), runtime.poll_deadline());
+        let deadline = earliest_deadline(
+            earliest_deadline(frames.deadline(), runtime.poll_deadline()),
+            state.streaming_deadline(),
+        );
         let event = receive_ui_event(&events, deadline)?;
         let Some(event) = event else {
             continue;
@@ -178,18 +207,24 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
         match event {
             UiEvent::Terminal(event) => {
                 let event = event?;
+                let resized = matches!(event, Event::Resize(_, _));
+                let overlay_was_open = terminal.overlay.is_some();
                 let keep_running = match event {
                     Event::Key(key)
                         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                     {
-                        handle_key_press(
-                            key,
-                            &mut state,
-                            &runtime,
-                            &commands,
-                            options.run.clone(),
-                            config_path.clone(),
-                        )
+                        if handle_audit_scroll_key(key, &state, &mut terminal.audit_scroll.offset) {
+                            true
+                        } else {
+                            handle_key_press(
+                                key,
+                                &mut state,
+                                &runtime,
+                                &commands,
+                                options.run.clone(),
+                                config_path.clone(),
+                            )
+                        }
                     }
                     Event::Paste(text) => {
                         state.handle_paste_text(&text);
@@ -197,14 +232,32 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
                     }
                     _ => true,
                 };
+                terminal.sync_audit_scroll(&state);
+                let draw_while_reader_is_paused =
+                    keep_running && (resized || overlay_was_open && !uses_alternate_screen(&state));
+                if draw_while_reader_is_paused {
+                    if resized {
+                        terminal.draw_after_resize(&state)?;
+                    } else {
+                        terminal.draw(&state)?;
+                    }
+                    let now = Instant::now();
+                    frames.frame_drawn_at(now);
+                    if let Some(delay) = next_animation_frame_in(&state) {
+                        frames.schedule_frame_at(now, delay);
+                    }
+                }
                 terminal_events.acknowledge(keep_running);
                 if !keep_running {
                     break;
                 }
-                frames.schedule_frame();
+                if !draw_while_reader_is_paused {
+                    frames.schedule_frame();
+                }
             }
             UiEvent::Daemon(event) => {
-                apply_client_event(&mut state, &mut runtime, event, &commands);
+                apply_client_event(&mut state, &mut runtime, *event, &commands);
+                terminal.sync_audit_scroll(&state);
                 frames.schedule_frame();
             }
         }
@@ -498,14 +551,6 @@ fn handle_key_press(
             }
             true
         }
-        KeyCode::PageUp => {
-            scroll_history_up(state);
-            true
-        }
-        KeyCode::PageDown => {
-            scroll_history_down(state);
-            true
-        }
         KeyCode::Char(_)
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
@@ -515,6 +560,25 @@ fn handle_key_press(
         }
         _ => true,
     }
+}
+
+fn handle_audit_scroll_key(key: KeyEvent, state: &TuiState, scroll_offset: &mut usize) -> bool {
+    let audit_has_focus = state.display_mode == DisplayMode::Audit
+        && state.status_modal.is_none()
+        && !state.help_visible
+        && state.approval.is_none()
+        && state.session_picker.is_none();
+    if !audit_has_focus {
+        return false;
+    }
+    match key.code {
+        KeyCode::Up => *scroll_offset = scroll_offset.saturating_add(1),
+        KeyCode::Down => *scroll_offset = scroll_offset.saturating_sub(1),
+        KeyCode::PageUp => *scroll_offset = scroll_offset.saturating_add(SCROLL_PAGE_LINES),
+        KeyCode::PageDown => *scroll_offset = scroll_offset.saturating_sub(SCROLL_PAGE_LINES),
+        _ => return false,
+    }
+    true
 }
 
 fn reconnect(commands: &Sender<ClientCommand>, state: &mut TuiState, run_id: Option<String>) {
@@ -745,14 +809,6 @@ fn dispatch_selected_slash_command(
     )
 }
 
-fn scroll_history_up(state: &mut TuiState) {
-    state.scroll_history_up(SCROLL_PAGE_LINES);
-}
-
-fn scroll_history_down(state: &mut TuiState) {
-    state.scroll_history_down(SCROLL_PAGE_LINES);
-}
-
 enum ApprovalAction {
     Grant,
     GrantSession,
@@ -854,7 +910,12 @@ fn submit_composer(
         return true;
     }
     push_live_event(state, crate::LiveEventLine::user(message.clone()));
-    let command = submit_message_command(message, state.selected_session_id.clone(), config_path);
+    let command = submit_message_command(
+        message,
+        state.selected_session_id.clone(),
+        config_path,
+        state.approval_profile,
+    );
     state.status_message = Some("submitted to daemon".into());
     send_command(commands, command, state);
     true
@@ -928,6 +989,14 @@ fn dispatch_slash_command(
             );
             true
         }
+        SlashCommandAction::Yolo => {
+            set_yolo_profile(commands, state, message);
+            true
+        }
+        SlashCommandAction::Voice => {
+            set_voice_activation(commands, state, message);
+            true
+        }
         SlashCommandAction::Clear => {
             clear_visible_transcript(state);
             state.status_message = Some("visible transcript cleared".into());
@@ -938,7 +1007,7 @@ fn dispatch_slash_command(
             true
         }
         SlashCommandAction::NewSession => {
-            start_fresh_session(state);
+            request_fresh_session(commands, state);
             true
         }
         SlashCommandAction::IssuePrep => {
@@ -961,17 +1030,68 @@ fn clear_visible_transcript(state: &mut TuiState) {
     state.replace_transcript(TranscriptState::None);
     state.clear_live_events();
     state.stream_warning = None;
-    state.reset_all_scroll();
 }
 
-fn start_fresh_session(state: &mut TuiState) {
+fn request_fresh_session(commands: &Sender<ClientCommand>, state: &mut TuiState) {
+    state.status_message = Some("turning voice off for new session".into());
+    send_command(commands, ClientCommand::VoiceResetForNewSession, state);
+}
+
+pub(super) fn select_fresh_session(state: &mut TuiState) {
     state.selected_session_id = None;
+    state.approval_profile = ApprovalProfile::Prompt;
     state.replace_transcript(TranscriptState::None);
     state.clear_live_events();
     state.stream_warning = None;
     state.session_picker = None;
-    state.reset_all_scroll();
     state.status_message = Some("new session selected".into());
+}
+
+fn set_voice_activation(commands: &Sender<ClientCommand>, state: &mut TuiState, message: &str) {
+    let mut parts = message.split_whitespace();
+    let enabled = match (parts.next(), parts.next(), parts.next()) {
+        (Some("/voice"), Some("on"), None) => true,
+        (Some("/voice"), Some("off"), None) => false,
+        _ => {
+            state.status_message = Some("usage: /voice on|off".into());
+            return;
+        }
+    };
+    state.status_message = Some(
+        if enabled {
+            "enabling voice"
+        } else {
+            "disabling voice"
+        }
+        .into(),
+    );
+    send_command(commands, ClientCommand::VoiceSet { enabled }, state);
+}
+
+fn set_yolo_profile(commands: &Sender<ClientCommand>, state: &mut TuiState, message: &str) {
+    let mut parts = message.split_whitespace();
+    let profile = match (parts.next(), parts.next(), parts.next()) {
+        (Some("/yolo"), Some("on"), None) => ApprovalProfile::Yolo,
+        (Some("/yolo"), Some("off"), None) => ApprovalProfile::Prompt,
+        _ => {
+            state.status_message = Some("usage: /yolo on|off".into());
+            return;
+        }
+    };
+    let Some(session_id) = state.selected_session_id.clone() else {
+        state.approval_profile = profile;
+        state.status_message = Some(format!("next session approval profile: {profile}"));
+        return;
+    };
+    state.status_message = Some(format!("setting session approval profile: {profile}"));
+    send_command(
+        commands,
+        ClientCommand::ApprovalProfileSet {
+            session_id,
+            profile,
+        },
+        state,
+    );
 }
 
 fn start_issue_prep(
@@ -1036,6 +1156,7 @@ pub(super) fn start_next_queued(
         message,
         state.selected_session_id.clone(),
         runtime.config_path.clone(),
+        state.approval_profile,
     );
     runtime.polling = true;
     runtime.poll_in_flight = false;
@@ -1051,16 +1172,19 @@ fn submit_message_command(
     message: String,
     selected_session_id: Option<String>,
     config_path: Option<String>,
+    approval_profile: ApprovalProfile,
 ) -> ClientCommand {
     match selected_session_id {
         Some(session_id) => ClientCommand::MessageAppend {
             message,
             session_id,
             config_path,
+            approval_profile: None,
         },
         None => ClientCommand::RunStart {
             question: message,
             config_path,
+            approval_profile,
         },
     }
 }
@@ -1090,9 +1214,21 @@ fn update_elapsed_at(state: &mut TuiState, runtime: &mut UiRuntime, now: Instant
     });
 }
 
-pub(super) fn push_live_event(state: &mut TuiState, mut line: crate::LiveEventLine) {
+pub(super) fn push_live_event(state: &mut TuiState, line: crate::LiveEventLine) {
+    push_live_event_at(state, line, Instant::now());
+}
+
+pub(super) fn push_live_event_at(state: &mut TuiState, line: crate::LiveEventLine, now: Instant) {
     use crate::LiveEventKind;
 
+    if line.kind == LiveEventKind::AssistantDelta {
+        state.queue_assistant_delta(line, now);
+        return;
+    }
+    if line.kind == LiveEventKind::Assistant {
+        state.consolidate_assistant(line);
+        return;
+    }
     state.invalidate_live_event_rows();
     if line.kind == LiveEventKind::Approval
         && line.offset.is_some()
@@ -1104,32 +1240,9 @@ pub(super) fn push_live_event(state: &mut TuiState, mut line: crate::LiveEventLi
         })
     {
         *immediate = line;
-        state.reset_scroll();
-        return;
-    }
-    if line.kind == LiveEventKind::AssistantDelta {
-        if let Some(last) = state.live_events.last_mut()
-            && last.kind == LiveEventKind::Assistant
-            && last.run_id == line.run_id
-        {
-            last.text.push_str(&line.text);
-            last.offset = line.offset;
-            state.reset_scroll();
-            return;
-        }
-        line.kind = LiveEventKind::Assistant;
-    } else if line.kind == LiveEventKind::Assistant
-        && let Some(last) = state.live_events.last_mut()
-        && last.kind == LiveEventKind::Assistant
-        && last.run_id == line.run_id
-    {
-        last.text = line.text;
-        last.offset = line.offset;
-        state.reset_scroll();
         return;
     }
     state.live_events.push(line);
-    state.reset_scroll();
 }
 
 enum TerminalReaderControl {
@@ -1182,26 +1295,219 @@ impl Drop for TerminalEventReader {
     }
 }
 
+type BufferedTerminal = Terminal<CrosstermBackend<Vec<u8>>>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuditScrollBoundary {
+    session_id: Option<String>,
+    run_id: Option<String>,
+    transcript_selected: bool,
+}
+
+impl AuditScrollBoundary {
+    fn from_state(state: &TuiState) -> Self {
+        let run_id = state
+            .active_run
+            .as_ref()
+            .map(|run| run.run_id.clone())
+            .or_else(|| {
+                let selected_session_id = state.selected_session_id.as_deref()?;
+                state
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == selected_session_id)
+                    .map(|session| session.run_id.clone())
+            })
+            .or_else(|| match &state.transcript {
+                TranscriptState::Loaded(transcript) => Some(transcript.run_id.clone()),
+                TranscriptState::Unavailable { run_id, .. } => Some(run_id.clone()),
+                TranscriptState::None => None,
+            });
+        Self {
+            session_id: state.selected_session_id.clone(),
+            run_id,
+            transcript_selected: !matches!(state.transcript, TranscriptState::None),
+        }
+    }
+}
+
+struct AuditScrollState {
+    offset: usize,
+    boundary: AuditScrollBoundary,
+}
+
+impl AuditScrollState {
+    fn new(state: &TuiState) -> Self {
+        Self {
+            offset: 0,
+            boundary: AuditScrollBoundary::from_state(state),
+        }
+    }
+
+    fn sync(&mut self, state: &TuiState) {
+        let boundary = AuditScrollBoundary::from_state(state);
+        if self.boundary != boundary {
+            self.offset = 0;
+            self.boundary = boundary;
+        }
+    }
+}
+
 struct TerminalSession {
-    terminal: Terminal<CrosstermBackend<Vec<u8>>>,
+    inline: BufferedTerminal,
+    overlay: Option<BufferedTerminal>,
     stdout: Stdout,
+    committed_transcript: Option<TranscriptView>,
+    audit_scroll: AuditScrollState,
 }
 
 impl TerminalSession {
-    fn enter() -> ClientResult<Self> {
+    fn enter(state: &TuiState) -> ClientResult<Self> {
         enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-        let terminal = Terminal::new(CrosstermBackend::new(Vec::new()))?;
-        Ok(Self { terminal, stdout })
+        let session: ClientResult<Self> = (|| {
+            let mut stdout = io::stdout();
+            let (_, height) = terminal::size()?;
+            execute!(
+                stdout,
+                EnableBracketedPaste,
+                MoveTo(0, height.saturating_sub(1))
+            )?;
+            let inline = Terminal::with_options(
+                CrosstermBackend::new(Vec::new()),
+                TerminalOptions {
+                    viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
+                },
+            )?;
+            Ok(Self {
+                inline,
+                overlay: None,
+                stdout,
+                committed_transcript: None,
+                audit_scroll: AuditScrollState::new(state),
+            })
+        })();
+        if session.is_err() {
+            let _ = execute!(io::stdout(), DisableBracketedPaste);
+            let _ = disable_raw_mode();
+        }
+        session
     }
 
     fn draw(&mut self, state: &TuiState) -> ClientResult<()> {
-        self.terminal.draw(|frame| render(frame, state))?;
-        let output = std::mem::take(self.terminal.backend_mut().writer_mut());
-        write_synchronized(&mut self.stdout, &output)?;
+        self.sync_audit_scroll(state);
+        if uses_alternate_screen(state) {
+            self.enter_overlay()?;
+            let overlay = self.overlay.as_mut().expect("overlay terminal entered");
+            let scroll_offset = if state.display_mode == DisplayMode::Audit {
+                self.audit_scroll.offset
+            } else {
+                0
+            };
+            overlay.draw(|frame| render_overlay(frame, state, scroll_offset))?;
+            write_terminal_output(overlay, &mut self.stdout)?;
+            return Ok(());
+        }
+
+        if self.leave_overlay()? {
+            self.anchor_inline_to_bottom()?;
+        }
+        self.commit_transcript(state)?;
+        self.inline.draw(|frame| render_main(frame, state))?;
+        write_terminal_output(&mut self.inline, &mut self.stdout)?;
         Ok(())
     }
+
+    fn draw_after_resize(&mut self, state: &TuiState) -> ClientResult<()> {
+        if self.overlay.is_some() {
+            self.leave_overlay()?;
+        }
+        self.anchor_inline_to_bottom()?;
+        self.inline.autoresize()?;
+        if uses_alternate_screen(state) {
+            self.enter_overlay()?;
+        }
+        self.draw(state)
+    }
+
+    fn sync_audit_scroll(&mut self, state: &TuiState) {
+        self.audit_scroll.sync(state);
+    }
+
+    fn anchor_inline_to_bottom(&mut self) -> io::Result<()> {
+        let (_, height) = terminal::size()?;
+        execute!(self.stdout, MoveTo(0, height.saturating_sub(1)))
+    }
+
+    fn commit_transcript(&mut self, state: &TuiState) -> ClientResult<()> {
+        self.inline.autoresize()?;
+        let TranscriptState::Loaded(current) = &state.transcript else {
+            return Ok(());
+        };
+        if self.committed_transcript.as_ref() == Some(current) {
+            return Ok(());
+        }
+
+        let width = self.inline.size()?.width.max(1);
+        let current_lines = committed_transcript_lines(state, current, width);
+        let first_new_line = self
+            .committed_transcript
+            .as_ref()
+            .map(|previous| committed_transcript_lines(state, previous, width))
+            .filter(|previous_lines| current_lines.starts_with(previous_lines))
+            .map_or(0, |previous_lines| previous_lines.len());
+        let new_lines = current_lines[first_new_line..].to_vec();
+        if !new_lines.is_empty() {
+            let paragraph = Paragraph::new(new_lines).wrap(Wrap { trim: false });
+            let height = u16::try_from(paragraph.line_count(width)).unwrap_or(u16::MAX);
+            self.inline.insert_before(height, move |buffer| {
+                paragraph.render(buffer.area, buffer);
+            })?;
+        }
+        self.committed_transcript = Some(current.clone());
+        Ok(())
+    }
+
+    fn enter_overlay(&mut self) -> ClientResult<()> {
+        if self.overlay.is_some() {
+            return Ok(());
+        }
+        let overlay = Terminal::new(CrosstermBackend::new(Vec::new()))?;
+        execute!(self.stdout, EnterAlternateScreen)?;
+        self.stdout.write_all(ENABLE_ALTERNATE_SCROLL)?;
+        self.stdout.flush()?;
+        self.overlay = Some(overlay);
+        Ok(())
+    }
+
+    fn leave_overlay(&mut self) -> ClientResult<bool> {
+        if self.overlay.is_none() {
+            return Ok(false);
+        }
+        self.stdout.write_all(DISABLE_ALTERNATE_SCROLL)?;
+        execute!(self.stdout, LeaveAlternateScreen)?;
+        self.stdout.flush()?;
+        self.overlay = None;
+        Ok(true)
+    }
+}
+
+fn uses_alternate_screen(state: &TuiState) -> bool {
+    state.display_mode == DisplayMode::Audit
+        || state.help_visible
+        || state.approval.is_some()
+        || state.session_picker.is_some()
+        || state.status_modal.is_some()
+}
+
+fn write_terminal_output(
+    terminal: &mut BufferedTerminal,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
+    let output = std::mem::take(terminal.backend_mut().writer_mut());
+    if output.is_empty() {
+        return Ok(());
+    }
+    write_synchronized(stdout, &output)
 }
 
 fn write_synchronized(output: &mut impl Write, frame: &[u8]) -> io::Result<()> {
@@ -1210,12 +1516,13 @@ fn write_synchronized(output: &mut impl Write, frame: &[u8]) -> io::Result<()> {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(self.stdout, DisableBracketedPaste, LeaveAlternateScreen);
-        self.terminal.backend_mut().writer_mut().clear();
-        let _ = self.terminal.show_cursor();
-        let output = std::mem::take(self.terminal.backend_mut().writer_mut());
+        let _ = self.leave_overlay();
+        let _ = self.inline.clear();
+        let _ = self.inline.show_cursor();
+        let output = std::mem::take(self.inline.backend_mut().writer_mut());
         let _ = self.stdout.write_all(&output);
+        let _ = execute!(self.stdout, DisableBracketedPaste);
+        let _ = disable_raw_mode();
         let _ = self.stdout.flush();
     }
 }
@@ -1232,12 +1539,12 @@ mod tests {
     use super::super::state::DisplayMode;
     use super::*;
     use crate::TranscriptState;
-    use plato_daemon_client::ClientError;
-    use plato_protocol::{
-        BufferedStreamEvent, DaemonStatusResult, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
-        ERROR_WORKSPACE_MISMATCH, EventsStreamResult, HelloResult, IssuePrepResult,
-        IssuePrepStartResult, ModelIdentityStatus, ProtocolError, RunStartResult, SessionSummary,
-        TranscriptReadResult,
+    use platonic_client::ClientError;
+    use platonic_protocol::{
+        BufferedStreamEvent, DaemonStatusResult, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED,
+        ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION, ERROR_WORKSPACE_MISMATCH, EventsStreamResult,
+        HelloResult, IssuePrepResult, IssuePrepStartResult, ModelIdentityStatus, ProtocolError,
+        RunStartResult, SessionApprovalProfileSetResult, SessionSummary, TranscriptReadResult,
     };
     use serde_json::json;
     #[cfg(unix)]
@@ -1363,9 +1670,11 @@ mod tests {
             ClientCommand::RunStart {
                 question,
                 config_path,
+                approval_profile,
             } => {
                 assert_eq!(question, "start work");
                 assert_eq!(config_path.as_deref(), Some("plato.toml"));
+                assert_eq!(approval_profile, ApprovalProfile::Prompt);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1393,10 +1702,12 @@ mod tests {
                 message,
                 session_id,
                 config_path,
+                approval_profile,
             } => {
                 assert_eq!(message, "continue work");
                 assert_eq!(session_id, "session_1");
                 assert_eq!(config_path.as_deref(), Some("plato.toml"));
+                assert_eq!(approval_profile, None);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1504,7 +1815,6 @@ mod tests {
             "[turn_1] user: question\n[turn_1] assistant: answer\n",
         ));
         state.live_events = vec![crate::LiveEventLine::status(Some(7), "run finished")];
-        state.scroll_history_up(20);
         let transcript = state.transcript.clone();
         let live_events = state.live_events.clone();
         let runtime = UiRuntime::from_state(&state, None);
@@ -1519,13 +1829,11 @@ mod tests {
         ));
 
         assert_eq!(state.display_mode, DisplayMode::Audit);
-        assert_eq!(state.scroll_offset, 0);
         assert_cached_rows(&state, false, false);
         assert_eq!(state.transcript, transcript);
         assert_eq!(state.live_events, live_events);
         assert!(receiver.try_recv().is_err());
 
-        state.scroll_history_up(10);
         render_snapshot(&state, 100, 24).unwrap();
         assert_cached_rows(&state, true, true);
         assert!(press_key(
@@ -1536,9 +1844,7 @@ mod tests {
         ));
 
         assert_eq!(state.display_mode, DisplayMode::Conversation);
-        assert_eq!(state.scroll_offset, 20);
         assert_cached_rows(&state, false, false);
-        assert_eq!(state.audit_scroll_offset, 10);
         assert!(receiver.try_recv().is_err());
     }
 
@@ -1666,6 +1972,209 @@ mod tests {
     }
 
     #[test]
+    fn yolo_command_sets_next_session_profile_before_a_session_exists() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.selected_session_id = None;
+        state.set_composer_text("/yolo on");
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+        assert_eq!(state.approval_profile, ApprovalProfile::Yolo);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("next session approval profile: yolo")
+        );
+        assert!(receiver.try_recv().is_err());
+
+        state.set_composer_text("start boldly");
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+        match receiver.try_recv().unwrap() {
+            ClientCommand::RunStart {
+                approval_profile, ..
+            } => assert_eq!(approval_profile, ApprovalProfile::Yolo),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn voice_command_sends_only_the_exact_client_activation_request() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let mut runtime = UiRuntime::from_state(&state, None);
+
+        state.set_composer_text("/voice on");
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ClientCommand::VoiceSet { enabled: true }
+        ));
+        assert_eq!(state.status_message.as_deref(), Some("enabling voice"));
+
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::VoiceSet(crate::VoiceControlResponse::Enabled),
+            &sender,
+        );
+        assert_eq!(state.status_message.as_deref(), Some("voice enabled"));
+
+        state.set_composer_text("/voice off");
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ClientCommand::VoiceSet { enabled: false }
+        ));
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::VoiceSet(crate::VoiceControlResponse::AlreadyDisabled),
+            &sender,
+        );
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("voice already disabled")
+        );
+    }
+
+    #[test]
+    fn voice_command_rejects_nonliteral_modes_without_a_worker_request() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        for command in ["/voice", "/voice yes", "/voice off now"] {
+            state.set_composer_text(command);
+            assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+            assert_eq!(
+                state.status_message.as_deref(),
+                Some("usage: /voice on|off")
+            );
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn voice_activation_failure_is_reported_without_daemon_state() {
+        let (sender, _) = mpsc::channel();
+        let mut state = test_state();
+        let mut runtime = UiRuntime::from_state(&state, None);
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::VoiceSet(crate::VoiceControlResponse::Failed(
+                "voice configuration is incomplete: missing voice.whisper_model".into(),
+            )),
+            &sender,
+        );
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("voice configuration is incomplete: missing voice.whisper_model")
+        );
+    }
+
+    #[test]
+    fn yolo_command_mutates_selected_session_only_after_daemon_ack() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.selected_session_id = Some("session_1".into());
+        state.set_composer_text("/yolo on");
+        let mut runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+        assert_eq!(state.approval_profile, ApprovalProfile::Prompt);
+        match receiver.try_recv().unwrap() {
+            ClientCommand::ApprovalProfileSet {
+                session_id,
+                profile,
+            } => {
+                assert_eq!(session_id, "session_1");
+                assert_eq!(profile, ApprovalProfile::Yolo);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::ApprovalProfileSet(SessionApprovalProfileSetResult {
+                session_id: "session_1".into(),
+                profile: ApprovalProfile::Yolo,
+            }),
+            &sender,
+        );
+        assert_eq!(state.approval_profile, ApprovalProfile::Yolo);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("session approval profile: yolo")
+        );
+    }
+
+    #[test]
+    fn stale_daemon_profile_readbacks_do_not_replace_the_visible_session_profile() {
+        let (sender, _) = mpsc::channel();
+        let mut state = test_state();
+        state.selected_session_id = Some("session_2".into());
+        state.approval_profile = ApprovalProfile::Prompt;
+        let mut runtime = UiRuntime::from_state(&state, None);
+
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::ApprovalProfileSet(SessionApprovalProfileSetResult {
+                session_id: "session_1".into(),
+                profile: ApprovalProfile::Yolo,
+            }),
+            &sender,
+        );
+        assert_eq!(state.approval_profile, ApprovalProfile::Prompt);
+
+        let mut stale_status = status_fixture();
+        stale_status.trust.approval_profile = ApprovalProfile::Yolo;
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::StatusLoaded(Box::new(stale_status)),
+            &sender,
+        );
+        assert_eq!(state.approval_profile, ApprovalProfile::Prompt);
+    }
+
+    #[test]
+    fn status_without_a_session_preserves_the_next_run_profile() {
+        let (sender, _) = mpsc::channel();
+        let mut state = test_state();
+        state.selected_session_id = None;
+        state.approval_profile = ApprovalProfile::Yolo;
+        let mut runtime = UiRuntime::from_state(&state, None);
+        let mut status = status_fixture();
+        status.session.session_id = None;
+
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::StatusLoaded(Box::new(status)),
+            &sender,
+        );
+
+        assert_eq!(state.approval_profile, ApprovalProfile::Yolo);
+    }
+
+    #[test]
+    fn yolo_command_rejects_nonliteral_modes_locally() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        for command in ["/yolo", "/yolo yes", "/yolo off now"] {
+            state.set_composer_text(command);
+            assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+            assert_eq!(state.status_message.as_deref(), Some("usage: /yolo on|off"));
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[test]
     fn issue_prep_command_sends_typed_daemon_request() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
@@ -1787,7 +2296,6 @@ mod tests {
         state.replace_transcript(loaded_transcript("run_1", "[turn_1] user: hello\n"));
         state.live_events = vec![crate::LiveEventLine::assistant(Some(1), "hello")];
         state.stream_warning = Some("lagged".into());
-        state.scroll_offset = 10;
         state.set_composer_text("/clear");
         let runtime = UiRuntime::from_state(&state, None);
         render_snapshot(&state, 100, 24).unwrap();
@@ -1803,7 +2311,6 @@ mod tests {
         assert!(state.live_events.is_empty());
         assert_cached_rows(&state, false, false);
         assert!(state.stream_warning.is_none());
-        assert_eq!(state.scroll_offset, 0);
         assert_eq!(
             state.status_message.as_deref(),
             Some("visible transcript cleared")
@@ -2072,16 +2579,47 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
         state.selected_session_id = Some("session_1".into());
+        state.approval_profile = ApprovalProfile::Yolo;
         state.replace_transcript(loaded_transcript("run_1", "[turn_1] user: old\n"));
         state.live_events = vec![crate::LiveEventLine::assistant(None, "old")];
         state.set_composer_text("/new");
-        let runtime = UiRuntime::from_state(&state, None);
+        let mut runtime = UiRuntime::from_state(&state, None);
         render_snapshot(&state, 100, 24).unwrap();
         assert_cached_rows(&state, true, true);
 
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
 
+        assert_eq!(state.selected_session_id.as_deref(), Some("session_1"));
+        assert_eq!(state.approval_profile, ApprovalProfile::Yolo);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("turning voice off for new session")
+        );
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientCommand::VoiceResetForNewSession
+        ));
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::VoiceResetForNewSession(crate::VoiceControlResponse::Failed(
+                "voice shutdown failed".into(),
+            )),
+            &sender,
+        );
+        assert_eq!(state.selected_session_id.as_deref(), Some("session_1"));
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("voice shutdown failed")
+        );
+        apply_client_event(
+            &mut state,
+            &mut runtime,
+            ClientEvent::VoiceResetForNewSession(crate::VoiceControlResponse::AlreadyDisabled),
+            &sender,
+        );
         assert!(state.selected_session_id.is_none());
+        assert_eq!(state.approval_profile, ApprovalProfile::Prompt);
         assert!(state.live_events.is_empty());
         assert_cached_rows(&state, false, false);
         assert_eq!(
@@ -2623,11 +3161,98 @@ mod tests {
             },
         );
 
+        assert!(state.live_events.is_empty());
+        assert!(state.finalize_streaming(Some("run_1")));
         assert_eq!(state.live_events.len(), 1);
         assert_eq!(state.live_events[0].kind, crate::LiveEventKind::Assistant);
         assert_eq!(state.live_events[0].text.len(), 500);
         assert!(state.stream_warning.is_none());
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn assistant_burst_drains_adaptively_and_quiet_tail_flushes_on_time() {
+        let mut state = test_state();
+        let base = Instant::now();
+        let burst = (0..20)
+            .map(|index| format!("burst line {index:02}\n"))
+            .collect::<String>();
+        for (offset, line) in burst.split_inclusive('\n').enumerate() {
+            push_live_event_at(
+                &mut state,
+                crate::LiveEventLine::assistant_delta(Some(offset as u64), line)
+                    .with_run_id("run_1"),
+                base,
+            );
+        }
+
+        assert!(state.live_events.is_empty());
+        let first_deadline = state.streaming_deadline().unwrap();
+        assert!(first_deadline < base + Duration::from_millis(40));
+        assert!(!state.drain_streaming_at(first_deadline - Duration::from_nanos(1)));
+        assert!(state.drain_streaming_at(first_deadline));
+        assert!(state.live_events[0].text.len() < burst.len());
+
+        while let Some(deadline) = state.streaming_deadline() {
+            assert!(state.drain_streaming_at(deadline));
+        }
+        assert_eq!(state.live_events[0].text, burst);
+
+        let quiet_at = first_deadline + Duration::from_secs(1);
+        push_live_event_at(
+            &mut state,
+            crate::LiveEventLine::assistant_delta(Some(20), "ends mid-token").with_run_id("run_1"),
+            quiet_at,
+        );
+        let quiet_deadline = quiet_at + crate::state::STREAM_QUIET_FLUSH;
+        assert!(!state.drain_streaming_at(quiet_deadline - Duration::from_nanos(1)));
+        assert!(state.drain_streaming_at(quiet_deadline));
+        assert_eq!(state.live_events[0].text, format!("{burst}ends mid-token"));
+    }
+
+    #[test]
+    fn incomplete_markdown_table_is_held_and_released_as_one_raw_chunk() {
+        let mut state = test_state();
+        let base = Instant::now();
+        let table = "| Name | Value |\n| --- | --- |\n| alpha | one |\n";
+        for (offset, line) in table.split_inclusive('\n').enumerate() {
+            push_live_event_at(
+                &mut state,
+                crate::LiveEventLine::assistant_delta(Some(offset as u64), line)
+                    .with_run_id("run_1"),
+                base,
+            );
+        }
+
+        assert!(state.streaming_deadline().is_none());
+        assert!(!state.drain_streaming_at(base + Duration::from_secs(1)));
+        assert!(state.live_events.is_empty());
+
+        push_live_event_at(
+            &mut state,
+            crate::LiveEventLine::assistant_delta(Some(3), "\n").with_run_id("run_1"),
+            base + Duration::from_millis(1),
+        );
+        let deadline = state.streaming_deadline().unwrap();
+        assert!(state.drain_streaming_at(deadline));
+        assert_eq!(state.live_events.len(), 1);
+        assert_eq!(state.live_events[0].text, table);
+    }
+
+    #[test]
+    fn terminal_mid_token_stream_consolidates_exact_raw_source() {
+        let mut state = test_state();
+        let base = Instant::now();
+        push_live_event_at(
+            &mut state,
+            crate::LiveEventLine::assistant_delta(Some(1), "final mid-tok").with_run_id("run_1"),
+            base,
+        );
+
+        assert!(state.finalize_streaming(Some("run_1")));
+        assert_eq!(state.live_events.len(), 1);
+        assert_eq!(state.live_events[0].text.as_bytes(), b"final mid-tok");
+        assert!(state.streaming_deadline().is_none());
     }
 
     #[test]
@@ -2813,6 +3438,7 @@ mod tests {
                 ledger_path: "/tmp/agent.db".into(),
                 status: RunStateName::Running,
                 final_answer: None,
+                completion_claim: None,
             },
             "run started",
         );
@@ -2840,6 +3466,7 @@ mod tests {
             &mut state,
             crate::LiveEventLine::assistant_delta(Some(2), "second").with_run_id("run_2"),
         );
+        assert!(state.finalize_streaming(Some("run_2")));
 
         assert_eq!(state.live_events.len(), 2);
         assert_eq!(state.live_events[0].text, "first");
@@ -2849,31 +3476,100 @@ mod tests {
     }
 
     #[test]
-    fn page_keys_adjust_scroll_offset() {
-        let (sender, receiver) = mpsc::channel();
+    fn page_and_arrow_keys_scroll_only_the_focused_audit_overlay() {
         let mut state = test_state();
-        let runtime = UiRuntime::from_state(&state, None);
+        let mut offset = 0;
 
-        assert!(handle_key_press(
+        assert!(!handle_audit_scroll_key(
             KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
-            &mut state,
-            &runtime,
-            &sender,
-            None,
-            None,
+            &state,
+            &mut offset,
         ));
-        assert_eq!(state.scroll_offset, SCROLL_PAGE_LINES);
+        assert_eq!(offset, 0);
 
-        assert!(handle_key_press(
-            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
-            &mut state,
-            &runtime,
-            &sender,
-            None,
-            None,
+        state.toggle_display_mode();
+        assert!(handle_audit_scroll_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+            &state,
+            &mut offset,
         ));
-        assert_eq!(state.scroll_offset, 0);
-        assert!(receiver.try_recv().is_err());
+        assert_eq!(offset, SCROLL_PAGE_LINES);
+        assert!(handle_audit_scroll_key(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            &state,
+            &mut offset,
+        ));
+        assert_eq!(offset, SCROLL_PAGE_LINES + 1);
+        assert!(handle_audit_scroll_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            &state,
+            &mut offset,
+        ));
+        assert_eq!(offset, SCROLL_PAGE_LINES);
+        assert!(handle_audit_scroll_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+            &state,
+            &mut offset,
+        ));
+        assert_eq!(offset, 0);
+
+        state.approval = Some(test_approval("run_1", "call_1"));
+        assert!(!handle_audit_scroll_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+            &state,
+            &mut offset,
+        ));
+    }
+
+    #[test]
+    fn terminal_audit_scroll_resets_only_at_selected_transcript_boundaries() {
+        let mut state = selected_state("session_1", "run_1", "first transcript");
+        state.approval_scroll_offset = 7;
+        let mut audit_scroll = AuditScrollState::new(&state);
+        audit_scroll.offset = SCROLL_PAGE_LINES;
+
+        state.toggle_display_mode();
+        audit_scroll.sync(&state);
+        state.toggle_display_mode();
+        audit_scroll.sync(&state);
+        assert_eq!(audit_scroll.offset, SCROLL_PAGE_LINES);
+
+        apply_loaded_state(
+            &mut state,
+            selected_state("session_1", "run_1", "updated same transcript"),
+        );
+        audit_scroll.sync(&state);
+        assert_eq!(audit_scroll.offset, SCROLL_PAGE_LINES);
+
+        clear_visible_transcript(&mut state);
+        audit_scroll.sync(&state);
+        assert_eq!(audit_scroll.offset, 0);
+        assert_eq!(state.approval_scroll_offset, 7);
+
+        state = selected_state("session_1", "run_1", "restored transcript");
+        audit_scroll.sync(&state);
+        audit_scroll.offset = SCROLL_PAGE_LINES;
+        select_fresh_session(&mut state);
+        audit_scroll.sync(&state);
+        assert_eq!(audit_scroll.offset, 0);
+
+        state = selected_state("session_1", "run_1", "first transcript");
+        audit_scroll.sync(&state);
+        audit_scroll.offset = SCROLL_PAGE_LINES;
+        apply_loaded_state(
+            &mut state,
+            selected_state("session_2", "run_2", "different session"),
+        );
+        audit_scroll.sync(&state);
+        assert_eq!(audit_scroll.offset, 0);
+
+        audit_scroll.offset = SCROLL_PAGE_LINES;
+        apply_loaded_state(
+            &mut state,
+            selected_state("session_2", "run_3", "different run"),
+        );
+        audit_scroll.sync(&state);
+        assert_eq!(audit_scroll.offset, 0);
     }
 
     #[test]
@@ -2912,9 +3608,11 @@ mod tests {
             ClientCommand::RunStart {
                 question,
                 config_path,
+                approval_profile,
             } => {
                 assert_eq!(question, "next turn");
                 assert_eq!(config_path.as_deref(), Some("plato.toml"));
+                assert_eq!(approval_profile, ApprovalProfile::Prompt);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -2960,10 +3658,12 @@ mod tests {
                 message,
                 session_id,
                 config_path,
+                approval_profile,
             } => {
                 assert_eq!(message, "next turn");
                 assert_eq!(session_id, "session_1");
                 assert_eq!(config_path.as_deref(), Some("plato.toml"));
+                assert_eq!(approval_profile, None);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -3014,7 +3714,7 @@ mod tests {
             .send(ClientEvent::Failed {
                 operation: ClientOperation::IssuePrepStart,
                 error: ClientError::DaemonResponse(ProtocolError {
-                    code: "issue_prep_failed".into(),
+                    code: ERROR_ISSUE_PREP_FAILED,
                     message: "provider failed".into(),
                 }),
             })
@@ -3096,7 +3796,7 @@ mod tests {
             .send(ClientEvent::Failed {
                 operation: ClientOperation::EventsStream,
                 error: ClientError::DaemonResponse(ProtocolError {
-                    code: "lagged".into(),
+                    code: ERROR_LAGGED,
                     message: "offset is no longer buffered".into(),
                 }),
             })
@@ -3172,19 +3872,19 @@ mod tests {
         )));
         assert!(is_connection_error(&ClientError::DaemonResponse(
             ProtocolError {
-                code: ERROR_UNSUPPORTED_VERSION.into(),
+                code: ERROR_UNSUPPORTED_VERSION,
                 message: "unsupported".into(),
             }
         )));
         assert!(is_connection_error(&ClientError::DaemonResponse(
             ProtocolError {
-                code: ERROR_WORKSPACE_MISMATCH.into(),
+                code: ERROR_WORKSPACE_MISMATCH,
                 message: "wrong workspace".into(),
             }
         )));
         assert!(!is_connection_error(&ClientError::DaemonResponse(
             ProtocolError {
-                code: ERROR_OVERLOAD.into(),
+                code: ERROR_OVERLOAD,
                 message: "busy".into(),
             }
         )));
@@ -3470,7 +4170,7 @@ mod tests {
             .send(ClientEvent::Failed {
                 operation: ClientOperation::ApprovalDecide,
                 error: ClientError::DaemonResponse(ProtocolError {
-                    code: "temporarily_unavailable".into(),
+                    code: ERROR_OVERLOAD,
                     message: "try the same decision again".into(),
                 }),
             })
@@ -3498,15 +4198,15 @@ mod tests {
 
         event_sender
             .send(ClientEvent::ApprovalDecided {
-                result: plato_protocol::CommandAcceptedResult {
+                result: platonic_protocol::CommandAcceptedResult {
                     run_id: "run_retry".into(),
                     status: RunStateName::Running,
                 },
                 tool_call_id: approval.tool_call_id.clone(),
                 decision: if grant {
-                    plato_protocol::ApprovalDecisionName::Granted
+                    platonic_protocol::ApprovalDecisionName::Granted
                 } else {
-                    plato_protocol::ApprovalDecisionName::Denied
+                    platonic_protocol::ApprovalDecisionName::Denied
                 },
             })
             .unwrap();
@@ -3721,7 +4421,6 @@ mod tests {
         });
         state.active_run_elapsed_secs = Some(17);
         state.toggle_display_mode();
-        state.scroll_history_up(10);
         state.cancel_requested = true;
         state.approval = Some(test_approval("run_1", "call_1"));
         render_snapshot(&state, 100, 24).unwrap();
@@ -3751,8 +4450,6 @@ mod tests {
         );
         assert_eq!(state.active_run_elapsed_secs, Some(17));
         assert_eq!(state.display_mode, DisplayMode::Audit);
-        assert_eq!(state.scroll_offset, 10);
-        assert_eq!(state.audit_scroll_offset, 10);
         assert!(state.cancel_requested);
         assert_eq!(
             state
@@ -3770,6 +4467,44 @@ mod tests {
         assert!(output.contains("refreshed answer"));
         assert!(!output.contains("old answer"));
         assert!(output.contains("live status"));
+    }
+
+    #[test]
+    fn canceled_mid_stream_source_survives_matching_transcript_reload() {
+        let mut state = selected_state(
+            "session_1",
+            "run_1",
+            "[turn_1] user: cancel this response\n",
+        );
+        push_live_event_at(
+            &mut state,
+            crate::LiveEventLine::assistant_delta(Some(7), "kept through mid-tok")
+                .with_run_id("run_1"),
+            Instant::now(),
+        );
+        assert!(state.finalize_streaming(Some("run_1")));
+        state.active_run = Some(crate::ActiveRunView {
+            run_id: "run_1".into(),
+            status: RunStateName::Canceled,
+        });
+        state.sessions[0].status = RunStateName::Canceled;
+
+        let mut loaded = test_state();
+        loaded.sessions = state.sessions.clone();
+        loaded.selected_session_id = Some("session_1".into());
+        loaded.replace_transcript(loaded_transcript(
+            "run_1",
+            "[turn_1] user: cancel this response\n",
+        ));
+        apply_loaded_state(&mut state, loaded);
+
+        assert_eq!(state.live_events.len(), 1);
+        assert_eq!(
+            state.live_events[0].text.as_bytes(),
+            b"kept through mid-tok"
+        );
+        let output = render_snapshot(&state, 100, 24).unwrap();
+        assert!(output.contains("kept through mid-tok"));
     }
 
     #[test]
@@ -3792,7 +4527,6 @@ mod tests {
             });
             state.active_run_elapsed_secs = Some(91);
             state.approval = Some(test_approval(&previous_run, "old-call"));
-            state.scroll_history_up(10);
             render_snapshot(&state, 100, 24).unwrap();
             assert_cached_rows(&state, true, true);
 
@@ -3807,9 +4541,6 @@ mod tests {
             assert!(state.active_run_elapsed_secs.is_none());
             assert!(state.approval.is_none());
             assert_eq!(state.display_mode, DisplayMode::Audit);
-            assert_eq!(state.scroll_offset, 0);
-            assert_eq!(state.conversation_scroll_offset, 0);
-            assert_eq!(state.audit_scroll_offset, 0);
             assert_cached_rows(&state, false, false);
             let output = render_snapshot(&state, 100, 24).unwrap();
             assert!(output.contains(next_transcript.split(": ").last().unwrap().trim()));
@@ -3851,6 +4582,7 @@ mod tests {
                 workspace_id: "workspace-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -3931,6 +4663,7 @@ mod tests {
                 transcript: transcript.into(),
                 typed: None,
                 pending_approval: None,
+                completion_claim: None,
             }
             .into(),
         )

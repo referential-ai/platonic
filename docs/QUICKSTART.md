@@ -1,45 +1,51 @@
-# Quickstart — run and test Plato Agent
+# Quickstart - run Platonic with Plato Agent
 
-Everything below is copy-pasteable. Companion docs: [`../README.md`](../README.md) (full reference), [`ARCHITECTURE.md`](ARCHITECTURE.md) (topology and law).
+Companion docs: [`../README.md`](../README.md) (full reference),
+[`RELEASE.md`](RELEASE.md) (release artifacts), and the
+[platform decision map](https://github.com/referential-ai/platonic-workspace/issues/83)
+(architecture authority).
 
 ## 0. One-time setup
 
 ```bash
-cd ~/projects/platonic-workspace/plato-agent
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64) target=linux-x86_64 ;;
+  Darwin-arm64) target=macos-arm64 ;;
+  *) echo "unsupported platform" >&2; exit 1 ;;
+esac
 
-head=$(git rev-parse --verify 'HEAD^{commit}')
-proof_root=$(mktemp -d)
-artifact="$proof_root/plato-agent-$head.tar.gz"
-source_root="$proof_root/source"
-prefix="$proof_root/install"
+bundle="platonic-0.1.0-$target"
+archive="$bundle.tar.gz"
+release="https://github.com/referential-ai/platonic/releases/download/platonic-v0.1.0"
+curl -fLO "$release/$archive"
+curl -fLO "$release/$bundle.sha256"
 
-git archive --format=tar.gz --prefix="plato-agent-$head/" \
-  --output "$artifact" "$head"
-sha256sum "$artifact"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum --check "$bundle.sha256"
+else
+  shasum -a 256 --check "$bundle.sha256"
+fi
 
-mkdir "$source_root"
-tar -xzf "$artifact" -C "$source_root"
-test ! -e "$prefix"
-PLATO_BUILD_IDENTITY="0.2.0 $head $(date -u +%Y-%m-%d)" \
-  CARGO_TARGET_DIR="$proof_root/target" \
-  cargo install --locked --root "$prefix" \
-    --path "$source_root/plato-agent-$head"
+tar -xzf "$archive"
+install -d "$HOME/.local/bin"
+install -m 0755 "$bundle/bin/platonic" "$HOME/.local/bin/platonic"
+install -m 0755 "$bundle/bin/plato" "$HOME/.local/bin/plato"
+install -m 0755 "$bundle/bin/plato-tui" "$HOME/.local/bin/plato-tui"
+export PATH="$HOME/.local/bin:$PATH"
 
-export PATH="$prefix/bin:$PATH"
-for binary in plato plato-agentd plato-tui; do
-  "$binary" --version
-done
-for binary in plato plato-agentd plato-tui plato-gateway-discord; do
-  "$binary" --help >/dev/null
-done
+platonic --version
+plato --version
+plato-tui --version
 
 export OPENROUTER_API_KEY="$(cat /path/to/your/openrouter-key)"
 ```
 
-The tarball is a complete source snapshot of the exact commit printed in its
-name. Installation builds only from its extracted workspace and writes the
-four binaries to the fresh prefix under `$proof_root`; it does not use
-`cargo run`, publish crates, or change an existing installation.
+The release tag is exactly `platonic-v0.1.0`. The bundle contains the Platonic
+server command `platonic` and the Plato Agent client commands `plato` and
+`plato-tui`. Linux x86-64 and macOS Apple silicon are the only launch targets;
+Windows server and client support is withdrawn. The
+[release contract](RELEASE.md) lists the exact archive contents and explains
+the independent `platonic-core` semver.
 
 `plato` works without a local config when `OPENROUTER_API_KEY` is exported.
 Config is discovered in this order: `--config`, `PLATO_CONFIG`, `./plato.toml`,
@@ -62,40 +68,70 @@ enabled = ["file.read", "file.list", "file.write", "file.edit", "shell.exec", "w
 
 ## 1. First run (60-second smoke test)
 
+In terminal 1, start the one host server:
+
 ```bash
-plato "list the files here and summarize what this project is"
-plato -c "name the most important file from that summary"
-plato replay        # audit the latest default SQLite session
+platonic serve
 ```
 
+In terminal 2, register the workspace deliberately and run Plato Agent as a
+short-lived client:
+
+```bash
+mkdir -p "$HOME/platonic-quickstart"
+cd "$HOME/platonic-quickstart"
+git init
+git -c user.name='Platonic Quickstart' \
+  -c user.email='quickstart@invalid' commit --allow-empty -m 'Initial workspace'
+platonic workspace create quickstart "$PWD"
+platonic status --workspace "$PWD"
+plato "list the files here and summarize what this project is"
+plato -c "name the most important file from that summary"
+plato replay        # audit the latest default workspace session
+```
+
+When no server is running, an interactive local `plato` one-shot or TUI starts
+the installed sibling `platonic` server. In an unknown directory it asks once
+for a workspace name and defaults to the directory basename. Piped/headless
+commands, `plato --remote`, gateways, desktop clients, explicit `--socket`
+attachments, and `plato-tui --snapshot` never register a workspace; use
+`platonic workspace create <name> <directory>` first.
+
 Live assistant text prints to stderr; the final answer prints to stdout. The
-complete run ledger lands in the default platform SQLite store for the workspace.
-`-c` continues the latest workspace session. Use `--events <file>` when you
-want JSONL.
+complete run event log lands in one JSONL file under the workspace ledger
+directory. SQLite retains the session index and other queryable state.
+`-c` continues the latest workspace session through the same host server.
 
 ## 2. Test the approval boundary
 
 ```bash
-plato --events w1.jsonl "write hello.txt containing: hi from plato"
+plato "write hello.txt containing: hi from plato"
 # -> Approve file.write {...}? [y/N]   press Enter -> denied (default no)
 
-plato --yolo --events w2.jsonl "write hello.txt containing: hi from plato"
+plato --yolo "write hello.txt containing: hi from plato"
 # -> auto-approved; the ledger records actor "yolo"
 
-plato --events w3.jsonl "run cargo test --locked and summarize the result"
+plato "run cargo test --locked and summarize the result"
 # -> Approve shell.exec?   press y to run the command
 ```
 
-Reads and listings never prompt. Workspace writes prompt unless `--yolo`.
-Yolo does not approve network tools or `shell.exec`. `shell.exec` always
-prompts and runs with a scrubbed environment that does not inherit provider
-credentials.
+Reads and listings never prompt. Workspace writes and exact `shell.exec` calls
+prompt unless `--yolo`; direct root `PLATONIC.md` changes still prompt. Yolo
+never approves network, secret-access, unknown, disabled, or other
+external-side-effect tools. `shell.exec` runs with a scrubbed environment that
+does not inherit provider credentials.
 `web.fetch` always prompts with its normalized public origin and validated
 addresses, revalidates immediately before each pinned connection, and returns
 only bounded UTF-8 text from the approved origin.
-Nothing escapes the workspace: `../`, absolute paths, and symlinks out are refused.
+File tools refuse `../`, absolute paths, and symlinks that escape their granted
+roots. Server-created thread children use Landlock write confinement when the
+Linux host supports it; macOS and Linux hosts without Landlock record
+`confinement: "none"`. Set `[confinement] require = true` in the user config to
+refuse an unconfined spawn. `plato thread status <thread-id>` reads the durable
+protocol-v1 authority projection and live state; the typed `thread.authority`
+protocol readback carries the complete immutable record and confinement fact.
 
-## 3. Durable runs (SQLite)
+## 3. Durable runs
 
 ```bash
 plato "read Cargo.toml and name the package"
@@ -104,11 +140,11 @@ plato -c "what did I ask you to inspect?"
 plato replay                # replays the latest session
 ```
 
-Explicit SQLite paths need the equals form: `--db=/tmp/run.db`. If the
-workspace daemon is live, default-ledger prompts delegate to it. Replay,
-explicit `--db=<path>`, and direct `--yolo` SQLite paths remain direct and fail
-closed if they conflict with the daemon-owned store. Replay shows final
-assistant messages, not partial live deltas.
+Explicit replay paths use the equals form: `--db=/tmp/run.db`. Prompts always
+use the server-owned workspace ledger. Replay is read-only and fully offline;
+it finds the selected per-run JSONL through the state database and shows final
+assistant messages, not partial live deltas. Runs created before the JSONL
+transition still replay from their SQLite event rows.
 
 ## 4. The full experience: TUI
 
@@ -116,11 +152,14 @@ One terminal, same workspace:
 
 ```bash
 plato
+# Start the TUI's local session in yolo mode instead:
+plato --tui --yolo
 ```
 
-This ensures the host-scoped `plato-agentd`, asks for the root thread spawn
+This ensures the host-scoped `platonic serve`, asks once to register an unknown
+directory (Enter accepts the basename), asks for the root thread spawn
 decision, and attaches the TUI to that durable thread. Quitting the TUI leaves
-the daemon and thread authority available. `plato --tui --config plato.toml`
+the server and thread authority available. `plato --tui --config plato.toml`
 is the explicit form when selecting a config. During a run, one working row
 shows elapsed active time and the interrupt key. Use `plato --reduced-motion`
 or set `PLATO_REDUCED_MOTION=1` to replace its animated braille marker with a
@@ -132,6 +171,7 @@ attach another interactive client:
 
 ```bash
 plato thread list
+plato thread status <thread-id>
 plato --remote <thread-id>
 ```
 
@@ -139,29 +179,25 @@ Both clients observe the same live output. Exactly one controller owns an
 active turn; another client is refused until that turn is idle, then can drive
 the next turn. Remote attachment does not create a duplicate thread.
 
-The explicit legacy workspace-daemon mode still works:
-
-```bash
-plato daemon                                          # terminal A
-plato-tui --workspace "$PWD" --config plato.toml      # terminal B
-```
-
-`plato daemon` stays in the foreground and delegates to the supported sibling
-`plato-agentd`. Ctrl-C shuts it down cleanly (socket and lock removed).
-Quitting either TUI form never stops the daemon.
+Quitting either TUI form never stops the server.
 
 Start the optional Discord connector from a separate environment:
 
 ```bash
 unset OPENAI_API_KEY OPENROUTER_API_KEY
-export DISCORD_BOT_TOKEN="$(cat /path/to/discord-bot-token)"
-plato gateway discord --config ~/.config/plato/gateway.toml
+platonic gateway discord --workspace "$PWD" \
+  --config "$HOME/.config/plato/gateway.toml"
 ```
 
-The gateway entry requires a successful workspace daemon `hello`. Probe
-failures start no connector and point to `plato daemon`; the gateway never
-starts a daemon with its Discord environment. The direct
-`plato-gateway-discord --workspace "$PWD"` technical command remains supported.
+Run that command only from a private environment that loaded the token from
+`$HOME/.config/plato/discord-bot-token` outside terminal or pane input. Never
+put its literal value in `argv`, pane text, logs, GitHub, or chat. The [gateway
+guide](GATEWAY.md) owns the file setup and `gateway-live` channel walkthrough.
+
+The gateway attaches to the host endpoint and requires a successful `hello` for
+the selected workspace. Probe failures start no connector; the gateway never
+starts a server with its Discord environment. An explicit `--socket` remains a
+test/operator override.
 
 The TUI footer is contextual by default and moves model and workspace context
 out of the transcript. Press `?` for the shared shortcut overlay. The footer
@@ -170,6 +206,9 @@ switches to a second-press quit hint after cancel and to
 model and workspace context; below 120 columns that right-side context drops,
 below 80 the queue hint drops, and below 40 the remaining `?` hint truncates
 without wrapping.
+When yolo is active, the footer shows `yolo` for the selected session or `yolo
+next` before a fresh session exists. Use `/yolo on|off` to change that
+daemon-lifetime local profile; `/status` reads it back authoritatively.
 
 | Key | Does |
 | --- | --- |
@@ -184,23 +223,50 @@ without wrapping.
 | `q` | quit when the composer is empty |
 | Ctrl-U | clear the composer |
 
-When `plato-gateway-discord` reaches an approval-required tool, Discord gets one
-bounded notification with the tool, effect, and preview. Grant or deny it
-locally in `plato-tui`; the gateway never sends approval decisions. Failed runs
-post `Run failed. Inspect it locally with: plato replay`. Canceled and
+When the Discord gateway reaches an approval-required tool, Discord gets one
+bounded notification with the tool, effect, and preview. An admitted home-config
+principal can use `/approve` or `/deny` in the mapped channel; the gateway binds
+the decision to that exact pending operation and records the principal name as
+attribution. Failed runs post `Run failed. Inspect it locally with: plato replay`. Canceled and
 interrupted runs do not post terminal messages. Allowed messages show 👀 and a
 typing indicator while active, then ✅ or ❌; canceled and interrupted runs
 remove 👀 without a terminal reaction. The bot needs Add Reactions and Read
 Message History, plus Send Messages in Threads when threads are used.
 
-## 5. Local voice proof (developer MVP)
+After closing the TUI and gateway, stop the idle host server explicitly:
 
-AU2 voice-out and AU4 explicit voice-in are exposed through focused examples,
-not a general CLI or ambient listener. Install espeak-ng, CUDA, and the native
+```bash
+platonic shutdown --workspace "$PWD"
+```
+
+## 5. Local voice activation and device proof
+
+TUI voice is opt-in through a dedicated client file that the server never reads.
+Choose every local model explicitly; Plato Agent does not search for or download
+artifacts. Relative model paths resolve from the voice file's directory.
+
+```toml
+[voice]
+kokoro_model = "/models/kokoro-82m"
+whisper_model = "/models/ggml-large-v3-turbo.bin"
+silero_model = "/models/silero_vad.onnx"
+# capture_device = "exact cpal input device ID"
+# playback_device = "exact cpal output device ID"
+```
+
+```bash
+plato --tui --voice-config /path/to/voice.toml
+# In the TUI, /voice on is the one session-local device grant.
+# /voice off stops capture, drains accepted speech, and closes both devices.
+```
+
+Missing, unreadable, incomplete, or unknown configuration fails closed in the
+TUI status line. Voice starts off after every client restart and `/new` turns it
+off before selecting a fresh session. Install espeak-ng, CUDA, and the native
 cpal backend headers, then place the pinned Kokoro, Silero v6.2.1, and
 large-v3-turbo artifacts described in
 [`../crates/plato-audio/README.md`](../crates/plato-audio/README.md) outside the
-repository.
+repository for the focused device proofs below.
 
 ```bash
 export PLATO_AUDIO_KOKORO_DIR="$HOME/.cache/plato-audio/kokoro-82m-v1.0-onnx-1939ad2a8e416c0acfeecc08a694d14ef25f2231"
@@ -262,12 +328,12 @@ PLATO_AUDIO_FIXTURE_KEY=local-proof \
 The model engine, native-rate resampling plan, and output stream open before
 timing. Both examples fail closed on artifact checksum, phonemizer, backend,
 device, PCM, worker, callback, sentence-order, gap, overlap, or teardown errors.
-`narrated_run` uses a root SQLite ledger (the `--events` path, or a temporary
-`.db` by default) and returns the exact committed revision-one `VoiceEvent`
-envelopes in its proof JSON. A selected-run `plato replay --db=/path/to/run.db
---run RUN_ID` appends those canonical `voice_event` lines without writing to the
-database; runs without voice facts retain their prior replay output byte for
-byte.
+`narrated_run` runs through the host server and reports its server-owned
+workspace ledger path. Its proof JSON includes the exact revision-one `VoiceEvent`
+envelopes observed by the client. Offline `plato replay --db=/path/to/run.db
+--run RUN_ID` reads the server-owned per-run log without starting or contacting
+the server. New voice companion streams use that same JSONL file; legacy runs
+remain readable from SQLite.
 
 `VoiceCaptured` stores only the final transcript's SHA-256 and UTF-8 byte
 length, transcript span, native and 16 kHz frame counts, VAD sample boundaries,
@@ -313,8 +379,8 @@ acoustic-loop latency claim.
 ## 6. Run the test suite (no API key needed)
 
 ```bash
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
+cargo test --workspace --locked
+cargo clippy --workspace --locked --all-targets -- -D warnings
 cargo fmt --check
 ```
 
@@ -325,6 +391,6 @@ cargo fmt --check
 | daemon lock held | on Unix, a live kernel lock owner or failed lock-file safety validation blocks startup; inspect the reported details. Crashed owners recover automatically. Never delete a live lock |
 | `--db /path` ignored | use the equals form: `--db=/path` |
 | provider api key env is not set | re-export `OPENROUTER_API_KEY` in this shell |
-| ledger already exists | JSONL ledgers never overwrite — pass a fresh `--events` name |
+| server unavailable | run `platonic serve`; ordinary `plato` prompts auto-ensure it when the sibling binary is installed |
 | run stops after 8 turns | runs are bounded by `limits.max_turns`; ask tighter or configure a different limit |
 | `plato -c` says no previous session | run `plato "..."` once in this workspace first |

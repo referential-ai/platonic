@@ -1,0 +1,280 @@
+name: Platonic release
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/platonic-release.yml
+      - Cargo.lock
+      - Cargo.toml
+      - CHANGELOG.md
+      - crates/plato-agent/src/bin/plato.rs
+      - crates/plato-agent/src/bin/plato-tui.rs
+      - crates/platonic-protocol/**
+      - crates/platonic/src/main.rs
+      - scripts/check-release-contract.sh
+      - scripts/package-release.py
+      - scripts/smoke-release-bundle.sh
+      - scripts/test-release.sh
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact 40-character source commit to build
+        required: true
+        type: string
+      release_tag:
+        description: Existing product tag to publish; leave blank for a dry run
+        required: false
+        type: string
+
+concurrency:
+  group: platonic-release-${{ inputs.source_commit || github.event.pull_request.head.sha }}-${{ inputs.release_tag || 'dry-run' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: 1.88.0
+
+jobs:
+  validate:
+    name: Validate exact source
+    runs-on: ubuntu-24.04
+    outputs:
+      build_date: ${{ steps.contract.outputs.build_date }}
+      product_version: ${{ steps.contract.outputs.product_version }}
+      release_tag: ${{ steps.contract.outputs.release_tag }}
+      source_commit: ${{ steps.contract.outputs.source_commit }}
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.source_commit || github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release contract and source
+        id: contract
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || '' }}
+          SOURCE_COMMIT: ${{ inputs.source_commit || github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          ./scripts/check-release-contract.sh metadata
+          ./scripts/check-release-contract.sh commit "$SOURCE_COMMIT"
+          product_version=$(./scripts/check-release-contract.sh product-version)
+          build_date=$(date -u +%Y-%m-%d)
+          test -n "$product_version"
+          [[ "$build_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+
+          if [[ -n "$RELEASE_TAG" ]]; then
+            expected_tag="platonic-v$product_version"
+            test "$RELEASE_TAG" = "$expected_tag"
+            git fetch --force --no-tags origin \
+              refs/heads/main:refs/remotes/origin/main
+            git fetch --force origin \
+              "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            tagged_commit=$(git rev-parse --verify "$RELEASE_TAG^{commit}")
+            main_commit=$(git rev-parse --verify 'refs/remotes/origin/main^{commit}')
+            test "$tagged_commit" = "$SOURCE_COMMIT"
+            ./scripts/check-release-contract.sh tag \
+              "$RELEASE_TAG" "$tagged_commit" "$main_commit"
+          fi
+
+          printf '%s\n' \
+            "build_date=$build_date" \
+            "product_version=$product_version" \
+            "release_tag=$RELEASE_TAG" \
+            "source_commit=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Bundle ${{ matrix.bundle_target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - bundle_target: linux-x86_64
+            rust_target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - bundle_target: macos-arm64
+            rust_target: aarch64-apple-darwin
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.validate.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Install Rust 1.88.0
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup target add "${{ matrix.rust_target }}" --toolchain 1.88.0
+
+      - name: Install Linux audio build dependencies
+        if: ${{ matrix.bundle_target == 'linux-x86_64' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+          key: platonic-release-${{ matrix.rust_target }}
+
+      - name: Build release commands with provenance
+        env:
+          BUILD_DATE: ${{ needs.validate.outputs.build_date }}
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          client_version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -er '.packages[] | select(.name == "plato-agent") | .version')
+          PLATONIC_BUILD_COMMIT="$SOURCE_COMMIT" \
+          PLATONIC_BUILD_DATE="$BUILD_DATE" \
+          PLATO_BUILD_IDENTITY="$client_version $SOURCE_COMMIT $BUILD_DATE" \
+            cargo build \
+              --locked \
+              --release \
+              --target "${{ matrix.rust_target }}" \
+              --package plato-agent \
+              --package platonic \
+              --bin plato \
+              --bin plato-tui \
+              --bin platonic
+
+      - name: Prove architecture and package the bundle
+        env:
+          BUILD_DATE: ${{ needs.validate.outputs.build_date }}
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          binary_dir="target/${{ matrix.rust_target }}/release"
+          case "${{ matrix.bundle_target }}" in
+            linux-x86_64)
+              file -b "$binary_dir/platonic" | grep -Eq '^ELF 64-bit .*x86-64'
+              ;;
+            macos-arm64)
+              file -b "$binary_dir/platonic" | grep -Eq '^Mach-O 64-bit executable arm64'
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+          output_dir="artifacts/${{ matrix.bundle_target }}"
+          ./scripts/package-release.py \
+            --target "${{ matrix.bundle_target }}" \
+            --source-commit "$SOURCE_COMMIT" \
+            --build-date "$BUILD_DATE" \
+            --binary-dir "$binary_dir" \
+            --output-dir "$output_dir"
+          find "$output_dir" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null \
+            | LC_ALL=C sort || find "$output_dir" -maxdepth 1 -type f -exec basename {} \; \
+            | LC_ALL=C sort
+
+      - name: Smoke clean extracted bundle lifecycle
+        env:
+          PRODUCT_VERSION: ${{ needs.validate.outputs.product_version }}
+        run: >-
+          ./scripts/smoke-release-bundle.sh
+          "artifacts/${{ matrix.bundle_target }}/platonic-${PRODUCT_VERSION}-${{ matrix.bundle_target }}.tar.gz"
+          "${{ matrix.bundle_target }}"
+
+      - name: Upload dry-run bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: platonic-${{ matrix.bundle_target }}
+          path: artifacts/${{ matrix.bundle_target }}/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Create draft GitHub release
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.validate.outputs.release_tag != '' }}
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PRODUCT_VERSION: ${{ needs.validate.outputs.product_version }}
+      RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+      SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.validate.outputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Revalidate tag and main at publication
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin \
+            refs/heads/main:refs/remotes/origin/main
+          git fetch --force origin \
+            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tagged_commit=$(git rev-parse --verify "$RELEASE_TAG^{commit}")
+          main_commit=$(git rev-parse --verify 'refs/remotes/origin/main^{commit}')
+          test "$tagged_commit" = "$SOURCE_COMMIT"
+          ./scripts/check-release-contract.sh tag \
+            "$RELEASE_TAG" "$tagged_commit" "$main_commit"
+
+      - name: Download both bundles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: platonic-*
+          path: incoming
+          merge-multiple: true
+
+      - name: Publish and verify the draft release
+        run: |
+          set -euo pipefail
+          expected=(
+            "platonic-$PRODUCT_VERSION-linux-x86_64.files"
+            "platonic-$PRODUCT_VERSION-linux-x86_64.sha256"
+            "platonic-$PRODUCT_VERSION-linux-x86_64.tar.gz"
+            "platonic-$PRODUCT_VERSION-macos-arm64.files"
+            "platonic-$PRODUCT_VERSION-macos-arm64.sha256"
+            "platonic-$PRODUCT_VERSION-macos-arm64.tar.gz"
+          )
+          mapfile -t actual < <(find incoming -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
+          diff -u <(printf '%s\n' "${expected[@]}") <(printf '%s\n' "${actual[@]}")
+          (
+            cd incoming
+            sha256sum -c "platonic-$PRODUCT_VERSION-linux-x86_64.sha256"
+            sha256sum -c "platonic-$PRODUCT_VERSION-macos-arm64.sha256"
+          )
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          mapfile -t assets < <(find incoming -maxdepth 1 -type f | LC_ALL=C sort)
+          gh release create "$RELEASE_TAG" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --generate-notes \
+            --title "Platonic $PRODUCT_VERSION" \
+            --verify-tag
+
+          verify="$RUNNER_TEMP/platonic-release-download"
+          mkdir -p "$verify"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$verify"
+          mapfile -t downloaded < <(find "$verify" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
+          diff -u <(printf '%s\n' "${expected[@]}") <(printf '%s\n' "${downloaded[@]}")
+          (
+            cd "$verify"
+            sha256sum -c "platonic-$PRODUCT_VERSION-linux-x86_64.sha256"
+            sha256sum -c "platonic-$PRODUCT_VERSION-macos-arm64.sha256"
+          )
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true

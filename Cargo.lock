@@ -457,6 +457,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-deque"
+version = "0.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5181e0de7b61eb03a81e347d6dd8797bae9da5146707b51077e2d71a54ec0ceb"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-epoch"
+version = "0.9.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
+
+[[package]]
 name = "crossterm"
 version = "0.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -602,6 +627,26 @@ name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
+
+[[package]]
+name = "enumflags2"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1027f7680c853e056ebcec683615fb6fbbc07dbaa13b4d5d9442b146ded4ecef"
+dependencies = [
+ "enumflags2_derive",
+]
+
+[[package]]
+name = "enumflags2_derive"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67c78a4d8fdf9953a5c9d458f9efe940fd97a0cab0941c075a813ac594733827"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "equivalent"
@@ -1122,6 +1167,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "landlock"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1344,6 +1400,27 @@ checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
 dependencies = [
  "memchr",
  "minimal-lexical",
+]
+
+[[package]]
+name = "nucleo"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5262af4c94921c2646c5ac6ff7900c2af9cbb08dc26a797e18130a7019c039d4"
+dependencies = [
+ "nucleo-matcher",
+ "parking_lot",
+ "rayon",
+]
+
+[[package]]
+name = "nucleo-matcher"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf33f538733d1a5a3494b836ba913207f14d9d4a1d3cd67030c5061bdd2cac85"
+dependencies = [
+ "memchr",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -1675,31 +1752,23 @@ name = "plato-agent"
 version = "0.2.0"
 dependencies = [
  "clap",
- "ctrlc",
  "hound",
- "html2text",
- "interprocess",
  "plato-audio",
- "plato-daemon-client",
- "plato-gateway-discord",
- "plato-protocol",
  "plato-tui",
+ "platonic-client",
  "platonic-core",
+ "platonic-protocol",
  "pty-process",
  "rusqlite",
  "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2",
- "signal-hook",
  "temp-env",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
- "ureq 2.12.1",
- "url",
  "vt100",
- "widestring",
  "windows-sys 0.61.2",
 ]
 
@@ -1721,11 +1790,51 @@ dependencies = [
 ]
 
 [[package]]
-name = "plato-daemon-client"
+name = "plato-tui"
+version = "0.2.0"
+dependencies = [
+ "crossterm",
+ "nucleo",
+ "platonic-client",
+ "platonic-core",
+ "platonic-protocol",
+ "pulldown-cmark",
+ "ratatui",
+ "serde_json",
+ "syntect",
+ "tempfile",
+ "tui-textarea",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "platonic"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "ctrlc",
+ "interprocess",
+ "platonic-client",
+ "platonic-core",
+ "platonic-protocol",
+ "platonic-server",
+ "rusqlite",
+ "rustix 1.1.4",
+ "serde_json",
+ "signal-hook",
+ "temp-env",
+ "tempfile",
+ "widestring",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "platonic-client"
 version = "0.2.0"
 dependencies = [
  "interprocess",
- "plato-protocol",
+ "platonic-protocol",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -1738,57 +1847,48 @@ dependencies = [
 ]
 
 [[package]]
-name = "plato-gateway-discord"
-version = "0.2.0"
+name = "platonic-core"
+version = "0.3.1"
 dependencies = [
- "plato-daemon-client",
- "plato-protocol",
+ "proptest",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "platonic-protocol"
+version = "0.2.0"
+dependencies = [
+ "platonic-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
+name = "platonic-server"
+version = "0.2.0"
+dependencies = [
+ "html2text",
+ "landlock",
+ "platonic-client",
+ "platonic-core",
+ "platonic-protocol",
+ "rusqlite",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "temp-env",
  "tempfile",
  "thiserror 2.0.18",
+ "toml",
  "tungstenite",
  "ureq 2.12.1",
  "url",
-]
-
-[[package]]
-name = "plato-protocol"
-version = "0.2.0"
-dependencies = [
- "platonic-core",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "plato-tui"
-version = "0.2.0"
-dependencies = [
- "crossterm",
- "plato-daemon-client",
- "plato-protocol",
- "platonic-core",
- "pulldown-cmark",
- "ratatui",
- "serde_json",
- "syntect",
- "tempfile",
- "tui-textarea",
- "unicode-segmentation",
- "unicode-width 0.2.0",
-]
-
-[[package]]
-name = "platonic-core"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50c86c6243e9f2d70bb927170f58dc82fcb815fc5910c0bbf704a4417dd2debf"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1868,6 +1968,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "proptest"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744"
+dependencies = [
+ "bitflags",
+ "num-traits",
+ "rand",
+ "rand_chacha",
+ "rand_xorshift",
+ "regex-syntax",
+ "unarray",
+]
+
+[[package]]
 name = "pty-process"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1938,6 +2053,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_xorshift"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
+dependencies = [
+ "rand_core",
+]
+
+[[package]]
 name = "ratatui"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1963,6 +2087,26 @@ name = "rawpointer"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60a357793950651c4ed0f3f52338f53b2f809f32d83a07f72909fa13e4c6c1e3"
+
+[[package]]
+name = "rayon"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
+dependencies = [
+ "either",
+ "rayon-core",
+]
+
+[[package]]
+name = "rayon-core"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
+dependencies = [
+ "crossbeam-deque",
+ "crossbeam-utils",
+]
 
 [[package]]
 name = "realfft"
@@ -2746,6 +2890,12 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "unarray"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
 
 [[package]]
 name = "unicase"

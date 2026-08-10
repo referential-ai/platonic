@@ -24,9 +24,9 @@ use crate::{
         KeyMap, matching_slash_commands,
     },
 };
-use plato_protocol::{
-    DaemonStatusResult, DaemonStatusTokenUsage, ModelIdentityStatus, RunStateName, TypedRun,
-    TypedTranscriptEntry,
+use platonic_protocol::{
+    ApprovalProfile, DaemonStatusResult, DaemonStatusTokenUsage, ModelIdentityStatus, RunStateName,
+    TypedRun, TypedTranscriptEntry,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthChar;
@@ -43,12 +43,32 @@ const FOOTER_CONTEXT_WIDTH: u16 = 120;
 
 /// Renders the current client state into a terminal frame.
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
-    render_at(frame, state, unix_now_ms());
+    render_overlay_at(frame, state, 0, unix_now_ms());
 }
 
-fn render_at(frame: &mut Frame<'_>, state: &TuiState, now_ms: u64) {
+pub(crate) fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
+    let [history, _, composer, footer] = vertical(frame.area(), state);
+    render_live_history(frame, history, state);
+    render_composer(frame, composer, state);
+    render_footer(frame, footer, state);
+}
+
+pub(crate) fn render_overlay(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    history_scroll_offset: usize,
+) {
+    render_overlay_at(frame, state, history_scroll_offset, unix_now_ms());
+}
+
+fn render_overlay_at(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    history_scroll_offset: usize,
+    now_ms: u64,
+) {
     let [history, approval, composer, footer] = vertical(frame.area(), state);
-    render_history(frame, history, state);
+    render_history(frame, history, state, history_scroll_offset);
     if let Some(approval_view) = &state.approval {
         render_approval_pane(frame, approval, approval_view, state.approval_scroll_offset);
     }
@@ -77,6 +97,10 @@ fn accent_style() -> Style {
     color::active().accent_style()
 }
 
+fn selected_row_style() -> Style {
+    accent_style().add_modifier(Modifier::REVERSED)
+}
+
 fn user_message_style() -> Style {
     color::active().user_message_style()
 }
@@ -94,7 +118,7 @@ fn render_snapshot_at(
 ) -> std::io::Result<String> {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend)?;
-    terminal.draw(|frame| render_at(frame, state, now_ms))?;
+    terminal.draw(|frame| render_overlay_at(frame, state, 0, now_ms))?;
     let buffer = terminal.backend().buffer();
     let area = buffer.area;
     let mut output = String::new();
@@ -107,7 +131,7 @@ fn render_snapshot_at(
     Ok(output)
 }
 
-fn render_history(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+fn render_history(frame: &mut Frame<'_>, area: Rect, state: &TuiState, scroll_offset: usize) {
     let mut lines = history_lines(state, area.width);
     if lines.is_empty() {
         lines.push(Line::from(""));
@@ -116,11 +140,55 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let bottom = paragraph
         .line_count(area.width.max(1))
         .saturating_sub(area.height as usize);
-    let scroll = bottom.saturating_sub(state.scroll_offset);
+    let scroll = bottom.saturating_sub(scroll_offset);
     frame.render_widget(
         paragraph.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
         area,
     );
+}
+
+fn render_live_history(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let mut lines = main_history_lines(state, area.width);
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let scroll = paragraph
+        .line_count(area.width.max(1))
+        .saturating_sub(area.height as usize);
+    frame.render_widget(
+        paragraph.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+        area,
+    );
+}
+
+fn main_history_lines(state: &TuiState, width: u16) -> Vec<Line<'static>> {
+    let TranscriptState::Loaded(transcript) = &state.transcript else {
+        return conversation_history_lines(state, width, DEFAULT_SYNTAX_THEME);
+    };
+    let mut lines = Vec::new();
+    append_conversation_activity(
+        &mut lines,
+        state,
+        Some(transcript),
+        width,
+        DEFAULT_SYNTAX_THEME,
+    );
+    append_queue_preview(&mut lines, state);
+    lines
+}
+
+pub(crate) fn committed_transcript_lines(
+    state: &TuiState,
+    transcript: &super::TranscriptView,
+    width: u16,
+) -> Vec<Line<'static>> {
+    conversation_transcript_lines(
+        transcript,
+        width,
+        DEFAULT_SYNTAX_THEME,
+        &state.history_rows.markdown,
+    )
 }
 
 fn history_lines(state: &TuiState, width: u16) -> Vec<Line<'static>> {
@@ -185,10 +253,9 @@ fn audit_history_lines(
             lines.push(Line::from(
                 "Quit and run plato --tui to ensure the host daemon.",
             ));
-            lines.push(Line::from(format!(
-                "Or start plato-agentd --workspace {}, then press r to reconnect.",
-                state.workspace_root
-            )));
+            lines.push(Line::from(
+                "Or start platonic serve, then press r to reconnect.",
+            ));
         }
     }
 
@@ -241,10 +308,9 @@ fn conversation_history_lines(
             lines.push(Line::from(
                 "Quit and run plato --tui to ensure the host daemon.",
             ));
-            lines.push(Line::from(format!(
-                "Or start plato-agentd --workspace {}, then press r to reconnect.",
-                state.workspace_root
-            )));
+            lines.push(Line::from(
+                "Or start platonic serve, then press r to reconnect.",
+            ));
         }
     }
 
@@ -743,9 +809,11 @@ fn conversation_live_event_lines(
                     && ((event.kind == LiveEventKind::Warning
                         && (event.text.starts_with("issue prep")
                             || event.text.starts_with("issue-prep")
-                            || event.text.starts_with("thread send rejected:")))
+                            || event.text.starts_with("thread send rejected:")
+                            || event.text.starts_with("voice ")))
                         || (event.kind == LiveEventKind::Status
-                            && event.text.starts_with("issue-prep artifacts:"))) =>
+                            && (event.text.starts_with("issue-prep artifacts:")
+                                || event.text.starts_with("voice ")))) =>
             {
                 let role = if event.kind == LiveEventKind::Warning {
                     SemanticRole::Error
@@ -1067,7 +1135,18 @@ fn contextual_footer(
     key_map: KeyMap<'_>,
     platform: KeyLabelPlatform,
 ) -> Line<'static> {
-    let mut spans = footer_hint_spans(
+    let mut spans = Vec::new();
+    if state.approval_profile == ApprovalProfile::Yolo {
+        spans.push(Span::styled(
+            if state.selected_session_id.is_some() {
+                "yolo"
+            } else {
+                "yolo next"
+            },
+            semantic_style(SemanticRole::Warning).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let hints = footer_hint_spans(
         key_map.bindings().iter().filter(|binding| {
             binding.footer.is_some_and(|hint| {
                 hint.priority == FooterHintPriority::Essential
@@ -1077,6 +1156,10 @@ fn contextual_footer(
         state,
         platform,
     );
+    if !spans.is_empty() && !hints.is_empty() {
+        push_footer_separator(&mut spans);
+    }
+    spans.extend(hints);
     if width < FOOTER_HELP_WIDTH {
         return Line::from(spans);
     }
@@ -1478,16 +1561,17 @@ fn slash_popup_lines(state: &TuiState) -> Vec<Line<'static>> {
         .take(5)
         .enumerate()
         .map(|(index, command)| {
-            let style = if index == popup.selected {
-                accent_style()
+            let selected = index == popup.selected;
+            let style = if selected {
+                selected_row_style()
             } else {
                 chrome_style()
             };
             Line::from(vec![
-                Span::styled(if index == popup.selected { "> " } else { "  " }, style),
+                Span::styled(if selected { "> " } else { "  " }, style),
                 Span::styled(format!("/{}", command.name), style),
-                Span::raw("  "),
-                Span::styled(command.description.to_owned(), chrome_style()),
+                Span::styled("  ", style),
+                Span::styled(command.description.to_owned(), style),
             ])
         })
         .collect()
@@ -1717,6 +1801,7 @@ fn render_status_modal(frame: &mut Frame<'_>, area: Rect, status: &DaemonStatusR
                 "not granted"
             }
         )),
+        Line::from(format!("profile         {}", status.trust.approval_profile)),
         Line::from("Esc close"),
     ];
     frame.render_widget(Clear, area);
@@ -1728,7 +1813,7 @@ fn render_status_modal(frame: &mut Frame<'_>, area: Rect, status: &DaemonStatusR
 
 fn status_modal_rect(area: Rect) -> Rect {
     let width = (area.width.saturating_mul(92) / 100).max(1);
-    let height = area.height.clamp(1, 23);
+    let height = area.height.clamp(1, 24);
     Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 2,
@@ -1797,7 +1882,7 @@ fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState, no
 
 fn session_picker_row(
     state: &TuiState,
-    session: &plato_protocol::SessionSummary,
+    session: &platonic_protocol::SessionSummary,
     focused: bool,
     now_ms: u64,
     row_width: u16,
@@ -1808,10 +1893,20 @@ fn session_picker_row(
     } else {
         " "
     };
-    let style = if focused {
-        accent_style()
+    let focus_style = if focused {
+        selected_row_style()
     } else {
         Style::default()
+    };
+    let status_style = if focused {
+        selected_row_style()
+    } else {
+        status_style(&session.status)
+    };
+    let age_style = if focused {
+        selected_row_style()
+    } else {
+        chrome_style()
     };
     let age = relative_age(session.updated_at_ms, now_ms);
     let prefix_width = 3 + SESSION_STATUS_WIDTH + 1 + SESSION_AGE_WIDTH + 1;
@@ -1820,15 +1915,15 @@ fn session_picker_row(
         .min(SESSION_QUESTION_MAX_CHARS);
     let question = bounded_question_preview(session_question_label(session), question_width);
     Line::from(vec![
-        Span::styled(format!("{focus}{current} "), style),
+        Span::styled(format!("{focus}{current} "), focus_style),
         Span::styled(
             format!("{:<SESSION_STATUS_WIDTH$}", session.status),
-            status_style(&session.status),
+            status_style,
         ),
-        Span::raw(" "),
-        Span::styled(format!("{age:>SESSION_AGE_WIDTH$}"), chrome_style()),
-        Span::raw(" "),
-        Span::raw(question),
+        Span::styled(" ", focus_style),
+        Span::styled(format!("{age:>SESSION_AGE_WIDTH$}"), age_style),
+        Span::styled(" ", focus_style),
+        Span::styled(question, focus_style),
     ])
 }
 
@@ -2016,11 +2111,11 @@ fn composer_height(state: &TuiState, width: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plato_protocol::{
+    use platonic_core::EffectClass;
+    use platonic_protocol::{
         ApprovalDecisionName, HelloResult, PendingApprovalSnapshot, SessionSummary,
         TranscriptReadResult, TypedRun, TypedTranscript, TypedTranscriptEntry,
     };
-    use platonic_core::EffectClass;
     use ratatui::backend::Backend;
 
     use super::super::state::approval_from_snapshot;
@@ -2036,6 +2131,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -2059,7 +2155,9 @@ mod tests {
     }
 
     #[test]
-    fn daemon_identity_keeps_unknown_provenance_explicit() {
+    fn daemon_identity_preserves_release_and_unknown_provenance() {
+        let release = "platonic 0.1.0 (0123456789abcdef0123456789abcdef01234567, 2026-08-01)";
+        assert_eq!(daemon_identity_label(release), release);
         assert_eq!(
             daemon_identity_label("0.1.0 unknown unknown"),
             "0.1.0 unknown unknown"
@@ -2129,6 +2227,24 @@ mod tests {
     }
 
     #[test]
+    fn yolo_footer_signal_is_stable_for_current_and_next_sessions() {
+        let mut state = conversation_fixture();
+        state.approval_profile = ApprovalProfile::Yolo;
+        state.selected_session_id = Some("session_1".into());
+        assert!(footer_line(&state, 40).to_string().starts_with("yolo · "));
+
+        state.selected_session_id = None;
+        assert!(
+            footer_line(&state, 40)
+                .to_string()
+                .starts_with("yolo next · ")
+        );
+        for width in [0, 4, 8, 16, 24, 40, 80, 120] {
+            assert!(footer_line(&state, width).width() <= usize::from(width));
+        }
+    }
+
+    #[test]
     fn renders_connected_sessions_and_transcript() {
         let state = TuiState::connected(
             "/tmp/work".into(),
@@ -2138,6 +2254,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             vec![SessionSummary {
                 session_id: "run_1".into(),
@@ -2158,6 +2275,7 @@ mod tests {
                             .into(),
                     typed: None,
                     pending_approval: None,
+                completion_claim: None,
                 }
                 .into(),
             ),
@@ -2310,6 +2428,28 @@ mod tests {
                 "  A bold answer."
             ]
         );
+    }
+
+    #[test]
+    fn finalized_raw_markdown_rerenders_from_120_to_40_and_back() {
+        let source = concat!(
+            "## Resize-safe answer\n\n",
+            "This deliberately long assistant sentence must wrap at forty columns while ",
+            "remaining one raw Markdown source when the terminal returns to one hundred twenty.\n\n",
+            "| Name | Value |\n| --- | --- |\n| alpha | one |"
+        );
+        let events = [LiveEventLine::assistant(Some(9), source).with_run_id("run_resize")];
+        let markdown = MarkdownRenderer::default();
+        let wide =
+            conversation_live_event_lines(&events, &[], 120, DEFAULT_SYNTAX_THEME, &markdown);
+        let narrow =
+            conversation_live_event_lines(&events, &[], 40, DEFAULT_SYNTAX_THEME, &markdown);
+        let wide_again =
+            conversation_live_event_lines(&events, &[], 120, DEFAULT_SYNTAX_THEME, &markdown);
+
+        assert_eq!(wide_again, wide);
+        assert!(narrow.len() > wide.len());
+        assert_eq!(events[0].text.as_bytes(), source.as_bytes());
     }
 
     #[test]
@@ -2584,6 +2724,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             vec![SessionSummary {
                 session_id: "run_1".into(),
@@ -2619,7 +2760,8 @@ mod tests {
 
         assert!(output.contains("daemon unavailable"));
         assert!(output.contains("plato --tui to ensure the host daemon"));
-        assert!(output.contains("plato-agentd --workspace /tmp/work"));
+        assert!(output.contains("start platonic serve"));
+        assert!(!output.contains("serve --workspace"));
         assert!(!output.contains("cargo run"));
         assert!(output.contains("press r to reconnect"));
         assert!(output.contains("daemon unavailable — r to reconnect"));
@@ -2635,6 +2777,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -2732,6 +2875,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -2757,6 +2901,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -2796,6 +2941,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -2824,6 +2970,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -2860,6 +3007,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -2887,6 +3035,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -2914,7 +3063,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_renders_only_unoffset_thread_send_rejection_warnings() {
+    fn conversation_renders_only_admitted_unoffset_client_notices() {
         let mut state = TuiState::connected(
             "/tmp/work".into(),
             "/tmp/agent.sock".into(),
@@ -2923,12 +3072,15 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
         );
         state.live_events = vec![
             LiveEventLine::warning(None, "thread send rejected: controller_owned"),
+            LiveEventLine::warning(None, "voice configuration is unavailable: missing [voice]"),
+            LiveEventLine::status(None, "voice enabled"),
             LiveEventLine::warning(None, "generic warning remains hidden"),
             LiveEventLine::warning(
                 Some(7),
@@ -2940,6 +3092,8 @@ mod tests {
 
         assert!(output.contains("Notice"));
         assert!(output.contains("thread send rejected: controller_owned"));
+        assert!(output.contains("voice configuration is unavailable: missing [voice]"));
+        assert!(output.contains("voice enabled"));
         assert!(!output.contains("generic warning remains hidden"));
         assert!(!output.contains("offset warning remains hidden"));
     }
@@ -3067,7 +3221,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_scrolled_transcript_window() {
+    fn audit_overlay_renders_a_scrolled_transcript_window() {
         let mut state = TuiState::connected(
             "/tmp/work".into(),
             "/tmp/agent.sock".into(),
@@ -3076,6 +3230,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -3084,12 +3239,35 @@ mod tests {
             .map(|index| LiveEventLine::status(Some(index), format!("line {index}")))
             .collect();
         state.toggle_display_mode();
-        state.scroll_history_up(10);
 
-        let output = render_snapshot(&state, 100, 12).unwrap();
+        let output = render_overlay_snapshot(&state, 100, 12, 10);
 
         assert!(output.contains("line 15"));
         assert!(!output.contains("line 29"));
+    }
+
+    #[test]
+    fn inline_main_screen_keeps_committed_rows_out_of_the_live_viewport() {
+        let state = conversation_fixture();
+        let TranscriptState::Loaded(transcript) = &state.transcript else {
+            panic!("conversation fixture must have a transcript");
+        };
+
+        for width in [40, 80, 120] {
+            let committed = committed_transcript_lines(&state, transcript, width);
+            assert!(
+                committed
+                    .iter()
+                    .any(|line| line.to_string().contains("First question"))
+            );
+
+            let main = render_main_snapshot(&state, width, 12);
+            assert!(!main.contains("First question"), "width {width}: {main}");
+            assert!(!main.contains("Second answer"), "width {width}: {main}");
+            assert!(main.contains("Trace"), "width {width}: {main}");
+            assert!(main.contains("> "), "width {width}: {main}");
+            assert!(main.contains("? shortcuts"), "width {width}: {main}");
+        }
     }
 
     #[test]
@@ -3102,6 +3280,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -3115,6 +3294,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "asserts Linux key labels; macOS renders its own keymap and needs a per-platform assertion; #465"
+    )]
     fn renders_shortcuts_overlay_from_styled_platform_keymap() {
         let mut state = TuiState::connected(
             "/tmp/work".into(),
@@ -3124,6 +3307,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -3276,6 +3460,7 @@ mod tests {
         assert!(normal.contains("session   input 17    output 8    unknown 2"));
         assert!(normal.contains("granted         2    denied 1"));
         assert!(normal.contains("shell session   granted"));
+        assert!(normal.contains("profile         yolo"));
     }
 
     #[test]
@@ -3288,6 +3473,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -3316,6 +3502,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             vec![
                 SessionSummary {
@@ -3362,6 +3549,45 @@ mod tests {
     }
 
     #[test]
+    fn selected_picker_rows_have_full_row_accents_at_40_and_80_columns() {
+        let mut slash_state = TuiState::disconnected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            "offline".into(),
+        );
+        slash_state.set_composer_text("/sp");
+        slash_state.slash_popup = Some(super::super::state::SlashPopupView {
+            filter: "sp".into(),
+            selected: 0,
+        });
+
+        let mut session_state = TuiState::disconnected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            "offline".into(),
+        );
+        session_state.sessions = vec![SessionSummary {
+            session_id: "session_1".into(),
+            run_id: "run_1".into(),
+            status: RunStateName::Finished,
+            latest_question: "Review matching".into(),
+            first_question: "Review matching".into(),
+            updated_at_ms: 1,
+            ledger_path: "/tmp/agent.db".into(),
+        }];
+        session_state.selected_session_id = Some("session_1".into());
+        session_state.session_picker = Some(super::super::state::SessionPickerView {
+            filter: String::new(),
+            selected: 0,
+        });
+
+        for width in [40, 80] {
+            assert_selected_row_accent(&slash_state, width, "> /issue-prep");
+            assert_selected_row_accent(&session_state, width, ">* finished");
+        }
+    }
+
+    #[test]
     fn session_picker_renders_filtered_sessions_and_explicit_no_match() {
         let mut state = TuiState::connected(
             "/tmp/work".into(),
@@ -3371,6 +3597,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             vec![
                 SessionSummary {
@@ -3504,6 +3731,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -3540,6 +3768,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -3578,6 +3807,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -3621,6 +3851,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::None,
@@ -3661,6 +3892,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::Loaded(
@@ -3681,6 +3913,7 @@ mod tests {
                         }],
                     }),
                     pending_approval: None,
+                    completion_claim: None,
                 }
                 .into(),
             ),
@@ -3755,6 +3988,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::Loaded(
@@ -3765,6 +3999,7 @@ mod tests {
                     transcript: transcript.into(),
                     typed: None,
                     pending_approval: None,
+                    completion_claim: None,
                 }
                 .into(),
             ),
@@ -3782,6 +4017,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::Loaded(
@@ -3840,6 +4076,7 @@ mod tests {
                         ],
                     }),
                     pending_approval: None,
+                completion_claim: None,
                 }
                 .into(),
             ),
@@ -3894,7 +4131,8 @@ mod tests {
             "trust": {
                 "approval_granted_count": 2,
                 "approval_denied_count": 1,
-                "shell_session_grant": true
+                "shell_session_grant": true,
+                "approval_profile": "yolo"
             }
         }))
         .unwrap()
@@ -3909,6 +4147,7 @@ mod tests {
                 workspace_id: "work-1234".into(),
                 ledger_path: "/tmp/agent.db".into(),
                 capabilities: vec![],
+                daemon_scope: None,
             },
             Vec::new(),
             TranscriptState::Loaded(
@@ -3929,6 +4168,7 @@ mod tests {
                         }],
                     }),
                     pending_approval: None,
+                    completion_claim: None,
                 }
                 .into(),
             ),
@@ -3968,6 +4208,79 @@ mod tests {
         lines.join("\n")
     }
 
+    fn render_main_snapshot(state: &TuiState, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render_main(frame, state)).unwrap();
+        terminal_buffer_text(&terminal)
+    }
+
+    fn render_overlay_snapshot(
+        state: &TuiState,
+        width: u16,
+        height: u16,
+        scroll_offset: usize,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_overlay_at(frame, state, scroll_offset, 0))
+            .unwrap();
+        terminal_buffer_text(&terminal)
+    }
+
+    fn terminal_buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let mut output = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                output.push_str(buffer[(x, y)].symbol());
+            }
+            output.push('\n');
+        }
+        output
+    }
+
+    fn assert_selected_row_accent(state: &TuiState, width: u16, needle: &str) {
+        let backend = TestBackend::new(width, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_overlay_at(frame, state, 0, 0))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let row = (area.top()..area.bottom())
+            .find(|y| {
+                let text = (area.left()..area.right())
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>();
+                text.contains(needle)
+            })
+            .unwrap_or_else(|| panic!("missing selected row {needle:?} at width {width}"));
+        let start = (area.left()..area.right())
+            .find(|x| buffer[(*x, row)].symbol() == ">")
+            .expect("selected row marker");
+        let styled_cells: Vec<_> = (start..area.right())
+            .filter(|x| {
+                let symbol = buffer[(*x, row)].symbol();
+                !symbol.trim().is_empty() && symbol != "│"
+            })
+            .collect();
+
+        assert!(
+            styled_cells.len() >= 8,
+            "selected row was truncated: {needle}"
+        );
+        for x in styled_cells {
+            let modifiers = buffer[(x, row)].modifier;
+            assert!(
+                modifiers.contains(Modifier::BOLD | Modifier::REVERSED),
+                "selected row cell at ({x}, {row}) lacked its full accent at width {width}"
+            );
+        }
+    }
+
     fn cached_row_ptrs(state: &TuiState) -> (*const Line<'static>, *const Line<'static>) {
         let transcript = state.history_rows.transcript.read().unwrap();
         let live_events = state.history_rows.live_events.read().unwrap();
@@ -4000,7 +4313,9 @@ mod tests {
     fn render_cursor_position(state: &TuiState, width: u16, height: u16) -> (u16, u16) {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render_at(frame, state, 0)).unwrap();
+        terminal
+            .draw(|frame| render_overlay_at(frame, state, 0, 0))
+            .unwrap();
         let position = terminal.backend_mut().get_cursor_position().unwrap();
         (position.x, position.y)
     }

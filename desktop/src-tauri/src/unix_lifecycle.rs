@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DAEMON_EXECUTABLE: &str = "plato-agentd";
+const DAEMON_EXECUTABLE: &str = "platonic";
 const PATH_BEGIN: &[u8] = b"\x1ePLATO_USER_PATH_BEGIN_7E2F3C91\x1f";
 const PATH_END: &[u8] = b"\x1ePLATO_USER_PATH_END_7E2F3C91\x1f";
 const PATH_PROBE: &str = r#"command printf '\036PLATO_USER_PATH_BEGIN_7E2F3C91\037'; command printf '%s' "$PATH"; command printf '\036PLATO_USER_PATH_END_7E2F3C91\037'"#;
@@ -39,7 +39,6 @@ pub(crate) fn user_launch_path() -> io::Result<OsString> {
 pub(crate) fn spawn_detached_daemon(
     executable: &Path,
     canonical_workspace_root: &Path,
-    socket_path: Option<&Path>,
     user_path: &OsStr,
 ) -> io::Result<Child> {
     if !executable.is_absolute() {
@@ -63,16 +62,13 @@ pub(crate) fn spawn_detached_daemon(
 
     let mut command = Command::new(executable);
     command
-        .arg("--workspace")
-        .arg(canonical_workspace_root)
+        .arg("serve")
+        .current_dir(canonical_workspace_root)
         .env("PATH", user_path)
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Some(socket_path) = socket_path {
-        command.arg("--socket").arg(socket_path);
-    }
     command.spawn()
 }
 
@@ -262,8 +258,9 @@ mod tests {
     use std::{
         fs,
         os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+        sync::{Arc, Barrier},
     };
-    use tempfile::tempdir;
+    use tempfile::{tempdir, tempdir_in};
 
     #[test]
     fn parses_delimited_path_around_shell_noise() {
@@ -347,6 +344,52 @@ mod tests {
     }
 
     #[test]
+    fn executable_fixture_publication_survives_parallel_replacement() {
+        const PUBLISHERS: usize = 2;
+        const EXECUTORS: usize = 2;
+        const ITERATIONS: usize = 4;
+
+        let directory = tempdir().expect("create temp directory");
+        let executable = directory.path().join("parallel-shell");
+        let contents = "#!/bin/sh\nexit 0\n";
+        write_executable(&executable, contents);
+        let busy_inode = fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .expect("hold published executable open for writing");
+        write_executable(&executable, contents);
+        let start = Arc::new(Barrier::new(PUBLISHERS + EXECUTORS));
+
+        thread::scope(|scope| {
+            for _ in 0..PUBLISHERS {
+                let executable = &executable;
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..ITERATIONS {
+                        write_executable(executable, contents);
+                    }
+                });
+            }
+            for _ in 0..EXECUTORS {
+                let executable = &executable;
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..ITERATIONS {
+                        let status = Command::new(executable)
+                            .status()
+                            .expect("execute fixture during parallel publication");
+                        assert!(status.success());
+                    }
+                });
+            }
+        });
+
+        drop(busy_inode);
+    }
+
+    #[test]
     fn rejects_non_utf8_launch_path_before_daemon_spawn() {
         let output = [PATH_BEGIN, b"/launch/\xff/bin:/usr/bin", PATH_END].concat();
 
@@ -364,13 +407,12 @@ mod tests {
         let observed = workspace_root.join("observed-path");
         write_executable(
             &daemon,
-            "#!/bin/sh\nprintf '%s' \"$PATH\" > \"$2/observed-path\"\n",
+            "#!/bin/sh\nprintf '%s' \"$PATH\" > observed-path\n",
         );
 
         let mut child = spawn_detached_daemon(
             &daemon,
             &workspace_root,
-            None,
             OsStr::new("/launch-only/bin:/usr/bin"),
         )
         .expect("spawn fake daemon");
@@ -387,23 +429,18 @@ mod tests {
     fn detached_daemon_rejects_invalid_paths() {
         let directory = tempdir().expect("create temp directory");
         let workspace_root = directory.path().canonicalize().expect("canonical root");
-        let executable = workspace_root.join("plato-agentd");
+        let executable = workspace_root.join("platonic");
 
         let executable_error = spawn_detached_daemon(
-            Path::new("plato-agentd"),
+            Path::new("platonic"),
             &workspace_root,
-            None,
             OsStr::new("/usr/bin"),
         )
         .expect_err("reject relative executable");
-        let workspace_error = spawn_detached_daemon(
-            &executable,
-            Path::new("workspace"),
-            None,
-            OsStr::new("/usr/bin"),
-        )
-        .expect_err("reject relative workspace");
-        let path_error = spawn_detached_daemon(&executable, &workspace_root, None, OsStr::new(""))
+        let workspace_error =
+            spawn_detached_daemon(&executable, Path::new("workspace"), OsStr::new("/usr/bin"))
+                .expect_err("reject relative workspace");
+        let path_error = spawn_detached_daemon(&executable, &workspace_root, OsStr::new(""))
             .expect_err("reject empty PATH");
 
         assert_eq!(executable_error.kind(), io::ErrorKind::InvalidInput);
@@ -412,9 +449,21 @@ mod tests {
     }
 
     fn write_executable(path: &Path, contents: &str) {
-        fs::write(path, contents).expect("write executable");
-        let mut permissions = fs::metadata(path).expect("read metadata").permissions();
+        let parent = path.parent().expect("executable fixture parent");
+        let publication = tempdir_in(parent).expect("create executable fixture directory");
+        let temporary = publication.path().join("executable");
+        let status = Command::new("/bin/sh")
+            .args(["-c", "printf '%s' \"$2\" > \"$1\"", "fixture-writer"])
+            .arg(&temporary)
+            .arg(contents)
+            .status()
+            .expect("write executable fixture");
+        assert!(status.success());
+        let mut permissions = fs::metadata(&temporary)
+            .expect("read executable fixture metadata")
+            .permissions();
         permissions.set_mode(0o700);
-        fs::set_permissions(path, permissions).expect("set executable mode");
+        fs::set_permissions(&temporary, permissions).expect("set executable mode");
+        fs::rename(temporary, path).expect("publish executable fixture");
     }
 }

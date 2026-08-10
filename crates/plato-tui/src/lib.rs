@@ -2,7 +2,7 @@
 //!
 //! This crate owns terminal state, daemon-event reduction, rendering, and the
 //! terminal loop. Provider, daemon, policy, approval, and persistence semantics
-//! remain with `plato-agentd`.
+//! remain with `platonic serve`.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -15,6 +15,7 @@ mod markdown;
 mod modal;
 mod render;
 mod state;
+mod voice;
 
 pub use app::{ThreadAttachment, TuiOptions, run_tui};
 pub use modal::{
@@ -26,3 +27,4 @@ pub use state::{
     ActiveRunView, ConnectionState, LiveEventKind, LiveEventLine, SessionPickerView,
     TranscriptState, TranscriptView, TuiState,
 };
+pub use voice::{VoiceControl, VoiceControlRequest, VoiceControlResponse};

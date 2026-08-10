@@ -2164,27 +2164,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
-name = "plato-daemon-client"
-version = "0.2.0"
-dependencies = [
- "interprocess",
- "plato-protocol",
- "rustix",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "widestring",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "plato-desktop"
 version = "0.2.0"
 dependencies = [
  "interprocess",
- "plato-daemon-client",
- "plato-protocol",
+ "platonic-client",
+ "platonic-protocol",
  "rustix",
  "serde",
  "serde_json",
@@ -2197,24 +2182,38 @@ dependencies = [
 ]
 
 [[package]]
-name = "plato-protocol"
+name = "platonic-client"
 version = "0.2.0"
 dependencies = [
- "platonic-core",
+ "interprocess",
+ "platonic-protocol",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "widestring",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "platonic-core"
+version = "0.3.1"
+dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
 ]
 
 [[package]]
-name = "platonic-core"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50c86c6243e9f2d70bb927170f58dc82fcb815fc5910c0bbf704a4417dd2debf"
+name = "platonic-protocol"
+version = "0.2.0"
 dependencies = [
+ "platonic-core",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "toml 0.9.12+spec-1.1.0",
 ]
 
 [[package]]

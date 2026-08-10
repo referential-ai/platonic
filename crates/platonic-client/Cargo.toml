@@ -1,0 +1,38 @@
+[package]
+name = "platonic-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Bounded daemon client and local IPC transport for Plato Agent."
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/platonic-client"
+readme = "README.md"
+include = ["src/**", "README.md"]
+
+[dependencies]
+platonic-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+interprocess.workspace = true
+widestring.workspace = true
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Pipes",
+  "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+temp-env.workspace = true
+tempfile.workspace = true

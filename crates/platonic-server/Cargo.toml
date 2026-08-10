@@ -1,0 +1,34 @@
+[package]
+name = "platonic-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Platonic agent server: workspaces, agents, threads, tools, providers, ledger, policy, approvals, and protocol."
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/platonic-server"
+readme = "README.md"
+
+[dependencies]
+html2text.workspace = true
+platonic-client.workspace = true
+platonic-core.workspace = true
+platonic-protocol.workspace = true
+rusqlite.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tungstenite.workspace = true
+ureq.workspace = true
+url.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock.workspace = true
+
+[dev-dependencies]
+temp-env.workspace = true
+tempfile.workspace = true

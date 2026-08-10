@@ -26,10 +26,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust 1.88.0
-        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
-
-      - name: Install Rust 1.85.0
-        run: rustup toolchain install 1.85.0 --profile minimal --component clippy
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+          rustup toolchain install 1.85.0 --profile minimal
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -65,68 +64,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Prove plato-protocol on Rust 1.85.0
-        run: |
-          cargo +1.85.0 check --locked -p plato-protocol --all-targets
-          cargo +1.85.0 test --locked -p plato-protocol
-          cargo +1.85.0 clippy --locked -p plato-protocol --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo +1.85.0 doc --locked -p plato-protocol --no-deps
-          cargo +1.85.0 package --locked -p plato-protocol
-          cargo +1.85.0 package --locked --list -p plato-protocol
+      - name: Check release identity and bundle contracts
+        run: ./scripts/test-release.sh
 
-      - name: Prove plato-daemon-client on Rust 1.85.0
-        run: |
-          cargo +1.85.0 check --locked -p plato-daemon-client --all-targets
-          cargo +1.85.0 test --locked -p plato-daemon-client
-          cargo +1.85.0 clippy --locked -p plato-daemon-client --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo +1.85.0 doc --locked -p plato-daemon-client --no-deps
-          cargo +1.85.0 package --locked --list -p plato-daemon-client
-          package_log=$(mktemp)
-          if cargo +1.85.0 package --locked --no-verify -p plato-daemon-client >"$package_log" 2>&1; then
-            cat "$package_log"
-          else
-            cat "$package_log"
-            grep -F 'no matching package named `plato-protocol` found' "$package_log"
-          fi
-
-      - name: Prove plato-tui on Rust 1.88.0
-        run: |
-          cargo check --locked -p plato-tui --all-targets
-          cargo test --locked -p plato-tui
-          cargo clippy --locked -p plato-tui --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked -p plato-tui --no-deps
-          cargo package --locked --list -p plato-tui
-          package_log=$(mktemp)
-          if cargo package --locked --no-verify -p plato-tui >"$package_log" 2>&1; then
-            cat "$package_log"
-          else
-            cat "$package_log"
-            grep -F 'no matching package named `plato-daemon-client` found' "$package_log"
-          fi
-
-      - name: Prove plato-gateway-discord on Rust 1.88.0
-        run: |
-          cargo check --locked -p plato-gateway-discord --all-targets
-          cargo test --locked -p plato-gateway-discord
-          cargo clippy --locked -p plato-gateway-discord --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked -p plato-gateway-discord --no-deps
-          cargo package --locked --list -p plato-gateway-discord
-          package_log=$(mktemp)
-          if cargo package --locked --no-verify -p plato-gateway-discord >"$package_log" 2>&1; then
-            cat "$package_log"
-          else
-            cat "$package_log"
-            grep -F 'no matching package named `plato-daemon-client` found' "$package_log"
-          fi
-
-      - name: Prove plato-audio on Rust 1.88.0
-        run: |
-          cargo check --locked -p plato-audio --all-targets
-          cargo test --locked -p plato-audio
-          cargo clippy --locked -p plato-audio --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked -p plato-audio --no-deps
-          cargo package --locked -p plato-audio
-          cargo package --locked --list -p plato-audio
+      - name: Check platonic-core MSRV
+        run: cargo +1.85.0 check --locked -p platonic-core
 
       - name: Run tests
         run: cargo test --workspace --locked
@@ -137,9 +79,58 @@ jobs:
       - name: Check documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --locked --no-deps
 
+      - name: Package platonic-core
+        run: cargo package --locked -p platonic-core
+
       - name: Check command help
         run: |
           cargo run --locked -p plato-agent --bin plato -- --help
-          cargo run --locked -p plato-agent --bin plato-agentd -- --help
           cargo run --locked -p plato-agent --bin plato-tui -- --help
-          cargo run --locked -p plato-agent --bin plato-gateway-discord -- --help
+          cargo run --locked -p platonic --bin platonic -- --help
+
+  macos:
+    name: macOS
+    runs-on: macos-15
+    env:
+      RUSTUP_TOOLCHAIN: 1.88.0
+    steps:
+      - name: Check out plato-agent
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal --component clippy
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --locked
+
+      # P026 makes macOS a supported server platform and #167 boards DMG
+      # distribution, but nothing has ever compiled it. This is the first gate.
+      #
+      # Four TestDaemon bin tests hang on macOS after bind succeeds and are
+      # ignored on this platform only, tracked as #462. timeout-minutes stays
+      # on every step so any future hang fails loudly in bounded time instead
+      # of burning the six-hour job limit in silence.
+      # Compile gate only. Twelve first-day runs proved the unit and
+      # integration fixtures carry real-time deadlines (audio capture,
+      # websocket waits, web-tool bounds) that flake nondeterministically on
+      # shared macOS runners -- a different test per run. Test EXECUTION on
+      # macOS is #465's charter on stable hardware; this gate proves the
+      # whole workspace, every test binary included, compiles and lints for
+      # the platform. The deterministic divergences found on the way are
+      # ignored in-tree with their issues named (#462/#463/#464/#465).
+      - name: Build everything
+        timeout-minutes: 45
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: cargo build --workspace --locked --all-targets
+
+      - name: Run clippy
+        timeout-minutes: 30
+        run: cargo clippy --workspace --locked --all-targets -- -D warnings

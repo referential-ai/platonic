@@ -713,7 +713,7 @@
 	{#if screen.state === 'loading'}
 		<section class="center-state" aria-live="polite">
 			<div class="loading-mark"></div>
-			<p>Connecting to plato-agentd...</p>
+			<p>Connecting to Platonic...</p>
 		</section>
 	{:else if screen.state === 'needs_workspace'}
 		<section class="center-state">

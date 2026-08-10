@@ -1,0 +1,24 @@
+[package]
+name = "platonic-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Sans-IO daemon wire protocol types for Plato Agent."
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/platonic-protocol"
+readme = "README.md"
+include = ["src/**", "README.md"]
+
+[dependencies]
+platonic-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+toml.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true

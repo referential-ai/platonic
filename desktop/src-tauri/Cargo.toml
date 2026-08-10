@@ -17,8 +17,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
-plato-daemon-client = { version = "0.2.0", path = "../../crates/plato-daemon-client" }
-plato-protocol = { version = "0.2.0", path = "../../crates/plato-protocol" }
+platonic-client = { version = "0.2.0", path = "../../crates/platonic-client" }
+platonic-protocol = { version = "0.2.0", path = "../../crates/platonic-protocol" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tauri = { version = "2.11.3", features = [] }

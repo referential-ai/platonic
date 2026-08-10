@@ -3,6 +3,15 @@ title: Gateway Readiness
 issue: https://github.com/referential-ai/plato-agent/issues/93
 ---
 
+> **PARTLY SUPERSEDED, 2026-08-07.** This design predates the platform
+> decisions of 2026-08-06/07. The
+> [platform decision map](https://github.com/referential-ai/platonic-workspace/issues/83)
+> supersedes it where they disagree, and the map wins.
+>
+> Gateways are reach onto the server (D006, P004): channels select context and
+> principals carry authority, and no thread is owned. Named principals with
+> default deny and remote ceilings are plato-agent#409.
+
 # Gateway Readiness (Spine Slice 6)
 
 ## Authority

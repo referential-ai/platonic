@@ -4,6 +4,15 @@ issue: https://github.com/referential-ai/plato-agent/issues/159
 status: active
 ---
 
+> **PARTLY SUPERSEDED, 2026-08-07.** This design predates the platform
+> decisions of 2026-08-06/07. The
+> [platform decision map](https://github.com/referential-ai/platonic-workspace/issues/83)
+> supersedes it where they disagree, and the map wins.
+>
+> Not yet re-checked against P003 (three layers), P005 (the server owns tools),
+> P015 (crate architecture), or P020 (the twelve-field authority record).
+> plato-agent#370 must not be dispatched until that check happens.
+
 # Plato Computer Use and Browser Control
 
 Revision 1 - **Active**. AJ accepted this revision on 2026-07-30 in the

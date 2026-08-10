@@ -16,16 +16,16 @@ const cargoTarget = process.env.CARGO_TARGET_DIR
 
 execFileSync(
 	'cargo',
-	['build', '--locked', '--release', '--target', target, '--bin', 'plato-agentd'],
+	['build', '--locked', '--release', '--target', target, '--bin', 'platonic'],
 	{ cwd: root, stdio: 'inherit' }
 );
 
-const source = join(cargoTarget, target, 'release', 'plato-agentd.exe');
+const source = join(cargoTarget, target, 'release', 'platonic.exe');
 const destination = join(
 	desktop,
 	'src-tauri',
 	'binaries',
-	`plato-agentd-${target}.exe`
+	`platonic-${target}.exe`
 );
 mkdirSync(dirname(destination), { recursive: true });
 copyFileSync(source, destination);
