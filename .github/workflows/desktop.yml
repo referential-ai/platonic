@@ -223,8 +223,7 @@ jobs:
     name: Windows unsigned installer
     if: >-
       github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' ||
-      startsWith(github.ref, 'refs/heads/release/'))
+      github.ref == 'refs/heads/main'
     runs-on: windows-2025
     timeout-minutes: 60
     defaults:
