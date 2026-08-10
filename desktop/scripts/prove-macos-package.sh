@@ -121,7 +121,7 @@ while Date() < deadline {
     let windows = CGWindowListCopyWindowInfo(
         [.optionOnScreenOnly, .excludeDesktopElements],
         kCGNullWindowID
-    ) as! [[String: Any]]
+    ) as? [[String: Any]] ?? []
     if let window = windows.first(where: { entry in
         let owner = (entry[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
         let layer = (entry[kCGWindowLayer as String] as? NSNumber)?.intValue
