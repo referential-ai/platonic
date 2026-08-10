@@ -13,6 +13,7 @@ on:
       - crates/platonic/src/main.rs
       - scripts/check-release-contract.sh
       - scripts/package-release.py
+      - scripts/smoke-release-bundle.sh
       - scripts/test-release.sh
   workflow_dispatch:
     inputs:
@@ -175,6 +176,14 @@ jobs:
           find "$output_dir" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null \
             | LC_ALL=C sort || find "$output_dir" -maxdepth 1 -type f -exec basename {} \; \
             | LC_ALL=C sort
+
+      - name: Smoke clean extracted bundle lifecycle
+        env:
+          PRODUCT_VERSION: ${{ needs.validate.outputs.product_version }}
+        run: >-
+          ./scripts/smoke-release-bundle.sh
+          "artifacts/${{ matrix.bundle_target }}/platonic-${PRODUCT_VERSION}-${{ matrix.bundle_target }}.tar.gz"
+          "${{ matrix.bundle_target }}"
 
       - name: Upload dry-run bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
