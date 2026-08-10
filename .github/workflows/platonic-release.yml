@@ -1,6 +1,19 @@
 name: Platonic release
 
 on:
+  pull_request:
+    paths:
+      - .github/workflows/platonic-release.yml
+      - Cargo.lock
+      - Cargo.toml
+      - CHANGELOG.md
+      - crates/plato-agent/src/bin/plato.rs
+      - crates/plato-agent/src/bin/plato-tui.rs
+      - crates/platonic-protocol/**
+      - crates/platonic/src/main.rs
+      - scripts/check-release-contract.sh
+      - scripts/package-release.py
+      - scripts/test-release.sh
   workflow_dispatch:
     inputs:
       source_commit:
@@ -13,7 +26,7 @@ on:
         type: string
 
 concurrency:
-  group: platonic-release-${{ inputs.source_commit }}-${{ inputs.release_tag || 'dry-run' }}
+  group: platonic-release-${{ inputs.source_commit || github.event.pull_request.head.sha }}-${{ inputs.release_tag || 'dry-run' }}
   cancel-in-progress: false
 
 permissions:
@@ -35,15 +48,15 @@ jobs:
       - name: Check out the exact source commit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ inputs.source_commit }}
+          ref: ${{ inputs.source_commit || github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Validate release contract and source
         id: contract
         env:
-          RELEASE_TAG: ${{ inputs.release_tag }}
-          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          RELEASE_TAG: ${{ inputs.release_tag || '' }}
+          SOURCE_COMMIT: ${{ inputs.source_commit || github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           ./scripts/check-release-contract.sh metadata
@@ -173,7 +186,7 @@ jobs:
 
   publish:
     name: Create draft GitHub release
-    if: ${{ needs.validate.outputs.release_tag != '' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.validate.outputs.release_tag != '' }}
     needs:
       - validate
       - build
