@@ -378,6 +378,34 @@ not cancel their active runs. Closing the shell never stops the server or an
 active run. Linux development requires the
 [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/#linux).
 
+### macOS DMG (Protected Build)
+
+The macOS desktop targets Apple Silicon and macOS 14 or newer. Its DMG contains
+the same-revision, target-suffixed `platonic` sidecar and uses the same
+attach-first, login-shell `PATH`, and detach-on-close lifecycle as the Linux
+package.
+
+Pull requests run credential-free native arm64 packaging validation and never
+upload the unsigned DMG. The signed artifact path is only the protected/manual
+or reusable `macOS Desktop DMG` workflow with `signed: true`. The protected
+`macos-release` environment supplies `APPLE_CERTIFICATE_P12`,
+`APPLE_CERTIFICATE_PASSWORD`, `APPLE_API_ISSUER`, `APPLE_API_KEY`, and
+`APPLE_API_KEY_P8`. The job imports the encrypted Developer ID identity into a
+disposable keychain and removes all signing material on exit. Missing inputs
+fail before the build; there is no unsigned distribution fallback. The
+workflow signs and notarizes with Tauri, verifies the nested sidecar and app
+signatures, validates the stapled DMG with Gatekeeper, and uploads the DMG plus
+its SHA-256 file as a short-lived Actions artifact. It never creates a tag or
+GitHub Release. This is a direct-download,
+drag-to-Applications DMG only: it does not add a Mac App Store path, App Store
+sandboxing or receipts, or a `.pkg` installer.
+
+The protected job runs only on the `wikus` Apple Silicon proof host. Its signed
+DMG must be installed there before the native workspace-selection, WKWebView,
+bundled-daemon cold-spawn, deterministic-run, PATH-only `shell.exec`, and
+shell-close-survival acceptance is recorded. The standard `macos-14` job is a
+minimum-version compatibility gate and does not replace that release proof.
+
 ## Discord Gateway
 
 The Discord gateway in `platonic-server` receives messages over an outbound WebSocket
