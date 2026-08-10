@@ -576,7 +576,7 @@ fn git_output(cwd: Option<&Path>, args: &[&str]) -> AppResult<Output> {
     Ok(command.output()?)
 }
 
-fn create_private_directory(path: &Path) -> AppResult<()> {
+pub(crate) fn create_private_directory(path: &Path) -> AppResult<()> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
     {

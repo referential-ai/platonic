@@ -72,6 +72,14 @@ pub(crate) fn thread_repository_root(server_db_path: &Path, thread_id: &str) -> 
     Ok(thread_repositories_root(server_db_path)?.join(thread_id))
 }
 
+pub(crate) fn one_shot_runs_root(server_db_path: &Path) -> AppResult<PathBuf> {
+    Ok(server_state_parent(server_db_path)?.join("one-shot-runs"))
+}
+
+pub(crate) fn one_shot_run_root(server_db_path: &Path, run_id: &str) -> AppResult<PathBuf> {
+    Ok(one_shot_runs_root(server_db_path)?.join(run_id))
+}
+
 /// Server-owned shared Git storage. Thread processes receive read-only alternates into it.
 pub(crate) fn shared_git_root(server_db_path: &Path) -> AppResult<PathBuf> {
     Ok(server_state_parent(server_db_path)?.join("git"))

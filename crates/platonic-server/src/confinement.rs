@@ -140,6 +140,7 @@ mod tests {
     use std::{fs, path::Path, process::Stdio};
 
     const FIXTURE_ENV: &str = "PLATONIC_LANDLOCK_TEST_FIXTURE";
+    const ONE_SHOT_FIXTURE_ENV: &str = "PLATONIC_ONE_SHOT_LANDLOCK_TEST_FIXTURE";
 
     fn git(path: &Path, args: &[&str]) {
         let output = Command::new("git")
@@ -190,6 +191,62 @@ mod tests {
             other_thread.join("private.txt"),
             outside.join("outside.txt"),
         ] {
+            let error = fs::write(&denied, "denied\n").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{denied:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_shot_landlock_child_fixture() {
+        let Some(encoded) = std::env::var_os(ONE_SHOT_FIXTURE_ENV) else {
+            return;
+        };
+        let paths: Vec<String> = serde_json::from_str(&encoded.to_string_lossy()).unwrap();
+        apply_child().unwrap();
+        let workspace = Path::new(&paths[0]);
+        let scratch = Path::new(&paths[1]);
+        let sibling_workspace = Path::new(&paths[2]);
+        let server_state = Path::new(&paths[3]);
+        let shared_objects = Path::new(&paths[4]);
+        let outside = Path::new(&paths[5]);
+
+        assert_eq!(
+            std::env::var_os("TMPDIR").as_deref(),
+            Some(scratch.as_os_str())
+        );
+        let allowed = Command::new("sh")
+            .arg("-c")
+            .arg(
+                "printf workspace > allowed.txt && \
+                 printf scratch > \"$TMPDIR/allowed.txt\" && \
+                 test -r /etc/os-release && git --version >/dev/null",
+            )
+            .current_dir(workspace)
+            .output()
+            .unwrap();
+        assert!(
+            allowed.status.success(),
+            "allowed one-shot shell failed: {}",
+            String::from_utf8_lossy(&allowed.stderr)
+        );
+
+        for denied in [
+            sibling_workspace.join("denied.txt"),
+            server_state.join("server.db"),
+            shared_objects.join("denied-object"),
+            outside.join("denied.txt"),
+        ] {
+            let shell = Command::new("sh")
+                .arg("-c")
+                .arg("printf denied > \"$DENIED\"")
+                .env("DENIED", &denied)
+                .output()
+                .unwrap();
+            assert!(!shell.status.success(), "shell wrote {denied:?}");
             let error = fs::write(&denied, "denied\n").unwrap_err();
             assert_eq!(
                 error.kind(),
@@ -267,5 +324,78 @@ mod tests {
         assert!(!shared.join("object").exists());
         assert!(!other_thread.join("private.txt").exists());
         assert!(!outside.join("outside.txt").exists());
+    }
+
+    #[test]
+    fn landlock_one_shot_shell_inherits_workspace_and_tmpdir_only_write_policy() {
+        assert_eq!(detect_support(), ConfinementSupport::Landlock);
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let sibling_workspace = root.path().join("sibling-workspace");
+        let server_state = root.path().join("server-state");
+        let scratch = server_state.join("one-shot-runs/run_test/scratch");
+        let shared_objects = server_state.join("git/repo.git/objects");
+        let outside = root.path().join("outside");
+        for path in [
+            &workspace,
+            &sibling_workspace,
+            &scratch,
+            &shared_objects,
+            &outside,
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(server_state.join("server.db"), "server state\n").unwrap();
+
+        let fixture = vec![
+            workspace.to_string_lossy().into_owned(),
+            scratch.to_string_lossy().into_owned(),
+            sibling_workspace.to_string_lossy().into_owned(),
+            server_state.to_string_lossy().into_owned(),
+            shared_objects.to_string_lossy().into_owned(),
+            outside.to_string_lossy().into_owned(),
+        ];
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("confinement::tests::one_shot_landlock_child_fixture")
+            .arg("--nocapture")
+            .env(
+                ONE_SHOT_FIXTURE_ENV,
+                serde_json::to_string(&fixture).unwrap(),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_child(
+            &mut command,
+            &ChildConfinement::Landlock {
+                writable_paths: vec![workspace.clone(), scratch.clone()],
+                scratch: scratch.clone(),
+            },
+        )
+        .unwrap();
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "one-shot Landlock fixture failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("allowed.txt")).unwrap(),
+            "workspace"
+        );
+        assert_eq!(
+            fs::read_to_string(scratch.join("allowed.txt")).unwrap(),
+            "scratch"
+        );
+        assert_eq!(
+            fs::read_to_string(server_state.join("server.db")).unwrap(),
+            "server state\n"
+        );
+        assert!(!sibling_workspace.join("denied.txt").exists());
+        assert!(!shared_objects.join("denied-object").exists());
+        assert!(!outside.join("denied.txt").exists());
     }
 }
