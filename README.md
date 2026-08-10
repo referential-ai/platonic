@@ -418,11 +418,13 @@ daemon access, session lookup, Discord response work, or effects. An admitted
 identity in an unmapped channel is ignored at the separate context gate.
 
 With the host daemon already running, start the gateway in an environment
-that contains the bot token but no provider credentials:
+that contains the bot token but no provider credentials. The durable token
+belongs only at `$HOME/.config/plato/discord-bot-token`; load it privately so
+the literal never appears in `argv`, pane text, logs, GitHub, or chat:
 
 ```bash
 unset OPENAI_API_KEY OPENROUTER_API_KEY
-export DISCORD_BOT_TOKEN="$(cat /path/to/discord-bot-token)"
+export DISCORD_BOT_TOKEN="$(tr -d '\r\n' < "$HOME/.config/plato/discord-bot-token")"
 platonic gateway discord --config ~/.config/plato/gateway.toml
 ```
 

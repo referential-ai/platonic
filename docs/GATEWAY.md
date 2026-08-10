@@ -9,7 +9,8 @@ description of gateway behavior; this page is the setup walkthrough.
 
 The commands below assume Bash on Unix. Use a test server where you can install
 an app, register one small Git workspace with the host server, and use that same
-directory for the gateway, TUI, and replay commands.
+directory for the gateway, TUI, and replay commands. The exact live launch
+channel is `gateway-live`.
 
 ## 1. Create and install the Discord bot
 
@@ -30,7 +31,7 @@ directory for the gateway, TUI, and replay commands.
    [permissions reference](https://docs.discord.com/developers/topics/permissions)
    defines these flags.
 6. Copy the install link, add the app to the test server, and confirm the bot
-   can see the channel where you will test it.
+   can see `gateway-live`.
 
 Discord's
 [first-bot guide](https://docs.discord.com/developers/quick-start/getting-started)
@@ -50,19 +51,21 @@ printf '\n'
 (umask 077; printf '%s' "$TOKEN" >"$TOKEN_FILE")
 unset TOKEN
 chmod 600 "$TOKEN_FILE"
-test "$(stat -c '%a' "$TOKEN_FILE")" = 600
+mode=$(stat -c '%a' "$TOKEN_FILE" 2>/dev/null || stat -f '%Lp' "$TOKEN_FILE")
+test "$mode" = 600
 ```
 
 Never print or inspect the token to verify it. A successful final `test`
-command verifies the file mode without revealing the contents.
+command verifies the file mode without revealing the contents. The L5 gateway
+proof consumes only the file path and loads the secret privately. The token
+literal must never appear in `argv`, pane text, logs, GitHub, or chat.
 
 ## 3. Add the principal and channel context map
 
 In Discord, enable **User Settings > Advanced > Developer Mode**, then
 right-click your own user and select **Copy User ID**. Use the numeric ID of the
 human account that will send messages, not the application, bot, server, or
-channel ID. Right-click the text channel used for this walkthrough and select
-**Copy Channel ID**.
+channel ID. Right-click `gateway-live` and select **Copy Channel ID**.
 
 Principal authority must be in the canonical home config
 `~/.config/plato/config.toml`:
@@ -165,8 +168,8 @@ successful authority readback for every mapped thread.
 
 ## 5. Receive the first reply
 
-From the allowlisted human account, send a simple text-only prompt in the test
-channel, such as:
+From the allowlisted human account, send a simple text-only prompt in
+`gateway-live`, such as:
 
 ```text
 Reply with one short greeting.

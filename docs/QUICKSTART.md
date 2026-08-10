@@ -185,10 +185,15 @@ Start the optional Discord connector from a separate environment:
 
 ```bash
 unset OPENAI_API_KEY OPENROUTER_API_KEY
-export DISCORD_BOT_TOKEN="$(cat /path/to/discord-bot-token)"
+export DISCORD_BOT_TOKEN="$(tr -d '\r\n' < "$HOME/.config/plato/discord-bot-token")"
 platonic gateway discord --workspace "$PWD" \
   --config "$HOME/.config/plato/gateway.toml"
 ```
+
+The token is stored only at `$HOME/.config/plato/discord-bot-token`; never put
+its literal value in `argv`, pane text, logs, GitHub, or chat. The
+[gateway guide](GATEWAY.md) owns the private file setup and `gateway-live`
+channel walkthrough.
 
 The gateway attaches to the host endpoint and requires a successful `hello` for
 the selected workspace. Probe failures start no connector; the gateway never
