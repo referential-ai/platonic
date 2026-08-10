@@ -1,0 +1,15 @@
+{
+  "$schema": "https://unpkg.com/knip@6.32.1/schema.json",
+  "entry": [
+    "scripts/stage-linux-sidecar.mjs",
+    "scripts/stage-windows-sidecar.mjs",
+    "src/routes/+layout.svelte",
+    "src/routes/+layout.ts",
+    "src/routes/+page.svelte"
+  ],
+  "ignoreIssues": {
+    "src/lib/components/ui/button/index.ts": ["exports", "types"],
+    "src/lib/utils.ts": ["types"]
+  },
+  "project": ["scripts/**/*.mjs", "src/**/*.{css,svelte,ts}", "vite.config.ts"]
+}
