@@ -1823,6 +1823,7 @@ struct AdmittedRun {
     cancel: Arc<AtomicBool>,
     event_collector: thread::JoinHandle<()>,
     authority: RunAuthorityProjection,
+    owns_one_shot_scratch: bool,
 }
 
 fn start_run(
@@ -1848,6 +1849,21 @@ fn start_run(
         ERROR_THREAD_SEND_FAILED
     } else {
         ERROR_RUN_FAILED
+    };
+    let one_shot_confinement = if thread_context.is_none() {
+        match runtime.thread_confinement() {
+            Ok(confinement) => Some(confinement),
+            Err(()) => {
+                return Err(Box::new(Envelope::error(
+                    request_id,
+                    Some(method.into()),
+                    error_code,
+                    "server policy requires confinement, but this run cannot be confined",
+                )));
+            }
+        }
+    } else {
+        None
     };
     let session_id = session.session_id().to_string();
     let run_id = match new_run_id() {
@@ -1892,6 +1908,19 @@ fn start_run(
             )));
         }
     }
+    let (one_shot_confinement, owns_one_shot_scratch) =
+        match prepare_one_shot_confinement(runtime, &run_id_string, one_shot_confinement) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                runtime.release_run_reservation(&record);
+                return Err(Box::new(Envelope::error(
+                    request_id,
+                    Some(method.into()),
+                    error_code,
+                    error.to_string(),
+                )));
+            }
+        };
     if let Some(context) = thread_context.as_ref()
         && let Err(error) = runtime.bind_thread_run(&context.turn, record.clone())
     {
@@ -1955,9 +1984,7 @@ fn start_run(
         .and_then(|context| projected_thread_spawn_handler(runtime, context));
     let child_confinement = thread_context
         .as_ref()
-        .map_or(ChildConfinement::None, |context| {
-            context.confinement.clone()
-        });
+        .map_or(one_shot_confinement, |context| context.confinement.clone());
     let authority = RunAuthorityProjection {
         agent_id: run_agent_id,
         toolset: run_toolset,
@@ -1976,11 +2003,22 @@ fn start_run(
             if let Some(context) = thread_context.as_ref() {
                 runtime.abort_thread_turn(&context.turn);
             }
+            let cleanup = remove_one_shot_run_root(
+                &runtime.paths.server_db_path,
+                &run_id_string,
+                owns_one_shot_scratch,
+            );
+            let message = match cleanup {
+                Ok(()) => error.to_string(),
+                Err(cleanup) => {
+                    format!("{error}; one-shot scratch cleanup failed: {cleanup}")
+                }
+            };
             return Err(Box::new(Envelope::error(
                 request_id,
                 Some(method.into()),
                 error_code,
-                error.to_string(),
+                message,
             )));
         }
     };
@@ -1994,6 +2032,7 @@ fn start_run(
         cancel: record.cancel.clone(),
         event_collector,
         authority,
+        owns_one_shot_scratch,
     };
 
     if wait.unwrap_or(false) {
@@ -2080,6 +2119,7 @@ fn discard_unstarted_run(
         recorder,
         event_sender,
         event_collector,
+        owns_one_shot_scratch,
         ..
     } = admitted;
     drop(event_sender);
@@ -2087,11 +2127,23 @@ fn discard_unstarted_run(
         .join()
         .map_err(|_| AppError::RunFailed(EVENT_COLLECTOR_PANIC.into()));
     let admission = recorder.discard_empty_session_admission();
-    match (collector, admission) {
+    let admission = match (collector, admission) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
         (Err(collector), Err(admission)) => Err(AppError::Config(format!(
             "{collector}; failed to discard run admission: {admission}"
+        ))),
+    };
+    let scratch = remove_one_shot_run_root(
+        &runtime.paths.server_db_path,
+        &record.run_id,
+        owns_one_shot_scratch,
+    );
+    match (admission, scratch) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(admission), Err(scratch)) => Err(AppError::Config(format!(
+            "{admission}; one-shot scratch cleanup failed: {scratch}"
         ))),
     }
 }
@@ -2143,6 +2195,7 @@ fn run_to_completion(
         cancel,
         event_collector,
         authority,
+        owns_one_shot_scratch,
     } = admitted;
     let RunAuthorityProjection {
         thread_spawn,
@@ -2173,7 +2226,99 @@ fn run_to_completion(
         thread_spawn,
         confinement,
     )));
+    let completion = match remove_one_shot_run_root(
+        &runtime.paths.server_db_path,
+        &record.run_id,
+        owns_one_shot_scratch,
+    ) {
+        Ok(()) => completion,
+        Err(error) => match completion {
+            RunCompletion::Published(_) => RunCompletion::Published(Err(error)),
+            RunCompletion::Supervised(completion) => {
+                RunCompletion::Supervised(Box::new((*completion).override_failure(error)))
+            }
+        },
+    };
     finish_run_after_event_collection(runtime, record, completion, event_collector)
+}
+
+fn prepare_one_shot_confinement(
+    runtime: &DaemonRuntime,
+    run_id: &str,
+    confinement: Option<ThreadConfinement>,
+) -> AppResult<(ChildConfinement, bool)> {
+    match confinement {
+        Some(ThreadConfinement::Landlock) => {
+            let run_root = crate::paths::one_shot_run_root(&runtime.paths.server_db_path, run_id)?;
+            if run_root.exists() {
+                return Err(AppError::Config(format!(
+                    "one-shot run root already exists: {}",
+                    run_root.display()
+                )));
+            }
+            if let Err(error) = crate::thread_repository::create_private_directory(&run_root) {
+                let _ = remove_one_shot_run_root(&runtime.paths.server_db_path, run_id, true);
+                return Err(error);
+            }
+            let scratch = run_root.join("scratch");
+            if let Err(error) = crate::thread_repository::create_private_directory(&scratch) {
+                let _ = remove_one_shot_run_root(&runtime.paths.server_db_path, run_id, true);
+                return Err(error);
+            }
+            let scratch = match scratch.canonicalize() {
+                Ok(scratch) => scratch,
+                Err(error) => {
+                    let _ = remove_one_shot_run_root(&runtime.paths.server_db_path, run_id, true);
+                    return Err(error.into());
+                }
+            };
+            Ok((
+                ChildConfinement::Landlock {
+                    writable_paths: vec![runtime.paths.workspace_root.clone(), scratch.clone()],
+                    scratch,
+                },
+                true,
+            ))
+        }
+        Some(ThreadConfinement::None) | None => Ok((ChildConfinement::None, false)),
+    }
+}
+
+fn remove_one_shot_run_root(server_db_path: &Path, run_id: &str, owned: bool) -> AppResult<()> {
+    if !owned {
+        return Ok(());
+    }
+    let root = crate::paths::one_shot_run_root(server_db_path, run_id)?;
+    match std::fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            std::fs::remove_dir_all(root).map_err(Into::into)
+        }
+        Ok(_) => Err(AppError::Config(format!(
+            "one-shot run root is not a directory: {}",
+            root.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(super) fn reconcile_one_shot_run_roots(server_db_path: &Path) -> AppResult<()> {
+    let root = crate::paths::one_shot_runs_root(server_db_path)?;
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 enum RunCompletion {
@@ -5838,7 +5983,13 @@ IFS= read -r _
 
     #[test]
     fn all_async_entry_methods_admit_jsonl_and_session_row_before_receipt() {
-        let (_root, runtime) = thread_test_runtime();
+        let (_root, base) = thread_test_runtime();
+        let runtime = DaemonRuntime::new_with_server_policy(
+            base.paths,
+            1,
+            false,
+            crate::confinement::ConfinementSupport::Landlock,
+        );
         let config_path = write_admission_test_config(&runtime.paths.workspace_root);
 
         let reached = Arc::new(Barrier::new(2));
@@ -5860,9 +6011,14 @@ IFS= read -r _
             &started.session_id,
             "first question",
         );
+        let started_root =
+            crate::paths::one_shot_run_root(&runtime.paths.server_db_path, &started.run_id)
+                .unwrap();
+        assert!(started_root.join("scratch").is_dir());
         cancel_admitted_run(&runtime, &started.run_id);
         release.wait();
         wait_for_run_terminal(&runtime, &started.run_id);
+        assert!(!started_root.exists());
 
         let reached = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
@@ -5893,9 +6049,14 @@ IFS= read -r _
                 .unwrap()
                 .is_file()
         );
+        let appended_root =
+            crate::paths::one_shot_run_root(&runtime.paths.server_db_path, &appended.run_id)
+                .unwrap();
+        assert!(appended_root.join("scratch").is_dir());
         cancel_admitted_run(&runtime, &appended.run_id);
         release.wait();
         wait_for_run_terminal(&runtime, &appended.run_id);
+        assert!(!appended_root.exists());
 
         let (spawn_id, thread_id) = pending_spawn(
             start_thread(
@@ -5940,14 +6101,35 @@ IFS= read -r _
             &thread_session,
             "thread question",
         );
+        let authority = runtime
+            .paths
+            .server_store()
+            .unwrap()
+            .thread_authority(&thread_id)
+            .unwrap()
+            .unwrap();
+        let thread_scratch = PathBuf::from(&authority.granted_paths[0].path);
+        assert!(thread_scratch.is_dir());
+        assert!(
+            !crate::paths::one_shot_run_root(&runtime.paths.server_db_path, &thread_run.run_id,)
+                .unwrap()
+                .exists()
+        );
         cancel_admitted_run(&runtime, &thread_run.run_id);
         release.wait();
         wait_for_run_terminal(&runtime, &thread_run.run_id);
+        assert!(thread_scratch.is_dir());
     }
 
     #[test]
     fn admission_failures_remove_runtime_thread_and_empty_storage_reservations() {
-        let (_root, jsonl_runtime) = bare_thread_test_runtime();
+        let (_root, base) = bare_thread_test_runtime();
+        let jsonl_runtime = DaemonRuntime::new_with_server_policy(
+            base.paths,
+            1,
+            false,
+            crate::confinement::ConfinementSupport::Landlock,
+        );
         let jsonl_config = write_admission_test_config(&jsonl_runtime.paths.workspace_root);
         drop(SqliteLedger::open_or_create_default(&jsonl_runtime.paths.default_ledger()).unwrap());
         let runs_path = jsonl_runtime
@@ -5967,6 +6149,14 @@ IFS= read -r _
         assert_eq!(response.error.unwrap().code, ERROR_RUN_FAILED);
         assert!(jsonl_runtime.state.lock().unwrap().runs.is_empty());
         assert_eq!(session_run_count(&jsonl_runtime), 0);
+        assert_eq!(
+            std::fs::read_dir(
+                crate::paths::one_shot_runs_root(&jsonl_runtime.paths.server_db_path).unwrap()
+            )
+            .unwrap()
+            .count(),
+            0
+        );
 
         let (_root, sqlite_runtime) = bare_thread_test_runtime();
         let sqlite_config = write_admission_test_config(&sqlite_runtime.paths.workspace_root);
@@ -5995,6 +6185,34 @@ IFS= read -r _
                     .parent()
                     .unwrap()
                     .join("runs")
+            )
+            .unwrap()
+            .count(),
+            0
+        );
+
+        let (_root, base) = bare_thread_test_runtime();
+        let one_shot_handoff = DaemonRuntime::new_with_server_policy(
+            base.paths,
+            1,
+            false,
+            crate::confinement::ConfinementSupport::Landlock,
+        );
+        let config_path = write_admission_test_config(&one_shot_handoff.paths.workspace_root);
+        one_shot_handoff.fail_next_run_handoff();
+        let response = handle_line(
+            &one_shot_handoff,
+            &format!(
+                r#"{{"v":1,"id":"start","kind":"request","method":"run.start","params":{{"question":"handoff fails","config_path":"{}"}}}}"#,
+                config_path.display()
+            ),
+        );
+        assert_eq!(response.error.unwrap().code, ERROR_RUN_FAILED);
+        assert!(one_shot_handoff.state.lock().unwrap().runs.is_empty());
+        assert_eq!(session_run_count(&one_shot_handoff), 0);
+        assert_eq!(
+            std::fs::read_dir(
+                crate::paths::one_shot_runs_root(&one_shot_handoff.paths.server_db_path).unwrap()
             )
             .unwrap()
             .count(),
@@ -6053,8 +6271,14 @@ IFS= read -r _
     }
 
     #[test]
-    fn wait_true_keeps_error_behavior_and_creates_one_admission() {
-        let (_root, runtime) = bare_thread_test_runtime();
+    fn wait_true_new_and_continued_runs_clean_owned_scratch_after_failure() {
+        let (_root, base) = bare_thread_test_runtime();
+        let runtime = DaemonRuntime::new_with_server_policy(
+            base.paths,
+            1,
+            false,
+            crate::confinement::ConfinementSupport::Landlock,
+        );
         let config_path = write_admission_test_config(&runtime.paths.workspace_root);
         let response = handle_line(
             &runtime,
@@ -6081,12 +6305,146 @@ IFS= read -r _
                 .count(),
             1
         );
+        assert!(
+            !crate::paths::one_shot_run_root(
+                &runtime.paths.server_db_path,
+                &session.runs[0].run_id,
+            )
+            .unwrap()
+            .exists()
+        );
+
+        let response = handle_line(
+            &runtime,
+            &format!(
+                r#"{{"v":1,"id":"append","kind":"request","method":"message.append","params":{{"session_id":"{}","message":"continued question","config_path":"{}","wait":true}}}}"#,
+                session.session_id,
+                config_path.display()
+            ),
+        );
+        assert_eq!(response.kind, EnvelopeKind::Error);
+        assert_eq!(response.error.unwrap().code, ERROR_RUN_FAILED);
+        assert_eq!(session_run_count(&runtime), 2);
+        let session = SqliteLedger::open_default_readonly(&runtime.paths.default_ledger())
+            .unwrap()
+            .read_latest_session()
+            .unwrap();
+        assert_eq!(session.runs.len(), 2);
+        assert_eq!(session.runs[1].question, "continued question");
+        assert_eq!(session.runs[1].status, RunStateName::Failed);
+        for run in &session.runs {
+            assert!(
+                !crate::paths::one_shot_run_root(&runtime.paths.server_db_path, &run.run_id,)
+                    .unwrap()
+                    .exists()
+            );
+        }
         assert_eq!(
             std::fs::read_dir(runtime.paths.ledger_path.parent().unwrap().join("runs"))
                 .unwrap()
                 .count(),
-            1
+            2
         );
+    }
+
+    #[test]
+    fn one_shot_fallback_runs_unconfined_and_require_refuses_before_admission() {
+        let (_root, base) = bare_thread_test_runtime();
+        let fallback = DaemonRuntime::new_with_server_policy(
+            base.paths,
+            1,
+            false,
+            crate::confinement::ConfinementSupport::None,
+        );
+        assert_eq!(
+            prepare_one_shot_confinement(
+                &fallback,
+                "run_fallback",
+                Some(fallback.thread_confinement().unwrap()),
+            )
+            .unwrap(),
+            (ChildConfinement::None, false)
+        );
+        let config_path = write_admission_test_config(&fallback.paths.workspace_root);
+        let response = handle_line(
+            &fallback,
+            &format!(
+                r#"{{"v":1,"id":"fallback","kind":"request","method":"run.start","params":{{"question":"fallback","config_path":"{}","wait":true}}}}"#,
+                config_path.display()
+            ),
+        );
+        assert_eq!(response.error.unwrap().code, ERROR_RUN_FAILED);
+        assert_eq!(session_run_count(&fallback), 1);
+        assert!(
+            !crate::paths::one_shot_runs_root(&fallback.paths.server_db_path)
+                .unwrap()
+                .exists()
+        );
+
+        let (_root, base) = bare_thread_test_runtime();
+        let required = DaemonRuntime::new_with_server_policy(
+            base.paths,
+            1,
+            true,
+            crate::confinement::ConfinementSupport::None,
+        );
+        let config_path = write_admission_test_config(&required.paths.workspace_root);
+        let response = handle_line(
+            &required,
+            &format!(
+                r#"{{"v":1,"id":"required","kind":"request","method":"run.start","params":{{"question":"required","config_path":"{}"}}}}"#,
+                config_path.display()
+            ),
+        );
+        let error = response.error.unwrap();
+        assert_eq!(error.code, ERROR_RUN_FAILED);
+        assert_eq!(
+            error.message,
+            "server policy requires confinement, but this run cannot be confined"
+        );
+        assert!(required.state.lock().unwrap().runs.is_empty());
+        assert!(!required.paths.ledger_path.exists());
+        assert!(
+            !crate::paths::one_shot_runs_root(&required.paths.server_db_path)
+                .unwrap()
+                .exists()
+        );
+    }
+
+    #[test]
+    fn one_shot_landlock_selection_uses_canonical_workspace_and_owned_tmpdir() {
+        let (_root, base) = bare_thread_test_runtime();
+        let runtime = DaemonRuntime::new_with_server_policy(
+            base.paths,
+            1,
+            false,
+            crate::confinement::ConfinementSupport::Landlock,
+        );
+        let run_id = "run_landlock_selection";
+        let scratch = crate::paths::one_shot_run_root(&runtime.paths.server_db_path, run_id)
+            .unwrap()
+            .join("scratch");
+
+        let (confinement, owned) = prepare_one_shot_confinement(
+            &runtime,
+            run_id,
+            Some(runtime.thread_confinement().unwrap()),
+        )
+        .unwrap();
+
+        assert!(owned);
+        assert_eq!(
+            confinement,
+            ChildConfinement::Landlock {
+                writable_paths: vec![
+                    runtime.paths.workspace_root.clone(),
+                    scratch.canonicalize().unwrap(),
+                ],
+                scratch: scratch.canonicalize().unwrap(),
+            }
+        );
+        remove_one_shot_run_root(&runtime.paths.server_db_path, run_id, owned).unwrap();
+        assert!(!scratch.exists());
     }
 
     #[test]

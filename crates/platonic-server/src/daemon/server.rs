@@ -4,7 +4,7 @@ use crate::paths;
 use crate::{
     AppResult,
     daemon::{
-        handlers::{handle_line, handle_request},
+        handlers::{handle_line, handle_request, reconcile_one_shot_run_roots},
         lock::HostProcessLock,
         protocol::{
             ERROR_INTERNAL, ERROR_MALFORMED_REQUEST, ERROR_WORKSPACE_MISMATCH,
@@ -179,6 +179,7 @@ impl HostRuntime {
         let control_paths =
             DaemonPaths::resolve(&std::env::current_dir()?, Some(socket_path.clone()))?;
         reconcile_thread_repositories(&control_paths.server_db_path)?;
+        reconcile_one_shot_run_roots(&control_paths.server_db_path)?;
         let control_runtime = DaemonRuntime::new_shared(
             control_paths,
             max_spawn_depth,
@@ -1188,6 +1189,37 @@ mod tests {
         );
         assert_eq!(git(&workspace, &["rev-parse", "HEAD"]), user_commit);
         assert!(!workspace.join("recovered.txt").exists());
+    }
+
+    #[test]
+    fn host_startup_removes_only_abandoned_one_shot_run_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("preserved.txt"), "workspace\n").unwrap();
+
+        temp_env::with_vars(
+            [("HOME", Some(home.as_os_str())), ("PLATO_CONFIG", None)],
+            || {
+                paths::with_test_xdg(root.path(), || {
+                    let server_db = crate::paths::server_db_path().unwrap();
+                    let abandoned =
+                        crate::paths::one_shot_run_root(&server_db, "run_abandoned").unwrap();
+                    fs::create_dir_all(abandoned.join("scratch")).unwrap();
+                    fs::write(abandoned.join("scratch/residue.txt"), "residue\n").unwrap();
+
+                    let _host = HostRuntime::new(root.path().join("host.sock")).unwrap();
+
+                    assert!(!abandoned.exists());
+                    assert_eq!(
+                        fs::read_to_string(workspace.join("preserved.txt")).unwrap(),
+                        "workspace\n"
+                    );
+                });
+            },
+        );
     }
 
     #[test]
@@ -2301,7 +2333,19 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"hello","config_path":"{}","wait":true}}}}"#,
             config_path.display()
         ));
+        assert_eq!(
+            response.kind,
+            EnvelopeKind::Response,
+            "{:?}",
+            response.error
+        );
         let result = response_value(&response);
+        let run_root = crate::paths::one_shot_run_root(
+            &server.paths().server_db_path,
+            result["run_id"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert!(!run_root.exists());
         let request = http_request_json(&provider.handle.join().unwrap());
         let ledger = SqliteLedger::open_readonly(&server.paths().ledger_path).unwrap();
         let records = ledger
