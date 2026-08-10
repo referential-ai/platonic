@@ -1,0 +1,138 @@
+name: Quality
+
+on:
+  pull_request:
+  push:
+    branches:
+      - develop
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  duplication:
+    name: Duplication
+    runs-on: ubuntu-24.04
+    outputs:
+      clones: ${{ steps.report.outputs.clones }}
+      percentage: ${{ steps.report.outputs.percentage }}
+      summary: ${{ steps.report.outputs.summary }}
+    steps:
+      - name: Check out plato-agent
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
+      - name: Check duplication
+        id: scan
+        continue-on-error: true
+        run: >-
+          npx --yes jscpd@5.0.14
+          --config .jscpd.json
+          --reporters console,json
+          --output "$RUNNER_TEMP/jscpd"
+          --no-colors
+          --no-tips
+
+      - name: Read duplication report
+        id: report
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/jscpd/jscpd-report.json"
+          test -s "$report"
+          jq -e '.statistics.total.percentageTokens | numbers' "$report" >/dev/null
+          jq -e '.statistics.total.clones | numbers' "$report" >/dev/null
+          printf 'percentage=%s\n' \
+            "$(jq -r '.statistics.total.percentageTokens' "$report")" \
+            >> "$GITHUB_OUTPUT"
+          printf 'clones=%s\n' \
+            "$(jq -r '.statistics.total.clones' "$report")" \
+            >> "$GITHUB_OUTPUT"
+          summary=$(jq -c '.duplicates | if length == 0 then null else max_by(.tokens) | {
+            tokens,
+            lines,
+            first: (.firstFile | { name, start, end }),
+            second: (.secondFile | { name, start, end })
+          } end' "$report" | base64 -w0)
+          printf 'summary=%s\n' "$summary" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce duplication gate
+        if: ${{ always() }}
+        env:
+          SCAN_OUTCOME: ${{ steps.scan.outcome }}
+        run: |
+          set -euo pipefail
+          test "$SCAN_OUTCOME" = success
+          threshold=$(jq -er '.threshold' .jscpd.json)
+          jq -e --argjson threshold "$threshold" \
+            '.statistics.total.percentageTokens <= $threshold' \
+            "$RUNNER_TEMP/jscpd/jscpd-report.json" >/dev/null
+
+  comment:
+    name: Report duplication
+    needs: duplication
+    if: >-
+      ${{
+        always() &&
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        needs.duplication.outputs.percentage != ''
+      }}
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Create or update JSCPD report comment
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CLONES: ${{ needs.duplication.outputs.clones }}
+          PERCENTAGE: ${{ needs.duplication.outputs.percentage }}
+          SUMMARY: ${{ needs.duplication.outputs.summary }}
+        with:
+          script: |
+            const marker = '<!-- jscpd-report -->';
+            const percentage = Number(process.env.PERCENTAGE).toFixed(2);
+            const clones = Number(process.env.CLONES);
+            const summary = JSON.parse(
+              Buffer.from(process.env.SUMMARY, 'base64').toString('utf8')
+            );
+            const clean = (value) => String(value).replace(/[\r\n`]/g, '');
+            const signal = summary
+              ? ` Largest clone: \`${clean(summary.first.name)}:${summary.first.start}-${summary.first.end}\` ` +
+                `and \`${clean(summary.second.name)}:${summary.second.start}-${summary.second.end}\` ` +
+                `(${summary.lines} lines, ${summary.tokens} tokens).`
+              : ' No clones found.';
+            const body = `${marker}\n**JSCPD:** ${percentage}% duplicated tokens ` +
+              `(${clones} clones; 1.50% gate).${signal}`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) =>
+              comment.user?.type === 'Bot' && comment.body?.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                ...context.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

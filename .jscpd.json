@@ -1,0 +1,16 @@
+{
+  "path": [
+    "crates/plato-agent/src",
+    "crates/plato-audio/src",
+    "crates/plato-tui/src",
+    "crates/platonic-client/src",
+    "crates/platonic-core/src",
+    "crates/platonic-protocol/src",
+    "crates/platonic-server/src",
+    "crates/platonic/src",
+    "site/src",
+    "desktop/src"
+  ],
+  "minTokens": 100,
+  "threshold": 1.5
+}
