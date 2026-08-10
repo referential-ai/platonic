@@ -1,6 +1,4 @@
-#[cfg(windows)]
-use platonic_client::installer_gate::InstallerStartupGate;
-use platonic_client::{client::DaemonClient, lock::LockMetadata, paths};
+use platonic_client::{client::DaemonClient, lock::LockMetadata};
 use platonic_core::{
     AgentId, ContextPack, HarnessEvent, Message, MessageRole, ModelName, ModelUsage, RecordedEvent,
     RunId, TurnId,
@@ -24,68 +22,6 @@ use std::{
 const PROOF_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const API_KEY_ENV: &str = "PLATO_SQLITE_LOCK_TEST_KEY";
-#[cfg(windows)]
-const WINDOWS_REPEAT_COUNT: usize = 25;
-
-#[cfg(windows)]
-#[test]
-fn independent_daemon_startups_wait_for_installer_gate_release() {
-    for iteration in 1..=WINDOWS_REPEAT_COUNT {
-        eprintln!("independent daemon-startup proof {iteration}/{WINDOWS_REPEAT_COUNT}");
-        independent_daemon_startups_wait_for_installer_gate_release_once();
-    }
-}
-
-#[cfg(windows)]
-fn independent_daemon_startups_wait_for_installer_gate_release_once() {
-    let gate = InstallerStartupGate::acquire_for_daemon_startup().unwrap();
-    let first_proof = ProofContext::new();
-    let second_proof = ProofContext::new();
-    let mut first = ProofDaemon::spawn_process(&first_proof);
-    let mut second = ProofDaemon::spawn_process(&second_proof);
-
-    first.assert_waiting_for_installer_gate(&first_proof);
-    second.assert_waiting_for_installer_gate(&second_proof);
-    drop(gate);
-
-    first.wait_until_ready();
-    second.wait_until_ready();
-    assert!(
-        first_proof.lock_path.exists(),
-        "first independent daemon {} did not own fixture lock {}",
-        first.id(),
-        first_proof.lock_path.display()
-    );
-    assert!(
-        second_proof.lock_path.exists(),
-        "second independent daemon {} did not own fixture lock {}",
-        second.id(),
-        second_proof.lock_path.display()
-    );
-    first.stop();
-    second.stop();
-    assert!(
-        !first_proof.lock_path.exists(),
-        "first independent daemon left fixture lock {}",
-        first_proof.lock_path.display()
-    );
-    assert!(
-        !second_proof.lock_path.exists(),
-        "second independent daemon left fixture lock {}",
-        second_proof.lock_path.display()
-    );
-    assert!(
-        DaemonClient::connect(&first_proof.socket_path).is_err(),
-        "first independent daemon left fixture endpoint {}",
-        first_proof.socket_path.display()
-    );
-    assert!(
-        DaemonClient::connect(&second_proof.socket_path).is_err(),
-        "second independent daemon left fixture endpoint {}",
-        second_proof.socket_path.display()
-    );
-}
-
 #[test]
 fn daemon_first_blocks_direct_sqlite_but_allows_jsonl_and_delegated_prompts() {
     let proof = ProofContext::new();
@@ -271,46 +207,19 @@ fn direct_replay_holds_lock_through_final_stdout() {
 #[test]
 fn replay_cli_reads_literal_v1_without_mutation_and_rejects_future_schema() {
     let proof = ProofContext::new();
-    let workspace_id = paths::workspace_id(&proof.workspace).unwrap();
-    #[cfg(unix)]
-    let legacy_path = proof
-        .state_root
-        .join("platonic")
-        .join("workspaces")
-        .join(&workspace_id)
-        .join("agent.db");
-    #[cfg(windows)]
-    let legacy_path = proof
-        .local_app_data
-        .join("platonic")
-        .join("workspaces")
-        .join(&workspace_id)
-        .join("agent.db");
-    write_literal_v1_sqlite(&legacy_path);
-    let bytes_before = fs::read(&legacy_path).unwrap();
+    let ledger_path = proof.workspace.join("literal-v1.db");
+    write_literal_v1_sqlite(&ledger_path);
+    let bytes_before = fs::read(&ledger_path).unwrap();
 
-    ProofDaemon::start(&proof).stop();
-    #[cfg(unix)]
-    let server_db_path = proof.state_root.join("platonic/server.db");
-    #[cfg(windows)]
-    let server_db_path = proof.local_app_data.join("platonic/server.db");
-    let registry = Connection::open(server_db_path).unwrap();
-    let ledger_path = PathBuf::from(
-        registry
-            .query_row(
-                "SELECT ledger_path FROM workspaces WHERE root = ?1",
-                params![proof.workspace.canonicalize().unwrap().to_string_lossy()],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-    );
-    drop(registry);
-    assert!(!legacy_path.exists());
-    assert_eq!(fs::read(&ledger_path).unwrap(), bytes_before);
-
-    let latest = proof.cli_output(&["replay".into()]);
+    let database = format!("--db={}", ledger_path.display());
+    let latest = proof.cli_output(&["replay".into(), database.clone().into()]);
     assert_success("literal v1 latest replay", &latest);
-    let exact = proof.cli_output(&["replay".into(), "--run".into(), "run_v1".into()]);
+    let exact = proof.cli_output(&[
+        "replay".into(),
+        database.into(),
+        "--run".into(),
+        "run_v1".into(),
+    ]);
     assert_success("literal v1 exact replay", &exact);
     assert_eq!(latest.stdout, exact.stdout);
     assert!(
@@ -396,8 +305,6 @@ fn selected_run_cli_replays_typed_voice_companion_without_writes() {
 struct ProofContext {
     _root: tempfile::TempDir,
     workspace: PathBuf,
-    #[cfg(windows)]
-    lock_path: PathBuf,
     socket_path: PathBuf,
     #[cfg(unix)]
     runtime_root: PathBuf,
@@ -412,42 +319,30 @@ impl ProofContext {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
         fs::create_dir(&workspace).unwrap();
-        let workspace_id = paths::workspace_id(&workspace).unwrap();
 
         #[cfg(unix)]
         let (socket_path, runtime_root, state_root) = {
             let runtime_root = root.path().join("runtime");
             let state_root = root.path().join("state");
-            let workspace_runtime = runtime_root
-                .join("platonic")
-                .join("workspaces")
-                .join(&workspace_id);
             (
-                workspace_runtime.join("agent.sock"),
+                runtime_root
+                    .join("platonic")
+                    .join("host")
+                    .join("agent.sock"),
                 runtime_root,
                 state_root,
             )
         };
 
         #[cfg(windows)]
-        let (lock_path, socket_path, local_app_data) = {
+        let (socket_path, local_app_data) = {
             let local_app_data = root.path().join("local-app-data");
-            let workspace_runtime = local_app_data
-                .join("platonic")
-                .join("workspaces")
-                .join(&workspace_id);
-            (
-                workspace_runtime.join("agent.lock"),
-                PathBuf::from(format!(r"\\.\pipe\plato-agent-{workspace_id}")),
-                local_app_data,
-            )
+            (PathBuf::from(r"\\.\pipe\plato-agent-host"), local_app_data)
         };
 
         Self {
             _root: root,
             workspace,
-            #[cfg(windows)]
-            lock_path,
             socket_path,
             #[cfg(unix)]
             runtime_root,
@@ -480,8 +375,7 @@ impl ProofContext {
         let mut command = Command::new(env!("CARGO_BIN_EXE_platonic"));
         command
             .arg("serve")
-            .arg("--workspace")
-            .arg(&self.workspace)
+            .current_dir(&self.workspace)
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         self.apply_environment(&mut command);
@@ -597,39 +491,6 @@ impl ProofDaemon {
             &self.workspace,
             self.child.as_mut().unwrap(),
         );
-    }
-
-    #[cfg(windows)]
-    fn assert_waiting_for_installer_gate(&mut self, proof: &ProofContext) {
-        let child = self.child.as_mut().unwrap();
-        let deadline = Instant::now() + Duration::from_millis(250);
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                let stderr = read_pipe(child.stderr.take());
-                panic!(
-                    "independent daemon {} exited instead of waiting on installer gate for fixture {} ({status}): {}",
-                    child.id(),
-                    proof.lock_path.display(),
-                    String::from_utf8_lossy(&stderr)
-                );
-            }
-            assert!(
-                !proof.lock_path.exists(),
-                "independent daemon {} created fixture lock {} while installer gate was held",
-                child.id(),
-                proof.lock_path.display()
-            );
-            assert!(
-                DaemonClient::connect(&proof.socket_path).is_err(),
-                "independent daemon {} created fixture endpoint {} while installer gate was held",
-                child.id(),
-                proof.socket_path.display()
-            );
-            if Instant::now() >= deadline {
-                return;
-            }
-            thread::sleep(POLL_INTERVAL);
-        }
     }
 
     #[cfg(windows)]

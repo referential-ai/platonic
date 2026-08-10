@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use platonic_server::daemon::server::DaemonServer;
+use platonic_server::daemon::server::HostDaemonServer;
 use std::{
     env,
     fs::{self, Permissions},
@@ -43,12 +43,11 @@ fn no_xdg_runtime_fallback_child() {
     let temp_root = PathBuf::from(env::var_os("TMPDIR").unwrap());
     let runtime_home = fallback_runtime_home(&temp_root);
 
-    let workspace = tempfile::tempdir().unwrap();
     fs::create_dir(&runtime_home).unwrap();
     fs::set_permissions(&runtime_home, Permissions::from_mode(0o755)).unwrap();
 
-    let first = DaemonServer::bind(workspace.path(), None).unwrap();
-    let socket_path = first.paths().socket_path.clone();
+    let first = HostDaemonServer::bind().unwrap();
+    let socket_path = first.socket_path().to_path_buf();
     assert!(socket_path.starts_with(runtime_home.join("platonic")));
     assert!(socket_path.exists());
     assert_eq!(mode(&runtime_home), PRIVATE_DIRECTORY_MODE);
@@ -58,28 +57,26 @@ fn no_xdg_runtime_fallback_child() {
     );
     drop(first);
 
-    let second = DaemonServer::bind(workspace.path(), None).unwrap();
-    assert_eq!(second.paths().socket_path, socket_path);
+    let second = HostDaemonServer::bind().unwrap();
+    assert_eq!(second.socket_path(), socket_path);
     assert!(socket_path.exists());
     assert_eq!(mode(&runtime_home), PRIVATE_DIRECTORY_MODE);
     drop(second);
     fs::remove_dir_all(&runtime_home).unwrap();
 
-    let workspace = tempfile::tempdir().unwrap();
     let target = temp_root.join("target");
     fs::create_dir(&target).unwrap();
     symlink(&target, &runtime_home).unwrap();
 
-    let error = DaemonServer::bind(workspace.path(), None).unwrap_err();
+    let error = HostDaemonServer::bind().unwrap_err();
 
     assert!(error.to_string().contains("not a real directory"));
     assert!(!target.join("platonic").exists());
     fs::remove_file(&runtime_home).unwrap();
 
-    let workspace = tempfile::tempdir().unwrap();
     fs::write(&runtime_home, b"not a directory").unwrap();
 
-    let error = DaemonServer::bind(workspace.path(), None).unwrap_err();
+    let error = HostDaemonServer::bind().unwrap_err();
 
     assert!(error.to_string().contains("not a real directory"));
     assert!(!runtime_home.join("platonic").exists());

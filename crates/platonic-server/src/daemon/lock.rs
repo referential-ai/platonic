@@ -1,4 +1,4 @@
-use crate::{AppError, AppResult, paths};
+use crate::{AppError, AppResult};
 pub use platonic_client::lock::{LOCK_VERSION, LockMetadata};
 #[cfg(unix)]
 use std::io::{Error, Read};
@@ -33,11 +33,11 @@ impl LockConflict {
 }
 
 #[derive(Debug)]
-pub struct WorkspaceLock {
+pub struct HostProcessLock {
     _file: File,
 }
 
-impl WorkspaceLock {
+impl HostProcessLock {
     pub fn acquire(path: PathBuf, metadata: LockMetadata) -> Result<Self, Box<LockConflict>> {
         if let Some(parent) = path.parent()
             && let Err(error) = fs::create_dir_all(parent)
@@ -95,23 +95,8 @@ impl WorkspaceLock {
         Ok(Self { _file: file })
     }
 
-    pub fn acquire_for_workspace(workspace_root: &Path, socket_path: &Path) -> AppResult<Self> {
-        let lock_path = paths::default_lock_path(workspace_root)?;
-        let metadata = LockMetadata::for_workspace(workspace_root, socket_path)?;
-        Self::acquire(lock_path, metadata).map_err(|conflict| lock_conflict_error(*conflict))
-    }
-
-    pub fn acquire_for_host(lock_path: PathBuf, socket_path: &Path) -> AppResult<Self> {
-        let metadata = LockMetadata {
-            v: LOCK_VERSION,
-            pid: std::process::id(),
-            executable: std::env::current_exe()
-                .ok()
-                .map(|path| path.to_string_lossy().into_owned()),
-            workspace_root: "host".into(),
-            workspace_id: "host".into(),
-            socket_path: socket_path.to_string_lossy().into_owned(),
-        };
+    pub fn acquire_for_host(lock_path: PathBuf, endpoint: &Path) -> AppResult<Self> {
+        let metadata = LockMetadata::for_host(endpoint);
         Self::acquire(lock_path, metadata).map_err(|conflict| lock_conflict_error(*conflict))
     }
 }
@@ -228,68 +213,6 @@ fn create_lock_file(path: &Path) -> std::io::Result<File> {
     crate::windows_security::create_current_user_file(path)
 }
 
-#[cfg(unix)]
-pub fn ensure_workspace_unlocked(workspace_root: &Path) -> AppResult<()> {
-    let lock_path = paths::default_lock_path(workspace_root)?;
-    ensure_unix_lock_unheld(lock_path)
-}
-
-#[cfg(windows)]
-pub fn ensure_workspace_unlocked(workspace_root: &Path) -> AppResult<()> {
-    let lock_path = paths::default_lock_path(workspace_root)?;
-    if lock_path.exists() {
-        return Err(lock_conflict_error(read_conflict(lock_path)));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn ensure_unix_lock_unheld(lock_path: PathBuf) -> AppResult<()> {
-    let mut file = match open_unix_lock_file(&lock_path, false) {
-        Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(lock_conflict_error(LockConflict {
-                path: lock_path,
-                metadata: None,
-                metadata_error: Some(error.to_string()),
-            }));
-        }
-    };
-    if let Err(error) =
-        validate_unix_lock_file(&lock_path, &file, rustix::process::geteuid().as_raw())
-    {
-        return Err(lock_conflict_error(LockConflict {
-            path: lock_path,
-            metadata: None,
-            metadata_error: Some(error.to_string()),
-        }));
-    }
-
-    match lock_unix_file(&file) {
-        Ok(()) => {
-            if let Err(error) =
-                validate_unix_lock_file(&lock_path, &file, rustix::process::geteuid().as_raw())
-            {
-                return Err(lock_conflict_error(LockConflict {
-                    path: lock_path,
-                    metadata: None,
-                    metadata_error: Some(error.to_string()),
-                }));
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == ErrorKind::WouldBlock => Err(lock_conflict_error(
-            read_conflict_from_file(lock_path, &mut file),
-        )),
-        Err(error) => Err(lock_conflict_error(LockConflict {
-            path: lock_path,
-            metadata: None,
-            metadata_error: Some(format!("advisory lock unavailable: {error}")),
-        })),
-    }
-}
-
 #[cfg(windows)]
 fn read_conflict(path: PathBuf) -> LockConflict {
     match fs::read_to_string(&path) {
@@ -356,29 +279,42 @@ mod tests {
     fn lock_conflict_reports_owner_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("agent.lock");
-        let workspace = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("agent.sock");
-        let metadata = LockMetadata::for_workspace(workspace.path(), &socket_path).unwrap();
-        let _lock = WorkspaceLock::acquire(lock_path.clone(), metadata.clone()).unwrap();
+        let metadata = LockMetadata::for_host(&socket_path);
+        let _lock = HostProcessLock::acquire(lock_path.clone(), metadata.clone()).unwrap();
 
         let conflict =
-            WorkspaceLock::acquire(lock_path, metadata).expect_err("second lock must conflict");
+            HostProcessLock::acquire(lock_path, metadata).expect_err("second lock must conflict");
 
         assert!(conflict.owner_summary().contains("pid="));
-        assert!(conflict.owner_summary().contains("workspace_id="));
-        assert!(conflict.owner_summary().contains("socket_path="));
+        assert!(conflict.owner_summary().contains("endpoint="));
+    }
+
+    #[test]
+    fn host_metadata_has_no_workspace_identity() {
+        let metadata = LockMetadata::for_host(Path::new("/tmp/platonic/host/agent.sock"));
+
+        assert_eq!(
+            serde_json::to_value(metadata).unwrap(),
+            serde_json::json!({
+                "v": LOCK_VERSION,
+                "pid": std::process::id(),
+                "executable": std::env::current_exe()
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                "endpoint": "/tmp/platonic/host/agent.sock"
+            })
+        );
     }
 
     #[test]
     fn dropping_lock_releases_ownership() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("agent.lock");
-        let workspace = tempfile::tempdir().unwrap();
-        let metadata =
-            LockMetadata::for_workspace(workspace.path(), &dir.path().join("agent.sock")).unwrap();
+        let metadata = LockMetadata::for_host(&dir.path().join("agent.sock"));
 
         {
-            let _lock = WorkspaceLock::acquire(lock_path.clone(), metadata.clone()).unwrap();
+            let _lock = HostProcessLock::acquire(lock_path.clone(), metadata.clone()).unwrap();
             assert!(lock_path.exists());
             #[cfg(windows)]
             assert!(
@@ -390,7 +326,19 @@ mod tests {
         #[cfg(unix)]
         {
             assert!(lock_path.exists());
-            drop(WorkspaceLock::acquire(lock_path, metadata).unwrap());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                match HostProcessLock::acquire(lock_path.clone(), metadata.clone()) {
+                    Ok(lock) => {
+                        drop(lock);
+                        break;
+                    }
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(conflict) => panic!("released lock remained held: {conflict:?}"),
+                }
+            }
         }
         #[cfg(windows)]
         assert!(!lock_path.exists());
@@ -402,11 +350,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("agent.lock");
         std::fs::write(&lock_path, "not json").unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let metadata =
-            LockMetadata::for_workspace(workspace.path(), &dir.path().join("agent.sock")).unwrap();
+        let metadata = LockMetadata::for_host(&dir.path().join("agent.sock"));
 
-        let conflict = WorkspaceLock::acquire(lock_path.clone(), metadata)
+        let conflict = HostProcessLock::acquire(lock_path.clone(), metadata)
             .expect_err("corrupt existing lock still conflicts");
 
         assert!(conflict.owner_summary().contains("metadata unreadable"));
@@ -421,37 +367,15 @@ mod tests {
         fs::write(&lock_path, "not json").unwrap();
         fs::set_permissions(&lock_path, fs::Permissions::from_mode(LOCK_FILE_MODE)).unwrap();
         let before = fs::symlink_metadata(&lock_path).unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let metadata =
-            LockMetadata::for_workspace(workspace.path(), &dir.path().join("agent.sock")).unwrap();
+        let metadata = LockMetadata::for_host(&dir.path().join("agent.sock"));
 
-        drop(WorkspaceLock::acquire(lock_path.clone(), metadata.clone()).unwrap());
+        drop(HostProcessLock::acquire(lock_path.clone(), metadata.clone()).unwrap());
 
         let after = fs::symlink_metadata(&lock_path).unwrap();
         assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
         let stored: LockMetadata =
             serde_json::from_str(fs::read_to_string(lock_path).unwrap().trim()).unwrap();
         assert_eq!(stored, metadata);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn kernel_probe_distinguishes_a_live_lock_from_a_persistent_path() {
-        let workspace = tempfile::tempdir().unwrap();
-        paths::with_test_xdg(workspace.path(), || {
-            let socket_path = workspace.path().join("agent.sock");
-            let lock =
-                WorkspaceLock::acquire_for_workspace(workspace.path(), &socket_path).unwrap();
-            let lock_path = paths::default_lock_path(workspace.path()).unwrap();
-
-            assert!(matches!(
-                ensure_workspace_unlocked(workspace.path()),
-                Err(AppError::DaemonLockHeld { .. })
-            ));
-            drop(lock);
-            assert!(lock_path.exists());
-            ensure_workspace_unlocked(workspace.path()).unwrap();
-        });
     }
 
     #[cfg(unix)]
@@ -463,11 +387,9 @@ mod tests {
         fs::write(&target, "target contents").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(LOCK_FILE_MODE)).unwrap();
         symlink(&target, &lock_path).unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let metadata =
-            LockMetadata::for_workspace(workspace.path(), &dir.path().join("agent.sock")).unwrap();
+        let metadata = LockMetadata::for_host(&dir.path().join("agent.sock"));
 
-        let conflict = WorkspaceLock::acquire(lock_path, metadata)
+        let conflict = HostProcessLock::acquire(lock_path, metadata)
             .expect_err("a symlink lock path must fail closed");
 
         assert!(conflict.metadata_error.is_some());
@@ -480,11 +402,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("agent.lock");
         let _listener = std::os::unix::net::UnixListener::bind(&lock_path).unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let metadata =
-            LockMetadata::for_workspace(workspace.path(), &dir.path().join("agent.sock")).unwrap();
+        let metadata = LockMetadata::for_host(&dir.path().join("agent.sock"));
 
-        let conflict = WorkspaceLock::acquire(lock_path.clone(), metadata)
+        let conflict = HostProcessLock::acquire(lock_path.clone(), metadata)
             .expect_err("a non-regular lock path must fail closed");
 
         assert!(conflict.metadata_error.is_some());
@@ -503,11 +423,9 @@ mod tests {
         let lock_path = dir.path().join("agent.lock");
         fs::write(&lock_path, "unsafe contents").unwrap();
         fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let metadata =
-            LockMetadata::for_workspace(workspace.path(), &dir.path().join("agent.sock")).unwrap();
+        let metadata = LockMetadata::for_host(&dir.path().join("agent.sock"));
 
-        let conflict = WorkspaceLock::acquire(lock_path.clone(), metadata)
+        let conflict = HostProcessLock::acquire(lock_path.clone(), metadata)
             .expect_err("an unsafe lock mode must fail closed");
 
         assert!(conflict.owner_summary().contains("mode 0644"));

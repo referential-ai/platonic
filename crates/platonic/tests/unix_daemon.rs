@@ -2,7 +2,7 @@
 
 use platonic_client::{client::DaemonClient, lock::LockMetadata};
 use platonic_core::{AgentId, HarnessEvent, RecordedEvent, RunId};
-use platonic_server::{ledger::SqliteLedger, paths};
+use platonic_server::ledger::SqliteLedger;
 use std::{
     fs,
     io::Read,
@@ -16,13 +16,13 @@ use std::{
 const PROOF_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[test]
-fn live_conflict_crash_recovery_and_persistent_normal_exit() {
+fn host_conflict_crash_recovery_and_persistent_normal_exit() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
     let runtime = root.path().join("runtime");
     let state = root.path().join("state");
     fs::create_dir(&workspace).unwrap();
-    let (lock_path, socket_path) = daemon_paths(&runtime, &workspace);
+    let (lock_path, socket_path) = daemon_paths(&runtime);
     let probe_db = root.path().join("probe.db");
     let run_id = RunId::new("run_lock_probe").unwrap();
     let mut ledger = SqliteLedger::open_or_create(&probe_db).unwrap();
@@ -57,6 +57,10 @@ fn live_conflict_crash_recovery_and_persistent_normal_exit() {
     let mut first = DaemonChild::spawn(&runtime, &state, &workspace);
     let first_metadata = wait_for_lock_owner(&lock_path, first.id(), &mut first);
     assert_eq!(first_metadata.pid, first.id());
+    assert_eq!(Path::new(&first_metadata.endpoint), socket_path);
+    let raw_metadata = fs::read_to_string(&lock_path).unwrap();
+    assert!(!raw_metadata.contains("workspace_root"));
+    assert!(!raw_metadata.contains("workspace_id"));
     let identity = file_identity(&lock_path);
     let lock_metadata = fs::symlink_metadata(&lock_path).unwrap();
     assert_eq!(lock_metadata.permissions().mode() & 0o7777, 0o600);
@@ -112,7 +116,7 @@ fn concurrent_daemon_acquisition_has_exactly_one_winner() {
     let runtime = root.path().join("runtime");
     let state = root.path().join("state");
     fs::create_dir(&workspace).unwrap();
-    let (lock_path, socket_path) = daemon_paths(&runtime, &workspace);
+    let (lock_path, socket_path) = daemon_paths(&runtime);
     let mut children: Vec<_> = (0..8)
         .map(|_| DaemonChild::spawn(&runtime, &state, &workspace))
         .collect();
@@ -153,12 +157,8 @@ fn concurrent_daemon_acquisition_has_exactly_one_winner() {
     assert!(children[winner_index].wait_bounded(PROOF_TIMEOUT).success());
 }
 
-fn daemon_paths(runtime: &Path, workspace: &Path) -> (PathBuf, PathBuf) {
-    let workspace_id = paths::workspace_id(workspace).unwrap();
-    let directory = runtime
-        .join("platonic")
-        .join("workspaces")
-        .join(workspace_id);
+fn daemon_paths(runtime: &Path) -> (PathBuf, PathBuf) {
+    let directory = runtime.join("platonic").join("host");
     (directory.join("agent.lock"), directory.join("agent.sock"))
 }
 
@@ -166,8 +166,7 @@ fn daemon_command(runtime: &Path, state: &Path, workspace: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_platonic"));
     command
         .arg("serve")
-        .arg("--workspace")
-        .arg(workspace)
+        .current_dir(workspace)
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_STATE_HOME", state)
         .stdout(Stdio::null())

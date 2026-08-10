@@ -262,15 +262,6 @@ For scripts and services, register deliberately before attaching:
 platonic workspace create example /path/to/workspace
 ```
 
-The explicit legacy workspace mode remains available for standalone clients
-and focused proofs, but it has the same create-before-use gate. Start it, then
-use the printed socket path for the control request before attaching:
-
-```bash
-platonic serve --workspace "$PWD"
-platonic workspace create example "$PWD" --socket <printed-socket-path>
-```
-
 Host mode uses `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/platonic/host/agent.sock`
 on Unix or `\\.\pipe\plato-agent-host` on Windows. Each connection selects its
 workspace through the existing `hello` request; the response adds
@@ -404,9 +395,8 @@ the approval gate.
 On startup it prints:
 
 ```text
-workspace_id: <workspace-id>
+daemon_scope: host
 socket_path: <daemon-endpoint>
-ledger_path: <state-path>/ledger.db
 ```
 
 Default ledger paths are keyed by the server-minted workspace id stored in the
@@ -419,39 +409,21 @@ id or its history:
 On first attach, a registered workspace that still points at the legacy
 path-derived `agent.db` is moved to this layout and its registry row is updated.
 
-Explicit legacy daemon endpoints remain keyed by the path-derived workspace id
-during migration:
-
-- Unix socket: `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/platonic/workspaces/<workspace-id>/agent.sock`
-- Unix lock: `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/platonic/workspaces/<workspace-id>/agent.lock`
-- Windows pipe: `\\.\pipe\plato-agent-<workspace-id>`
-- Windows lock: `%LOCALAPPDATA%\platonic\workspaces\<workspace-id>\agent.lock`
-
 Interactive `plato` uses the host endpoint above.
 One-shot `plato "question"` auto-ensures the host server and always uses its
 server-owned workspace ledger.
 
-Runtime directories are restricted to `0700` and the daemon socket to `0600`.
-A custom Unix `--socket` parent is restricted to `0700` at startup. Windows
-pipe and lock ACLs grant access only to the current user and reject remote pipe
-clients. Windows clients limit server impersonation to identity inspection,
-authenticate the server's user before sending protocol bytes, and bound
-busy-pipe connection waits.
-
-The daemon holds the workspace lock while it is active. On Unix, the lock is a
-persistent current-user `0600` regular file guarded by a nonblocking exclusive
-kernel advisory lock. Startup validates the file without following symlinks,
-then rewrites its diagnostic metadata only after acquiring the kernel lock.
-Normal and abrupt exits release the kernel lock but leave the file in place, so
-lock probes use kernel ownership rather than path existence. SIGINT and SIGTERM
-on Unix, and Ctrl-C or Ctrl-Break on Windows, trigger a graceful shutdown: the
-daemon stops accepting new connections, then removes its endpoint before
-exiting. On Windows the daemon creates the exact lock file with delete-on-close
-and holds its handle for the daemon lifetime, so normal or abrupt exit removes
-the path. Do not remove a lock for a live daemon. Ordinary Windows daemon
-startup may wait up to five seconds for a valid installer or update gate
-owner to release or abandon the gate. Invalid ownership or a timeout causes
-startup to fail closed before the daemon creates its endpoint or workspace lock.
+Runtime directories are restricted to `0700` and the Unix host socket to
+`0600`. The server holds one host process lock at
+`${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/platonic/host/agent.lock`.
+It is a persistent current-user `0600` regular file guarded by a nonblocking
+exclusive kernel advisory lock. Version 2 diagnostic metadata contains only
+`v`, `pid`, `executable`, and `endpoint`; it carries no workspace identity.
+Startup validates the file without following symlinks and rewrites metadata
+only after acquiring the kernel lock. Normal and abrupt exits release the
+kernel lock but leave the file in place, so probes use kernel ownership rather
+than path existence. SIGINT and SIGTERM stop new connections and remove the
+host endpoint before exit. Do not remove the lock for a live server.
 Live assistant deltas are transient `events.stream` events and are not written
 to the ledger. After a `lagged` response, omitting `from_offset` resumes at the
 current tip; `transcript.read` returns ledger-backed status and final answer.
@@ -705,7 +677,7 @@ platonic gateway discord --config ~/.config/plato/gateway.toml
 ```
 
 With no `--socket`, the gateway attaches to the host endpoint. An explicit
-socket remains a test/operator override during the endpoint migration.
+socket remains a test/operator override.
 
 The server-owned gateway completes a bounded daemon `hello`, requires the exact
 workspace ID plus `hello`, `thread.authority`, `thread.status`, `thread.send`,
@@ -755,7 +727,7 @@ spawn decision, and attaches to that durable thread. `plato --remote
 <thread-id>` attaches a second TUI without creating another thread. Exiting a
 TUI leaves the host daemon and authority record available. Standalone
 `plato-tui` attaches to the same host endpoint but never starts it; an explicit
-`--socket` remains available for focused legacy-endpoint proofs.
+`--socket` remains available for focused endpoint proofs.
 It renders a conversation-first transcript with distinct `You` and `Plato`
 messages, at most one subtle trace summary per run, one status row, a composer,
 session picker, and a bounded approval pane above the composer. Press `v` from

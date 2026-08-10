@@ -5,7 +5,7 @@ use crate::{
     AppResult,
     daemon::{
         handlers::{handle_line, handle_request},
-        lock::WorkspaceLock,
+        lock::HostProcessLock,
         protocol::{
             ERROR_INTERNAL, ERROR_MALFORMED_REQUEST, ERROR_WORKSPACE_MISMATCH,
             ERROR_WORKSPACE_UNREGISTERED, Envelope, EnvelopeKind, HelloParams, ProtocolErrorCode,
@@ -159,101 +159,13 @@ impl Drop for BoundEndpoint {
     }
 }
 
-#[derive(Debug)]
-pub struct DaemonServer {
-    endpoint: BoundEndpoint,
-    runtime: DaemonRuntime,
-    handlers: Arc<HandlerCapacity>,
-    _lock: WorkspaceLock,
-}
-
-impl DaemonServer {
-    pub fn bind(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<Self> {
-        #[cfg(test)]
-        {
-            paths::with_test_xdg(workspace_root, || {
-                Self::bind_inner(workspace_root, socket_path)
-            })
-        }
-        #[cfg(not(test))]
-        Self::bind_inner(workspace_root, socket_path)
-    }
-
-    fn bind_inner(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<Self> {
-        let max_spawn_depth = crate::config::server_max_spawn_depth()?;
-        let require_confinement = crate::config::server_require_confinement()?;
-        let confinement_support = crate::confinement::detect_support();
-        let paths = DaemonPaths::provisional(workspace_root, socket_path)?;
-        #[cfg(unix)]
-        let reclaim_default_socket =
-            paths.socket_path == crate::paths::default_socket_path(&paths.workspace_root)?;
-        #[cfg(windows)]
-        let reclaim_default_socket = false;
-        prepare_workspace_lock_parent(&paths)?;
-        #[cfg(unix)]
-        prepare_socket_parent(&paths::runtime_home_and_fallback().0, &paths.socket_path)?;
-        let lock = WorkspaceLock::acquire_for_workspace(&paths.workspace_root, &paths.socket_path)?;
-        let paths = paths.resolve_workspace_record()?;
-        if paths.is_registered() {
-            crate::ledger::interrupt_orphaned_default_sqlite_runs(&paths.default_ledger())?;
-        }
-        let endpoint = BoundEndpoint::bind(paths.socket_path.clone(), reclaim_default_socket)?;
-        reconcile_thread_repositories(&paths.server_db_path)?;
-        let runtime = DaemonRuntime::new_with_server_policy(
-            paths,
-            max_spawn_depth,
-            require_confinement,
-            confinement_support,
-        );
-        Ok(Self {
-            endpoint,
-            runtime,
-            handlers: Arc::new(HandlerCapacity::default()),
-            _lock: lock,
-        })
-    }
-
-    pub fn paths(&self) -> &DaemonPaths {
-        &self.runtime.paths
-    }
-
-    pub fn serve_forever(&self, shutdown: Arc<AtomicBool>) -> AppResult<()> {
-        let runtime = self.runtime.clone();
-        serve_connections(
-            &shutdown,
-            &self.runtime.stop_requested,
-            Arc::clone(&self.handlers),
-            || transport::accept(&self.endpoint.listener),
-            move |stream| handle_stream(runtime.clone(), stream),
-            thread::sleep,
-        )
-    }
-
-    pub fn serve_next(&self) -> AppResult<()> {
-        let stream = transport::accept(&self.endpoint.listener)?;
-        handle_stream(self.runtime.clone(), stream)
-    }
-
-    #[cfg(all(test, unix))]
-    fn handle_line(&self, line: &str) -> crate::daemon::protocol::Envelope {
-        handle_registered_line(&self.runtime, line)
-    }
-}
-
-#[derive(Debug)]
-struct HostWorkspaceRuntime {
-    runtime: DaemonRuntime,
-    _lock: WorkspaceLock,
-}
-
 #[derive(Clone, Debug)]
 struct HostRuntime {
     socket_path: PathBuf,
     started_at: Instant,
     state: Arc<Mutex<RuntimeState>>,
-    stop_requested: Arc<AtomicBool>,
     control_runtime: DaemonRuntime,
-    workspaces: Arc<Mutex<HashMap<PathBuf, HostWorkspaceRuntime>>>,
+    workspaces: Arc<Mutex<HashMap<PathBuf, DaemonRuntime>>>,
 }
 
 impl HostRuntime {
@@ -280,7 +192,6 @@ impl HostRuntime {
             socket_path,
             started_at,
             state,
-            stop_requested,
             control_runtime,
             workspaces: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -330,15 +241,10 @@ impl HostRuntime {
             .workspaces
             .lock()
             .expect("host workspace runtime lock poisoned");
-        if let Some(workspace) = workspaces.get(&workspace_root) {
-            return Ok(workspace.runtime.clone());
+        if let Some(runtime) = workspaces.get(&workspace_root) {
+            return Ok(runtime.clone());
         }
 
-        prepare_workspace_lock_parent(&paths)
-            .map_err(|error| (ERROR_INTERNAL, error.to_string()))?;
-        let workspace_lock =
-            WorkspaceLock::acquire_for_workspace(&paths.workspace_root, &paths.socket_path)
-                .map_err(|error| (ERROR_INTERNAL, error.to_string()))?;
         crate::ledger::interrupt_orphaned_default_sqlite_runs(&paths.default_ledger())
             .map_err(|error| (ERROR_INTERNAL, error.to_string()))?;
         let runtime = DaemonRuntime::new_shared(
@@ -348,15 +254,9 @@ impl HostRuntime {
             self.control_runtime.confinement_support(),
             self.started_at,
             Arc::clone(&self.state),
-            Arc::clone(&self.stop_requested),
+            Arc::clone(&self.control_runtime.stop_requested),
         );
-        workspaces.insert(
-            workspace_root,
-            HostWorkspaceRuntime {
-                runtime: runtime.clone(),
-                _lock: workspace_lock,
-            },
-        );
+        workspaces.insert(workspace_root, runtime.clone());
         Ok(runtime)
     }
 }
@@ -366,7 +266,7 @@ pub struct HostDaemonServer {
     endpoint: BoundEndpoint,
     runtime: HostRuntime,
     handlers: Arc<HandlerCapacity>,
-    _lock: WorkspaceLock,
+    _lock: HostProcessLock,
 }
 
 impl HostDaemonServer {
@@ -388,7 +288,7 @@ impl HostDaemonServer {
                 .parent()
                 .expect("default Windows host lock path has a parent"),
         )?;
-        let lock = WorkspaceLock::acquire_for_host(lock_path, &socket_path)?;
+        let lock = HostProcessLock::acquire_for_host(lock_path, &socket_path)?;
         let endpoint = BoundEndpoint::bind(socket_path.clone(), true)?;
         Ok(Self {
             endpoint,
@@ -406,7 +306,7 @@ impl HostDaemonServer {
         let runtime = self.runtime.clone();
         serve_connections(
             &shutdown,
-            &self.runtime.stop_requested,
+            &self.runtime.control_runtime.stop_requested,
             Arc::clone(&self.handlers),
             || transport::accept(&self.endpoint.listener),
             move |stream| handle_host_stream(runtime.clone(), stream),
@@ -418,25 +318,6 @@ impl HostDaemonServer {
         let stream = transport::accept(&self.endpoint.listener)?;
         handle_host_stream(self.runtime.clone(), stream)
     }
-}
-
-fn prepare_workspace_lock_parent(paths: &DaemonPaths) -> AppResult<()> {
-    #[cfg(unix)]
-    {
-        let (runtime_home, is_fallback) = paths::runtime_home_and_fallback();
-        if is_fallback {
-            prepare_temp_runtime_home(&runtime_home)?;
-        }
-        prepare_runtime_path(&runtime_home, &paths.lock_path)?;
-    }
-    #[cfg(windows)]
-    fs::create_dir_all(
-        paths
-            .lock_path
-            .parent()
-            .expect("default Windows lock path has a parent"),
-    )?;
-    Ok(())
 }
 
 fn serve_connections<S, A, H, B>(
@@ -696,6 +577,7 @@ fn verify_mode(path: &Path, expected: u32) -> std::io::Result<()> {
     ))
 }
 
+#[cfg(all(test, unix))]
 fn handle_stream(runtime: DaemonRuntime, stream: transport::Stream) -> AppResult<()> {
     let stop_requested = Arc::clone(&runtime.stop_requested);
     let socket_path = runtime.paths.socket_path.clone();
@@ -713,6 +595,7 @@ fn handle_stream(runtime: DaemonRuntime, stream: transport::Stream) -> AppResult
     )
 }
 
+#[cfg(all(test, unix))]
 fn handle_registered_line(runtime: &DaemonRuntime, line: &str) -> Envelope {
     match runtime_with_registered_paths(runtime) {
         Ok(runtime) => handle_line(&runtime, line),
@@ -728,6 +611,7 @@ fn handle_registered_line(runtime: &DaemonRuntime, line: &str) -> Envelope {
     }
 }
 
+#[cfg(all(test, unix))]
 fn runtime_with_registered_paths(runtime: &DaemonRuntime) -> AppResult<DaemonRuntime> {
     let store = runtime.paths.server_store()?;
     let Some(record) = store.workspace_by_root(&runtime.paths.workspace_root.to_string_lossy())?
@@ -745,7 +629,7 @@ fn runtime_with_registered_paths(runtime: &DaemonRuntime) -> AppResult<DaemonRun
 }
 
 fn handle_host_stream(runtime: HostRuntime, stream: transport::Stream) -> AppResult<()> {
-    let stop_requested = Arc::clone(&runtime.stop_requested);
+    let stop_requested = Arc::clone(&runtime.control_runtime.stop_requested);
     let socket_path = runtime.socket_path.clone();
     let mut workspace_runtime = None;
     handle_stream_lines(
@@ -805,7 +689,8 @@ fn handle_host_line(
 fn is_control_method(method: ProtocolMethod) -> bool {
     matches!(
         method,
-        ProtocolMethod::WorkspaceCreate
+        ProtocolMethod::DaemonShutdownIfIdle
+            | ProtocolMethod::WorkspaceCreate
             | ProtocolMethod::WorkspaceList
             | ProtocolMethod::WorkspaceStatus
             | ProtocolMethod::AgentCreate
@@ -1135,8 +1020,7 @@ mod tests {
                 ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
                 ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED,
                 ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind, ProtocolError, RunStartResult,
-                RunStateName, ShutdownIfIdleResultName, StreamEvent, TypedTranscript,
-                TypedTranscriptEntry,
+                RunStateName, StreamEvent, TypedTranscript, TypedTranscriptEntry,
             },
             runtime::{MAX_EVENT_BUFFER, MAX_TERMINAL_RUNS, PendingApproval, RunRecord},
         },
@@ -1377,13 +1261,78 @@ mod tests {
         }
     }
 
-    fn bind_test(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<DaemonServer> {
-        let mut server = DaemonServer::bind(workspace_root, socket_path)?;
-        register_legacy_workspace(&mut server);
+    #[derive(Debug)]
+    struct TestDaemonServer {
+        endpoint: BoundEndpoint,
+        runtime: DaemonRuntime,
+        handlers: Arc<HandlerCapacity>,
+    }
+
+    impl TestDaemonServer {
+        fn bind(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<Self> {
+            paths::with_test_xdg(workspace_root, || {
+                let max_spawn_depth = crate::config::server_max_spawn_depth()?;
+                let require_confinement = crate::config::server_require_confinement()?;
+                let confinement_support = crate::confinement::detect_support();
+                let paths = DaemonPaths::provisional(workspace_root, socket_path)?;
+                let reclaim_host_socket = paths.socket_path == crate::paths::host_socket_path()?;
+                prepare_socket_parent(&paths::runtime_home_and_fallback().0, &paths.socket_path)?;
+                let endpoint = BoundEndpoint::bind(paths.socket_path.clone(), reclaim_host_socket)?;
+                let paths = paths.resolve_workspace_record()?;
+                if paths.is_registered() {
+                    crate::ledger::interrupt_orphaned_default_sqlite_runs(&paths.default_ledger())?;
+                }
+                reconcile_thread_repositories(&paths.server_db_path)?;
+                let runtime = DaemonRuntime::new_with_server_policy(
+                    paths,
+                    max_spawn_depth,
+                    require_confinement,
+                    confinement_support,
+                );
+                Ok(Self {
+                    endpoint,
+                    runtime,
+                    handlers: Arc::new(HandlerCapacity::default()),
+                })
+            })
+        }
+
+        fn paths(&self) -> &DaemonPaths {
+            &self.runtime.paths
+        }
+
+        fn serve_forever(&self, shutdown: Arc<AtomicBool>) -> AppResult<()> {
+            let runtime = self.runtime.clone();
+            serve_connections(
+                &shutdown,
+                &self.runtime.stop_requested,
+                Arc::clone(&self.handlers),
+                || transport::accept(&self.endpoint.listener),
+                move |stream| handle_stream(runtime.clone(), stream),
+                thread::sleep,
+            )
+        }
+
+        fn serve_next(&self) -> AppResult<()> {
+            let stream = transport::accept(&self.endpoint.listener)?;
+            handle_stream(self.runtime.clone(), stream)
+        }
+
+        fn handle_line(&self, line: &str) -> Envelope {
+            handle_registered_line(&self.runtime, line)
+        }
+    }
+
+    fn bind_test(
+        workspace_root: &Path,
+        socket_path: Option<PathBuf>,
+    ) -> AppResult<TestDaemonServer> {
+        let mut server = TestDaemonServer::bind(workspace_root, socket_path)?;
+        register_test_workspace(&mut server);
         Ok(server)
     }
 
-    fn register_legacy_workspace(server: &mut DaemonServer) -> DaemonPaths {
+    fn register_test_workspace(server: &mut TestDaemonServer) -> DaemonPaths {
         if server.runtime.paths.is_registered() {
             return server.runtime.paths.clone();
         }
@@ -1424,12 +1373,6 @@ mod tests {
                 .paths()
                 .ledger_path
                 .starts_with(workspace.path().join("xdg-state"))
-        );
-        assert!(
-            server
-                .paths()
-                .lock_path
-                .starts_with(workspace.path().join("xdg-runtime"))
         );
         drop(server);
     }
@@ -1504,10 +1447,8 @@ mod tests {
         fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
     }
 
-    fn test_default_socket_path(workspace: &Path) -> PathBuf {
-        crate::paths::with_test_xdg(workspace, || {
-            crate::paths::default_socket_path(workspace).unwrap()
-        })
+    fn test_host_socket_path(workspace: &Path) -> PathBuf {
+        crate::paths::with_test_xdg(workspace, || crate::paths::host_socket_path().unwrap())
     }
 
     fn socket_identity(path: &Path) -> (u64, u64) {
@@ -1530,7 +1471,7 @@ mod tests {
             let socket_path = if custom_socket {
                 socket_root.path().join("agent.sock")
             } else {
-                test_default_socket_path(workspace.path())
+                test_host_socket_path(workspace.path())
             };
             fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
             fs::write(&socket_path, b"rightful owner").unwrap();
@@ -1552,7 +1493,7 @@ mod tests {
             let socket_path = if custom_socket {
                 socket_root.path().join("agent.sock")
             } else {
-                test_default_socket_path(workspace.path())
+                test_host_socket_path(workspace.path())
             };
             let target = workspace.path().join("rightful-owner");
             fs::write(&target, b"rightful owner").unwrap();
@@ -1584,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_socket_collision_preserves_the_first_workspace_server() {
+    fn custom_socket_collision_preserves_the_first_server() {
         let first_workspace = tempfile::tempdir().unwrap();
         let second_workspace = tempfile::tempdir().unwrap();
         let socket_root = tempfile::tempdir().unwrap();
@@ -1618,14 +1559,10 @@ mod tests {
     }
 
     fn assert_stale_default_socket_recovers(explicit_default: bool) {
-        // These tests must exercise the DEFAULT socket derivation, so they
-        // cannot bind a short custom socket. The derived path sits at the
-        // macOS sockaddr_un boundary (104 bytes) when the workspace lives in
-        // a deep temp root, so the workspace itself goes under /tmp, which
-        // keeps the derived default path comfortably inside the limit on
-        // both platforms.
+        // Exercise stale recovery at the host endpoint rather than a custom
+        // test socket.
         let workspace = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
-        let socket_path = test_default_socket_path(workspace.path());
+        let socket_path = test_host_socket_path(workspace.path());
         fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
         let stale_listener = UnixListener::bind(&socket_path).unwrap();
         drop(stale_listener);
@@ -1686,96 +1623,6 @@ mod tests {
             Err(error) if error.kind() == ErrorKind::NotFound
         ));
     }
-
-    #[test]
-    fn legacy_hello_requires_workspace_create_before_round_trip() {
-        let workspace = tempfile::tempdir().unwrap();
-        let socket_dir = tempfile::tempdir().unwrap();
-        let socket_path = socket_dir.path().join("agent.sock");
-        let server =
-            Arc::new(DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap());
-        let paths = server.paths().clone();
-
-        let runner = Arc::clone(&server);
-        let handle = thread::spawn(move || {
-            for _ in 0..3 {
-                runner.serve_next().unwrap();
-            }
-        });
-
-        let mut unregistered = DaemonClient::connect(&socket_path).unwrap();
-        let error = unregistered.hello(workspace.path()).unwrap_err();
-        assert!(matches!(
-            error,
-            platonic_client::ClientError::DaemonResponse(ProtocolError { ref code, .. })
-                if *code == ERROR_WORKSPACE_UNREGISTERED
-        ));
-        drop(unregistered);
-
-        let mut control = DaemonClient::connect(&socket_path).unwrap();
-        let created = control
-            .workspace_create("legacy".into(), workspace.path().to_path_buf())
-            .unwrap();
-        drop(control);
-
-        let mut stream = UnixStream::connect(&socket_path).unwrap();
-        writeln!(
-            stream,
-            r#"{{"v":1,"id":"req_1","kind":"request","method":"hello","params":{{"workspace_root":"{}","workspace_id":"{}"}}}}"#,
-            paths.workspace_root.display(),
-            paths.workspace_id
-        )
-        .unwrap();
-        stream.shutdown(std::net::Shutdown::Write).unwrap();
-
-        let mut raw = String::new();
-        stream.read_to_string(&mut raw).unwrap();
-        drop(stream);
-        handle.join().unwrap();
-        let response: Envelope = serde_json::from_str(raw.trim()).unwrap();
-
-        assert_eq!(response.kind, EnvelopeKind::Response);
-        assert_eq!(response.id.as_deref(), Some("req_1"));
-        assert_eq!(response.method.as_deref(), Some("hello"));
-        let result = response_value(&response);
-        assert_eq!(result["daemon_version"], platonic_protocol::BUILD_IDENTITY);
-        assert_eq!(result["workspace_id"], created.workspace.id);
-        assert_eq!(result["ledger_path"], created.workspace.ledger_path);
-        assert!(result.get("daemon_scope").is_none());
-        assert_eq!(
-            result["capabilities"],
-            serde_json::json!([
-                "hello",
-                "run.start",
-                "message.append",
-                "issue-prep.start",
-                "events.stream",
-                "approval.decide",
-                "run.cancel",
-                "sessions.list",
-                "transcript.read",
-                "transcript.read.typed",
-                "transcript.read.pending_approval",
-                "daemon.status",
-                "session.approval_profile.set",
-                "daemon.shutdown_if_idle",
-                "thread.spawn",
-                "thread.list",
-                "thread.status",
-                "thread.authority",
-                "thread.send",
-                "thread.events",
-                "thread.stop",
-                "workspace.create",
-                "workspace.list",
-                "workspace.status",
-                "agent.create",
-                "agent.list",
-                "agent.status"
-            ])
-        );
-    }
-
     #[test]
     fn host_hello_reports_scope_and_existing_build_provenance() {
         let root = tempfile::tempdir().unwrap();
@@ -1784,9 +1631,8 @@ mod tests {
         paths::with_test_xdg(root.path(), || {
             let server = Arc::new(HostDaemonServer::bind().unwrap());
             let socket_path = server.socket_path().to_path_buf();
-            let legacy_workspace_id = paths::workspace_id(&workspace).unwrap();
+            let requested_workspace_id = paths::workspace_id(&workspace).unwrap();
             assert_eq!(socket_path, paths::host_socket_path().unwrap());
-            assert_ne!(socket_path, paths::default_socket_path(&workspace).unwrap());
 
             let runner = Arc::clone(&server);
             let handle = thread::spawn(move || {
@@ -1818,7 +1664,7 @@ mod tests {
                 attached,
                 r#"{{"v":1,"id":"host_hello","kind":"request","method":"hello","params":{{"workspace_root":"{}","workspace_id":"{}"}}}}"#,
                 workspace.display(),
-                legacy_workspace_id
+                requested_workspace_id
             )
             .unwrap();
             attached.shutdown(std::net::Shutdown::Write).unwrap();
@@ -2081,11 +1927,6 @@ base_url = "https://example.invalid/v1"
         }
         assert!(server.runtime.state.lock().unwrap().runs.is_empty());
 
-        let empty_server = bind_test(workspace.path(), Some(socket_dir.path().join("empty.sock")));
-        assert!(
-            empty_server.is_err(),
-            "the first server still owns the lock"
-        );
         drop(server);
         let empty_server =
             bind_test(workspace.path(), Some(socket_dir.path().join("empty.sock"))).unwrap();
@@ -2113,7 +1954,6 @@ base_url = "https://example.invalid/v1"
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
         let server = bind_test(workspace.path(), Some(socket_path.clone())).unwrap();
-        let lock_path = server.paths().lock_path.clone();
         let barrier = Arc::new(Barrier::new(2));
         server.runtime.set_shutdown_flush_barrier(barrier.clone());
         let handle = thread::spawn(move || {
@@ -2132,7 +1972,6 @@ base_url = "https://example.invalid/v1"
         let response = read_envelope(&mut shutdown_reader);
         assert_eq!(response_value(&response), json!({"result": "shutdown"}));
         assert!(socket_path.exists());
-        assert!(lock_path.exists());
 
         for request in [
             r#"{"v":1,"id":"shutdown_2","kind":"request","method":"daemon.shutdown_if_idle"}"#,
@@ -2160,51 +1999,6 @@ base_url = "https://example.invalid/v1"
             outcome => panic!("post-ack connection did not close: {outcome:?}"),
         }
         assert!(!socket_path.exists());
-        assert!(lock_path.exists());
-    }
-
-    #[test]
-    fn two_workspaces_flush_shutdown_responses_and_leave_persistent_locks() {
-        let first_workspace = tempfile::tempdir().unwrap();
-        let second_workspace = tempfile::tempdir().unwrap();
-        let socket_dir = tempfile::tempdir().unwrap();
-        let first_socket = socket_dir.path().join("first.sock");
-        let second_socket = socket_dir.path().join("second.sock");
-        let first_server = bind_test(first_workspace.path(), Some(first_socket.clone())).unwrap();
-        let second_server =
-            bind_test(second_workspace.path(), Some(second_socket.clone())).unwrap();
-        let first_lock = first_server.paths().lock_path.clone();
-        let second_lock = second_server.paths().lock_path.clone();
-        let first_handle = thread::spawn(move || {
-            first_server
-                .serve_forever(Arc::new(AtomicBool::new(false)))
-                .unwrap()
-        });
-        let second_handle = thread::spawn(move || {
-            second_server
-                .serve_forever(Arc::new(AtomicBool::new(false)))
-                .unwrap()
-        });
-        let mut first_client = DaemonClient::connect(&first_socket).unwrap();
-        let mut second_client = DaemonClient::connect(&second_socket).unwrap();
-
-        assert_eq!(
-            first_client.shutdown_if_idle().unwrap().result,
-            ShutdownIfIdleResultName::Shutdown
-        );
-        assert_eq!(
-            second_client.shutdown_if_idle().unwrap().result,
-            ShutdownIfIdleResultName::Shutdown
-        );
-        first_handle.join().unwrap();
-        second_handle.join().unwrap();
-
-        for path in [first_socket, second_socket] {
-            assert!(!path.exists(), "shutdown left {}", path.display());
-        }
-        for path in [first_lock, second_lock] {
-            assert!(path.exists(), "shutdown removed {}", path.display());
-        }
     }
 
     #[test]
@@ -2242,7 +2036,6 @@ base_url = "https://example.invalid/v1"
             json!({"result": "refused_active"})
         );
         assert!(socket_path.exists());
-        assert!(paths.lock_path.exists());
 
         writeln!(
             stream,
@@ -2272,7 +2065,6 @@ base_url = "https://example.invalid/v1"
 
         handle.join().unwrap();
         assert!(!socket_path.exists());
-        assert!(paths.lock_path.exists());
     }
 
     #[test]
@@ -4339,7 +4131,7 @@ enabled = ["{enabled_tool}"]
         ConcurrentTextProvider { base_url, handle }
     }
 
-    fn wait_for_finished_run(server: &DaemonServer, run_id: &str) {
+    fn wait_for_finished_run(server: &TestDaemonServer, run_id: &str) {
         let deadline = Instant::now() + FAKE_PROVIDER_TIMEOUT;
         loop {
             let response = server.handle_line(&format!(
@@ -4363,7 +4155,11 @@ enabled = ["{enabled_tool}"]
         }
     }
 
-    fn start_test_run(server: &DaemonServer, config_path: &Path, question: &str) -> RunStartResult {
+    fn start_test_run(
+        server: &TestDaemonServer,
+        config_path: &Path,
+        question: &str,
+    ) -> RunStartResult {
         let response = server.handle_line(&format!(
             r#"{{"v":1,"id":"start","kind":"request","method":"run.start","params":{{"question":"{question}","config_path":"{}"}}}}"#,
             config_path.display()
@@ -4373,7 +4169,7 @@ enabled = ["{enabled_tool}"]
     }
 
     fn append_test_run(
-        server: &DaemonServer,
+        server: &TestDaemonServer,
         config_path: &Path,
         session_id: &str,
         message: &str,
@@ -4386,7 +4182,7 @@ enabled = ["{enabled_tool}"]
         response_result(&response)
     }
 
-    fn wait_for_pending_call(server: &DaemonServer, run_id: &str, call_id: &str) {
+    fn wait_for_pending_call(server: &TestDaemonServer, run_id: &str, call_id: &str) {
         let record = server.runtime.state.lock().unwrap().runs[run_id].clone();
         let deadline = Instant::now() + FAKE_PROVIDER_TIMEOUT;
         loop {
@@ -4405,7 +4201,7 @@ enabled = ["{enabled_tool}"]
         }
     }
 
-    fn assert_run_finishes_without_pending_approval(server: &DaemonServer, run_id: &str) {
+    fn assert_run_finishes_without_pending_approval(server: &TestDaemonServer, run_id: &str) {
         let record = server.runtime.state.lock().unwrap().runs[run_id].clone();
         let deadline = Instant::now() + FAKE_PROVIDER_TIMEOUT;
         loop {
@@ -4482,7 +4278,7 @@ enabled = ["{enabled_tool}"]
         );
     }
 
-    fn assert_canceled_terminal(server: &DaemonServer, record: &RunRecord) {
+    fn assert_canceled_terminal(server: &TestDaemonServer, record: &RunRecord) {
         let status = record.status();
         assert_eq!(status.state, RunStateName::Canceled);
         assert_eq!(
