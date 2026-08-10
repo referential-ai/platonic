@@ -227,7 +227,6 @@ name = "jerome"
                 || {
                     let server = Arc::new(HostDaemonServer::bind().unwrap());
                     let expected_socket = paths::host_socket_path().unwrap();
-                    let legacy_socket = paths::default_socket_path(&workspace).unwrap();
                     let runner = Arc::clone(&server);
                     let daemon = thread::spawn(move || runner.serve_next().unwrap());
                     let rest = spawn_observed_rest(Vec::new());
@@ -239,7 +238,6 @@ name = "jerome"
                     .unwrap();
 
                     assert_eq!(runtime.daemon.socket_path, expected_socket);
-                    assert_ne!(runtime.daemon.socket_path, legacy_socket);
                     runtime.discord_api_base = rest.base_url.clone();
 
                     let error = run_runtime(runtime).unwrap_err();

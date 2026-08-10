@@ -7,11 +7,7 @@ use platonic_protocol::{AgentId, ReasoningEffort, ThreadApprovalPolicy};
 use platonic_server::{
     AppError, AppResult,
     config::Config,
-    daemon::{
-        run_stdio_child,
-        server::{DaemonServer, HostDaemonServer},
-        wake_listener,
-    },
+    daemon::{run_stdio_child, server::HostDaemonServer, wake_listener},
 };
 #[cfg(unix)]
 use signal_hook::{
@@ -48,14 +44,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run the server in the foreground.
-    Serve {
-        /// Serve one legacy workspace instead of the host endpoint.
-        #[arg(long, value_name = "DIR")]
-        workspace: Option<PathBuf>,
-        /// Override the endpoint for a legacy workspace server.
-        #[arg(long, value_name = "PATH", requires = "workspace")]
-        socket: Option<PathBuf>,
-    },
+    Serve,
     /// Read server status for a workspace.
     Status {
         #[arg(long, value_name = "DIR", default_value = ".")]
@@ -184,7 +173,7 @@ fn run() -> AppResult<()> {
     }
 
     match cli.command {
-        Some(Command::Serve { workspace, socket }) => serve(workspace, socket),
+        Some(Command::Serve) => serve(),
         Some(Command::Status {
             workspace,
             socket,
@@ -217,23 +206,11 @@ fn run() -> AppResult<()> {
     }
 }
 
-fn serve(workspace: Option<PathBuf>, socket: Option<PathBuf>) -> AppResult<()> {
+fn serve() -> AppResult<()> {
     #[cfg(windows)]
     let installer_gate =
         platonic_client::installer_gate::InstallerStartupGate::acquire_for_daemon_startup()?;
     let shutdown = Arc::new(AtomicBool::new(false));
-    if let Some(workspace) = workspace {
-        let server = DaemonServer::bind(&workspace, socket)?;
-        #[cfg(windows)]
-        drop(installer_gate);
-        let socket_path = server.paths().socket_path.clone();
-        eprintln!("workspace_id: {}", server.paths().workspace_id);
-        eprintln!("socket_path: {}", socket_path.display());
-        eprintln!("ledger_path: {}", server.paths().ledger_path.display());
-        install_shutdown_handler(Arc::clone(&shutdown), socket_path)?;
-        return server.serve_forever(shutdown);
-    }
-
     let server = HostDaemonServer::bind()?;
     #[cfg(windows)]
     drop(installer_gate);
@@ -370,13 +347,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_mode_conflicts_with_workspace_and_custom_socket() {
+    fn serve_rejects_retired_workspace_and_socket_options() {
         assert!(Cli::try_parse_from(["platonic"]).is_ok());
         assert!(Cli::try_parse_from(["platonic", "serve"]).is_ok());
         assert!(Cli::try_parse_from(["platonic", "serve", "--socket", "agent.sock"]).is_err());
-        assert!(
-            Cli::try_parse_from(["platonic", "workspace", "list", "--workspace", "."]).is_err()
-        );
+        assert!(Cli::try_parse_from(["platonic", "serve", "--workspace", "."]).is_err());
     }
 
     #[test]
