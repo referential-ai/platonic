@@ -1,5 +1,6 @@
 use crate::{
     ActiveRunView, ApprovalModalView, ThreadAttachment, TranscriptState, TranscriptView, TuiState,
+    VoiceControl, VoiceControlRequest, VoiceControlResponse,
 };
 use platonic_client::{
     ClientError, ClientResult,
@@ -14,8 +15,9 @@ use platonic_protocol::{
 };
 use std::{
     collections::HashMap,
+    ops::Deref,
     sync::mpsc::{self, Sender},
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -23,7 +25,10 @@ use std::{
 use std::sync::mpsc::Receiver;
 
 use super::{
-    app::{UiEvent, push_live_event, push_live_event_at, send_command, start_next_queued},
+    app::{
+        UiEvent, push_live_event, push_live_event_at, select_fresh_session, send_command,
+        start_next_queued,
+    },
     state::approval_from_snapshot,
 };
 
@@ -392,6 +397,10 @@ pub(super) enum ClientCommand {
         session_id: String,
         profile: ApprovalProfile,
     },
+    VoiceSet {
+        enabled: bool,
+    },
+    VoiceResetForNewSession,
     ThreadSend {
         thread_id: String,
         controller_id: String,
@@ -433,6 +442,8 @@ pub(super) enum ClientEvent {
     Loaded(Box<TuiState>),
     StatusLoaded(Box<DaemonStatusResult>),
     ApprovalProfileSet(SessionApprovalProfileSetResult),
+    VoiceSet(VoiceControlResponse),
+    VoiceResetForNewSession(VoiceControlResponse),
     RunStarted(RunStartResult),
     ThreadSent(ThreadSendResult),
     IssuePrepFinished(IssuePrepStartResult),
@@ -489,7 +500,7 @@ pub(super) fn spawn_client_worker(
     let (event_sender, event_receiver) = mpsc::channel();
     thread::spawn(move || {
         for command in command_receiver {
-            let event = handle_client_command(&config, None, command);
+            let event = handle_client_command(&config, None, None, command);
             if event_sender.send(event).is_err() {
                 break;
             }
@@ -501,23 +512,53 @@ pub(super) fn spawn_client_worker(
 pub(super) fn spawn_client_worker_to(
     config: DaemonConnectionConfig,
     attachment: Option<ThreadAttachment>,
+    voice: Option<VoiceControl>,
     event_sender: Sender<UiEvent>,
-) -> Sender<ClientCommand> {
+) -> ClientWorker {
     let (command_sender, command_receiver) = mpsc::channel();
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         for command in command_receiver {
-            let event = handle_client_command(&config, attachment.as_ref(), command);
+            let event =
+                handle_client_command(&config, attachment.as_ref(), voice.as_ref(), command);
             if event_sender.send(UiEvent::Daemon(Box::new(event))).is_err() {
                 break;
             }
         }
     });
-    command_sender
+    ClientWorker {
+        commands: Some(command_sender),
+        worker: Some(worker),
+    }
+}
+
+pub(super) struct ClientWorker {
+    commands: Option<Sender<ClientCommand>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Deref for ClientWorker {
+    type Target = Sender<ClientCommand>;
+
+    fn deref(&self) -> &Self::Target {
+        self.commands
+            .as_ref()
+            .expect("live client worker retains its command sender")
+    }
+}
+
+impl Drop for ClientWorker {
+    fn drop(&mut self) {
+        self.commands.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 fn handle_client_command(
     config: &DaemonConnectionConfig,
     attachment: Option<&ThreadAttachment>,
+    voice: Option<&VoiceControl>,
     command: ClientCommand,
 ) -> ClientEvent {
     match command {
@@ -583,6 +624,22 @@ fn handle_client_command(
             failed_event(ClientOperation::ApprovalProfileSet),
             ClientEvent::ApprovalProfileSet,
         ),
+        ClientCommand::VoiceSet { enabled } => ClientEvent::VoiceSet(match voice {
+            Some(voice) => voice.request(if enabled {
+                VoiceControlRequest::Enable
+            } else {
+                VoiceControlRequest::Disable
+            }),
+            None => VoiceControlResponse::Failed(
+                "voice configuration is unavailable: no client voice control".into(),
+            ),
+        }),
+        ClientCommand::VoiceResetForNewSession => {
+            ClientEvent::VoiceResetForNewSession(match voice {
+                Some(voice) => voice.request(VoiceControlRequest::Disable),
+                None => VoiceControlResponse::AlreadyDisabled,
+            })
+        }
         ClientCommand::ThreadSend {
             thread_id,
             controller_id,
@@ -746,6 +803,15 @@ pub(super) fn apply_client_event(
                 ));
             }
         }
+        ClientEvent::VoiceSet(response) => apply_voice_response(state, response),
+        ClientEvent::VoiceResetForNewSession(response) => match response {
+            VoiceControlResponse::Disabled | VoiceControlResponse::AlreadyDisabled => {
+                select_fresh_session(state);
+            }
+            response => {
+                apply_voice_response(state, response);
+            }
+        },
         ClientEvent::RunStarted(result) => {
             apply_run_response(state, runtime, result, "run started")
         }
@@ -887,6 +953,23 @@ pub(super) fn apply_client_event(
             }
         }
     }
+}
+
+fn apply_voice_response(state: &mut TuiState, response: VoiceControlResponse) {
+    let message: String = match response {
+        VoiceControlResponse::Enabled => "voice enabled".into(),
+        VoiceControlResponse::AlreadyEnabled => "voice already enabled".into(),
+        VoiceControlResponse::Disabled => "voice disabled".into(),
+        VoiceControlResponse::AlreadyDisabled => "voice already disabled".into(),
+        VoiceControlResponse::Denied => "voice grant denied".into(),
+        VoiceControlResponse::Failed(error) => {
+            state.status_message = Some(error.clone());
+            push_live_event(state, crate::LiveEventLine::warning(None, error));
+            return;
+        }
+    };
+    state.status_message = Some(message.clone());
+    push_live_event(state, crate::LiveEventLine::status(None, message));
 }
 
 pub(super) fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
@@ -1312,6 +1395,38 @@ mod tests {
 
     const OUTER_WATCHDOG: Duration = Duration::from_secs(10);
     const DEADLINE_MARGIN: Duration = Duration::from_millis(100);
+
+    #[test]
+    fn client_worker_drop_waits_for_voice_shutdown() {
+        let (request_sender, requests) = mpsc::channel();
+        let (response_sender, responses) = mpsc::channel();
+        let (observed_sender, observed) = mpsc::channel();
+        let voice_worker = thread::spawn(move || {
+            let request = requests.recv().unwrap();
+            observed_sender.send(request).unwrap();
+            response_sender
+                .send(VoiceControlResponse::AlreadyDisabled)
+                .unwrap();
+        });
+        let voice = VoiceControl::new(request_sender, responses, voice_worker);
+        let workspace = tempfile::tempdir().unwrap();
+        let config = DaemonConnectionConfig::resolve(
+            workspace.path(),
+            Some(workspace.path().join("agent.sock")),
+        )
+        .unwrap();
+        let (event_sender, _) = mpsc::channel();
+
+        drop(spawn_client_worker_to(
+            config,
+            None,
+            Some(voice),
+            event_sender,
+        ));
+
+        assert_eq!(observed.recv().unwrap(), VoiceControlRequest::Shutdown);
+        assert!(observed.try_recv().is_err());
+    }
 
     fn request_params_value(request: &Envelope) -> serde_json::Value {
         let request = serde_json::to_value(request.params.as_ref().unwrap()).unwrap();

@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{
@@ -35,6 +36,14 @@ use crate::{
 /// Fail-closed diagnostics for the one client-owned voice configuration.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum VoiceConfigError {
+    /// The exact client-selected configuration file could not be read.
+    #[error("voice configuration could not be read from {}: {reason}", path.display())]
+    Read {
+        /// Exact path selected by the client.
+        path: PathBuf,
+        /// Bounded filesystem diagnostic.
+        reason: String,
+    },
     /// The trusted document did not define voice at all.
     #[error("voice configuration is unavailable: missing [voice]")]
     MissingTable,
@@ -53,7 +62,7 @@ pub enum VoiceConfigError {
     /// The trusted TOML document or voice table had the wrong shape.
     #[error("voice configuration is invalid: {reason}")]
     InvalidDocument {
-        /// TOML diagnostic; no file contents are included.
+        /// TOML diagnostic from the exact selected document.
         reason: String,
     },
 }
@@ -69,6 +78,7 @@ pub struct VoiceConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VoiceConfigDocument {
     voice: Option<RawVoiceConfig>,
 }
@@ -213,6 +223,28 @@ pub struct VoiceActivation {
 }
 
 impl VoiceActivation {
+    /// Creates an off session from one exact client-selected file, or unavailable if absent.
+    pub fn from_explicit_config(path: Option<&Path>) -> Self {
+        let config = match path {
+            Some(path) => fs::read_to_string(path)
+                .map_err(|error| VoiceConfigError::Read {
+                    path: path.to_path_buf(),
+                    reason: error.to_string(),
+                })
+                .and_then(|document| {
+                    VoiceConfig::from_trusted_toml(
+                        &document,
+                        path.parent().unwrap_or_else(|| Path::new(".")),
+                    )
+                }),
+            None => Err(VoiceConfigError::MissingTable),
+        };
+        Self {
+            config,
+            session: None,
+        }
+    }
+
     /// Creates an off session from caller-vetted TOML without discovering any config or model.
     pub fn from_trusted_toml(document: &str, config_dir: &Path) -> Self {
         Self {
@@ -1240,9 +1272,6 @@ mod tests {
     fn trusted_voice_config_resolves_exact_artifacts_and_devices() {
         let config = VoiceConfig::from_trusted_toml(
             r#"
-[provider]
-model = "ignored-by-client-voice"
-
 [voice]
 kokoro_model = "models/kokoro"
 whisper_model = "models/whisper.bin"
@@ -1279,10 +1308,13 @@ playback_device = "cpal:output-9"
     #[test]
     fn voice_config_is_typed_and_fail_closed_for_absent_or_incomplete_input() {
         assert_eq!(
-            VoiceConfig::from_trusted_toml("[provider]\nmodel = 'gpt-test'", Path::new("/tmp"))
-                .unwrap_err(),
+            VoiceConfig::from_trusted_toml("", Path::new("/tmp")).unwrap_err(),
             VoiceConfigError::MissingTable
         );
+        assert!(matches!(
+            VoiceConfig::from_trusted_toml("[provider]\nmodel = 'gpt-test'", Path::new("/tmp")),
+            Err(VoiceConfigError::InvalidDocument { .. })
+        ));
 
         let cases = [
             (
@@ -1338,7 +1370,7 @@ playback_device = "cpal:output-9"
 
     #[test]
     fn activation_starts_off_and_denial_or_missing_config_never_opens_devices() {
-        let mut activation = VoiceActivation::from_trusted_toml("", Path::new("/trusted"));
+        let mut activation = VoiceActivation::from_explicit_config(None);
 
         assert!(!activation.is_enabled());
         assert_eq!(
@@ -1358,6 +1390,33 @@ playback_device = "cpal:output-9"
             activation.disable().unwrap(),
             VoiceActivationChange::AlreadyDisabled
         );
+    }
+
+    #[test]
+    fn explicit_voice_config_reads_only_the_selected_file_and_uses_its_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("voice.toml");
+        fs::write(
+            &path,
+            "[voice]\nkokoro_model='k'\nwhisper_model='w'\nsilero_model='s'\n",
+        )
+        .unwrap();
+
+        let activation = VoiceActivation::from_explicit_config(Some(&path));
+        let config = activation.config.as_ref().unwrap();
+        assert_eq!(
+            config.kokoro().model_path(),
+            directory.path().join("k/model.onnx")
+        );
+        assert_eq!(config.whisper().model_path(), directory.path().join("w"));
+        assert_eq!(config.silero().model_path(), directory.path().join("s"));
+
+        let missing = directory.path().join("missing.toml");
+        let activation = VoiceActivation::from_explicit_config(Some(&missing));
+        assert!(matches!(
+            &activation.config,
+            Err(VoiceConfigError::Read { path, .. }) if path == &missing
+        ));
     }
 
     #[test]

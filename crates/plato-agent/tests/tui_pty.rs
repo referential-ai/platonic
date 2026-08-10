@@ -956,6 +956,59 @@ fn bare_plato_status_modal_sends_one_read_only_request_and_escape_closes() {
 
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
+fn bare_plato_voice_fails_closed_locally_without_a_dedicated_config() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+
+    let workspace_id = paths::workspace_id(&workspace).unwrap();
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
+    let ledger = state.join("fake-agent.db");
+    let fake = FakeDaemon::bind(&endpoint, &workspace, &workspace_id, &ledger);
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        br#""$PLATO_BIN"; printf '\n%sSTATUS:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Try \"read README.md and summarize it\"",
+    );
+
+    shell.write(b"/voice on");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "> /voice on");
+    shell.write(b"\r");
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "voice configuration is unavailable: missing [voice]",
+    );
+    shell.write(b"/voice off");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "> /voice off");
+    shell.write(b"\r");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "voice already disabled");
+    shell.write(b"q");
+
+    assert_eq!(shell.wait_for_marker("STATUS"), "0");
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+    assert!(!fake.finish().iter().any(|request| {
+        request
+            .method
+            .as_deref()
+            .is_some_and(|method| method.contains("voice"))
+    }));
+}
+
+#[test]
+#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_yolo_slash_command_round_trips_typed_session_mutation() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");

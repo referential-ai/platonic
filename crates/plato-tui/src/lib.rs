@@ -15,6 +15,7 @@ mod markdown;
 mod modal;
 mod render;
 mod state;
+mod voice;
 
 pub use app::{ThreadAttachment, TuiOptions, run_tui};
 pub use modal::{
@@ -26,3 +27,4 @@ pub use state::{
     ActiveRunView, ConnectionState, LiveEventKind, LiveEventLine, SessionPickerView,
     TranscriptState, TranscriptView, TuiState,
 };
+pub use voice::{VoiceControl, VoiceControlRequest, VoiceControlResponse};

@@ -1,7 +1,7 @@
 use clap::Parser;
 use plato_agent::{
     attach_server_interactive,
-    tui::{TuiOptions, run_tui},
+    tui::{TuiOptions, run_tui, voice_control},
 };
 use platonic_client::{
     ClientError,
@@ -40,6 +40,13 @@ struct Cli {
 
     #[arg(long, value_name = "PATH", help = "Config path passed to daemon runs")]
     config: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Exact client-side voice configuration"
+    )]
+    voice_config: Option<PathBuf>,
 
     #[arg(long, help = "Render the current TUI state once and exit")]
     snapshot: bool,
@@ -86,6 +93,7 @@ fn run() -> plato_agent::AppResult<()> {
         Err(ClientError::Io(error)) if endpoint_is_unavailable(&error) => {}
         Err(error) => return Err(error.into()),
     }
+    let voice = voice_control(cli.voice_config.as_deref())?;
     run_tui(TuiOptions {
         workspace: cli.workspace,
         socket: Some(socket),
@@ -94,6 +102,7 @@ fn run() -> plato_agent::AppResult<()> {
         snapshot: cli.snapshot,
         reduced_motion: cli.reduced_motion,
         thread: None,
+        voice: Some(voice),
     })
 }
 

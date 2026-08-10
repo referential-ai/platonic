@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use plato_agent::{
     AppError, AppResult, ApprovalMode, RunOptions, ensure_server, ensure_server_interactive,
     offline, run_question,
-    tui::{ThreadAttachment, TuiOptions, run_tui},
+    tui::{ThreadAttachment, TuiOptions, run_tui, voice_control},
 };
 use platonic_client::{client::DaemonClient, paths};
 use platonic_protocol::{
@@ -24,6 +24,14 @@ const THREAD_EVENT_PAGE: usize = 128;
 struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "FILE",
+        help = "Exact client-side voice configuration used only by the TUI"
+    )]
+    voice_config: Option<PathBuf>,
 
     #[arg(
         long,
@@ -217,6 +225,7 @@ fn implicit_tui_requested(cli: &Cli, stdin_is_terminal: bool, stdout_is_terminal
 
 fn validate_replay_cli(cli: &Cli, file: Option<&Path>) -> AppResult<()> {
     if cli.config.is_some()
+        || cli.voice_config.is_some()
         || cli.yolo
         || cli.continue_session
         || cli.tui
@@ -224,7 +233,7 @@ fn validate_replay_cli(cli: &Cli, file: Option<&Path>) -> AppResult<()> {
         || !cli.question.is_empty()
     {
         return Err(AppError::Config(
-            "plato replay cannot be combined with --config, --yolo, -c, --tui, --remote, or a question"
+            "plato replay cannot be combined with --config, --voice-config, --yolo, -c, --tui, --remote, or a question"
                 .into(),
         ));
     }
@@ -238,6 +247,7 @@ fn validate_replay_cli(cli: &Cli, file: Option<&Path>) -> AppResult<()> {
 
 fn validate_using_subcommand(cli: &Cli, name: &str) -> AppResult<()> {
     if cli.db.is_some()
+        || cli.voice_config.is_some()
         || cli.yolo
         || cli.continue_session
         || cli.tui
@@ -245,7 +255,7 @@ fn validate_using_subcommand(cli: &Cli, name: &str) -> AppResult<()> {
         || !cli.question.is_empty()
     {
         return Err(AppError::Config(format!(
-            "plato {name} cannot be combined with --db, --yolo, -c, --tui, --remote, or a question"
+            "plato {name} cannot be combined with --db, --voice-config, --yolo, -c, --tui, --remote, or a question"
         )));
     }
     Ok(())
@@ -270,6 +280,11 @@ fn replay_path(
 }
 
 fn run_prompt(cli: Cli, workspace_root: PathBuf, interactive: bool) -> AppResult<()> {
+    if cli.voice_config.is_some() {
+        return Err(AppError::Config(
+            "--voice-config is available only in the TUI".into(),
+        ));
+    }
     if cli.db.is_some() {
         return Err(AppError::Config(
             "--db is an offline replay option; one-shot runs use the server ledger".into(),
@@ -441,6 +456,7 @@ fn run_tui_mode(cli: Cli, workspace_root: PathBuf, local_interactive: bool) -> A
     options.socket = Some(paths::host_socket_path()?);
     options.config = cli.config.clone();
     options.reduced_motion = cli.reduced_motion;
+    options.voice = Some(voice_control(cli.voice_config.as_deref())?);
     let yolo = cli.yolo;
     let thread_id = match cli.remote {
         Some(thread_id) => client.thread_status(thread_id)?.thread.authority.thread_id,
@@ -807,6 +823,24 @@ mod tests {
         let cli = Cli::try_parse_from(["plato", "--tui", "--config", "agent.toml"]).unwrap();
         assert_eq!(cli.config, Some(PathBuf::from("agent.toml")));
         assert!(validate_tui_cli(&cli).is_ok());
+    }
+
+    #[test]
+    fn voice_config_is_a_dedicated_tui_only_input() {
+        let cli = Cli::try_parse_from(["plato", "--tui", "--voice-config", "voice.toml"]).unwrap();
+        assert_eq!(cli.voice_config, Some(PathBuf::from("voice.toml")));
+        assert!(validate_tui_cli(&cli).is_ok());
+
+        let replay =
+            Cli::try_parse_from(["plato", "--voice-config", "voice.toml", "replay"]).unwrap();
+        assert!(validate_replay_cli(&replay, None).is_err());
+
+        let one_shot =
+            Cli::try_parse_from(["plato", "--voice-config", "voice.toml", "question"]).unwrap();
+        assert!(matches!(
+            run_prompt(one_shot, PathBuf::from("/workspace"), false),
+            Err(AppError::Config(message)) if message.contains("only in the TUI")
+        ));
     }
 
     #[test]
