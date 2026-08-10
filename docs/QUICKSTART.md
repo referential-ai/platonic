@@ -1,54 +1,51 @@
-# Quickstart — run and test Plato Agent
+# Quickstart - run Platonic with Plato Agent
 
-Everything below is copy-pasteable. Companion docs: [`../README.md`](../README.md) (full reference), [`ARCHITECTURE.md`](ARCHITECTURE.md) (topology and law).
+Companion docs: [`../README.md`](../README.md) (full reference),
+[`RELEASE.md`](RELEASE.md) (release artifacts), and the
+[platform decision map](https://github.com/referential-ai/platonic-workspace/issues/83)
+(architecture authority).
 
 ## 0. One-time setup
 
 ```bash
-cd ~/projects/platonic-workspace/plato-agent
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64) target=linux-x86_64 ;;
+  Darwin-arm64) target=macos-arm64 ;;
+  *) echo "unsupported platform" >&2; exit 1 ;;
+esac
 
-head=$(git rev-parse --verify 'HEAD^{commit}')
-build_date=$(date -u +%Y-%m-%d)
-proof_root=$(mktemp -d)
-artifact="$proof_root/plato-agent-$head.tar.gz"
-source_root="$proof_root/source"
-prefix="$proof_root/install"
+bundle="platonic-0.1.0-$target"
+archive="$bundle.tar.gz"
+release="https://github.com/referential-ai/platonic/releases/download/platonic-v0.1.0"
+curl -fLO "$release/$archive"
+curl -fLO "$release/$bundle.sha256"
 
-git archive --format=tar.gz --prefix="plato-agent-$head/" \
-  --output "$artifact" "$head"
-sha256sum "$artifact"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum --check "$bundle.sha256"
+else
+  shasum -a 256 --check "$bundle.sha256"
+fi
 
-mkdir "$source_root"
-tar -xzf "$artifact" -C "$source_root"
-test ! -e "$prefix"
-PLATONIC_BUILD_COMMIT="$head" \
-  PLATONIC_BUILD_DATE="$build_date" \
-  PLATO_BUILD_IDENTITY="0.2.0 $head $build_date" \
-  CARGO_TARGET_DIR="$proof_root/target" \
-  cargo install --locked --root "$prefix" \
-    --path "$source_root/plato-agent-$head/crates/plato-agent"
-PLATONIC_BUILD_COMMIT="$head" \
-  PLATONIC_BUILD_DATE="$build_date" \
-  PLATO_BUILD_IDENTITY="0.2.0 $head $build_date" \
-  CARGO_TARGET_DIR="$proof_root/target" \
-  cargo install --locked --root "$prefix" \
-    --path "$source_root/plato-agent-$head/crates/platonic"
+tar -xzf "$archive"
+install -d "$HOME/.local/bin"
+install -m 0755 "$bundle/bin/platonic" "$HOME/.local/bin/platonic"
+install -m 0755 "$bundle/bin/plato" "$HOME/.local/bin/plato"
+install -m 0755 "$bundle/bin/plato-tui" "$HOME/.local/bin/plato-tui"
+export PATH="$HOME/.local/bin:$PATH"
 
-export PATH="$prefix/bin:$PATH"
-for binary in plato platonic plato-tui; do
-  "$binary" --version
-done
-for binary in plato platonic plato-tui; do
-  "$binary" --help >/dev/null
-done
+platonic --version
+plato --version
+plato-tui --version
 
 export OPENROUTER_API_KEY="$(cat /path/to/your/openrouter-key)"
 ```
 
-The tarball is a complete source snapshot of the exact commit printed in its
-name. Installation builds only from its extracted workspace and writes the
-three binaries to the fresh prefix under `$proof_root`; it does not use
-`cargo run`, publish crates, or change an existing installation.
+The release tag is exactly `platonic-v0.1.0`. The bundle contains the Platonic
+server command `platonic` and the Plato Agent client commands `plato` and
+`plato-tui`. Linux x86-64 and macOS Apple silicon are the only launch targets;
+Windows server and client support is withdrawn. The
+[release contract](RELEASE.md) lists the exact archive contents and explains
+the independent `platonic-core` semver.
 
 `plato` works without a local config when `OPENROUTER_API_KEY` is exported.
 Config is discovered in this order: `--config`, `PLATO_CONFIG`, `./plato.toml`,
@@ -71,19 +68,34 @@ enabled = ["file.read", "file.list", "file.write", "file.edit", "shell.exec", "w
 
 ## 1. First run (60-second smoke test)
 
+In terminal 1, start the one host server:
+
 ```bash
+platonic serve
+```
+
+In terminal 2, register the workspace deliberately and run Plato Agent as a
+short-lived client:
+
+```bash
+mkdir -p "$HOME/platonic-quickstart"
+cd "$HOME/platonic-quickstart"
+git init
+git -c user.name='Platonic Quickstart' \
+  -c user.email='quickstart@invalid' commit --allow-empty -m 'Initial workspace'
+platonic workspace create quickstart "$PWD"
+platonic status --workspace "$PWD"
 plato "list the files here and summarize what this project is"
 plato -c "name the most important file from that summary"
 plato replay        # audit the latest default workspace session
 ```
 
-On the first local terminal invocation, `plato` asks for a workspace name and
-defaults it to the current directory basename. Press Enter once to register it
-and continue. Piped/headless commands and `plato --remote` never prompt or
-register; bootstrap those paths explicitly with a running host server and
-`platonic workspace create <name> <directory>`. Standalone `plato-tui` prompts
-only on its default local endpoint; `--socket` attachments and `--snapshot` do
-not.
+When no server is running, an interactive local `plato` one-shot or TUI starts
+the installed sibling `platonic` server. In an unknown directory it asks once
+for a workspace name and defaults to the directory basename. Piped/headless
+commands, `plato --remote`, gateways, desktop clients, explicit `--socket`
+attachments, and `plato-tui --snapshot` never register a workspace; use
+`platonic workspace create <name> <directory>` first.
 
 Live assistant text prints to stderr; the final answer prints to stdout. The
 complete run event log lands in one JSONL file under the workspace ledger
@@ -111,7 +123,13 @@ does not inherit provider credentials.
 `web.fetch` always prompts with its normalized public origin and validated
 addresses, revalidates immediately before each pinned connection, and returns
 only bounded UTF-8 text from the approved origin.
-Nothing escapes the workspace: `../`, absolute paths, and symlinks out are refused.
+File tools refuse `../`, absolute paths, and symlinks that escape their granted
+roots. Server-created thread children use Landlock write confinement when the
+Linux host supports it; macOS and Linux hosts without Landlock record
+`confinement: "none"`. Set `[confinement] require = true` in the user config to
+refuse an unconfined spawn. `plato thread status <thread-id>` reads the durable
+protocol-v1 authority projection and live state; the typed `thread.authority`
+protocol readback carries the complete immutable record and confinement fact.
 
 ## 3. Durable runs
 
@@ -141,7 +159,7 @@ plato --tui --yolo
 This ensures the host-scoped `platonic serve`, asks once to register an unknown
 directory (Enter accepts the basename), asks for the root thread spawn
 decision, and attaches the TUI to that durable thread. Quitting the TUI leaves
-the daemon and thread authority available. `plato --tui --config plato.toml`
+the server and thread authority available. `plato --tui --config plato.toml`
 is the explicit form when selecting a config. During a run, one working row
 shows elapsed active time and the interrupt key. Use `plato --reduced-motion`
 or set `PLATO_REDUCED_MOTION=1` to replace its animated braille marker with a
@@ -153,6 +171,7 @@ attach another interactive client:
 
 ```bash
 plato thread list
+plato thread status <thread-id>
 plato --remote <thread-id>
 ```
 
@@ -160,15 +179,20 @@ Both clients observe the same live output. Exactly one controller owns an
 active turn; another client is refused until that turn is idle, then can drive
 the next turn. Remote attachment does not create a duplicate thread.
 
-Quitting either TUI form never stops the daemon.
+Quitting either TUI form never stops the server.
 
 Start the optional Discord connector from a separate environment:
 
 ```bash
 unset OPENAI_API_KEY OPENROUTER_API_KEY
-export DISCORD_BOT_TOKEN="$(cat /path/to/discord-bot-token)"
-platonic gateway discord --config ~/.config/plato/gateway.toml
+platonic gateway discord --workspace "$PWD" \
+  --config "$HOME/.config/plato/gateway.toml"
 ```
+
+Run that command only from a private environment that loaded the token from
+`$HOME/.config/plato/discord-bot-token` outside terminal or pane input. Never
+put its literal value in `argv`, pane text, logs, GitHub, or chat. The [gateway
+guide](GATEWAY.md) owns the file setup and `gateway-live` channel walkthrough.
 
 The gateway attaches to the host endpoint and requires a successful `hello` for
 the selected workspace. Probe failures start no connector; the gateway never
@@ -209,10 +233,16 @@ typing indicator while active, then ✅ or ❌; canceled and interrupted runs
 remove 👀 without a terminal reaction. The bot needs Add Reactions and Read
 Message History, plus Send Messages in Threads when threads are used.
 
+After closing the TUI and gateway, stop the idle host server explicitly:
+
+```bash
+platonic shutdown --workspace "$PWD"
+```
+
 ## 5. Local voice activation and device proof
 
 TUI voice is opt-in through a dedicated client file that the server never reads.
-Choose every local model explicitly; Plato does not search for or download
+Choose every local model explicitly; Plato Agent does not search for or download
 artifacts. Relative model paths resolve from the voice file's directory.
 
 ```toml
