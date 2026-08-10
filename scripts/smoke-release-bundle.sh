@@ -24,8 +24,9 @@ bundle=${archive_name%.tar.gz}
 
 umask 077
 proof_root=$(mktemp -d /tmp/p14l4.XXXXXX)
+proof_root=$(cd -- "$proof_root" && pwd -P)
 case "$proof_root" in
-  /tmp/p14l4.*) ;;
+  /tmp/p14l4.* | /private/tmp/p14l4.*) ;;
   *) die "unexpected proof root: $proof_root" ;;
 esac
 chmod 0700 "$proof_root"
