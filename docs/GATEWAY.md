@@ -37,19 +37,24 @@ Discord's
 [first-bot guide](https://docs.discord.com/developers/quick-start/getting-started)
 owns the current Developer Portal installation flow.
 
-## 2. Store the token in the approved file
+## 2. Store the token at the approved path
 
 The gateway reads the token from an environment variable, but the durable local
-copy belongs at `~/.config/plato/discord-bot-token` with mode `0600`. This Bash
-sequence prompts without echoing the token:
+copy belongs at `~/.config/plato/discord-bot-token` with mode `0600`. Create
+only the parent path from a terminal:
 
 ```bash
 TOKEN_FILE="$HOME/.config/plato/discord-bot-token"
 install -d -m 700 "$(dirname "$TOKEN_FILE")"
-read -rsp "Discord bot token: " TOKEN
-printf '\n'
-(umask 077; printf '%s' "$TOKEN" >"$TOKEN_FILE")
-unset TOKEN
+```
+
+AJ creates the one-line token file through a password-manager or secure GUI
+action outside terminal history and pane input. After that action, a shell may
+only secure and check the path:
+
+```bash
+TOKEN_FILE="$HOME/.config/plato/discord-bot-token"
+test -s "$TOKEN_FILE"
 chmod 600 "$TOKEN_FILE"
 mode=$(stat -c '%a' "$TOKEN_FILE" 2>/dev/null || stat -f '%Lp' "$TOKEN_FILE")
 test "$mode" = 600
@@ -144,9 +149,10 @@ The [platform decision map](https://github.com/referential-ai/platonic-workspace
 owns the architecture: the server, not the gateway, owns runs, tools, policy,
 approvals, and the ledger.
 
-In terminal 2, register the workspace, use the configured provider credential
-to create the mapped thread, then remove provider credentials, expose only the
-Discord token, and start the gateway:
+In terminal 2, register the workspace and use the configured provider credential
+to create the mapped thread. Then remove provider credentials and start the
+gateway from the private L5 environment that loads the approved file without
+terminal or pane input:
 
 ```bash
 cd "$HOME/plato-discord-workspace"
@@ -154,7 +160,6 @@ platonic workspace create discord "$PWD"
 # Approve the prompt, then replace thread_123 in gateway.toml with the printed id.
 plato thread spawn --model '~openai/gpt-latest' --reasoning-effort none
 unset OPENAI_API_KEY OPENROUTER_API_KEY
-export DISCORD_BOT_TOKEN="$(tr -d '\r\n' < "$HOME/.config/plato/discord-bot-token")"
 platonic gateway discord --workspace "$PWD" \
   --config "$HOME/.config/plato/gateway.toml"
 ```
