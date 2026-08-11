@@ -438,10 +438,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "timing-sensitive on macOS runners; #465"
-    )]
     fn websocket_forwards_messages_while_commands_apply_principal_and_channel_auth() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();

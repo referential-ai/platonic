@@ -2105,7 +2105,6 @@ base_url = "https://example.invalid/v1"
     }
 
     #[test]
-    #[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
     fn admission_closed_window_returns_typed_errors_before_teardown() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
@@ -2143,12 +2142,12 @@ base_url = "https://example.invalid/v1"
             assert_eq!(response.error.unwrap().code, ERROR_DAEMON_SHUTTING_DOWN);
         }
 
-        barrier.wait();
-        handle.join().unwrap();
         shutdown_reader
             .get_mut()
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
+        barrier.wait();
+        handle.join().unwrap();
         let mut trailing = String::new();
         match shutdown_reader.read_line(&mut trailing) {
             Ok(0) => {}

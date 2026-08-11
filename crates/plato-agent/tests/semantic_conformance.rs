@@ -118,7 +118,6 @@ fn killed_wedged_child_has_no_ledger_handle_and_other_run_stays_healthy() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
 fn one_host_daemon_serves_two_workspaces() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     let root = Arc::new(tempfile::tempdir().unwrap());
@@ -167,7 +166,7 @@ fn workspace_and_agent_six_method_control_plane_is_semantically_conformant() {
         assert!(hello.capabilities.contains(&capability));
     }
 
-    let second = proof._root.path().join("agent-control-workspace");
+    let second = proof.workspace.with_file_name("agent-control-workspace");
     fs::create_dir(&second).unwrap();
     let created = client
         .workspace_create("agent-control".into(), second.clone())
@@ -243,7 +242,6 @@ fn headless_one_shot_and_remote_never_prompt_or_register() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
 fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     let proof = ProofContext::new();
@@ -493,7 +491,6 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
 fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     let proof = ProofContext::new();
@@ -715,7 +712,6 @@ fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
 fn thread_send_and_three_observers_are_semantically_conformant_on_host_daemon() {
     const INITIAL_MESSAGE: &str = "begin the controlled thread proof";
     const STEERED_MESSAGE: &str = "include the exact steered phrase in the continuation";
@@ -1084,7 +1080,8 @@ impl ProofContext {
     }
 
     fn in_root(root: Arc<tempfile::TempDir>, workspace_name: &str) -> Self {
-        let workspace = root.path().join(workspace_name);
+        let root_path = root.path().canonicalize().unwrap();
+        let workspace = root_path.join(workspace_name);
         fs::create_dir(&workspace).unwrap();
         init_git_repository(&workspace);
 
@@ -1102,13 +1099,13 @@ impl ProofContext {
             let root_key = {
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                root.path().hash(&mut hasher);
+                root_path.hash(&mut hasher);
                 hasher.finish() as u32
             };
             let runtime_root =
                 PathBuf::from(format!("/tmp/pconf-{}-{root_key:08x}", std::process::id()));
             fs::create_dir_all(&runtime_root).unwrap();
-            let state_root = root.path().join("state");
+            let state_root = root_path.join("state");
             (runtime_root, state_root)
         };
         #[cfg(unix)]

@@ -264,6 +264,7 @@ fn gateway_wrapper_rejects_workspace_gateway_before_daemon_or_service_access() {
 
 struct ServerFixture {
     root: tempfile::TempDir,
+    runtime: tempfile::TempDir,
     workspace: PathBuf,
     name: String,
     child: Option<Child>,
@@ -275,17 +276,26 @@ impl ServerFixture {
             .prefix(&format!("p468-{name}-"))
             .tempdir()
             .unwrap();
+        let runtime = tempfile::Builder::new()
+            .prefix("p468-")
+            .tempdir_in("/tmp")
+            .unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let workspace = root.path().join("workspace");
-        let runtime = root.path().join("runtime");
         let state = root.path().join("state");
         fs::create_dir(&workspace).unwrap();
-        fs::create_dir(&runtime).unwrap();
-        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = runtime.path().join("platonic/host/agent.sock");
+        assert!(
+            socket.as_os_str().len() < 100,
+            "socket path must stay under the sockaddr_un limit: {}",
+            socket.display()
+        );
+        eprintln!("service-command fixture endpoint={}", socket.display());
         let child = Command::new(env!("CARGO_BIN_EXE_platonic"))
             .arg("serve")
             .current_dir(&workspace)
-            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_RUNTIME_DIR", runtime.path())
             .env("XDG_STATE_HOME", &state)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -294,6 +304,7 @@ impl ServerFixture {
             .unwrap();
         let fixture = Self {
             root,
+            runtime,
             workspace,
             name: name.into(),
             child: Some(child),
@@ -307,7 +318,7 @@ impl ServerFixture {
         command
             .args(args)
             .current_dir(&self.workspace)
-            .env("XDG_RUNTIME_DIR", self.root.path().join("runtime"))
+            .env("XDG_RUNTIME_DIR", self.runtime.path())
             .env("XDG_STATE_HOME", self.root.path().join("state"));
         command
     }
@@ -358,11 +369,10 @@ impl ServerFixture {
     }
 
     fn with_env<T>(&self, f: impl FnOnce() -> T) -> T {
-        let runtime = self.root.path().join("runtime");
         let state = self.root.path().join("state");
         temp_env::with_vars(
             [
-                ("XDG_RUNTIME_DIR", Some(runtime.as_os_str())),
+                ("XDG_RUNTIME_DIR", Some(self.runtime.path().as_os_str())),
                 ("XDG_STATE_HOME", Some(state.as_os_str())),
             ],
             f,
