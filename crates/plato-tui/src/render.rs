@@ -3294,10 +3294,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "asserts Linux key labels; macOS renders its own keymap and needs a per-platform assertion; #465"
-    )]
     fn renders_shortcuts_overlay_from_styled_platform_keymap() {
         let mut state = TuiState::connected(
             "/tmp/work".into(),
@@ -3317,7 +3313,11 @@ mod tests {
         let output = render_to_text(&state);
 
         assert!(output.contains("╭Shortcuts"));
-        assert!(output.contains("alt + enter"));
+        assert!(output.contains(if cfg!(target_os = "macos") {
+            "⌥ enter"
+        } else {
+            "alt + enter"
+        }));
         assert!(output.contains("PgUp/PgDown"));
         assert!(output.contains("toggle conversation / audit"));
         assert!(output.contains("Ctrl+C"));

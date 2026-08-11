@@ -101,6 +101,10 @@ const DISABLE_ALTERNATE_SCROLL: &[u8] = b"\x1b[?1007l";
 const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "inline PTY viewport omits the preserved title on macOS; #465"
+)]
 fn plato_tui_yolo_cold_starts_host_thread_and_remote_reuses_it() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -251,7 +255,10 @@ fn local_interactive_one_shot_asks_once_and_enter_registers_the_directory() {
     let workspaces = client.workspace_list().unwrap().workspaces;
     assert_eq!(workspaces.len(), 1);
     assert_eq!(workspaces[0].name, "workspace");
-    assert_eq!(Path::new(&workspaces[0].root), workspace);
+    assert_eq!(
+        Path::new(&workspaces[0].root),
+        workspace.canonicalize().unwrap()
+    );
     daemon.kill().unwrap();
     daemon.wait().unwrap();
     assert_ne!(shell.wait_for_marker("STATUS"), "0");
@@ -294,7 +301,10 @@ fn standalone_tui_default_local_endpoint_asks_once_and_registers() {
     let workspaces = client.workspace_list().unwrap().workspaces;
     assert_eq!(workspaces.len(), 1);
     assert_eq!(workspaces[0].name, "workspace");
-    assert_eq!(Path::new(&workspaces[0].root), workspace);
+    assert_eq!(
+        Path::new(&workspaces[0].root),
+        workspace.canonicalize().unwrap()
+    );
 
     shell.write(b"q");
     assert_eq!(shell.wait_for_marker("STATUS"), "0");
@@ -428,6 +438,10 @@ fn standalone_tui_absent_default_endpoint_keeps_the_offline_view_without_prompti
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "inline PTY viewport omits the preserved title on macOS; #465"
+)]
 fn standalone_tui_reconnects_to_registered_host_after_restart() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -531,7 +545,6 @@ fn standalone_tui_surfaces_registration_io_failure_after_prompt() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_preserves_draft_and_restores_parent_terminal() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -580,7 +593,11 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
     let keypress_at = Instant::now();
     shell.write(b"?");
     let shortcuts = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Shortcuts");
-    assert!(shortcuts.contains("alt + enter"));
+    assert!(shortcuts.contains(if cfg!(target_os = "macos") {
+        "⌥ enter"
+    } else {
+        "alt + enter"
+    }));
     assert!(shortcuts.contains("? shortcuts · Esc close"));
     assert!(
         keypress_at.elapsed() < Duration::from_secs(1),
@@ -693,7 +710,6 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn composer_cursor_stays_real_at_placeholder_origin_and_narrow_wrap() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -742,7 +758,6 @@ fn composer_cursor_stays_real_at_placeholder_origin_and_narrow_wrap() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn composer_textarea_features_preserve_submit_queue_slash_and_history_contracts() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -856,7 +871,6 @@ fn composer_textarea_features_preserve_submit_queue_slash_and_history_contracts(
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn nonempty_no_color_suppresses_only_color_sgr_in_the_pty() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -882,7 +896,10 @@ fn nonempty_no_color_suppresses_only_color_sgr_in_the_pty() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "alternate-screen restore omits the inline title on macOS PTYs; #464"
+)]
 fn bare_plato_status_modal_sends_one_read_only_request_and_escape_closes() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -955,7 +972,6 @@ fn bare_plato_status_modal_sends_one_read_only_request_and_escape_closes() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_voice_fails_closed_locally_without_a_dedicated_config() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -1008,7 +1024,6 @@ fn bare_plato_voice_fails_closed_locally_without_a_dedicated_config() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_yolo_slash_command_round_trips_typed_session_mutation() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -1056,7 +1071,6 @@ fn bare_plato_yolo_slash_command_round_trips_typed_session_mutation() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -1167,6 +1181,10 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "inline PTY viewport omits the preserved title on macOS; #465"
+)]
 fn bare_plato_shell_session_grant_flow_is_scoped_and_expires_on_daemon_restart() {
     let root = tempfile::tempdir().unwrap();
     let root_path = root.path().to_path_buf();
@@ -1397,7 +1415,6 @@ enabled = ["shell.exec"]
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -1554,7 +1571,6 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn streamed_markdown_smooths_holds_tables_and_survives_reload_and_resize() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -1648,7 +1664,6 @@ fn streamed_markdown_smooths_holds_tables_and_survives_reload_and_resize() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_session_picker_resumes_exact_hidden_session_id() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -2890,14 +2905,20 @@ fn serve_fake_daemon(
             Err(TryRecvError::Empty) => {}
         }
         match listener.accept() {
-            Ok((stream, _)) => handle_connection(
-                stream,
-                &requests,
-                &workspace_root,
-                &workspace_id,
-                &ledger,
-                scenario,
-            )?,
+            Ok((stream, _)) => {
+                // macOS accepts inherit the listener's nonblocking mode.
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|error| format!("fake daemon blocking mode failed: {error}"))?;
+                handle_connection(
+                    stream,
+                    &requests,
+                    &workspace_root,
+                    &workspace_id,
+                    &ledger,
+                    scenario,
+                )?
+            }
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(5));
             }

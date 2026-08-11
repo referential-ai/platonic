@@ -1366,6 +1366,8 @@ pub(super) fn spawn_status_query_daemon(socket_path: &Path) -> thread::JoinHandl
                 Err(error) => panic!("daemon query accept failed: {error}"),
             }
         };
+        // macOS accepts inherit the listener's nonblocking mode.
+        stream.set_nonblocking(false).unwrap();
         let mut writer = stream.try_clone().unwrap();
         let mut reader = BufReader::new(stream);
         respond_hello(&mut reader, &mut writer);
