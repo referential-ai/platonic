@@ -5,7 +5,7 @@ use nucleo::{
 use platonic_core::EffectClass;
 use platonic_protocol::{
     ApprovalProfile, DaemonStatusResult, HelloResult, ModelIdentityStatus, PendingApprovalSnapshot,
-    RunStateName, SessionSummary, TranscriptReadResult, TypedTranscript,
+    RunStateName, SessionSummary, ThreadStatus, TranscriptReadResult, TypedTranscript,
 };
 use ratatui::text::Line;
 use std::{
@@ -56,8 +56,12 @@ pub struct TuiState {
     pub connection: ConnectionState,
     /// Sessions returned by the daemon, newest first.
     pub sessions: Vec<SessionSummary>,
+    /// Durable threads returned for the thread picker.
+    pub threads: Vec<ThreadStatus>,
     /// Session selected for display and continuation.
     pub selected_session_id: Option<String>,
+    /// Durable thread currently attached to this TUI.
+    pub selected_thread_id: Option<String>,
     /// Current selected-session profile, or the next fresh session's profile.
     pub approval_profile: ApprovalProfile,
     /// Selected transcript state.
@@ -78,7 +82,7 @@ pub struct TuiState {
     pub composer: TextArea<'static>,
     /// Open slash-command popup state.
     pub slash_popup: Option<SlashPopupView>,
-    /// Open session-picker state.
+    /// Open thread-picker state.
     pub session_picker: Option<SessionPickerView>,
     /// Messages queued behind the active operation.
     pub queued_messages: Vec<String>,
@@ -112,7 +116,9 @@ impl PartialEq for TuiState {
             && self.socket_path == other.socket_path
             && self.connection == other.connection
             && self.sessions == other.sessions
+            && self.threads == other.threads
             && self.selected_session_id == other.selected_session_id
+            && self.selected_thread_id == other.selected_thread_id
             && self.approval_profile == other.approval_profile
             && self.transcript == other.transcript
             && self.active_run == other.active_run
@@ -221,7 +227,9 @@ impl TuiState {
             socket_path,
             connection,
             sessions: Vec::new(),
+            threads: Vec::new(),
             selected_session_id: None,
+            selected_thread_id: None,
             approval_profile: ApprovalProfile::Prompt,
             transcript: TranscriptState::None,
             active_run: None,
@@ -922,19 +930,19 @@ pub struct SlashPopupView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Filter and focus state for the session picker.
+/// Filter and focus state for the thread picker.
 pub struct SessionPickerView {
-    /// Case-insensitive session-question filter.
+    /// Case-insensitive thread filter.
     pub filter: String,
     /// Focused index within the filtered results.
     pub selected: usize,
 }
 
 impl SessionPickerView {
-    /// Returns sessions whose visible first-question label or recovery ID matches the filter.
-    pub fn matching_sessions<'a>(&self, sessions: &'a [SessionSummary]) -> Vec<&'a SessionSummary> {
+    /// Returns durable threads whose stable ID or live state matches the filter.
+    pub fn matching_threads<'a>(&self, threads: &'a [ThreadStatus]) -> Vec<&'a ThreadStatus> {
         if self.filter.is_empty() {
-            return sessions.iter().collect();
+            return threads.iter().collect();
         }
 
         let fuzzy = Atom::new(
@@ -955,19 +963,20 @@ impl SessionPickerView {
         config.prefer_prefix = true;
         let mut matcher = Matcher::new(config);
         let mut chars = Vec::new();
-        let recovery_filter = self.filter.to_lowercase();
-        let mut matches: Vec<_> = sessions
+        let fallback_filter = self.filter.to_lowercase();
+        let mut matches: Vec<_> = threads
             .iter()
             .enumerate()
-            .filter_map(|(source_index, session)| {
-                let label = session_question_label(session);
-                if let Some(score) = fuzzy.score(Utf32Str::new(label, &mut chars), &mut matcher) {
+            .filter_map(|(source_index, thread)| {
+                let thread_id = thread.authority.thread_id.as_str();
+                if let Some(score) = fuzzy.score(Utf32Str::new(thread_id, &mut chars), &mut matcher)
+                {
                     let is_prefix = prefix
-                        .score(Utf32Str::new(label, &mut chars), &mut matcher)
+                        .score(Utf32Str::new(thread_id, &mut chars), &mut matcher)
                         .is_some();
-                    Some((source_index, true, is_prefix, score, session))
-                } else if session.session_id.to_lowercase().contains(&recovery_filter) {
-                    Some((source_index, false, false, 0, session))
+                    Some((source_index, true, is_prefix, score, thread))
+                } else if thread_live_label(thread) == fallback_filter {
+                    Some((source_index, false, false, 0, thread))
                 } else {
                     None
                 }
@@ -983,18 +992,18 @@ impl SessionPickerView {
         });
         matches
             .into_iter()
-            .map(|(_, _, _, _, session)| session)
+            .map(|(_, _, _, _, thread)| thread)
             .collect()
     }
 }
 
-pub(super) fn session_question_label(session: &SessionSummary) -> &str {
-    if !session.first_question.trim().is_empty() {
-        &session.first_question
-    } else if !session.latest_question.trim().is_empty() {
-        &session.latest_question
+pub(super) fn thread_live_label(thread: &ThreadStatus) -> &'static str {
+    if thread.live.current_turn_id.is_some() {
+        "active"
+    } else if thread.live.loaded {
+        "loaded"
     } else {
-        "(no question)"
+        "unloaded"
     }
 }
 
@@ -1307,11 +1316,11 @@ mod tests {
     }
 
     #[test]
-    fn session_picker_matches_unicode_lowercase_substrings_in_source_order() {
-        let sessions = vec![
-            session("session_1", "First STRAẞE task"),
-            session("session_2", "unrelated"),
-            session("session_3", "Third Straße follow-up"),
+    fn thread_picker_filters_durable_ids_and_preserves_source_order() {
+        let threads = vec![
+            thread("thread_release_alpha", true, false),
+            thread("thread_other", false, false),
+            thread("thread_release_beta", true, true),
         ];
         let mut picker = SessionPickerView {
             filter: String::new(),
@@ -1319,111 +1328,46 @@ mod tests {
         };
 
         assert_eq!(
-            session_ids(picker.matching_sessions(&sessions)),
-            vec!["session_1", "session_2", "session_3"]
+            thread_ids(picker.matching_threads(&threads)),
+            vec![
+                "thread_release_alpha",
+                "thread_other",
+                "thread_release_beta"
+            ]
         );
 
-        picker.filter = "straße".into();
+        picker.filter = "RELEASE".into();
         assert_eq!(
-            session_ids(picker.matching_sessions(&sessions)),
-            vec!["session_1", "session_3"]
+            thread_ids(picker.matching_threads(&threads)),
+            vec!["thread_release_alpha", "thread_release_beta"]
         );
     }
 
     #[test]
-    fn session_picker_ranks_prefixes_before_mid_question_subsequences() {
-        let sessions = vec![
-            session("session_mid", "Plan the deploy checklist"),
-            session("session_prefix", "Deploy the release"),
-            session("session_other", "Review documentation"),
+    fn thread_picker_filters_loaded_unloaded_and_active_live_states() {
+        let threads = vec![
+            thread("thread_one", true, false),
+            thread("thread_two", false, false),
+            thread("thread_three", true, true),
         ];
         let mut picker = SessionPickerView {
-            filter: "DEPLOY".into(),
+            filter: "unloaded".into(),
             selected: 0,
         };
 
         assert_eq!(
-            session_ids(picker.matching_sessions(&sessions)),
-            vec!["session_prefix", "session_mid"]
+            thread_ids(picker.matching_threads(&threads)),
+            vec!["thread_two"]
         );
-
-        picker.filter = "checklist".into();
+        picker.filter = "active".into();
         assert_eq!(
-            session_ids(picker.matching_sessions(&sessions)),
-            vec!["session_mid"]
+            thread_ids(picker.matching_threads(&threads)),
+            vec!["thread_three"]
         );
-    }
-
-    #[test]
-    fn session_picker_preserves_source_order_for_equal_scores_across_repeated_runs() {
-        let sessions = vec![
-            session("session_1", "Review deterministic matching"),
-            session("session_2", "Review deterministic matching"),
-            session("session_3", "Review deterministic matching"),
-        ];
-        let picker = SessionPickerView {
-            filter: "rdm".into(),
-            selected: 0,
-        };
-        let expected = vec!["session_1", "session_2", "session_3"];
-
-        for _ in 0..32 {
-            assert_eq!(session_ids(picker.matching_sessions(&sessions)), expected);
-        }
-    }
-
-    #[test]
-    fn session_picker_uses_nucleo_case_folding_without_unicode_normalization() {
-        let sessions = vec![
-            session("session_1", "Review Café"),
-            session("session_2", "Visit İSTANBUL"),
-        ];
-        let mut picker = SessionPickerView {
-            filter: "cafe\u{301}".into(),
-            selected: 0,
-        };
-
-        assert!(picker.matching_sessions(&sessions).is_empty());
-
-        picker.filter = "istanbul".into();
+        picker.filter = "loaded".into();
         assert_eq!(
-            session_ids(picker.matching_sessions(&sessions)),
-            vec!["session_2"]
-        );
-
-        picker.filter = "i\u{307}stanbul".into();
-        assert_eq!(
-            session_ids(picker.matching_sessions(&sessions)),
-            vec!["session_2"]
-        );
-    }
-
-    #[test]
-    fn session_picker_filters_first_question_with_legacy_and_id_recovery_fallbacks() {
-        let sessions = vec![
-            session_with_questions("session_first", "Plan the release", "approved, go ahead"),
-            session_with_questions("session_legacy", "", "Legacy latest question"),
-        ];
-        let mut picker = SessionPickerView {
-            filter: "release".into(),
-            selected: 0,
-        };
-
-        assert_eq!(
-            session_ids(picker.matching_sessions(&sessions)),
-            vec!["session_first"]
-        );
-        picker.filter = "approved".into();
-        assert!(picker.matching_sessions(&sessions).is_empty());
-        picker.filter = "legacy latest".into();
-        assert_eq!(
-            session_ids(picker.matching_sessions(&sessions)),
-            vec!["session_legacy"]
-        );
-        picker.filter = "SESSION_FIRST".into();
-        assert_eq!(
-            session_ids(picker.matching_sessions(&sessions)),
-            vec!["session_first"]
+            thread_ids(picker.matching_threads(&threads)),
+            vec!["thread_one"]
         );
     }
 
@@ -1453,30 +1397,30 @@ mod tests {
         );
     }
 
-    fn session(session_id: &str, latest_question: &str) -> SessionSummary {
-        session_with_questions(session_id, latest_question, latest_question)
+    fn thread(thread_id: &str, loaded: bool, active: bool) -> ThreadStatus {
+        serde_json::from_value(serde_json::json!({
+            "authority": {
+                "thread_id": thread_id,
+                "parent_thread_id": null,
+                "spawning_actor": "test",
+                "cwd": "/tmp/work",
+                "model": "test-model",
+                "reasoning_effort": "none",
+                "approval_policy": "prompt",
+                "created_at_ms": 1
+            },
+            "live": {
+                "loaded": loaded,
+                "current_turn_id": active.then_some("turn_active")
+            }
+        }))
+        .unwrap()
     }
 
-    fn session_with_questions(
-        session_id: &str,
-        first_question: &str,
-        latest_question: &str,
-    ) -> SessionSummary {
-        SessionSummary {
-            session_id: session_id.into(),
-            run_id: format!("run_{session_id}"),
-            status: RunStateName::Finished,
-            latest_question: latest_question.into(),
-            first_question: first_question.into(),
-            updated_at_ms: 1,
-            ledger_path: "/tmp/agent.db".into(),
-        }
-    }
-
-    fn session_ids(sessions: Vec<&SessionSummary>) -> Vec<&str> {
-        sessions
+    fn thread_ids(threads: Vec<&ThreadStatus>) -> Vec<&str> {
+        threads
             .into_iter()
-            .map(|session| session.session_id.as_str())
+            .map(|thread| thread.authority.thread_id.as_str())
             .collect()
     }
 }

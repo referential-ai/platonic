@@ -1050,7 +1050,7 @@ fn bare_plato_yolo_slash_command_round_trips_typed_session_mutation() {
     fake.wait_for_request_count("session.approval_profile.set", 1);
     let on = fake.requests_for("session.approval_profile.set");
     let on = request_params_value(&on[0]);
-    assert_eq!(on["session_id"], "session_pty_conversation");
+    assert_eq!(on["session_id"], "session_thread_pty_conversation");
     assert_eq!(on["profile"], "yolo");
     let enabled = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "yolo ·");
     assert!(enabled.contains("yolo ·"));
@@ -1059,7 +1059,7 @@ fn bare_plato_yolo_slash_command_round_trips_typed_session_mutation() {
     fake.wait_for_request_count("session.approval_profile.set", 2);
     let off = fake.requests_for("session.approval_profile.set");
     let off = request_params_value(&off[1]);
-    assert_eq!(off["session_id"], "session_pty_conversation");
+    assert_eq!(off["session_id"], "session_thread_pty_conversation");
     assert_eq!(off["profile"], "prompt");
     shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "yolo ·");
 
@@ -1271,6 +1271,13 @@ enabled = ["shell.exec"]
     let mut client = connect_pty_daemon(&config);
     client.hello(&workspace).unwrap();
     let session_id = wait_for_finished_session(&mut client, "allow once");
+    let session_run_id = client
+        .sessions_list()
+        .unwrap()
+        .into_iter()
+        .find(|session| session.session_id == session_id)
+        .unwrap()
+        .run_id;
     let ready = shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "Esc interrupt");
     assert!(ready.contains("? shortcuts · Tab queue 0"));
 
@@ -1343,18 +1350,12 @@ enabled = ["shell.exec"]
     let restart_at = shell.output_len();
     shell.write(
         format!(
-            "\"$PLATO_BIN\" --config \"{}\"; printf '\\n%sSTATUS2:%s\\n' \"$PTY_MARK\" \"$?\"\n",
-            config_path.display()
+            "\"$PLATO_BIN\" --config \"{}\" --run \"{}\"; printf '\\n%sSTATUS2:%s\\n' \"$PTY_MARK\" \"$?\"\n",
+            config_path.display(), session_run_id
         )
         .as_bytes(),
     );
     shell.wait_for_ordered_output_after(restart_at, b"\x1b[6n", b"\x1b[?2026l");
-    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "different session");
-    shell.write(b"/sessions\r");
-    let picker = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Sessions");
-    assert!(picker.contains("allow once"));
-    assert!(picker.contains("different session"));
-    shell.write(b"\x1b[B\r");
     shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "repeat shell");
 
     shell.write(b"restart expires grant\r");
@@ -1626,7 +1627,8 @@ fn streamed_markdown_smooths_holds_tables_and_survives_reload_and_resize() {
     shell.wait_for_current_screen_text("final mid-tok");
 
     shell.write(b"/sessions\r");
-    shell.wait_for_current_screen_text("Sessions");
+    let picker = shell.wait_for_current_screen_text("thread_pty_streaming_384");
+    assert!(picker.contains("Threads"));
     shell.write(b"\r");
     fake.wait_for_request_count("transcript.read", 2);
     let reloaded = shell.wait_for_current_screen_text("final mid-tok");
@@ -1664,7 +1666,7 @@ fn streamed_markdown_smooths_holds_tables_and_survives_reload_and_resize() {
 }
 
 #[test]
-fn bare_plato_session_picker_resumes_exact_hidden_session_id() {
+fn bare_plato_threads_picker_lists_durable_state_and_attaches_exact_thread() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
     let runtime = root.path().join("runtime");
@@ -1690,19 +1692,26 @@ fn bare_plato_session_picker_resumes_exact_hidden_session_id() {
         "Conversation-first PTY question",
     );
 
-    shell.write(b"/sessions\r");
-    let picker = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Sessions");
-    assert!(picker.contains("running"));
-    assert!(picker.contains("Conversation-first PTY question"));
-    assert!(!picker.contains("approved, go ahead"));
-    assert!(!picker.contains("session_pty_conversation"));
+    shell.write(b"/threads\r");
+    let picker = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "thread_pty_conversation");
+    assert!(picker.contains("Threads"));
+    assert!(picker.contains("active"));
+    assert!(picker.contains("thread_pty_conversation"));
+    assert!(picker.contains("unloaded"));
+    assert!(picker.contains("thread_pty_unloaded"));
+    assert!(!picker.contains("Conversation-first PTY question"));
 
     shell.write(b"\r");
     fake.wait_for_request_count("transcript.read", 2);
     let transcript_requests = fake.requests_for("transcript.read");
     assert_eq!(
         request_params_value(&transcript_requests[1])["session_id"],
-        "session_pty_conversation"
+        "session_thread_pty_conversation"
+    );
+    let status_requests = fake.requests_for("thread.status");
+    assert_eq!(
+        request_params_value(&status_requests[0])["thread_id"],
+        "thread_pty_conversation"
     );
 
     shell.write(b"q");
@@ -1717,6 +1726,13 @@ fn bare_plato_session_picker_resumes_exact_hidden_session_id() {
             .filter(|request| request.method.as_deref() == Some("transcript.read"))
             .count(),
         2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method.as_deref() == Some("thread.list"))
+            .count(),
+        1
     );
 }
 
@@ -3026,6 +3042,9 @@ fn fake_response(
                     "run.cancel",
                     "events.stream",
                     "sessions.list",
+                    "thread.list",
+                    "thread.status",
+                    "thread.events",
                     "transcript.read",
                     "transcript.read.typed",
                     "transcript.read.pending_approval",
@@ -3033,6 +3052,42 @@ fn fake_response(
                     "session.approval_profile.set",
                     "approval.decide"
                 ]
+            })
+        }
+        "thread.list" => match scenario {
+            FakeScenario::ConversationAudit => json!({
+                "threads": [
+                    fake_thread_status("thread_pty_conversation", true, Some("turn_pty")),
+                    fake_thread_status("thread_pty_unloaded", false, None)
+                ]
+            }),
+            FakeScenario::Streaming => json!({
+                "threads": [fake_thread_status("thread_pty_streaming_384", true, None)]
+            }),
+            FakeScenario::FreshRun | FakeScenario::PendingApproval => json!({"threads": []}),
+        },
+        "thread.status" => {
+            let Some(ProtocolRequest::ThreadStatus(params)) = request.params.as_ref() else {
+                return Err("thread.status omitted typed params".to_owned());
+            };
+            json!({
+                "thread": fake_thread_status(
+                    &params.thread_id,
+                    params.thread_id != "thread_pty_unloaded",
+                    None
+                )
+            })
+        }
+        "thread.events" => {
+            let Some(ProtocolRequest::ThreadEvents(params)) = request.params.as_ref() else {
+                return Err("thread.events omitted typed params".to_owned());
+            };
+            json!({
+                "thread_id": params.thread_id,
+                "from_offset": params.from_offset.unwrap_or(0),
+                "next_offset": params.from_offset.unwrap_or(0),
+                "current_turn_id": null,
+                "events": []
             })
         }
         "sessions.list" => match scenario {
@@ -3061,7 +3116,7 @@ fn fake_response(
             }),
             FakeScenario::ConversationAudit => json!({
                 "sessions": [{
-                    "session_id": "session_pty_conversation",
+                    "session_id": "session_thread_pty_conversation",
                     "run_id": CONVERSATION_RUN_ID,
                     "status": "running",
                     "latest_question": "approved, go ahead",
@@ -3073,7 +3128,7 @@ fn fake_response(
             FakeScenario::Streaming if request_index == 0 => json!({"sessions": []}),
             FakeScenario::Streaming => json!({
                 "sessions": [{
-                    "session_id": "session_pty_streaming_384",
+                    "session_id": "session_thread_pty_streaming_384",
                     "run_id": STREAMING_RUN_ID,
                     "status": "finished",
                     "latest_question": "stream the answer",
@@ -3372,4 +3427,23 @@ fn fake_response(
         Some(method.to_owned()),
         result,
     ))
+}
+
+fn fake_thread_status(thread_id: &str, loaded: bool, current_turn_id: Option<&str>) -> Value {
+    json!({
+        "authority": {
+            "thread_id": thread_id,
+            "parent_thread_id": null,
+            "spawning_actor": "pty",
+            "cwd": "/tmp/pty-work",
+            "model": "test-model",
+            "reasoning_effort": "none",
+            "approval_policy": "prompt",
+            "created_at_ms": 1_785_638_400_000_u64
+        },
+        "live": {
+            "loaded": loaded,
+            "current_turn_id": current_turn_id
+        }
+    })
 }

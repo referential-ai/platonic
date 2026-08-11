@@ -29,7 +29,7 @@ use std::{
     path::PathBuf,
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tui_textarea::CursorMove;
 
@@ -109,6 +109,20 @@ pub struct ThreadAttachment {
     pub thread_id: String,
     /// Unique controller identity used for turn arbitration.
     pub controller_id: String,
+}
+
+impl ThreadAttachment {
+    /// Creates a thread attachment with a controller identity unique to this TUI process.
+    pub fn new(thread_id: String) -> Self {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+        Self {
+            thread_id,
+            controller_id: format!("tui_{millis}_{}", std::process::id()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -478,7 +492,7 @@ fn handle_key_press(
         }
         KeyCode::Char('q') if state.composer_is_empty() => handle_exit_request(state),
         KeyCode::Char('r') if is_disconnected(state) => {
-            reconnect(commands, state, initial_run_id);
+            reconnect(commands, state, runtime, initial_run_id);
             true
         }
         KeyCode::Enter => {
@@ -581,9 +595,19 @@ fn handle_audit_scroll_key(key: KeyEvent, state: &TuiState, scroll_offset: &mut 
     true
 }
 
-fn reconnect(commands: &Sender<ClientCommand>, state: &mut TuiState, run_id: Option<String>) {
+fn reconnect(
+    commands: &Sender<ClientCommand>,
+    state: &mut TuiState,
+    runtime: &UiRuntime,
+    run_id: Option<String>,
+) {
     state.status_message = Some("reconnecting".into());
-    send_command(commands, ClientCommand::Load { run_id }, state);
+    let command = runtime
+        .thread
+        .clone()
+        .map(|attachment| ClientCommand::LoadThread { attachment })
+        .unwrap_or(ClientCommand::Load { run_id });
+    send_command(commands, command, state);
 }
 
 fn is_disconnected(state: &TuiState) -> bool {
@@ -729,29 +753,21 @@ fn handle_session_picker_key(
     }
 }
 
-fn open_session_picker(state: &mut TuiState) {
-    let selected = state
-        .selected_session_id
-        .as_deref()
-        .and_then(|session_id| {
-            state
-                .sessions
-                .iter()
-                .position(|session| session.session_id == session_id)
-        })
-        .unwrap_or(0);
+fn open_thread_picker(commands: &Sender<ClientCommand>, state: &mut TuiState) {
+    state.threads.clear();
     state.session_picker = Some(SessionPickerView {
         filter: String::new(),
-        selected: selected.min(state.sessions.len().saturating_sub(1)),
+        selected: 0,
     });
-    state.status_message = Some("session picker opened".into());
+    state.status_message = Some("loading threads".into());
+    send_command(commands, ClientCommand::ThreadList, state);
 }
 
 fn move_session_picker_selection(state: &mut TuiState, delta: isize) {
     let count = state
         .session_picker
         .as_ref()
-        .map(|picker| picker.matching_sessions(&state.sessions).len())
+        .map(|picker| picker.matching_threads(&state.threads).len())
         .unwrap_or(0);
     let Some(picker) = state.session_picker.as_mut() else {
         return;
@@ -760,12 +776,12 @@ fn move_session_picker_selection(state: &mut TuiState, delta: isize) {
 }
 
 fn select_picker_session(commands: &Sender<ClientCommand>, state: &mut TuiState) {
-    let Some(session) = state
+    let Some(thread) = state
         .session_picker
         .as_ref()
         .and_then(|picker| {
             picker
-                .matching_sessions(&state.sessions)
+                .matching_threads(&state.threads)
                 .into_iter()
                 .nth(picker.selected)
         })
@@ -773,16 +789,11 @@ fn select_picker_session(commands: &Sender<ClientCommand>, state: &mut TuiState)
     else {
         return;
     };
+    let attachment = ThreadAttachment::new(thread.authority.thread_id.clone());
     state.session_picker = None;
-    state.selected_session_id = Some(session.session_id.clone());
-    state.status_message = Some(format!("loading session {}", session.session_id));
-    send_command(
-        commands,
-        ClientCommand::LoadSession {
-            session_id: session.session_id,
-        },
-        state,
-    );
+    state.selected_thread_id = Some(attachment.thread_id.clone());
+    state.status_message = Some(format!("attaching to thread {}", attachment.thread_id));
+    send_command(commands, ClientCommand::LoadThread { attachment }, state);
 }
 
 fn dispatch_selected_slash_command(
@@ -963,9 +974,7 @@ fn dispatch_slash_command(
     config_path: Option<String>,
 ) -> bool {
     match action {
-        SlashCommandAction::Sessions
-        | SlashCommandAction::NewSession
-        | SlashCommandAction::IssuePrep
+        SlashCommandAction::NewSession | SlashCommandAction::IssuePrep
             if runtime.is_thread_attached() =>
         {
             state.status_message = Some("command unavailable while attached to a thread".into());
@@ -1002,8 +1011,8 @@ fn dispatch_slash_command(
             state.status_message = Some("visible transcript cleared".into());
             true
         }
-        SlashCommandAction::Sessions => {
-            open_session_picker(state);
+        SlashCommandAction::Threads => {
+            open_thread_picker(commands, state);
             true
         }
         SlashCommandAction::NewSession => {
@@ -1016,7 +1025,7 @@ fn dispatch_slash_command(
         }
         SlashCommandAction::Reconnect => {
             if is_disconnected(state) {
-                reconnect(commands, state, initial_run_id);
+                reconnect(commands, state, runtime, initial_run_id);
             } else {
                 state.status_message = Some("already connected".into());
             }
@@ -2379,36 +2388,33 @@ mod tests {
     }
 
     #[test]
-    fn sessions_command_opens_picker_without_daemon_command() {
+    fn threads_and_sessions_open_the_same_picker_and_request_thread_list() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.sessions = vec![test_session(
-            "session_1",
-            "run_1",
-            RunStateName::Finished,
-            "first",
-        )];
-        state.set_composer_text("/sessions");
+        state.threads = vec![test_thread("thread_1", true, false)];
         let runtime = UiRuntime::from_state(&state, None);
 
-        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
-
-        assert_eq!(
-            state.session_picker,
-            Some(SessionPickerView {
-                filter: String::new(),
-                selected: 0,
-            })
-        );
-        assert_eq!(
-            state.status_message.as_deref(),
-            Some("session picker opened")
-        );
-        assert!(receiver.try_recv().is_err());
+        for command in ["/threads", "/sessions"] {
+            state.set_composer_text(command);
+            assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+            assert_eq!(
+                state.session_picker,
+                Some(SessionPickerView {
+                    filter: String::new(),
+                    selected: 0,
+                })
+            );
+            assert_eq!(state.status_message.as_deref(), Some("loading threads"));
+            assert!(matches!(
+                receiver.try_recv().unwrap(),
+                ClientCommand::ThreadList
+            ));
+            state.session_picker = None;
+        }
     }
 
     #[test]
-    fn thread_attachment_keeps_session_commands_on_the_selected_thread() {
+    fn thread_attachment_keeps_non_switching_session_commands_on_the_selected_thread() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
         state.selected_session_id = Some("session_thread_selected".into());
@@ -2418,7 +2424,7 @@ mod tests {
             controller_id: "controller_local".into(),
         }));
 
-        for command in ["/sessions", "/new", "/issue-prep draft"] {
+        for command in ["/new", "/issue-prep draft"] {
             state.set_composer_text(command);
             assert!(submit_composer(&sender, &mut state, &runtime, None, None));
             assert_eq!(
@@ -2435,15 +2441,15 @@ mod tests {
     }
 
     #[test]
-    fn session_picker_enter_loads_focused_filtered_session() {
+    fn thread_picker_enter_loads_focused_filtered_thread_through_attachment() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.sessions = vec![
-            test_session("session_1", "run_1", RunStateName::Finished, "first"),
-            test_session("session_2", "run_2", RunStateName::Interrupted, "second"),
+        state.threads = vec![
+            test_thread("thread_first", true, false),
+            test_thread("thread_second", false, false),
         ];
         state.session_picker = Some(SessionPickerView {
-            filter: "sec".into(),
+            filter: "second".into(),
             selected: 0,
         });
         let runtime = UiRuntime::from_state(&state, None);
@@ -2456,9 +2462,12 @@ mod tests {
         ));
 
         assert!(state.session_picker.is_none());
-        assert_eq!(state.selected_session_id.as_deref(), Some("session_2"));
+        assert_eq!(state.selected_thread_id.as_deref(), Some("thread_second"));
         match receiver.try_recv().unwrap() {
-            ClientCommand::LoadSession { session_id } => assert_eq!(session_id, "session_2"),
+            ClientCommand::LoadThread { attachment } => {
+                assert_eq!(attachment.thread_id, "thread_second");
+                assert!(attachment.controller_id.starts_with("tui_"));
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -2467,9 +2476,9 @@ mod tests {
     fn session_picker_filter_edit_is_local_and_resets_selection() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.sessions = vec![
-            test_session("session_1", "run_1", RunStateName::Finished, "question one"),
-            test_session("session_2", "run_2", RunStateName::Finished, "question two"),
+        state.threads = vec![
+            test_thread("thread_one", true, false),
+            test_thread("thread_two", false, false),
         ];
         state.session_picker = Some(SessionPickerView {
             filter: String::new(),
@@ -2513,10 +2522,10 @@ mod tests {
     fn session_picker_navigation_wraps_filtered_results() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.sessions = vec![
-            test_session("session_1", "run_1", RunStateName::Finished, "alpha"),
-            test_session("session_2", "run_2", RunStateName::Finished, "unrelated"),
-            test_session("session_3", "run_3", RunStateName::Finished, "ALPINE"),
+        state.threads = vec![
+            test_thread("thread_alpha", true, false),
+            test_thread("thread_unrelated", false, false),
+            test_thread("thread_alpine", true, true),
         ];
         state.session_picker = Some(SessionPickerView {
             filter: "alp".into(),
@@ -2543,12 +2552,7 @@ mod tests {
     fn session_picker_no_match_enter_stays_open_and_escape_closes() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.sessions = vec![test_session(
-            "session_1",
-            "run_1",
-            RunStateName::Finished,
-            "first",
-        )];
+        state.threads = vec![test_thread("thread_first", true, false)];
         state.session_picker = Some(SessionPickerView {
             filter: "missing".into(),
             selected: 0,
@@ -4684,5 +4688,25 @@ mod tests {
             updated_at_ms: 1,
             ledger_path: "/tmp/agent.db".into(),
         }
+    }
+
+    fn test_thread(thread_id: &str, loaded: bool, active: bool) -> platonic_protocol::ThreadStatus {
+        serde_json::from_value(serde_json::json!({
+            "authority": {
+                "thread_id": thread_id,
+                "parent_thread_id": null,
+                "spawning_actor": "test",
+                "cwd": "/tmp/work",
+                "model": "test-model",
+                "reasoning_effort": "none",
+                "approval_policy": "prompt",
+                "created_at_ms": 1
+            },
+            "live": {
+                "loaded": loaded,
+                "current_turn_id": active.then_some("turn_active")
+            }
+        }))
+        .unwrap()
     }
 }

@@ -509,7 +509,7 @@ TUI leaves the host daemon and authority record available. Standalone
 `--socket` remains available for focused endpoint proofs.
 It renders a conversation-first transcript with distinct `You` and `Plato`
 messages, at most one subtle trace summary per run, one status row, a composer,
-session picker, and a bounded approval pane above the composer. Press `v` from
+thread picker, and a bounded approval pane above the composer. Press `v` from
 an empty composer to toggle
 the complete ordered audit view without reloading the session.
 Assistant messages render headings, emphasis, lists, quotes, inline code,
@@ -521,7 +521,7 @@ Slash-command suggestions use case-insensitive subsequence matching while
 retaining the five-row popup.
 Committed conversation rows use the terminal's native scrollback, so wheel
 scrolling, text selection, search, and transcript retention after exit work as
-they do for ordinary terminal output. Audit, session, help, status, and approval
+they do for ordinary terminal output. Audit, thread, help, status, and approval
 overlays temporarily use the alternate screen and restore the conversation when
 they close. On resize, the terminal reflows rows already in scrollback while the
 TUI redraws only the live tail, composer, footer, and active overlay; committed
@@ -544,11 +544,10 @@ based on final ledger messages.
 Live Markdown drains at a pressure-adaptive cadence, flushes quiet partial text
 promptly, holds incomplete tables, and consolidates to the exact raw assistant
 source before transcript reload and resize.
-Session picker statuses are `running`, `finished`, `failed`, `canceled`, or
-`interrupted`; `interrupted` means a daemon restart closed a previously running
-session so it can be resumed. Picker rows show that status, a compact relative
-age, and a bounded preview of the session's first question. Raw session IDs stay
-hidden in normal rows while remaining available for exact resume and recovery.
+The thread picker reads `thread.list` and shows every durable thread by stable
+ID with its current `active`, `loaded`, or `unloaded` live state. Selecting a
+thread attaches the TUI through the same path as `plato --remote`, loading its
+available transcript and live events.
 On attach, the TUI selects the latest session by default; submitted messages
 continue that session until `/new` clears the selection.
 Live rows, model status, warnings, and approvals remain bound to that selected
@@ -595,10 +594,11 @@ Keys:
   `Ctrl-W`, and `Ctrl-Y` retain the existing kill/yank bindings.
 - `v` (with an empty composer): toggle conversation and audit views. A `v`
   typed into a nonempty composer remains input.
-- `/sessions`: open the session picker. Type a case-insensitive subsequence of a
-  first-question label or a raw session ID for recovery (`q` is text);
+- `/threads`: open the thread picker. `/sessions` is a compatibility alias for
+  the same action. Type a case-insensitive subsequence of a thread ID or a live
+  state (`q` is text);
   `Backspace` edits; `Up`/`Down`
-  and `Ctrl-P`/`Ctrl-N` wrap through matches; `Enter` resumes the focused match;
+  and `Ctrl-P`/`Ctrl-N` wrap through matches; `Enter` attaches the focused match;
   `Esc` closes. With no matches, `Enter` keeps the picker open.
 - `/status`: request one authoritative runtime readback; `Esc` closes the
   read-only modal.
@@ -621,7 +621,7 @@ Keys:
   TUI. Exiting the TUI does not stop the daemon.
 - `r`: reconnect and reload daemon state.
 - `q` (with an empty composer) or `Esc`: exit the TUI from the main view; the
-  session picker uses them as described above.
+  thread picker uses them as described above.
 
 ## Commands
 

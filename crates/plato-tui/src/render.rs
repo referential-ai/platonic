@@ -14,14 +14,14 @@ use super::{
     markdown::{DEFAULT_SYNTAX_THEME, MarkdownRenderer, SyntaxTheme},
     state::{
         CachedLiveEventRows, CachedTranscriptRows, DisplayMode, FooterMode, LiveEventRowsKey,
-        MotionMode, TranscriptRowsKey, session_question_label,
+        MotionMode, TranscriptRowsKey, thread_live_label,
     },
 };
 use crate::{
     color::{self, SemanticRole},
     commands::{
         FooterHintPriority, FooterHintWhen, KEY_MAP, KeyAction, KeyBinding, KeyLabelPlatform,
-        KeyMap, matching_slash_commands,
+        KeyMap, SLASH_COMMANDS, SlashCommandAction, matching_slash_commands,
     },
 };
 use platonic_protocol::{
@@ -31,9 +31,7 @@ use platonic_protocol::{
 use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthChar;
 
-const SESSION_STATUS_WIDTH: usize = 16;
-const SESSION_AGE_WIDTH: usize = 5;
-const SESSION_QUESTION_MAX_CHARS: usize = 72;
+const THREAD_STATE_WIDTH: usize = 8;
 const WORKING_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 const WORKING_FRAME_MILLIS: u64 = 80;
 const CURSOR_PROBE: Modifier = Modifier::RAPID_BLINK;
@@ -65,7 +63,7 @@ fn render_overlay_at(
     frame: &mut Frame<'_>,
     state: &TuiState,
     history_scroll_offset: usize,
-    now_ms: u64,
+    _now_ms: u64,
 ) {
     let [history, approval, composer, footer] = vertical(frame.area(), state);
     render_history(frame, history, state, history_scroll_offset);
@@ -78,7 +76,7 @@ fn render_overlay_at(
         render_shortcuts_overlay(frame, history);
     }
     if state.session_picker.is_some() {
-        render_session_picker(frame, frame.area(), state, now_ms);
+        render_session_picker(frame, frame.area(), state);
     }
     if let Some(status) = &state.status_modal {
         render_status_modal(frame, frame.area(), status);
@@ -1685,7 +1683,19 @@ fn format_elapsed(seconds: u64) -> String {
 }
 
 fn render_shortcuts_overlay(frame: &mut Frame<'_>, area: Rect) {
-    let lines = shortcut_lines(KEY_MAP, KeyLabelPlatform::current());
+    let mut lines = shortcut_lines(KEY_MAP, KeyLabelPlatform::current());
+    lines.push(Line::from(""));
+    lines.extend(
+        SLASH_COMMANDS
+            .iter()
+            .filter(|command| command.action == SlashCommandAction::Threads)
+            .map(|command| {
+                Line::from(vec![
+                    Span::styled(format!("/{:<10}", command.name), composer_prefix_style()),
+                    Span::styled(command.description, chrome_style()),
+                ])
+            }),
+    );
     let area = centered_overlay_rect(area, 68, lines.len().saturating_add(2));
     if area.is_empty() {
         return;
@@ -1844,37 +1854,37 @@ fn selected_or_none(value: Option<&str>) -> &str {
     value.unwrap_or("none")
 }
 
-fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState, now_ms: u64) {
+fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let area = centered_rect(78, 64, area);
     let row_width = area.width.saturating_sub(2);
     let picker = state
         .session_picker
         .as_ref()
         .expect("session picker is open");
-    let sessions = picker.matching_sessions(&state.sessions);
+    let threads = picker.matching_threads(&state.threads);
     let mut lines = vec![
         Line::from(vec![Span::styled(
-            "Sessions",
+            "Threads",
             Style::default().add_modifier(Modifier::BOLD),
         )]),
         Line::from("Type to filter    Backspace edit    Esc close"),
-        Line::from("Up/Down or Ctrl-P/Ctrl-N move    Enter resume"),
+        Line::from("Up/Down or Ctrl-P/Ctrl-N move    Enter attach"),
         Line::from(format!("Filter: {}|", picker.filter)),
         Line::from(""),
     ];
-    if sessions.is_empty() && state.sessions.is_empty() && picker.filter.is_empty() {
-        lines.push(Line::from("No sessions"));
-    } else if sessions.is_empty() {
-        lines.push(Line::from("No matching sessions"));
+    if threads.is_empty() && state.threads.is_empty() && picker.filter.is_empty() {
+        lines.push(Line::from("No threads"));
+    } else if threads.is_empty() {
+        lines.push(Line::from("No matching threads"));
     } else {
-        lines.extend(sessions.iter().enumerate().map(|(index, session)| {
-            session_picker_row(state, session, index == picker.selected, now_ms, row_width)
+        lines.extend(threads.iter().enumerate().map(|(index, thread)| {
+            session_picker_row(state, thread, index == picker.selected, row_width)
         }));
     }
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title("Sessions"))
+            .block(Block::default().borders(Borders::ALL).title("Threads"))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -1882,74 +1892,42 @@ fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState, no
 
 fn session_picker_row(
     state: &TuiState,
-    session: &platonic_protocol::SessionSummary,
+    thread: &platonic_protocol::ThreadStatus,
     focused: bool,
-    now_ms: u64,
     row_width: u16,
 ) -> Line<'static> {
     let focus = if focused { ">" } else { " " };
-    let current = if state.selected_session_id.as_deref() == Some(session.session_id.as_str()) {
-        "*"
-    } else {
-        " "
-    };
+    let current =
+        if state.selected_thread_id.as_deref() == Some(thread.authority.thread_id.as_str()) {
+            "*"
+        } else {
+            " "
+        };
     let focus_style = if focused {
         selected_row_style()
     } else {
         Style::default()
     };
-    let status_style = if focused {
-        selected_row_style()
-    } else {
-        status_style(&session.status)
-    };
-    let age_style = if focused {
+    let live_style = if focused {
         selected_row_style()
     } else {
         chrome_style()
     };
-    let age = relative_age(session.updated_at_ms, now_ms);
-    let prefix_width = 3 + SESSION_STATUS_WIDTH + 1 + SESSION_AGE_WIDTH + 1;
-    let question_width = usize::from(row_width)
-        .saturating_sub(prefix_width)
-        .min(SESSION_QUESTION_MAX_CHARS);
-    let question = bounded_question_preview(session_question_label(session), question_width);
+    let id_width = usize::from(row_width).saturating_sub(3 + THREAD_STATE_WIDTH + 1);
+    let thread_id = bounded_preview(&thread.authority.thread_id, id_width);
     Line::from(vec![
         Span::styled(format!("{focus}{current} "), focus_style),
         Span::styled(
-            format!("{:<SESSION_STATUS_WIDTH$}", session.status),
-            status_style,
+            format!("{:<THREAD_STATE_WIDTH$}", thread_live_label(thread)),
+            live_style,
         ),
         Span::styled(" ", focus_style),
-        Span::styled(format!("{age:>SESSION_AGE_WIDTH$}"), age_style),
-        Span::styled(" ", focus_style),
-        Span::styled(question, focus_style),
+        Span::styled(thread_id, focus_style),
     ])
 }
 
-fn relative_age(updated_at_ms: u64, now_ms: u64) -> String {
-    if updated_at_ms == 0 {
-        return "--".into();
-    }
-    let elapsed_ms = now_ms.saturating_sub(updated_at_ms);
-    if elapsed_ms < 60_000 {
-        format!("{}s", elapsed_ms / 1_000)
-    } else if elapsed_ms < 3_600_000 {
-        format!("{}m", elapsed_ms / 60_000)
-    } else if elapsed_ms < 86_400_000 {
-        format!("{}h", elapsed_ms / 3_600_000)
-    } else {
-        let days = elapsed_ms / 86_400_000;
-        if days > 999 {
-            "999d+".into()
-        } else {
-            format!("{days}d")
-        }
-    }
-}
-
-fn bounded_question_preview(question: &str, max_chars: usize) -> String {
-    let line = question.lines().next().unwrap_or_default();
+fn bounded_preview(value: &str, max_chars: usize) -> String {
+    let line = value.lines().next().unwrap_or_default();
     if line.chars().count() <= max_chars {
         return line.to_owned();
     }
@@ -1960,15 +1938,6 @@ fn bounded_question_preview(question: &str, max_chars: usize) -> String {
         "{}...",
         line.chars().take(max_chars - 3).collect::<String>()
     )
-}
-
-fn status_style(status: &RunStateName) -> Style {
-    match status {
-        RunStateName::Running => semantic_style(SemanticRole::Success),
-        RunStateName::Interrupted => semantic_style(SemanticRole::Warning),
-        RunStateName::Failed | RunStateName::Canceled => semantic_style(SemanticRole::Error),
-        _ => semantic_style(SemanticRole::Muted),
-    }
 }
 
 fn unix_now_ms() -> u64 {
@@ -2373,10 +2342,6 @@ mod tests {
 
                 assert_eq!(
                     status_row("ready").spans[0].style,
-                    semantic_style(SemanticRole::Muted)
-                );
-                assert_eq!(
-                    status_style(&RunStateName::Finished),
                     semantic_style(SemanticRole::Muted)
                 );
             },
@@ -3322,6 +3287,10 @@ mod tests {
         assert!(output.contains("toggle conversation / audit"));
         assert!(output.contains("Ctrl+C"));
         assert!(output.contains("close overlay"));
+        assert!(output.contains("/threads"));
+        assert!(output.contains("open the thread picker"));
+        assert!(output.contains("/sessions"));
+        assert!(output.contains("compatibility alias for /threads"));
         assert!(output.contains("? shortcuts · Esc close"));
 
         let lines = shortcut_lines(KEY_MAP, KeyLabelPlatform::Other);
@@ -3492,8 +3461,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_session_picker_overlay() {
-        const NOW_MS: u64 = 172_800_000;
+    fn renders_thread_picker_overlay_with_durable_ids_and_live_states() {
         let mut state = TuiState::connected(
             "/tmp/work".into(),
             "/tmp/agent.sock".into(),
@@ -3504,48 +3472,30 @@ mod tests {
                 capabilities: vec![],
                 daemon_scope: None,
             },
-            vec![
-                SessionSummary {
-                    session_id: "session_1".into(),
-                    run_id: "run_1".into(),
-                    status: RunStateName::Finished,
-                    latest_question: "approved, go ahead".into(),
-                    first_question: "read README".into(),
-                    updated_at_ms: 172_680_000,
-                    ledger_path: "/tmp/agent.db".into(),
-                },
-                SessionSummary {
-                    session_id: "session_2".into(),
-                    run_id: "run_2".into(),
-                    status: RunStateName::Interrupted,
-                    latest_question: "continue docs".into(),
-                    first_question: "continue docs".into(),
-                    updated_at_ms: 169_200_000,
-                    ledger_path: "/tmp/agent.db".into(),
-                },
-            ],
+            vec![],
             TranscriptState::None,
         );
-        state.selected_session_id = Some("session_1".into());
+        state.threads = vec![
+            test_thread("thread_loaded", true, false),
+            test_thread("thread_unloaded", false, false),
+            test_thread("thread_active", true, true),
+        ];
+        state.selected_thread_id = Some("thread_loaded".into());
         state.session_picker = Some(super::super::state::SessionPickerView {
             filter: String::new(),
             selected: 1,
         });
 
-        let output = render_to_text_at(&state, NOW_MS);
+        let output = render_to_text(&state);
 
-        assert!(output.contains("Sessions"));
+        assert!(output.contains("Threads"));
         assert!(output.contains("Type to filter"));
         assert!(output.contains("Ctrl-P/Ctrl-N"));
-        assert!(output.contains("Enter resume"));
+        assert!(output.contains("Enter attach"));
         assert!(output.contains("Filter: |"));
-        assert!(output.contains("read README"));
-        assert!(output.contains("2m read README"));
-        assert!(output.contains("interrupted"));
-        assert!(output.contains("1h continue docs"));
-        assert!(!output.contains("approved, go ahead"));
-        assert!(!output.contains("session_1"));
-        assert!(!output.contains("session_2"));
+        assert!(output.contains("loaded   thread_loaded"));
+        assert!(output.contains("unloaded thread_unloaded"));
+        assert!(output.contains("active   thread_active"));
     }
 
     #[test]
@@ -3561,34 +3511,26 @@ mod tests {
             selected: 0,
         });
 
-        let mut session_state = TuiState::disconnected(
+        let mut thread_state = TuiState::disconnected(
             "/tmp/work".into(),
             "/tmp/agent.sock".into(),
             "offline".into(),
         );
-        session_state.sessions = vec![SessionSummary {
-            session_id: "session_1".into(),
-            run_id: "run_1".into(),
-            status: RunStateName::Finished,
-            latest_question: "Review matching".into(),
-            first_question: "Review matching".into(),
-            updated_at_ms: 1,
-            ledger_path: "/tmp/agent.db".into(),
-        }];
-        session_state.selected_session_id = Some("session_1".into());
-        session_state.session_picker = Some(super::super::state::SessionPickerView {
+        thread_state.threads = vec![test_thread("thread_1", true, false)];
+        thread_state.selected_thread_id = Some("thread_1".into());
+        thread_state.session_picker = Some(super::super::state::SessionPickerView {
             filter: String::new(),
             selected: 0,
         });
 
         for width in [40, 80] {
             assert_selected_row_accent(&slash_state, width, "> /issue-prep");
-            assert_selected_row_accent(&session_state, width, ">* finished");
+            assert_selected_row_accent(&thread_state, width, ">* loaded");
         }
     }
 
     #[test]
-    fn session_picker_renders_filtered_sessions_and_explicit_no_match() {
+    fn thread_picker_renders_filtered_threads_and_explicit_no_match() {
         let mut state = TuiState::connected(
             "/tmp/work".into(),
             "/tmp/agent.sock".into(),
@@ -3599,28 +3541,13 @@ mod tests {
                 capabilities: vec![],
                 daemon_scope: None,
             },
-            vec![
-                SessionSummary {
-                    session_id: "session_1".into(),
-                    run_id: "run_1".into(),
-                    status: RunStateName::Finished,
-                    latest_question: "prepare release notes".into(),
-                    first_question: "prepare release notes".into(),
-                    updated_at_ms: 1,
-                    ledger_path: "/tmp/agent.db".into(),
-                },
-                SessionSummary {
-                    session_id: "session_2".into(),
-                    run_id: "run_2".into(),
-                    status: RunStateName::Interrupted,
-                    latest_question: "continue docs".into(),
-                    first_question: "continue docs".into(),
-                    updated_at_ms: 1,
-                    ledger_path: "/tmp/agent.db".into(),
-                },
-            ],
+            vec![],
             TranscriptState::None,
         );
+        state.threads = vec![
+            test_thread("thread_release", true, false),
+            test_thread("thread_continue", false, false),
+        ];
         state.session_picker = Some(super::super::state::SessionPickerView {
             filter: "CONT".into(),
             selected: 0,
@@ -3629,96 +3556,38 @@ mod tests {
         let output = render_to_text_at(&state, 172_800_000);
 
         assert!(output.contains("Filter: CONT|"));
-        assert!(output.contains("continue docs"));
-        assert!(!output.contains("prepare release notes"));
-        assert!(!output.contains("No matching sessions"));
+        assert!(output.contains("thread_continue"));
+        assert!(!output.contains("thread_release"));
+        assert!(!output.contains("No matching threads"));
 
         state.session_picker.as_mut().unwrap().filter = "missing".into();
         let output = render_to_text_at(&state, 172_800_000);
 
         assert!(output.contains("Filter: missing|"));
-        assert!(output.contains("No matching sessions"));
-        assert!(!output.contains("prepare release notes"));
-        assert!(!output.contains("continue docs"));
+        assert!(output.contains("No matching threads"));
+        assert!(!output.contains("thread_release"));
+        assert!(!output.contains("thread_continue"));
     }
 
     #[test]
-    fn session_picker_relative_age_uses_deterministic_unit_boundaries() {
-        const NOW_MS: u64 = 1_000_000_000;
-        for (elapsed_ms, expected) in [
-            (0, "0s"),
-            (999, "0s"),
-            (1_000, "1s"),
-            (59_999, "59s"),
-            (60_000, "1m"),
-            (3_599_999, "59m"),
-            (3_600_000, "1h"),
-            (86_399_999, "23h"),
-            (86_400_000, "1d"),
-        ] {
-            assert_eq!(relative_age(NOW_MS - elapsed_ms, NOW_MS), expected);
-        }
-        assert_eq!(relative_age(NOW_MS + 1, NOW_MS), "0s");
-        assert_eq!(relative_age(0, NOW_MS), "--");
-    }
-
-    #[test]
-    fn session_picker_row_bounds_first_question_and_keeps_legacy_fallback() {
-        let session = SessionSummary {
-            session_id: "session_full_raw_identifier".into(),
-            run_id: "run_full_raw_identifier".into(),
-            status: RunStateName::Finished,
-            latest_question: "approved, go ahead".into(),
-            first_question:
-                "This first question is deliberately much longer than the picker row can display"
-                    .into(),
-            updated_at_ms: 99_000,
-            ledger_path: "/tmp/agent.db".into(),
-        };
+    fn thread_picker_row_bounds_long_stable_id() {
+        let thread = test_thread(
+            "thread_this_identifier_is_deliberately_much_longer_than_the_picker_row",
+            false,
+            false,
+        );
 
         let row = session_picker_row(
             &TuiState::disconnected("w".into(), "s".into(), "e".into()),
-            &session,
+            &thread,
             true,
-            100_000,
             48,
         );
         let rendered = row.to_string();
 
         assert!(row.width() <= 48);
         assert!(rendered.ends_with("..."));
-        assert!(!rendered.contains("session_full_raw_identifier"));
-        assert!(!rendered.contains("approved, go ahead"));
-
-        let legacy = SessionSummary {
-            first_question: String::new(),
-            latest_question: "legacy latest question".into(),
-            updated_at_ms: 0,
-            ..session
-        };
-        let rendered = session_picker_row(
-            &TuiState::disconnected("w".into(), "s".into(), "e".into()),
-            &legacy,
-            false,
-            100_000,
-            80,
-        )
-        .to_string();
-        assert!(rendered.contains("-- legacy latest question"));
-
-        let empty = SessionSummary {
-            latest_question: String::new(),
-            ..legacy
-        };
-        let rendered = session_picker_row(
-            &TuiState::disconnected("w".into(), "s".into(), "e".into()),
-            &empty,
-            false,
-            100_000,
-            80,
-        )
-        .to_string();
-        assert!(rendered.contains("-- (no question)"));
+        assert!(rendered.contains("unloaded"));
     }
 
     #[test]
@@ -4308,6 +4177,26 @@ mod tests {
 
     fn render_to_text_at(state: &TuiState, now_ms: u64) -> String {
         render_snapshot_at(state, 100, 24, now_ms).unwrap()
+    }
+
+    fn test_thread(thread_id: &str, loaded: bool, active: bool) -> platonic_protocol::ThreadStatus {
+        serde_json::from_value(serde_json::json!({
+            "authority": {
+                "thread_id": thread_id,
+                "parent_thread_id": null,
+                "spawning_actor": "test",
+                "cwd": "/tmp/work",
+                "model": "test-model",
+                "reasoning_effort": "none",
+                "approval_policy": "prompt",
+                "created_at_ms": 1
+            },
+            "live": {
+                "loaded": loaded,
+                "current_turn_id": active.then_some("turn_active")
+            }
+        }))
+        .unwrap()
     }
 
     fn render_cursor_position(state: &TuiState, width: u16, height: u16) -> (u16, u16) {
