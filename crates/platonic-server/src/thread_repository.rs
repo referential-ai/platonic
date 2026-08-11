@@ -777,6 +777,7 @@ mod tests {
         let workspace = root.path().join("workspace");
         init_repository(&workspace.join("repo-a"), "a\n");
         init_repository(&workspace.join("repo-b"), "b\n");
+        let workspace = workspace.canonicalize().unwrap();
         let server_db = root.path().join("state/server.db");
         let barrier = Arc::new(Barrier::new(3));
         let workers = [("thread_a", "repo-a"), ("thread_b", "repo-b")].map(|(thread_id, repo)| {
@@ -784,47 +785,53 @@ mod tests {
             let server_db = server_db.clone();
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
-                let drafts = resolve(
-                    &workspace,
-                    thread_id,
-                    &workspace.join(repo),
-                    None,
-                    &[ThreadRepositoryRequest {
-                        repo: repo.into(),
-                        branch: None,
-                    }],
-                )
-                .unwrap();
-                let prepared = prepare(&server_db, "workspace-test", thread_id, &drafts).unwrap();
-                let private = Path::new(&prepared.worktrees[0].path);
-                git(private, &["config", "user.name", "Platonic Test"]).unwrap();
-                git(
-                    private,
-                    &["config", "user.email", "platonic@example.invalid"],
-                )
-                .unwrap();
-                fs::write(private.join("thread.txt"), format!("{thread_id}\n")).unwrap();
-                git(private, &["add", "thread.txt"]).unwrap();
-                git(private, &["commit", "--quiet", "-m", thread_id]).unwrap();
-                let commit = git_stdout(private, &["rev-parse", "HEAD"]).unwrap();
-                let branch = prepared.worktrees[0].branch.clone();
-                let authority = ThreadAuthorityRecord {
-                    thread_id: thread_id.into(),
-                    parent_thread_id: None,
-                    spawning_actor: "test".into(),
-                    agent_id: Some(AgentId::new("plato").unwrap()),
-                    model: "gpt-test".into(),
-                    reasoning_effort: ReasoningEffort::None,
-                    approval_policy: ThreadApprovalPolicy::Prompt,
-                    toolset: vec!["file.read".into()],
-                    worktrees: prepared.worktrees,
-                    granted_paths: prepared.granted_paths,
-                    network: false,
-                    created_at_ms: 1,
-                };
+                let ready = std::panic::catch_unwind(|| {
+                    let drafts = resolve(
+                        &workspace,
+                        thread_id,
+                        &workspace.join(repo),
+                        None,
+                        &[ThreadRepositoryRequest {
+                            repo: repo.into(),
+                            branch: None,
+                        }],
+                    )
+                    .unwrap();
+                    let prepared =
+                        prepare(&server_db, "workspace-test", thread_id, &drafts).unwrap();
+                    let private = Path::new(&prepared.worktrees[0].path);
+                    git(private, &["config", "user.name", "Platonic Test"]).unwrap();
+                    git(
+                        private,
+                        &["config", "user.email", "platonic@example.invalid"],
+                    )
+                    .unwrap();
+                    fs::write(private.join("thread.txt"), format!("{thread_id}\n")).unwrap();
+                    git(private, &["add", "thread.txt"]).unwrap();
+                    git(private, &["commit", "--quiet", "-m", thread_id]).unwrap();
+                    let commit = git_stdout(private, &["rev-parse", "HEAD"]).unwrap();
+                    let branch = prepared.worktrees[0].branch.clone();
+                    let authority = ThreadAuthorityRecord {
+                        thread_id: thread_id.into(),
+                        parent_thread_id: None,
+                        spawning_actor: "test".into(),
+                        agent_id: Some(AgentId::new("plato").unwrap()),
+                        model: "gpt-test".into(),
+                        reasoning_effort: ReasoningEffort::None,
+                        approval_policy: ThreadApprovalPolicy::Prompt,
+                        toolset: vec!["file.read".into()],
+                        worktrees: prepared.worktrees,
+                        granted_paths: prepared.granted_paths,
+                        network: false,
+                        created_at_ms: 1,
+                    };
+                    (authority, repo.to_owned(), branch, commit)
+                });
                 barrier.wait();
+                let (authority, repo, branch, commit) =
+                    ready.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                 integrate_and_discard(&server_db, "workspace-test", &authority).unwrap();
-                (repo.to_owned(), branch, commit)
+                (repo, branch, commit)
             })
         });
         barrier.wait();
