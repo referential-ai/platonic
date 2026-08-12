@@ -12,7 +12,7 @@ export default defineConfig({
     starlight({
       title: "Platonic docs",
       description: "User, developer, and reference documentation for Platonic and Plato Agent.",
-      favicon: "favicon.svg",
+      favicon: "/favicon.svg",
       logo: {
         src: "./src/assets/platonic-mark.svg",
         alt: "",
