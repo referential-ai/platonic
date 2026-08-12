@@ -230,10 +230,23 @@ impl DaemonClient {
         turn_id: Option<String>,
         message: String,
     ) -> ClientResult<ThreadSendResult> {
+        self.thread_send_with_prior_interruption(thread_id, controller_id, turn_id, message, None)
+    }
+
+    /// Starts an idle thread turn with an optional committed prior interruption reference.
+    pub fn thread_send_with_prior_interruption(
+        &mut self,
+        thread_id: String,
+        controller_id: String,
+        turn_id: Option<String>,
+        message: String,
+        prior_interrupted_run_id: Option<String>,
+    ) -> ClientResult<ThreadSendResult> {
         self.request(ProtocolRequest::ThreadSend(ThreadSendParams {
             thread_id,
             controller_id,
             turn_id,
+            prior_interrupted_run_id,
             message,
         }))
     }
@@ -417,6 +430,28 @@ impl DaemonClient {
             config_path,
             overrides,
             approval_profile,
+            prior_interrupted_run_id: None,
+            wait: Some(wait),
+        }))
+    }
+
+    /// Appends a message with a server-verified prior interruption reference.
+    pub fn message_append_to_session_with_prior_interruption(
+        &mut self,
+        message: String,
+        session_id: Option<String>,
+        config_path: Option<String>,
+        approval_profile: Option<ApprovalProfile>,
+        prior_interrupted_run_id: Option<String>,
+        wait: bool,
+    ) -> ClientResult<RunStartResult> {
+        self.request(ProtocolRequest::MessageAppend(MessageAppendParams {
+            message,
+            session_id,
+            config_path,
+            overrides: RunOverrides::default(),
+            approval_profile,
+            prior_interrupted_run_id,
             wait: Some(wait),
         }))
     }

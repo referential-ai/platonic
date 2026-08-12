@@ -12,8 +12,8 @@ mod vad_corpus_tests;
 
 pub use capture::{
     CaptureConfig, CaptureDeviceDescriptor, CaptureDeviceInfo, CaptureMetrics, CaptureOverflow,
-    CapturePartial, CaptureReport, CaptureWorker, CaptureWorkerShutdown, InputDeviceSelection,
-    capture_devices,
+    CapturePartial, CaptureReport, CaptureRequest, CaptureWorker, CaptureWorkerShutdown,
+    InputDeviceSelection, capture_devices,
 };
 pub use kokoro::{
     KOKORO_MODEL_REVISION, KOKORO_MODEL_SHA256, KOKORO_MODEL_SOURCE, KOKORO_SAMPLE_RATE,

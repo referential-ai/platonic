@@ -67,6 +67,7 @@ pub(super) fn handle_run_start(
             config_path: params.config_path,
             overrides: params.overrides,
             approval_profile: Some(params.approval_profile.unwrap_or_default()),
+            prior_interrupted_run_id: None,
             wait: params.wait,
             thread_context: None,
         },
@@ -111,6 +112,7 @@ pub(super) fn handle_message_append(
             config_path: params.config_path,
             overrides: params.overrides,
             approval_profile: params.approval_profile,
+            prior_interrupted_run_id: params.prior_interrupted_run_id,
             wait: params.wait,
             thread_context: None,
         },
@@ -222,6 +224,7 @@ pub(super) fn start_run(
         config_path,
         overrides,
         approval_profile,
+        prior_interrupted_run_id,
         wait,
         thread_context,
     } = request;
@@ -251,6 +254,22 @@ pub(super) fn start_run(
         None
     };
     let session_id = session.session_id().to_string();
+    let voice_interruption_context = match prior_interrupted_run_id.as_deref() {
+        Some(prior_run_id) => {
+            match prior_voice_interruption_context(runtime, &session_id, prior_run_id) {
+                Ok(context) => Some(context),
+                Err(error) => {
+                    return Err(Box::new(Envelope::error(
+                        request_id,
+                        Some(method.into()),
+                        error_code,
+                        error.to_string(),
+                    )));
+                }
+            }
+        }
+        None => None,
+    };
     let run_id = match new_run_id() {
         Ok(run_id) => run_id,
         Err(error) => {
@@ -356,7 +375,7 @@ pub(super) fn start_run(
         event_sender: None,
         stream_to_stderr: false,
         cancel: None,
-        voice_interruption_context: None,
+        voice_interruption_context,
     };
     let run_agent_id = thread_context
         .as_ref()
@@ -559,6 +578,7 @@ fn drive_thread_turn(
                 config_path: driver.config_path.clone(),
                 overrides: driver.overrides.clone(),
                 approval_profile: None,
+                prior_interrupted_run_id: None,
                 wait: Some(true),
                 thread_context: Some(driver.context.clone()),
             },
@@ -971,6 +991,75 @@ fn require_voice_ledger(runtime: &DaemonRuntime, run_id: &str) -> AppResult<()> 
     Ok(())
 }
 
+fn prior_voice_interruption_context(
+    runtime: &DaemonRuntime,
+    session_id: &str,
+    prior_run_id: &str,
+) -> AppResult<String> {
+    validate_voice_run_id(prior_run_id)?;
+    let _state = runtime.state.lock().expect("daemon state lock poisoned");
+    require_voice_ledger(runtime, prior_run_id)?;
+    let ledger = SqliteLedger::open_default_readonly(&runtime.paths.default_ledger())?;
+    let session = ledger.read_session(session_id)?;
+    let prior = session.runs.last().ok_or_else(|| {
+        AppError::VoiceEventContract(format!("session {session_id} has no prior run"))
+    })?;
+    if prior.run_id != prior_run_id {
+        return Err(AppError::VoiceEventContract(format!(
+            "prior interrupted run {prior_run_id} is not the latest run in session {session_id}"
+        )));
+    }
+    if matches!(
+        prior.status,
+        RunStateName::Running | RunStateName::CancelRequested
+    ) {
+        return Err(AppError::VoiceEventContract(format!(
+            "prior interrupted run {prior_run_id} is not terminal"
+        )));
+    }
+    let events = ledger.read_voice_events(prior_run_id)?;
+    let pair = events
+        .len()
+        .checked_sub(2)
+        .and_then(|index| events.get(index).zip(events.get(index.saturating_add(1))));
+    let Some((spoken, interrupted)) = pair else {
+        return Err(AppError::VoiceEventContract(format!(
+            "prior run {prior_run_id} has no committed terminal voice interruption"
+        )));
+    };
+    let (
+        VoiceEvent::VoiceSpoken {
+            run_id: spoken_run,
+            turn_id: spoken_turn,
+            interrupted_at: Some(sentence_index),
+            ..
+        },
+        VoiceEvent::VoiceInterrupted {
+            run_id: interrupted_run,
+            turn_id: interrupted_turn,
+            spoken_prefix,
+            delta_index,
+        },
+    ) = (&spoken.event, &interrupted.event)
+    else {
+        return Err(AppError::VoiceEventContract(format!(
+            "prior run {prior_run_id} has no committed terminal voice interruption"
+        )));
+    };
+    if spoken_run.as_str() != prior_run_id
+        || interrupted_run != spoken_run
+        || interrupted_turn != spoken_turn
+    {
+        return Err(AppError::VoiceEventContract(format!(
+            "prior run {prior_run_id} has a mismatched terminal voice interruption"
+        )));
+    }
+    let prefix = serde_json::to_string(spoken_prefix)?;
+    Ok(format!(
+        "The user interrupted your spoken reply after {prefix} (assistant sentence index {sentence_index}, assistant delta index {delta_index})."
+    ))
+}
+
 fn validate_voice_capture(
     run: &crate::ledger::SessionRunRecords,
     events: &[VoiceEvent],
@@ -1290,9 +1379,10 @@ pub(in crate::daemon::handlers) mod tests {
         daemon::protocol::{EnvelopeKind, StreamEvent, ThreadSendResult},
         daemon::runtime::{PendingApproval, PendingApprovalDecision},
     };
-    #[cfg(target_os = "linux")]
-    use platonic_core::{AgentId, ContextPack, Message, MessageRole, ModelName};
-    use platonic_core::{EffectClass, HarnessEvent, RecordedEvent, RunId, ToolCallId, TurnId};
+    use platonic_core::{
+        AgentId, ContextPack, EffectClass, HarnessEvent, Message, MessageRole, ModelName,
+        RecordedEvent, RunId, ToolCallId, TurnId,
+    };
     use serde_json::json;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
@@ -1339,6 +1429,114 @@ enabled = ["file.read"]
         )
         .unwrap();
         path
+    }
+
+    fn seed_terminal_voice_run(
+        runtime: &DaemonRuntime,
+        session_id: &str,
+        run_id: &str,
+        create_session: bool,
+        interrupted: bool,
+    ) {
+        let run_id = RunId::new(run_id).unwrap();
+        let turn_id = TurnId::new(format!("turn_{}", run_id.as_str())).unwrap();
+        let mut ledger =
+            SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
+        ledger
+            .begin_session_run(session_id, &run_id, "question", create_session)
+            .unwrap();
+        for (seq, event) in [
+            HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: AgentId::new("plato").unwrap(),
+            },
+            HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                context: ContextPack {
+                    token_budget: 1,
+                    fragments: Vec::new(),
+                },
+            },
+            HarnessEvent::ModelRequested {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 0,
+                model: ModelName::new("model").unwrap(),
+            },
+            HarnessEvent::ModelResponded {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 0,
+                output: Message {
+                    role: MessageRole::Assistant,
+                    content: "answer".into(),
+                },
+                proposed_calls: Vec::new(),
+                served_model: None,
+                usage: None,
+            },
+            HarnessEvent::RunFinished {
+                run_id: run_id.clone(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ledger
+                .append(
+                    run_id.as_str(),
+                    &RecordedEvent {
+                        seq: seq as u64,
+                        occurred_at_ms: seq as u64,
+                        event,
+                    },
+                )
+                .unwrap();
+        }
+        ledger.finish_session_run(&run_id, "answer").unwrap();
+        let spoken = VoiceEvent::VoiceSpoken {
+            run_id: run_id.clone(),
+            turn_id: turn_id.clone(),
+            ttfa_ms: 10,
+            sentence_count: 1,
+            interrupted_at: interrupted.then_some(3),
+        };
+        let events = if interrupted {
+            vec![
+                spoken,
+                VoiceEvent::VoiceInterrupted {
+                    run_id,
+                    turn_id,
+                    spoken_prefix: "one \"two\"".into(),
+                    delta_index: 8,
+                },
+            ]
+        } else {
+            vec![spoken]
+        };
+        ledger.append_voice_events(&events).unwrap();
+    }
+
+    #[test]
+    fn prior_interruption_context_is_server_derived_and_bound_to_the_latest_session_run() {
+        let (_root, runtime) = bare_thread_test_runtime();
+        seed_terminal_voice_run(&runtime, "session_voice", "run_prior", true, true);
+
+        assert_eq!(
+            prior_voice_interruption_context(&runtime, "session_voice", "run_prior").unwrap(),
+            "The user interrupted your spoken reply after \"one \\\"two\\\"\" (assistant sentence index 3, assistant delta index 8)."
+        );
+        assert!(prior_voice_interruption_context(&runtime, "session_other", "run_prior").is_err());
+        assert!(
+            prior_voice_interruption_context(&runtime, "session_voice", "run_missing").is_err()
+        );
+
+        seed_terminal_voice_run(&runtime, "session_plain", "run_plain", true, false);
+        assert!(prior_voice_interruption_context(&runtime, "session_plain", "run_plain").is_err());
+
+        seed_terminal_voice_run(&runtime, "session_voice", "run_latest", false, false);
+        assert!(prior_voice_interruption_context(&runtime, "session_voice", "run_prior").is_err());
     }
 
     fn assert_running_admission(

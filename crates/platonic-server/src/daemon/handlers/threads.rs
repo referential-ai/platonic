@@ -933,6 +933,7 @@ pub(super) fn handle_thread_send(
                 reasoning_effort: Some(authority.reasoning_effort),
             },
             approval_profile: None,
+            prior_interrupted_run_id: params.prior_interrupted_run_id,
             wait: Some(false),
             thread_context: Some(context),
         },
@@ -987,6 +988,9 @@ fn validate_thread_send(params: &ThreadSendParams) -> Result<(), String> {
     ActorId::new(params.controller_id.clone()).map_err(|error| error.to_string())?;
     if let Some(turn_id) = &params.turn_id {
         TurnId::new(turn_id.clone()).map_err(|error| error.to_string())?;
+    }
+    if params.turn_id.is_some() && params.prior_interrupted_run_id.is_some() {
+        return Err("thread.send prior interruption is valid only when starting from idle".into());
     }
     if params.message.trim().is_empty() {
         return Err("thread.send message must not be empty".into());

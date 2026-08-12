@@ -315,6 +315,9 @@ pub enum CaptureError {
         /// Caller-selected wait bound.
         milliseconds: u128,
     },
+    /// The owner disarmed capture before an utterance completed.
+    #[error("capture was canceled")]
+    Canceled,
     /// The owned capture worker panicked.
     #[error("capture worker panicked")]
     WorkerPanicked,
