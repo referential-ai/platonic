@@ -1,20 +1,26 @@
 #![cfg(unix)]
 
+use plato_agent::tui::{
+    TuiOptions, VOICE_CONTROL_CAPACITY, VoiceControl, VoiceControlEvent, VoiceControlRequest,
+    VoiceControlResponse, run_tui,
+};
 use platonic_client::paths;
 use platonic_client::{
     ClientError,
     client::{DaemonClient, DaemonConnectionConfig},
 };
+use platonic_core::{RunId, TurnId};
 use platonic_protocol::{
-    ApprovalProfile, ERROR_LAGGED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_UNREGISTERED,
-    Envelope, EnvelopeKind, PROTOCOL_VERSION, ProtocolRequest, RunStateName,
-    ShutdownIfIdleResultName,
+    ApprovalProfile, ERROR_INTERNAL, ERROR_LAGGED, ERROR_UNSUPPORTED_METHOD,
+    ERROR_WORKSPACE_UNREGISTERED, Envelope, EnvelopeKind, PROTOCOL_VERSION, ProtocolRequest,
+    RunStateName, ShutdownIfIdleResultName, StreamEvent, VoiceEvent, VoiceEventEnvelope,
 };
 use pty_process::{
     Size,
     blocking::{Command, Pty, open},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
     io::{BufRead, BufReader, ErrorKind, Read, Write},
@@ -24,9 +30,10 @@ use std::{
         unix::net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
-    process::{Child, ExitStatus},
+    process::{Child, Command as ProcessCommand, ExitStatus},
     sync::{
         Arc, Mutex,
+        atomic::AtomicBool,
         mpsc::{self, Receiver, Sender, TryRecvError},
     },
     thread::{self, JoinHandle},
@@ -44,6 +51,10 @@ const PENDING_RUN_ID: &str = "run_pty_pending";
 const PENDING_CALL_ID: &str = "call_pty_pending";
 const CONVERSATION_RUN_ID: &str = "run_pty_conversation_full_identifier";
 const STREAMING_RUN_ID: &str = "run_pty_streaming_384";
+const VOICE_RUN_ID: &str = "run_pty_voice_interrupted";
+const VOICE_NEXT_RUN_ID: &str = "run_pty_voice_follow_up";
+const VOICE_FIRST_QUESTION: &str = "First voice question";
+const VOICE_NEXT_QUESTION: &str = "Same barge-in utterance";
 const STREAMING_SOURCE: &str = concat!(
     "Burst line one.\n",
     "quiet partial\n",
@@ -1021,6 +1032,352 @@ fn bare_plato_voice_fails_closed_locally_without_a_dedicated_config() {
             .as_deref()
             .is_some_and(|method| method.contains("voice"))
     }));
+}
+
+#[test]
+fn hands_free_voice_bridge_preserves_barge_in_order_through_the_production_tui() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+
+    let workspace_id = paths::workspace_id(&workspace).unwrap();
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
+    let ledger = state.join("fake-agent.db");
+    let fake = FakeDaemon::bind_voice_bridge(&endpoint, &workspace, &workspace_id, &ledger);
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        br#"PLATO_VOICE_FIXTURE_CHILD=1 "$PLATO_TUI_PTY_TEST_BIN" --exact voice_bridge_fixture_child --nocapture; printf '\n%sSTATUS:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Try \"read README.md and summarize it\"",
+    );
+    shell.write(b"/voice on\r");
+
+    let start = fake.wait_for_request("run.start");
+    assert_eq!(
+        request_params_value(&start)["question"],
+        VOICE_FIRST_QUESTION
+    );
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, VOICE_FIRST_QUESTION);
+    let append = fake.wait_for_request("message.append");
+    let append_params = request_params_value(&append);
+    assert_eq!(append_params["message"], VOICE_NEXT_QUESTION);
+    assert_eq!(append_params["session_id"], "session_tui_pty");
+    assert_eq!(append_params["prior_interrupted_run_id"], VOICE_RUN_ID);
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, VOICE_NEXT_QUESTION);
+    shell.write(b"\x03");
+    fake.wait_for_request_count("run.cancel", 2);
+    shell.write(b"q");
+
+    assert_eq!(shell.wait_for_marker("STATUS"), "0");
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+
+    let requests = fake.finish();
+    for method in [
+        "run.start",
+        "run.cancel",
+        "voice.events.commit",
+        "message.append",
+    ] {
+        let expected = match method {
+            "run.cancel" | "voice.events.commit" => 2,
+            _ => 1,
+        };
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method.as_deref() == Some(method))
+                .count(),
+            expected,
+            "unexpected {method} request count"
+        );
+    }
+    let request_index = |method: &str| {
+        requests
+            .iter()
+            .position(|request| request.method.as_deref() == Some(method))
+            .unwrap()
+    };
+    assert!(request_index("run.start") < request_index("run.cancel"));
+    assert!(request_index("run.cancel") < request_index("voice.events.commit"));
+    let commit_positions = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| {
+            (request.method.as_deref() == Some("voice.events.commit")).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert!(commit_positions[1] < request_index("message.append"));
+    let cancel_positions = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| {
+            (request.method.as_deref() == Some("run.cancel")).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert!(request_index("message.append") < cancel_positions[1]);
+    let canceled_runs = requests
+        .iter()
+        .filter(|request| request.method.as_deref() == Some("run.cancel"))
+        .map(|request| {
+            request_params_value(request)["run_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(canceled_runs, [VOICE_RUN_ID, VOICE_NEXT_RUN_ID]);
+
+    let commits = requests
+        .iter()
+        .filter(|request| request.method.as_deref() == Some("voice.events.commit"))
+        .collect::<Vec<_>>();
+    assert_eq!(commits[0].params, commits[1].params);
+    let ProtocolRequest::VoiceEventsCommit(params) = commits[0].params.as_ref().unwrap() else {
+        panic!("voice commit request did not retain typed parameters");
+    };
+    assert_eq!(params.run_id, VOICE_RUN_ID);
+    assert_eq!(params.events.len(), 3);
+    assert!(matches!(
+        &params.events[1],
+        VoiceEvent::VoiceSpoken {
+            interrupted_at: Some(0),
+            ..
+        }
+    ));
+    assert!(matches!(
+        &params.events[2],
+        VoiceEvent::VoiceInterrupted { spoken_prefix, .. }
+            if spoken_prefix == "First audible sentence."
+    ));
+}
+
+#[test]
+fn voice_restart_does_not_recover_an_unacknowledged_in_memory_batch() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+
+    let workspace_id = paths::workspace_id(&workspace).unwrap();
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
+    let ledger = state.join("fake-agent.db");
+    let fake = FakeDaemon::bind_voice_bridge(&endpoint, &workspace, &workspace_id, &ledger);
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        br#"PLATO_VOICE_FIXTURE_CHILD=crash "$PLATO_TUI_PTY_TEST_BIN" --exact voice_bridge_fixture_child --nocapture; printf '\n%sCRASH:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Try \"read README.md and summarize it\"",
+    );
+    shell.write(b"/voice on\r");
+    fake.wait_for_request_count("voice.events.commit", 1);
+    let pid = fs::read_to_string(workspace.join("voice-fixture.pid")).unwrap();
+    assert!(
+        ProcessCommand::new("kill")
+            .args(["-KILL", pid.trim()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(shell.wait_for_marker("CRASH"), "137");
+
+    let restart_at = shell.output_len();
+    shell.write(
+        br#"PLATO_VOICE_FIXTURE_CHILD=restart "$PLATO_TUI_PTY_TEST_BIN" --exact voice_bridge_fixture_child --nocapture; printf '\n%sRESTART:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text_after(INITIAL_ROWS, INITIAL_COLS, restart_at, VOICE_FIRST_QUESTION);
+    shell.write(b"/voice on\r");
+    shell.wait_for_screen_text_after(INITIAL_ROWS, INITIAL_COLS, restart_at, "voice enabled");
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(fake.requests_for("voice.events.commit").len(), 1);
+    assert!(fake.requests_for("message.append").is_empty());
+    shell.write(b"q");
+    assert_eq!(shell.wait_for_marker("RESTART"), "0");
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+
+    let requests = fake.finish();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method.as_deref() == Some("voice.events.commit"))
+            .count(),
+        1
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.method.as_deref() == Some("message.append"))
+    );
+}
+
+#[test]
+fn voice_bridge_fixture_child() {
+    let Some(mode) = std::env::var_os("PLATO_VOICE_FIXTURE_CHILD") else {
+        return;
+    };
+    let workspace = std::env::current_dir().unwrap();
+    if mode == "crash" {
+        fs::write(
+            workspace.join("voice-fixture.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+    }
+    let socket = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
+        .join("platonic")
+        .join("host")
+        .join("agent.sock");
+    let mut options = TuiOptions::new(workspace);
+    options.socket = Some(socket);
+    options.voice = Some(voice_bridge_fixture_control(&mode.to_string_lossy()));
+    run_tui(options).unwrap();
+}
+
+fn voice_bridge_fixture_control(mode: &str) -> VoiceControl {
+    let (request_sender, requests) = mpsc::sync_channel(VOICE_CONTROL_CAPACITY);
+    let (response_sender, responses) = mpsc::channel();
+    let (event_sender, events) = mpsc::channel();
+    let abandon = Arc::new(AtomicBool::new(false));
+    let retry_commit = mode == "1";
+    let emit_capture = mode != "restart";
+    let worker = thread::spawn(move || {
+        let mut cancel_sent = false;
+        let mut commit_sent = false;
+        let mut pending_commit = None;
+        for request in requests {
+            match request {
+                VoiceControlRequest::Enable { .. } => {
+                    response_sender.send(VoiceControlResponse::Enabled).unwrap();
+                    if emit_capture {
+                        event_sender
+                            .send(VoiceControlEvent::Captured {
+                                transcript: VOICE_FIRST_QUESTION.into(),
+                                prior_interrupted_run_id: None,
+                            })
+                            .unwrap();
+                    }
+                }
+                VoiceControlRequest::Stream(StreamEvent::AssistantDelta { run_id, .. })
+                    if run_id == VOICE_RUN_ID && !cancel_sent =>
+                {
+                    cancel_sent = true;
+                    event_sender
+                        .send(VoiceControlEvent::CancelRun { run_id })
+                        .unwrap();
+                }
+                VoiceControlRequest::Terminal { run_id, .. }
+                    if run_id == VOICE_RUN_ID && !commit_sent =>
+                {
+                    commit_sent = true;
+                    let run_id = RunId::new(run_id).unwrap();
+                    let turn_id = TurnId::new("turn_pty_voice").unwrap();
+                    let events = vec![
+                        VoiceEvent::VoiceCaptured {
+                            run_id: run_id.clone(),
+                            turn_id: turn_id.clone(),
+                            transcript_sha256: format!(
+                                "{:x}",
+                                Sha256::digest(VOICE_FIRST_QUESTION.as_bytes())
+                            ),
+                            transcript_bytes: u64::try_from(VOICE_FIRST_QUESTION.len()).unwrap(),
+                            transcript_span_ms: 400,
+                            input_frames: 19_200,
+                            output_frames: 6_400,
+                            vad_start_sample: 100,
+                            vad_speech_end_sample: 5_000,
+                            vad_close_sample: 6_400,
+                            vad_close_to_final_us: 20_000,
+                            normalization_resampling_us: 100,
+                        },
+                        VoiceEvent::VoiceSpoken {
+                            run_id: run_id.clone(),
+                            turn_id: turn_id.clone(),
+                            ttfa_ms: 40,
+                            sentence_count: 1,
+                            interrupted_at: Some(0),
+                        },
+                        VoiceEvent::VoiceInterrupted {
+                            run_id: run_id.clone(),
+                            turn_id,
+                            spoken_prefix: "First audible sentence.".into(),
+                            delta_index: 0,
+                        },
+                    ];
+                    pending_commit = Some(events.clone());
+                    event_sender
+                        .send(VoiceControlEvent::Commit {
+                            run_id: run_id.to_string(),
+                            events,
+                        })
+                        .unwrap();
+                }
+                VoiceControlRequest::CommitAcknowledged { run_id } if run_id == VOICE_RUN_ID => {
+                    event_sender
+                        .send(VoiceControlEvent::Captured {
+                            transcript: VOICE_NEXT_QUESTION.into(),
+                            prior_interrupted_run_id: Some(run_id),
+                        })
+                        .unwrap();
+                }
+                VoiceControlRequest::CommitFailed { run_id }
+                    if retry_commit && run_id == VOICE_RUN_ID =>
+                {
+                    event_sender
+                        .send(VoiceControlEvent::Commit {
+                            run_id,
+                            events: pending_commit.clone().unwrap(),
+                        })
+                        .unwrap();
+                }
+                VoiceControlRequest::Cancel { .. } => {
+                    response_sender
+                        .send(VoiceControlResponse::Silenced)
+                        .unwrap();
+                }
+                VoiceControlRequest::Disable => {
+                    response_sender
+                        .send(VoiceControlResponse::Disabled)
+                        .unwrap();
+                }
+                VoiceControlRequest::Shutdown => {
+                    response_sender
+                        .send(VoiceControlResponse::AlreadyDisabled)
+                        .unwrap();
+                    break;
+                }
+                VoiceControlRequest::SubmissionStarted
+                | VoiceControlRequest::RunObserved { .. }
+                | VoiceControlRequest::Stream(_)
+                | VoiceControlRequest::Terminal { .. }
+                | VoiceControlRequest::SubmissionFailed
+                | VoiceControlRequest::Loaded { .. }
+                | VoiceControlRequest::CommitAcknowledged { .. }
+                | VoiceControlRequest::CommitFailed { .. } => {}
+            }
+        }
+    });
+    VoiceControl::new(request_sender, responses, events, abandon, worker)
 }
 
 #[test]
@@ -2121,6 +2478,7 @@ impl PtyShell {
             .env("XDG_STATE_HOME", state)
             .env("PLATO_BIN", env!("CARGO_BIN_EXE_plato-tui"))
             .env("PLATO_ROOT_BIN", env!("CARGO_BIN_EXE_plato"))
+            .env("PLATO_TUI_PTY_TEST_BIN", std::env::current_exe().unwrap())
             .env("PTY_MARK", MARKER)
             .env("PS1", "")
             .env("PS2", "")
@@ -2727,6 +3085,7 @@ enum FakeScenario {
     PendingApproval,
     ConversationAudit,
     Streaming,
+    VoiceBridge,
 }
 
 struct FakeDaemon {
@@ -2788,6 +3147,21 @@ impl FakeDaemon {
             workspace_id,
             ledger,
             FakeScenario::Streaming,
+        )
+    }
+
+    fn bind_voice_bridge(
+        endpoint: &Path,
+        workspace: &Path,
+        workspace_id: &str,
+        ledger: &Path,
+    ) -> Self {
+        Self::bind_scenario(
+            endpoint,
+            workspace,
+            workspace_id,
+            ledger,
+            FakeScenario::VoiceBridge,
         )
     }
 
@@ -3021,6 +3395,17 @@ fn fake_response(
             "offset is no longer buffered",
         ));
     }
+    if scenario == FakeScenario::VoiceBridge
+        && method == "voice.events.commit"
+        && request_index == 0
+    {
+        return Ok(Envelope::error(
+            request.id.clone(),
+            Some(method.into()),
+            ERROR_INTERNAL,
+            "synthetic lost acknowledgement",
+        ));
+    }
     let result = match method {
         "hello" => {
             let Some(ProtocolRequest::Hello(params)) = request.params.as_ref() else {
@@ -3039,8 +3424,10 @@ fn fake_response(
                 "capabilities": [
                     "hello",
                     "run.start",
+                    "message.append",
                     "run.cancel",
                     "events.stream",
+                    "voice.events.commit",
                     "sessions.list",
                     "thread.list",
                     "thread.status",
@@ -3064,7 +3451,9 @@ fn fake_response(
             FakeScenario::Streaming => json!({
                 "threads": [fake_thread_status("thread_pty_streaming_384", true, None)]
             }),
-            FakeScenario::FreshRun | FakeScenario::PendingApproval => json!({"threads": []}),
+            FakeScenario::FreshRun | FakeScenario::PendingApproval | FakeScenario::VoiceBridge => {
+                json!({"threads": []})
+            }
         },
         "thread.status" => {
             let Some(ProtocolRequest::ThreadStatus(params)) = request.params.as_ref() else {
@@ -3137,6 +3526,18 @@ fn fake_response(
                     "ledger_path": ledger.to_string_lossy()
                 }]
             }),
+            FakeScenario::VoiceBridge if request_index == 0 => json!({"sessions": []}),
+            FakeScenario::VoiceBridge => json!({
+                "sessions": [{
+                    "session_id": "session_tui_pty",
+                    "run_id": VOICE_RUN_ID,
+                    "status": "canceled",
+                    "latest_question": VOICE_FIRST_QUESTION,
+                    "first_question": VOICE_FIRST_QUESTION,
+                    "updated_at_ms": 1_785_638_400_000_u64,
+                    "ledger_path": ledger.to_string_lossy()
+                }]
+            }),
         },
         "transcript.read" if scenario == FakeScenario::PendingApproval => json!({
             "run_id": PENDING_RUN_ID,
@@ -3203,21 +3604,82 @@ fn fake_response(
                 }]
             }
         }),
+        "transcript.read" if scenario == FakeScenario::VoiceBridge => json!({
+            "run_id": VOICE_RUN_ID,
+            "status": "canceled",
+            "final_answer": null,
+            "transcript": format!(
+                "run_id: {VOICE_RUN_ID}\n[turn_pty_voice] user: {VOICE_FIRST_QUESTION}\n[turn_pty_voice] assistant: First audible sentence.\n"
+            ),
+            "typed": {
+                "runs": [{
+                    "run_id": VOICE_RUN_ID,
+                    "session_index": 0,
+                    "status": "canceled",
+                    "entries": [
+                        {"kind": "user", "text": VOICE_FIRST_QUESTION},
+                        {"kind": "assistant", "text": "First audible sentence."}
+                    ]
+                }]
+            }
+        }),
         "run.start" => json!({
-            "run_id": if scenario == FakeScenario::Streaming {
-                STREAMING_RUN_ID
-            } else {
-                "run_tui_pty"
+            "run_id": match scenario {
+                FakeScenario::Streaming => STREAMING_RUN_ID,
+                FakeScenario::VoiceBridge => VOICE_RUN_ID,
+                _ => "run_tui_pty",
             },
             "session_id": "session_tui_pty",
             "ledger_path": ledger.to_string_lossy(),
             "status": "running",
             "final_answer": null
         }),
-        "run.cancel" => json!({
-            "run_id": "run_tui_pty",
-            "status": "cancel_requested"
-        }),
+        "message.append" if scenario == FakeScenario::VoiceBridge => {
+            let Some(ProtocolRequest::MessageAppend(params)) = request.params.as_ref() else {
+                return Err("message.append omitted typed params".to_owned());
+            };
+            if params.message != VOICE_NEXT_QUESTION
+                || params.session_id.as_deref() != Some("session_tui_pty")
+                || params.prior_interrupted_run_id.as_deref() != Some(VOICE_RUN_ID)
+            {
+                return Err(format!(
+                    "voice follow-up changed routing or prior run: {params:?}"
+                ));
+            }
+            json!({
+                "run_id": VOICE_NEXT_RUN_ID,
+                "session_id": "session_tui_pty",
+                "ledger_path": ledger.to_string_lossy(),
+                "status": "running",
+                "final_answer": null
+            })
+        }
+        "run.cancel" => {
+            let Some(ProtocolRequest::RunCancel(params)) = request.params.as_ref() else {
+                return Err("run.cancel omitted typed params".to_owned());
+            };
+            json!({"run_id": params.run_id, "status": "cancel_requested"})
+        }
+        "voice.events.commit" if scenario == FakeScenario::VoiceBridge => {
+            let Some(ProtocolRequest::VoiceEventsCommit(params)) = request.params.as_ref() else {
+                return Err("voice.events.commit omitted typed params".to_owned());
+            };
+            if params.run_id != VOICE_RUN_ID || params.events.len() != 3 {
+                return Err(format!(
+                    "voice commit changed the exact fixture batch: {params:?}"
+                ));
+            }
+            let events = params
+                .events
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(sequence, event)| {
+                    VoiceEventEnvelope::revision_one(u64::try_from(sequence).unwrap(), event)
+                })
+                .collect::<Vec<_>>();
+            json!({"run_id": VOICE_RUN_ID, "events": events})
+        }
         "daemon.status" => json!({
             "model": {
                 "requested_alias": "~openai/gpt-latest",
@@ -3277,6 +3739,7 @@ fn fake_response(
                 FakeScenario::ConversationAudit => CONVERSATION_RUN_ID,
                 FakeScenario::FreshRun => "run_tui_pty",
                 FakeScenario::Streaming => STREAMING_RUN_ID,
+                FakeScenario::VoiceBridge => params.run_id.as_str(),
             };
             let (next_offset, status, events) = match (scenario, request_index) {
                 (FakeScenario::ConversationAudit, 0) => (
@@ -3399,6 +3862,23 @@ fn fake_response(
                         }
                     ]),
                 ),
+                (FakeScenario::VoiceBridge, 0) => (
+                    1,
+                    "running",
+                    json!([{
+                        "offset": 0,
+                        "event": {
+                            "kind": "assistant_delta",
+                            "run_id": VOICE_RUN_ID,
+                            "turn_id": "turn_pty_voice",
+                            "step": 0,
+                            "delta_index": 0,
+                            "text": "First audible sentence."
+                        }
+                    }]),
+                ),
+                (FakeScenario::VoiceBridge, 1) => (1, "canceled", json!([])),
+                (FakeScenario::VoiceBridge, _) => (from_offset, "running", json!([])),
                 _ => (from_offset, "running", json!([])),
             };
             json!({

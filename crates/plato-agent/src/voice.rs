@@ -15,16 +15,17 @@ use std::{
 
 use plato_audio::{
     BargeInMetrics, CaptureConfig, CaptureDeviceInfo, CaptureError, CaptureMetrics, CapturePartial,
-    CaptureReport, CaptureWorker, CaptureWorkerShutdown, InputDeviceSelection, KokoroConfig,
-    KokoroMetrics, KokoroMetricsReader, KokoroProvenance, KokoroSynthesizer, OrtRuntime,
-    OrtRuntimeError, OrtRuntimeMetrics, OrtRuntimeMetricsReader, OutputDeviceSelection,
+    CaptureReport, CaptureRequest, CaptureWorker, CaptureWorkerShutdown, InputDeviceSelection,
+    KokoroConfig, KokoroMetrics, KokoroMetricsReader, KokoroProvenance, KokoroSynthesizer,
+    OrtRuntime, OrtRuntimeError, OrtRuntimeMetrics, OrtRuntimeMetricsReader, OutputDeviceSelection,
     PlaybackConfig, PlaybackDeviceInfo, PlaybackMetrics, PlaybackReport, Sentence, SentenceCutter,
     SileroConfig, SileroMetrics, SileroMetricsReader, SileroProvenance, SileroVad, SpeechSource,
     SpokenInterruption, SttError, SynthError, SynthWorker, SynthWorkerError, SynthWorkerShutdown,
-    SynthWorkerStartError, Transcript, VadError, WhisperConfig, WhisperMetrics,
-    WhisperMetricsReader, WhisperProvenance, WhisperRecognizer,
+    SynthWorkerStartError, SynthesizedSentenceReport, Transcript, VadError, WhisperConfig,
+    WhisperMetrics, WhisperMetricsReader, WhisperProvenance, WhisperRecognizer,
 };
 use platonic_core::{HarnessEvent, RunId, TurnId};
+use platonic_protocol::{RunStateName, StreamEvent};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -258,6 +259,10 @@ impl VoiceActivation {
         self.session.is_some()
     }
 
+    pub(crate) fn session_mut(&mut self) -> Option<&mut VoiceSession> {
+        self.session.as_mut()
+    }
+
     /// Opens one concrete voice session only after the explicit local grant.
     pub fn enable(
         &mut self,
@@ -419,6 +424,57 @@ pub struct VoiceSession {
     silero_metrics: Option<SileroMetricsReader>,
     capture: Option<CaptureWorker>,
     cancel: Arc<AtomicBool>,
+    capture_request: Option<CaptureRequest>,
+    submission_pending: bool,
+    pending_capture: Option<CaptureReport>,
+    streamed_run: Option<StreamedVoiceRun>,
+    pending_commit: Option<PendingVoiceCommit>,
+}
+
+/// One asynchronous outcome from the TUI voice bridge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VoiceSessionEvent {
+    /// One final transcript is ready for the ordinary TUI submission route.
+    Captured {
+        /// Exact final recognizer text.
+        transcript: String,
+        /// Prior interrupted run, present only after its commit acknowledgement.
+        prior_interrupted_run_id: Option<String>,
+    },
+    /// Local playback is silent and the matching daemon run should be canceled.
+    CancelRun {
+        /// Exact run whose playback triggered barge-in.
+        run_id: String,
+    },
+    /// One exact in-memory raw batch is ready for the existing daemon commit method.
+    Commit {
+        /// Terminal run receiving the batch.
+        run_id: String,
+        /// Complete raw batch, retained unchanged until acknowledgement.
+        events: Vec<VoiceEvent>,
+    },
+}
+
+struct StreamedVoiceRun {
+    run_id: RunId,
+    capture: Option<CaptureReport>,
+    capture_turn_id: Option<TurnId>,
+    stream: AssistantTextStream,
+    accepted_sources: BTreeMap<u64, AcceptedNarrationSource>,
+    sentences: Vec<NarratedSentenceReport>,
+    interruption: Option<SpokenInterruption>,
+    next_capture: Option<CaptureReport>,
+    terminal: Option<RunStateName>,
+    audio_finished: bool,
+    barge_cancel_sent: bool,
+    narration_abandoned: bool,
+}
+
+struct PendingVoiceCommit {
+    run_id: String,
+    events: Vec<VoiceEvent>,
+    next_capture: Option<CaptureReport>,
+    retried: bool,
 }
 
 impl VoiceSession {
@@ -443,6 +499,11 @@ impl VoiceSession {
             silero_metrics: None,
             capture: None,
             cancel,
+            capture_request: None,
+            submission_pending: false,
+            pending_capture: None,
+            streamed_run: None,
+            pending_commit: None,
         })
     }
 
@@ -539,6 +600,442 @@ impl VoiceSession {
             .as_ref()
             .expect("open voice session retains its worker")
             .barge_in_metrics()
+    }
+
+    /// Arms one bounded hands-free capture when no submission or commit is active.
+    pub fn arm_capture(&mut self) -> Result<(), VoiceError> {
+        if self.capture_request.is_some()
+            || self.submission_pending
+            || self.pending_capture.is_some()
+            || self.streamed_run.is_some()
+            || self.pending_commit.is_some()
+        {
+            return Ok(());
+        }
+        let capture = self
+            .capture
+            .as_ref()
+            .ok_or(VoiceError::CaptureUnavailable)?;
+        self.capture_request = Some(capture.arm_capture(Duration::from_secs(30))?);
+        Ok(())
+    }
+
+    /// Disarms idle capture before the ordinary daemon submission begins.
+    pub fn submission_started(&mut self) -> Result<(), VoiceError> {
+        self.submission_pending = true;
+        if self.capture_request.is_some() {
+            self.capture
+                .as_ref()
+                .ok_or(VoiceError::CaptureUnavailable)?
+                .cancel_capture()?;
+            self.capture_request = None;
+        }
+        Ok(())
+    }
+
+    /// Drops an unbound captured question after daemon admission failed.
+    pub fn submission_failed(&mut self) -> Result<(), VoiceError> {
+        self.submission_pending = false;
+        self.pending_capture = None;
+        self.arm_capture()
+    }
+
+    /// Binds the current captured question, when any, to one daemon-minted run.
+    pub fn observe_run(&mut self, run_id: &str) -> Result<(), VoiceError> {
+        let run_id =
+            RunId::new(run_id.to_owned()).map_err(|error| contract_error(error.to_string()))?;
+        if let Some(active) = self.streamed_run.as_ref() {
+            if active.run_id == run_id {
+                return Ok(());
+            }
+            return Err(contract_error("voice bridge observed a second active run"));
+        }
+        if self.pending_commit.is_some() {
+            return Err(contract_error(
+                "voice bridge observed a run before the prior voice commit was acknowledged",
+            ));
+        }
+        self.submission_started()?;
+        self.submission_pending = false;
+        self.worker
+            .as_ref()
+            .ok_or(VoiceError::SessionClosed)?
+            .begin_run()?;
+        self.streamed_run = Some(StreamedVoiceRun {
+            run_id,
+            capture: self.pending_capture.take(),
+            capture_turn_id: None,
+            stream: AssistantTextStream::default(),
+            accepted_sources: BTreeMap::new(),
+            sentences: Vec::new(),
+            interruption: None,
+            next_capture: None,
+            terminal: None,
+            audio_finished: false,
+            barge_cancel_sent: false,
+            narration_abandoned: false,
+        });
+        Ok(())
+    }
+
+    /// Feeds one existing daemon stream event into the authoritative text/synthesis owners.
+    pub fn accept_stream_event(&mut self, event: StreamEvent) -> Result<(), VoiceError> {
+        let Some(run_id) = stream_event_run_id(&event) else {
+            return Ok(());
+        };
+        self.observe_run(&run_id)?;
+        let active = self
+            .streamed_run
+            .as_mut()
+            .expect("observing a run creates streamed voice state");
+        if active.run_id.as_str() != run_id {
+            return Err(contract_error("voice stream event run ID changed"));
+        }
+        if let StreamEvent::Ledger { record } = &event
+            && let HarnessEvent::ContextBuilt { turn_id, .. } = &record.event
+        {
+            active
+                .capture_turn_id
+                .get_or_insert_with(|| turn_id.clone());
+        }
+        let event = match event {
+            StreamEvent::Ledger { record } => RunEvent::Ledger(record),
+            StreamEvent::AssistantDelta {
+                run_id,
+                turn_id,
+                step,
+                delta_index,
+                text,
+            } => RunEvent::AssistantDelta(AssistantDeltaEvent {
+                run_id: RunId::new(run_id).map_err(|error| contract_error(error.to_string()))?,
+                turn_id: TurnId::new(turn_id).map_err(|error| contract_error(error.to_string()))?,
+                step,
+                delta_index,
+                text,
+            }),
+            StreamEvent::ApprovalRequested { .. }
+            | StreamEvent::Canceled { .. }
+            | StreamEvent::CompletionClaimed { .. }
+            | StreamEvent::Unknown(_) => return Ok(()),
+        };
+        if active.narration_abandoned {
+            return Ok(());
+        }
+        let accepted = active.stream.accept(event)?;
+        let worker = self.worker.as_ref().ok_or(VoiceError::SessionClosed)?;
+        for narrated in accepted {
+            match worker.try_accept(narrated.sentence, narrated.source) {
+                Ok(admission) => {
+                    if active
+                        .accepted_sources
+                        .insert(
+                            admission.sequence,
+                            AcceptedNarrationSource {
+                                key: narrated.key,
+                                source: narrated.source,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(contract_error(
+                            "synthesis reused a worker sequence within one streamed run",
+                        ));
+                    }
+                    append_completed_sentences(active, admission.completed);
+                }
+                Err(SynthWorkerError::Canceled)
+                    if worker.barge_in_metrics().speech_onset_decision_ns.is_some() => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Records the daemon's terminal status; polling finishes audio and emits any batch.
+    pub fn observe_terminal(
+        &mut self,
+        run_id: &str,
+        status: RunStateName,
+    ) -> Result<(), VoiceError> {
+        let active = self
+            .streamed_run
+            .as_mut()
+            .ok_or_else(|| contract_error("voice terminal arrived without an active run"))?;
+        if active.run_id.as_str() != run_id {
+            return Err(contract_error("voice terminal run ID changed"));
+        }
+        if matches!(
+            status,
+            RunStateName::Running | RunStateName::CancelRequested
+        ) {
+            return Err(contract_error(
+                "voice terminal carried a nonterminal status",
+            ));
+        }
+        active.terminal = Some(status);
+        Ok(())
+    }
+
+    /// Silences local playback for plain Ctrl-C without producing interruption facts.
+    pub fn cancel_run(&mut self, run_id: &str) -> Result<(), VoiceError> {
+        let mut active = self
+            .streamed_run
+            .take()
+            .ok_or_else(|| contract_error("voice cancel arrived without an active run"))?;
+        if active.run_id.as_str() != run_id {
+            self.streamed_run = Some(active);
+            return Err(contract_error("voice cancel run ID changed"));
+        }
+        self.cancel.store(true, Ordering::Release);
+        finish_stream_audio(self.worker.as_ref(), &mut active)?;
+        active.interruption = None;
+        active.next_capture = None;
+        active.narration_abandoned = true;
+        active.barge_cancel_sent = true;
+        if let Some(capture) = self.capture.as_ref() {
+            capture.cancel_capture()?;
+        }
+        self.streamed_run = Some(active);
+        Ok(())
+    }
+
+    /// Silences and abandons narration while leaving the daemon text run untouched.
+    pub fn abandon_run(&mut self) -> Result<(), VoiceError> {
+        self.submission_pending = true;
+        self.pending_capture = None;
+        if self.capture_request.is_some() {
+            self.capture
+                .as_ref()
+                .ok_or(VoiceError::CaptureUnavailable)?
+                .cancel_capture()?;
+            self.capture_request = None;
+        }
+        let Some(mut active) = self.streamed_run.take() else {
+            return Ok(());
+        };
+        self.cancel.store(true, Ordering::Release);
+        finish_stream_audio(self.worker.as_ref(), &mut active)?;
+        active.interruption = None;
+        active.next_capture = None;
+        active.narration_abandoned = true;
+        if let Some(capture) = self.capture.as_ref() {
+            capture.cancel_capture()?;
+        }
+        self.streamed_run = Some(active);
+        Ok(())
+    }
+
+    /// Reconciles an abandoned run after the normal TUI reload path recovers.
+    pub fn observe_loaded_run(&mut self, active_run_id: Option<&str>) -> Result<(), VoiceError> {
+        let Some(mut active) = self.streamed_run.take() else {
+            return match active_run_id {
+                Some(run_id) => self.observe_run(run_id),
+                None => {
+                    self.submission_pending = false;
+                    self.arm_capture()
+                }
+            };
+        };
+        if active_run_id == Some(active.run_id.as_str()) || active.terminal.is_some() {
+            self.streamed_run = Some(active);
+            return Ok(());
+        }
+        if !active.narration_abandoned {
+            self.streamed_run = Some(active);
+            return Err(contract_error(
+                "voice reload dropped an unabandoned active run",
+            ));
+        }
+        finish_stream_audio(self.worker.as_ref(), &mut active)?;
+        self.submission_pending = false;
+        self.arm_capture()
+    }
+
+    /// Polls capture, barge-in, terminal audio, and commit readiness without blocking daemon I/O.
+    pub fn poll_bridge(&mut self) -> Result<Vec<VoiceSessionEvent>, VoiceError> {
+        let mut events = Vec::new();
+        if let Some(request) = self.capture_request.as_ref() {
+            match request.try_complete() {
+                Ok(Some(report)) => {
+                    self.capture_request = None;
+                    let transcript = report.transcript.text.clone();
+                    self.pending_capture = Some(report);
+                    events.push(VoiceSessionEvent::Captured {
+                        transcript,
+                        prior_interrupted_run_id: None,
+                    });
+                }
+                Ok(None) => {}
+                Err(CaptureError::Timeout { .. } | CaptureError::Canceled) => {
+                    self.capture_request = None;
+                }
+                Err(error) => {
+                    self.capture_request = None;
+                    return Err(error.into());
+                }
+            }
+        }
+
+        if let Some(report) = self
+            .capture
+            .as_ref()
+            .ok_or(VoiceError::CaptureUnavailable)?
+            .poll_barge_in_capture()?
+        {
+            let active = self.streamed_run.as_mut().ok_or_else(|| {
+                contract_error("barge-in capture completed without an active run")
+            })?;
+            if !active.narration_abandoned && active.next_capture.replace(report).is_some() {
+                return Err(contract_error(
+                    "one streamed run produced more than one barge-in capture",
+                ));
+            }
+        }
+
+        let barge_started = self
+            .worker
+            .as_ref()
+            .ok_or(VoiceError::SessionClosed)?
+            .barge_in_metrics()
+            .speech_onset_decision_ns
+            .is_some();
+        if self
+            .streamed_run
+            .as_ref()
+            .is_some_and(|active| barge_started && !active.barge_cancel_sent)
+        {
+            let mut active = self.streamed_run.take().expect("checked active run");
+            finish_stream_audio(self.worker.as_ref(), &mut active)?;
+            active.barge_cancel_sent = true;
+            events.push(VoiceSessionEvent::CancelRun {
+                run_id: active.run_id.to_string(),
+            });
+            self.streamed_run = Some(active);
+        }
+
+        let ready = self.streamed_run.as_ref().is_some_and(|active| {
+            active.terminal.is_some()
+                && (active.narration_abandoned
+                    || !active.barge_cancel_sent
+                    || active.next_capture.is_some())
+        });
+        if ready {
+            let mut active = self.streamed_run.take().expect("checked active run");
+            finish_stream_audio(self.worker.as_ref(), &mut active)?;
+            if let Err(error) = active.stream.finish() {
+                if active.narration_abandoned || active.terminal != Some(RunStateName::Finished) {
+                    active.narration_abandoned = true;
+                    active.sentences.clear();
+                    active.accepted_sources.clear();
+                    active.interruption = None;
+                } else {
+                    return Err(match error {
+                        VoiceRunError::Voice(error) => error,
+                        _ => contract_error(error.to_string()),
+                    });
+                }
+            }
+            if active.capture_turn_id.is_none()
+                && (active.narration_abandoned || active.terminal != Some(RunStateName::Finished))
+            {
+                active.capture = None;
+            }
+            let raw = voice_events_for_observations(
+                &active.run_id,
+                &active.sentences,
+                active.capture.as_ref(),
+                active.capture_turn_id.as_ref(),
+                &active.accepted_sources,
+                active.interruption.as_ref(),
+                |sequence| {
+                    self.worker
+                        .as_ref()
+                        .and_then(|worker| worker.accepted_to_first_non_silent_us(sequence))
+                },
+            )?;
+            if active.next_capture.is_some()
+                && !raw.iter().any(|event| {
+                    matches!(
+                        event,
+                        VoiceEvent::VoiceInterrupted { run_id, .. }
+                            if run_id == &active.run_id
+                    )
+                })
+            {
+                return Err(contract_error(
+                    "barge-in utterance completed without an interrupted voice fact",
+                ));
+            }
+            if !raw.is_empty() {
+                let run_id = active.run_id.to_string();
+                self.pending_commit = Some(PendingVoiceCommit {
+                    run_id: run_id.clone(),
+                    events: raw.clone(),
+                    next_capture: active.next_capture,
+                    retried: false,
+                });
+                events.push(VoiceSessionEvent::Commit {
+                    run_id,
+                    events: raw,
+                });
+            }
+            self.submission_pending = false;
+        }
+        self.worker
+            .as_ref()
+            .ok_or(VoiceError::SessionClosed)?
+            .check_health()
+            .map_err(|failure| VoiceError::Worker(SynthWorkerError::Failed(failure)))?;
+        self.capture
+            .as_ref()
+            .ok_or(VoiceError::CaptureUnavailable)?
+            .check_health()?;
+        Ok(events)
+    }
+
+    /// Releases a retained barge-in utterance only after exact commit acknowledgement.
+    pub fn acknowledge_commit(
+        &mut self,
+        run_id: &str,
+    ) -> Result<Option<VoiceSessionEvent>, VoiceError> {
+        let pending = self
+            .pending_commit
+            .take()
+            .ok_or_else(|| contract_error("voice commit acknowledgement had no pending batch"))?;
+        if pending.run_id != run_id {
+            self.pending_commit = Some(pending);
+            return Err(contract_error(
+                "voice commit acknowledgement run ID changed",
+            ));
+        }
+        let Some(report) = pending.next_capture else {
+            return Ok(None);
+        };
+        let transcript = report.transcript.text.clone();
+        self.pending_capture = Some(report);
+        Ok(Some(VoiceSessionEvent::Captured {
+            transcript,
+            prior_interrupted_run_id: Some(run_id.to_owned()),
+        }))
+    }
+
+    /// Returns the unchanged live batch once after a failed acknowledgement attempt.
+    pub fn retry_commit(&mut self, run_id: &str) -> Result<Option<VoiceSessionEvent>, VoiceError> {
+        let pending = self
+            .pending_commit
+            .as_mut()
+            .ok_or_else(|| contract_error("voice commit retry had no pending batch"))?;
+        if pending.run_id != run_id {
+            return Err(contract_error("voice commit retry run ID changed"));
+        }
+        if pending.retried {
+            return Ok(None);
+        }
+        pending.retried = true;
+        Ok(Some(VoiceSessionEvent::Commit {
+            run_id: pending.run_id.clone(),
+            events: pending.events.clone(),
+        }))
     }
 
     fn close(&mut self) -> Result<Option<VoiceSessionShutdown>, VoiceError> {
@@ -780,6 +1277,46 @@ impl Drop for VoiceSession {
     }
 }
 
+fn stream_event_run_id(event: &StreamEvent) -> Option<String> {
+    match event {
+        StreamEvent::Ledger { record } => Some(record.event.run_id().to_string()),
+        StreamEvent::AssistantDelta { run_id, .. }
+        | StreamEvent::ApprovalRequested { run_id, .. }
+        | StreamEvent::Canceled { run_id }
+        | StreamEvent::CompletionClaimed { run_id, .. } => Some(run_id.clone()),
+        StreamEvent::Unknown(_) => None,
+    }
+}
+
+fn append_completed_sentences(
+    active: &mut StreamedVoiceRun,
+    reports: Vec<SynthesizedSentenceReport>,
+) {
+    active
+        .sentences
+        .extend(reports.into_iter().map(|report| NarratedSentenceReport {
+            sentence: report.sentence,
+            playback: report.playback,
+        }));
+}
+
+fn finish_stream_audio(
+    worker: Option<&SynthWorker>,
+    active: &mut StreamedVoiceRun,
+) -> Result<(), VoiceError> {
+    if active.audio_finished {
+        return Ok(());
+    }
+    let worker = worker.ok_or(VoiceError::SessionClosed)?;
+    let completed = worker
+        .wait_until_idle()
+        .map_err(|failure| VoiceError::Worker(SynthWorkerError::Failed(failure)))?;
+    append_completed_sentences(active, completed);
+    active.interruption = worker.finish_run()?;
+    active.audio_finished = true;
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AcceptedNarrationSource {
     key: ResponseKey,
@@ -801,11 +1338,12 @@ fn voice_events_for_run(
     interruption: Option<&SpokenInterruption>,
     worker: &SynthWorker,
 ) -> Result<Vec<VoiceEvent>, VoiceError> {
+    let capture_turn_id = first_response_key.map(|key| &key.turn_id);
     voice_events_for_observations(
         &outcome.run.run_id,
         &outcome.narration.sentences,
         capture,
-        first_response_key,
+        capture_turn_id,
         accepted,
         interruption,
         |sequence| worker.accepted_to_first_non_silent_us(sequence),
@@ -816,7 +1354,7 @@ fn voice_events_for_observations(
     run_id: &RunId,
     sentences: &[NarratedSentenceReport],
     capture: Option<&CaptureReport>,
-    first_response_key: Option<&ResponseKey>,
+    capture_turn_id: Option<&TurnId>,
     accepted: &BTreeMap<u64, AcceptedNarrationSource>,
     interruption: Option<&SpokenInterruption>,
     ttfa_us_for_sequence: impl Fn(u64) -> Option<u64>,
@@ -828,19 +1366,9 @@ fn voice_events_for_observations(
                 "durable capture mapping received a non-final transcript",
             ));
         }
-        let response = first_response_key.ok_or_else(|| {
-            contract_error("captured run completed without a committed response turn")
-        })?;
-        if &response.run_id != run_id {
-            return Err(contract_error(
-                "captured response run ID differed from the completed run",
-            ));
-        }
-        events.push(captured_event(
-            run_id.clone(),
-            response.turn_id.clone(),
-            capture,
-        ));
+        let turn_id = capture_turn_id
+            .ok_or_else(|| contract_error("captured run completed without a durable first turn"))?;
+        events.push(captured_event(run_id.clone(), turn_id.clone(), capture));
     }
 
     let mut turns = Vec::<VoiceTurnEvidence>::new();

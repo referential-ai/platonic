@@ -18,8 +18,8 @@ use rtrb::{Consumer, RingBuffer};
 #[cfg(test)]
 use crate::DeviceBufferSize;
 use crate::{
-    AudioFormat, BargeInHandle, CaptureError, CaptureResampleReport, DeviceError, PcmData,
-    PcmFrame, SampleFormat, SpeechRecognizer, SttError, Transcript, VoiceActivityDetector,
+    AudioFormat, BargeInHandle, CaptureError, CaptureResampleReport, DeviceError, MAX_UTTERANCE_MS,
+    PcmData, PcmFrame, SampleFormat, SpeechRecognizer, SttError, Transcript, VoiceActivityDetector,
     core::{
         capture::CaptureNormalizer,
         vad::{NeuralVadEvent, NeuralVadState},
@@ -49,7 +49,27 @@ pub struct CaptureWorker {
     stream_failed: Arc<AtomicBool>,
     counters: Arc<CaptureCounters>,
     worker_status: Arc<WorkerStatus>,
+    barge_results: Receiver<CaptureMessage>,
     closed: bool,
+}
+
+/// One armed capture whose bounded updates are drained without blocking the owner.
+pub struct CaptureRequest {
+    results: Receiver<CaptureMessage>,
+}
+
+impl CaptureRequest {
+    /// Returns the final report when ready while consuming ephemeral partial hypotheses.
+    pub fn try_complete(&self) -> Result<Option<CaptureReport>, CaptureError> {
+        loop {
+            match self.results.try_recv() {
+                Ok(CaptureMessage::Partial(_)) => {}
+                Ok(CaptureMessage::Complete(result)) => return result.map(Some),
+                Err(TryRecvError::Empty) => return Ok(None),
+                Err(TryRecvError::Disconnected) => return Err(CaptureError::WorkerStopped),
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -189,6 +209,7 @@ impl CaptureWorker {
                 reason: bounded(&error.to_string()),
             })?;
         let (commands, requests) = mpsc::sync_channel(1);
+        let (barge_reply, barge_results) = mpsc::sync_channel(CAPTURE_EVENT_CAPACITY);
         let (worker, worker_status) = spawn_worker(
             CaptureWorkerRuntime {
                 consumer,
@@ -197,6 +218,7 @@ impl CaptureWorker {
                 stream_failed: Arc::clone(&stream_failed),
                 counters: Arc::clone(&counters),
                 barge_in,
+                barge_reply,
             },
             Box::new(detector),
             Box::new(recognizer),
@@ -217,6 +239,7 @@ impl CaptureWorker {
             stream_failed,
             counters,
             worker_status,
+            barge_results,
             closed: false,
         })
     }
@@ -265,6 +288,48 @@ impl CaptureWorker {
             match message {
                 CaptureMessage::Partial(partial) => on_partial(&partial),
                 CaptureMessage::Complete(result) => return result,
+            }
+        }
+    }
+
+    /// Arms one capture and returns immediately so another owner can poll its result.
+    pub fn arm_capture(&self, timeout: Duration) -> Result<CaptureRequest, CaptureError> {
+        if self.closed {
+            return Err(CaptureError::Closed);
+        }
+        self.check_health()?;
+        let (reply, results) = mpsc::sync_channel(CAPTURE_EVENT_CAPACITY);
+        self.commands
+            .send(WorkerCommand::Capture { timeout, reply })
+            .map_err(|_| {
+                if self.worker_status.panicked.load(Ordering::Acquire) {
+                    CaptureError::WorkerPanicked
+                } else {
+                    CaptureError::WorkerStopped
+                }
+            })?;
+        Ok(CaptureRequest { results })
+    }
+
+    /// Disarms the current explicit capture without closing the persistent input stream.
+    pub fn cancel_capture(&self) -> Result<(), CaptureError> {
+        if self.closed {
+            return Err(CaptureError::Closed);
+        }
+        self.commands
+            .send(WorkerCommand::CancelCapture)
+            .map_err(|_| CaptureError::WorkerStopped)
+    }
+
+    /// Polls the final transcript retained from playback-time barge-in onset.
+    pub fn poll_barge_in_capture(&self) -> Result<Option<CaptureReport>, CaptureError> {
+        loop {
+            match self.barge_results.try_recv() {
+                Ok(CaptureMessage::Partial(_)) => {}
+                Ok(CaptureMessage::Complete(Err(CaptureError::Canceled))) => return Ok(None),
+                Ok(CaptureMessage::Complete(result)) => return result.map(Some),
+                Err(TryRecvError::Empty) => return Ok(None),
+                Err(TryRecvError::Disconnected) => return Err(CaptureError::WorkerStopped),
             }
         }
     }
@@ -391,6 +456,7 @@ impl CaptureWorker {
         let stream_failed = Arc::new(AtomicBool::new(false));
         let callback = CallbackWriter::new(producer, format.channels(), Arc::clone(&counters));
         let (commands, requests) = mpsc::sync_channel(1);
+        let (barge_reply, barge_results) = mpsc::sync_channel(CAPTURE_EVENT_CAPACITY);
         let (worker, worker_status) = spawn_worker(
             CaptureWorkerRuntime {
                 consumer,
@@ -399,6 +465,7 @@ impl CaptureWorker {
                 stream_failed: Arc::clone(&stream_failed),
                 counters: Arc::clone(&counters),
                 barge_in,
+                barge_reply,
             },
             Box::new(detector),
             Box::new(recognizer),
@@ -421,6 +488,7 @@ impl CaptureWorker {
                 stream_failed: Arc::clone(&stream_failed),
                 counters,
                 worker_status,
+                barge_results,
                 closed: false,
             },
             callback,
@@ -440,6 +508,7 @@ enum WorkerCommand {
         timeout: Duration,
         reply: SyncSender<CaptureMessage>,
     },
+    CancelCapture,
     Shutdown,
 }
 
@@ -460,6 +529,7 @@ struct CaptureWorkerRuntime {
     stream_failed: Arc<AtomicBool>,
     counters: Arc<CaptureCounters>,
     barge_in: Option<BargeInHandle>,
+    barge_reply: SyncSender<CaptureMessage>,
 }
 
 struct ActiveCapture {
@@ -568,6 +638,7 @@ fn run_worker(
         stream_failed,
         counters,
         barge_in,
+        barge_reply,
     } = runtime;
     let CaptureEngines {
         mut detector,
@@ -602,6 +673,14 @@ fn run_worker(
             }
             Ok(WorkerCommand::Capture { reply, .. }) => {
                 let _ = reply.send(CaptureMessage::Complete(Err(CaptureError::WorkerStopped)));
+            }
+            Ok(WorkerCommand::CancelCapture) => {
+                if let Some(capture) = active.take() {
+                    complete_capture(worker_status, capture, Err(CaptureError::Canceled));
+                }
+                active_barge_in = None;
+                drain_discard(&mut consumer);
+                continue;
             }
             Ok(WorkerCommand::Shutdown) => {
                 if let Some(capture) = active.take() {
@@ -664,6 +743,10 @@ fn run_worker(
             thread::sleep(WORKER_POLL_INTERVAL);
             continue;
         }
+        let audio_available = drained
+            .first()
+            .expect("nonempty drain has one callback timestamp")
+            .available_at;
         let Some(capture) = active.as_mut() else {
             let Some(handle) = barge_in.as_ref() else {
                 continue;
@@ -730,6 +813,7 @@ fn run_worker(
                 .normalization_resampling_us
                 .fetch_add(elapsed_us, Ordering::Relaxed);
             update_global_conversion_counters(&counters, report);
+            let vad_evaluation_started_at = Instant::now();
             let events = match monitor.vad.push(&samples, detector.as_mut()) {
                 Ok(events) => events,
                 Err(error) => {
@@ -740,15 +824,41 @@ fn run_worker(
             if events
                 .iter()
                 .any(|event| matches!(event, NeuralVadEvent::SpeechOnset { .. }))
+                && handle.trigger_speech_onset()
             {
-                let _ = handle.trigger_speech_onset();
+                let monitor = active_barge_in
+                    .take()
+                    .expect("barge-in monitor produced the onset");
+                recognizer.reset();
+                sequence = sequence.saturating_add(1);
+                let timeout = Duration::from_millis(MAX_UTTERANCE_MS);
+                let mut capture = ActiveCapture::new(
+                    sequence,
+                    timeout,
+                    barge_reply.clone(),
+                    monitor.normalizer,
+                    monitor.vad,
+                    monitor.overflow_at_gate,
+                );
+                capture.normalization_resampling_us = elapsed_us;
+                capture.input_frames = u64::try_from(report.input_frames).unwrap_or(u64::MAX);
+                capture.output_frames = u64::try_from(report.output_frames).unwrap_or(u64::MAX);
+                worker_status.arm(barge_reply.clone());
+                active = Some(capture);
+                if !handle_capture_events(
+                    &mut active,
+                    events,
+                    audio_available,
+                    vad_evaluation_started_at,
+                    recognizer.as_mut(),
+                    &counters,
+                    worker_status,
+                ) {
+                    return;
+                }
             }
             continue;
         };
-        let audio_available = drained
-            .first()
-            .expect("nonempty drain has one callback timestamp")
-            .available_at;
         native_samples.clear();
         native_samples.extend(drained.iter().map(|sample| sample.sample));
         let started = Instant::now();
@@ -778,70 +888,91 @@ fn run_worker(
                 continue;
             }
         };
-        for event in events {
-            match event {
-                NeuralVadEvent::SpeechOnset { .. } => {}
-                NeuralVadEvent::RejectedTransient(endpoint) => {
-                    debug_assert!(endpoint.close_sample >= endpoint.speech_end_sample);
-                    counters.rejected_transients.fetch_add(1, Ordering::Relaxed);
-                }
-                NeuralVadEvent::SpeechSamples(samples) => {
-                    let Some(capture) = active.as_mut() else {
-                        break;
-                    };
-                    let updates = match recognize_samples(recognizer.as_mut(), &samples) {
-                        Ok(updates) => updates,
-                        Err(error) => {
-                            let capture = active.take().expect("active capture exists");
-                            complete_capture(worker_status, capture, Err(error));
-                            return;
-                        }
-                    };
-                    for transcript in updates {
-                        let partial =
-                            CapturePartial::new(transcript, duration_us(audio_available.elapsed()));
-                        capture.partials.push(partial.clone());
-                        counters.partial_updates.fetch_add(1, Ordering::Relaxed);
-                        if capture
-                            .reply
-                            .send(CaptureMessage::Partial(partial))
-                            .is_err()
-                        {
-                            worker_status.clear();
-                            return;
-                        }
-                    }
-                }
-                NeuralVadEvent::Segment(segment) => {
-                    let overflow_at_close = counters.overflow();
-                    let capture = active.take().expect("active capture exists");
-                    let recognition = overflow_error(capture.overflow_at_arm, overflow_at_close)
-                        .map_or_else(|| finalize_segment(recognizer.as_mut(), &segment), Err);
-                    let result = recognition.map(|transcript| {
-                        counters.transcripts.fetch_add(1, Ordering::Relaxed);
-                        CaptureReport {
-                            sequence: capture.sequence,
-                            transcript,
-                            partials: capture.partials.clone(),
-                            endpoint: segment.endpoint(),
-                            vad_close_to_final_us: duration_us(vad_evaluation_started_at.elapsed()),
-                            vad_evaluation_started_at,
-                            normalization_resampling_us: capture.normalization_resampling_us,
-                            input_frames: capture.input_frames,
-                            output_frames: capture.output_frames,
-                            overflow: overflow_at_close,
-                        }
-                    });
-                    let recognition_failed = result.is_err();
-                    complete_capture(worker_status, capture, result);
-                    if recognition_failed {
-                        return;
-                    }
+        if !handle_capture_events(
+            &mut active,
+            events,
+            audio_available,
+            vad_evaluation_started_at,
+            recognizer.as_mut(),
+            &counters,
+            worker_status,
+        ) {
+            return;
+        }
+    }
+}
+
+fn handle_capture_events(
+    active: &mut Option<ActiveCapture>,
+    events: Vec<NeuralVadEvent>,
+    audio_available: Instant,
+    vad_evaluation_started_at: Instant,
+    recognizer: &mut dyn SpeechRecognizer,
+    counters: &CaptureCounters,
+    worker_status: &WorkerStatus,
+) -> bool {
+    for event in events {
+        match event {
+            NeuralVadEvent::SpeechOnset { .. } => {}
+            NeuralVadEvent::RejectedTransient(endpoint) => {
+                debug_assert!(endpoint.close_sample >= endpoint.speech_end_sample);
+                counters.rejected_transients.fetch_add(1, Ordering::Relaxed);
+            }
+            NeuralVadEvent::SpeechSamples(samples) => {
+                let Some(capture) = active.as_mut() else {
                     break;
+                };
+                let updates = match recognize_samples(recognizer, &samples) {
+                    Ok(updates) => updates,
+                    Err(error) => {
+                        let capture = active.take().expect("active capture exists");
+                        complete_capture(worker_status, capture, Err(error));
+                        return false;
+                    }
+                };
+                for transcript in updates {
+                    let partial =
+                        CapturePartial::new(transcript, duration_us(audio_available.elapsed()));
+                    capture.partials.push(partial.clone());
+                    counters.partial_updates.fetch_add(1, Ordering::Relaxed);
+                    if capture
+                        .reply
+                        .send(CaptureMessage::Partial(partial))
+                        .is_err()
+                    {
+                        worker_status.clear();
+                        active.take();
+                        return true;
+                    }
                 }
+            }
+            NeuralVadEvent::Segment(segment) => {
+                let overflow_at_close = counters.overflow();
+                let capture = active.take().expect("active capture exists");
+                let recognition = overflow_error(capture.overflow_at_arm, overflow_at_close)
+                    .map_or_else(|| finalize_segment(recognizer, &segment), Err);
+                let result = recognition.map(|transcript| {
+                    counters.transcripts.fetch_add(1, Ordering::Relaxed);
+                    CaptureReport {
+                        sequence: capture.sequence,
+                        transcript,
+                        partials: capture.partials.clone(),
+                        endpoint: segment.endpoint(),
+                        vad_close_to_final_us: duration_us(vad_evaluation_started_at.elapsed()),
+                        vad_evaluation_started_at,
+                        normalization_resampling_us: capture.normalization_resampling_us,
+                        input_frames: capture.input_frames,
+                        output_frames: capture.output_frames,
+                        overflow: overflow_at_close,
+                    }
+                });
+                let recognition_failed = result.is_err();
+                complete_capture(worker_status, capture, result);
+                return !recognition_failed;
             }
         }
     }
+    true
 }
 
 fn fail_barge_in(

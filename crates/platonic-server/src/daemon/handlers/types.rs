@@ -27,6 +27,7 @@ pub(super) struct StartRunRequest {
     pub(super) config_path: Option<String>,
     pub(super) overrides: RunOverrides,
     pub(super) approval_profile: Option<ApprovalProfile>,
+    pub(super) prior_interrupted_run_id: Option<String>,
     pub(super) wait: Option<bool>,
     pub(super) thread_context: Option<ThreadRunContext>,
 }

@@ -263,10 +263,15 @@ plato --tui --voice-config /path/to/voice.toml
 ```
 
 Missing, unreadable, incomplete, or unknown configuration fails closed in the
-TUI status line. Voice starts off after every client restart and `/new` turns it
-off before selecting a fresh session. Install espeak-ng, CUDA, and the native
-cpal backend headers, then place the pinned Kokoro, Silero v6.2.1, and
-large-v3-turbo artifacts described in
+TUI status line. Voice starts off after every client restart. Once enabled, the
+TUI captures whenever no submission is active and sends each final transcript
+through the ordinary composer route: `thread.send` for an attached thread,
+`message.append` for a selected session, or `run.start` otherwise. Exact daemon
+deltas are narrated in order, with the durable response as the final equality
+check. `/voice off`, `/new`, and TUI exit close local capture and playback but do
+not cancel a continuing text run. Install espeak-ng, CUDA, and the native cpal
+backend headers, then place the pinned Kokoro, Silero v6.2.1, and large-v3-turbo
+artifacts described in
 [`../crates/plato-audio/README.md`](../crates/plato-audio/README.md) outside the
 repository for the focused device proofs below.
 
@@ -337,7 +342,9 @@ native protocol accepts one complete batch through `voice.events.commit` and
 returns server-minted envelopes through `voice.events.read`. Offline `plato replay --db=/path/to/run.db
 --run RUN_ID` reads the server-owned per-run log without starting or contacting
 the server. New voice companion streams use that same JSONL file; legacy runs
-remain readable from SQLite.
+remain readable from SQLite. A live client retries only the unchanged in-memory
+batch. There is no voice outbox: a client crash before commit acknowledgement
+can lose voice observations, but never the durable question or text run.
 
 `VoiceCaptured` stores only the final transcript's SHA-256 and UTF-8 byte
 length, transcript span, native and 16 kHz frame counts, VAD sample boundaries,
@@ -359,10 +366,22 @@ recognition failure are typed terminal outcomes.
 During narrated playback, the resident Silero session also evaluates input
 continuously after a fixed 150 ms self-playback gate. Qualified speech uses the
 run's existing cancel atomic, silences the next complete output callback
-quantum, and flushes synthesis/prefetch outside the real-time callback. The next
-run receives exactly one sample-derived spoken prefix and sentence/delta
-position in its recorded `ContextBuilt` current-task context. A generic cancel
-does not create that context, and AU5 does not start another run automatically.
+quantum, and flushes synthesis/prefetch outside the real-time callback. The same
+utterance continues through final recognition while the TUI cancels the daemon
+run. Only after the terminal result and acknowledged interrupted VoiceEvent
+batch does the TUI submit that utterance with the prior run ID; the server then
+derives the one-turn interruption context from committed facts. Plain Ctrl-C
+silences before remote cancellation but creates no interruption fact or next
+prompt.
+
+The client-to-voice queue holds exactly 128 events and never blocks daemon
+polling. Audio retains one capture command, eight capture updates, a 30-second
+utterance limit, four unfinished synthesis sentences, and fixed PCM rings.
+Queue overflow, lag, disconnect, malformed deltas, or audio worker failure
+silences and abandons current narration without replaying possibly audible
+text. The text run continues unless Ctrl-C or barge-in explicitly cancels it,
+and voice may re-arm for a later run after recovery. A captured question whose
+admitted run fails commits only its capture fact.
 
 The deterministic timing command selects a named PipeWire/Pulse null-sink
 monitor through the real production cpal/callback/rtrb/normalization path. The

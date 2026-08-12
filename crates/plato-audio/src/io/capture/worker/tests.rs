@@ -263,6 +263,7 @@ fn worker_thread_start_failure_is_typed_and_bounded() {
     drop(producer);
     let (commands, requests) = mpsc::sync_channel(1);
     drop(commands);
+    let (barge_reply, _barge_results) = mpsc::sync_channel(CAPTURE_EVENT_CAPACITY);
     let result = spawn_worker_with(
         CaptureWorkerRuntime {
             consumer,
@@ -271,6 +272,7 @@ fn worker_thread_start_failure_is_typed_and_bounded() {
             stream_failed: Arc::new(AtomicBool::new(false)),
             counters: Arc::new(CaptureCounters::default()),
             barge_in: None,
+            barge_reply,
         },
         CaptureEngines {
             detector: Box::new(FakeVad),
@@ -328,6 +330,42 @@ fn one_explicit_capture_returns_one_final_endpoint() {
     let shutdown = worker.shutdown();
     assert!(shutdown.worker_joined);
     assert!(shutdown.input_closed);
+}
+
+#[test]
+fn a_dropped_async_capture_does_not_stop_the_persistent_worker() {
+    let (recognizer, finalizations) = fake_recognizer(false);
+    let (worker, mut callback, _) = CaptureWorker::test_worker(
+        format(16_000, 1, SampleFormat::F32),
+        16_384,
+        FakeVad,
+        recognizer,
+    );
+    drop(worker.arm_capture(Duration::from_secs(30)).unwrap());
+    thread::sleep(Duration::from_millis(20));
+    callback.write(&utterance(), CaptureSample::F32);
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while worker.metrics().partial_updates == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(worker.metrics().partial_updates, 1);
+    worker.check_health().unwrap();
+
+    let request = worker.arm_capture(Duration::from_secs(2)).unwrap();
+    thread::sleep(Duration::from_millis(20));
+    callback.write(&utterance(), CaptureSample::F32);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let report = loop {
+        match request.try_complete().unwrap() {
+            Some(report) => break report,
+            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+            None => panic!("replacement capture did not finish"),
+        }
+    };
+    assert_eq!(report.transcript.text, "synthetic question");
+    assert_eq!(finalizations.load(Ordering::Relaxed), 1);
+    assert!(worker.shutdown().worker_joined);
 }
 
 #[test]
@@ -477,7 +515,7 @@ fn recognizer_and_device_failures_are_typed() {
 }
 
 #[test]
-fn continuous_vad_ignores_pre_gate_audio_then_sets_the_shared_cancel() {
+fn continuous_vad_preserves_the_barge_in_utterance_from_onset() {
     let cancel = Arc::new(AtomicBool::new(false));
     let barge_in = BargeInHandle::new(Arc::clone(&cancel));
     barge_in.configure_output(16_000).unwrap();
@@ -503,20 +541,26 @@ fn continuous_vad_ignores_pre_gate_audio_then_sets_the_shared_cancel() {
     barge_in.record_played_frames(2_400);
     callback.write(&vec![0.0; SILERO_WINDOW_SAMPLES], CaptureSample::F32);
     thread::sleep(Duration::from_millis(20));
-    callback.write(
-        &vec![0.05; usize::from(SILERO_MINIMUM_SPEECH_FRAMES) * SILERO_WINDOW_SAMPLES],
-        CaptureSample::F32,
-    );
+    callback.write(&utterance(), CaptureSample::F32);
     let deadline = Instant::now() + Duration::from_secs(1);
     while !cancel.load(Ordering::Acquire) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(1));
     }
 
     assert!(cancel.load(Ordering::Acquire));
+    let report = loop {
+        match worker.poll_barge_in_capture().unwrap() {
+            Some(report) => break report,
+            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+            None => panic!("barge-in utterance did not reach final recognition"),
+        }
+    };
+    assert_eq!(report.transcript.text, "synthetic question");
+    assert!(report.transcript.is_final);
     let metrics = barge_in.metrics();
     assert!(metrics.gate_open_at_decision);
     assert_eq!(metrics.played_frames_at_decision, 2_400);
-    assert_eq!(finalizations.load(Ordering::Relaxed), 0);
+    assert_eq!(finalizations.load(Ordering::Relaxed), 1);
     worker.check_health().unwrap();
     assert!(worker.shutdown().worker_joined);
 }

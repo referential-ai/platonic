@@ -2155,6 +2155,9 @@ pub struct ThreadSendParams {
     /// Exact active turn expected for a steer, or none when starting from idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// Prior interrupted run whose committed server facts should inform this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_interrupted_run_id: Option<String>,
     /// User text to submit to the thread.
     pub message: String,
 }
@@ -2375,6 +2378,9 @@ pub struct MessageAppendParams {
     /// Optional approval profile replacing the existing session's live profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_profile: Option<ApprovalProfile>,
+    /// Prior interrupted run whose committed server facts should inform this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_interrupted_run_id: Option<String>,
     /// Whether the request waits for the run's terminal result.
     #[serde(default)]
     pub wait: Option<bool>,
@@ -4301,6 +4307,53 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(append.approval_profile, Some(ApprovalProfile::Prompt));
+    }
+
+    #[test]
+    fn prior_interruption_reference_is_typed_only_on_session_and_thread_continuations() {
+        let legacy_append: MessageAppendParams = serde_json::from_value(json!({
+            "message": "again",
+            "session_id": "session_1"
+        }))
+        .unwrap();
+        assert_eq!(legacy_append.prior_interrupted_run_id, None);
+        assert!(
+            serde_json::to_value(legacy_append)
+                .unwrap()
+                .get("prior_interrupted_run_id")
+                .is_none()
+        );
+
+        let append: MessageAppendParams = serde_json::from_value(json!({
+            "message": "same utterance",
+            "session_id": "session_1",
+            "prior_interrupted_run_id": "run_prior"
+        }))
+        .unwrap();
+        assert_eq!(
+            append.prior_interrupted_run_id.as_deref(),
+            Some("run_prior")
+        );
+
+        let thread: ThreadSendParams = serde_json::from_value(json!({
+            "thread_id": "thread_1",
+            "controller_id": "terminal_a",
+            "message": "same utterance",
+            "prior_interrupted_run_id": "run_prior"
+        }))
+        .unwrap();
+        assert_eq!(
+            thread.prior_interrupted_run_id.as_deref(),
+            Some("run_prior")
+        );
+
+        assert!(
+            serde_json::from_value::<RunStartParams>(json!({
+                "question": "fresh",
+                "prior_interrupted_run_id": "run_prior"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

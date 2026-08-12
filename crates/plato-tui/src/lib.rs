@@ -27,4 +27,7 @@ pub use state::{
     ActiveRunView, ConnectionState, LiveEventKind, LiveEventLine, SessionPickerView,
     TranscriptState, TranscriptView, TuiState,
 };
-pub use voice::{VoiceControl, VoiceControlRequest, VoiceControlResponse};
+pub use voice::{
+    VOICE_CONTROL_CAPACITY, VoiceControl, VoiceControlEvent, VoiceControlRequest,
+    VoiceControlResponse,
+};

@@ -163,7 +163,7 @@ impl TuiOptions {
 }
 
 /// Connects to the workspace daemon and runs the terminal client.
-pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
+pub fn run_tui(mut options: TuiOptions) -> ClientResult<()> {
     let config = DaemonConnectionConfig::resolve(&options.workspace, options.socket)?;
     let mut state = match options.thread.as_ref() {
         Some(thread) => load_thread_state(&config, thread),
@@ -184,7 +184,7 @@ pub fn run_tui(options: TuiOptions) -> ClientResult<()> {
     let commands = spawn_client_worker_to(
         config.clone(),
         options.thread.clone(),
-        options.voice.clone(),
+        options.voice.take(),
         event_sender.clone(),
     );
     let mut runtime = UiRuntime::from_state(&state, config_path.clone());
@@ -868,6 +868,7 @@ fn request_cancel(commands: &Sender<ClientCommand>, state: &mut TuiState) -> boo
         commands,
         ClientCommand::RunCancel {
             run_id: active.run_id,
+            silence_locally: true,
         },
         state,
     );
@@ -926,6 +927,7 @@ fn submit_composer(
         state.selected_session_id.clone(),
         config_path,
         state.approval_profile,
+        None,
     );
     state.status_message = Some("submitted to daemon".into());
     send_command(commands, command, state);
@@ -1003,7 +1005,7 @@ fn dispatch_slash_command(
             true
         }
         SlashCommandAction::Voice => {
-            set_voice_activation(commands, state, message);
+            set_voice_activation(commands, state, runtime, message);
             true
         }
         SlashCommandAction::Clear => {
@@ -1056,7 +1058,12 @@ pub(super) fn select_fresh_session(state: &mut TuiState) {
     state.status_message = Some("new session selected".into());
 }
 
-fn set_voice_activation(commands: &Sender<ClientCommand>, state: &mut TuiState, message: &str) {
+fn set_voice_activation(
+    commands: &Sender<ClientCommand>,
+    state: &mut TuiState,
+    runtime: &UiRuntime,
+    message: &str,
+) {
     let mut parts = message.split_whitespace();
     let enabled = match (parts.next(), parts.next(), parts.next()) {
         (Some("/voice"), Some("on"), None) => true,
@@ -1074,7 +1081,28 @@ fn set_voice_activation(commands: &Sender<ClientCommand>, state: &mut TuiState, 
         }
         .into(),
     );
-    send_command(commands, ClientCommand::VoiceSet { enabled }, state);
+    let capture_idle = !runtime_is_busy(runtime, state)
+        && (!runtime.is_thread_attached() || runtime.thread_turn_id.is_none());
+    let active_run_id = if enabled {
+        state.active_run.as_ref().and_then(|run| {
+            matches!(
+                run.status,
+                RunStateName::Running | RunStateName::CancelRequested
+            )
+            .then(|| run.run_id.clone())
+        })
+    } else {
+        None
+    };
+    send_command(
+        commands,
+        ClientCommand::VoiceSet {
+            enabled,
+            active_run_id,
+            capture_idle,
+        },
+        state,
+    );
 }
 
 fn set_yolo_profile(commands: &Sender<ClientCommand>, state: &mut TuiState, message: &str) {
@@ -1166,6 +1194,7 @@ pub(super) fn start_next_queued(
         state.selected_session_id.clone(),
         runtime.config_path.clone(),
         state.approval_profile,
+        None,
     );
     runtime.polling = true;
     runtime.poll_in_flight = false;
@@ -1182,6 +1211,7 @@ fn submit_message_command(
     selected_session_id: Option<String>,
     config_path: Option<String>,
     approval_profile: ApprovalProfile,
+    prior_interrupted_run_id: Option<String>,
 ) -> ClientCommand {
     match selected_session_id {
         Some(session_id) => ClientCommand::MessageAppend {
@@ -1189,6 +1219,7 @@ fn submit_message_command(
             session_id,
             config_path,
             approval_profile: None,
+            prior_interrupted_run_id,
         },
         None => ClientCommand::RunStart {
             question: message,
@@ -1196,6 +1227,63 @@ fn submit_message_command(
             approval_profile,
         },
     }
+}
+
+pub(super) fn submit_voice_transcript(
+    commands: &Sender<ClientCommand>,
+    state: &mut TuiState,
+    runtime: &UiRuntime,
+    transcript: String,
+    prior_interrupted_run_id: Option<String>,
+) {
+    if transcript.trim().is_empty() {
+        let message = "voice capture returned an empty final transcript".to_owned();
+        send_command(
+            commands,
+            ClientCommand::VoiceSubmissionFailed { reason: message },
+            state,
+        );
+        return;
+    }
+    if (!runtime.is_thread_attached() && runtime_is_busy(runtime, state))
+        || (runtime.is_thread_attached() && runtime.thread_turn_id.is_some())
+    {
+        let message = "voice capture arrived while another submission was active".to_owned();
+        send_command(
+            commands,
+            ClientCommand::VoiceSubmissionFailed { reason: message },
+            state,
+        );
+        return;
+    }
+    if prior_interrupted_run_id.is_some()
+        && !runtime.is_thread_attached()
+        && state.selected_session_id.is_none()
+    {
+        let message = "voice interruption has no selected session".to_owned();
+        send_command(
+            commands,
+            ClientCommand::VoiceSubmissionFailed { reason: message },
+            state,
+        );
+        return;
+    }
+    push_live_event(state, crate::LiveEventLine::user(transcript.clone()));
+    let command = if runtime.is_thread_attached() {
+        runtime
+            .thread_send_command_with_prior(transcript, prior_interrupted_run_id)
+            .expect("attached runtime builds thread sends")
+    } else {
+        submit_message_command(
+            transcript,
+            state.selected_session_id.clone(),
+            runtime.config_path.clone(),
+            state.approval_profile,
+            prior_interrupted_run_id,
+        )
+    };
+    state.status_message = Some("submitted voice transcript".into());
+    send_command(commands, command, state);
 }
 
 pub(super) fn send_command(
@@ -1680,6 +1768,7 @@ mod tests {
                 question,
                 config_path,
                 approval_profile,
+                ..
             } => {
                 assert_eq!(question, "start work");
                 assert_eq!(config_path.as_deref(), Some("plato.toml"));
@@ -1712,6 +1801,7 @@ mod tests {
                 session_id,
                 config_path,
                 approval_profile,
+                ..
             } => {
                 assert_eq!(message, "continue work");
                 assert_eq!(session_id, "session_1");
@@ -1721,6 +1811,67 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
         assert!(state.composer.is_empty());
+    }
+
+    #[test]
+    fn voice_transcripts_reuse_fresh_session_and_thread_submission_routes() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, Some("plato.toml".into()));
+        submit_voice_transcript(&sender, &mut state, &runtime, "fresh voice".into(), None);
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientCommand::RunStart { question, .. } if question == "fresh voice"
+        ));
+
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.selected_session_id = Some("session_voice".into());
+        let runtime = UiRuntime::from_state(&state, Some("plato.toml".into()));
+        submit_voice_transcript(
+            &sender,
+            &mut state,
+            &runtime,
+            "continued voice".into(),
+            Some("run_interrupted".into()),
+        );
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientCommand::MessageAppend {
+                message,
+                session_id,
+                prior_interrupted_run_id: Some(prior),
+                ..
+            } if message == "continued voice"
+                && session_id == "session_voice"
+                && prior == "run_interrupted"
+        ));
+
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let mut runtime = UiRuntime::from_state(&state, None);
+        runtime.attach_thread(Some(ThreadAttachment {
+            thread_id: "thread_voice".into(),
+            controller_id: "controller_voice".into(),
+        }));
+        submit_voice_transcript(
+            &sender,
+            &mut state,
+            &runtime,
+            "thread voice".into(),
+            Some("run_interrupted".into()),
+        );
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientCommand::ThreadSend {
+                thread_id,
+                message,
+                prior_interrupted_run_id: Some(prior),
+                ..
+            } if thread_id == "thread_voice"
+                && message == "thread voice"
+                && prior == "run_interrupted"
+        ));
     }
 
     #[test]
@@ -2016,7 +2167,7 @@ mod tests {
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
         assert!(matches!(
             receiver.recv().unwrap(),
-            ClientCommand::VoiceSet { enabled: true }
+            ClientCommand::VoiceSet { enabled: true, .. }
         ));
         assert_eq!(state.status_message.as_deref(), Some("enabling voice"));
 
@@ -2032,7 +2183,7 @@ mod tests {
         assert!(submit_composer(&sender, &mut state, &runtime, None, None));
         assert!(matches!(
             receiver.recv().unwrap(),
-            ClientCommand::VoiceSet { enabled: false }
+            ClientCommand::VoiceSet { enabled: false, .. }
         ));
         apply_client_event(
             &mut state,
@@ -2061,6 +2212,50 @@ mod tests {
             );
             assert!(receiver.try_recv().is_err());
         }
+    }
+
+    #[test]
+    fn voice_enable_disarms_capture_while_a_submission_is_active() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.active_run = Some(crate::ActiveRunView::new(
+            "run_active".into(),
+            RunStateName::Running,
+        ));
+        let runtime = UiRuntime::from_state(&state, None);
+
+        state.set_composer_text("/voice on");
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ClientCommand::VoiceSet {
+                enabled: true,
+                active_run_id: Some(run_id),
+                capture_idle: false,
+            } if run_id == "run_active"
+        ));
+    }
+
+    #[test]
+    fn voice_enable_arms_capture_after_the_previous_run_is_terminal() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.active_run = Some(crate::ActiveRunView::new(
+            "run_finished".into(),
+            RunStateName::Finished,
+        ));
+        let runtime = UiRuntime::from_state(&state, None);
+
+        state.set_composer_text("/voice on");
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ClientCommand::VoiceSet {
+                enabled: true,
+                active_run_id: None,
+                capture_idle: true,
+            }
+        ));
     }
 
     #[test]
@@ -3613,6 +3808,7 @@ mod tests {
                 question,
                 config_path,
                 approval_profile,
+                ..
             } => {
                 assert_eq!(question, "next turn");
                 assert_eq!(config_path.as_deref(), Some("plato.toml"));
@@ -3663,6 +3859,7 @@ mod tests {
                 session_id,
                 config_path,
                 approval_profile,
+                ..
             } => {
                 assert_eq!(message, "next turn");
                 assert_eq!(session_id, "session_1");
@@ -4240,7 +4437,7 @@ mod tests {
         assert!(state.cancel_requested);
         assert_eq!(state.footer_mode(), crate::state::FooterMode::QuitConfirm);
         match receiver.try_recv().unwrap() {
-            ClientCommand::RunCancel { run_id } => assert_eq!(run_id, "run_1"),
+            ClientCommand::RunCancel { run_id, .. } => assert_eq!(run_id, "run_1"),
             other => panic!("unexpected command: {other:?}"),
         }
 
@@ -4268,7 +4465,7 @@ mod tests {
         assert_eq!(state.footer_mode(), crate::state::FooterMode::QuitConfirm);
         assert!(matches!(
             receiver.try_recv().unwrap(),
-            ClientCommand::RunCancel { run_id } if run_id == "run_escape"
+            ClientCommand::RunCancel { run_id, .. } if run_id == "run_escape"
         ));
     }
 
@@ -4293,7 +4490,7 @@ mod tests {
         assert!(state.cancel_requested);
         assert!(matches!(
             receiver.try_recv().unwrap(),
-            ClientCommand::RunCancel { run_id } if run_id == "run_approval_escape"
+            ClientCommand::RunCancel { run_id, .. } if run_id == "run_approval_escape"
         ));
     }
 
