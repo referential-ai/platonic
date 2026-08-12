@@ -1200,6 +1200,12 @@ fn voice_restart_does_not_recover_an_unacknowledged_in_memory_batch() {
     );
     assert_eq!(shell.wait_for_marker("CRASH"), "137");
 
+    shell.write(
+        br#"stty sane; printf '\n%sVOICE_TTY_SANE:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    assert_eq!(shell.wait_for_marker("VOICE_TTY_SANE"), "0");
+
     let restart_at = shell.output_len();
     shell.write(
         br#"PLATO_VOICE_FIXTURE_CHILD=restart "$PLATO_TUI_PTY_TEST_BIN" --exact voice_bridge_fixture_child --nocapture; printf '\n%sRESTART:%s\n' "$PTY_MARK" "$?"
