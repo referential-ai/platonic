@@ -974,6 +974,7 @@ fn drain_after_exit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use crate::ApprovalRequest;
     use platonic_core::HarnessEvent;
     use std::fs;
