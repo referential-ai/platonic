@@ -1114,11 +1114,8 @@ pub(in crate::daemon::handlers) mod tests {
         daemon::runtime::{PendingApproval, PendingApprovalDecision},
     };
     #[cfg(target_os = "linux")]
-    use platonic_core::{AgentId, ContextPack};
-    use platonic_core::{
-        EffectClass, HarnessEvent, Message, MessageRole, ModelName, RecordedEvent, RunId,
-        ToolCallId, TurnId,
-    };
+    use platonic_core::{AgentId, ContextPack, Message, MessageRole, ModelName};
+    use platonic_core::{EffectClass, HarnessEvent, RecordedEvent, RunId, ToolCallId, TurnId};
     use serde_json::json;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
@@ -1127,11 +1124,13 @@ pub(in crate::daemon::handlers) mod tests {
         time::Duration,
     };
 
+    #[cfg(target_os = "linux")]
+    use crate::daemon::handlers::sessions::read_run_transcript;
     use crate::daemon::handlers::{
         handle_line,
-        sessions::read_run_transcript,
         threads::{tests::*, thread_session_id},
     };
+    #[cfg(target_os = "linux")]
     use crate::daemon::runtime::ShutdownIfIdleDecision;
     pub(in crate::daemon::handlers) fn response_result<T: serde::de::DeserializeOwned>(
         response: &Envelope,

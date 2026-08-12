@@ -1278,25 +1278,25 @@ fn joined_thread_status(
 pub(in crate::daemon::handlers) mod tests {
     use super::*;
 
+    use platonic_core::EffectClass;
     #[cfg(target_os = "linux")]
-    use platonic_core::AgentId;
-    use platonic_core::{EffectClass, RunId};
+    use platonic_core::{AgentId, RunId};
     use serde_json::json;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
-    use std::{
-        sync::{Arc, Barrier},
-        time::Duration,
-    };
+    #[cfg(target_os = "linux")]
+    use std::sync::Barrier;
+    use std::{sync::Arc, time::Duration};
 
+    #[cfg(target_os = "linux")]
+    use crate::daemon::handlers::runs::{finish_run_after_event_collection, spawn_event_collector};
     use crate::daemon::handlers::{
-        handle_line, handle_request,
-        registry::tests::workspace_request,
+        handle_line, handle_request, registry::tests::workspace_request,
         runs::tests::response_result,
-        runs::{finish_run_after_event_collection, spawn_event_collector},
     };
+    #[cfg(target_os = "linux")]
+    use crate::{ApprovalMode, RunLedger, RunOptions};
     use crate::{
-        ApprovalMode, RunLedger, RunOptions,
         daemon::{
             protocol::{RunStateName, ThreadApprovalPolicy},
             runtime::{RunRecord, ThreadTurnBinding},
@@ -1304,10 +1304,9 @@ pub(in crate::daemon::handlers) mod tests {
         ledger::SqliteLedger,
         server_store::AgentRecord,
     };
-    use std::{
-        sync::{atomic::Ordering, mpsc},
-        thread,
-    };
+    #[cfg(target_os = "linux")]
+    use std::sync::mpsc;
+    use std::{sync::atomic::Ordering, thread};
 
     pub(in crate::daemon::handlers) fn bare_thread_test_runtime()
     -> (tempfile::TempDir, DaemonRuntime) {

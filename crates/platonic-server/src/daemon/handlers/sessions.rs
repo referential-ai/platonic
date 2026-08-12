@@ -403,7 +403,6 @@ pub(super) fn latest_session_id(runtime: &DaemonRuntime) -> Result<String, Strin
 mod tests {
     use super::*;
     use crate::daemon::protocol::StreamEvent;
-    #[cfg(target_os = "linux")]
     use platonic_core::AgentId;
     use platonic_core::{
         ActorId, ContextFragment, ContextLane, EffectClass, HarnessEvent, Message, MessageRole,
