@@ -519,7 +519,7 @@ fn continuous_vad_preserves_the_barge_in_utterance_from_onset() {
     let cancel = Arc::new(AtomicBool::new(false));
     let barge_in = BargeInHandle::new(Arc::clone(&cancel));
     barge_in.configure_output(16_000).unwrap();
-    barge_in.begin_run();
+    let generation = barge_in.begin_run();
     barge_in.record_playback_started();
     barge_in.record_queued_frames(8_192);
     let (recognizer, finalizations) = fake_recognizer(false);
@@ -540,7 +540,11 @@ fn continuous_vad_preserves_the_barge_in_utterance_from_onset() {
 
     barge_in.record_played_frames(2_400);
     callback.write(&vec![0.0; SILERO_WINDOW_SAMPLES], CaptureSample::F32);
-    thread::sleep(Duration::from_millis(20));
+    let readiness_deadline = Instant::now() + Duration::from_secs(1);
+    while !worker.barge_in_monitor_ready(generation) && Instant::now() < readiness_deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(worker.barge_in_monitor_ready(generation));
     callback.write(&utterance(), CaptureSample::F32);
     let deadline = Instant::now() + Duration::from_secs(1);
     while !cancel.load(Ordering::Acquire) && Instant::now() < deadline {
@@ -548,10 +552,14 @@ fn continuous_vad_preserves_the_barge_in_utterance_from_onset() {
     }
 
     assert!(cancel.load(Ordering::Acquire));
+    let report_deadline = Instant::now() + Duration::from_secs(1);
     let report = loop {
         match worker.poll_barge_in_capture().unwrap() {
             Some(report) => break report,
-            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+            None if Instant::now() < report_deadline => {
+                callback.write(&vec![0.0; SILERO_WINDOW_SAMPLES], CaptureSample::F32);
+                thread::sleep(Duration::from_millis(1));
+            }
             None => panic!("barge-in utterance did not reach final recognition"),
         }
     };

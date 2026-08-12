@@ -25,6 +25,8 @@ use crate::{
         vad::{NeuralVadEvent, NeuralVadState},
     },
 };
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 
 use super::{
     CaptureConfig, CaptureCounters, CaptureDeviceInfo, CaptureMetrics, CaptureOverflow,
@@ -76,6 +78,8 @@ impl CaptureRequest {
 struct WorkerStatus {
     active_reply: Mutex<Option<SyncSender<CaptureMessage>>>,
     barge_failure: Mutex<Option<String>>,
+    #[cfg(test)]
+    barge_in_generation: AtomicU64,
     panicked: AtomicBool,
     exited: AtomicBool,
 }
@@ -332,6 +336,14 @@ impl CaptureWorker {
                 Err(TryRecvError::Disconnected) => return Err(CaptureError::WorkerStopped),
             }
         }
+    }
+
+    #[cfg(test)]
+    fn barge_in_monitor_ready(&self, generation: u64) -> bool {
+        self.worker_status
+            .barge_in_generation
+            .load(Ordering::Acquire)
+            == generation
     }
 
     /// Reads monotonic capture, endpointing, and callback-overflow counters.
@@ -786,6 +798,10 @@ fn run_worker(
                     vad,
                     overflow_at_gate: counters.overflow(),
                 });
+                #[cfg(test)]
+                worker_status
+                    .barge_in_generation
+                    .store(generation, Ordering::Release);
                 // The gate can open during a native callback. Start on the next
                 // drained batch so pre-gate self-playback never enters Silero.
                 continue;
