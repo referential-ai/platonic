@@ -12,11 +12,12 @@ use crate::{
         protocol::{
             ApprovalDecideParams, ApprovalDecision, BufferedStreamEvent, CommandAcceptedResult,
             ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
-            ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_THREAD_SEND_FAILED, Envelope,
-            EventsStreamParams, EventsStreamResult, IssuePrepResult, IssuePrepStartParams,
-            IssuePrepStartResult, MessageAppendParams, ProtocolResponse, RunCancelParams,
-            RunStartParams, RunStartResult, RunStateName, StreamEvent, ThreadApprovalPolicy,
-            ThreadConfinement,
+            ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_THREAD_SEND_FAILED,
+            ERROR_VOICE_EVENTS_CONFLICT, Envelope, EventsStreamParams, EventsStreamResult,
+            IssuePrepResult, IssuePrepStartParams, IssuePrepStartResult, MessageAppendParams,
+            ProtocolResponse, RunCancelParams, RunStartParams, RunStartResult, RunStateName,
+            StreamEvent, ThreadApprovalPolicy, ThreadConfinement, VoiceEvent,
+            VoiceEventsCommitParams, VoiceEventsReadParams, VoiceEventsResult,
         },
         runtime::{
             DaemonRuntime, IssuePrepAdmissionError, RunAdmissionError, RunRecord,
@@ -30,7 +31,8 @@ use crate::{
     tool_catalog::SHELL_EXEC,
     tools::ThreadSpawnToolHandler,
 };
-use platonic_core::{ActorId, AgentId, EffectClass};
+use platonic_core::{ActorId, AgentId, EffectClass, HarnessEvent, RunId};
+use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -44,6 +46,9 @@ use std::{
 pub(super) const DEFAULT_EVENT_LIMIT: usize = 64;
 pub(super) const MAX_EVENT_LIMIT: usize = 128;
 const EVENT_COLLECTOR_PANIC: &str = "daemon event collector panicked";
+const MAX_VOICE_EVENTS: usize = 128;
+const MAX_VOICE_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
+const MAX_SPOKEN_PREFIX_BYTES: usize = 16 * 1024;
 
 pub(super) fn handle_run_start(
     runtime: &DaemonRuntime,
@@ -840,6 +845,178 @@ pub(super) fn handle_events_stream(
         }
     };
     Envelope::typed_response(request.id, ProtocolResponse::EventsStream(result))
+}
+
+pub(super) fn handle_voice_events_commit(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: VoiceEventsCommitParams,
+) -> Envelope {
+    let request_id = request.id;
+    match commit_voice_events(runtime, params) {
+        Ok(result) => {
+            Envelope::typed_response(request_id, ProtocolResponse::VoiceEventsCommit(result))
+        }
+        Err(error) => voice_events_error(request_id, "voice.events.commit", error),
+    }
+}
+
+fn commit_voice_events(
+    runtime: &DaemonRuntime,
+    params: VoiceEventsCommitParams,
+) -> AppResult<VoiceEventsResult> {
+    validate_voice_commit_request(&params)?;
+
+    // ponytail: one global lock gives both backends one writer; split only if throughput needs it.
+    let _state = runtime.state.lock().expect("daemon state lock poisoned");
+    require_voice_ledger(runtime, &params.run_id)?;
+    let mut ledger = SqliteLedger::open_or_create_default(&runtime.paths.default_ledger())?;
+    let run = ledger.read_session_run(&params.run_id)?;
+    if matches!(
+        run.status,
+        RunStateName::Running | RunStateName::CancelRequested
+    ) {
+        return Err(AppError::VoiceEventContract(format!(
+            "run {} is not terminal",
+            params.run_id
+        )));
+    }
+    validate_voice_capture(&run, &params.events)?;
+    let events = ledger.append_voice_events(&params.events)?;
+    Ok(VoiceEventsResult {
+        run_id: params.run_id,
+        events,
+    })
+}
+
+pub(super) fn handle_voice_events_read(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: VoiceEventsReadParams,
+) -> Envelope {
+    let request_id = request.id;
+    match read_voice_events(runtime, params) {
+        Ok(result) => {
+            Envelope::typed_response(request_id, ProtocolResponse::VoiceEventsRead(result))
+        }
+        Err(error) => voice_events_error(request_id, "voice.events.read", error),
+    }
+}
+
+fn read_voice_events(
+    runtime: &DaemonRuntime,
+    params: VoiceEventsReadParams,
+) -> AppResult<VoiceEventsResult> {
+    validate_voice_run_id(&params.run_id)?;
+    let _state = runtime.state.lock().expect("daemon state lock poisoned");
+    require_voice_ledger(runtime, &params.run_id)?;
+    let ledger = SqliteLedger::open_default_readonly(&runtime.paths.default_ledger())?;
+    ledger.read_session_run(&params.run_id)?;
+    let events = ledger.read_voice_events(&params.run_id)?;
+    Ok(VoiceEventsResult {
+        run_id: params.run_id,
+        events,
+    })
+}
+
+fn validate_voice_commit_request(params: &VoiceEventsCommitParams) -> AppResult<()> {
+    validate_voice_run_id(&params.run_id)?;
+    if params.events.is_empty() {
+        return Err(AppError::VoiceEventContract(
+            "voice event commit must not be empty".into(),
+        ));
+    }
+    if params.events.len() > MAX_VOICE_EVENTS {
+        return Err(AppError::VoiceEventContract(format!(
+            "voice event count exceeds {MAX_VOICE_EVENTS}"
+        )));
+    }
+    let encoded_bytes = serde_json::to_vec(&params.events)?.len();
+    if encoded_bytes > MAX_VOICE_EVENT_PAYLOAD_BYTES {
+        return Err(AppError::VoiceEventContract(format!(
+            "voice event payload exceeds {MAX_VOICE_EVENT_PAYLOAD_BYTES} bytes"
+        )));
+    }
+    for event in &params.events {
+        if event.run_id().as_str() != params.run_id {
+            return Err(AppError::VoiceEventContract(format!(
+                "voice event run {} does not match request run {}",
+                event.run_id(),
+                params.run_id
+            )));
+        }
+        if let VoiceEvent::VoiceInterrupted { spoken_prefix, .. } = event
+            && spoken_prefix.len() > MAX_SPOKEN_PREFIX_BYTES
+        {
+            return Err(AppError::VoiceEventContract(format!(
+                "spoken prefix exceeds {MAX_SPOKEN_PREFIX_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_voice_run_id(run_id: &str) -> AppResult<()> {
+    RunId::new(run_id.to_owned())
+        .map(|_| ())
+        .map_err(|error| AppError::VoiceEventContract(error.to_string()))
+}
+
+fn require_voice_ledger(runtime: &DaemonRuntime, run_id: &str) -> AppResult<()> {
+    if std::fs::symlink_metadata(&runtime.paths.ledger_path)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Err(AppError::RunNotFound(run_id.into()));
+    }
+    Ok(())
+}
+
+fn validate_voice_capture(
+    run: &crate::ledger::SessionRunRecords,
+    events: &[VoiceEvent],
+) -> AppResult<()> {
+    let first_turn_id = run.records.iter().find_map(|record| match &record.event {
+        HarnessEvent::ContextBuilt { turn_id, .. } => Some(turn_id),
+        _ => None,
+    });
+    for event in events {
+        let VoiceEvent::VoiceCaptured {
+            turn_id,
+            transcript_sha256,
+            transcript_bytes,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if first_turn_id != Some(turn_id) {
+            return Err(AppError::VoiceEventContract(format!(
+                "voice capture turn {turn_id} is not the durable first turn for run {}",
+                run.run_id
+            )));
+        }
+        let expected_hash = format!("{:x}", Sha256::digest(run.question.as_bytes()));
+        let expected_bytes = u64::try_from(run.question.len()).map_err(|_| {
+            AppError::VoiceEventContract("durable question length exceeds u64".into())
+        })?;
+        if transcript_sha256 != &expected_hash || *transcript_bytes != expected_bytes {
+            return Err(AppError::VoiceEventContract(format!(
+                "voice capture transcript does not match durable question for run {}",
+                run.run_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn voice_events_error(request_id: Option<String>, method: &str, error: AppError) -> Envelope {
+    let code = match &error {
+        AppError::RunNotFound(_) => ERROR_NOT_FOUND,
+        AppError::VoiceEventContract(_) => ERROR_MALFORMED_REQUEST,
+        AppError::VoiceLedgerConflict { .. } => ERROR_VOICE_EVENTS_CONFLICT,
+        _ => ERROR_INTERNAL,
+    };
+    Envelope::error(request_id, Some(method.into()), code, error.to_string())
 }
 
 pub(super) fn durable_events_stream(

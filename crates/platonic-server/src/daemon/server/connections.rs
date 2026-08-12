@@ -22,12 +22,15 @@ use crate::{
     AppResult,
     daemon::{
         lock::HostProcessLock,
-        protocol::{Envelope, ProtocolResponse, ShutdownIfIdleResultName},
+        protocol::{
+            ERROR_MALFORMED_REQUEST, Envelope, MAX_PROTOCOL_LINE_BYTES, ProtocolResponse,
+            ShutdownIfIdleResultName,
+        },
         transport,
     },
 };
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -264,13 +267,41 @@ where
     F: FnOnce(),
 {
     let mut writer = transport::try_clone(&stream)?;
-    let reader = BufReader::new(stream);
-    for line in reader.lines() {
-        let line = line?;
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut line = Vec::new();
+        let read = reader
+            .by_ref()
+            .take((MAX_PROTOCOL_LINE_BYTES + 1) as u64)
+            .read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        let terminated = line.last() == Some(&b'\n');
+        if terminated {
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+        }
+        if line.len() > MAX_PROTOCOL_LINE_BYTES {
+            let response = Envelope::error(
+                None,
+                None,
+                ERROR_MALFORMED_REQUEST,
+                format!("protocol line exceeds {MAX_PROTOCOL_LINE_BYTES} bytes"),
+            );
+            serde_json::to_writer(&mut writer, &response)?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+            return Ok(());
+        }
+        let line = std::str::from_utf8(&line)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         if line.trim().is_empty() {
             continue;
         }
-        let response = handle(&line);
+        let response = handle(line);
         let stop_after_response = matches!(
             response.result,
             Some(ProtocolResponse::DaemonShutdownIfIdle(ref result))
@@ -540,13 +571,14 @@ mod tests {
                 DaemonStatusProviderKind, DaemonStatusResult, ERROR_DAEMON_SHUTTING_DOWN,
                 ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
                 ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED,
-                ERROR_WORKSPACE_MISMATCH, ERROR_WORKSPACE_UNREGISTERED, Envelope, EnvelopeKind,
-                ProtocolError, RunStartResult, RunStateName, StreamEvent, TypedTranscript,
-                TypedTranscriptEntry,
+                ERROR_VOICE_EVENTS_CONFLICT, ERROR_WORKSPACE_MISMATCH,
+                ERROR_WORKSPACE_UNREGISTERED, Envelope, EnvelopeKind, ProtocolError,
+                RunStartResult, RunStateName, StreamEvent, TypedTranscript, TypedTranscriptEntry,
+                VoiceEvent, VoiceEventsResult,
             },
             runtime::{MAX_EVENT_BUFFER, MAX_TERMINAL_RUNS, PendingApproval, RunRecord},
         },
-        ledger::SqliteLedger,
+        ledger::{EventRecorder, SqliteLedger},
         tool_catalog::SHELL_EXEC,
     };
     use platonic_core::{
@@ -555,6 +587,7 @@ mod tests {
     };
     use rusqlite::params;
     use serde_json::json;
+    use sha2::{Digest, Sha256};
     use std::{
         io::{BufRead, Read},
         net::TcpListener,
@@ -859,6 +892,270 @@ mod tests {
                 .starts_with(workspace.path().join("xdg-state"))
         );
         drop(server);
+    }
+
+    #[test]
+    fn overlong_protocol_lines_are_rejected_before_dispatch() {
+        for terminated in [false, true] {
+            let (server_stream, mut client_stream) = UnixStream::pair().unwrap();
+            let dispatched = Arc::new(AtomicUsize::new(0));
+            let handler_dispatched = Arc::clone(&dispatched);
+            let handler = thread::spawn(move || {
+                handle_stream_lines(
+                    server_stream,
+                    Arc::new(AtomicBool::new(false)),
+                    PathBuf::from("unused.sock"),
+                    move |_| {
+                        handler_dispatched.fetch_add(1, Ordering::SeqCst);
+                        Envelope::error(None, None, ERROR_INTERNAL, "unexpected dispatch")
+                    },
+                    || {},
+                )
+                .unwrap();
+            });
+
+            client_stream
+                .write_all(&vec![b'x'; MAX_PROTOCOL_LINE_BYTES + 1])
+                .unwrap();
+            if terminated {
+                client_stream.write_all(b"\n").unwrap();
+            }
+            client_stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            BufReader::new(&client_stream)
+                .read_line(&mut response)
+                .unwrap();
+            let response: Envelope = serde_json::from_str(&response).unwrap();
+
+            handler.join().unwrap();
+            assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+            assert_eq!(response.kind, EnvelopeKind::Error);
+            assert_eq!(response.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+        }
+    }
+
+    #[test]
+    fn voice_event_handlers_validate_bounds_and_durable_run_authority_without_mutation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let server = bind_test(
+            workspace.path(),
+            Some(socket_dir.path().join("voice-validation.sock")),
+        )
+        .unwrap();
+        let run_id = "run_voice_validation";
+        let turn_id = "turn_run_voice_validation";
+
+        let missing = server.handle_line(
+            r#"{"v":1,"id":"read_missing","kind":"request","method":"voice.events.read","params":{"run_id":"run_absent"}}"#,
+        );
+        assert_eq!(missing.error.unwrap().code, ERROR_NOT_FOUND);
+
+        seed_finished_session_run(
+            &server.paths().ledger_path,
+            run_id,
+            "session_voice_validation",
+            "durable question",
+            "answer",
+            true,
+        );
+        let empty = server.handle_line(
+            &json!({
+                "v": 1,
+                "id": "read_empty",
+                "kind": "request",
+                "method": "voice.events.read",
+                "params": {"run_id": run_id}
+            })
+            .to_string(),
+        );
+        assert!(
+            response_result::<VoiceEventsResult>(&empty)
+                .events
+                .is_empty()
+        );
+        let missing = server.handle_line(
+            r#"{"v":1,"id":"read_missing","kind":"request","method":"voice.events.read","params":{"run_id":"run_absent"}}"#,
+        );
+        assert_eq!(missing.error.unwrap().code, ERROR_NOT_FOUND);
+
+        seed_running_session(
+            &server.paths().ledger_path,
+            "run_voice_running",
+            "session_voice_running",
+            "still running",
+        );
+        let nonterminal = commit_voice_line(
+            &server,
+            "run_voice_running",
+            vec![spoken_voice_event(
+                "run_voice_running",
+                "turn_run_voice_running",
+                1,
+            )],
+        );
+        assert_eq!(nonterminal.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+
+        let mut capture_mismatch = captured_voice_event(run_id, turn_id, "durable question");
+        if let VoiceEvent::VoiceCaptured {
+            transcript_sha256, ..
+        } = &mut capture_mismatch
+        {
+            *transcript_sha256 = "0".repeat(64);
+        }
+        let malformed = vec![
+            vec![],
+            vec![spoken_voice_event("run_other", turn_id, 1)],
+            vec![spoken_voice_event(run_id, "turn_absent", 1)],
+            vec![capture_mismatch],
+            vec![VoiceEvent::VoiceInterrupted {
+                run_id: RunId::new(run_id).unwrap(),
+                turn_id: TurnId::new(turn_id).unwrap(),
+                spoken_prefix: "heard".into(),
+                delta_index: 0,
+            }],
+            vec![spoken_voice_event(run_id, turn_id, 1); 129],
+            (0..100)
+                .map(|_| spoken_voice_event(run_id, &"t".repeat(3_000), 1))
+                .collect(),
+            vec![VoiceEvent::VoiceInterrupted {
+                run_id: RunId::new(run_id).unwrap(),
+                turn_id: TurnId::new(turn_id).unwrap(),
+                spoken_prefix: "x".repeat(16 * 1024 + 1),
+                delta_index: 0,
+            }],
+        ];
+        for events in malformed {
+            let response = commit_voice_line(&server, run_id, events);
+            assert_eq!(response.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+        }
+
+        let ledger = SqliteLedger::open_default_readonly(&server.paths().default_ledger()).unwrap();
+        assert!(ledger.read_voice_events(run_id).unwrap().is_empty());
+        assert!(
+            ledger
+                .read_voice_events("run_voice_running")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn capture_only_commit_is_valid_for_a_failed_run_with_a_first_turn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let server = bind_test(
+            workspace.path(),
+            Some(socket_dir.path().join("voice-failed.sock")),
+        )
+        .unwrap();
+        let run_id = "run_voice_failed";
+        let turn_id = "turn_run_voice_failed";
+        let question = "capture survived failure";
+        seed_failed_session_run(
+            &server.paths().ledger_path,
+            run_id,
+            "session_voice_failed",
+            question,
+        );
+
+        let response = commit_voice_line(
+            &server,
+            run_id,
+            vec![captured_voice_event(run_id, turn_id, question)],
+        );
+        let committed = response_result::<VoiceEventsResult>(&response);
+
+        assert_eq!(committed.run_id, run_id);
+        assert_eq!(committed.events.len(), 1);
+        assert_eq!(committed.events[0].sequence, 0);
+    }
+
+    #[test]
+    fn concurrent_voice_commits_are_serialized_and_survive_restart_for_both_ledgers() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("voice-concurrency.sock");
+        let server = bind_test(workspace.path(), Some(socket_path.clone())).unwrap();
+        let ledger_path = server.paths().ledger_path.clone();
+        let same_run = "run_voice_same";
+        let conflict_run = "run_voice_conflict";
+        seed_finished_session_run(
+            &ledger_path,
+            same_run,
+            "session_voice_same",
+            "question",
+            "answer",
+            true,
+        );
+        seed_finished_jsonl_session_run(
+            &ledger_path,
+            conflict_run,
+            "session_voice_conflict",
+            "question",
+            "answer",
+        );
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let handle = thread::spawn(move || server.serve_forever(server_shutdown).unwrap());
+
+        let same_batch = vec![spoken_voice_event(same_run, "turn_run_voice_same", 287)];
+        let [first, second] =
+            concurrent_voice_commits(&socket_path, same_run, same_batch.clone(), same_batch);
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.events[0].sequence, 0);
+
+        let [left, right] = concurrent_voice_commits(
+            &socket_path,
+            conflict_run,
+            vec![spoken_voice_event(
+                conflict_run,
+                "turn_run_voice_conflict",
+                10,
+            )],
+            vec![spoken_voice_event(
+                conflict_run,
+                "turn_run_voice_conflict",
+                20,
+            )],
+        );
+        let winner = match (left, right) {
+            (Ok(winner), Err(error)) | (Err(error), Ok(winner)) => {
+                let crate::daemon::client::ClientError::DaemonResponse(ProtocolError {
+                    code,
+                    message,
+                }) = error
+                else {
+                    panic!("expected typed voice conflict");
+                };
+                assert_eq!(code, ERROR_VOICE_EVENTS_CONFLICT);
+                assert!(message.contains("sequence 0"));
+                winner
+            }
+            outcomes => panic!("expected one voice commit winner and one conflict: {outcomes:?}"),
+        };
+        assert_eq!(winner.events.len(), 1);
+        assert_eq!(winner.events[0].sequence, 0);
+
+        shutdown.store(true, Ordering::SeqCst);
+        transport::wake(&socket_path);
+        handle.join().unwrap();
+
+        let restarted = bind_test(workspace.path(), Some(socket_path.clone())).unwrap();
+        let restarted_shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&restarted_shutdown);
+        let restarted_handle =
+            thread::spawn(move || restarted.serve_forever(server_shutdown).unwrap());
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        assert_eq!(client.voice_events_read(same_run).unwrap(), first);
+        assert_eq!(client.voice_events_read(conflict_run).unwrap(), winner);
+        drop(client);
+        restarted_shutdown.store(true, Ordering::SeqCst);
+        transport::wake(&socket_path);
+        restarted_handle.join().unwrap();
     }
 
     #[test]
@@ -3771,6 +4068,174 @@ enabled = ["{enabled_tool}"]
                 },
             )
             .unwrap();
+    }
+
+    fn seed_failed_session_run(path: &Path, run_id: &str, session_id: &str, question: &str) {
+        let run_id = RunId::new(run_id).unwrap();
+        let turn_id = TurnId::new(format!("turn_{}", run_id.as_str())).unwrap();
+        let mut ledger = SqliteLedger::open_or_create(path).unwrap();
+        ledger
+            .begin_session_run(session_id, &run_id, question, true)
+            .unwrap();
+        for (seq, event) in [
+            HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: AgentId::new("agent_1").unwrap(),
+            },
+            HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id,
+                context: ContextPack {
+                    token_budget: 0,
+                    fragments: vec![],
+                },
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ledger
+                .append(
+                    run_id.as_str(),
+                    &RecordedEvent {
+                        seq: seq as u64,
+                        occurred_at_ms: seq as u64,
+                        event,
+                    },
+                )
+                .unwrap();
+        }
+        ledger
+            .fail_session_run(&run_id, "synthetic failure", false)
+            .unwrap();
+    }
+
+    fn seed_finished_jsonl_session_run(
+        path: &Path,
+        run_id: &str,
+        session_id: &str,
+        question: &str,
+        answer: &str,
+    ) {
+        let location = crate::paths::DefaultSqlitePath::from_path(path.to_owned());
+        let run_id = RunId::new(run_id).unwrap();
+        let turn_id = TurnId::new(format!("turn_{}", run_id.as_str())).unwrap();
+        let mut ledger = SqliteLedger::open_or_create_default(&location).unwrap();
+        ledger
+            .begin_session_run(session_id, &run_id, question, true)
+            .unwrap();
+        let mut recorder = EventRecorder::create_default_jsonl(&location, &run_id)
+            .unwrap()
+            .with_session_jsonl_creation(ledger, &run_id, true);
+        for event in [
+            HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: AgentId::new("agent_1").unwrap(),
+            },
+            HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                context: ContextPack {
+                    token_budget: 0,
+                    fragments: vec![],
+                },
+            },
+            HarnessEvent::ModelRequested {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 0,
+                model: ModelName::new("model_1").unwrap(),
+            },
+            HarnessEvent::ModelResponded {
+                run_id: run_id.clone(),
+                turn_id,
+                step: 0,
+                output: Message {
+                    role: MessageRole::Assistant,
+                    content: answer.into(),
+                },
+                proposed_calls: vec![],
+                served_model: None,
+                usage: Some(ModelUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                }),
+            },
+        ] {
+            recorder.record(event).unwrap();
+        }
+        recorder.finish_run(&run_id, answer).unwrap();
+    }
+
+    fn spoken_voice_event(run_id: &str, turn_id: &str, ttfa_ms: u64) -> VoiceEvent {
+        VoiceEvent::VoiceSpoken {
+            run_id: RunId::new(run_id).unwrap(),
+            turn_id: TurnId::new(turn_id).unwrap(),
+            ttfa_ms,
+            sentence_count: 1,
+            interrupted_at: None,
+        }
+    }
+
+    fn captured_voice_event(run_id: &str, turn_id: &str, question: &str) -> VoiceEvent {
+        VoiceEvent::VoiceCaptured {
+            run_id: RunId::new(run_id).unwrap(),
+            turn_id: TurnId::new(turn_id).unwrap(),
+            transcript_sha256: format!("{:x}", Sha256::digest(question.as_bytes())),
+            transcript_bytes: question.len().try_into().unwrap(),
+            transcript_span_ms: 800,
+            input_frames: 38_400,
+            output_frames: 12_800,
+            vad_start_sample: 320,
+            vad_speech_end_sample: 11_200,
+            vad_close_sample: 12_800,
+            vad_close_to_final_us: 105_000,
+            normalization_resampling_us: 900,
+        }
+    }
+
+    fn commit_voice_line(
+        server: &TestDaemonServer,
+        run_id: &str,
+        events: Vec<VoiceEvent>,
+    ) -> Envelope {
+        server.handle_line(
+            &json!({
+                "v": 1,
+                "id": "voice_commit",
+                "kind": "request",
+                "method": "voice.events.commit",
+                "params": {"run_id": run_id, "events": events}
+            })
+            .to_string(),
+        )
+    }
+
+    fn concurrent_voice_commits(
+        socket_path: &Path,
+        run_id: &str,
+        first_events: Vec<VoiceEvent>,
+        second_events: Vec<VoiceEvent>,
+    ) -> [platonic_client::ClientResult<VoiceEventsResult>; 2] {
+        let barrier = Arc::new(Barrier::new(3));
+        let first_barrier = Arc::clone(&barrier);
+        let first_socket = socket_path.to_owned();
+        let first_run = run_id.to_owned();
+        let first = thread::spawn(move || {
+            let mut client = DaemonClient::connect(&first_socket).unwrap();
+            first_barrier.wait();
+            client.voice_events_commit(&first_run, first_events)
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second_socket = socket_path.to_owned();
+        let second_run = run_id.to_owned();
+        let second = thread::spawn(move || {
+            let mut client = DaemonClient::connect(&second_socket).unwrap();
+            second_barrier.wait();
+            client.voice_events_commit(&second_run, second_events)
+        });
+        barrier.wait();
+        [first.join().unwrap(), second.join().unwrap()]
     }
 
     fn seed_finished_session_run(

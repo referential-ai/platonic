@@ -10,15 +10,17 @@ use platonic_protocol::{
     AgentStatusParams, AgentStatusResult, ApprovalDecideParams, ApprovalDecision, ApprovalProfile,
     CommandAcceptedResult, DaemonStatusParams, DaemonStatusResult, Envelope, EnvelopeKind,
     EventsStreamParams, EventsStreamResult, HelloParams, HelloResult, IssuePrepStartParams,
-    IssuePrepStartResult, MessageAppendParams, PROTOCOL_VERSION, ProtocolMethod, ProtocolRequest,
-    ProtocolResponse, ReasoningEffort, RunCancelParams, RunOverrides, RunStartParams,
-    RunStartResult, SessionApprovalProfileSetParams, SessionApprovalProfileSetResult,
-    SessionSummary, SessionsListResult, ShutdownIfIdleResult, ThreadApprovalPolicy,
-    ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams, ThreadEventsResult,
-    ThreadListResult, ThreadSendParams, ThreadSendResult, ThreadSpawnDecision, ThreadSpawnParams,
-    ThreadSpawnResult, ThreadStatusParams, ThreadStatusResult, ThreadStopParams, ThreadStopResult,
-    TranscriptReadParams, TranscriptReadResult, WorkspaceCreateParams, WorkspaceCreateResult,
-    WorkspaceListParams, WorkspaceListResult, WorkspaceStatusParams, WorkspaceStatusResult,
+    IssuePrepStartResult, MAX_PROTOCOL_LINE_BYTES, MessageAppendParams, PROTOCOL_VERSION,
+    ProtocolMethod, ProtocolRequest, ProtocolResponse, ReasoningEffort, RunCancelParams,
+    RunOverrides, RunStartParams, RunStartResult, SessionApprovalProfileSetParams,
+    SessionApprovalProfileSetResult, SessionSummary, SessionsListResult, ShutdownIfIdleResult,
+    ThreadApprovalPolicy, ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams,
+    ThreadEventsResult, ThreadListResult, ThreadSendParams, ThreadSendResult, ThreadSpawnDecision,
+    ThreadSpawnParams, ThreadSpawnResult, ThreadStatusParams, ThreadStatusResult, ThreadStopParams,
+    ThreadStopResult, TranscriptReadParams, TranscriptReadResult, VoiceEvent,
+    VoiceEventsCommitParams, VoiceEventsReadParams, VoiceEventsResult, WorkspaceCreateParams,
+    WorkspaceCreateResult, WorkspaceListParams, WorkspaceListResult, WorkspaceStatusParams,
+    WorkspaceStatusResult,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -33,7 +35,6 @@ pub struct DaemonClient {
     reader: BufReader<Stream>,
     writer: Stream,
     next_id: u64,
-    response_limit: Option<u64>,
     request_timeout: Option<Duration>,
 }
 
@@ -41,13 +42,13 @@ impl DaemonClient {
     /// Connects to a daemon endpoint using the platform's ordinary connect bound.
     pub fn connect(socket_path: &Path) -> ClientResult<Self> {
         let writer = transport::connect(socket_path)?;
-        Self::from_stream(writer, None, None)
+        Self::from_stream(writer, None)
     }
 
     /// Connects to a daemon endpoint within `timeout` and applies that bound to requests.
     pub fn connect_with_timeout(socket_path: &Path, timeout: Duration) -> ClientResult<Self> {
         let writer = transport::connect_with_timeout(socket_path, timeout)?;
-        Self::from_stream(writer, None, Some(timeout))
+        Self::from_stream(writer, Some(timeout))
     }
 
     #[cfg(unix)]
@@ -65,17 +66,12 @@ impl DaemonClient {
         Ok(())
     }
 
-    fn from_stream(
-        writer: Stream,
-        response_limit: Option<u64>,
-        request_timeout: Option<Duration>,
-    ) -> ClientResult<Self> {
+    fn from_stream(writer: Stream, request_timeout: Option<Duration>) -> ClientResult<Self> {
         let reader = BufReader::new(transport::try_clone(&writer)?);
         Ok(Self {
             reader,
             writer,
             next_id: 1,
-            response_limit,
             request_timeout,
         })
     }
@@ -451,6 +447,27 @@ impl DaemonClient {
         }))
     }
 
+    /// Commits one complete raw voice event batch for a terminal run.
+    pub fn voice_events_commit(
+        &mut self,
+        run_id: &str,
+        events: Vec<VoiceEvent>,
+    ) -> ClientResult<VoiceEventsResult> {
+        self.request(ProtocolRequest::VoiceEventsCommit(
+            VoiceEventsCommitParams {
+                run_id: run_id.into(),
+                events,
+            },
+        ))
+    }
+
+    /// Reads the committed voice event batch for `run_id`.
+    pub fn voice_events_read(&mut self, run_id: &str) -> ClientResult<VoiceEventsResult> {
+        self.request(ProtocolRequest::VoiceEventsRead(VoiceEventsReadParams {
+            run_id: run_id.into(),
+        }))
+    }
+
     /// Grants a pending daemon approval request.
     pub fn approval_grant(
         &mut self,
@@ -560,18 +577,18 @@ impl DaemonClient {
         if let Some(deadline) = deadline {
             let bytes_read = self.read_line_until_deadline(
                 method.as_str(),
-                self.response_limit,
+                MAX_PROTOCOL_LINE_BYTES as u64,
                 deadline,
                 &mut line,
             )?;
             return self.decode_response(method, id, bytes_read, line);
         }
-        let bytes_read = match self.response_limit {
-            Some(limit) => {
-                Self::read_limited_line(&mut self.reader, method.as_str(), limit, &mut line)?
-            }
-            None => self.reader.read_until(b'\n', &mut line)?,
-        };
+        let bytes_read = Self::read_limited_line(
+            &mut self.reader,
+            method.as_str(),
+            MAX_PROTOCOL_LINE_BYTES as u64,
+            &mut line,
+        )?;
         self.decode_response(method, id, bytes_read, line)
     }
 
@@ -638,7 +655,7 @@ impl DaemonClient {
     ) -> ClientResult<usize> {
         let mut reader = std::io::Read::take(reader, limit + 1);
         let bytes_read = reader.read_until(b'\n', line)?;
-        if bytes_read as u64 > limit {
+        if Self::response_payload_len(line) > limit {
             return Err(ClientError::DaemonProtocol(format!(
                 "{method} response exceeds {limit} bytes"
             )));
@@ -677,7 +694,7 @@ impl DaemonClient {
     fn read_line_until_deadline(
         &mut self,
         method: &str,
-        limit: Option<u64>,
+        limit: u64,
         deadline: Instant,
         line: &mut Vec<u8>,
     ) -> ClientResult<usize> {
@@ -694,22 +711,22 @@ impl DaemonClient {
                 .position(|byte| *byte == b'\n')
                 .map_or(available.len(), |position| position + 1);
             let ended = available[consumed - 1] == b'\n';
-            let retained = match limit {
-                Some(limit) => consumed.min((limit + 1).saturating_sub(line.len() as u64) as usize),
-                None => consumed,
-            };
+            let retained = consumed.min((limit + 1).saturating_sub(line.len() as u64) as usize);
             line.extend_from_slice(&available[..retained]);
             self.reader.consume(consumed);
-            if limit.is_some_and(|limit| line.len() as u64 > limit) {
+            if Self::response_payload_len(line) > limit {
                 return Err(ClientError::DaemonProtocol(format!(
-                    "{method} response exceeds {} bytes",
-                    limit.expect("checked as present")
+                    "{method} response exceeds {limit} bytes"
                 )));
             }
             if ended {
                 return Ok(line.len());
             }
         }
+    }
+
+    fn response_payload_len(line: &[u8]) -> u64 {
+        (line.len() - usize::from(line.last() == Some(&b'\n'))) as u64
     }
 
     fn ensure_deadline(method: &str, deadline: Instant) -> ClientResult<()> {
@@ -754,6 +771,8 @@ fn response_result_value(response: ProtocolResponse) -> serde_json::Result<Value
         ProtocolResponse::MessageAppend(result) => serde_json::to_value(result),
         ProtocolResponse::IssuePrepStart(result) => serde_json::to_value(result),
         ProtocolResponse::EventsStream(result) => serde_json::to_value(result),
+        ProtocolResponse::VoiceEventsCommit(result) => serde_json::to_value(result),
+        ProtocolResponse::VoiceEventsRead(result) => serde_json::to_value(result),
         ProtocolResponse::ApprovalDecide(result) => serde_json::to_value(result),
         ProtocolResponse::RunCancel(result) => serde_json::to_value(result),
         ProtocolResponse::SessionsList(result) => serde_json::to_value(result),
@@ -1769,6 +1788,46 @@ mod tests {
     }
 
     #[test]
+    fn client_rejects_terminated_and_unterminated_overlong_responses_with_or_without_timeout() {
+        for timed in [false, true] {
+            for terminated in [false, true] {
+                let socket_dir = tempfile::tempdir().unwrap();
+                let socket_path = socket_dir.path().join("agent.sock");
+                let listener = UnixListener::bind(&socket_path).unwrap();
+                let handle = thread::spawn(move || {
+                    let (stream, _) = listener.accept().unwrap();
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let request = read_request(&mut reader);
+                    assert_eq!(request.method.as_deref(), Some("sessions.list"));
+                    let mut response = vec![b'x'; MAX_PROTOCOL_LINE_BYTES + 1];
+                    if terminated {
+                        response.push(b'\n');
+                    }
+                    writer.write_all(&response).unwrap();
+                    writer.flush().unwrap();
+                });
+                let mut client = if timed {
+                    DaemonClient::connect_with_timeout(&socket_path, Duration::from_secs(5))
+                        .unwrap()
+                } else {
+                    DaemonClient::connect(&socket_path).unwrap()
+                };
+
+                let error = client.sessions_list().unwrap_err();
+                drop(client);
+                handle.join().unwrap();
+
+                assert!(matches!(
+                    error,
+                    ClientError::DaemonProtocol(message)
+                        if message == "sessions.list response exceeds 1048576 bytes"
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn client_rejects_an_unsupported_response_protocol_version() {
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
@@ -1885,6 +1944,75 @@ mod tests {
         assert_eq!(events.events.len(), 1);
         assert_eq!(tail.from_offset, 3);
         assert!(tail.events.is_empty());
+    }
+
+    #[test]
+    fn client_sends_raw_voice_commit_and_typed_read_requests() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let event = json!({
+            "event": "voice_spoken",
+            "run_id": "run_voice",
+            "turn_id": "turn_voice",
+            "ttfa_ms": 287,
+            "sentence_count": 2,
+            "interrupted_at": null
+        });
+        let response_events = json!([{"v": 1, "sequence": 0, "event": event.clone()}]);
+        let expected = response_events.clone();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+
+            let commit = read_request(&mut reader);
+            assert_eq!(commit.method.as_deref(), Some("voice.events.commit"));
+            assert_eq!(
+                request_params_value(&commit),
+                Some(json!({"run_id": "run_voice", "events": [event]}))
+            );
+            write_response(
+                &mut writer,
+                commit.id,
+                "voice.events.commit",
+                json!({"run_id": "run_voice", "events": response_events}),
+            );
+
+            let read = read_request(&mut reader);
+            assert_eq!(read.method.as_deref(), Some("voice.events.read"));
+            assert_eq!(
+                request_params_value(&read),
+                Some(json!({"run_id": "run_voice"}))
+            );
+            write_response(
+                &mut writer,
+                read.id,
+                "voice.events.read",
+                json!({"run_id": "run_voice", "events": expected}),
+            );
+        });
+
+        let event = serde_json::from_value::<VoiceEvent>(json!({
+            "event": "voice_spoken",
+            "run_id": "run_voice",
+            "turn_id": "turn_voice",
+            "ttfa_ms": 287,
+            "sentence_count": 2,
+            "interrupted_at": null
+        }))
+        .unwrap();
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        let committed = client
+            .voice_events_commit("run_voice", vec![event])
+            .unwrap();
+        let read = client.voice_events_read("run_voice").unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(committed.run_id, "run_voice");
+        assert_eq!(committed.events.len(), 1);
+        assert_eq!(committed.events[0].sequence, 0);
+        assert_eq!(read, committed);
     }
 
     #[test]

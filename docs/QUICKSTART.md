@@ -332,7 +332,9 @@ timing. Both examples fail closed on artifact checksum, phonemizer, backend,
 device, PCM, worker, callback, sentence-order, gap, overlap, or teardown errors.
 `narrated_run` runs through the host server and reports its server-owned
 workspace ledger path. Its proof JSON includes the exact revision-one `VoiceEvent`
-envelopes observed by the client. Offline `plato replay --db=/path/to/run.db
+envelopes observed by the client, but the example does not commit them. The
+native protocol accepts one complete batch through `voice.events.commit` and
+returns server-minted envelopes through `voice.events.read`. Offline `plato replay --db=/path/to/run.db
 --run RUN_ID` reads the server-owned per-run log without starting or contacting
 the server. New voice companion streams use that same JSONL file; legacy runs
 remain readable from SQLite.
@@ -342,8 +344,8 @@ length, transcript span, native and 16 kHz frame counts, VAD sample boundaries,
 and capture timing. `VoiceSpoken` stores the AU2 sentence-acceptance to first
 non-silent callback TTFA in whole milliseconds plus sentence/interruption
 coordinates; an AU5 latch adds one exact `VoiceInterrupted` prefix and delta
-index. These companion facts are committed atomically beside the core ledger,
-never as `HarnessEvent` variants.
+index. When submitted through `voice.events.commit`, these companion facts are
+committed atomically beside the core ledger, never as `HarnessEvent` variants.
 
 AU4 opens one persistent input stream and one worker, normalizes/resamples on
 the worker, and runs a warm Silero session through the ONNX Runtime owner shared
