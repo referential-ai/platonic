@@ -11,7 +11,8 @@ use platonic_protocol::{
     DaemonStatusResult, ERROR_LAGGED, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
     ERROR_WORKSPACE_MISMATCH, EventsStreamResult, HarnessEvent, IssuePrepResult,
     IssuePrepStartResult, RunOverrides, RunStartResult, RunStateName,
-    SessionApprovalProfileSetResult, StreamEvent, ThreadEventsResult, ThreadSendResult,
+    SessionApprovalProfileSetResult, StreamEvent, ThreadEventsResult, ThreadListResult,
+    ThreadSendResult,
 };
 use std::{
     collections::HashMap,
@@ -99,6 +100,7 @@ fn load_connected_thread_state(
         transcript,
     );
     state.selected_session_id = Some(session_id.clone());
+    state.selected_thread_id = Some(attachment.thread_id.clone());
     state.approval_profile = approval_profile;
     state.approval = approval;
     state.status_message = Some(format!("attached to thread {}", attachment.thread_id));
@@ -203,17 +205,6 @@ fn loaded_transcript_state(
         TranscriptState::Loaded(TranscriptView::from(transcript)),
         approval,
     )
-}
-
-fn load_selected_session_state(config: &DaemonConnectionConfig, session_id: &str) -> TuiState {
-    match load_connected_state(config, None, Some(session_id)) {
-        Ok(state) => state,
-        Err(error) => TuiState::disconnected(
-            config.workspace_root.to_string_lossy().into_owned(),
-            config.socket_path.to_string_lossy().into_owned(),
-            error.to_string(),
-        ),
-    }
 }
 
 #[derive(Debug)]
@@ -375,8 +366,9 @@ pub(super) enum ClientCommand {
     Load {
         run_id: Option<String>,
     },
-    LoadSession {
-        session_id: String,
+    ThreadList,
+    LoadThread {
+        attachment: ThreadAttachment,
     },
     DaemonStatus {
         session_id: Option<String>,
@@ -440,6 +432,11 @@ pub(super) enum ClientCommand {
 #[derive(Debug)]
 pub(super) enum ClientEvent {
     Loaded(Box<TuiState>),
+    ThreadLoaded {
+        state: Box<TuiState>,
+        attachment: ThreadAttachment,
+    },
+    ThreadsLoaded(ThreadListResult),
     StatusLoaded(Box<DaemonStatusResult>),
     ApprovalProfileSet(SessionApprovalProfileSetResult),
     VoiceSet(VoiceControlResponse),
@@ -464,6 +461,7 @@ pub(super) enum ClientEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ClientOperation {
     DaemonStatus,
+    ThreadList,
     ApprovalProfileSet,
     RunStart,
     MessageAppend,
@@ -479,6 +477,7 @@ impl ClientOperation {
     fn method(self) -> &'static str {
         match self {
             Self::DaemonStatus => "daemon.status",
+            Self::ThreadList => "thread.list",
             Self::ApprovalProfileSet => "session.approval_profile.set",
             Self::RunStart => "run.start",
             Self::MessageAppend => "message.append",
@@ -566,9 +565,14 @@ fn handle_client_command(
             Some(attachment) => load_thread_state(config, attachment),
             None => load_state(config, run_id.as_deref()),
         })),
-        ClientCommand::LoadSession { session_id } => {
-            ClientEvent::Loaded(Box::new(load_selected_session_state(config, &session_id)))
-        }
+        ClientCommand::ThreadList => with_client(config, DaemonClient::thread_list).map_or_else(
+            failed_event(ClientOperation::ThreadList),
+            ClientEvent::ThreadsLoaded,
+        ),
+        ClientCommand::LoadThread { attachment } => ClientEvent::ThreadLoaded {
+            state: Box::new(load_thread_state(config, &attachment)),
+            attachment,
+        },
         ClientCommand::DaemonStatus {
             session_id,
             config_path,
@@ -782,6 +786,31 @@ pub(super) fn apply_client_event(
             apply_loaded_state(state, *loaded);
             runtime.sync_from_state(state);
         }
+        ClientEvent::ThreadLoaded {
+            state: loaded,
+            attachment,
+        } => {
+            apply_loaded_state(state, *loaded);
+            runtime.attach_thread(Some(attachment));
+            runtime.sync_from_state(state);
+        }
+        ClientEvent::ThreadsLoaded(result) => {
+            state.threads = result.threads;
+            if let Some(picker) = state.session_picker.as_mut() {
+                picker.selected = state
+                    .selected_thread_id
+                    .as_deref()
+                    .and_then(|thread_id| {
+                        state
+                            .threads
+                            .iter()
+                            .position(|thread| thread.authority.thread_id == thread_id)
+                    })
+                    .unwrap_or(0)
+                    .min(state.threads.len().saturating_sub(1));
+            }
+            state.status_message = Some("thread picker loaded".into());
+        }
         ClientEvent::StatusLoaded(status) => {
             if state.selected_session_id.is_some()
                 && status.session.session_id == state.selected_session_id
@@ -943,6 +972,7 @@ pub(super) fn apply_client_event(
                     }
                     ClientOperation::RunStart
                     | ClientOperation::MessageAppend
+                    | ClientOperation::ThreadList
                     | ClientOperation::ApprovalProfileSet
                     | ClientOperation::ThreadSend
                     | ClientOperation::EventsStream
@@ -1157,6 +1187,13 @@ fn apply_thread_events_result(
     runtime: &mut UiRuntime,
     result: ThreadEventsResult,
 ) {
+    if runtime
+        .thread
+        .as_ref()
+        .is_none_or(|thread| thread.thread_id != result.thread_id)
+    {
+        return;
+    }
     runtime.poll_in_flight = false;
     runtime.thread_next_offset = Some(result.next_offset);
     runtime.thread_turn_id = result.current_turn_id;
@@ -1434,6 +1471,59 @@ mod tests {
     }
 
     #[test]
+    fn thread_picker_request_uses_thread_list_and_keeps_loaded_and_unloaded_threads() {
+        let harness = ScriptedDaemon::start("thread-list", |workspace_id| {
+            vec![
+                hello_reply(workspace_id),
+                ScriptedReply::result(
+                    "thread.list",
+                    json!({
+                        "threads": [
+                            {
+                                "authority": {
+                                    "thread_id": "thread_loaded",
+                                    "parent_thread_id": null,
+                                    "spawning_actor": "test",
+                                    "cwd": "/work/loaded",
+                                    "model": "test-model",
+                                    "reasoning_effort": "none",
+                                    "approval_policy": "prompt",
+                                    "created_at_ms": 42
+                                },
+                                "live": {"loaded": true, "current_turn_id": "turn_1"}
+                            },
+                            {
+                                "authority": {
+                                    "thread_id": "thread_unloaded",
+                                    "parent_thread_id": null,
+                                    "spawning_actor": "test",
+                                    "cwd": "/work/unloaded",
+                                    "model": "test-model",
+                                    "reasoning_effort": "none",
+                                    "approval_policy": "prompt",
+                                    "created_at_ms": 41
+                                },
+                                "live": {"loaded": false, "current_turn_id": null}
+                            }
+                        ]
+                    }),
+                ),
+            ]
+        });
+
+        let ClientEvent::ThreadsLoaded(result) =
+            handle_client_command(&harness.config, None, None, ClientCommand::ThreadList)
+        else {
+            panic!("expected thread list result")
+        };
+
+        assert!(result.threads[0].live.loaded);
+        assert!(!result.threads[1].live.loaded);
+        let requests = harness.finish();
+        assert_eq!(requests[1].method.as_deref(), Some("thread.list"));
+    }
+
+    #[test]
     fn thread_attachment_loads_exact_session_and_polls_from_live_tip() {
         let harness = ScriptedDaemon::start("thread-attachment", |workspace_id| {
             vec![
@@ -1496,6 +1586,7 @@ mod tests {
             state.selected_session_id.as_deref(),
             Some("session_thread_selected")
         );
+        assert_eq!(state.selected_thread_id.as_deref(), Some("thread_selected"));
         assert_eq!(
             state.active_run.as_ref().map(|run| run.run_id.as_str()),
             Some("run_selected")
@@ -1566,6 +1657,36 @@ mod tests {
                 .iter()
                 .any(|event| event.text.contains("controller_owned"))
         );
+    }
+
+    #[test]
+    fn switched_attachment_ignores_late_events_from_the_previous_thread() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = DaemonConnectionConfig {
+            workspace_root: workspace.path().to_owned(),
+            socket_path: workspace.path().join("agent.sock"),
+        };
+        let mut state = connected_state(&config);
+        let mut runtime = UiRuntime::from_state(&state, None);
+        runtime.attach_thread(Some(ThreadAttachment {
+            thread_id: "thread_new".into(),
+            controller_id: "controller_new".into(),
+        }));
+
+        apply_thread_events_result(
+            &mut state,
+            &mut runtime,
+            ThreadEventsResult {
+                thread_id: "thread_old".into(),
+                from_offset: 0,
+                next_offset: 4,
+                current_turn_id: Some("turn_old".into()),
+                events: vec![],
+            },
+        );
+
+        assert_eq!(runtime.thread_next_offset, None);
+        assert_eq!(runtime.thread_turn_id, None);
     }
 
     #[test]
@@ -2201,6 +2322,7 @@ mod tests {
                 "capabilities": [
                     "hello",
                     "sessions.list",
+                    "thread.list",
                     "transcript.read",
                     "transcript.read.pending_approval",
                     "events.stream",

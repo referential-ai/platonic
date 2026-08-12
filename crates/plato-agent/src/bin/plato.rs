@@ -12,7 +12,6 @@ use platonic_protocol::{
 use std::{
     io::{self, BufRead, IsTerminal, Read, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 const THREAD_EVENT_PAGE: usize = 128;
@@ -468,10 +467,7 @@ fn run_tui_mode(cli: Cli, workspace_root: PathBuf, local_interactive: bool) -> A
         client
             .session_approval_profile_set(format!("session_{thread_id}"), ApprovalProfile::Yolo)?;
     }
-    options.thread = Some(ThreadAttachment {
-        thread_id,
-        controller_id: new_tui_controller_id(),
-    });
+    options.thread = Some(ThreadAttachment::new(thread_id));
     run_tui(options)
 }
 
@@ -535,14 +531,6 @@ fn validate_tui_cli(cli: &Cli) -> AppResult<()> {
         ));
     }
     Ok(())
-}
-
-fn new_tui_controller_id() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    format!("tui_{millis}_{}", std::process::id())
 }
 
 fn run_thread_cli(command: ThreadCommand, workspace_root: PathBuf) -> AppResult<()> {
