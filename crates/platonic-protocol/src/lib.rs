@@ -95,6 +95,9 @@ impl RunOverrides {
 /// Current daemon protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Maximum JSON payload bytes in one protocol NDJSON line before decode.
+pub const MAX_PROTOCOL_LINE_BYTES: usize = 1024 * 1024;
+
 /// Plato Agent package version and optional build provenance embedded at compile time.
 ///
 /// Repository builds that do not provide deploy provenance remain visibly
@@ -137,6 +140,12 @@ pub enum Capability {
     /// Stream buffered run events.
     #[serde(rename = "events.stream")]
     EventsStream,
+    /// Commit one complete voice event batch.
+    #[serde(rename = "voice.events.commit")]
+    VoiceEventsCommit,
+    /// Read one committed voice event batch.
+    #[serde(rename = "voice.events.read")]
+    VoiceEventsRead,
     /// Decide a pending approval.
     #[serde(rename = "approval.decide")]
     ApprovalDecide,
@@ -214,6 +223,8 @@ impl Capability {
             Self::MessageAppend => "message.append",
             Self::IssuePrepStart => "issue-prep.start",
             Self::EventsStream => "events.stream",
+            Self::VoiceEventsCommit => "voice.events.commit",
+            Self::VoiceEventsRead => "voice.events.read",
             Self::ApprovalDecide => "approval.decide",
             Self::RunCancel => "run.cancel",
             Self::SessionsList => "sessions.list",
@@ -256,6 +267,10 @@ pub const CAPABILITY_MESSAGE_APPEND: Capability = Capability::MessageAppend;
 pub const CAPABILITY_ISSUE_PREP_START: Capability = Capability::IssuePrepStart;
 /// Capability name for streaming buffered run events.
 pub const CAPABILITY_EVENTS_STREAM: Capability = Capability::EventsStream;
+/// Capability name for committing one complete voice event batch.
+pub const CAPABILITY_VOICE_EVENTS_COMMIT: Capability = Capability::VoiceEventsCommit;
+/// Capability name for reading one committed voice event batch.
+pub const CAPABILITY_VOICE_EVENTS_READ: Capability = Capability::VoiceEventsRead;
 /// Capability name for deciding a pending approval.
 pub const CAPABILITY_APPROVAL_DECIDE: Capability = Capability::ApprovalDecide;
 /// Capability name for requesting run cancellation.
@@ -304,12 +319,14 @@ pub const CAPABILITY_AGENT_LIST: Capability = Capability::AgentList;
 pub const CAPABILITY_AGENT_STATUS: Capability = Capability::AgentStatus;
 
 /// Capabilities advertised by a protocol v1 daemon, in wire order.
-pub const CAPABILITIES: [Capability; 27] = [
+pub const CAPABILITIES: [Capability; 29] = [
     CAPABILITY_HELLO,
     CAPABILITY_RUN_START,
     CAPABILITY_MESSAGE_APPEND,
     CAPABILITY_ISSUE_PREP_START,
     CAPABILITY_EVENTS_STREAM,
+    CAPABILITY_VOICE_EVENTS_COMMIT,
+    CAPABILITY_VOICE_EVENTS_READ,
     CAPABILITY_APPROVAL_DECIDE,
     CAPABILITY_RUN_CANCEL,
     CAPABILITY_SESSIONS_LIST,
@@ -354,6 +371,8 @@ pub enum ProtocolErrorCode {
     Overload,
     /// A run failed.
     RunFailed,
+    /// A different immutable voice event batch was already committed.
+    VoiceEventsConflict,
     /// Sessions could not be listed.
     SessionsListFailed,
     /// Requested thread authority exceeds its parent.
@@ -400,6 +419,7 @@ impl ProtocolErrorCode {
             Self::NotFound => "not_found",
             Self::Overload => "overload",
             Self::RunFailed => "run_failed",
+            Self::VoiceEventsConflict => "voice_events_conflict",
             Self::SessionsListFailed => "sessions_list_failed",
             Self::ThreadAuthorityExceeded => "thread_authority_exceeded",
             Self::ThreadBranchClaimConflict => "thread_branch_claim_conflict",
@@ -442,6 +462,8 @@ pub const ERROR_NOT_FOUND: ProtocolErrorCode = ProtocolErrorCode::NotFound;
 pub const ERROR_OVERLOAD: ProtocolErrorCode = ProtocolErrorCode::Overload;
 /// Error code returned when a run fails.
 pub const ERROR_RUN_FAILED: ProtocolErrorCode = ProtocolErrorCode::RunFailed;
+/// Error code returned when a different immutable voice event batch already exists.
+pub const ERROR_VOICE_EVENTS_CONFLICT: ProtocolErrorCode = ProtocolErrorCode::VoiceEventsConflict;
 /// Error code returned when sessions cannot be listed.
 pub const ERROR_SESSIONS_LIST_FAILED: ProtocolErrorCode = ProtocolErrorCode::SessionsListFailed;
 /// Error code returned when requested thread authority exceeds its parent.
@@ -550,6 +572,12 @@ pub enum ProtocolMethod {
     /// Stream buffered run events.
     #[serde(rename = "events.stream")]
     EventsStream,
+    /// Commit one complete voice event batch.
+    #[serde(rename = "voice.events.commit")]
+    VoiceEventsCommit,
+    /// Read one committed voice event batch.
+    #[serde(rename = "voice.events.read")]
+    VoiceEventsRead,
     /// Decide a pending approval.
     #[serde(rename = "approval.decide")]
     ApprovalDecide,
@@ -621,6 +649,8 @@ impl ProtocolMethod {
             Self::MessageAppend => "message.append",
             Self::IssuePrepStart => "issue-prep.start",
             Self::EventsStream => "events.stream",
+            Self::VoiceEventsCommit => "voice.events.commit",
+            Self::VoiceEventsRead => "voice.events.read",
             Self::ApprovalDecide => "approval.decide",
             Self::RunCancel => "run.cancel",
             Self::SessionsList => "sessions.list",
@@ -679,6 +709,8 @@ impl ProtocolMethod {
             "message.append" => Some(Self::MessageAppend),
             "issue-prep.start" => Some(Self::IssuePrepStart),
             "events.stream" => Some(Self::EventsStream),
+            "voice.events.commit" => Some(Self::VoiceEventsCommit),
+            "voice.events.read" => Some(Self::VoiceEventsRead),
             "approval.decide" => Some(Self::ApprovalDecide),
             "run.cancel" => Some(Self::RunCancel),
             "sessions.list" => Some(Self::SessionsList),
@@ -723,6 +755,12 @@ pub enum ProtocolRequest {
     /// Stream buffered run events.
     #[serde(rename = "events.stream")]
     EventsStream(EventsStreamParams),
+    /// Commit one complete voice event batch.
+    #[serde(rename = "voice.events.commit")]
+    VoiceEventsCommit(VoiceEventsCommitParams),
+    /// Read one committed voice event batch.
+    #[serde(rename = "voice.events.read")]
+    VoiceEventsRead(VoiceEventsReadParams),
     /// Decide a pending approval.
     #[serde(rename = "approval.decide")]
     ApprovalDecide(ApprovalDecideParams),
@@ -794,6 +832,8 @@ impl ProtocolRequest {
             Self::MessageAppend(_) => ProtocolMethod::MessageAppend,
             Self::IssuePrepStart(_) => ProtocolMethod::IssuePrepStart,
             Self::EventsStream(_) => ProtocolMethod::EventsStream,
+            Self::VoiceEventsCommit(_) => ProtocolMethod::VoiceEventsCommit,
+            Self::VoiceEventsRead(_) => ProtocolMethod::VoiceEventsRead,
             Self::ApprovalDecide(_) => ProtocolMethod::ApprovalDecide,
             Self::RunCancel(_) => ProtocolMethod::RunCancel,
             Self::SessionsList => ProtocolMethod::SessionsList,
@@ -826,6 +866,12 @@ impl ProtocolRequest {
                 decode_params(params, method).map(Self::IssuePrepStart)
             }
             ProtocolMethod::EventsStream => decode_params(params, method).map(Self::EventsStream),
+            ProtocolMethod::VoiceEventsCommit => {
+                decode_params(params, method).map(Self::VoiceEventsCommit)
+            }
+            ProtocolMethod::VoiceEventsRead => {
+                decode_params(params, method).map(Self::VoiceEventsRead)
+            }
             ProtocolMethod::ApprovalDecide => {
                 decode_params(params, method).map(Self::ApprovalDecide)
             }
@@ -877,6 +923,8 @@ impl ProtocolRequest {
             Self::MessageAppend(params) => serialize_sorted_field(envelope, "params", params),
             Self::IssuePrepStart(params) => serialize_sorted_field(envelope, "params", params),
             Self::EventsStream(params) => serialize_sorted_field(envelope, "params", params),
+            Self::VoiceEventsCommit(params) => serialize_sorted_field(envelope, "params", params),
+            Self::VoiceEventsRead(params) => serialize_sorted_field(envelope, "params", params),
             Self::ApprovalDecide(params) => serialize_sorted_field(envelope, "params", params),
             Self::RunCancel(params) => serialize_sorted_field(envelope, "params", params),
             Self::SessionsList => Ok(()),
@@ -922,6 +970,12 @@ pub enum ProtocolResponse {
     /// Buffered run-event page.
     #[serde(rename = "events.stream")]
     EventsStream(EventsStreamResult),
+    /// Committed voice event batch.
+    #[serde(rename = "voice.events.commit")]
+    VoiceEventsCommit(VoiceEventsResult),
+    /// Voice event batch readback.
+    #[serde(rename = "voice.events.read")]
+    VoiceEventsRead(VoiceEventsResult),
     /// Approval-decision receipt.
     #[serde(rename = "approval.decide")]
     ApprovalDecide(CommandAcceptedResult),
@@ -993,6 +1047,8 @@ impl ProtocolResponse {
             Self::MessageAppend(_) => ProtocolMethod::MessageAppend,
             Self::IssuePrepStart(_) => ProtocolMethod::IssuePrepStart,
             Self::EventsStream(_) => ProtocolMethod::EventsStream,
+            Self::VoiceEventsCommit(_) => ProtocolMethod::VoiceEventsCommit,
+            Self::VoiceEventsRead(_) => ProtocolMethod::VoiceEventsRead,
             Self::ApprovalDecide(_) => ProtocolMethod::ApprovalDecide,
             Self::RunCancel(_) => ProtocolMethod::RunCancel,
             Self::SessionsList(_) => ProtocolMethod::SessionsList,
@@ -1025,6 +1081,12 @@ impl ProtocolResponse {
                 decode_result(result, method).map(Self::IssuePrepStart)
             }
             ProtocolMethod::EventsStream => decode_result(result, method).map(Self::EventsStream),
+            ProtocolMethod::VoiceEventsCommit => {
+                decode_result(result, method).map(Self::VoiceEventsCommit)
+            }
+            ProtocolMethod::VoiceEventsRead => {
+                decode_result(result, method).map(Self::VoiceEventsRead)
+            }
             ProtocolMethod::ApprovalDecide => {
                 decode_result(result, method).map(Self::ApprovalDecide)
             }
@@ -1072,6 +1134,8 @@ impl ProtocolResponse {
             Self::MessageAppend(result) => serialize_sorted_field(envelope, "result", result),
             Self::IssuePrepStart(result) => serialize_sorted_field(envelope, "result", result),
             Self::EventsStream(result) => serialize_sorted_field(envelope, "result", result),
+            Self::VoiceEventsCommit(result) => serialize_sorted_field(envelope, "result", result),
+            Self::VoiceEventsRead(result) => serialize_sorted_field(envelope, "result", result),
             Self::ApprovalDecide(result) => serialize_sorted_field(envelope, "result", result),
             Self::RunCancel(result) => serialize_sorted_field(envelope, "result", result),
             Self::SessionsList(result) => serialize_sorted_field(envelope, "result", result),
@@ -2368,6 +2432,34 @@ pub struct EventsStreamParams {
     pub limit: Option<usize>,
 }
 
+/// Parameters for committing one complete raw voice event batch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceEventsCommitParams {
+    /// Durable run receiving the batch.
+    pub run_id: String,
+    /// Raw client-observed events; the server assigns durable envelopes.
+    pub events: Vec<VoiceEvent>,
+}
+
+/// Parameters for reading one run's committed voice event batch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceEventsReadParams {
+    /// Durable run whose batch should be read.
+    pub run_id: String,
+}
+
+/// Server-minted voice event envelopes returned by commit and readback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceEventsResult {
+    /// Durable run owning the batch.
+    pub run_id: String,
+    /// Zero-based authoritative envelopes, or an empty readback.
+    pub events: Vec<VoiceEventEnvelope>,
+}
+
 /// Stream event paired with its run-local offset.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BufferedStreamEvent {
@@ -2999,6 +3091,7 @@ mod tests {
 
     #[test]
     fn capability_names_and_error_codes_keep_exact_v1_literals() {
+        assert_eq!(MAX_PROTOCOL_LINE_BYTES, 1_048_576);
         assert_eq!(
             CAPABILITIES.map(Capability::as_str),
             [
@@ -3007,6 +3100,8 @@ mod tests {
                 "message.append",
                 "issue-prep.start",
                 "events.stream",
+                "voice.events.commit",
+                "voice.events.read",
                 "approval.decide",
                 "run.cancel",
                 "sessions.list",
@@ -3041,6 +3136,7 @@ mod tests {
                 ERROR_NOT_FOUND,
                 ERROR_OVERLOAD,
                 ERROR_RUN_FAILED,
+                ERROR_VOICE_EVENTS_CONFLICT,
                 ERROR_SESSIONS_LIST_FAILED,
                 ERROR_THREAD_AUTHORITY_EXCEEDED,
                 ERROR_THREAD_AUTHORITY_FAILED,
@@ -3066,6 +3162,7 @@ mod tests {
                 "not_found",
                 "overload",
                 "run_failed",
+                "voice_events_conflict",
                 "sessions_list_failed",
                 "thread_authority_exceeded",
                 "thread_authority_failed",
@@ -3112,6 +3209,14 @@ mod tests {
             (
                 ProtocolMethod::EventsStream,
                 r#"{"v":1,"id":"events_1","kind":"request","method":"events.stream","params":{"from_offset":0,"limit":64,"run_id":"run-1"}}"#,
+            ),
+            (
+                ProtocolMethod::VoiceEventsCommit,
+                r#"{"v":1,"id":"voice_commit_1","kind":"request","method":"voice.events.commit","params":{"events":[{"event":"voice_spoken","interrupted_at":null,"run_id":"run-1","sentence_count":2,"ttfa_ms":287,"turn_id":"turn-1"}],"run_id":"run-1"}}"#,
+            ),
+            (
+                ProtocolMethod::VoiceEventsRead,
+                r#"{"v":1,"id":"voice_read_1","kind":"request","method":"voice.events.read","params":{"run_id":"run-1"}}"#,
             ),
             (
                 ProtocolMethod::ApprovalDecide,
@@ -3216,6 +3321,14 @@ mod tests {
                 r#"{"v":1,"id":"events_1","kind":"response","method":"events.stream","result":{"events":[],"from_offset":0,"next_offset":0,"run_id":"run-1","status":"running"}}"#,
             ),
             (
+                ProtocolMethod::VoiceEventsCommit,
+                r#"{"v":1,"id":"voice_commit_1","kind":"response","method":"voice.events.commit","result":{"events":[{"event":{"event":"voice_spoken","interrupted_at":null,"run_id":"run-1","sentence_count":2,"ttfa_ms":287,"turn_id":"turn-1"},"sequence":0,"v":1}],"run_id":"run-1"}}"#,
+            ),
+            (
+                ProtocolMethod::VoiceEventsRead,
+                r#"{"v":1,"id":"voice_read_1","kind":"response","method":"voice.events.read","result":{"events":[{"event":{"event":"voice_spoken","interrupted_at":null,"run_id":"run-1","sentence_count":2,"ttfa_ms":287,"turn_id":"turn-1"},"sequence":0,"v":1}],"run_id":"run-1"}}"#,
+            ),
+            (
                 ProtocolMethod::ApprovalDecide,
                 r#"{"v":1,"id":"approval_1","kind":"response","method":"approval.decide","result":{"run_id":"run-1","status":"running"}}"#,
             ),
@@ -3297,7 +3410,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(REQUESTS.len(), 25);
+        assert_eq!(REQUESTS.len(), 27);
         assert_eq!(RESPONSES.len(), REQUESTS.len());
         for ((request_method, request_fixture), (response_method, response_fixture)) in
             REQUESTS.iter().zip(RESPONSES)
@@ -3330,6 +3443,14 @@ mod tests {
         let error = decode_request(unknown_param).unwrap_err();
         assert_eq!(error.method, Some(ProtocolMethod::RunCancel));
         assert_eq!(error.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+
+        let client_minted_envelope = r#"{"v":1,"id":"voice_1","kind":"request","method":"voice.events.commit","params":{"events":[{"event":"voice_spoken","run_id":"run-1","turn_id":"turn-1","ttfa_ms":1,"sentence_count":1,"interrupted_at":null,"sequence":0}],"run_id":"run-1"}}"#;
+        let error = decode_request(client_minted_envelope).unwrap_err();
+        assert_eq!(error.method, Some(ProtocolMethod::VoiceEventsCommit));
+        assert_eq!(error.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+
+        let unknown_result = r#"{"v":1,"id":"voice_1","kind":"response","method":"voice.events.read","result":{"events":[],"future":true,"run_id":"run-1"}}"#;
+        assert!(serde_json::from_str::<Envelope>(unknown_result).is_err());
     }
 
     #[test]

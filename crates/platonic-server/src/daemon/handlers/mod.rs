@@ -36,6 +36,12 @@ pub(super) fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Enve
         ProtocolRequest::EventsStream(params) => {
             runs::handle_events_stream(runtime, request, params)
         }
+        ProtocolRequest::VoiceEventsCommit(params) => {
+            runs::handle_voice_events_commit(runtime, request, params)
+        }
+        ProtocolRequest::VoiceEventsRead(params) => {
+            runs::handle_voice_events_read(runtime, request, params)
+        }
         ProtocolRequest::ApprovalDecide(params) => {
             runs::handle_approval_decide(runtime, request, params)
         }
