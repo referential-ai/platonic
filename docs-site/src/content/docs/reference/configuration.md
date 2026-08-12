@@ -28,6 +28,8 @@ api_key_env = "OPENROUTER_API_KEY"
 
 Keep credentials in the environment. The configuration names the environment variable; it does not contain the secret.
 
+An auto-discovered workspace `plato.toml` cannot set `provider.api_key_env`, `provider.base_url`, or gateway trust settings.
+
 ## Where to continue
 
 Return to the [User docs](../../user/#start-a-durable-thread) for the operating path or [Developer docs](../../developer/#the-boundary) for runtime ownership.

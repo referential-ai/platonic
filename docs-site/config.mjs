@@ -1,4 +1,5 @@
-const siteUrl = new URL(process.env.DOCS_SITE ?? "https://referential.ai");
+// Production host selection remains pending in platonic-workspace#108.
+const siteUrl = new URL(process.env.DOCS_SITE ?? "https://docs.example.invalid");
 
 if (siteUrl.pathname !== "/" || siteUrl.search || siteUrl.hash) {
   throw new Error("DOCS_SITE must be an origin; configure its path with DOCS_BASE");

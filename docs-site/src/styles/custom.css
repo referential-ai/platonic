@@ -113,9 +113,9 @@ input,
 
 .section-entrances {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 1rem;
-  margin-block: 2rem 3rem;
+  margin-block: 2rem 1rem;
 }
 
 .section-entrance {
@@ -138,10 +138,6 @@ input,
   border-top-color: var(--section-developer);
 }
 
-.section-entrance.reference {
-  border-top-color: var(--section-reference);
-}
-
 .section-entrance strong {
   margin-bottom: 0.75rem;
   font-size: 1.2rem;
@@ -160,6 +156,123 @@ input,
 
 .section-entrance:hover {
   background: var(--sl-color-gray-6);
+}
+
+.shared-reference {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 1rem;
+  margin-block-end: 3rem;
+  padding: 1rem 1.25rem;
+  border-block: 1px solid var(--sl-color-gray-5);
+  color: var(--sl-color-white);
+  text-decoration: none;
+}
+
+.shared-reference strong {
+  color: var(--section-reference);
+}
+
+.shared-reference span {
+  color: var(--sl-color-gray-2);
+}
+
+.shared-reference small {
+  font-weight: 700;
+}
+
+.shared-reference:hover {
+  background: var(--sl-color-gray-6);
+}
+
+.system-flow {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  margin-block: 2rem 3rem;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid #39434f;
+  border-radius: 4px;
+  background: #11151c;
+  list-style: none;
+}
+
+.system-flow li {
+  position: relative;
+  min-width: 0;
+  min-height: 6.5rem;
+  padding: 1rem;
+  color: #f7f8fa;
+}
+
+.system-flow li + li {
+  border-inline-start: 1px solid #39434f;
+}
+
+.system-flow li:not(:last-child)::after {
+  position: absolute;
+  z-index: 1;
+  inset-block-start: 50%;
+  inset-inline-end: -0.3rem;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-block-start: 1px solid #909dac;
+  border-inline-end: 1px solid #909dac;
+  background: #11151c;
+  content: "";
+  transform: translateY(-50%) rotate(45deg);
+}
+
+.system-flow li:last-child {
+  background: #12382d;
+}
+
+.system-flow small,
+.system-flow strong {
+  display: block;
+}
+
+.system-flow small {
+  color: #909dac;
+  font-family: var(--sl-font-mono);
+  font-weight: 700;
+}
+
+.system-flow strong {
+  margin-top: 1.75rem;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 40rem) {
+  .section-entrances,
+  .system-flow {
+    grid-template-columns: 1fr;
+  }
+
+  .shared-reference {
+    grid-template-columns: 1fr;
+    gap: 0.35rem;
+  }
+
+  .system-flow li {
+    min-height: 4.5rem;
+  }
+
+  .system-flow li + li {
+    border-block-start: 1px solid #39434f;
+    border-inline-start: 0;
+  }
+
+  .system-flow li:not(:last-child)::after {
+    inset-block: auto -0.3rem;
+    inset-inline: 50% auto;
+    transform: translateX(-50%) rotate(135deg);
+  }
+
+  .system-flow strong {
+    margin-top: 0.5rem;
+  }
 }
 
 @media print {
