@@ -1,89 +1,50 @@
-pub use super::DaemonPaths;
-#[cfg(any(test, unix))]
+#[cfg(unix)]
+use super::socket::{prepare_runtime_path, prepare_socket_parent, prepare_temp_runtime_home};
+#[cfg(all(test, unix))]
+use super::{
+    DaemonPaths,
+    reconcile::reconcile_thread_repositories,
+    socket::{PRIVATE_DIRECTORY_MODE, SOCKET_MODE, mode},
+};
+use super::{
+    host::{HostRuntime, handle_host_line},
+    socket::BoundEndpoint,
+};
+#[cfg(all(test, unix))]
+use crate::daemon::{
+    handlers::handle_line,
+    protocol::{ERROR_INTERNAL, decode_request},
+    runtime::DaemonRuntime,
+};
+#[cfg(unix)]
 use crate::paths;
 use crate::{
     AppResult,
     daemon::{
-        handlers::{handle_line, handle_request, reconcile_one_shot_run_roots},
         lock::HostProcessLock,
-        protocol::{
-            ERROR_INTERNAL, ERROR_MALFORMED_REQUEST, ERROR_WORKSPACE_MISMATCH,
-            ERROR_WORKSPACE_UNREGISTERED, Envelope, EnvelopeKind, HelloParams, ProtocolErrorCode,
-            ProtocolMethod, ProtocolRequest, ProtocolResponse, ShutdownIfIdleResultName,
-            decode_request,
-        },
-        runtime::{DaemonRuntime, RuntimeState},
+        protocol::{Envelope, ProtocolResponse, ShutdownIfIdleResultName},
         transport,
     },
-    thread_authority::{ThreadStopRecord, now_ms},
 };
 use std::{
-    collections::HashMap,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 use std::{
-    fs::{self, DirBuilder, Permissions},
-    io::{Error, ErrorKind},
-    os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
+    fs::{self, Permissions},
+    io::ErrorKind,
+    os::unix::fs::MetadataExt,
 };
 
-#[cfg(unix)]
-const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
-#[cfg(unix)]
-const SOCKET_MODE: u32 = 0o600;
 const MAX_CONNECTION_HANDLERS: usize = 64;
-const HOST_DAEMON_SCOPE: &str = "host";
-const RECONCILIATION_ACTOR: &str = "startup-reconciliation";
-
-fn reconcile_thread_repositories(server_db_path: &Path) -> AppResult<()> {
-    let mut store = crate::server_store::ServerStore::open_or_create(server_db_path)?;
-    let mut claims = HashMap::<String, (String, Vec<String>)>::new();
-    for claim in store.branch_claims()? {
-        let entry = claims
-            .entry(claim.thread_id)
-            .or_insert_with(|| (claim.workspace_id.clone(), Vec::new()));
-        if entry.0 != claim.workspace_id {
-            return Err(crate::AppError::Config(
-                "one thread has branch claims in multiple workspaces".into(),
-            ));
-        }
-        entry.1.push(claim.repo);
-    }
-    for (thread_id, (workspace_id, repos)) in claims {
-        match store.thread_authority(&thread_id)? {
-            Some(authority) if store.thread_stop(&thread_id)?.is_none() => {
-                crate::thread_repository::reconcile_and_discard(
-                    server_db_path,
-                    &workspace_id,
-                    &authority,
-                )?;
-                store.persist_thread_stop(&ThreadStopRecord::new(
-                    thread_id.clone(),
-                    RECONCILIATION_ACTOR.into(),
-                    None,
-                    now_ms(),
-                )?)?;
-            }
-            Some(_) | None => crate::thread_repository::discard_claims(
-                server_db_path,
-                &workspace_id,
-                &thread_id,
-                &repos,
-            )?,
-        }
-        store.release_thread_claims(&thread_id)?;
-    }
-    crate::thread_repository::remove_all_thread_roots(server_db_path)
-}
 
 #[derive(Debug, Default)]
 struct HandlerCapacity {
@@ -111,150 +72,6 @@ impl Drop for HandlerPermit {
     fn drop(&mut self) {
         let previous = self.capacity.live.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
-    }
-}
-
-#[derive(Debug)]
-struct BoundEndpoint {
-    listener: transport::Listener,
-    socket_path: PathBuf,
-    #[cfg(unix)]
-    socket_device: u64,
-    #[cfg(unix)]
-    socket_inode: u64,
-}
-
-impl BoundEndpoint {
-    fn bind(socket_path: PathBuf, reclaim_default_socket: bool) -> AppResult<Self> {
-        #[cfg(unix)]
-        prepare_socket_for_bind(&socket_path, reclaim_default_socket)?;
-        let listener = transport::bind(&socket_path)?;
-        #[cfg(unix)]
-        let (socket_device, socket_inode) = bound_socket_identity(&socket_path)?;
-        #[cfg(unix)]
-        if let Err(error) = restrict_socket(&socket_path) {
-            drop(listener);
-            let _ = remove_socket_if_matches(&socket_path, socket_device, socket_inode);
-            return Err(error.into());
-        }
-        Ok(Self {
-            listener,
-            socket_path,
-            #[cfg(unix)]
-            socket_device,
-            #[cfg(unix)]
-            socket_inode,
-        })
-    }
-}
-
-impl Drop for BoundEndpoint {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        let _ = remove_socket_if_matches(&self.socket_path, self.socket_device, self.socket_inode);
-    }
-}
-
-#[derive(Clone, Debug)]
-struct HostRuntime {
-    socket_path: PathBuf,
-    started_at: Instant,
-    state: Arc<Mutex<RuntimeState>>,
-    control_runtime: DaemonRuntime,
-    workspaces: Arc<Mutex<HashMap<PathBuf, DaemonRuntime>>>,
-}
-
-impl HostRuntime {
-    fn new(socket_path: PathBuf) -> AppResult<Self> {
-        let max_spawn_depth = crate::config::server_max_spawn_depth()?;
-        let require_confinement = crate::config::server_require_confinement()?;
-        let confinement_support = crate::confinement::detect_support();
-        let started_at = Instant::now();
-        let state = Arc::new(Mutex::new(RuntimeState::default()));
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let control_paths =
-            DaemonPaths::resolve(&std::env::current_dir()?, Some(socket_path.clone()))?;
-        reconcile_thread_repositories(&control_paths.server_db_path)?;
-        reconcile_one_shot_run_roots(&control_paths.server_db_path)?;
-        let control_runtime = DaemonRuntime::new_shared(
-            control_paths,
-            max_spawn_depth,
-            require_confinement,
-            confinement_support,
-            started_at,
-            Arc::clone(&state),
-            Arc::clone(&stop_requested),
-        );
-        Ok(Self {
-            socket_path,
-            started_at,
-            state,
-            control_runtime,
-            workspaces: Arc::new(Mutex::new(HashMap::new())),
-        })
-    }
-
-    fn workspace_runtime(
-        &self,
-        params: &HelloParams,
-    ) -> Result<DaemonRuntime, (ProtocolErrorCode, String)> {
-        let workspace_root = PathBuf::from(&params.workspace_root)
-            .canonicalize()
-            .map_err(|error| {
-                (
-                    ERROR_WORKSPACE_MISMATCH,
-                    format!("workspace_root cannot be resolved: {error}"),
-                )
-            })?;
-        let paths = DaemonPaths::resolve(&workspace_root, Some(self.socket_path.clone()))
-            .map_err(|error| (ERROR_INTERNAL, error.to_string()))?;
-        if !paths.is_registered() {
-            return Err((
-                ERROR_WORKSPACE_UNREGISTERED,
-                format!(
-                    "workspace is not registered: {}; run platonic workspace create <name> \"{}\"",
-                    workspace_root.display(),
-                    workspace_root.display()
-                ),
-            ));
-        }
-        let legacy_workspace_id = crate::paths::workspace_id(&workspace_root).map_err(|error| {
-            (
-                ERROR_WORKSPACE_MISMATCH,
-                format!("workspace_id cannot be derived: {error}"),
-            )
-        })?;
-        if params.workspace_id != paths.workspace_id && params.workspace_id != legacy_workspace_id {
-            return Err((
-                ERROR_WORKSPACE_MISMATCH,
-                format!(
-                    "workspace_id mismatch: expected {}, got {}",
-                    paths.workspace_id, params.workspace_id
-                ),
-            ));
-        }
-
-        let mut workspaces = self
-            .workspaces
-            .lock()
-            .expect("host workspace runtime lock poisoned");
-        if let Some(runtime) = workspaces.get(&workspace_root) {
-            return Ok(runtime.clone());
-        }
-
-        crate::ledger::interrupt_orphaned_default_sqlite_runs(&paths.default_ledger())
-            .map_err(|error| (ERROR_INTERNAL, error.to_string()))?;
-        let runtime = DaemonRuntime::new_shared(
-            paths,
-            self.control_runtime.max_spawn_depth(),
-            self.control_runtime.require_confinement(),
-            self.control_runtime.confinement_support(),
-            self.started_at,
-            Arc::clone(&self.state),
-            Arc::clone(&self.control_runtime.stop_requested),
-        );
-        workspaces.insert(workspace_root, runtime.clone());
-        Ok(runtime)
     }
 }
 
@@ -371,203 +188,6 @@ where
     })
 }
 
-#[cfg(unix)]
-fn prepare_socket_for_bind(path: &Path, reclaim_default_socket: bool) -> std::io::Result<()> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    let path_in_use = || {
-        Error::new(
-            ErrorKind::AddrInUse,
-            format!("daemon socket path already exists: {}", path.display()),
-        )
-    };
-    if !reclaim_default_socket
-        || !metadata.file_type().is_socket()
-        || metadata.uid() != rustix::process::geteuid().as_raw()
-    {
-        return Err(path_in_use());
-    }
-
-    remove_socket_if_matches(path, metadata.dev(), metadata.ino())?;
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Ok(_) => Err(path_in_use()),
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(unix)]
-fn bound_socket_identity(path: &Path) -> std::io::Result<(u64, u64)> {
-    let metadata = fs::symlink_metadata(path)?;
-    let expected_uid = rustix::process::geteuid().as_raw();
-    if !metadata.file_type().is_socket() || metadata.uid() != expected_uid {
-        return Err(Error::new(
-            ErrorKind::PermissionDenied,
-            format!(
-                "daemon socket path is not a current-user socket: {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok((metadata.dev(), metadata.ino()))
-}
-
-#[cfg(unix)]
-fn remove_socket_if_matches(
-    path: &Path,
-    expected_device: u64,
-    expected_inode: u64,
-) -> std::io::Result<()> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if metadata.dev() == expected_device && metadata.ino() == expected_inode {
-        fs::remove_file(path)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn prepare_temp_runtime_home(path: &Path) -> std::io::Result<()> {
-    match DirBuilder::new().mode(PRIVATE_DIRECTORY_MODE).create(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error),
-    }
-    restrict_owned_runtime_home(path, rustix::process::geteuid().as_raw())
-}
-
-#[cfg(unix)]
-fn restrict_owned_runtime_home(path: &Path, expected_uid: u32) -> std::io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        return Err(Error::new(
-            ErrorKind::PermissionDenied,
-            format!(
-                "temporary runtime home is not a real directory: {}",
-                path.display()
-            ),
-        ));
-    }
-    if metadata.uid() != expected_uid {
-        return Err(Error::new(
-            ErrorKind::PermissionDenied,
-            format!(
-                "temporary runtime home {} is owned by uid {}, expected {expected_uid}",
-                path.display(),
-                metadata.uid()
-            ),
-        ));
-    }
-    fs::set_permissions(path, Permissions::from_mode(PRIVATE_DIRECTORY_MODE))?;
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != expected_uid
-    {
-        return Err(Error::new(
-            ErrorKind::PermissionDenied,
-            format!(
-                "temporary runtime home changed while securing it: {}",
-                path.display()
-            ),
-        ));
-    }
-    verify_mode(path, PRIVATE_DIRECTORY_MODE)
-}
-
-#[cfg(unix)]
-fn prepare_runtime_path(runtime_home: &Path, path: &Path) -> std::io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "runtime path has no parent"))?;
-    prepare_private_directory(parent, Some(runtime_home))
-}
-
-#[cfg(unix)]
-fn prepare_socket_parent(runtime_home: &Path, socket_path: &Path) -> std::io::Result<()> {
-    let parent = socket_path
-        .parent()
-        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "socket path has no parent"))?;
-    let root = parent.starts_with(runtime_home).then_some(runtime_home);
-    prepare_private_directory(parent, root)
-}
-
-#[cfg(unix)]
-fn prepare_private_directory(parent: &Path, root: Option<&Path>) -> std::io::Result<()> {
-    if root.is_some_and(|root| !parent.starts_with(root)) {
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
-            "private directory is outside its runtime root",
-        ));
-    }
-    DirBuilder::new()
-        .recursive(true)
-        .mode(PRIVATE_DIRECTORY_MODE)
-        .create(parent)?;
-
-    if let Some(root) = root {
-        for directory in parent
-            .ancestors()
-            .take_while(|directory| directory.starts_with(root))
-        {
-            restrict_private_directory(directory)?;
-        }
-    } else {
-        restrict_private_directory(parent)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn restrict_private_directory(path: &Path) -> std::io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        return Err(Error::new(
-            ErrorKind::PermissionDenied,
-            format!(
-                "private runtime path is not a directory: {}",
-                path.display()
-            ),
-        ));
-    }
-    fs::set_permissions(path, Permissions::from_mode(PRIVATE_DIRECTORY_MODE))?;
-    verify_mode(path, PRIVATE_DIRECTORY_MODE)
-}
-
-#[cfg(unix)]
-fn restrict_socket(path: &Path) -> std::io::Result<()> {
-    fs::set_permissions(path, Permissions::from_mode(SOCKET_MODE))?;
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_socket() {
-        return Err(Error::new(
-            ErrorKind::PermissionDenied,
-            format!("daemon socket path is not a socket: {}", path.display()),
-        ));
-    }
-    verify_mode(path, SOCKET_MODE)
-}
-
-#[cfg(unix)]
-fn verify_mode(path: &Path, expected: u32) -> std::io::Result<()> {
-    let actual = fs::symlink_metadata(path)?.permissions().mode() & 0o777;
-    if actual == expected {
-        return Ok(());
-    }
-    Err(Error::new(
-        ErrorKind::PermissionDenied,
-        format!(
-            "unsafe permissions on {}: expected {expected:04o}, got {actual:04o}",
-            path.display()
-        ),
-    ))
-}
-
 #[cfg(all(test, unix))]
 fn handle_stream(runtime: DaemonRuntime, stream: transport::Stream) -> AppResult<()> {
     let stop_requested = Arc::clone(&runtime.stop_requested);
@@ -630,71 +250,6 @@ fn handle_host_stream(runtime: HostRuntime, stream: transport::Stream) -> AppRes
         move |line| handle_host_line(&runtime, &mut workspace_runtime, line),
         || {},
     )
-}
-
-fn handle_host_line(
-    host: &HostRuntime,
-    workspace_runtime: &mut Option<DaemonRuntime>,
-    line: &str,
-) -> Envelope {
-    if let Some(runtime) = workspace_runtime {
-        return add_host_scope(handle_line(runtime, line));
-    }
-
-    let request = match decode_request(line) {
-        Ok(request) => request,
-        Err(error) => return *error,
-    };
-    if request.method.is_some_and(is_control_method) {
-        return handle_request(&host.control_runtime, request);
-    }
-    if request.method != Some(ProtocolMethod::Hello) {
-        let method = request.method;
-        return Envelope::error(
-            request.id,
-            method.map(|method| method.to_string()),
-            ERROR_MALFORMED_REQUEST,
-            format!(
-                "host daemon requires hello before {}",
-                method.map_or("request", ProtocolMethod::as_str)
-            ),
-        );
-    }
-    let params = match request.params.as_ref() {
-        Some(ProtocolRequest::Hello(params)) => params.clone(),
-        _ => unreachable!("hello request carries hello params"),
-    };
-    let runtime = match host.workspace_runtime(&params) {
-        Ok(runtime) => runtime,
-        Err((code, message)) => {
-            return Envelope::error(request.id, Some("hello".into()), code, message);
-        }
-    };
-    let response = add_host_scope(handle_request(&runtime, request));
-    if response.kind == EnvelopeKind::Response {
-        *workspace_runtime = Some(runtime);
-    }
-    response
-}
-
-fn is_control_method(method: ProtocolMethod) -> bool {
-    matches!(
-        method,
-        ProtocolMethod::DaemonShutdownIfIdle
-            | ProtocolMethod::WorkspaceCreate
-            | ProtocolMethod::WorkspaceList
-            | ProtocolMethod::WorkspaceStatus
-            | ProtocolMethod::AgentCreate
-            | ProtocolMethod::AgentList
-            | ProtocolMethod::AgentStatus
-    )
-}
-
-fn add_host_scope(mut response: Envelope) -> Envelope {
-    if let Some(ProtocolResponse::Hello(result)) = response.result.as_mut() {
-        result.daemon_scope = Some(HOST_DAEMON_SCOPE.into());
-    }
-    response
 }
 
 fn handle_stream_lines<H, F>(
@@ -985,8 +540,9 @@ mod tests {
                 DaemonStatusProviderKind, DaemonStatusResult, ERROR_DAEMON_SHUTTING_DOWN,
                 ERROR_INTERNAL, ERROR_ISSUE_PREP_FAILED, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
                 ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED,
-                ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind, ProtocolError, RunStartResult,
-                RunStateName, StreamEvent, TypedTranscript, TypedTranscriptEntry,
+                ERROR_WORKSPACE_MISMATCH, ERROR_WORKSPACE_UNREGISTERED, Envelope, EnvelopeKind,
+                ProtocolError, RunStartResult, RunStateName, StreamEvent, TypedTranscript,
+                TypedTranscriptEntry,
             },
             runtime::{MAX_EVENT_BUFFER, MAX_TERMINAL_RUNS, PendingApproval, RunRecord},
         },
@@ -1022,228 +578,6 @@ mod tests {
 
     fn response_result<T: serde::de::DeserializeOwned>(response: &Envelope) -> T {
         serde_json::from_value(response_value(response)).unwrap()
-    }
-
-    fn git(cwd: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .current_dir(cwd)
-            .args(args)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().into()
-    }
-
-    #[test]
-    fn startup_reconciliation_integrates_orphaned_private_repo_and_releases_claim() {
-        use crate::thread_authority::{ThreadSpawnApprovalRecord, ThreadSpawnDecisionName};
-        use platonic_protocol::{
-            ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadConfinement,
-            ThreadRepositoryRequest,
-        };
-
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
-        fs::create_dir(&workspace).unwrap();
-        git(&workspace, &["init", "--quiet", "--initial-branch", "main"]);
-        git(&workspace, &["config", "user.name", "Platonic Test"]);
-        git(
-            &workspace,
-            &["config", "user.email", "platonic@example.invalid"],
-        );
-        fs::write(workspace.join("tracked.txt"), "user\n").unwrap();
-        git(&workspace, &["add", "tracked.txt"]);
-        git(&workspace, &["commit", "--quiet", "-m", "initial"]);
-        let user_commit = git(&workspace, &["rev-parse", "HEAD"]);
-        let server_db = root.path().join("state/platonic/server.db");
-        let drafts = crate::thread_repository::resolve(
-            &workspace,
-            "thread_crashed",
-            &workspace,
-            None,
-            &[ThreadRepositoryRequest {
-                repo: ".".into(),
-                branch: None,
-            }],
-        )
-        .unwrap();
-        let prepared = crate::thread_repository::prepare(
-            &server_db,
-            "workspace-crash",
-            "thread_crashed",
-            &drafts,
-        )
-        .unwrap();
-        let private = Path::new(&prepared.worktrees[0].path);
-        git(private, &["config", "user.name", "Platonic Test"]);
-        git(
-            private,
-            &["config", "user.email", "platonic@example.invalid"],
-        );
-        fs::write(private.join("recovered.txt"), "recovered\n").unwrap();
-        git(private, &["add", "recovered.txt"]);
-        git(private, &["commit", "--quiet", "-m", "recovered"]);
-        let recovered_commit = git(private, &["rev-parse", "HEAD"]);
-        let authority = ThreadAuthorityRecord {
-            thread_id: "thread_crashed".into(),
-            parent_thread_id: None,
-            spawning_actor: "test".into(),
-            agent_id: Some(AgentId::new("plato").unwrap()),
-            model: "gpt-test".into(),
-            reasoning_effort: ReasoningEffort::None,
-            approval_policy: ThreadApprovalPolicy::Prompt,
-            toolset: vec!["file.read".into()],
-            worktrees: prepared.worktrees,
-            granted_paths: prepared.granted_paths,
-            network: false,
-            created_at_ms: 1,
-        };
-        let approval = ThreadSpawnApprovalRecord {
-            spawn_id: "spawn_crashed".into(),
-            thread_id: authority.thread_id.clone(),
-            decision: ThreadSpawnDecisionName::Granted,
-            actor: "test".into(),
-            reason: None,
-            occurred_at_ms: 1,
-        };
-        let mut store = crate::server_store::ServerStore::open_or_create(&server_db).unwrap();
-        store
-            .claim_thread_branches(
-                "workspace-crash",
-                "thread_crashed",
-                &[(".".into(), "thread/thread_crashed".into())],
-                1,
-            )
-            .unwrap();
-        store
-            .persist_thread_spawn(&approval, Some(&authority), Some(ThreadConfinement::None))
-            .unwrap();
-        drop(store);
-
-        reconcile_thread_repositories(&server_db).unwrap();
-
-        let store = crate::server_store::ServerStore::open_or_create(&server_db).unwrap();
-        let stop = store.thread_stop("thread_crashed").unwrap().unwrap();
-        assert_eq!(stop.actor, RECONCILIATION_ACTOR);
-        assert!(store.branch_claims().unwrap().is_empty());
-        assert!(
-            !crate::paths::thread_repository_root(&server_db, "thread_crashed")
-                .unwrap()
-                .exists()
-        );
-        let shared =
-            crate::thread_repository::shared_repository_path(&server_db, "workspace-crash", ".")
-                .unwrap();
-        assert_eq!(
-            git(
-                shared.parent().unwrap(),
-                &[
-                    "--git-dir",
-                    &shared.to_string_lossy(),
-                    "rev-parse",
-                    "refs/heads/thread/thread_crashed",
-                ],
-            ),
-            recovered_commit
-        );
-        assert_eq!(git(&workspace, &["rev-parse", "HEAD"]), user_commit);
-        assert!(!workspace.join("recovered.txt").exists());
-    }
-
-    #[test]
-    fn host_startup_removes_only_abandoned_one_shot_run_roots() {
-        let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("home");
-        let workspace = root.path().join("workspace");
-        fs::create_dir(&home).unwrap();
-        fs::create_dir(&workspace).unwrap();
-        fs::write(workspace.join("preserved.txt"), "workspace\n").unwrap();
-
-        temp_env::with_vars(
-            [("HOME", Some(home.as_os_str())), ("PLATO_CONFIG", None)],
-            || {
-                paths::with_test_xdg(root.path(), || {
-                    let server_db = crate::paths::server_db_path().unwrap();
-                    let abandoned =
-                        crate::paths::one_shot_run_root(&server_db, "run_abandoned").unwrap();
-                    fs::create_dir_all(abandoned.join("scratch")).unwrap();
-                    fs::write(abandoned.join("scratch/residue.txt"), "residue\n").unwrap();
-
-                    let _host = HostRuntime::new(root.path().join("host.sock")).unwrap();
-
-                    assert!(!abandoned.exists());
-                    assert_eq!(
-                        fs::read_to_string(workspace.join("preserved.txt")).unwrap(),
-                        "workspace\n"
-                    );
-                });
-            },
-        );
-    }
-
-    #[test]
-    fn host_runtime_freezes_and_carries_configured_spawn_depth() {
-        let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("home");
-        let config_path = home.join(".config/plato/config.toml");
-        let workspace = root.path().join("workspace");
-        fs::create_dir(&workspace).unwrap();
-        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        fs::write(
-            &config_path,
-            "[limits]\nmax_spawn_depth = 2\n[confinement]\nrequire = true\n",
-        )
-        .unwrap();
-
-        temp_env::with_vars(
-            [("HOME", Some(home.as_os_str())), ("PLATO_CONFIG", None)],
-            || {
-                paths::with_test_xdg(root.path(), || {
-                    let host = HostRuntime::new(root.path().join("host.sock")).unwrap();
-                    assert_eq!(host.control_runtime.max_spawn_depth(), 2);
-                    assert!(host.control_runtime.require_confinement());
-
-                    fs::write(
-                        &config_path,
-                        "[limits]\nmax_spawn_depth = 99\n[confinement]\nrequire = false\n",
-                    )
-                    .unwrap();
-                    fs::write(
-                        workspace.join("plato.toml"),
-                        "[limits]\nmax_spawn_depth = 77\n",
-                    )
-                    .unwrap();
-                    host.control_runtime
-                        .paths
-                        .server_store()
-                        .unwrap()
-                        .register_workspace(
-                            "ws-host-depth",
-                            "host-depth",
-                            &workspace.canonicalize().unwrap().to_string_lossy(),
-                            &root.path().join("ledger.db").to_string_lossy(),
-                            1,
-                        )
-                        .unwrap();
-                    let workspace_runtime = host
-                        .workspace_runtime(&HelloParams {
-                            workspace_root: workspace.to_string_lossy().into_owned(),
-                            workspace_id: "ws-host-depth".into(),
-                        })
-                        .unwrap();
-
-                    assert_eq!(host.control_runtime.max_spawn_depth(), 2);
-                    assert_eq!(workspace_runtime.max_spawn_depth(), 2);
-                    assert!(workspace_runtime.require_confinement());
-                });
-            },
-        );
     }
 
     fn pending_request(run_id: &str, call_id: &str) -> ApprovalRequest {
@@ -1384,7 +718,7 @@ mod tests {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "daemon::server::tests::p501_external_daemon_helper",
+                "daemon::server::connections::tests::p501_external_daemon_helper",
                 "--nocapture",
             ])
             .env(P501_HELPER_MODE, mode)
@@ -1541,60 +875,6 @@ mod tests {
         assert_eq!(mode(&parent), PRIVATE_DIRECTORY_MODE);
         assert_eq!(mode(&socket_path), SOCKET_MODE);
         drop(server);
-    }
-
-    #[test]
-    fn temp_runtime_home_rejects_foreign_owner_before_chmod() {
-        let root = tempfile::tempdir().unwrap();
-        let runtime_home = root.path().join("runtime");
-        fs::create_dir(&runtime_home).unwrap();
-        fs::set_permissions(&runtime_home, Permissions::from_mode(0o755)).unwrap();
-        let owner = fs::symlink_metadata(&runtime_home).unwrap().uid();
-        let foreign_uid = if owner == u32::MAX {
-            owner - 1
-        } else {
-            owner + 1
-        };
-
-        let error = restrict_owned_runtime_home(&runtime_home, foreign_uid).unwrap_err();
-
-        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("is owned by uid"));
-        assert_eq!(mode(&runtime_home), 0o755);
-    }
-
-    #[test]
-    fn mode_verification_rejects_wide_permissions() {
-        let parent = tempfile::tempdir().unwrap();
-        fs::set_permissions(parent.path(), Permissions::from_mode(0o755)).unwrap();
-
-        let error = verify_mode(parent.path(), PRIVATE_DIRECTORY_MODE).unwrap_err();
-
-        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("expected 0700, got 0755"));
-    }
-
-    #[test]
-    fn runtime_permission_hardening_covers_the_private_chain() {
-        let root_parent = tempfile::tempdir().unwrap();
-        let root = root_parent.path().join("user");
-        let middle = root.join("platonic");
-        let leaf = middle.join("workspaces").join("workspace-1");
-        fs::create_dir_all(&leaf).unwrap();
-        for path in [&root, &middle, &leaf] {
-            fs::set_permissions(path, Permissions::from_mode(0o755)).unwrap();
-        }
-
-        prepare_private_directory(&leaf, Some(&root)).unwrap();
-
-        assert_eq!(mode(&root), PRIVATE_DIRECTORY_MODE);
-        assert_eq!(mode(&middle), PRIVATE_DIRECTORY_MODE);
-        assert_eq!(mode(&middle.join("workspaces")), PRIVATE_DIRECTORY_MODE);
-        assert_eq!(mode(&leaf), PRIVATE_DIRECTORY_MODE);
-    }
-
-    fn mode(path: &Path) -> u32 {
-        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
     }
 
     fn test_host_socket_path(workspace: &Path) -> PathBuf {
