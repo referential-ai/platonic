@@ -1,0 +1,317 @@
+:root {
+  --sl-font: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --sl-font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --sl-color-accent-low: #d8eee6;
+  --sl-color-accent: #087a52;
+  --sl-color-accent-high: #07553c;
+  --sl-color-white: #11151c;
+  --sl-color-gray-1: #263142;
+  --sl-color-gray-2: #4d5a6c;
+  --sl-color-gray-3: #687688;
+  --sl-color-gray-4: #9aa7b5;
+  --sl-color-gray-5: #cfd7e2;
+  --sl-color-gray-6: #f0f4f7;
+  --sl-color-black: #ffffff;
+  --sl-color-bg-nav: rgba(255, 255, 255, 0.96);
+  --sl-color-bg-sidebar: #f6f8fa;
+  --sl-content-width: 54rem;
+  --sl-sidebar-width: 18rem;
+  --section-user: #a75d00;
+  --section-developer: #075ea8;
+  --section-reference: #087a52;
+  letter-spacing: 0;
+}
+
+:root[data-theme="dark"] {
+  --sl-color-accent-low: #12382d;
+  --sl-color-accent: #58d09c;
+  --sl-color-accent-high: #c8f4df;
+  --sl-color-white: #f7f8fa;
+  --sl-color-gray-1: #dce1e7;
+  --sl-color-gray-2: #b6c0cb;
+  --sl-color-gray-3: #909dac;
+  --sl-color-gray-4: #647182;
+  --sl-color-gray-5: #39434f;
+  --sl-color-gray-6: #242b33;
+  --sl-color-black: #14181d;
+  --sl-color-bg-nav: rgba(20, 24, 29, 0.96);
+  --sl-color-bg-sidebar: #191f25;
+  --section-user: #e7a84d;
+  --section-developer: #6eb8ef;
+  --section-reference: #58d09c;
+}
+
+body,
+button,
+input,
+.site-title {
+  letter-spacing: 0;
+}
+
+.site-title {
+  font-weight: 750;
+}
+
+.site-title img {
+  width: 1.75rem;
+  height: 1.75rem;
+}
+
+.header {
+  border-bottom-color: var(--sl-color-gray-5);
+}
+
+.sidebar-pane {
+  border-inline-end-color: var(--sl-color-gray-5);
+}
+
+.sidebar-content a {
+  border-radius: 4px;
+}
+
+.sidebar-content a[data-section] {
+  border-inline-start: 3px solid transparent;
+}
+
+.sidebar-content a[data-section="user"] {
+  border-inline-start-color: var(--section-user);
+}
+
+.sidebar-content a[data-section="developer"] {
+  border-inline-start-color: var(--section-developer);
+}
+
+.sidebar-content a[data-section="reference"] {
+  border-inline-start-color: var(--section-reference);
+}
+
+:where(a, button, input, summary, [tabindex]):focus-visible {
+  outline: 3px solid var(--sl-color-accent);
+  outline-offset: 3px;
+}
+
+.section-kicker {
+  margin-block: 0 1rem;
+  font-family: var(--sl-font-mono);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.section-kicker.user {
+  color: var(--section-user);
+}
+
+.section-kicker.developer {
+  color: var(--section-developer);
+}
+
+.section-kicker.reference {
+  color: var(--section-reference);
+}
+
+.section-entrances {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin-block: 2rem 1rem;
+}
+
+.section-entrance {
+  display: flex;
+  min-height: 11rem;
+  flex-direction: column;
+  padding: 1.25rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-top: 4px solid;
+  border-radius: 4px;
+  color: var(--sl-color-white);
+  text-decoration: none;
+}
+
+.section-entrance.user {
+  border-top-color: var(--section-user);
+}
+
+.section-entrance.developer {
+  border-top-color: var(--section-developer);
+}
+
+.section-entrance strong {
+  margin-bottom: 0.75rem;
+  font-size: 1.2rem;
+}
+
+.section-entrance span {
+  color: var(--sl-color-gray-2);
+}
+
+.section-entrance small {
+  margin-top: auto;
+  padding-top: 1rem;
+  color: var(--sl-color-white);
+  font-weight: 700;
+}
+
+.section-entrance:hover {
+  background: var(--sl-color-gray-6);
+}
+
+.shared-reference {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 1rem;
+  margin-block-end: 3rem;
+  padding: 1rem 1.25rem;
+  border-block: 1px solid var(--sl-color-gray-5);
+  color: var(--sl-color-white);
+  text-decoration: none;
+}
+
+.shared-reference strong {
+  color: var(--section-reference);
+}
+
+.shared-reference span {
+  color: var(--sl-color-gray-2);
+}
+
+.shared-reference small {
+  font-weight: 700;
+}
+
+.shared-reference:hover {
+  background: var(--sl-color-gray-6);
+}
+
+.system-flow {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  margin-block: 2rem 3rem;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid #39434f;
+  border-radius: 4px;
+  background: #11151c;
+  list-style: none;
+}
+
+.system-flow li {
+  position: relative;
+  min-width: 0;
+  min-height: 6.5rem;
+  padding: 1rem;
+  color: #f7f8fa;
+}
+
+.system-flow li + li {
+  border-inline-start: 1px solid #39434f;
+}
+
+.system-flow li:not(:last-child)::after {
+  position: absolute;
+  z-index: 1;
+  inset-block-start: 50%;
+  inset-inline-end: -0.3rem;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-block-start: 1px solid #909dac;
+  border-inline-end: 1px solid #909dac;
+  background: #11151c;
+  content: "";
+  transform: translateY(-50%) rotate(45deg);
+}
+
+.system-flow li:last-child {
+  background: #12382d;
+}
+
+.system-flow small,
+.system-flow strong {
+  display: block;
+}
+
+.system-flow small {
+  color: #909dac;
+  font-family: var(--sl-font-mono);
+  font-weight: 700;
+}
+
+.system-flow strong {
+  margin-top: 1.75rem;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 40rem) {
+  .section-entrances,
+  .system-flow {
+    grid-template-columns: 1fr;
+  }
+
+  .shared-reference {
+    grid-template-columns: 1fr;
+    gap: 0.35rem;
+  }
+
+  .system-flow li {
+    min-height: 4.5rem;
+  }
+
+  .system-flow li + li {
+    border-block-start: 1px solid #39434f;
+    border-inline-start: 0;
+  }
+
+  .system-flow li:not(:last-child)::after {
+    inset-block: auto -0.3rem;
+    inset-inline: 50% auto;
+    transform: translateX(-50%) rotate(135deg);
+  }
+
+  .system-flow strong {
+    margin-top: 0.5rem;
+  }
+}
+
+@media print {
+  header,
+  nav,
+  aside,
+  .sidebar-pane,
+  .right-sidebar-panel,
+  .pagination-links {
+    display: none !important;
+  }
+
+  :root,
+  :root[data-theme="dark"] {
+    --sl-color-white: #000000;
+    --sl-color-gray-1: #222222;
+    --sl-color-gray-2: #333333;
+    --sl-color-gray-5: #777777;
+    --sl-color-gray-6: #eeeeee;
+    --sl-color-black: #ffffff;
+  }
+
+  body {
+    background: #ffffff;
+    color: #000000;
+  }
+
+  main {
+    width: 100%;
+    max-width: none;
+  }
+
+  a {
+    color: #000000;
+    text-decoration: underline;
+  }
+
+  pre,
+  .section-entrance {
+    break-inside: avoid;
+  }
+}

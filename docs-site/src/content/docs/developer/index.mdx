@@ -1,0 +1,39 @@
+---
+title: Develop with Platonic
+description: Understand the server boundary and extend Platonic without duplicating run semantics.
+sidebar:
+  label: Developer overview
+  order: 1
+---
+
+<p class="section-kicker developer">Developer docs</p>
+
+Platonic centralizes workspaces, agents, threads, policy, approvals, providers, tools, and the ledger in one server. Clients remain protocol consumers.
+
+## The boundary
+
+The server instantiates the pure typed harness once per thread and performs every requested effect. The harness describes work; it does not own I/O, storage, provider clients, or daemon behavior.
+
+| Owner | Contains |
+| --- | --- |
+| `platonic-core` | Pure typed harness primitives |
+| `platonic-server` | Run semantics, effects, policy, providers, ledger, and gateways |
+| `plato-agent` | Client distribution, TUI, and voice surfaces |
+
+## Trace a run
+
+1. A client sends a typed request.
+2. The server resolves thread authority and policy.
+3. The harness asks for model or tool effects.
+4. The server performs and records each effect.
+5. Clients observe protocol events; replay reads committed history.
+
+Continue with [runtime boundaries](./runtime-boundaries/#one-run-driving-path).
+
+## Verify a change
+
+```bash
+cargo test --workspace --locked
+```
+
+Run the repository's complete verification battery when a change reaches shared behavior.

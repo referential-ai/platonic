@@ -1,0 +1,38 @@
+---
+title: Use Plato Agent
+description: Start and inspect durable work with Plato Agent.
+sidebar:
+  label: User overview
+  order: 1
+---
+
+<p class="section-kicker user">User docs</p>
+
+Plato Agent is the client distribution for Platonic. Use it to open a workspace, talk to an agent, review tool approvals, and return to recorded work.
+
+## Start a durable thread
+
+From a registered workspace, a one-shot prompt ensures the local host server and records the run:
+
+```bash
+plato "list the files here and summarize this project"
+```
+
+Interactive sessions use the same server-owned run path. Start the TUI with bare `plato`; inspect the latest recorded session with `plato replay`.
+
+## The everyday path
+
+1. Open a registered workspace.
+2. Run Plato Agent as a one-shot client or TUI.
+3. Approve only the proposed tool effects you expect.
+4. Use replay when you need the durable record.
+
+The [first-run shell](./first-run/) keeps the shortest path visible without duplicating the full release guide.
+
+## What runs where
+
+| Surface | Responsibility |
+| --- | --- |
+| `platonic` | Host server and workspace or agent administration |
+| `plato` | One-shot, TUI entry, continuation, and offline replay |
+| `plato-tui` | Terminal rendering and keyboard interaction |

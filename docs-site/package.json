@@ -1,0 +1,22 @@
+{
+  "name": "platonic-docs-site",
+  "private": true,
+  "description": "Static Platonic and Plato Agent documentation shell.",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "build": "astro build",
+    "crawl": "node scripts/crawl.mjs",
+    "audit": "npm audit --audit-level=high"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "0.41.7",
+    "astro": "7.2.1"
+  },
+  "devDependencies": {
+    "parse5": "8.0.0"
+  }
+}
