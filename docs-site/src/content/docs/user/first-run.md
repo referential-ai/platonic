@@ -44,6 +44,16 @@ date. `plato` and `plato-tui` report 0.2.0. `platonic` reports product version
 contract; that output is not evidence of a 0.2.0 bundle. Keep this terminal's
 `PATH` for the rest of the journey.
 
+<figure class="expected-output">
+  <figcaption>
+    Stable version shape
+    <span>Underlined provenance values come from the exact source commit and UTC build date.</span>
+  </figcaption>
+  <pre tabindex="0"><samp>platonic 0.1.0 (<var>&lt;source-commit&gt;</var>, <var>&lt;YYYY-MM-DD&gt;</var>)
+plato 0.2.0 <var>&lt;source-commit&gt;</var> <var>&lt;YYYY-MM-DD&gt;</var>
+plato-tui 0.2.0 <var>&lt;source-commit&gt;</var> <var>&lt;YYYY-MM-DD&gt;</var></samp></pre>
+</figure>
+
 ## 2. Give the server its OpenRouter credential
 
 Create an [OpenRouter API key](https://openrouter.ai/settings/keys) and save
@@ -60,9 +70,13 @@ test -n "$OPENROUTER_API_KEY" && printf '%s\n' 'OpenRouter key: available (value
 
 **Checkpoint:** the last command prints only:
 
-```text
-OpenRouter key: available (value not shown)
-```
+<figure class="expected-output">
+  <figcaption>
+    Literal stable output
+    <span>No credential value appears.</span>
+  </figcaption>
+  <pre tabindex="0"><samp>OpenRouter key: available (value not shown)</samp></pre>
+</figure>
 
 The secret belongs in the `platonic serve` environment. Do not put it in the
 workspace, a command argument, a transcript, or a log. Server-run shell tools
@@ -80,10 +94,14 @@ platonic serve
 **Checkpoint:** before waiting for clients, the server prints these two lines;
 the socket prefix varies by host:
 
-```text
-daemon_scope: host
-socket_path: <runtime-directory>/platonic/host/agent.sock
-```
+<figure class="expected-output">
+  <figcaption>
+    Stable startup shape
+    <span>The underlined runtime directory varies by host.</span>
+  </figcaption>
+  <pre tabindex="0"><samp>daemon_scope: host
+socket_path: <var>&lt;runtime-directory&gt;</var>/platonic/host/agent.sock</samp></pre>
+</figure>
 
 Leave this process running. The server, not the TUI, owns provider calls,
 tools, approvals, and ledger writes.
@@ -114,14 +132,18 @@ contains a stable `id`, the canonical `root`, a `ledger_path`, and
 `"health":"present"`. In the following status JSON, check the `model` object
 without exposing the key:
 
-```json
-{
+<figure class="expected-output">
+  <figcaption>
+    Stable status excerpt
+    <span>The model object is reformatted; surrounding status fields are omitted.</span>
+  </figcaption>
+  <pre tabindex="0"><samp>{
   "requested_alias": "~openai/gpt-latest",
   "served_model": null,
   "provider_kind": "open_router",
   "key_present": true
-}
-```
+}</samp></pre>
+</figure>
 
 `served_model` is `null` because this clean workspace has not completed a
 provider response yet.
@@ -137,10 +159,14 @@ plato
 Before the TUI opens, Plato Agent proposes a root thread with workspace-write
 authority. The generated thread id varies:
 
-```text
-thread.spawn <thread-id> (WorkspaceWrite): thread.spawn requires approval before authority is created
-Approve thread.spawn? [y/N/c]
-```
+<figure class="expected-output">
+  <figcaption>
+    Stable approval prompt
+    <span>The underlined thread id is minted by the server.</span>
+  </figcaption>
+  <pre tabindex="0"><samp>thread.spawn <var>&lt;thread-id&gt;</var> (WorkspaceWrite): thread.spawn requires approval before authority is created
+Approve thread.spawn? [y/N/c]</samp></pre>
+</figure>
 
 Type `y` and press Enter. This approves creation of the durable thread; it does
 not approve every future tool call.
@@ -159,10 +185,14 @@ Use only file.read to read README.md. Reply with its Markdown heading and the pu
 **Checkpoint:** the transcript shows your task, a successful `file.read` tool
 step, and a final answer containing both of these facts:
 
-```text
-First-run workspace
-This repository is a harmless, read-only target for the Plato Agent first run.
-```
+<figure class="expected-output">
+  <figcaption>
+    Required answer facts
+    <span>The provider may format or add text; these two facts must appear.</span>
+  </figcaption>
+  <pre tabindex="0"><samp>First-run workspace
+This repository is a harmless, read-only target for the Plato Agent first run.</samp></pre>
+</figure>
 
 `file.read` is read-only and auto-allowed, so no tool-approval panel appears.
 After the answer finishes, press `q` with an empty composer to leave the TUI,
