@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "toolchain": {
+    "node": "24",
+    "playwright": "1.61.1",
+    "chromiumRevision": "1228",
+    "chromiumVersion": "149.0.7827.55",
+    "axe": "4.12.1",
+    "systemDependencies": "ubuntu-24.04 + playwright install --with-deps chromium"
+  },
+  "baselines": [
+    {
+      "name": "homepage",
+      "file": "homepage.png",
+      "route": "/",
+      "viewport": { "width": 1440, "height": 900 },
+      "theme": "light",
+      "fullPage": true,
+      "rationale": "Desktop overview locks the primary entrances and five-step product model.",
+      "sha256": "pending"
+    },
+    {
+      "name": "user",
+      "file": "user.png",
+      "route": "/user/operations/tui-and-cli/",
+      "viewport": { "width": 390, "height": 844 },
+      "theme": "light",
+      "fullPage": true,
+      "rationale": "Mobile User guide locks responsive navigation, code, output, and instructional TUI media.",
+      "sha256": "pending"
+    },
+    {
+      "name": "developer",
+      "file": "developer.png",
+      "route": "/developer/runtime-boundaries/",
+      "viewport": { "width": 1440, "height": 900 },
+      "theme": "dark",
+      "fullPage": true,
+      "rationale": "Desktop Developer guide locks the semantic request-flow treatment and dense architecture prose.",
+      "sha256": "pending"
+    },
+    {
+      "name": "search",
+      "file": "search.png",
+      "route": "/",
+      "viewport": { "width": 1440, "height": 900 },
+      "theme": "light",
+      "fullPage": false,
+      "rationale": "Search overlay locks the fixed approval query, expected owned result, and selection surface.",
+      "sha256": "pending"
+    },
+    {
+      "name": "404",
+      "file": "404.png",
+      "route": "/missing-baseline-route/",
+      "status": 404,
+      "viewport": { "width": 390, "height": 844 },
+      "theme": "dark",
+      "fullPage": true,
+      "rationale": "Mobile dark 404 locks the real missing-route response and recovery controls.",
+      "sha256": "pending"
+    }
+  ]
+}
