@@ -11,15 +11,13 @@ sidebar:
 
 ## One request, end to end
 
-```text
-client surface
-  -> local typed protocol
-  -> server authority and run admission
-  -> pure RunState validation
-  -> server-owned provider, approval, or tool effect
-  -> parent-owned ledger commit
-  -> ordered client observation
-```
+<ol class="system-flow" aria-label="Request path from the client through server authority, pure kernel validation, and host effects to the durable ledger">
+  <li><small aria-hidden="true">01</small><strong>Client</strong></li>
+  <li><small aria-hidden="true">02</small><strong>Server authority</strong></li>
+  <li><small aria-hidden="true">03</small><strong>Pure kernel</strong></li>
+  <li><small aria-hidden="true">04</small><strong>Host effects</strong></li>
+  <li><small aria-hidden="true">05</small><strong>Durable ledger</strong></li>
+</ol>
 
 1. **A client attaches.** For a one-shot question, Plato Agent ensures the host daemon, opens a local connection, completes `hello`, and calls `run.start` or `message.append`. The client then polls `events.stream`; it does not drive the run itself. Read [`plato-agent/src/run.rs`](https://github.com/referential-ai/platonic/blob/develop/crates/plato-agent/src/run.rs).
 

@@ -51,6 +51,16 @@ plato "summarize the current Git status"
 
 The client ensures the same host server and streams the answer. On success it prints the run ID, ledger path, and an offline replay command.
 
+<figure class="expected-output">
+  <figcaption>
+    Stable one-shot completion shape
+    <span>Underlined values vary by run and registered workspace.</span>
+  </figcaption>
+  <pre tabindex="0"><samp>run_id: <var>&lt;run-id&gt;</var>
+ledger_path: <var>&lt;ledger-path&gt;</var>
+replay: plato replay --db='<var>&lt;ledger-path&gt;</var>' --run <var>&lt;run-id&gt;</var></samp></pre>
+</figure>
+
 Continue the latest workspace session with:
 
 ```bash
