@@ -1,6 +1,6 @@
 ---
 title: Use Plato Agent
-description: Start and inspect durable work with Plato Agent.
+description: Understand the durable work model, then complete one first run.
 sidebar:
   label: User overview
   order: 1
@@ -8,31 +8,66 @@ sidebar:
 
 <p class="section-kicker user">User docs</p>
 
-Plato Agent is the client distribution for Platonic. Use it to open a workspace, talk to an agent, review tool approvals, and return to recorded work.
+> **Unreleased 0.2.0 documentation:** This page describes the current `develop`
+> behavior. The public release is still 0.1.0; no released 0.2.0 bundle or
+> bundle-install proof exists. This journey is verified with binaries built
+> from its exact source commit and must not be published as release-current
+> until `platonic-v0.2.0` exists.
+
+**Platonic** is the self-hosted agent server. It owns workspaces, agent
+profiles, threads, provider calls, tools, policy, approvals, and ledgers.
+**Plato Agent** is the client distribution built on Platonic; its commands are
+`plato` and `plato-tui`.
 
 ## Start a durable thread
 
-From a registered workspace, a one-shot prompt ensures the local host server and records the run:
+<ol class="system-flow" aria-label="Workspace to agent profile to thread to run to ledger">
+  <li><small>01</small><strong>Workspace</strong></li>
+  <li><small>02</small><strong>Agent profile</strong></li>
+  <li><small>03</small><strong>Thread</strong></li>
+  <li><small>04</small><strong>Run</strong></li>
+  <li><small>05</small><strong>Ledger</strong></li>
+</ol>
 
-```bash
-plato "list the files here and summarize this project"
-```
-
-Interactive sessions use the same server-owned run path. Start the TUI with bare `plato`; inspect the latest recorded session with `plato replay`.
-
-## The everyday path
-
-1. Open a registered workspace.
-2. Run Plato Agent as a one-shot client or TUI.
-3. Approve only the proposed tool effects you expect.
-4. Use replay when you need the durable record.
-
-The [first-run shell](./first-run/) keeps the shortest path visible without duplicating the full release guide.
-
-## What runs where
-
-| Surface | Responsibility |
+| Part | What it means |
 | --- | --- |
-| `platonic` | Host server and workspace or agent administration |
-| `plato` | One-shot, TUI entry, continuation, and offline replay |
-| `plato-tui` | Terminal rendering and keyboard interaction |
+| **Workspace** | A named, registered directory with a server-minted id and one ledger. Registration is explicit; identity is not inferred from the directory name. |
+| **Agent profile** | Immutable configured data bound to one workspace: model, reasoning effort, approval policy, and default toolset. It is not a process or plugin. The first-run path uses the built-in `plato` identity and resolved defaults, so it does not require a separate `platonic agent create`. |
+| **Thread** | A durable conversation with immutable authority: working directory, model, approval policy, and allowed effects. A thread can carry many turns and runs. |
+| **Run** | One submitted task driven by the server. Provider requests, tool decisions, results, and the final answer belong to that run. |
+| **Ledger** | The workspace-owned durable record used for status, transcript loading, and offline replay. It is the audit record, not a cache of the TUI screen. |
+
+## Profile defaults, thread authority
+
+An agent profile supplies defaults when a thread is created. The created
+thread records the authority it actually received; later profile or config
+changes do not rewrite that record. A child thread may receive a narrower
+toolset, path set, repository set, network grant, or approval policy than its
+parent, but it cannot use inheritance to widen the parent's authority.
+
+That split makes history interpretable: the profile answers "what defaults
+were offered?" and the thread answers "what was this conversation allowed to
+do?"
+
+## What survives
+
+- Closing Plato Agent leaves the host server, thread authority, completed run,
+  and ledger in place. Reattach while that daemon is running to see the thread
+  transcript again.
+- `plato replay` reads the committed ledger without a server, provider call, or
+  tool execution.
+- Restarting the server preserves registered workspaces, agent profiles,
+  thread authority, and completed ledger records. Live thread state is
+  process-local, so an old thread is listed as unloaded after restart; start a
+  new TUI thread for new work.
+- If the server stops during a run, restart recovery records the interrupted
+  run as failed. Partial streaming text is not promoted into a completed
+  replay answer.
+
+Follow the [first productive journey](./first-run/) to see each boundary and
+its exact checkpoint.
+
+Daily operation, approval, and provider guidance belongs to
+[#548](https://github.com/referential-ai/platonic/issues/548). Architecture and
+protocol internals belong to
+[#547](https://github.com/referential-ai/platonic/issues/547).
