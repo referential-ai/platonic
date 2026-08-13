@@ -27,6 +27,17 @@ if [[ $target_dir != /* ]]; then
   target_dir="$repo_root/$target_dir"
 fi
 
+client_package=$(cargo pkgid --offline --package plato-agent)
+client_version=${client_package##*#}
+export CARGO_INCREMENTAL=0
+export CARGO_PROFILE_DEV_DEBUG=0
+export CARGO_PROFILE_TEST_DEBUG=0
+export PLATONIC_BUILD_COMMIT="$source_commit"
+export PLATONIC_BUILD_DATE=2026-08-12
+export PLATO_BUILD_IDENTITY="$client_version $source_commit 2026-08-12"
+export RUSTFLAGS="--remap-path-prefix=$repo_root=. --remap-path-prefix=$HOME=/.build"
+export SOURCE_DATE_EPOCH=1786536000
+
 cargo build --locked --offline --package plato-agent --bin plato-tui
 PLATO_TUI_DOC_OUTPUT_DIR="$repo_root/docs-site/src/assets/tui" \
 PLATO_TUI_DOC_SOURCE_COMMIT="$source_commit" \
