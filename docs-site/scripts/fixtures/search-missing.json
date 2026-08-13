@@ -1,0 +1,7 @@
+[
+  {
+    "section": "User fixture",
+    "query": "User docs",
+    "route": "user/not-indexed/"
+  }
+]

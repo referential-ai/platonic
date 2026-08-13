@@ -6,12 +6,14 @@ on:
       - develop
     paths:
       - docs-site/**
+      - "**/*.md"
       - .github/workflows/docs-site.yml
   push:
     branches:
       - develop
     paths:
       - docs-site/**
+      - "**/*.md"
       - .github/workflows/docs-site.yml
 
 concurrency:
@@ -52,6 +54,7 @@ jobs:
         run: |
           npm run build
           npm run crawl
+          npm run search
 
       - name: Build and crawl at a subpath
         working-directory: docs-site
@@ -60,3 +63,14 @@ jobs:
         run: |
           npm run build
           npm run crawl
+          npm run search
+
+      - name: Prove controlled failures
+        working-directory: docs-site
+        env:
+          DOCS_BASE: /platonic-docs/
+        run: npm run negative
+
+      - name: Audit CI path inputs
+        working-directory: docs-site
+        run: npm run paths

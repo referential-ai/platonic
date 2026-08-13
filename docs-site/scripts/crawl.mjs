@@ -6,7 +6,9 @@ import { parse } from "parse5";
 
 import { base, site } from "../config.mjs";
 
-const root = resolve(dirname(fileURLToPath(import.meta.url)), "../dist");
+const root = resolve(
+  process.env.DOCS_DIST ?? resolve(dirname(fileURLToPath(import.meta.url)), "../dist"),
+);
 const origin = new URL(site).origin;
 const failures = [];
 const references = [];
@@ -66,10 +68,10 @@ function addReference(source, value, kind, runtime = false) {
 
 function addCssReferences(source, css) {
   for (const match of css.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/g)) {
-    addReference(source, match[1], "css", true);
+    addReference(source, match[1], "stylesheet asset", true);
   }
   for (const match of css.matchAll(/@import\s+(?:url\()?\s*["']([^"']+)["']/g)) {
-    addReference(source, match[1], "css", true);
+    addReference(source, match[1], "stylesheet", true);
   }
 }
 
@@ -81,6 +83,18 @@ function addJavaScriptReferences(source, javascript) {
       addReference(source, match[1], "script", true);
     }
   }
+}
+
+function elementKind(node) {
+  if (["a", "area", "form"].includes(node.tagName)) return "page";
+  if (node.tagName === "script") return "script";
+  if (node.tagName === "link") {
+    const rel = attribute(node, "rel") ?? "";
+    if (/(?:^|\s)stylesheet(?:\s|$)/.test(rel)) return "stylesheet";
+    if (/(?:^|\s)(?:icon|apple-touch-icon)(?:\s|$)/.test(rel)) return "image";
+  }
+  if (["image", "img"].includes(node.tagName)) return "image";
+  return "asset";
 }
 
 const fileList = await listFiles(root);
@@ -137,14 +151,14 @@ for (const file of fileList.filter((path) => extname(path) === ".html")) {
         canonicals.push(value);
       }
       if (!metadata) {
-        addReference(file, value, node.tagName, !["a", "area", "form"].includes(node.tagName));
+        addReference(file, value, elementKind(node), !["a", "area", "form"].includes(node.tagName));
       }
     }
 
     for (const name of ["srcset", "imagesrcset"]) {
       const value = attribute(node, name);
       for (const candidate of value?.split(",") ?? []) {
-        addReference(file, candidate.trim().split(/\s+/)[0], node.tagName, true);
+        addReference(file, candidate.trim().split(/\s+/)[0], "image", true);
       }
     }
 
@@ -161,13 +175,18 @@ for (const file of fileList.filter((path) => extname(path) === ".html")) {
   if (canonicals.length !== 1) {
     failures.push(`${file}: expected exactly one canonical link, found ${canonicals.length}`);
   } else {
-    const canonicalUrl = new URL(canonicals[0], site);
-    const expected = new URL(routeForFile(file), site).href;
-    if (file !== "404.html" && canonicalUrl.href !== expected) {
-      failures.push(`${file}: canonical is ${canonicalUrl.href}, expected ${expected}`);
-    }
-    if (canonicalUrl.origin !== origin || !canonicalUrl.pathname.startsWith(base)) {
-      failures.push(`${file}: canonical escapes DOCS_SITE or DOCS_BASE`);
+    try {
+      const canonicalUrl = new URL(canonicals[0], site);
+      const route = file === "404.html" ? `${base}404/` : routeForFile(file);
+      const expected = new URL(route, site).href;
+      if (canonicalUrl.href !== expected) {
+        failures.push(`${file}: canonical is ${canonicalUrl.href}, expected ${expected}`);
+      }
+      if (canonicalUrl.origin !== origin || !canonicalUrl.pathname.startsWith(base)) {
+        failures.push(`${file}: canonical escapes DOCS_SITE or DOCS_BASE`);
+      }
+    } catch {
+      failures.push(`${file}: invalid canonical URL ${canonicals[0]}`);
     }
   }
 }
@@ -180,19 +199,40 @@ for (const file of fileList.filter((path) => extname(path) === ".js")) {
   addJavaScriptReferences(file, await readFile(resolve(root, file), "utf8"));
 }
 
+const sitemapEntries = [];
+
 for (const file of fileList.filter((path) => extname(path) === ".xml")) {
   const xml = await readFile(resolve(root, file), "utf8");
-  for (const match of xml.matchAll(/<loc>([^<]+)<\/loc>/g)) addReference(file, match[1], "xml");
+  const containsPages = /<urlset(?:\s|>)/.test(xml);
+  for (const match of xml.matchAll(/<loc>([^<]+)<\/loc>/g)) {
+    addReference(file, match[1], containsPages ? "page" : "sitemap");
+    if (containsPages) sitemapEntries.push(match[1]);
+  }
 }
 
 for (const reference of references) {
   const sourceUrl = new URL(routeForFile(reference.source), site);
-  const targetUrl = new URL(reference.value, sourceUrl);
+  let targetUrl;
+  try {
+    targetUrl = new URL(reference.value, sourceUrl);
+  } catch {
+    failures.push(`${reference.source}: invalid ${reference.kind} URL ${reference.value}`);
+    continue;
+  }
 
   if (targetUrl.origin !== origin) {
     if (reference.runtime) {
       failures.push(`${reference.source}: runtime ${reference.kind} loads ${targetUrl.href}`);
+    } else if (extname(reference.source) === ".xml") {
+      failures.push(`${reference.source}: ${reference.kind} escapes DOCS_SITE: ${targetUrl.href}`);
     }
+    continue;
+  }
+
+  if (!targetUrl.pathname.startsWith(base)) {
+    failures.push(
+      `${reference.source}: ${reference.kind} target escapes DOCS_BASE: ${targetUrl.pathname}`,
+    );
     continue;
   }
 
@@ -210,6 +250,37 @@ for (const reference of references) {
   }
 }
 
+const sitemapCounts = new Map();
+for (const entry of sitemapEntries) {
+  try {
+    const url = new URL(entry, site).href;
+    sitemapCounts.set(url, (sitemapCounts.get(url) ?? 0) + 1);
+  } catch {
+    // The reference pass reports the actionable invalid URL diagnostic.
+  }
+}
+
+const expectedSitemapEntries = new Set(
+  [...documents.keys()]
+    .filter((file) => file !== "404.html")
+    .map((file) => new URL(routeForFile(file), site).href),
+);
+
+for (const expected of expectedSitemapEntries) {
+  const count = sitemapCounts.get(expected) ?? 0;
+  if (count === 0) failures.push(`sitemap: missing page ${expected}`);
+  if (count > 1) failures.push(`sitemap: duplicate page ${expected}`);
+}
+for (const entry of sitemapCounts.keys()) {
+  if (!expectedSitemapEntries.has(entry)) failures.push(`sitemap: unexpected page ${entry}`);
+}
+
+for (const kind of ["image", "stylesheet", "script"]) {
+  if (!references.some((reference) => reference.kind === kind)) {
+    failures.push(`missing generated ${kind} reference`);
+  }
+}
+
 if (failures.length > 0) {
   console.error(`Crawl failed (${failures.length}):`);
   for (const failure of failures) console.error(`- ${failure}`);
@@ -217,6 +288,6 @@ if (failures.length > 0) {
 } else {
   console.log(
     `Crawl passed: ${documents.size} pages, ${references.length} references, ` +
-      `${files.size} output files at ${base}`,
+      `${sitemapEntries.length} sitemap entries, ${files.size} output files at ${base}`,
   );
 }
