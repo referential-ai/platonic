@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "toolchain": {
+    "node": "24",
+    "playwright": "1.61.1",
+    "chromiumRevision": "1228",
+    "chromiumVersion": "149.0.7827.55",
+    "axe": "4.12.1",
+    "systemDependencies": "ubuntu-24.04 + playwright install --with-deps chromium"
+  },
+  "baselines": [
+    {
+      "name": "homepage",
+      "file": "homepage.png",
+      "route": "/",
+      "viewport": { "width": 1440, "height": 900 },
+      "theme": "light",
+      "fullPage": true,
+      "rationale": "Initial pinned Ubuntu 24.04 capture: desktop overview locks the primary entrances, five-step product model, and repository/license section.",
+      "sha256": "f81d72fa06b7019e704c81cae06e2edd86c9d865eb6bea43fe1f4048faabb623"
+    },
+    {
+      "name": "user",
+      "file": "user.png",
+      "route": "/user/operations/tui-and-cli/",
+      "viewport": { "width": 390, "height": 844 },
+      "theme": "light",
+      "fullPage": true,
+      "rationale": "Initial pinned Ubuntu 24.04 capture: mobile User guide locks responsive navigation, code, output, and instructional TUI media.",
+      "sha256": "aa7b4c01461992f2e5b46af2429926560b77fdf61c8740099c5f58852fc876b2"
+    },
+    {
+      "name": "developer",
+      "file": "developer.png",
+      "route": "/developer/runtime-boundaries/",
+      "viewport": { "width": 1440, "height": 900 },
+      "theme": "dark",
+      "fullPage": true,
+      "rationale": "Initial pinned Ubuntu 24.04 capture: desktop Developer guide locks the semantic request flow, migrated navigation, and final confinement references.",
+      "sha256": "2b9db5b36d7079f59957a7eed2fd26fb777f35fd92e7eb00fb45fbe590174e48"
+    },
+    {
+      "name": "search",
+      "file": "search.png",
+      "route": "/",
+      "viewport": { "width": 1440, "height": 900 },
+      "theme": "light",
+      "fullPage": false,
+      "rationale": "Initial pinned Ubuntu 24.04 capture: search overlay locks the fixed approval query, expected owned result, and selection surface.",
+      "sha256": "e9d43c10edc4c48f4a2b36cbc9d473ab8b10443b0d13b5aa3d6dfcec73769d19"
+    },
+    {
+      "name": "404",
+      "file": "404.png",
+      "route": "/missing-baseline-route/",
+      "status": 404,
+      "viewport": { "width": 390, "height": 844 },
+      "theme": "dark",
+      "fullPage": true,
+      "rationale": "Initial pinned Ubuntu 24.04 capture: mobile dark 404 locks the real missing-route response and recovery controls.",
+      "sha256": "8f3875cba610c8bc9cb9ea9817301cbbba66bb563058b7ed5f8cf9f39e1ce417"
+    }
+  ]
+}
