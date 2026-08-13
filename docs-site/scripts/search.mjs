@@ -10,8 +10,25 @@ const expectations = process.argv[2]
   ? JSON.parse(await readFile(resolve(process.argv[2]), "utf8"))
   : [
       { section: "User", query: "User docs", route: "user/" },
+      { section: "User install", query: "Current public release", route: "user/install/" },
+      { section: "User voice", query: "voice mode", route: "user/operations/voice/" },
+      {
+        section: "User Discord",
+        query: "Discord connector",
+        route: "user/operations/discord/",
+      },
       { section: "Developer", query: "Developer docs", route: "developer/" },
+      {
+        section: "Developer lifecycle",
+        query: "request lifecycle",
+        route: "developer/runtime-boundaries/",
+      },
       { section: "Reference", query: "Reference", route: "reference/" },
+      {
+        section: "Reference configuration",
+        query: "Provider fields",
+        route: "reference/configuration/",
+      },
     ];
 
 const nativeFetch = globalThis.fetch;

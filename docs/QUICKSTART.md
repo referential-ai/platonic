@@ -3,6 +3,8 @@
 This file selects the guide that matches the command bundle. It is not a
 second copy of the user manual.
 
+<a id="0-one-time-setup"></a>
+
 ## Current public release: 0.1.0
 
 Install the released 0.1.0 bundle for Linux x86-64 or macOS Apple silicon:
@@ -38,13 +40,13 @@ plato-tui --version
 ```
 
 The tag is exactly `platonic-v0.1.0`. See the
-[release contract](RELEASE.md) for archive contents, supported targets, and
-verification details.
+[release contract](https://github.com/referential-ai/platonic/blob/develop/docs/RELEASE.md)
+for archive contents, supported targets, and verification details.
 
 ## Unreleased develop / 0.2.0
 
-The Starlight [user overview](../docs-site/src/content/docs/user/index.mdx) and
-[first productive journey](../docs-site/src/content/docs/user/first-run.md)
+The Starlight [user overview](https://docs.referential.ai/user/) and
+[first productive journey](https://docs.referential.ai/user/first-run/)
 document current `develop` behavior. They use one OpenRouter route and exact
 what-you-see checkpoints with binaries built from the exact source commit. No
 released 0.2.0 bundle or bundle-install proof exists, so they are review
@@ -82,8 +84,8 @@ check. `/voice off`, `/new`, and TUI exit close local capture and playback but d
 not cancel a continuing text run. Install espeak-ng, CUDA, and the native cpal
 backend headers, then place the pinned Kokoro, Silero v6.2.1, and large-v3-turbo
 artifacts described in
-[`../crates/plato-audio/README.md`](../crates/plato-audio/README.md) outside the
-repository for the focused device proofs below.
+[`crates/plato-audio/README.md`](https://github.com/referential-ai/platonic/blob/develop/crates/plato-audio/README.md)
+outside the repository for the focused device proofs below.
 
 ```bash
 export PLATO_AUDIO_KOKORO_DIR="$HOME/.cache/plato-audio/kokoro-82m-v1.0-onnx-1939ad2a8e416c0acfeecc08a694d14ef25f2231"
@@ -211,7 +213,8 @@ acoustic-loop latency claim.
 
 ## Next guides
 
-Daily operation, approval, and provider material is tracked in
-[#548](https://github.com/referential-ai/platonic/issues/548). Server and
-protocol internals are tracked in
-[#547](https://github.com/referential-ai/platonic/issues/547).
+Continue with the Starlight
+[User operations guide](https://docs.referential.ai/user/operations/) for daily
+operation, approvals, and providers, or the
+[Developer guide](https://docs.referential.ai/developer/) for server and protocol
+internals.

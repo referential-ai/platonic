@@ -11,7 +11,7 @@ sidebar:
 
 ## Two durable tiers
 
-The server is the only ledger writer. New run events are append-only JSONL; SQLite holds indexed and mutable state. The current layout is described in the [Workspace Ledgers section](https://github.com/referential-ai/platonic/blob/develop/README.md#workspace-ledgers) and implemented by [`ledger/jsonl.rs`](https://github.com/referential-ai/platonic/blob/develop/crates/platonic-server/src/ledger/jsonl.rs) and [`ledger/sqlite.rs`](https://github.com/referential-ai/platonic/blob/develop/crates/platonic-server/src/ledger/sqlite.rs).
+The server is the only ledger writer. New run events are append-only JSONL; SQLite holds indexed and mutable state. The current layout is implemented by [`ledger/jsonl.rs`](https://github.com/referential-ai/platonic/blob/develop/crates/platonic-server/src/ledger/jsonl.rs) and [`ledger/sqlite.rs`](https://github.com/referential-ai/platonic/blob/develop/crates/platonic-server/src/ledger/sqlite.rs).
 
 | Store | Durable responsibility |
 | --- | --- |

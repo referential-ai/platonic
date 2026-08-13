@@ -6,9 +6,14 @@ sidebar:
   order: 1
 ---
 
+<span id="plato-agent-architecture"></span>
+<span id="read-this-before-using-the-document-below"></span>
+
 <p class="section-kicker developer">Developer docs</p>
 
 > **Orientation, not architecture law.** These pages explain the current tree and route you to its owners. The workspace [naming authority](https://github.com/referential-ai/platonic-workspace/blob/main/product/branding.md), the repository [agent guide](https://github.com/referential-ai/platonic/blob/develop/AGENTS.md), the accepted [decision map](https://github.com/referential-ai/platonic-workspace/issues/83), typed source, and executable tests remain authoritative.
+
+<span id="runtime-topology"></span>
 
 ## The boundary
 
@@ -27,6 +32,10 @@ Clients submit typed protocol requests. The server owns workspace and thread aut
 | Approval | A server-persisted question about one tool call, followed by a single decision. A client can present or decide it; the client does not own the approval state. | [`tool_call_approvals`](https://github.com/referential-ai/platonic/blob/develop/crates/platonic-server/src/server_store/queries.rs) |
 | Command | On the wire, a callable protocol method. Inside the kernel, a `RunCommand` is a pure request for the host to call a model, await approval, or execute a tool. Neither is a new authority owner. | [`ProtocolMethod`](https://github.com/referential-ai/platonic/blob/develop/crates/platonic-protocol/src/lib.rs) and [`RunCommand` on docs.rs](https://docs.rs/platonic-core/0.3.1/platonic_core/run/enum.RunCommand.html) |
 
+<span id="boundary-ladder"></span>
+<span id="sequence"></span>
+<span id="ledger-versioning"></span>
+
 ## Follow one request
 
 Start with the [request lifecycle](./runtime-boundaries/#one-request-end-to-end). It follows a real one-shot request through local transport, server admission, the pure kernel boundary, provider or tool effects, the ledger, and ordered observation.
@@ -37,4 +46,4 @@ Then use the page that matches the boundary you are changing:
 - [Durability and replay](./durability-and-replay/) for JSONL commits, SQLite state, crash repair, interrupted runs, approvals, and offline replay.
 - [Crates and change routing](./crate-map/) for dependency rules and the small set of modules where these boundaries meet.
 
-Operational setup, deployment, and troubleshooting belong to [issue #548](https://github.com/referential-ai/platonic/issues/548), not to this architecture journey.
+Operational setup and troubleshooting belong to the [User operations guide](../user/operations/), not to this architecture journey. Deployment remains separately gated.

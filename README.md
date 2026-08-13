@@ -7,7 +7,9 @@ workspaces, agent profiles, and durable threads while owning provider calls,
 tools, policy, approvals, and ledgers. Plato Agent is the client distribution
 built on Platonic.
 
-The public site is [referential.ai](https://referential.ai). The workspace
+The public site is [referential.ai](https://referential.ai), and the canonical
+documentation is [docs.referential.ai](https://docs.referential.ai/). The
+workspace
 [naming authority](https://github.com/referential-ai/platonic-workspace/blob/main/product/branding.md)
 owns the product hierarchy and exact forms.
 
@@ -17,18 +19,30 @@ owns the product hierarchy and exact forms.
   the concise [quickstart](docs/QUICKSTART.md), then use the
   [matching release documentation](https://github.com/referential-ai/platonic/blob/platonic-v0.1.0/docs/QUICKSTART.md).
 - **Unreleased `develop` / 0.2.0:** read the Starlight
-  [user overview](docs-site/src/content/docs/user/index.mdx) and complete the
-  [first productive journey](docs-site/src/content/docs/user/first-run.md).
+  [user overview](https://docs.referential.ai/user/) and complete the
+  [first productive journey](https://docs.referential.ai/user/first-run/).
   No released 0.2.0 bundle or bundle-install proof exists; the journey uses
   exact-head local binaries and must not be published as current documentation
   until the `platonic-v0.2.0` release exists.
 - **Release artifacts and verification:** use the
-  [release contract](docs/RELEASE.md).
+  [release contract](https://github.com/referential-ai/platonic/blob/develop/docs/RELEASE.md).
 
-Daily operation, approvals, and provider guidance belongs to
-[#548](https://github.com/referential-ai/platonic/issues/548). Architecture,
-protocol, and ledger internals belong to
-[#547](https://github.com/referential-ai/platonic/issues/547).
+Daily operation, approvals, and provider guidance is in the
+[User operations guide](https://docs.referential.ai/user/operations/).
+Architecture, protocol, and ledger internals are in the
+[Developer guide](https://docs.referential.ai/developer/).
+
+<a id="configuration"></a>
+<a id="discord-gateway"></a>
+<a id="workspace-ledgers"></a>
+<a id="server"></a>
+
+## Reference routes
+
+- [Configuration](https://docs.referential.ai/reference/configuration/)
+- [Discord gateway](https://docs.referential.ai/user/operations/discord/)
+- [Workspace ledgers](https://docs.referential.ai/developer/durability-and-replay/)
+- [Server request lifecycle](https://docs.referential.ai/developer/runtime-boundaries/)
 
 ## Development
 
@@ -53,8 +67,13 @@ npm run crawl
 ## Boundary
 
 `platonic-core` is an independent harness contract, not the Platonic product
-server. See [AGENTS.md](AGENTS.md) for repository ownership rules.
+server. See the repository
+[agent guide](https://github.com/referential-ai/platonic/blob/develop/AGENTS.md)
+for ownership rules.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+MIT OR Apache-2.0. See
+[LICENSE-MIT](https://github.com/referential-ai/platonic/blob/develop/LICENSE-MIT)
+and
+[LICENSE-APACHE](https://github.com/referential-ai/platonic/blob/develop/LICENSE-APACHE).
