@@ -19,6 +19,8 @@ use crate::{
     paths,
 };
 use idempotency::IdempotencyStore;
+#[cfg(unix)]
+use platonic_client::transport;
 use platonic_client::{ClientError, client::DaemonClient, paths as client_paths};
 use platonic_protocol::{
     CAPABILITY_AGENT_STATUS, CAPABILITY_APPROVAL_DECIDE, CAPABILITY_DAEMON_STATUS,
@@ -163,12 +165,32 @@ struct Gateway {
     limits: Arc<Limits>,
     active_connections: Arc<AtomicUsize>,
     stream_cursors: Arc<Mutex<HashMap<String, StreamCursor>>>,
+    #[cfg(unix)]
+    daemon_generations: Arc<Mutex<DaemonGenerationState>>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DaemonGeneration {
-    device: u64,
-    inode: u64,
+struct DaemonGeneration(u64);
+
+#[cfg(unix)]
+struct DaemonConnection {
+    identity: SocketIdentity,
+    stream: transport::Stream,
+    generation: DaemonGeneration,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct DaemonGenerationState {
+    current: Option<DaemonConnection>,
+    next: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -192,6 +214,8 @@ impl Gateway {
             limits: Arc::new(Limits::default()),
             active_connections: Arc::new(AtomicUsize::new(0)),
             stream_cursors: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(unix)]
+            daemon_generations: Arc::new(Mutex::new(DaemonGenerationState::default())),
         })
     }
 
@@ -357,16 +381,43 @@ impl Gateway {
 
     #[cfg(unix)]
     fn daemon_generation(&self) -> Result<DaemonGeneration, HttpResponse> {
+        let identity = self.daemon_socket_identity()?;
+        let mut state = self
+            .daemon_generations
+            .lock()
+            .expect("HTTP daemon generation lock poisoned");
+        if let Some(current) = state.current.as_mut()
+            && current.identity == identity
+            && daemon_connection_alive(&mut current.stream)
+        {
+            return Ok(current.generation);
+        }
+
+        let stream = transport::connect_with_timeout(&self.socket_path, DAEMON_TIMEOUT)
+            .map_err(|_| daemon_unavailable())?;
+        stream
+            .set_nonblocking(true)
+            .map_err(|_| daemon_unavailable())?;
+        if self.daemon_socket_identity()? != identity {
+            return Err(daemon_unavailable());
+        }
+        let generation =
+            DaemonGeneration(state.next.checked_add(1).ok_or_else(daemon_unavailable)?);
+        state.next = generation.0;
+        state.current = Some(DaemonConnection {
+            identity,
+            stream,
+            generation,
+        });
+        Ok(generation)
+    }
+
+    #[cfg(unix)]
+    fn daemon_socket_identity(&self) -> Result<SocketIdentity, HttpResponse> {
         use std::os::unix::fs::MetadataExt;
 
-        let metadata = std::fs::metadata(&self.socket_path).map_err(|_| {
-            error_response(
-                503,
-                "native_unavailable",
-                "the native daemon is unavailable",
-            )
-        })?;
-        Ok(DaemonGeneration {
+        let metadata = std::fs::metadata(&self.socket_path).map_err(|_| daemon_unavailable())?;
+        Ok(SocketIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
         })
@@ -446,6 +497,18 @@ impl Gateway {
                 next_offset,
             });
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn daemon_connection_alive(stream: &mut transport::Stream) -> bool {
+    let mut byte = [0];
+    loop {
+        match stream.read(&mut byte) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return true,
+            _ => return false,
+        }
     }
 }
 
@@ -652,6 +715,15 @@ fn cursor_unavailable() -> HttpResponse {
         409,
         "event_cursor_unavailable",
         "the native event cursor is unavailable; inspect status or transcript",
+    )
+}
+
+#[cfg(unix)]
+fn daemon_unavailable() -> HttpResponse {
+    error_response(
+        503,
+        "native_unavailable",
+        "the native daemon is unavailable",
     )
 }
 
@@ -965,6 +1037,15 @@ mod tests {
         drop(listener);
         std::fs::remove_file(&socket).unwrap();
         let _restarted = UnixListener::bind(&socket).unwrap();
+        let restarted_identity = gateway.daemon_socket_identity().unwrap();
+        gateway
+            .daemon_generations
+            .lock()
+            .unwrap()
+            .current
+            .as_mut()
+            .unwrap()
+            .identity = restarted_identity;
         let second = gateway.daemon_generation().unwrap();
         assert_ne!(first, second);
         assert!(
