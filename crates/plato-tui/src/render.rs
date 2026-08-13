@@ -31,6 +31,9 @@ use platonic_protocol::{
 use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthChar;
 
+#[cfg(test)]
+mod doc_capture;
+
 const THREAD_STATE_WIDTH: usize = 8;
 const WORKING_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 const WORKING_FRAME_MILLIS: u64 = 80;

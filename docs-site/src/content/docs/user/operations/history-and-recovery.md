@@ -36,11 +36,33 @@ With no run ID, replay resolves the registered workspace through the read-only s
 
 Replay reports committed messages, tool and approval facts, final phase, and the next event sequence. Provider streaming deltas are transient and are not replay output. An incomplete final JSONL line is ignored because it was not committed.
 
+<figure style="break-inside: avoid;">
+<div role="region" aria-label="Scrollable audit TUI capture" tabindex="0" style="overflow-x: auto;">
+<div style="min-width: 50rem;">
+
+![Ordered audit view presenting the committed user, tool-call, tool-result, and assistant facts for one finished run.](../../../../assets/tui/replay-audit.svg)
+
+</div>
+</div>
+<figcaption>The audit view makes the committed sequence legible; offline replay exposes those durable facts without contacting the server.</figcaption>
+</figure>
+
 ## Reconnect a TUI
 
 An I/O or protocol failure leaves the TUI disconnected rather than silently starting a replacement server. Restore the existing server first, then press `r` or run `/reconnect`. The client reloads the selected transcript, thread events, and any pending approval while preserving the composer.
 
 The standalone `plato-tui` client never starts, restarts, or stops the server. Bare `plato` only ensures the server during initial startup; it does not replace a server after a live TUI disconnects.
+
+<figure style="break-inside: avoid;">
+<div role="region" aria-label="Scrollable recovery TUI capture" tabindex="0" style="overflow-x: auto;">
+<div style="min-width: 50rem;">
+
+![Disconnected TUI retaining its composer and offering bounded reconnect guidance after a refused daemon connection.](../../../../assets/tui/daemon-recovery.svg)
+
+</div>
+</div>
+<figcaption>A disconnect stays visible and recoverable: restore the existing server, then reconnect without deleting durable state.</figcaption>
+</figure>
 
 A server restart preserves registered workspaces, thread authority, and committed history, but prior threads initially appear as `unloaded`. Use replay for the old record. For new work, follow the [first-run guidance](../../first-run/) and admit a new root thread rather than assuming the old live execution state resumed.
 

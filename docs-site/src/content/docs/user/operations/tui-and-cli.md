@@ -73,6 +73,17 @@ Use one-shot mode for a bounded request and the TUI when you want live audit, th
 
 In the TUI, `/status` opens a read-only snapshot for the selected session. It distinguishes the configured model or alias from the provider-reported served model; a provider that omits that identity appears as `served unknown`.
 
+<figure style="break-inside: avoid;">
+<div role="region" aria-label="Scrollable status TUI capture" tabindex="0" style="overflow-x: auto;">
+<div style="min-width: 50rem;">
+
+![Status overlay separating the configured model, daemon, selected session, usage, and approval profile.](../../../../assets/tui/thread-status.svg)
+
+</div>
+</div>
+<figcaption>The read-only snapshot keeps requested model, daemon, session, usage, and trust facts separate.</figcaption>
+</figure>
+
 The audit view includes the exact ordered events already available to the client. It does not replace the offline durable record. Use [replay](../history-and-recovery/#read-durable-history) when the client or server is not running.
 
 ## Finish or leave

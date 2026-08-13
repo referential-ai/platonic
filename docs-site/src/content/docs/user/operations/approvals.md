@@ -15,6 +15,17 @@ The Platonic server evaluates every tool proposal against server-owned run limit
 
 In the TUI, the approval pane shows the tool, reason, effect class, and a bounded preview. Read the command, path, URL, working directory, and timeout before deciding.
 
+<figure style="break-inside: avoid;">
+<div role="region" aria-label="Scrollable approval TUI capture" tabindex="0" style="overflow-x: auto;">
+<div style="min-width: 50rem;">
+
+![Approval pane binding one proposed file write to its run, tool call, effect class, and bounded preview.](../../../../assets/tui/approval.svg)
+
+</div>
+</div>
+<figcaption>Review one proposed effect before choosing: the pane binds the decision to this run, tool call, path, and preview.</figcaption>
+</figure>
+
 | Key | Decision |
 | --- | --- |
 | `g` | Grant this request once |
