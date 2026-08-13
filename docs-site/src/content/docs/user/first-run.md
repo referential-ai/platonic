@@ -194,6 +194,17 @@ step, and a final answer containing both of these facts:
 This repository is a harmless, read-only target for the Plato Agent first run.</samp></pre>
 </figure>
 
+<figure style="break-inside: avoid;">
+<div role="region" aria-label="Scrollable first task TUI capture" tabindex="0" style="overflow-x: auto;">
+<div style="min-width: 50rem;">
+
+![Completed first-run conversation showing that a read-only task finishes without an approval prompt.](../../../assets/tui/first-useful-thread.svg)
+
+</div>
+</div>
+<figcaption>A completed read-only turn foregrounds the result while keeping the tool step available in audit and replay.</figcaption>
+</figure>
+
 `file.read` is read-only and auto-allowed, so no tool-approval panel appears.
 After the answer finishes, press `q` with an empty composer to leave the TUI,
 then verify that the repository is unchanged:
