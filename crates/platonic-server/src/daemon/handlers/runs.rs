@@ -1317,11 +1317,45 @@ pub(super) fn handle_run_cancel(
     request: Envelope,
     params: RunCancelParams,
 ) -> Envelope {
+    let actor = match params.actor {
+        Some(actor) => match platonic_core::ActorId::new(actor) {
+            Ok(actor) => actor.to_string(),
+            Err(error) => {
+                return Envelope::error(
+                    request.id,
+                    Some("run.cancel".into()),
+                    ERROR_MALFORMED_REQUEST,
+                    format!("invalid cancellation actor: {error}"),
+                );
+            }
+        },
+        None => "daemon".into(),
+    };
     let record = match find_run(runtime, &params.run_id) {
         Ok(record) => record,
         Err(error) => return error_response(request.id, "run.cancel", error),
     };
-    let Some(status) = record.request_cancel() else {
+    let cancellation = crate::server_store::RunCancellationRecord {
+        run_id: record.run_id.clone(),
+        actor,
+        requested_at_ms: crate::thread_authority::now_ms(),
+    };
+    let accepted = record.request_cancel_after(|| {
+        let mut store = runtime.paths.server_store()?;
+        store.persist_run_cancellation(&cancellation)?;
+        Ok(())
+    });
+    let Some(status) = (match accepted {
+        Ok(status) => status,
+        Err(error) => {
+            return Envelope::error(
+                request.id,
+                Some("run.cancel".into()),
+                ERROR_INTERNAL,
+                error.to_string(),
+            );
+        }
+    }) else {
         return error_response(
             request.id,
             "run.cancel",
@@ -2297,6 +2331,65 @@ enabled = ["file.read"]
     }
 
     #[test]
+    fn attributed_run_cancel_records_only_the_first_actor() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = DaemonRuntime::new(crate::daemon::server::DaemonPaths {
+            workspace_root: root.path().to_path_buf(),
+            workspace_id: "workspace-1".into(),
+            socket_path: root.path().join("agent.sock"),
+            ledger_path: root.path().join("ledger.db"),
+            server_db_path: root.path().join("server.db"),
+        });
+        let record = test_run_record("attributed_cancel");
+        runtime.reserve_run(record.clone()).unwrap();
+
+        let first = cancel_run_as(&runtime, "cancel_actor_1", &record.run_id, "remote_laptop");
+        let duplicate = cancel_run_as(&runtime, "cancel_actor_2", &record.run_id, "other_actor");
+
+        assert_eq!(first.kind, EnvelopeKind::Response);
+        assert_eq!(duplicate.kind, EnvelopeKind::Response);
+        let stored = runtime
+            .paths
+            .server_store()
+            .unwrap()
+            .run_cancellation(&record.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.run_id, record.run_id);
+        assert_eq!(stored.actor, "remote_laptop");
+        assert!(stored.requested_at_ms > 0);
+    }
+
+    #[test]
+    fn attributed_run_cancel_fails_before_control_when_recording_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let unusable = root.path().join("server.db");
+        std::fs::create_dir(&unusable).unwrap();
+        let runtime = DaemonRuntime::new(crate::daemon::server::DaemonPaths {
+            workspace_root: root.path().to_path_buf(),
+            workspace_id: "workspace-1".into(),
+            socket_path: root.path().join("agent.sock"),
+            ledger_path: root.path().join("ledger.db"),
+            server_db_path: unusable,
+        });
+        let record = test_run_record("cancel_store_failure");
+        runtime.reserve_run(record.clone()).unwrap();
+
+        let response = cancel_run_as(
+            &runtime,
+            "cancel_store_failure",
+            &record.run_id,
+            "remote_laptop",
+        );
+
+        assert_eq!(response.kind, EnvelopeKind::Error);
+        assert_eq!(response.error.unwrap().code, ERROR_INTERNAL);
+        assert_eq!(record.status().state, RunStateName::Running);
+        assert!(!record.cancel.load(Ordering::SeqCst));
+        assert!(record.events.lock().unwrap().events.is_empty());
+    }
+
+    #[test]
     fn run_cancel_rejects_every_terminal_status_without_side_effects() {
         let runtime = test_runtime();
 
@@ -2849,6 +2942,20 @@ enabled = ["file.read"]
             runtime,
             &format!(
                 r#"{{"v":1,"id":"{request_id}","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
+            ),
+        )
+    }
+
+    fn cancel_run_as(
+        runtime: &DaemonRuntime,
+        request_id: &str,
+        run_id: &str,
+        actor: &str,
+    ) -> Envelope {
+        handle_line(
+            runtime,
+            &format!(
+                r#"{{"v":1,"id":"{request_id}","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}","actor":"{actor}"}}}}"#
             ),
         )
     }

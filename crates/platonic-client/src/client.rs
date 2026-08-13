@@ -586,6 +586,19 @@ impl DaemonClient {
     pub fn run_cancel(&mut self, run_id: &str) -> ClientResult<CommandAcceptedResult> {
         self.request(ProtocolRequest::RunCancel(RunCancelParams {
             run_id: run_id.into(),
+            actor: None,
+        }))
+    }
+
+    /// Requests cancellation for an active daemon run and attributes the request.
+    pub fn run_cancel_as(
+        &mut self,
+        run_id: &str,
+        actor: String,
+    ) -> ClientResult<CommandAcceptedResult> {
+        self.request(ProtocolRequest::RunCancel(RunCancelParams {
+            run_id: run_id.into(),
+            actor: Some(actor),
         }))
     }
 
@@ -2250,11 +2263,30 @@ mod tests {
             let cancel = read_request(&mut reader);
             assert_eq!(cancel.method.as_deref(), Some("run.cancel"));
             assert_eq!(request_params_value(&cancel).unwrap()["run_id"], "run_3");
+            assert!(
+                request_params_value(&cancel)
+                    .unwrap()
+                    .get("actor")
+                    .is_none()
+            );
             write_response(
                 &mut writer,
                 cancel.id,
                 "run.cancel",
                 json!({"run_id": "run_3", "status": "cancel_requested"}),
+            );
+
+            let attributed_cancel = read_request(&mut reader);
+            assert_eq!(attributed_cancel.method.as_deref(), Some("run.cancel"));
+            assert_eq!(
+                request_params_value(&attributed_cancel).unwrap(),
+                json!({"run_id": "run_4", "actor": "remote_laptop"})
+            );
+            write_response(
+                &mut writer,
+                attributed_cancel.id,
+                "run.cancel",
+                json!({"run_id": "run_4", "status": "cancel_requested"}),
             );
         });
 
@@ -2267,12 +2299,16 @@ mod tests {
             .approval_deny("run_2", "call_2", "denied by plato-tui".into())
             .unwrap();
         let canceled = client.run_cancel("run_3").unwrap();
+        let attributed = client
+            .run_cancel_as("run_4", "remote_laptop".into())
+            .unwrap();
         handle.join().unwrap();
 
         assert_eq!(granted.status, RunStateName::Running);
         assert_eq!(session_granted.status, RunStateName::Running);
         assert_eq!(denied.status, RunStateName::Running);
         assert_eq!(canceled.status, RunStateName::CancelRequested);
+        assert_eq!(attributed.status, RunStateName::CancelRequested);
     }
 
     fn read_request(reader: &mut BufReader<UnixStream>) -> Envelope {

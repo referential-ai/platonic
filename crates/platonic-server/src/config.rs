@@ -6,8 +6,9 @@ use crate::{
 use platonic_core::ActorId;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
 };
 
@@ -22,6 +23,7 @@ const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 120_000;
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const PLATO_CONFIG_ENV: &str = "PLATO_CONFIG";
+pub(crate) const DEFAULT_HTTP_GATEWAY_BIND: &str = "127.0.0.1:8787";
 const WORKSPACE_PROVIDER_OVERRIDE_ERROR: &str = "workspace plato.toml cannot set provider.api_key_env or provider.base_url; use --config, PLATO_CONFIG, or user config";
 const WORKSPACE_GATEWAY_ERROR: &str =
     "workspace plato.toml cannot set [gateway]; use --config, PLATO_CONFIG, or user config";
@@ -65,7 +67,8 @@ pub struct ConfinementConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GatewayConfig {
-    pub discord: DiscordGatewayConfig,
+    pub discord: Option<DiscordGatewayConfig>,
+    pub http: Option<HttpGatewayConfig>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,6 +81,30 @@ pub struct DiscordGatewayConfig {
 pub struct DiscordGatewayPrincipal {
     pub name: String,
     pub remote_ceiling: ThreadApprovalPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpGatewayConfig {
+    pub bind: SocketAddr,
+    pub allow_non_loopback: bool,
+}
+
+impl Default for HttpGatewayConfig {
+    fn default() -> Self {
+        Self {
+            bind: DEFAULT_HTTP_GATEWAY_BIND
+                .parse()
+                .expect("HTTP gateway default bind is valid"),
+            allow_non_loopback: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpGatewayPrincipal {
+    pub name: String,
+    pub token_sha256: Vec<[u8; 32]>,
+    pub workspace_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -132,7 +159,8 @@ struct RawConfinementConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawGatewayConfig {
-    discord: RawDiscordGatewayConfig,
+    discord: Option<RawDiscordGatewayConfig>,
+    http: Option<RawHttpGatewayConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,11 +171,20 @@ struct RawDiscordGatewayConfig {
     channel_threads: HashMap<String, String>,
 }
 
+#[derive(Default, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHttpGatewayConfig {
+    bind: Option<String>,
+    allow_non_loopback: Option<bool>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPrincipalsConfig {
     #[serde(default)]
     discord: HashMap<String, RawDiscordPrincipal>,
+    #[serde(default)]
+    http: HashMap<String, RawHttpPrincipal>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +192,14 @@ struct RawPrincipalsConfig {
 struct RawDiscordPrincipal {
     name: String,
     remote_ceiling: Option<ThreadApprovalPolicy>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHttpPrincipal {
+    name: String,
+    token_sha256: Vec<String>,
+    workspace_ids: Vec<String>,
 }
 
 #[derive(Default, Debug, Deserialize)]
@@ -352,55 +397,79 @@ fn positive<T: From<u8> + PartialEq>(value: T, field: &str) -> AppResult<T> {
 
 impl GatewayConfig {
     fn from_raw(raw: RawGatewayConfig) -> AppResult<Self> {
-        if raw.discord.api_key_env.trim().is_empty() {
+        if raw.discord.is_none() && raw.http.is_none() {
             return Err(AppError::Config(
-                "gateway.discord.api_key_env must not be empty".into(),
+                "gateway must define [gateway.discord] or [gateway.http]".into(),
             ));
-        }
-        if raw.discord.channel_threads.is_empty() {
-            return Err(AppError::Config(
-                "gateway.discord.channel_threads must not be empty".into(),
-            ));
-        }
-        let mut channel_threads = HashMap::new();
-        for (channel_id, thread_id) in raw.discord.channel_threads {
-            if !channel_id.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(AppError::Config(
-                    "gateway.discord.channel_threads keys must be positive numeric Discord channel IDs"
-                        .into(),
-                ));
-            }
-            let channel_id = channel_id.parse::<u64>().map_err(|_| {
-                AppError::Config(
-                    "gateway.discord.channel_threads keys must be positive numeric Discord channel IDs"
-                        .into(),
-                )
-            })?;
-            if channel_id == 0 {
-                return Err(AppError::Config(
-                    "gateway.discord.channel_threads keys must be positive numeric Discord channel IDs"
-                        .into(),
-                ));
-            }
-            ActorId::new(thread_id.clone()).map_err(|error| {
-                AppError::Config(format!(
-                    "gateway.discord.channel_threads contains an invalid thread id: {error}"
-                ))
-            })?;
-            if channel_threads.insert(channel_id, thread_id).is_some() {
-                return Err(AppError::Config(
-                    "gateway.discord.channel_threads contains a duplicate numeric Discord channel ID"
-                        .into(),
-                ));
-            }
         }
         Ok(Self {
-            discord: DiscordGatewayConfig {
-                api_key_env: raw.discord.api_key_env,
-                channel_threads,
-            },
+            discord: raw.discord.map(discord_gateway_from_raw).transpose()?,
+            http: raw.http.map(http_gateway_from_raw).transpose()?,
         })
     }
+}
+
+fn discord_gateway_from_raw(raw: RawDiscordGatewayConfig) -> AppResult<DiscordGatewayConfig> {
+    if raw.api_key_env.trim().is_empty() {
+        return Err(AppError::Config(
+            "gateway.discord.api_key_env must not be empty".into(),
+        ));
+    }
+    if raw.channel_threads.is_empty() {
+        return Err(AppError::Config(
+            "gateway.discord.channel_threads must not be empty".into(),
+        ));
+    }
+    let mut channel_threads = HashMap::new();
+    for (channel_id, thread_id) in raw.channel_threads {
+        if !channel_id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(AppError::Config(
+                "gateway.discord.channel_threads keys must be positive numeric Discord channel IDs"
+                    .into(),
+            ));
+        }
+        let channel_id = channel_id.parse::<u64>().map_err(|_| {
+            AppError::Config(
+                "gateway.discord.channel_threads keys must be positive numeric Discord channel IDs"
+                    .into(),
+            )
+        })?;
+        if channel_id == 0 {
+            return Err(AppError::Config(
+                "gateway.discord.channel_threads keys must be positive numeric Discord channel IDs"
+                    .into(),
+            ));
+        }
+        ActorId::new(thread_id.clone()).map_err(|error| {
+            AppError::Config(format!(
+                "gateway.discord.channel_threads contains an invalid thread id: {error}"
+            ))
+        })?;
+        if channel_threads.insert(channel_id, thread_id).is_some() {
+            return Err(AppError::Config(
+                "gateway.discord.channel_threads contains a duplicate numeric Discord channel ID"
+                    .into(),
+            ));
+        }
+    }
+    Ok(DiscordGatewayConfig {
+        api_key_env: raw.api_key_env,
+        channel_threads,
+    })
+}
+
+fn http_gateway_from_raw(raw: RawHttpGatewayConfig) -> AppResult<HttpGatewayConfig> {
+    let default = HttpGatewayConfig::default();
+    let bind = raw
+        .bind
+        .as_deref()
+        .unwrap_or(DEFAULT_HTTP_GATEWAY_BIND)
+        .parse::<SocketAddr>()
+        .map_err(|error| AppError::Config(format!("gateway.http.bind is invalid: {error}")))?;
+    Ok(HttpGatewayConfig {
+        bind,
+        allow_non_loopback: raw.allow_non_loopback.unwrap_or(default.allow_non_loopback),
+    })
 }
 
 pub(crate) fn server_discord_principals() -> AppResult<HashMap<u64, DiscordGatewayPrincipal>> {
@@ -465,6 +534,135 @@ fn server_discord_principals_with(
         }
     }
     Ok(principals)
+}
+
+pub(crate) fn server_http_gateway_config(
+    explicit_path: Option<&Path>,
+) -> AppResult<HttpGatewayConfig> {
+    let home = user_home();
+    let current_dir = std::env::current_dir()?;
+    let resolved = resolve_authorized_server_config_with(
+        &current_dir,
+        explicit_path.map(Path::to_path_buf),
+        std::env::var_os(PLATO_CONFIG_ENV).map(PathBuf::from),
+        home.clone(),
+        user_config_path(home.as_deref()),
+    )?;
+    Ok(Config::load_resolved(resolved.as_ref())?
+        .gateway
+        .and_then(|gateway| gateway.http)
+        .unwrap_or_default())
+}
+
+pub(crate) fn server_http_principals() -> AppResult<Vec<HttpGatewayPrincipal>> {
+    let home = user_home();
+    server_http_principals_with(user_config_path(home.as_deref()))
+}
+
+fn server_http_principals_with(
+    user_config: Option<PathBuf>,
+) -> AppResult<Vec<HttpGatewayPrincipal>> {
+    let Some(path) = user_config.filter(|path| path.exists()) else {
+        return Err(AppError::Config(
+            "HTTP gateway principals require [principals.http] in the user config".into(),
+        ));
+    };
+    let raw = Config::read_raw(&path)?;
+    let Some(raw) = raw.principals else {
+        return Err(AppError::Config(
+            "HTTP gateway principals require [principals.http] in the user config".into(),
+        ));
+    };
+    if raw.http.is_empty() {
+        return Err(AppError::Config(
+            "principals.http must not be empty in the user config".into(),
+        ));
+    }
+
+    let mut names = HashSet::new();
+    let mut token_hashes = HashSet::new();
+    let mut principals = Vec::with_capacity(raw.http.len());
+    for principal in raw.http.into_values() {
+        let name = ActorId::new(principal.name)
+            .map_err(|error| AppError::Config(format!("invalid HTTP principal name: {error}")))?
+            .to_string();
+        if !names.insert(name.clone()) {
+            return Err(AppError::Config(
+                "principals.http names must be unique".into(),
+            ));
+        }
+        if principal.token_sha256.is_empty() {
+            return Err(AppError::Config(format!(
+                "principals.http.{name}.token_sha256 must not be empty"
+            )));
+        }
+        let mut parsed_hashes = Vec::with_capacity(principal.token_sha256.len());
+        for hash in principal.token_sha256 {
+            let parsed = parse_sha256(&hash).ok_or_else(|| {
+                AppError::Config(format!(
+                    "principals.http.{name}.token_sha256 must contain 64 lowercase hex characters"
+                ))
+            })?;
+            if !token_hashes.insert(parsed) {
+                return Err(AppError::Config(
+                    "principals.http token hashes must be unique".into(),
+                ));
+            }
+            parsed_hashes.push(parsed);
+        }
+        if principal.workspace_ids.is_empty() {
+            return Err(AppError::Config(format!(
+                "principals.http.{name}.workspace_ids must not be empty"
+            )));
+        }
+        let mut workspace_ids = Vec::with_capacity(principal.workspace_ids.len());
+        let mut unique_workspace_ids = HashSet::new();
+        for workspace_id in principal.workspace_ids {
+            if workspace_id.is_empty()
+                || workspace_id.len() > 128
+                || workspace_id
+                    .bytes()
+                    .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+            {
+                return Err(AppError::Config(format!(
+                    "principals.http.{name}.workspace_ids contains an invalid workspace id"
+                )));
+            }
+            if unique_workspace_ids.insert(workspace_id.clone()) {
+                workspace_ids.push(workspace_id);
+            }
+        }
+        principals.push(HttpGatewayPrincipal {
+            name,
+            token_sha256: parsed_hashes,
+            workspace_ids,
+        });
+    }
+    principals.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(principals)
+}
+
+fn parse_sha256(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let mut output = [0; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        output[index] = (hex_nibble(chunk[0])? << 4) | hex_nibble(chunk[1])?;
+    }
+    Some(output)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn default_model(kind: &ProviderKind) -> &'static str {
@@ -567,6 +765,24 @@ fn resolve_config_with(
     }
 
     Ok(None)
+}
+
+fn resolve_authorized_server_config_with(
+    base: &Path,
+    explicit_path: Option<PathBuf>,
+    env_path: Option<PathBuf>,
+    home: Option<PathBuf>,
+    user_config: Option<PathBuf>,
+) -> AppResult<Option<ResolvedConfigPath>> {
+    if let Some(path) = explicit_path {
+        return resolve_explicit_config_path(base, path, home.as_deref())
+            .map(|path| Some(ResolvedConfigPath::Authorized(path)));
+    }
+    if let Some(path) = env_path {
+        return resolve_explicit_config_path(base, path, home.as_deref())
+            .map(|path| Some(ResolvedConfigPath::Authorized(path)));
+    }
+    Ok(resolve_server_config_with(user_config))
 }
 
 fn resolve_server_config_with(user_config: Option<PathBuf>) -> Option<ResolvedConfigPath> {
@@ -677,13 +893,125 @@ api_key_env = "DISCORD_BOT_TOKEN"
 
         let resolved = ResolvedConfigPath::Authorized(path);
         let config = Config::load_resolved(Some(&resolved)).unwrap();
-        let discord = config.gateway.unwrap().discord;
+        let discord = config.gateway.unwrap().discord.unwrap();
 
         assert_eq!(discord.api_key_env, "DISCORD_BOT_TOKEN");
         assert_eq!(
             discord.channel_threads,
             HashMap::from([(111111111111111111, "thread_news".into())])
         );
+    }
+
+    #[test]
+    fn http_gateway_defaults_to_loopback_and_parses_explicit_settings() {
+        assert_eq!(
+            HttpGatewayConfig::default().bind,
+            "127.0.0.1:8787".parse().unwrap()
+        );
+        assert!(!HttpGatewayConfig::default().allow_non_loopback);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[gateway.http]\nbind = \"0.0.0.0:9876\"\nallow_non_loopback = true\n",
+        )
+        .unwrap();
+        let config = Config::load_resolved(Some(&ResolvedConfigPath::Authorized(path))).unwrap();
+        let http = config.gateway.unwrap().http.unwrap();
+
+        assert_eq!(http.bind, "0.0.0.0:9876".parse().unwrap());
+        assert!(http.allow_non_loopback);
+    }
+
+    #[test]
+    fn canonical_home_http_principals_validate_rotation_and_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[principals.http.remote]
+name = "remote_laptop"
+token_sha256 = [
+  "1111111111111111111111111111111111111111111111111111111111111111",
+  "2222222222222222222222222222222222222222222222222222222222222222",
+]
+workspace_ids = ["workspace-1", "workspace-2"]
+"#,
+        )
+        .unwrap();
+
+        let principals = server_http_principals_with(Some(path)).unwrap();
+
+        assert_eq!(principals.len(), 1);
+        assert_eq!(principals[0].name, "remote_laptop");
+        assert_eq!(principals[0].token_sha256, vec![[0x11; 32], [0x22; 32]]);
+        assert_eq!(
+            principals[0].workspace_ids,
+            vec!["workspace-1", "workspace-2"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_principal_authority_ignores_explicit_and_environment_config() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let explicit = root.path().join("gateway.toml");
+        let home_config = home.join(".config/plato/config.toml");
+        std::fs::create_dir_all(home_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &explicit,
+            "[gateway.http]\nbind = \"127.0.0.1:9876\"\n\n[principals.http.attacker]\nname = \"attacker\"\ntoken_sha256 = [\"1111111111111111111111111111111111111111111111111111111111111111\"]\nworkspace_ids = [\"workspace-attacker\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &home_config,
+            "[principals.http.remote]\nname = \"remote_laptop\"\ntoken_sha256 = [\"2222222222222222222222222222222222222222222222222222222222222222\"]\nworkspace_ids = [\"workspace-1\"]\n",
+        )
+        .unwrap();
+
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.as_os_str())),
+                (PLATO_CONFIG_ENV, Some(explicit.as_os_str())),
+            ],
+            || {
+                assert_eq!(
+                    server_http_gateway_config(None).unwrap().bind,
+                    "127.0.0.1:9876".parse().unwrap()
+                );
+                let principals = server_http_principals().unwrap();
+                assert_eq!(principals.len(), 1);
+                assert_eq!(principals[0].name, "remote_laptop");
+                assert_eq!(principals[0].workspace_ids, vec!["workspace-1"]);
+            },
+        );
+    }
+
+    #[test]
+    fn malformed_http_principals_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, contents) in [
+            ("missing", "[principals]\n"),
+            (
+                "uppercase-hash",
+                "[principals.http.remote]\nname = \"remote\"\ntoken_sha256 = [\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"]\nworkspace_ids = [\"workspace-1\"]\n",
+            ),
+            (
+                "empty-scope",
+                "[principals.http.remote]\nname = \"remote\"\ntoken_sha256 = [\"1111111111111111111111111111111111111111111111111111111111111111\"]\nworkspace_ids = []\n",
+            ),
+            (
+                "invalid-name",
+                "[principals.http.remote]\nname = \"   \"\ntoken_sha256 = [\"1111111111111111111111111111111111111111111111111111111111111111\"]\nworkspace_ids = [\"workspace-1\"]\n",
+            ),
+        ] {
+            let path = root.path().join(format!("{name}.toml"));
+            std::fs::write(&path, contents).unwrap();
+            assert!(server_http_principals_with(Some(path)).is_err(), "{name}");
+        }
     }
 
     #[test]
@@ -1107,7 +1435,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
             ));
             assert_eq!(config.provider.api_key_env, "AUTHORIZED_SECRET");
             assert_eq!(config.provider.base_url, "https://provider.example/v1");
-            let discord = config.gateway.unwrap().discord;
+            let discord = config.gateway.unwrap().discord.unwrap();
             assert_eq!(
                 discord.channel_threads,
                 HashMap::from([(200, "thread_news".into())])

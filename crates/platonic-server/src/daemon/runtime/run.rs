@@ -325,11 +325,20 @@ impl RunRecord {
     }
 
     pub(in crate::daemon) fn request_cancel(&self) -> Option<RunStateName> {
+        self.request_cancel_after(|| Ok(()))
+            .expect("infallible cancel")
+    }
+
+    pub(in crate::daemon) fn request_cancel_after(
+        &self,
+        before_first_accept: impl FnOnce() -> AppResult<()>,
+    ) -> AppResult<Option<RunStateName>> {
         let mut approvals = self.approvals.lock().expect("approvals lock poisoned");
         let state = {
             let mut status = self.status.lock().expect("run status lock poisoned");
             match status.state {
                 RunStateName::Running => {
+                    before_first_accept()?;
                     status.state = RunStateName::CancelRequested;
                     self.cancel.store(true, Ordering::SeqCst);
                     self.push_event(StreamEvent::Canceled {
@@ -343,11 +352,11 @@ impl RunRecord {
                 RunStateName::Finished
                 | RunStateName::Failed
                 | RunStateName::Canceled
-                | RunStateName::Interrupted => return None,
+                | RunStateName::Interrupted => return Ok(None),
             }
         };
         drop(approvals);
-        Some(state)
+        Ok(Some(state))
     }
 
     pub(in crate::daemon) fn wait_for_terminal(&self, timeout: Duration) -> bool {

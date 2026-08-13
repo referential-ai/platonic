@@ -5,12 +5,13 @@ use super::{
         tool_call_approval_from_row, workspace_from_row,
     },
     schema::{
-        create_agent_table, create_thread_authority_tables, create_thread_repository_tables,
-        create_thread_stop_table, create_tool_call_approval_table, create_workspace_table,
+        create_agent_table, create_run_cancellation_table, create_thread_authority_tables,
+        create_thread_repository_tables, create_thread_stop_table, create_tool_call_approval_table,
+        create_workspace_table,
     },
     types::{
-        AgentRecord, DurableThreadAuthority, ToolCallApprovalDecision, ToolCallApprovalRecord,
-        WorkspaceRecord,
+        AgentRecord, DurableThreadAuthority, RunCancellationRecord, ToolCallApprovalDecision,
+        ToolCallApprovalRecord, WorkspaceRecord,
     },
 };
 use crate::{
@@ -60,6 +61,7 @@ impl ServerStore {
         create_workspace_table(&connection)?;
         create_agent_table(&connection)?;
         create_tool_call_approval_table(&connection)?;
+        create_run_cancellation_table(&connection)?;
         Ok(Self {
             connection,
             path: path.to_path_buf(),
@@ -793,6 +795,61 @@ impl ServerStore {
     pub(crate) fn thread_stop(&self, thread_id: &str) -> AppResult<Option<ThreadStopRecord>> {
         thread_stop_from(&self.connection, thread_id)
     }
+
+    /// Persists the first attributed cancellation request without replacing it.
+    pub(crate) fn persist_run_cancellation(
+        &mut self,
+        cancellation: &RunCancellationRecord,
+    ) -> AppResult<(RunCancellationRecord, bool)> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = run_cancellation_from(&transaction, &cancellation.run_id)? {
+            transaction.commit()?;
+            return Ok((existing, false));
+        }
+        transaction.execute(
+            "INSERT INTO run_cancellations (run_id, actor, requested_at_ms) VALUES (?1, ?2, ?3)",
+            params![
+                cancellation.run_id,
+                cancellation.actor,
+                sqlite_i64(
+                    cancellation.requested_at_ms,
+                    "run cancellation requested_at_ms"
+                )?
+            ],
+        )?;
+        transaction.commit()?;
+        Ok((cancellation.clone(), true))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_cancellation(
+        &self,
+        run_id: &str,
+    ) -> AppResult<Option<RunCancellationRecord>> {
+        run_cancellation_from(&self.connection, run_id)
+    }
+}
+
+fn run_cancellation_from(
+    connection: &Connection,
+    run_id: &str,
+) -> AppResult<Option<RunCancellationRecord>> {
+    let record = connection
+        .query_row(
+            "SELECT run_id, actor, requested_at_ms FROM run_cancellations WHERE run_id = ?1",
+            params![run_id],
+            |row| {
+                Ok(RunCancellationRecord {
+                    run_id: row.get(0)?,
+                    actor: row.get(1)?,
+                    requested_at_ms: row_u64(row, 2, "run cancellation requested_at_ms")?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(record)
 }
 
 fn rollback_adopted_ledger(
@@ -1214,6 +1271,52 @@ mod tests {
         assert_eq!(
             reopened.thread_authority("thread_stop_target").unwrap(),
             Some(authority)
+        );
+    }
+
+    #[test]
+    fn run_cancellation_keeps_the_first_actor_and_is_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run-cancellation.db");
+        let mut store = ServerStore::open_or_create(&path).unwrap();
+        let first = RunCancellationRecord {
+            run_id: "run_1".into(),
+            actor: "remote_laptop".into(),
+            requested_at_ms: 42,
+        };
+        let second = RunCancellationRecord {
+            run_id: "run_1".into(),
+            actor: "other_actor".into(),
+            requested_at_ms: 43,
+        };
+
+        assert_eq!(
+            store.persist_run_cancellation(&first).unwrap(),
+            (first.clone(), true)
+        );
+        assert_eq!(
+            store.persist_run_cancellation(&second).unwrap(),
+            (first.clone(), false)
+        );
+        assert_eq!(
+            store.run_cancellation("run_1").unwrap(),
+            Some(first.clone())
+        );
+
+        for statement in [
+            "UPDATE run_cancellations SET actor = 'changed' WHERE run_id = 'run_1'",
+            "DELETE FROM run_cancellations WHERE run_id = 'run_1'",
+        ] {
+            assert!(store.connection.execute(statement, []).is_err());
+        }
+        drop(store);
+
+        assert_eq!(
+            ServerStore::open_readonly(&path)
+                .unwrap()
+                .run_cancellation("run_1")
+                .unwrap(),
+            Some(first)
         );
     }
 

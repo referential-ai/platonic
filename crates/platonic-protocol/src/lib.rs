@@ -2741,6 +2741,9 @@ pub struct ApprovalDecideParams {
 pub struct RunCancelParams {
     /// Run to cancel.
     pub run_id: String,
+    /// Attributed actor supplied by an already-trusted local client boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
 }
 
 /// Result returned after a run mutation is accepted.
@@ -3434,6 +3437,25 @@ mod tests {
             );
             assert_eq!(serde_json::to_string(&response).unwrap(), *response_fixture);
         }
+    }
+
+    #[test]
+    fn run_cancel_actor_is_additive_and_legacy_compatible() {
+        let legacy: RunCancelParams = serde_json::from_str(r#"{"run_id":"run-1"}"#).unwrap();
+        assert_eq!(legacy.actor, None);
+        assert_eq!(
+            serde_json::to_string(&legacy).unwrap(),
+            r#"{"run_id":"run-1"}"#
+        );
+
+        let attributed = RunCancelParams {
+            run_id: "run-1".into(),
+            actor: Some("remote_laptop".into()),
+        };
+        assert_eq!(
+            serde_json::to_string(&attributed).unwrap(),
+            r#"{"run_id":"run-1","actor":"remote_laptop"}"#
+        );
     }
 
     #[test]

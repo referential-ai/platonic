@@ -68,6 +68,14 @@ pub(crate) struct ToolCallApprovalDecision {
     pub(crate) decided_at_ms: u64,
 }
 
+/// The first attributed request to cancel one run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunCancellationRecord {
+    pub(crate) run_id: String,
+    pub(crate) actor: String,
+    pub(crate) requested_at_ms: u64,
+}
+
 /// A thread authority record proven to be durably written.
 ///
 /// The type exists so a caller cannot mistake an in-memory record for one that

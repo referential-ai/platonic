@@ -64,6 +64,35 @@ npm run build
 npm run crawl
 ```
 
+### Unreleased HTTP gateway
+
+`platonic gateway http` exposes the bounded authenticated `/v1` HTTP/SSE
+adapter on `127.0.0.1:8787` by default. It is plaintext and intended only for
+a loopback hop behind an operator-owned TLS proxy. Generate a bearer token and
+its configuration hash without persisting either value:
+
+```bash
+platonic gateway http --generate-token
+```
+
+Store only the emitted hash and fixed workspace scope in the canonical user
+configuration at `$HOME/.config/plato/config.toml`:
+
+```toml
+[gateway.http]
+bind = "127.0.0.1:8787"
+
+[principals.http.remote_laptop]
+name = "remote_laptop"
+token_sha256 = ["<emitted lowercase SHA-256 hash>"]
+workspace_ids = ["<server workspace id>"]
+```
+
+Then run `platonic gateway http`. A non-loopback bind additionally requires
+`allow_non_loopback = true` or `--allow-non-loopback` and still requires
+external TLS. The generated OpenAPI 3.1 contract is
+[`openapi/gateway-v1.yaml`](openapi/gateway-v1.yaml).
+
 ## Boundary
 
 `platonic-core` is an independent harness contract, not the Platonic product

@@ -26,6 +26,7 @@ use std::{
 };
 
 mod discord;
+mod http;
 
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -152,6 +153,24 @@ enum GatewayCommand {
         #[arg(long, value_name = "FILE")]
         config: Option<PathBuf>,
     },
+    /// Run the authenticated plaintext HTTP/SSE gateway.
+    Http {
+        /// Override the host endpoint for testing or operations.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+        /// Read gateway settings from an authorized configuration file.
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+        /// Override the plaintext listener address.
+        #[arg(long, value_name = "ADDRESS")]
+        bind: Option<std::net::SocketAddr>,
+        /// Explicitly authorize a non-loopback plaintext listener.
+        #[arg(long)]
+        allow_non_loopback: bool,
+        /// Generate one bearer token and its configuration hash without persistence.
+        #[arg(long)]
+        generate_token: bool,
+    },
 }
 
 fn main() {
@@ -201,6 +220,13 @@ fn run() -> AppResult<()> {
                 socket,
                 config,
             } => discord::run(workspace, socket, config),
+            GatewayCommand::Http {
+                socket,
+                config,
+                bind,
+                allow_non_loopback,
+                generate_token,
+            } => http::run(socket, config, bind, allow_non_loopback, generate_token),
         },
         None => Err(AppError::Config("a command is required".into())),
     }
