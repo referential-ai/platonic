@@ -25,7 +25,7 @@
   },
   "metadata": "no SVG metadata or comments",
   "motion": "reduced",
-  "plato_tui_binary_sha256": "2da55e48178ebbaeb9b7ae81f545da14628305006ade1df1c7b3a8b73742642c",
+  "plato_tui_binary_sha256": "675b1c46e21aec4eb538a58fe1ced88a93731626c397a273776f3005fd477307",
   "scenes": [
     {
       "bytes": 2631,
@@ -79,7 +79,7 @@
     }
   ],
   "schema_version": 1,
-  "source_commit": "2698b9c96ffb368702493780a9ee7da810a5d942",
+  "source_commit": "a7c623427eee1957cf807dbe63c507572c33c0f9",
   "theme": {
     "accent": "#00ffff",
     "background": "#0b0f14",
