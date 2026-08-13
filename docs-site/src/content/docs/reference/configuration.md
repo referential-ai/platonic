@@ -25,7 +25,7 @@ An explicit or `PLATO_CONFIG` path may start with `~`; a relative path resolves 
 
 A client-supplied `--config` path is carried by one-shot and unattached session runs. With `plato --tui --config FILE`, that file supplies the proposed root thread's model, but an attached durable-thread turn does not carry it in `thread.send`. Use `PLATO_CONFIG` in the server environment or user config for trusted provider settings that must govern attached turns. The thread's admitted model and toolset remain immutable.
 
-The auto-discovered workspace `plato.toml` is untrusted. It cannot contain `provider.api_key_env`, `provider.base_url`, `[gateway]`, `[principals]`, `limits.max_spawn_depth`, or `[confinement]`. Put trusted provider fields in an explicitly selected config, the `PLATO_CONFIG` file, or user config. The [Discord gateway guide](https://github.com/referential-ai/platonic/blob/develop/docs/GATEWAY.md) owns gateway and principal configuration.
+The auto-discovered workspace `plato.toml` is untrusted. It cannot contain `provider.api_key_env`, `provider.base_url`, `[gateway]`, `[principals]`, `limits.max_spawn_depth`, or `[confinement]`. Put trusted provider fields in an explicitly selected config, the `PLATO_CONFIG` file, or user config. The [Discord operations page](../../user/operations/discord/) routes gateway and principal configuration to its detailed owner.
 
 Server startup reads `limits.max_spawn_depth` and `confinement.require` only from `$HOME/.config/plato/config.toml`, then falls back to defaults. Restart an idle server after changing either field.
 
