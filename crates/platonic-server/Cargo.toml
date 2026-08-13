@@ -12,6 +12,7 @@ readme = "README.md"
 
 [dependencies]
 html2text.workspace = true
+httparse.workspace = true
 platonic-client.workspace = true
 platonic-core.workspace = true
 platonic-protocol.workspace = true

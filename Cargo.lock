@@ -1815,6 +1815,7 @@ name = "platonic-server"
 version = "0.2.0"
 dependencies = [
  "html2text",
+ "httparse",
  "landlock",
  "platonic-client",
  "platonic-core",

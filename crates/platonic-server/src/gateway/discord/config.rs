@@ -30,7 +30,7 @@ fn resolve_discord_gateway_runtime(
     let discord = config
         .gateway
         .clone()
-        .map(|gateway| gateway.discord)
+        .and_then(|gateway| gateway.discord)
         .ok_or_else(|| AppError::Config("gateway.discord configuration is required".into()))?;
     let principals = server_discord_principals()?;
     let token = gateway_token(&config, &discord, |name| std::env::var_os(name))?;

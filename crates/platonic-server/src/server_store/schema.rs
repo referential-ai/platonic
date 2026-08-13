@@ -112,6 +112,31 @@ pub(super) fn create_tool_call_approval_table(connection: &Connection) -> AppRes
     Ok(())
 }
 
+pub(super) fn create_run_cancellation_table(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS run_cancellations (
+          run_id TEXT PRIMARY KEY,
+          actor TEXT NOT NULL,
+          requested_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TRIGGER IF NOT EXISTS run_cancellations_no_update
+        BEFORE UPDATE ON run_cancellations
+        BEGIN
+          SELECT RAISE(ABORT, 'run cancellation records are immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS run_cancellations_no_delete
+        BEFORE DELETE ON run_cancellations
+        BEGIN
+          SELECT RAISE(ABORT, 'run cancellation records are immutable');
+        END;
+        "#,
+    )?;
+    Ok(())
+}
+
 pub(super) fn create_thread_authority_tables(connection: &mut Connection) -> AppResult<()> {
     connection.execute_batch(
         r#"
