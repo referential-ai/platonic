@@ -2,7 +2,7 @@
 title: Install and release tracks
 description: Choose the current public release or the exact-head unreleased journey without mixing their commands.
 sidebar:
-  order: 3
+  order: 2
 ---
 
 <span id="quickstart-entry-point"></span>

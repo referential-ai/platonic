@@ -250,6 +250,13 @@
       "sha256": "9d4b4fabd76d5f7139770673088b6021b5307289cf2bbe0ff939d0af400b3af5",
       "disposition": "replace-with-canonical-starlight-content",
       "rationale": "Starlight's existing favicon replaces the generated mdBook favicons."
+    },
+    {
+      "path": "docs-site/src/assets/tui/manifest.json",
+      "sha256": "bab31389e63e670b775c39cdc8df4f5ec7b1afbc76e594aed34ac3f48347377e",
+      "disposition": "link-to-existing-authority",
+      "authority": "referential-ai/platonic#556",
+      "rationale": "The #556 manifest exclusively inventories the five useful TUI captures, their consuming pages, provenance, and byte digests."
     }
   ],
   "licenses": [

@@ -2,7 +2,7 @@
 title: First run
 description: Build exact-head commands, finish one read-only TUI task, and prove its durable record.
 sidebar:
-  order: 2
+  order: 3
 ---
 
 <p class="section-kicker user">User docs</p>
@@ -289,7 +289,6 @@ for future work rather than trying to continue the unloaded authority record.
 | The task fails before a final answer | Check `platonic status --workspace "$PWD"`. Confirm `provider_kind` is `open_router` and `key_present` is `true`; then retry in a new TUI thread. The failed attempt remains in the ledger. |
 | `plato replay` reports no sessions | Finish one task from this registered workspace first. Replay selects that workspace's latest recorded session. |
 
-For daily operation, approvals, and provider choices, follow
-[#548](https://github.com/referential-ai/platonic/issues/548). For server,
-protocol, and ledger internals, follow
-[#547](https://github.com/referential-ai/platonic/issues/547).
+Continue with the [User operations guide](../operations/) for daily operation,
+approvals, and provider choices, or the [Developer guide](../../developer/) for
+server, protocol, and ledger internals.
