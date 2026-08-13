@@ -5,12 +5,15 @@ import { fileURLToPath } from "node:url";
 import AxeBuilder from "@axe-core/playwright";
 import { chromium } from "playwright";
 
+import { readRedirectManifest, redirectsFromManifest } from "./docs-redirects.mjs";
+
 const defaultBaseUrl = "http://127.0.0.1:8080/";
 const baseUrl = new URL(
   process.argv[2] ?? process.env.BASE_URL ?? process.env.SITE_URL ?? defaultBaseUrl,
 );
 const siteRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const artifactRoot = resolve(process.env.SITE_PROOF_DIR ?? resolve(siteRoot, "artifacts/browser"));
+const redirects = redirectsFromManifest(await readRedirectManifest());
 
 if (baseUrl.pathname !== "/" || baseUrl.search || baseUrl.hash) {
   throw new Error(`BASE_URL or SITE_URL must be an origin with a trailing slash, received ${baseUrl.href}`);
@@ -34,11 +37,24 @@ const resourceRoutes = [
   { path: "/missing-browser-proof", status: 404, contentType: "text/html" },
 ];
 
+const securityHeaders = new Map([
+  ["content-security-policy", "default-src 'self'; img-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'"],
+  ["referrer-policy", "strict-origin-when-cross-origin"],
+  ["x-content-type-options", "nosniff"],
+  ["x-frame-options", "DENY"],
+]);
+
 const failures = [];
 
 function record(condition, message) {
   if (!condition) {
     failures.push(message);
+  }
+}
+
+function proveSecurityHeaders(headers, label) {
+  for (const [name, expected] of securityHeaders) {
+    record(headers[name] === expected, `${label}: expected ${name}: ${expected}, received ${headers[name] ?? "no header"}`);
   }
 }
 
@@ -53,6 +69,40 @@ async function proveResources(request) {
     record(response.status() === resource.status, `${resource.path}: expected HTTP ${resource.status}, received ${response.status()}`);
     const contentType = response.headers()["content-type"] ?? "";
     record(contentType.startsWith(resource.contentType), `${resource.path}: expected ${resource.contentType}, received ${contentType || "no content type"}`);
+    proveSecurityHeaders(response.headers(), resource.path);
+  }
+}
+
+async function proveRedirects(request) {
+  const requestUrl = (path) => `${baseUrl.origin}${path}`;
+
+  for (const redirect of redirects) {
+    const response = await request.get(requestUrl(redirect.source), { maxRedirects: 0 });
+    record(response.status() === 308, `${redirect.source}: expected HTTP 308, received ${response.status()}`);
+    record(response.headers().location === redirect.destination, `${redirect.source}: expected Location ${redirect.destination}, received ${response.headers().location ?? "no Location"}`);
+    proveSecurityHeaders(response.headers(), redirect.source);
+
+    const query = "proof=redirect&next=%2Fdocs";
+    const queried = await request.get(requestUrl(`${redirect.source}?${query}`), { maxRedirects: 0 });
+    record(queried.status() === 308, `${redirect.source}?${query}: expected HTTP 308, received ${queried.status()}`);
+    record(queried.headers().location === `${redirect.destination}?${query}`, `${redirect.source}: query string was not preserved exactly`);
+  }
+
+  const existing404 = await request.get(requestUrl("/missing-browser-proof"));
+  const existing404Body = await existing404.text();
+  const rejectedPaths = [
+    "/docs/not-in-manifest",
+    "/docs/docs/quickstart.html",
+    "/docs/docs/QUICKSTART.html/",
+    "/docs//docs/QUICKSTART.html",
+    "/%64ocs/docs/QUICKSTART.html",
+  ];
+
+  for (const path of rejectedPaths) {
+    const response = await request.get(requestUrl(path), { maxRedirects: 0 });
+    record(response.status() === 404, `${path}: expected the existing HTTP 404, received ${response.status()}`);
+    record(await response.text() === existing404Body, `${path}: response did not match the existing real 404`);
+    proveSecurityHeaders(response.headers(), path);
   }
 }
 
@@ -314,6 +364,7 @@ async function provePage(page, profile, route) {
   const response = await page.goto(new URL(route, baseUrl).href, { waitUntil: "networkidle" });
   record(Boolean(response?.ok()), `${profile.name} ${route}: navigation did not return 2xx`);
   record(response?.headers()["content-type"]?.startsWith("text/html") ?? false, `${profile.name} ${route}: page did not return text/html`);
+  if (response) proveSecurityHeaders(response.headers(), `${profile.name} ${route}`);
   await page.locator("body").waitFor({ state: "visible" });
 
   const layout = await page.evaluate(() => {
@@ -485,6 +536,7 @@ try {
     try {
       if (profileIndex === 0) {
         await proveResources(context.request);
+        await proveRedirects(context.request);
       }
       for (const route of routes) {
         const page = await context.newPage();
