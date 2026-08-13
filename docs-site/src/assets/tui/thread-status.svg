@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="520" viewBox="0 0 1040 520" preserveAspectRatio="xMinYMin meet">
+<rect width="1040" height="520" fill="#0b0f14"/>
+<g font-family="DejaVu Sans Mono, Liberation Mono, monospace" font-size="16" font-variant-ligatures="none">
+<rect x="20" y="40" width="40" height="20" fill="#282b30"/>
+<text x="20" y="36" textLength="30" lengthAdjust="spacingAndGlyphs" fill="#00ffff" font-weight="700" font-style="normal" opacity="1" xml:space="preserve">You</text>
+<text x="50" y="36" textLength="930" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve"> ┌Status────────────────────────────────────────────────────────────────────────────────────┐</text>
+<text x="20" y="56" textLength="40" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">  Us</text>
+<text x="60" y="56" textLength="10" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">│</text>
+<text x="70" y="56" textLength="50" lengthAdjust="spacingAndGlyphs" fill="#7dd3fc" font-weight="700" font-style="normal" opacity="1" xml:space="preserve">MODEL</text>
+<text x="120" y="56" textLength="860" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">                                                                                     │</text>
+<text x="20" y="76" textLength="960" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">    │requested alias  ~openai/gpt-latest                                                       │</text>
+<text x="20" y="96" textLength="40" lengthAdjust="spacingAndGlyphs" fill="#4ade80" font-weight="700" font-style="normal" opacity="1" xml:space="preserve">Plat</text>
+<text x="60" y="96" textLength="920" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">│served model    unknown                                                                   │</text>
+<text x="40" y="116" textLength="20" lengthAdjust="spacingAndGlyphs" fill="#e5e510" font-weight="700" font-style="normal" opacity="1" xml:space="preserve">Fi</text>
+<text x="60" y="116" textLength="920" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">│provider        open_router    key present: true                                          │</text>
+<text x="20" y="136" textLength="50" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">    │</text>
+<text x="70" y="136" textLength="60" lengthAdjust="spacingAndGlyphs" fill="#7dd3fc" font-weight="700" font-style="normal" opacity="1" xml:space="preserve">DAEMON</text>
+<text x="130" y="136" textLength="850" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">                                                                                    │</text>
+<text x="20" y="156" textLength="960" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">  Th│package         0.2.0    commit unknown                                                   │</text>
+<text x="20" y="176" textLength="960" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">    │build UTC       unknown    uptime 42000 ms                                                │</text>
+<text x="20" y="196" textLength="40" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="0.64" xml:space="preserve">Trac</text>
+<text x="60" y="196" textLength="920" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">│endpoint        /run/platonic/host/agent.sock                                             │</text>
+<text x="20" y="216" textLength="960" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">    │workspace       work-docs                                                                 │</text>
+<text x="20" y="236" textLength="50" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">    │</text>
+<text x="70" y="236" textLength="70" lengthAdjust="spacingAndGlyphs" fill="#7dd3fc" font-weight="700" font-style="normal" opacity="1" xml:space="preserve">SESSION</text>
+<text x="140" y="236" textLength="840" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">                                                                                   │</text>
+<text x="20" y="256" textLength="960" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">    │selected        session-docs-001                                                          │</text>
+<text x="20" y="276" textLength="960" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">    │latest run      run-docs-001                                                              │</text>
+<text x="20" y="296" textLength="960" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">    │human turns     1    core events 9                                                        │</text>
+<text x="20" y="316" textLength="960" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">    │ledger          /state/platonic/workspaces/work-docs/ledger.db                            │</text>
+<text x="20" y="336" textLength="50" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">    │</text>
+<text x="70" y="336" textLength="50" lengthAdjust="spacingAndGlyphs" fill="#7dd3fc" font-weight="700" font-style="normal" opacity="1" xml:space="preserve">USAGE</text>
+<text x="120" y="336" textLength="860" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">                                                                                     │</text>
+<text x="20" y="356" textLength="960" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">    │last run  input 48    output 19    unknown 0                                              │</text>
+<text x="20" y="376" textLength="960" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">    │session   input 48    output 19    unknown 0                                              │</text>
+<text x="20" y="396" textLength="50" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">    │</text>
+<text x="70" y="396" textLength="50" lengthAdjust="spacingAndGlyphs" fill="#7dd3fc" font-weight="700" font-style="normal" opacity="1" xml:space="preserve">TRUST</text>
+<text x="120" y="396" textLength="860" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">                                                                                     │</text>
+<text x="20" y="416" textLength="960" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">    │granted         0    denied 0                                                             │</text>
+<text x="20" y="436" textLength="960" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">    │shell session   not granted                                                               │</text>
+<text x="20" y="456" textLength="960" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">    │profile         prompt                                                                    │</text>
+<text x="20" y="476" textLength="10" lengthAdjust="spacingAndGlyphs" fill="#00ffff" font-weight="700" font-style="normal" opacity="1" xml:space="preserve">&gt;</text>
+<text x="30" y="476" textLength="950" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">   │Esc close                                                                                 │</text>
+<text x="20" y="496" textLength="10" lengthAdjust="spacingAndGlyphs" fill="#00ffff" font-weight="700" font-style="normal" opacity="1" xml:space="preserve">?</text>
+<text x="30" y="496" textLength="30" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="0.64" xml:space="preserve"> sh</text>
+<text x="60" y="496" textLength="920" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────┘</text>
+</g>
+</svg>

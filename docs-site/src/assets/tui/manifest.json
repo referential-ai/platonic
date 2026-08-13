@@ -1,0 +1,97 @@
+{
+  "capture_command": "./scripts/capture-tui-docs.sh",
+  "clock": {
+    "unix_ms": 1786536000000,
+    "utc": "2026-08-12T12:00:00Z"
+  },
+  "encoding_variance": "none for UTF-8 SVG bytes; proof rasterization may vary by installed font rasterizer",
+  "fixture_revision": "tui-docs-v1",
+  "geometry": {
+    "cell_height_px": 20,
+    "cell_width_px": 10,
+    "columns": 100,
+    "height_px": 520,
+    "rows": 24,
+    "width_px": 1040
+  },
+  "identities": {
+    "runs": [
+      "run-docs-001",
+      "run-docs-002"
+    ],
+    "session": "session-docs-001",
+    "thread": "thread-docs-001",
+    "workspace": "work-docs"
+  },
+  "metadata": "no SVG metadata or comments",
+  "motion": "reduced",
+  "plato_tui_binary_sha256": "c35f35d34a5b591a4b63052e29cb51238310dd33519876739a84525abb49d9c1",
+  "scenes": [
+    {
+      "bytes": 2631,
+      "consuming_path": "docs-site/src/content/docs/user/first-run.md",
+      "file": "first-useful-thread.svg",
+      "id": "first-useful-thread",
+      "issue": "#546",
+      "semantic_sha256": "7635cced3039eb1d3eb3a89d04db99c8f1bf8f2ca6b6a8d0076eada02d93b41b",
+      "sha256": "dd983db8c6cb72b5c2c6f36cbb0cadd147a1925a654190fda7e2134ef12852b5",
+      "task": "Complete one read-only task"
+    },
+    {
+      "bytes": 9976,
+      "consuming_path": "docs-site/src/content/docs/user/operations/tui-and-cli.md",
+      "file": "thread-status.svg",
+      "id": "thread-status",
+      "issue": "#548",
+      "semantic_sha256": "72562385ecb8505a117c14c5e43ed9dc9d7218587a3c34c93063df15b9be76c5",
+      "sha256": "396006816819e463ec0cd6533b54208ddec3508938a338f5affa80cb1770c634",
+      "task": "Read live state"
+    },
+    {
+      "bytes": 10532,
+      "consuming_path": "docs-site/src/content/docs/user/operations/approvals.md",
+      "file": "approval.svg",
+      "id": "approval",
+      "issue": "#548",
+      "semantic_sha256": "97e9580e9a2d5fc10d08b076383bc5f017ee975afb74fda5700f3a55623ba976",
+      "sha256": "adcafd04407284be91d2025758c94210fc133c2d6e51f7661dce38340186bdc9",
+      "task": "Decide from the proposed effect"
+    },
+    {
+      "bytes": 4341,
+      "consuming_path": "docs-site/src/content/docs/user/operations/history-and-recovery.md",
+      "file": "replay-audit.svg",
+      "id": "replay-audit",
+      "issue": "#548",
+      "semantic_sha256": "72369c7439f1816cf2dbae87e6a2fcbdddd6439051b18ff413621b63512dc5c6",
+      "sha256": "a80f234e919729a2787c934f3c06b9c8f7aaac8e1f392aaf24eed4255232b3d8",
+      "task": "Read durable history"
+    },
+    {
+      "bytes": 2030,
+      "consuming_path": "docs-site/src/content/docs/user/operations/history-and-recovery.md",
+      "file": "daemon-recovery.svg",
+      "id": "daemon-recovery",
+      "issue": "#548",
+      "semantic_sha256": "9a4594e47c659704634a9976453dba9c890aa8d1c01a47f3428bddd1e7bf7113",
+      "sha256": "fca579b11b1a9d8b82894dd5fe7659b1f39dcd07a95d65e3a658a88ff1dc919f",
+      "task": "Reconnect a TUI"
+    }
+  ],
+  "schema_version": 1,
+  "source_commit": "647e3ae831c1839f0efb2090d7a1a507c52956ce",
+  "theme": {
+    "accent": "#00ffff",
+    "background": "#0b0f14",
+    "color_capability": "truecolor",
+    "error": "#f87171",
+    "font_family": "DejaVu Sans Mono, Liberation Mono, monospace",
+    "foreground": "#e6edf3",
+    "muted": "#94a3b8",
+    "name": "plato-docs-dark-v1",
+    "primary": "#7dd3fc",
+    "success": "#4ade80",
+    "syntax_heading": "#e5e510",
+    "warning": "#facc15"
+  }
+}
