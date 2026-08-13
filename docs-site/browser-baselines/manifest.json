@@ -16,8 +16,8 @@
       "viewport": { "width": 1440, "height": 900 },
       "theme": "light",
       "fullPage": true,
-      "rationale": "Desktop overview locks the primary entrances and five-step product model.",
-      "sha256": "pending"
+      "rationale": "Reviewed after #551: desktop overview locks the primary entrances, five-step product model, and repository/license section.",
+      "sha256": "7365bc9b88791260a9d05439a565df606049bbece9dc71a9646efc66e66312bd"
     },
     {
       "name": "user",
@@ -27,7 +27,7 @@
       "theme": "light",
       "fullPage": true,
       "rationale": "Mobile User guide locks responsive navigation, code, output, and instructional TUI media.",
-      "sha256": "pending"
+      "sha256": "11de0b3037e9fc6cebeebd0cc3c96ae1bba2257ab1abe95a8018ae14f504538f"
     },
     {
       "name": "developer",
@@ -36,8 +36,8 @@
       "viewport": { "width": 1440, "height": 900 },
       "theme": "dark",
       "fullPage": true,
-      "rationale": "Desktop Developer guide locks the semantic request-flow treatment and dense architecture prose.",
-      "sha256": "pending"
+      "rationale": "Reviewed after #551: desktop Developer guide locks the semantic request flow, migrated navigation, and final confinement references.",
+      "sha256": "3a0bdebf832a19bfeb131a12fe1fcf9490c21139f08d0955079ece54c9dc8524"
     },
     {
       "name": "search",
@@ -47,7 +47,7 @@
       "theme": "light",
       "fullPage": false,
       "rationale": "Search overlay locks the fixed approval query, expected owned result, and selection surface.",
-      "sha256": "pending"
+      "sha256": "15fcedf96c2856a339bf05a5fb7d58fc41fc3adb07a15b75c930c060c66a7cb1"
     },
     {
       "name": "404",
@@ -58,7 +58,7 @@
       "theme": "dark",
       "fullPage": true,
       "rationale": "Mobile dark 404 locks the real missing-route response and recovery controls.",
-      "sha256": "pending"
+      "sha256": "b3f370e8e376b30ceca012597fa770cc9449029d57e2c34835a6cd8c531af7c1"
     }
   ]
 }

@@ -8,6 +8,7 @@
     "node": ">=22.12.0"
   },
   "scripts": {
+    "browser": "node scripts/browser-run.mjs",
     "build": "astro build",
     "crawl": "node scripts/crawl.mjs",
     "migration": "node scripts/migration.mjs",
@@ -17,6 +18,7 @@
     "check:root": "npm run build && npm run migration && npm run crawl && npm run search",
     "check:subpath": "DOCS_BASE=/platonic-docs/ npm run check:root",
     "check": "npm ci && npm run audit && npm run check:root && npm run check:subpath && DOCS_BASE=/platonic-docs/ npm run negative && npm run paths",
+    "check:browser": "npm ci && playwright install chromium && npm run browser",
     "audit": "npm audit --audit-level=high"
   },
   "dependencies": {
@@ -24,6 +26,9 @@
     "astro": "7.2.1"
   },
   "devDependencies": {
-    "parse5": "8.0.0"
+    "@axe-core/playwright": "4.12.1",
+    "@playwright/test": "1.61.1",
+    "parse5": "8.0.0",
+    "playwright-core": "1.61.1"
   }
 }

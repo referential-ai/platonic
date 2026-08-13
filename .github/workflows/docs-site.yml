@@ -75,6 +75,25 @@ jobs:
         working-directory: docs-site
         run: npm run paths
 
+      - name: Install pinned Chromium
+        working-directory: docs-site
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser quality gate
+        working-directory: docs-site
+        env:
+          DOCS_BROWSER_ARTIFACTS: ${{ runner.temp }}/platonic-docs-browser
+        run: npm run browser
+
+      - name: Upload browser quality report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: docs-browser-${{ github.sha }}
+          path: ${{ runner.temp }}/platonic-docs-browser
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Build and smoke-test the static container
         run: docs-site/scripts/smoke-container.sh platonic-docs:verify
 
