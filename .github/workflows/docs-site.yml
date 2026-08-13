@@ -74,3 +74,9 @@ jobs:
       - name: Audit CI path inputs
         working-directory: docs-site
         run: npm run paths
+
+      - name: Build and smoke-test the static container
+        run: docs-site/scripts/smoke-container.sh platonic-docs:verify
+
+      - name: Prove the local publisher fails closed
+        run: docs-site/scripts/test-publish-image.sh
