@@ -35,7 +35,7 @@ export CARGO_PROFILE_TEST_DEBUG=0
 export PLATONIC_BUILD_COMMIT="$source_commit"
 export PLATONIC_BUILD_DATE=2026-08-12
 export PLATO_BUILD_IDENTITY="$client_version $source_commit 2026-08-12"
-export RUSTFLAGS="--remap-path-prefix=$repo_root=. --remap-path-prefix=$HOME=/.build"
+export RUSTFLAGS="--remap-path-prefix=$HOME=/.build --remap-path-prefix=$repo_root=."
 export SOURCE_DATE_EPOCH=1786536000
 
 cargo build --locked --offline --package plato-agent --bin plato-tui
