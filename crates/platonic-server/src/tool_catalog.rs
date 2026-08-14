@@ -9,6 +9,8 @@ pub const FILE_EDIT: &str = "file.edit";
 pub const SHELL_EXEC: &str = "shell.exec";
 pub const WEB_FETCH: &str = "web.fetch";
 pub const THREAD_SPAWN: &str = "thread.spawn";
+pub const COMPUTER_WINDOWS: &str = "computer.windows";
+pub const COMPUTER_OBSERVE: &str = "computer.observe";
 
 const PROVIDER_FILE_READ: &str = "file_read";
 const PROVIDER_FILE_LIST: &str = "file_list";
@@ -17,6 +19,8 @@ const PROVIDER_FILE_EDIT: &str = "file_edit";
 const PROVIDER_SHELL_EXEC: &str = "shell_exec";
 const PROVIDER_WEB_FETCH: &str = "web_fetch";
 const PROVIDER_THREAD_SPAWN: &str = "thread_spawn";
+const PROVIDER_COMPUTER_WINDOWS: &str = "computer_windows";
+const PROVIDER_COMPUTER_OBSERVE: &str = "computer_observe";
 
 const BOOTSTRAP_TOOLS: &[ToolDefinition] = &[
     ToolDefinition {
@@ -68,6 +72,20 @@ const BOOTSTRAP_TOOLS: &[ToolDefinition] = &[
         description: "Spawn one bounded worker thread from a configured agent after approval.",
         input_schema: ToolInputSchema::ThreadSpawn,
     },
+    ToolDefinition {
+        internal_name: COMPUTER_WINDOWS,
+        provider_name: PROVIDER_COMPUTER_WINDOWS,
+        effect: EffectClass::SecretAccess,
+        description: "List visible Linux desktop windows as run-local opaque references.",
+        input_schema: ToolInputSchema::ComputerWindows,
+    },
+    ToolDefinition {
+        internal_name: COMPUTER_OBSERVE,
+        provider_name: PROVIDER_COMPUTER_OBSERVE,
+        effect: EffectClass::SecretAccess,
+        description: "Read bounded semantic accessibility data for one approved window reference.",
+        input_schema: ToolInputSchema::ComputerObserve,
+    },
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,6 +105,8 @@ enum ToolInputSchema {
     ShellExec,
     WebFetch,
     ThreadSpawn,
+    ComputerWindows,
+    ComputerObserve,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -104,7 +124,12 @@ pub fn bootstrap_tools() -> &'static [ToolDefinition] {
 pub fn default_enabled_tools() -> Vec<String> {
     BOOTSTRAP_TOOLS
         .iter()
-        .filter(|tool| tool.internal_name != THREAD_SPAWN)
+        .filter(|tool| {
+            !matches!(
+                tool.internal_name,
+                THREAD_SPAWN | COMPUTER_WINDOWS | COMPUTER_OBSERVE
+            )
+        })
         .map(|tool| tool.internal_name.into())
         .collect()
 }
@@ -278,6 +303,30 @@ impl ToolInputSchema {
                 "required": ["agent_id", "cwd"],
                 "additionalProperties": false
             }),
+            Self::ComputerWindows => json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            Self::ComputerObserve => json!({
+                "type": "object",
+                "properties": {
+                    "window_ref": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 96,
+                        "pattern": "^[A-Za-z0-9_-]+$"
+                    },
+                    "max_elements": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "default": 100
+                    }
+                },
+                "required": ["window_ref"],
+                "additionalProperties": false
+            }),
         }
     }
 }
@@ -303,6 +352,8 @@ mod tests {
                 (SHELL_EXEC, EffectClass::ExternalSideEffect),
                 (WEB_FETCH, EffectClass::Network),
                 (THREAD_SPAWN, EffectClass::WorkspaceWrite),
+                (COMPUTER_WINDOWS, EffectClass::SecretAccess),
+                (COMPUTER_OBSERVE, EffectClass::SecretAccess),
             ]
         );
 
@@ -320,6 +371,8 @@ mod tests {
                 PROVIDER_SHELL_EXEC,
                 PROVIDER_WEB_FETCH,
                 PROVIDER_THREAD_SPAWN,
+                PROVIDER_COMPUTER_WINDOWS,
+                PROVIDER_COMPUTER_OBSERVE,
             ]
         );
     }
@@ -342,9 +395,11 @@ mod tests {
             SHELL_EXEC.into(),
             WEB_FETCH.into(),
             THREAD_SPAWN.into(),
+            COMPUTER_WINDOWS.into(),
+            COMPUTER_OBSERVE.into(),
         ]);
 
-        assert_eq!(specs.len(), 7);
+        assert_eq!(specs.len(), 9);
         assert_eq!(specs[0].name, PROVIDER_FILE_READ);
         assert_eq!(specs[1].name, PROVIDER_FILE_LIST);
         assert_eq!(specs[2].name, PROVIDER_FILE_WRITE);
@@ -352,6 +407,8 @@ mod tests {
         assert_eq!(specs[4].name, PROVIDER_SHELL_EXEC);
         assert_eq!(specs[5].name, PROVIDER_WEB_FETCH);
         assert_eq!(specs[6].name, PROVIDER_THREAD_SPAWN);
+        assert_eq!(specs[7].name, PROVIDER_COMPUTER_WINDOWS);
+        assert_eq!(specs[8].name, PROVIDER_COMPUTER_OBSERVE);
         assert_eq!(
             specs[4].input_schema,
             json!({
@@ -445,6 +502,38 @@ mod tests {
                 "additionalProperties": false
             })
         );
+        assert_eq!(
+            specs[7].input_schema,
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        );
+        assert_eq!(
+            specs[8].input_schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "window_ref": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 96,
+                        "pattern": "^[A-Za-z0-9_-]+$"
+                    },
+                    "max_elements": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "default": 100
+                    }
+                },
+                "required": ["window_ref"],
+                "additionalProperties": false
+            })
+        );
         assert!(!default_enabled_tools().contains(&THREAD_SPAWN.to_owned()));
+        assert!(!default_enabled_tools().contains(&COMPUTER_WINDOWS.to_owned()));
+        assert!(!default_enabled_tools().contains(&COMPUTER_OBSERVE.to_owned()));
     }
 }

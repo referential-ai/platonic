@@ -7,10 +7,12 @@ use crate::{
     config::Config,
     ledger::RunEventRecorder,
     model::ModelResponse,
-    tool_catalog::{SHELL_EXEC, THREAD_SPAWN, WEB_FETCH, effect_for_tool},
+    tool_catalog::{
+        COMPUTER_OBSERVE, COMPUTER_WINDOWS, SHELL_EXEC, THREAD_SPAWN, WEB_FETCH, effect_for_tool,
+    },
     tools::{
-        ApprovalOutcome, ThreadSpawnToolHandler, ToolExecutionContext, execute_tool_with_context,
-        targets_platonic_memory,
+        ApprovalOutcome, ThreadSpawnToolHandler, ToolExecutionContext,
+        computer::ComputerToolHandler, execute_tool_with_context, targets_platonic_memory,
     },
 };
 use platonic_core::{
@@ -476,6 +478,36 @@ mod tests {
             PolicyDecision::Deny { reason } if reason == "tool is not enabled: web.fetch"
         ));
     }
+
+    #[test]
+    fn computer_tools_require_explicit_approval_and_never_accept_yolo() {
+        for tool in [COMPUTER_WINDOWS, COMPUTER_OBSERVE] {
+            let call = ToolCall {
+                id: ToolCallId::new(format!("call_{}", tool.replace('.', "_"))).unwrap(),
+                tool: ToolName::new(tool).unwrap(),
+                effect: EffectClass::SecretAccess,
+                input: if tool == COMPUTER_OBSERVE {
+                    json!({"window_ref": "opaque_ref"})
+                } else {
+                    json!({})
+                },
+            };
+            let policy = evaluate_policy(&[tool.into()], &call);
+            assert!(matches!(
+                policy,
+                PolicyDecision::RequireApproval { ref reason }
+                    if reason == &format!("{tool} requires explicit local approval")
+            ));
+            assert_eq!(
+                ApprovalMode::AutoApprove.auto_grant_actor(Path::new("."), &call, &policy),
+                None
+            );
+            assert!(matches!(
+                evaluate_policy(&["file.read".into()], &call),
+                PolicyDecision::Deny { .. }
+            ));
+        }
+    }
 }
 
 pub(super) fn yolo_eligible(
@@ -580,8 +612,12 @@ pub(super) fn execute_and_record_tool(
     run_id: &RunId,
     call: ToolCall,
     approving_actor: Option<&str>,
-    thread_spawn: Option<&ThreadSpawnToolHandler>,
+    handlers: (
+        Option<&ThreadSpawnToolHandler>,
+        Option<&mut ComputerToolHandler>,
+    ),
 ) -> AppResult<ToolMessage> {
+    let (thread_spawn, computer) = handlers;
     check_cancel(recorder, options, run_id)?;
     let ToolCall {
         id: call_id,
@@ -603,6 +639,7 @@ pub(super) fn execute_and_record_tool(
         provider_api_key_env: Some(&config.provider.api_key_env),
         cancel: options.cancel.as_deref(),
         thread_spawn,
+        computer,
         approving_actor,
     };
     match execute_tool_with_context(context, call_id.clone(), tool.as_str(), input) {
@@ -687,6 +724,11 @@ pub(super) fn evaluate_policy(enabled_tools: &[String], call: &ToolCall) -> Poli
         if call.tool.as_str() == WEB_FETCH {
             return PolicyDecision::RequireApproval {
                 reason: "web.fetch requires explicit local approval".into(),
+            };
+        }
+        if matches!(call.tool.as_str(), COMPUTER_WINDOWS | COMPUTER_OBSERVE) {
+            return PolicyDecision::RequireApproval {
+                reason: format!("{} requires explicit local approval", call.tool),
             };
         }
         call.effect.default_policy()

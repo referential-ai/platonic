@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     AppError, AppResult,
-    config::{Config, LimitsConfig, ProviderConfig, ProviderKind, ToolsConfig},
+    config::{ComputerConfig, Config, LimitsConfig, ProviderConfig, ProviderKind, ToolsConfig},
     ledger::{EventRecorder, SqliteLedger, run_jsonl_path},
     model::{ModelMessage, RunOverrides},
     paths::DefaultSqlitePath,
@@ -95,6 +95,7 @@ pub(super) struct RunConfigSnapshot {
     pub(super) provider: ProviderConfig,
     pub(super) limits: LimitsConfig,
     pub(super) tools: ToolsConfig,
+    pub(super) computer: ComputerConfig,
 }
 
 impl PreparedRun {
@@ -262,6 +263,7 @@ pub(crate) fn prepare_run_for_thread(
                 provider: config.provider,
                 limits: config.limits,
                 tools: config.tools,
+                computer: config.computer,
             },
             agent_id: agent_id.unwrap_or(AgentId::new("plato")?),
             run_id,

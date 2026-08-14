@@ -17,10 +17,10 @@ use crate::{
     ledger::{RUN_CANCELED_REASON, RunEventRecorder},
     model::{ModelMessage, ModelRequest, ModelStop},
     provider::openai_compat::OpenAiCompatibleClient,
-    tool_catalog::tool_specs,
+    tool_catalog::{COMPUTER_OBSERVE, COMPUTER_WINDOWS, tool_specs},
     tools::{
         ApprovalOutcome, ThreadSpawnToolHandler, approval_command_preview, approval_diff_preview,
-        approval_input_preview, ask_for_approval,
+        approval_input_preview, ask_for_approval, computer::ComputerToolHandler,
     },
 };
 use platonic_core::{
@@ -69,6 +69,7 @@ pub(crate) fn run_prepared_question(
         limits: config.limits,
         confinement: Default::default(),
         tools: config.tools,
+        computer: config.computer,
         gateway: None,
     };
     let options = RunOptions {
@@ -107,6 +108,23 @@ pub(crate) fn run_prepared_question(
         },
     )?;
 
+    let mut computer = if config
+        .tools
+        .enabled
+        .iter()
+        .any(|tool| matches!(tool.as_str(), COMPUTER_WINDOWS | COMPUTER_OBSERVE))
+    {
+        match ComputerToolHandler::new(&config.computer, options.cancel.clone()) {
+            Ok(handler) => Some(handler),
+            Err(error) => {
+                record_terminal_failure(recorder, &options, &run_id, &error.to_string(), false)?;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+
     for turn_index in 0..config.limits.max_turns {
         let turn_id = TurnId::new(format!("turn_{}", turn_index + 1))?;
         let voice_interruption = if turn_index == 0 {
@@ -132,7 +150,7 @@ pub(crate) fn run_prepared_question(
             platonic_memory.as_deref(),
             voice_interruption,
         )?;
-        check_cancel(recorder, &options, &run_id)?;
+        check_cancel_with_computer(recorder, &options, &run_id, &mut computer)?;
         if turn_index == 0
             && let Some(hydration) = &session_hydration
             && hydration.dropped_turns > 0
@@ -150,7 +168,14 @@ pub(crate) fn run_prepared_question(
                 },
             )?;
         }
-        record_context_built(recorder, &options, &run_id, turn_id.clone(), context)?;
+        record_context_built(
+            recorder,
+            &options,
+            &run_id,
+            turn_id.clone(),
+            context,
+            &mut computer,
+        )?;
         record_event(
             recorder,
             &options,
@@ -200,7 +225,7 @@ pub(crate) fn run_prepared_question(
             completion_retry_delay(error).map(|delay| (delay, error.to_string()))
         });
         if let Some((delay, reason)) = retry {
-            check_cancel(recorder, &options, &run_id)?;
+            check_cancel_with_computer(recorder, &options, &run_id, &mut computer)?;
             record_event(
                 recorder,
                 &options,
@@ -221,10 +246,10 @@ pub(crate) fn run_prepared_question(
                 let remaining = retry_deadline - now;
                 std::thread::sleep(remaining.min(retry_poll_interval));
                 if remaining > retry_poll_interval {
-                    check_cancel(recorder, &options, &run_id)?;
+                    check_cancel_with_computer(recorder, &options, &run_id, &mut computer)?;
                 }
             }
-            check_cancel(recorder, &options, &run_id)?;
+            check_cancel_with_computer(recorder, &options, &run_id, &mut computer)?;
             record_event(
                 recorder,
                 &options,
@@ -250,7 +275,14 @@ pub(crate) fn run_prepared_question(
                 } else {
                     error.to_string()
                 };
-                record_terminal_failure(recorder, &options, &run_id, &reason, canceled)?;
+                record_terminal_failure_with_computer(
+                    recorder,
+                    &options,
+                    &run_id,
+                    &reason,
+                    canceled,
+                    &mut computer,
+                )?;
                 if canceled {
                     return Err(AppError::RunCanceled);
                 }
@@ -278,40 +310,49 @@ pub(crate) fn run_prepared_question(
 
         match response.stop {
             ModelStop::MaxOutput => {
-                return fail_run(
+                return fail_run_with_computer(
                     recorder,
                     &options,
                     &run_id,
                     "model reached max output tokens",
                     false,
+                    &mut computer,
                 );
             }
             ModelStop::ContentFilter => {
-                return fail_run(
+                return fail_run_with_computer(
                     recorder,
                     &options,
                     &run_id,
                     "model response was stopped by content filter",
                     false,
+                    &mut computer,
                 );
             }
             ModelStop::EndTurn | ModelStop::ToolUse => {}
         }
 
-        check_cancel(recorder, &options, &run_id)?;
+        check_cancel_with_computer(recorder, &options, &run_id, &mut computer)?;
         let tool_uses = response.tool_uses();
         if response.stop == ModelStop::ToolUse && tool_uses.is_empty() {
-            return fail_run(
+            return fail_run_with_computer(
                 recorder,
                 &options,
                 &run_id,
                 "provider reported tool use without tool calls",
                 false,
+                &mut computer,
             );
         }
         if tool_uses.is_empty() {
             let final_answer = response.text();
-            record_terminal_success(recorder, &options, &run_id, &final_answer)?;
+            record_terminal_success_with_computer(
+                recorder,
+                &options,
+                &run_id,
+                &final_answer,
+                &mut computer,
+            )?;
             return Ok(RunOutcome {
                 run_id,
                 final_answer,
@@ -321,12 +362,13 @@ pub(crate) fn run_prepared_question(
 
         let mut seen_ids = HashSet::new();
         if tool_uses.iter().any(|(id, ..)| !seen_ids.insert(id)) {
-            return fail_run(
+            return fail_run_with_computer(
                 recorder,
                 &options,
                 &run_id,
                 "provider returned duplicate tool call ids",
                 false,
+                &mut computer,
             );
         }
 
@@ -351,7 +393,16 @@ pub(crate) fn run_prepared_question(
             },
         )?;
 
-        let policy = evaluate_policy(&config.tools.enabled, &call);
+        let configured_policy = evaluate_policy(&config.tools.enabled, &call);
+        let policy = if matches!(call.tool.as_str(), COMPUTER_WINDOWS | COMPUTER_OBSERVE)
+            && !matches!(&configured_policy, PolicyDecision::Deny { .. })
+        {
+            computer.as_mut().map_or(configured_policy, |computer| {
+                computer.policy_decision(&call)
+            })
+        } else {
+            configured_policy
+        };
         record_event(
             recorder,
             &options,
@@ -370,7 +421,7 @@ pub(crate) fn run_prepared_question(
                 &run_id,
                 call.clone(),
                 None,
-                thread_spawn.as_ref(),
+                (thread_spawn.as_ref(), computer.as_mut()),
             )?,
             PolicyDecision::RequireApproval { ref reason } => {
                 if let Some(actor) =
@@ -378,6 +429,7 @@ pub(crate) fn run_prepared_question(
                         .approval_mode
                         .auto_grant_actor(&options.workspace_root, &call, &policy)
                 {
+                    grant_computer_approval(&mut computer, &call)?;
                     let actor_id = ActorId::new(actor)?;
                     record_event(
                         recorder,
@@ -395,9 +447,10 @@ pub(crate) fn run_prepared_question(
                         &run_id,
                         call.clone(),
                         Some(actor),
-                        thread_spawn.as_ref(),
+                        (thread_spawn.as_ref(), computer.as_mut()),
                     )?
                 } else if let Some(actor) = options.approval_mode.deny_actor(&policy) {
+                    deny_computer_approval(&mut computer, &call);
                     let reason =
                         format!("approval required but no approval channel is available: {reason}");
                     record_event(
@@ -415,11 +468,12 @@ pub(crate) fn run_prepared_question(
                         is_error: true,
                     }
                 } else if let ApprovalMode::External(handler) = options.approval_mode.clone() {
-                    match approval_command_preview(
+                    match run_approval_preview(
                         &options.workspace_root,
                         call.tool.as_str(),
                         &call.input,
                         Some(&config.provider.api_key_env),
+                        computer.as_ref(),
                     ) {
                         Ok(approval_preview) => {
                             let request = ApprovalRequest {
@@ -443,6 +497,7 @@ pub(crate) fn run_prepared_question(
                             };
                             match (handler.decide)(request)? {
                                 ExternalApprovalOutcome::Granted { actor } => {
+                                    grant_computer_approval(&mut computer, &call)?;
                                     record_event(
                                         recorder,
                                         &options,
@@ -459,10 +514,11 @@ pub(crate) fn run_prepared_question(
                                         &run_id,
                                         call.clone(),
                                         Some(&actor),
-                                        thread_spawn.as_ref(),
+                                        (thread_spawn.as_ref(), computer.as_mut()),
                                     )?
                                 }
                                 ExternalApprovalOutcome::Denied { actor, reason } => {
+                                    deny_computer_approval(&mut computer, &call);
                                     record_event(
                                         recorder,
                                         &options,
@@ -485,11 +541,12 @@ pub(crate) fn run_prepared_question(
                         )?,
                     }
                 } else {
-                    match approval_command_preview(
+                    match run_approval_preview(
                         &options.workspace_root,
                         call.tool.as_str(),
                         &call.input,
                         Some(&config.provider.api_key_env),
+                        computer.as_ref(),
                     ) {
                         Ok(approval_preview) => {
                             match ask_for_approval(
@@ -498,6 +555,7 @@ pub(crate) fn run_prepared_question(
                                 approval_preview.as_deref(),
                             )? {
                                 ApprovalOutcome::Granted => {
+                                    grant_computer_approval(&mut computer, &call)?;
                                     record_event(
                                         recorder,
                                         &options,
@@ -514,10 +572,11 @@ pub(crate) fn run_prepared_question(
                                         &run_id,
                                         call.clone(),
                                         Some("stdin"),
-                                        thread_spawn.as_ref(),
+                                        (thread_spawn.as_ref(), computer.as_mut()),
                                     )?
                                 }
                                 ApprovalOutcome::Denied { reason } => {
+                                    deny_computer_approval(&mut computer, &call);
                                     record_event(
                                         recorder,
                                         &options,
@@ -561,14 +620,56 @@ pub(crate) fn run_prepared_question(
         }
     }
 
-    fail_run(
+    fail_run_with_computer(
         recorder,
         &options,
         &run_id,
         format!("exceeded maximum turn count of {}", config.limits.max_turns),
         false,
+        &mut computer,
     )
 }
+
+fn run_approval_preview(
+    workspace_root: &std::path::Path,
+    tool_name: &str,
+    input: &serde_json::Value,
+    provider_api_key_env: Option<&str>,
+    computer: Option<&ComputerToolHandler>,
+) -> AppResult<Option<String>> {
+    if matches!(tool_name, COMPUTER_WINDOWS | COMPUTER_OBSERVE) {
+        return computer
+            .ok_or_else(|| AppError::Tool("computer_disabled".into()))?
+            .approval_preview(tool_name, input)
+            .map(Some);
+    }
+    approval_command_preview(workspace_root, tool_name, input, provider_api_key_env)
+}
+
+fn grant_computer_approval(
+    computer: &mut Option<ComputerToolHandler>,
+    call: &platonic_core::ToolCall,
+) -> AppResult<()> {
+    if matches!(call.tool.as_str(), COMPUTER_WINDOWS | COMPUTER_OBSERVE) {
+        computer
+            .as_mut()
+            .ok_or_else(|| AppError::Tool("computer_disabled".into()))?
+            .approval_granted(call)?;
+    }
+    Ok(())
+}
+
+fn deny_computer_approval(
+    computer: &mut Option<ComputerToolHandler>,
+    call: &platonic_core::ToolCall,
+) {
+    if matches!(call.tool.as_str(), COMPUTER_WINDOWS | COMPUTER_OBSERVE)
+        && let Some(computer) = computer
+    {
+        computer.approval_denied();
+    }
+}
+
 pub(super) fn record_event(
     recorder: &mut dyn RunEventRecorder,
     options: &RunOptions,
@@ -585,14 +686,40 @@ fn emit_ledger_record(options: &RunOptions, record: &RecordedEvent) {
     }
 }
 
-fn record_terminal_success(
+fn record_terminal_success_with_computer(
     recorder: &mut dyn RunEventRecorder,
     options: &RunOptions,
     run_id: &RunId,
     final_answer: &str,
+    computer: &mut Option<ComputerToolHandler>,
 ) -> AppResult<RecordedEvent> {
+    if let Err(error) = cleanup_computer(computer) {
+        let record = recorder.fail_run(run_id, &error.to_string(), false)?;
+        emit_ledger_record(options, &record);
+        return Err(error);
+    }
     let record = recorder.finish_run(run_id, final_answer)?;
     emit_ledger_record(options, &record);
+    Ok(record)
+}
+
+fn record_terminal_failure_with_computer(
+    recorder: &mut dyn RunEventRecorder,
+    options: &RunOptions,
+    run_id: &RunId,
+    reason: &str,
+    canceled: bool,
+    computer: &mut Option<ComputerToolHandler>,
+) -> AppResult<RecordedEvent> {
+    let cleanup_error = cleanup_computer(computer).err();
+    let reason = cleanup_error
+        .as_ref()
+        .map_or_else(|| reason.to_owned(), ToString::to_string);
+    let record = recorder.fail_run(run_id, &reason, canceled && cleanup_error.is_none())?;
+    emit_ledger_record(options, &record);
+    if let Some(error) = cleanup_error {
+        return Err(error);
+    }
     Ok(record)
 }
 
@@ -621,6 +748,30 @@ fn fail_run<T>(
         Err(AppError::RunCanceled)
     } else {
         Err(AppError::RunFailed(reason))
+    }
+}
+
+fn fail_run_with_computer<T>(
+    recorder: &mut dyn RunEventRecorder,
+    options: &RunOptions,
+    run_id: &RunId,
+    reason: impl Into<String>,
+    canceled: bool,
+    computer: &mut Option<ComputerToolHandler>,
+) -> AppResult<T> {
+    let reason = reason.into();
+    record_terminal_failure_with_computer(recorder, options, run_id, &reason, canceled, computer)?;
+    if canceled {
+        Err(AppError::RunCanceled)
+    } else {
+        Err(AppError::RunFailed(reason))
+    }
+}
+
+fn cleanup_computer(computer: &mut Option<ComputerToolHandler>) -> AppResult<()> {
+    match computer {
+        Some(computer) => computer.cleanup(),
+        None => Ok(()),
     }
 }
 
@@ -666,6 +817,7 @@ fn record_context_built(
     run_id: &RunId,
     turn_id: TurnId,
     context: ContextPack,
+    computer: &mut Option<ComputerToolHandler>,
 ) -> AppResult<()> {
     match record_event(
         recorder,
@@ -679,11 +831,37 @@ fn record_context_built(
         Ok(_) => Ok(()),
         Err(AppError::Core(CoreError::ContextBudgetExceeded { used, budget })) => {
             let error = CoreError::ContextBudgetExceeded { used, budget };
-            record_terminal_failure(recorder, options, run_id, &error.to_string(), false)?;
+            record_terminal_failure_with_computer(
+                recorder,
+                options,
+                run_id,
+                &error.to_string(),
+                false,
+                computer,
+            )?;
             Err(AppError::Core(error))
         }
         Err(error) => Err(error),
     }
+}
+
+fn check_cancel_with_computer(
+    recorder: &mut dyn RunEventRecorder,
+    options: &RunOptions,
+    run_id: &RunId,
+    computer: &mut Option<ComputerToolHandler>,
+) -> AppResult<()> {
+    if cancel_requested(options) {
+        return fail_run_with_computer(
+            recorder,
+            options,
+            run_id,
+            RUN_CANCELED_REASON,
+            true,
+            computer,
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn check_cancel(

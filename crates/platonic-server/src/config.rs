@@ -30,6 +30,7 @@ const WORKSPACE_GATEWAY_ERROR: &str =
 const WORKSPACE_PRINCIPALS_ERROR: &str = "workspace plato.toml cannot set [principals]; define gateway principals only in the user config";
 const WORKSPACE_SPAWN_DEPTH_ERROR: &str = "workspace plato.toml cannot set limits.max_spawn_depth; use the user config and restart the server";
 const WORKSPACE_CONFINEMENT_ERROR: &str = "workspace plato.toml cannot set confinement.require; use the user config and restart the server";
+const WORKSPACE_COMPUTER_ERROR: &str = "workspace plato.toml cannot configure or enable computer tools; use --config, PLATO_CONFIG, or user config";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolvedConfigPath {
@@ -56,8 +57,14 @@ pub struct Config {
     pub provider: ProviderConfig,
     pub limits: LimitsConfig,
     pub tools: ToolsConfig,
+    pub computer: ComputerConfig,
     pub confinement: ConfinementConfig,
     pub gateway: Option<GatewayConfig>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ComputerConfig {
+    pub executable: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -145,6 +152,7 @@ struct RawConfig {
     provider: Option<RawProviderConfig>,
     limits: Option<RawLimitsConfig>,
     tools: Option<RawToolsConfig>,
+    computer: Option<RawComputerConfig>,
     confinement: Option<RawConfinementConfig>,
     gateway: Option<RawGatewayConfig>,
     principals: Option<RawPrincipalsConfig>,
@@ -231,6 +239,12 @@ struct RawToolsConfig {
     enabled: Option<Vec<String>>,
 }
 
+#[derive(Default, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawComputerConfig {
+    executable: Option<PathBuf>,
+}
+
 impl Config {
     pub fn load(workspace_root: &Path, explicit_path: Option<&Path>) -> AppResult<Self> {
         let resolved = resolve_config(workspace_root, explicit_path)?;
@@ -260,6 +274,16 @@ impl Config {
             return Err(AppError::Config(WORKSPACE_CONFINEMENT_ERROR.into()));
         }
         if matches!(resolved, ResolvedConfigPath::Workspace(_))
+            && (raw.computer.is_some()
+                || raw.tools.as_ref().is_some_and(|tools| {
+                    tools.enabled.as_ref().is_some_and(|enabled| {
+                        enabled.iter().any(|tool| tool.starts_with("computer."))
+                    })
+                }))
+        {
+            return Err(AppError::Config(WORKSPACE_COMPUTER_ERROR.into()));
+        }
+        if matches!(resolved, ResolvedConfigPath::Workspace(_))
             && raw.provider.as_ref().is_some_and(|provider| {
                 provider.api_key_env.is_some() || provider.base_url.is_some()
             })
@@ -278,6 +302,7 @@ impl Config {
         let provider = raw.provider.unwrap_or_default();
         let limits = raw.limits.unwrap_or_default();
         let tools = raw.tools.unwrap_or_default();
+        let computer = raw.computer.unwrap_or_default();
         let confinement = raw.confinement.unwrap_or_default();
         let gateway = raw.gateway.map(GatewayConfig::from_raw).transpose()?;
         let token_budget = positive(
@@ -326,6 +351,15 @@ impl Config {
                 "unknown tool in tools.enabled: {tool}"
             )));
         }
+        if computer
+            .executable
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(AppError::Config(
+                "computer.executable must be an absolute path".into(),
+            ));
+        }
 
         Ok(Self {
             provider: ProviderConfig {
@@ -351,6 +385,9 @@ impl Config {
                 max_spawn_depth,
             },
             tools: ToolsConfig { enabled },
+            computer: ComputerConfig {
+                executable: computer.executable,
+            },
             confinement: ConfinementConfig {
                 require: confinement.require.unwrap_or(false),
             },
@@ -382,6 +419,7 @@ impl Default for Config {
             tools: ToolsConfig {
                 enabled: default_enabled_tools(),
             },
+            computer: ComputerConfig::default(),
             confinement: ConfinementConfig::default(),
             gateway: None,
         }
@@ -1171,6 +1209,63 @@ api_key_env = "DISCORD_BOT_TOKEN"
     }
 
     #[test]
+    fn trusted_config_admits_absolute_computer_driver_and_tools() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("authorized.toml");
+        std::fs::write(
+            &path,
+            r#"
+[computer]
+executable = "/opt/cua/bin/cua-driver"
+
+[tools]
+enabled = ["computer.windows", "computer.observe"]
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_resolved(Some(&ResolvedConfigPath::Authorized(path))).unwrap();
+
+        assert_eq!(
+            config.computer.executable,
+            Some(PathBuf::from("/opt/cua/bin/cua-driver"))
+        );
+        assert_eq!(
+            config.tools.enabled,
+            ["computer.windows", "computer.observe"]
+        );
+    }
+
+    #[test]
+    fn computer_configuration_is_trusted_only_and_absolute() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_path = workspace.path().join("plato.toml");
+
+        for source in [
+            "[computer]\nexecutable = \"/opt/cua-driver\"\n",
+            "[tools]\nenabled = [\"computer.windows\"]\n",
+        ] {
+            std::fs::write(&workspace_path, source).unwrap();
+            let error =
+                Config::load_resolved(Some(&ResolvedConfigPath::Workspace(workspace_path.clone())))
+                    .unwrap_err();
+            assert!(matches!(
+                error,
+                AppError::Config(message) if message == WORKSPACE_COMPUTER_ERROR
+            ));
+        }
+
+        let relative = workspace.path().join("relative.toml");
+        std::fs::write(&relative, "[computer]\nexecutable = \"cua-driver\"\n").unwrap();
+        let error =
+            Config::load_resolved(Some(&ResolvedConfigPath::Authorized(relative))).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Config(message) if message == "computer.executable must be an absolute path"
+        ));
+    }
+
+    #[test]
     fn workspace_config_cannot_define_principal_authority() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1401,6 +1496,12 @@ enabled = ["file.read"]
 api_key_env = "AUTHORIZED_SECRET"
 base_url = "https://provider.example/v1"
 
+[computer]
+executable = "/opt/cua/bin/cua-driver"
+
+[tools]
+enabled = ["computer.windows", "computer.observe"]
+
 [gateway.discord]
 api_key_env = "DISCORD_BOT_TOKEN"
 
@@ -1435,6 +1536,14 @@ api_key_env = "DISCORD_BOT_TOKEN"
             ));
             assert_eq!(config.provider.api_key_env, "AUTHORIZED_SECRET");
             assert_eq!(config.provider.base_url, "https://provider.example/v1");
+            assert_eq!(
+                config.computer.executable,
+                Some(PathBuf::from("/opt/cua/bin/cua-driver"))
+            );
+            assert_eq!(
+                config.tools.enabled,
+                ["computer.windows", "computer.observe"]
+            );
             let discord = config.gateway.unwrap().discord.unwrap();
             assert_eq!(
                 discord.channel_threads,
@@ -1455,6 +1564,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
                 max_spawn_depth: None,
             }),
             tools: None,
+            computer: None,
             gateway: None,
             principals: None,
         };
@@ -1468,6 +1578,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
             provider: None,
             limits: None,
             tools: None,
+            computer: None,
             confinement: Some(RawConfinementConfig {
                 require: Some(true),
             }),
@@ -1501,6 +1612,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
                 max_spawn_depth: None,
             }),
             tools: None,
+            computer: None,
             gateway: None,
             principals: None,
         };
@@ -1517,6 +1629,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
             tools: Some(RawToolsConfig {
                 enabled: Some(vec!["shell.delete".into()]),
             }),
+            computer: None,
             gateway: None,
             principals: None,
         };
@@ -1541,6 +1654,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
                 max_spawn_depth: None,
             }),
             tools: None,
+            computer: None,
             gateway: None,
             principals: None,
         };
@@ -1560,6 +1674,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
                 max_spawn_depth: None,
             }),
             tools: None,
+            computer: None,
             gateway: None,
             principals: None,
         };
@@ -1579,6 +1694,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
                 max_spawn_depth: Some(0),
             }),
             tools: None,
+            computer: None,
             gateway: None,
             principals: None,
         };
@@ -1681,6 +1797,7 @@ stream_idle_timeout_ms = 9000
             confinement: None,
             limits: None,
             tools: None,
+            computer: None,
             gateway: None,
             principals: None,
         };
