@@ -13,7 +13,7 @@ readonly script_dir
 site_root="$(cd -- "$script_dir/.." && pwd -P)"
 readonly site_root
 
-for command in awk curl docker grep mktemp rm sed; do
+for command in awk curl docker grep mktemp node rm sed; do
   command -v "$command" >/dev/null 2>&1 || die "required command is unavailable: $command"
 done
 
@@ -140,14 +140,17 @@ require_header Permissions-Policy 'camera=(), geolocation=(), microphone=()'
 require_header Referrer-Policy strict-origin-when-cross-origin
 require_header X-Content-Type-Options nosniff
 require_header X-Frame-Options DENY
-[[ "$(header_value Content-Security-Policy)" == *"frame-ancestors 'none'"* ]] \
-  || die 'Content-Security-Policy does not deny framing'
 
 request /user/first-run/ 200 text/html
 grep -F 'First run' "$body" >/dev/null || die 'representative page content is missing'
 
 request /pagefind/pagefind.js 200 application/javascript
 [[ -s "$body" ]] || die 'Pagefind search asset is empty'
+DOCS_BROWSER_ARTIFACTS="$proof_root/browser" DOCS_BROWSER_ORIGIN="$base_url" \
+  node "$site_root/node_modules/@playwright/test/cli.js" test \
+  --config "$site_root/scripts/browser-playwright.config.mjs" \
+  --grep 'root deployment.*search selection and theme persistence'
+require_header Content-Security-Policy "default-src 'none'; base-uri 'self'; connect-src 'self'; font-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:"
 
 request /sitemap-index.xml 200 application/xml
 grep -F '<sitemapindex' "$body" >/dev/null || die 'sitemap index content is missing'
