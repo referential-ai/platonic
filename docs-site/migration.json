@@ -36,6 +36,8 @@
         "server",
         "reference-routes",
         "development",
+        "unreleased-http-gateway",
+        "unreleased-linux-desktop-observation",
         "boundary",
         "license"
       ],
