@@ -48,6 +48,7 @@ macro_rules! id_type {
 id_type!(RunId, "Identifier for one durable harness run.");
 id_type!(TurnId, "Identifier for one model/tool turn inside a run.");
 id_type!(AgentId, "Identifier for one bounded agent unit.");
+id_type!(ProfileId, "Identifier for one workspace-bound profile.");
 id_type!(
     ToolCallId,
     "Identifier for one host-validated tool invocation."

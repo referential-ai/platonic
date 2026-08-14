@@ -1152,10 +1152,12 @@ enabled = ["file.read"]
                 let run_started = serde_json::to_string(&ChildMessage::Record {
                     request_id: 1,
                     operation: RecordOperation::Event {
-                        event: HarnessEvent::RunStarted {
+                        event: HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                             run_id: run_id.clone(),
-                            agent_id: platonic_core::AgentId::new("plato").unwrap(),
-                        },
+                            identity: platonic_core::RunIdentity::LegacyAgent {
+                                agent_id: platonic_core::AgentId::new("plato").unwrap(),
+                            },
+                        }),
                     },
                 })
                 .unwrap();
@@ -1278,10 +1280,12 @@ while :; do :; done
                 let healthy_started = serde_json::to_string(&ChildMessage::Record {
                     request_id: 1,
                     operation: RecordOperation::Event {
-                        event: HarnessEvent::RunStarted {
+                        event: HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                             run_id: healthy_run_id.clone(),
-                            agent_id: platonic_core::AgentId::new("plato").unwrap(),
-                        },
+                            identity: platonic_core::RunIdentity::LegacyAgent {
+                                agent_id: platonic_core::AgentId::new("plato").unwrap(),
+                            },
+                        }),
                     },
                 })
                 .unwrap();

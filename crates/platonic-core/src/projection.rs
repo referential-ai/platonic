@@ -2,7 +2,7 @@
 
 use crate::{
     ActorId, ContextFragment, Error, HarnessEvent, Message, ModelName, PolicyDecision,
-    RecordedEvent, RunPhase, RunState, ToolCall, ToolCallId, ToolResult, TurnId,
+    RecordedEvent, RunIdentity, RunPhase, RunState, ToolCall, ToolCallId, ToolResult, TurnId,
 };
 
 /// Replay-validated, all-visibility audit view for one run ledger.
@@ -11,6 +11,8 @@ use crate::{
 /// filter entries for a model or user audience.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunReadback {
+    /// Identity from the run-start event, absent only for an empty projection.
+    pub identity: Option<RunIdentity>,
     /// Chronological entries useful for replay output.
     pub entries: Vec<ReadbackEntry>,
     /// Final run phase after replaying all events.
@@ -24,13 +26,22 @@ impl RunReadback {
     pub fn from_events(events: &[RecordedEvent]) -> Result<Self, Error> {
         let mut state = RunState::new();
         let mut entries = Vec::new();
+        let mut identity = None;
 
         for record in events {
             state.apply(record)?;
+            if let HarnessEvent::RunStarted(crate::RunStartedEvent {
+                identity: run_identity,
+                ..
+            }) = &record.event
+            {
+                identity = Some(run_identity.clone());
+            }
             collect_entry(&record.event, &mut entries);
         }
 
         Ok(Self {
+            identity,
             entries,
             final_phase: state.phase().clone(),
             next_seq: state.next_seq(),
@@ -239,7 +250,7 @@ fn collect_entry(event: &HarnessEvent, entries: &mut Vec<ReadbackEntry>) {
                 reason: reason.clone(),
             });
         }
-        HarnessEvent::RunStarted { .. }
+        HarnessEvent::RunStarted(_)
         | HarnessEvent::ModelRequested { .. }
         | HarnessEvent::PolicyEvaluated {
             decision: PolicyDecision::Allow | PolicyDecision::RequireApproval { .. },
@@ -256,7 +267,7 @@ mod tests {
     use super::*;
     use crate::{
         AgentId, ContextFragment, ContextLane, ContextPack, EffectClass, MessageRole, ModelName,
-        ModelUsage, ResultVisibility, RunId, ToolName, ToolProposal,
+        ModelUsage, ResultVisibility, RunId, RunIdentity, ToolName, ToolProposal,
     };
     use serde_json::json;
 
@@ -392,10 +403,12 @@ mod tests {
     fn start_event(seq: u64) -> RecordedEvent {
         rec(
             seq,
-            HarnessEvent::RunStarted {
+            HarnessEvent::RunStarted(crate::RunStartedEvent {
                 run_id: run_id(),
-                agent_id: agent_id(),
-            },
+                identity: RunIdentity::LegacyAgent {
+                    agent_id: agent_id(),
+                },
+            }),
         )
     }
 

@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     ActorId, AgentId, ContextFragment, ContextLane, EffectClass, Message, MessageRole, ModelName,
-    ModelUsage, ResultVisibility, ToolName, ToolProposal, ToolResult,
+    ModelUsage, ResultVisibility, RunIdentity, ToolName, ToolProposal, ToolResult,
 };
 use serde_json::json;
 
@@ -117,10 +117,12 @@ fn rec(seq: u64, event: HarnessEvent) -> RecordedEvent {
 fn start_event(seq: u64) -> RecordedEvent {
     rec(
         seq,
-        HarnessEvent::RunStarted {
+        HarnessEvent::RunStarted(crate::RunStartedEvent {
             run_id: run_id(),
-            agent_id: agent_id(),
-        },
+            identity: RunIdentity::LegacyAgent {
+                agent_id: agent_id(),
+            },
+        }),
     )
 }
 

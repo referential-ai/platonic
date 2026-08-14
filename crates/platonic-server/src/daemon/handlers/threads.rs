@@ -2776,7 +2776,7 @@ IFS= read -r _
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(columns.len(), 13);
+        assert_eq!(columns.len(), 18);
         assert!(!columns.iter().any(|column| column.contains("activity")));
     }
 

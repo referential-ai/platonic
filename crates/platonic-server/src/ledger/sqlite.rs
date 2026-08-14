@@ -7,7 +7,7 @@ use super::{
         first_voice_difference, read_run_records_from, read_voice_events_from, replay_records,
         validate_voice_event_keys, validate_voice_event_stream,
     },
-    types::{LEDGER_VERSION, SessionTurn},
+    types::{LEDGER_VERSION, SessionTurn, validate_ledger_identity},
 };
 use crate::{AppError, AppResult, paths::DefaultSqlitePath};
 use platonic_core::{AgentId, HarnessEvent, MessageRole, RecordedEvent, RunId, RunPhase, RunState};
@@ -504,10 +504,12 @@ impl SqliteLedger {
         let mut recorder = JsonlEventRecorder::open(path)?;
         let mut records = read_records(path)?;
         if records.is_empty() {
-            recorder.record(HarnessEvent::RunStarted {
+            recorder.record(HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: run_id.clone(),
-                agent_id: AgentId::new("plato")?,
-            })?;
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("plato")?,
+                },
+            }))?;
             records = read_records(path)?;
         }
         let state = replay_records(&records)?;
@@ -717,6 +719,7 @@ fn append_record_in(
     run_id: &str,
     record: &RecordedEvent,
 ) -> AppResult<()> {
+    validate_ledger_identity(LEDGER_VERSION, &record.event)?;
     let event_json = serde_json::to_string(&record.event)?;
     let seq = sqlite_i64(record.seq, "seq")?;
     let occurred_at_ms = sqlite_i64(record.occurred_at_ms, "occurred_at_ms")?;
@@ -2053,10 +2056,12 @@ pub(super) mod tests {
         RecordedEvent {
             seq,
             occurred_at_ms,
-            event: HarnessEvent::RunStarted {
+            event: HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: RunId::new(run_id).unwrap(),
-                agent_id: AgentId::new("plato").unwrap(),
-            },
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+            }),
         }
     }
 
@@ -2112,10 +2117,12 @@ pub(super) mod tests {
     ) -> Vec<HarnessEvent> {
         let turn_id = TurnId::new("turn_1").unwrap();
         vec![
-            HarnessEvent::RunStarted {
+            HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: run_id.clone(),
-                agent_id: AgentId::new("plato").unwrap(),
-            },
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+            }),
             HarnessEvent::ContextBuilt {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),

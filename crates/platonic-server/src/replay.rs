@@ -3,7 +3,7 @@ use crate::{
     ledger::{self, SqliteLedger},
     paths::DefaultSqlitePath,
 };
-use platonic_core::{MessageRole, ReadbackEntry, RunReadback};
+use platonic_core::{MessageRole, ReadbackEntry, RunIdentity, RunReadback};
 use std::path::Path;
 
 pub fn replay_file(path: &Path) -> AppResult<String> {
@@ -69,6 +69,19 @@ pub fn format_readback(readback: &RunReadback) -> String {
     let mut lines = Vec::new();
     lines.push(format!("final_phase: {:?}", readback.final_phase));
     lines.push(format!("next_seq: {}", readback.next_seq));
+    match &readback.identity {
+        Some(RunIdentity::LegacyAgent { agent_id }) => {
+            lines.push(format!("legacy_agent_id: {agent_id}"));
+        }
+        Some(RunIdentity::Profile {
+            profile_id,
+            profile_revision,
+        }) => {
+            lines.push(format!("profile_id: {profile_id}"));
+            lines.push(format!("profile_revision: {profile_revision}"));
+        }
+        None => {}
+    }
 
     for entry in &readback.entries {
         match entry {
@@ -170,6 +183,18 @@ mod tests {
         r#"{"v":1,"record":{"seq":4,"occurred_at_ms":4,"event":{"event":"run_finished","run_id":"run_v1"}}}"#,
         "\n",
     );
+    const V2_JSONL_FIXTURE: &str = concat!(
+        r#"{"v":2,"record":{"seq":0,"occurred_at_ms":0,"event":{"event":"run_started","run_id":"run_v2","profile_id":"profile_1","profile_revision":3}}}"#,
+        "\n",
+        r#"{"v":2,"record":{"seq":1,"occurred_at_ms":1,"event":{"event":"context_built","run_id":"run_v2","turn_id":"turn_1","context":{"fragments":[],"token_budget":4000}}}}"#,
+        "\n",
+        r#"{"v":2,"record":{"seq":2,"occurred_at_ms":2,"event":{"event":"model_requested","run_id":"run_v2","turn_id":"turn_1","step":0,"model":"test-model"}}}"#,
+        "\n",
+        r#"{"v":2,"record":{"seq":3,"occurred_at_ms":3,"event":{"event":"model_responded","run_id":"run_v2","turn_id":"turn_1","step":0,"output":{"role":"assistant","content":"profile answer"},"proposed_calls":[],"usage":{"input_tokens":8,"output_tokens":3}}}}"#,
+        "\n",
+        r#"{"v":2,"record":{"seq":4,"occurred_at_ms":4,"event":{"event":"run_finished","run_id":"run_v2"}}}"#,
+        "\n",
+    );
     const V1_SQLITE_SCHEMA: &str = r#"
         CREATE TABLE ledger_events (
           run_id TEXT NOT NULL,
@@ -193,7 +218,22 @@ mod tests {
 
         let replay = replay_file(&path).unwrap();
         assert!(replay.contains("final_phase: Finished"));
+        assert!(replay.contains("legacy_agent_id: plato"));
         assert!(replay.contains("[turn_1] assistant: old answer"));
+    }
+
+    #[test]
+    fn replay_reads_v2_jsonl_with_explicit_profile_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2-events.jsonl");
+        std::fs::write(&path, V2_JSONL_FIXTURE).unwrap();
+
+        let replay = replay_file(&path).unwrap();
+        assert!(replay.contains("final_phase: Finished"));
+        assert!(replay.contains("profile_id: profile_1"));
+        assert!(replay.contains("profile_revision: 3"));
+        assert!(!replay.contains("legacy_agent_id"));
+        assert!(replay.contains("[turn_1] assistant: profile answer"));
     }
 
     #[test]
@@ -208,6 +248,7 @@ mod tests {
 
         let replay = replay_sqlite(&path, None).unwrap();
         assert!(replay.contains("final_phase: Finished"));
+        assert!(replay.contains("legacy_agent_id: plato"));
         assert!(replay.contains("[turn_1] assistant: old answer"));
         assert_eq!(replay_sqlite(&path, Some("run_v1")).unwrap(), replay);
         assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
@@ -332,10 +373,12 @@ mod tests {
                 "run_0",
                 &record(
                     0,
-                    HarnessEvent::RunStarted {
+                    HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                         run_id: run_0.clone(),
-                        agent_id: AgentId::new("plato").unwrap(),
-                    },
+                        identity: platonic_core::RunIdentity::LegacyAgent {
+                            agent_id: AgentId::new("plato").unwrap(),
+                        },
+                    }),
                 ),
             )
             .unwrap();
@@ -350,10 +393,12 @@ mod tests {
                 "run_1",
                 &record(
                     0,
-                    HarnessEvent::RunStarted {
+                    HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                         run_id: run_1.clone(),
-                        agent_id: AgentId::new("plato").unwrap(),
-                    },
+                        identity: platonic_core::RunIdentity::LegacyAgent {
+                            agent_id: AgentId::new("plato").unwrap(),
+                        },
+                    }),
                 ),
             )
             .unwrap();
@@ -368,10 +413,12 @@ mod tests {
                 "run_2",
                 &record(
                     0,
-                    HarnessEvent::RunStarted {
+                    HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                         run_id: run_2.clone(),
-                        agent_id: AgentId::new("plato").unwrap(),
-                    },
+                        identity: platonic_core::RunIdentity::LegacyAgent {
+                            agent_id: AgentId::new("plato").unwrap(),
+                        },
+                    }),
                 ),
             )
             .unwrap();
@@ -400,7 +447,7 @@ mod tests {
 
         assert_eq!(
             exact,
-            "final_phase: Failed { reason: \"synthetic failure\" }\nnext_seq: 2"
+            "final_phase: Failed { reason: \"synthetic failure\" }\nnext_seq: 2\nlegacy_agent_id: plato"
         );
         assert!(latest.contains("session_id: session_1"));
         assert!(!latest.contains("session_id: session_0"));
@@ -539,10 +586,12 @@ mod tests {
         let records = vec![
             record(
                 0,
-                HarnessEvent::RunStarted {
+                HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                     run_id: run_id.clone(),
-                    agent_id: AgentId::new("plato").unwrap(),
-                },
+                    identity: platonic_core::RunIdentity::LegacyAgent {
+                        agent_id: AgentId::new("plato").unwrap(),
+                    },
+                }),
             ),
             record(
                 1,
@@ -711,10 +760,12 @@ mod tests {
         turn: usize,
     ) {
         let events = [
-            HarnessEvent::RunStarted {
+            HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: run_id.clone(),
-                agent_id: AgentId::new("plato").unwrap(),
-            },
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+            }),
             HarnessEvent::ContextBuilt {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
@@ -766,10 +817,12 @@ mod tests {
         vec![
             record(
                 0,
-                HarnessEvent::RunStarted {
+                HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                     run_id: run_id.clone(),
-                    agent_id: AgentId::new("plato").unwrap(),
-                },
+                    identity: platonic_core::RunIdentity::LegacyAgent {
+                        agent_id: AgentId::new("plato").unwrap(),
+                    },
+                }),
             ),
             record(
                 1,

@@ -1,8 +1,13 @@
 use super::types::{
-    AgentRecord, ToolCallApprovalDecision, ToolCallApprovalRecord, WorkspaceRecord,
+    AgentRecord, ProfileRecord, ProfileRevisionContent, ProfileRevisionRecord,
+    ToolCallApprovalDecision, ToolCallApprovalRecord, WorkspaceRecord,
 };
-use crate::{AppError, AppResult, ledger::row_u64};
-use platonic_core::{AgentId, EffectClass};
+use crate::{
+    AppError, AppResult,
+    ledger::row_u64,
+    thread_authority::{LegacyReason, ThreadKind, ThreadProfileAuthority},
+};
+use platonic_core::{AgentId, EffectClass, ProfileId};
 use platonic_protocol::{
     ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadGrantedPath, ThreadWorktree,
 };
@@ -81,6 +86,41 @@ pub(super) fn thread_authority_from_row(
         granted_paths,
         network,
         created_at_ms: row_u64(row, 12, "thread created_at_ms")?,
+    })
+}
+
+pub(super) fn thread_profile_authority_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ThreadProfileAuthority> {
+    let profile_id = row
+        .get::<_, Option<String>>(1)?
+        .map(ProfileId::new)
+        .transpose()
+        .map_err(|error| invalid_thread_column(1, error.to_string()))?;
+    let profile_revision = row
+        .get::<_, Option<i64>>(2)?
+        .map(|value| {
+            value.try_into().map_err(|_| {
+                invalid_thread_column(2, format!("negative profile revision: {value}"))
+            })
+        })
+        .transpose()?;
+    let kind_value: String = row.get(3)?;
+    let thread_kind = ThreadKind::parse(&kind_value)
+        .ok_or_else(|| invalid_thread_column(3, format!("unknown thread kind: {kind_value}")))?;
+    let reason_value: Option<String> = row.get(4)?;
+    let legacy_reason = reason_value
+        .map(|value| {
+            LegacyReason::parse(&value)
+                .ok_or_else(|| invalid_thread_column(4, format!("unknown legacy reason: {value}")))
+        })
+        .transpose()?;
+    Ok(ThreadProfileAuthority {
+        workspace_id: row.get(0)?,
+        profile_id,
+        profile_revision,
+        thread_kind,
+        legacy_reason,
     })
 }
 
@@ -175,6 +215,81 @@ pub(super) fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentR
     })
 }
 
+pub(super) fn profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProfileRecord> {
+    let id = ProfileId::new(row.get::<_, String>(0)?)
+        .map_err(|error| invalid_profile_column(0, error.to_string()))?;
+    let reasoning_value: String = row.get(4)?;
+    let reasoning_effort = ReasoningEffort::parse(&reasoning_value).ok_or_else(|| {
+        invalid_profile_column(4, format!("unknown reasoning effort: {reasoning_value}"))
+    })?;
+    let policy_value: String = row.get(5)?;
+    let approval_policy = ThreadApprovalPolicy::parse(&policy_value).ok_or_else(|| {
+        invalid_profile_column(5, format!("unknown approval policy: {policy_value}"))
+    })?;
+    let toolset = serde_json::from_str::<Vec<String>>(&row.get::<_, String>(6)?)
+        .map_err(|error| invalid_profile_column(6, error.to_string()))?;
+    Ok(ProfileRecord {
+        id,
+        workspace_id: row.get(1)?,
+        display_name: row.get(2)?,
+        model: row.get(3)?,
+        reasoning_effort,
+        approval_policy,
+        toolset,
+        current_revision: row_u64(row, 7, "profile current_revision")?,
+        home_thread_id: row.get(8)?,
+        imported_agent_id: row.get(9)?,
+        created_at_ms: row_u64(row, 10, "profile created_at_ms")?,
+    })
+}
+
+pub(super) fn profile_revision_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ProfileRevisionRecord> {
+    let profile_id = ProfileId::new(row.get::<_, String>(0)?)
+        .map_err(|error| invalid_profile_column(0, error.to_string()))?;
+    let content = ProfileRevisionContent {
+        instructions_markdown: row.get(6)?,
+        memory_markdown: row.get(7)?,
+        skill_refs: serde_json::from_str(&row.get::<_, String>(8)?)
+            .map_err(|error| invalid_profile_column(8, error.to_string()))?,
+    };
+    content
+        .validate()
+        .map_err(|error| invalid_profile_column(8, error.to_string()))?;
+    let content_hash: String = row.get(5)?;
+    if content
+        .content_hash()
+        .map_err(|error| invalid_profile_column(5, error.to_string()))?
+        != content_hash
+    {
+        return Err(invalid_profile_column(
+            5,
+            "profile revision content hash mismatch".into(),
+        ));
+    }
+    Ok(ProfileRevisionRecord {
+        profile_id,
+        revision: row_u64(row, 1, "profile revision")?,
+        parent_revision: row
+            .get::<_, Option<i64>>(2)?
+            .map(|value| {
+                value.try_into().map_err(|_| {
+                    invalid_profile_column(2, format!("negative parent revision: {value}"))
+                })
+            })
+            .transpose()?,
+        actor: row.get(3)?,
+        created_at_ms: row_u64(row, 4, "profile revision created_at_ms")?,
+        content_hash,
+        content,
+    })
+}
+
 fn invalid_agent_column(index: usize, message: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(index, Type::Text, message.into())
+}
+
+fn invalid_profile_column(index: usize, message: String) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(index, Type::Text, message.into())
 }

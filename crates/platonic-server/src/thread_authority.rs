@@ -1,6 +1,6 @@
 use crate::thread_repository::ThreadRepositoryDraft;
 use crate::{AppError, AppResult};
-use platonic_core::{ActorId, AgentId, EffectClass, ModelName, ToolName};
+use platonic_core::{ActorId, AgentId, EffectClass, ModelName, ProfileId, ToolName};
 use platonic_protocol::{
     ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadGrantedPath,
     ThreadSpawnDecision, ThreadStatusAuthority, ThreadWorktree,
@@ -15,6 +15,73 @@ pub(crate) const THREAD_SPAWN_APPROVAL_REASON: &str =
     "thread.spawn requires approval before authority is created";
 
 static THREAD_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ThreadKind {
+    Home,
+    Child,
+    Legacy,
+}
+
+impl ThreadKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Home => "home",
+            Self::Child => "child",
+            Self::Legacy => "legacy",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "home" => Some(Self::Home),
+            "child" => Some(Self::Child),
+            "legacy" => Some(Self::Legacy),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LegacyReason {
+    AdditionalRoot,
+    MissingProfile,
+    CrossProfileEdge,
+    MissingWorkspace,
+    UnsupportedAuthority,
+}
+
+impl LegacyReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AdditionalRoot => "additional_root",
+            Self::MissingProfile => "missing_profile",
+            Self::CrossProfileEdge => "cross_profile_edge",
+            Self::MissingWorkspace => "missing_workspace",
+            Self::UnsupportedAuthority => "unsupported_authority",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "additional_root" => Some(Self::AdditionalRoot),
+            "missing_profile" => Some(Self::MissingProfile),
+            "cross_profile_edge" => Some(Self::CrossProfileEdge),
+            "missing_workspace" => Some(Self::MissingWorkspace),
+            "unsupported_authority" => Some(Self::UnsupportedAuthority),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ThreadProfileAuthority {
+    pub(crate) workspace_id: Option<String>,
+    pub(crate) profile_id: Option<ProfileId>,
+    pub(crate) profile_revision: Option<u64>,
+    pub(crate) thread_kind: ThreadKind,
+    pub(crate) legacy_reason: Option<LegacyReason>,
+}
 
 pub(crate) struct ThreadAuthorityDraftParams<'a> {
     pub(crate) parent_thread_id: Option<String>,

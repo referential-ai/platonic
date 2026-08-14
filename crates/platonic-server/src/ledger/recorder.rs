@@ -155,10 +155,12 @@ mod tests {
         let run_id = RunId::new("run_1").unwrap();
         let mut jsonl = JsonlEventRecorder::create(&jsonl_path).unwrap();
         let mut sqlite = SqliteEventRecorder::create(&sqlite_path, &run_id).unwrap();
-        let event = HarnessEvent::RunStarted {
+        let event = HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
             run_id,
-            agent_id: AgentId::new("plato").unwrap(),
-        };
+            identity: platonic_core::RunIdentity::LegacyAgent {
+                agent_id: AgentId::new("plato").unwrap(),
+            },
+        });
 
         let jsonl_record = jsonl.record(event.clone()).unwrap();
         let sqlite_record = sqlite.record(event).unwrap();

@@ -1,4 +1,5 @@
-use platonic_core::RecordedEvent;
+use crate::{AppError, AppResult};
+use platonic_core::{HarnessEvent, RecordedEvent, RunIdentity};
 use platonic_protocol::RunStateName;
 use serde::{Deserialize, Serialize};
 
@@ -7,6 +8,37 @@ pub const LEDGER_VERSION: u32 = 2;
 
 pub(super) fn supported_ledger_version(version: u32) -> bool {
     matches!(version, LEGACY_LEDGER_VERSION | LEDGER_VERSION)
+}
+
+pub(super) fn validate_ledger_identity(version: u32, event: &HarnessEvent) -> AppResult<()> {
+    if matches!(
+        event,
+        HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
+            identity: RunIdentity::Profile {
+                profile_revision: 0,
+                ..
+            },
+            ..
+        })
+    ) {
+        return Err(AppError::Config(
+            "ledger profile identity requires a positive revision".into(),
+        ));
+    }
+    if version == LEGACY_LEDGER_VERSION
+        && matches!(
+            event,
+            HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
+                identity: RunIdentity::Profile { .. },
+                ..
+            })
+        )
+    {
+        return Err(AppError::Config(
+            "ledger v1 run_started requires legacy agent identity".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

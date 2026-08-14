@@ -8,8 +8,8 @@
 use platonic_core::{
     ActorId, AgentId, ArtifactId, ContextFragment, ContextLane, ContextPack, EffectClass, Error,
     HarnessEvent, Message, MessageRole, ModelName, ModelUsage, PolicyDecision, RecordedEvent,
-    ResultVisibility, RunId, RunState, ToolCall, ToolCallId, ToolName, ToolProposal, ToolResult,
-    TurnId,
+    ResultVisibility, RunId, RunIdentity, RunState, ToolCall, ToolCallId, ToolName, ToolProposal,
+    ToolResult, TurnId,
 };
 use proptest::{
     prelude::*,
@@ -238,8 +238,12 @@ fn tool_result() -> BoxedStrategy<ToolResult> {
 
 fn harness_event() -> BoxedStrategy<HarnessEvent> {
     prop_oneof![
-        (run_id(), agent_id())
-            .prop_map(|(run_id, agent_id)| HarnessEvent::RunStarted { run_id, agent_id }),
+        (run_id(), agent_id()).prop_map(|(run_id, agent_id)| {
+            HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
+                run_id,
+                identity: RunIdentity::LegacyAgent { agent_id },
+            })
+        }),
         (run_id(), turn_id(), context_pack()).prop_map(|(run_id, turn_id, context)| {
             HarnessEvent::ContextBuilt {
                 run_id,

@@ -1,8 +1,8 @@
 //! Durable harness event ledger types.
 
 use crate::{
-    ActorId, AgentId, ContextPack, Message, ModelName, PolicyDecision, RunId, ToolCall, ToolCallId,
-    ToolProposal, ToolResult, TurnId,
+    ActorId, AgentId, ContextPack, Message, ModelName, PolicyDecision, ProfileId, RunId, ToolCall,
+    ToolCallId, ToolProposal, ToolResult, TurnId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -28,19 +28,45 @@ pub struct RecordedEvent {
     pub event: HarnessEvent,
 }
 
+/// Durable identity recorded when a run starts.
+///
+/// The untagged shape preserves historical `agent_id` bytes while making the
+/// profile identity in ledger v2 explicit rather than treating it as an alias.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, untagged)]
+pub enum RunIdentity {
+    /// Identity carried by historical and transitional agent-based runs.
+    LegacyAgent {
+        /// Exact legacy agent identifier from the event.
+        agent_id: AgentId,
+    },
+    /// Identity carried by profile-based ledger-v2 runs.
+    Profile {
+        /// Stable workspace-bound profile identifier.
+        profile_id: ProfileId,
+        /// Exact profile-content revision selected for the run.
+        profile_revision: u64,
+    },
+}
+
+/// Payload of the `run_started` event.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RunStartedEvent {
+    /// Durable run identifier shared by every later event.
+    pub run_id: RunId,
+    /// Legacy-agent or profile identity selected by the host.
+    #[serde(flatten)]
+    pub identity: RunIdentity,
+}
+
 /// Durable event log entries. Transcript, metrics, replay, and audit views are derived from this log.
 ///
 /// The tagged JSON schema rejects unknown fields rather than discarding durable data.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "event")]
 pub enum HarnessEvent {
-    /// Binds a fresh state machine to one run and agent.
-    RunStarted {
-        /// Durable run identifier shared by every later event.
-        run_id: RunId,
-        /// Agent identity selected by the host for this run.
-        agent_id: AgentId,
-    },
+    /// Binds a fresh state machine to one run identity.
+    RunStarted(RunStartedEvent),
     /// Records the exact bounded context selected for a model turn.
     ContextBuilt {
         /// Run receiving the context.
@@ -200,7 +226,7 @@ impl HarnessEvent {
     /// Returns the owning run id without validating event order or phase.
     pub fn run_id(&self) -> &RunId {
         match self {
-            Self::RunStarted { run_id, .. }
+            Self::RunStarted(RunStartedEvent { run_id, .. })
             | Self::ContextBuilt { run_id, .. }
             | Self::ContextCompacted { run_id, .. }
             | Self::ModelRequested { run_id, .. }
@@ -222,7 +248,7 @@ impl HarnessEvent {
     /// Returns the stable snake-case event name used in transition diagnostics.
     pub fn name(&self) -> &'static str {
         match self {
-            Self::RunStarted { .. } => "run_started",
+            Self::RunStarted(_) => "run_started",
             Self::ContextBuilt { .. } => "context_built",
             Self::ContextCompacted { .. } => "context_compacted",
             Self::ModelRequested { .. } => "model_requested",
@@ -244,7 +270,7 @@ impl HarnessEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{HarnessEvent, ModelUsage, RecordedEvent};
+    use super::{HarnessEvent, ModelUsage, RecordedEvent, RunIdentity, RunStartedEvent};
     use crate::{
         ActorId, AgentId, ArtifactId, ContextFragment, ContextLane, ContextPack, EffectClass,
         Message, MessageRole, ModelName, PolicyDecision, ResultVisibility, RunId, ToolCall,
@@ -254,6 +280,8 @@ mod tests {
 
     const ACCEPTED_V0_2_0_HARNESS_EVENT_JSON: &str =
         r#"{"event":"run_started","run_id":"run_1","agent_id":"agent_1"}"#;
+    const PROFILE_V2_RUN_STARTED_JSON: &str =
+        r#"{"event":"run_started","run_id":"run_2","profile_id":"profile_1","profile_revision":7}"#;
     const REJECTED_UNKNOWN_FIELD_HARNESS_EVENT_JSON: &str =
         r#"{"event":"run_started","run_id":"run_1","agent_id":"agent_1","future_field":true}"#;
     const PRE_FIELD_V0_3_0_MODEL_RESPONDED_JSON: &str = r#"{"seq":7,"occurred_at_ms":1700000000000,"event":{"event":"model_responded","run_id":"run_1","turn_id":"turn_1","step":1,"output":{"role":"assistant","content":"Done."},"proposed_calls":[],"usage":{"input_tokens":12,"output_tokens":4}}}"#;
@@ -264,15 +292,58 @@ mod tests {
             serde_json::from_str(ACCEPTED_V0_2_0_HARNESS_EVENT_JSON).unwrap();
         assert_eq!(
             accepted,
-            HarnessEvent::RunStarted {
+            HarnessEvent::RunStarted(RunStartedEvent {
                 run_id: RunId::new("run_1").unwrap(),
-                agent_id: AgentId::new("agent_1").unwrap(),
-            }
+                identity: RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("agent_1").unwrap(),
+                },
+            })
         );
 
-        let error = serde_json::from_str::<HarnessEvent>(REJECTED_UNKNOWN_FIELD_HARNESS_EVENT_JSON)
-            .unwrap_err();
-        assert!(error.to_string().contains("unknown field `future_field`"));
+        assert!(
+            serde_json::from_str::<HarnessEvent>(REJECTED_UNKNOWN_FIELD_HARNESS_EVENT_JSON)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn run_identity_v1_and_v2_fixtures_round_trip_byte_for_byte() {
+        let legacy: HarnessEvent =
+            serde_json::from_str(ACCEPTED_V0_2_0_HARNESS_EVENT_JSON).unwrap();
+        assert!(matches!(
+            legacy,
+            HarnessEvent::RunStarted(RunStartedEvent {
+                identity: RunIdentity::LegacyAgent { .. },
+                ..
+            })
+        ));
+        assert_eq!(
+            serde_json::to_string(&legacy).unwrap(),
+            ACCEPTED_V0_2_0_HARNESS_EVENT_JSON
+        );
+
+        let profile: HarnessEvent = serde_json::from_str(PROFILE_V2_RUN_STARTED_JSON).unwrap();
+        assert_eq!(
+            profile,
+            HarnessEvent::RunStarted(RunStartedEvent {
+                run_id: RunId::new("run_2").unwrap(),
+                identity: RunIdentity::Profile {
+                    profile_id: crate::ProfileId::new("profile_1").unwrap(),
+                    profile_revision: 7,
+                },
+            })
+        );
+        assert_eq!(
+            serde_json::to_string(&profile).unwrap(),
+            PROFILE_V2_RUN_STARTED_JSON
+        );
+
+        for invalid in [
+            r#"{"event":"run_started","run_id":"run_2","profile_id":"profile_1"}"#,
+            r#"{"event":"run_started","run_id":"run_2","agent_id":"agent_1","profile_id":"profile_1","profile_revision":1}"#,
+        ] {
+            assert!(serde_json::from_str::<HarnessEvent>(invalid).is_err());
+        }
     }
 
     #[test]
@@ -283,10 +354,12 @@ mod tests {
         let tool = ToolName::new("file.read").unwrap();
 
         let events = [
-            HarnessEvent::RunStarted {
+            HarnessEvent::RunStarted(RunStartedEvent {
                 run_id: run_id.clone(),
-                agent_id: AgentId::new("agent_1").unwrap(),
-            },
+                identity: RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("agent_1").unwrap(),
+                },
+            }),
             HarnessEvent::ContextBuilt {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
@@ -410,7 +483,7 @@ mod tests {
         for event in events {
             let name = event.name();
             let fixture = match &event {
-                HarnessEvent::RunStarted { .. } => json!({
+                HarnessEvent::RunStarted(_) => json!({
                     "seq": 7,
                     "occurred_at_ms": 1_700_000_000_000_u64,
                     "event": {

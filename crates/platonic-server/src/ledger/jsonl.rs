@@ -10,7 +10,7 @@ use super::{
         validate_voice_event_stream,
     },
     sqlite::SqliteLedger,
-    types::{LEDGER_VERSION, LedgerLine, supported_ledger_version},
+    types::{LEDGER_VERSION, LedgerLine, supported_ledger_version, validate_ledger_identity},
 };
 use crate::{AppError, AppResult, paths::DefaultSqlitePath};
 use platonic_core::{HarnessEvent, RecordedEvent, RunId, RunState};
@@ -378,6 +378,9 @@ fn parse_ledger_lines(bytes: &[u8]) -> AppResult<Vec<PersistedLedgerLine>> {
                 actual: line.v,
             });
         }
+        if let PersistedLedgerLine::Record(line) = &line {
+            validate_ledger_identity(line.v, &line.record.event)?;
+        }
         if let PersistedLedgerLine::Voice(line) = &line {
             validate_voice_envelopes(&line.voice_events)?;
         }
@@ -530,10 +533,12 @@ mod tests {
         let mut recorder = JsonlEventRecorder::create(&path).unwrap();
 
         let record = recorder
-            .record(HarnessEvent::RunStarted {
+            .record(HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: RunId::new("run_1").unwrap(),
-                agent_id: AgentId::new("plato").unwrap(),
-            })
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+            }))
             .unwrap();
 
         let records = read_records(&path).unwrap();
@@ -550,16 +555,42 @@ mod tests {
     }
 
     #[test]
+    fn v1_and_v2_run_identity_lines_round_trip_byte_for_byte() {
+        let fixtures = [
+            r#"{"v":1,"record":{"seq":0,"occurred_at_ms":0,"event":{"event":"run_started","run_id":"run_v1","agent_id":"plato"}}}"#,
+            r#"{"v":2,"record":{"seq":0,"occurred_at_ms":0,"event":{"event":"run_started","run_id":"run_v2","profile_id":"profile_1","profile_revision":3}}}"#,
+        ];
+        for fixture in fixtures {
+            let line: LedgerLine = serde_json::from_str(fixture).unwrap();
+            validate_ledger_identity(line.v, &line.record.event).unwrap();
+            assert_eq!(serde_json::to_string(&line).unwrap(), fixture);
+        }
+
+        let invalid_v1: LedgerLine = serde_json::from_str(
+            r#"{"v":1,"record":{"seq":0,"occurred_at_ms":0,"event":{"event":"run_started","run_id":"run_bad","profile_id":"profile_1","profile_revision":1}}}"#,
+        )
+        .unwrap();
+        assert!(validate_ledger_identity(invalid_v1.v, &invalid_v1.record.event).is_err());
+        let zero_revision: LedgerLine = serde_json::from_str(
+            r#"{"v":2,"record":{"seq":0,"occurred_at_ms":0,"event":{"event":"run_started","run_id":"run_bad","profile_id":"profile_1","profile_revision":0}}}"#,
+        )
+        .unwrap();
+        assert!(validate_ledger_identity(zero_revision.v, &zero_revision.record.event).is_err());
+    }
+
+    #[test]
     fn jsonl_readers_ignore_a_valid_unterminated_tail() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
         let run_id = RunId::new("run_tail").unwrap();
         let mut recorder = JsonlEventRecorder::create(&path).unwrap();
         let committed = recorder
-            .record(HarnessEvent::RunStarted {
+            .record(HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: run_id.clone(),
-                agent_id: AgentId::new("plato").unwrap(),
-            })
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+            }))
             .unwrap();
         drop(recorder);
 
@@ -590,10 +621,12 @@ mod tests {
         let run_id = RunId::new("run_tail").unwrap();
         let mut recorder = JsonlEventRecorder::create(&path).unwrap();
         recorder
-            .record(HarnessEvent::RunStarted {
+            .record(HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: run_id.clone(),
-                agent_id: AgentId::new("plato").unwrap(),
-            })
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+            }))
             .unwrap();
         let mut tail = File::open(&path).unwrap();
         tail.seek(SeekFrom::End(0)).unwrap();
@@ -634,10 +667,12 @@ mod tests {
             .unwrap()
             .with_session(ledger, &run_id, true);
         recorder
-            .record(HarnessEvent::RunStarted {
+            .record(HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: run_id.clone(),
-                agent_id: AgentId::new("plato").unwrap(),
-            })
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+            }))
             .unwrap();
         recorder.file = File::open(&path).unwrap();
 
@@ -752,10 +787,12 @@ mod tests {
         let run_id = RunId::new("run_sigkill").unwrap();
         let mut recorder = JsonlEventRecorder::create(&path).unwrap();
         recorder
-            .record(HarnessEvent::RunStarted {
+            .record(HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: run_id.clone(),
-                agent_id: AgentId::new("plato").unwrap(),
-            })
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+            }))
             .unwrap();
         recorder
             .record(HarnessEvent::ContextBuilt {
@@ -803,10 +840,12 @@ mod tests {
         fs::create_dir_all(jsonl_path.parent().unwrap()).unwrap();
         let mut recorder = JsonlEventRecorder::create(&jsonl_path).unwrap();
         recorder
-            .record(HarnessEvent::RunStarted {
+            .record(HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: actual_run.clone(),
-                agent_id: AgentId::new("plato").unwrap(),
-            })
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+            }))
             .unwrap();
         drop(recorder);
         let ledger = SqliteLedger::open_or_create(&sqlite_path).unwrap();
@@ -946,10 +985,12 @@ mod tests {
         fs::create_dir_all(jsonl_path.parent().unwrap()).unwrap();
         let mut recorder = JsonlEventRecorder::create(&jsonl_path).unwrap();
         recorder
-            .record(HarnessEvent::RunStarted {
+            .record(HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: run_id.clone(),
-                agent_id: AgentId::new("plato").unwrap(),
-            })
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+            }))
             .unwrap();
         recorder
             .record(HarnessEvent::ContextBuilt {

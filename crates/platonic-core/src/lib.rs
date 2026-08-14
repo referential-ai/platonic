@@ -19,8 +19,10 @@ pub mod tool;
 
 pub use context::{ContextFragment, ContextLane, ContextPack};
 pub use error::Error;
-pub use event::{HarnessEvent, ModelUsage, RecordedEvent};
-pub use ids::{ActorId, AgentId, ArtifactId, ModelName, RunId, ToolCallId, ToolName, TurnId};
+pub use event::{HarnessEvent, ModelUsage, RecordedEvent, RunIdentity, RunStartedEvent};
+pub use ids::{
+    ActorId, AgentId, ArtifactId, ModelName, ProfileId, RunId, ToolCallId, ToolName, TurnId,
+};
 pub use message::{Message, MessageRole};
 pub use policy::{EffectClass, PolicyDecision};
 pub use projection::{ReadbackEntry, RunReadback};
