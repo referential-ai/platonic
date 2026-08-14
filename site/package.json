@@ -8,10 +8,12 @@
     "node": ">=24.8.0"
   },
   "scripts": {
-    "check": "npm run check:html && npm run check:site",
+    "check": "npm run check:redirects && npm run check:html && npm run check:site",
     "check:external": "node scripts/check-site.mjs --external",
     "check:html": "html-validate \"index.html\" \"blog/**/*.html\"",
+    "check:redirects": "node scripts/docs-redirects.mjs --check && node --test scripts/docs-redirects.test.mjs",
     "check:site": "node scripts/check-site.mjs",
+    "generate:redirects": "node scripts/docs-redirects.mjs",
     "proof:browser": "npm run test:browser",
     "test:browser": "node scripts/browser-proof.mjs"
   },
