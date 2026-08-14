@@ -1,339 +1,42 @@
 {
   "version": 1,
   "canonical_origin": "https://docs.referential.ai",
-  "legacy_origin": "https://referential-ai.github.io",
-  "legacy_base": "/platonic/",
   "redirect_origin": "https://referential.ai",
   "homepage": {
     "sources": [
       "/docs",
       "/docs/"
     ],
-    "destination": "https://docs.referential.ai/",
-    "owner": "referential-ai/platonic#560"
+    "destination": "https://docs.referential.ai/"
   },
   "routes": [
     {
       "title": "Platonic",
-      "wrapper": "docs/book/README.md",
-      "include": "../../README.md",
-      "source": "README.md",
-      "legacy_routes": [
-        "/platonic/",
-        "/platonic/index.html"
-      ],
       "redirect_sources": [
         "/docs/index.html"
       ],
-      "destination": "https://docs.referential.ai/",
-      "disposition": "replace-with-canonical-starlight-content",
-      "fragments": [
-        "platonic",
-        "start-here",
-        "configuration",
-        "discord-gateway",
-        "workspace-ledgers",
-        "server",
-        "reference-routes",
-        "development",
-        "unreleased-http-gateway",
-        "unreleased-linux-desktop-observation",
-        "boundary",
-        "license"
-      ],
-      "rationale": "The Starlight root replaces the mdBook landing page while linking repository-owned build, boundary, and license authorities."
+      "destination": "https://docs.referential.ai/"
     },
     {
       "title": "Quickstart",
-      "wrapper": "docs/book/docs/QUICKSTART.md",
-      "include": "../../QUICKSTART.md",
-      "source": "docs/QUICKSTART.md",
-      "legacy_routes": [
-        "/platonic/docs/QUICKSTART.html"
-      ],
       "redirect_sources": [
         "/docs/docs/QUICKSTART.html"
       ],
-      "destination": "https://docs.referential.ai/user/install/",
-      "disposition": "link-to-existing-authority",
-      "fragments": [
-        "quickstart-entry-point",
-        "0-one-time-setup",
-        "current-public-release-010",
-        "unreleased-develop--020",
-        "5-local-voice-activation-and-device-proof",
-        "next-guides"
-      ],
-      "rationale": "Starlight selects the release track and links the tagged release, release contract, first-run journey, and source-owned voice proof without copying them."
+      "destination": "https://docs.referential.ai/user/install/"
     },
     {
       "title": "Discord gateway",
-      "wrapper": "docs/book/docs/GATEWAY.md",
-      "include": "../../GATEWAY.md",
-      "source": "docs/GATEWAY.md",
-      "legacy_routes": [
-        "/platonic/docs/GATEWAY.html"
-      ],
       "redirect_sources": [
         "/docs/docs/GATEWAY.html"
       ],
-      "destination": "https://docs.referential.ai/user/operations/discord/",
-      "disposition": "link-to-existing-authority",
-      "fragments": [
-        "platonic-discord-gateway-first-reply-and-replay",
-        "1-create-and-install-the-discord-bot",
-        "2-store-the-token-at-the-approved-path",
-        "3-add-the-principal-and-channel-context-map",
-        "4-start-the-server-and-gateway",
-        "5-receive-the-first-reply",
-        "gateway-approvals",
-        "6-replay-the-reply",
-        "troubleshooting",
-        "bot-ignores-the-principal-wrong-user-id",
-        "bot-ignores-the-principal-channel-is-not-mapped",
-        "gateway-closes-with-code-4014-message-content-intent-is-disabled"
-      ],
-      "rationale": "The Starlight task page preserves every legacy fragment and links the detailed gateway guide as the single procedure owner."
+      "destination": "https://docs.referential.ai/user/operations/discord/"
     },
     {
       "title": "Architecture",
-      "wrapper": "docs/book/docs/ARCHITECTURE.md",
-      "include": "../../ARCHITECTURE.md",
-      "source": "docs/ARCHITECTURE.md",
-      "legacy_routes": [
-        "/platonic/docs/ARCHITECTURE.html"
-      ],
       "redirect_sources": [
         "/docs/docs/ARCHITECTURE.html"
       ],
-      "destination": "https://docs.referential.ai/developer/",
-      "disposition": "replace-with-canonical-starlight-content",
-      "fragments": [
-        "plato-agent-architecture",
-        "read-this-before-using-the-document-below",
-        "runtime-topology",
-        "boundary-ladder",
-        "sequence",
-        "ledger-versioning"
-      ],
-      "rationale": "The current Developer journey replaces the partly superseded overview and links binding architecture, source, and executable-test owners."
-    }
-  ],
-  "intentional_404": {
-    "rationale": "Generated mdBook utility pages and renderer assets have no durable content identity. Starlight supplies its own 404, per-page print, navigation, search, styles, scripts, icons, and system-font stack; exact /docs near-matches remain the root site's real 404.",
-    "paths": [
-      ".nojekyll",
-      "404.html",
-      "ayu-highlight-3fdfc3ac.css",
-      "book-609e4cb8.js",
-      "clipboard-1626706a.min.js",
-      "css/chrome-d279d366.css",
-      "css/general-e96d0476.css",
-      "css/print-9e4910d8.css",
-      "css/variables-8adf115d.css",
-      "elasticlunr-ef4e11c1.min.js",
-      "favicon-8114d1fc.png",
-      "favicon-de23e50b.svg",
-      "fonts/OPEN-SANS-LICENSE.txt",
-      "fonts/SOURCE-CODE-PRO-LICENSE.txt",
-      "fonts/fonts-9644e21d.css",
-      "fonts/open-sans-v17-all-charsets-300-7736aa35.woff2",
-      "fonts/open-sans-v17-all-charsets-300italic-2c7b95c0.woff2",
-      "fonts/open-sans-v17-all-charsets-600-486c6759.woff2",
-      "fonts/open-sans-v17-all-charsets-600italic-1a3e8659.woff2",
-      "fonts/open-sans-v17-all-charsets-700-c22fe8c7.woff2",
-      "fonts/open-sans-v17-all-charsets-700italic-238ae959.woff2",
-      "fonts/open-sans-v17-all-charsets-800-3d2c812a.woff2",
-      "fonts/open-sans-v17-all-charsets-800italic-ba1521ec.woff2",
-      "fonts/open-sans-v17-all-charsets-italic-6c9463f7.woff2",
-      "fonts/open-sans-v17-all-charsets-regular-2e3b1d34.woff2",
-      "fonts/source-code-pro-v11-all-charsets-500-2bdd9410.woff2",
-      "highlight-493f70e1.css",
-      "highlight-abc7f01d.js",
-      "mark-09e88c2c.min.js",
-      "print.html",
-      "searcher-09f2665d.js",
-      "searchindex-25cd09cf.js",
-      "toc-5bf6ac24.js",
-      "toc.html",
-      "tomorrow-night-4c0ae647.css"
-    ]
-  },
-  "sources": [
-    {
-      "path": "README.md",
-      "kind": "canonical include and repository entry point",
-      "disposition": "link-to-existing-authority",
-      "rationale": "Repository build, ownership, release-entry, and license links remain concise here."
-    },
-    {
-      "path": "docs/QUICKSTART.md",
-      "kind": "canonical include",
-      "disposition": "link-to-existing-authority",
-      "rationale": "The released 0.1.0 install and specialist voice/device proof remain source-owned and linked from Starlight."
-    },
-    {
-      "path": "docs/GATEWAY.md",
-      "kind": "canonical include",
-      "disposition": "link-to-existing-authority",
-      "rationale": "The detailed Discord setup and replay procedure remains source-owned and linked from Starlight."
-    },
-    {
-      "path": "docs/ARCHITECTURE.md",
-      "kind": "canonical include",
-      "disposition": "link-to-existing-authority",
-      "rationale": "The explicitly historical and partly superseded architecture record remains linked evidence, not current Starlight law."
-    },
-    {
-      "path": "book.toml",
-      "kind": "mdBook configuration",
-      "disposition": "archive-in-git-history",
-      "retirement_owner": "referential-ai/platonic#557"
-    },
-    {
-      "path": "docs/book/SUMMARY.md",
-      "kind": "mdBook navigation",
-      "disposition": "archive-in-git-history",
-      "retirement_owner": "referential-ai/platonic#557"
-    },
-    {
-      "path": "docs/book/README.md",
-      "kind": "include wrapper",
-      "disposition": "archive-in-git-history",
-      "retirement_owner": "referential-ai/platonic#557"
-    },
-    {
-      "path": "docs/book/docs/QUICKSTART.md",
-      "kind": "include wrapper",
-      "disposition": "archive-in-git-history",
-      "retirement_owner": "referential-ai/platonic#557"
-    },
-    {
-      "path": "docs/book/docs/GATEWAY.md",
-      "kind": "include wrapper",
-      "disposition": "archive-in-git-history",
-      "retirement_owner": "referential-ai/platonic#557"
-    },
-    {
-      "path": "docs/book/docs/ARCHITECTURE.md",
-      "kind": "include wrapper",
-      "disposition": "archive-in-git-history",
-      "retirement_owner": "referential-ai/platonic#557"
-    },
-    {
-      "path": ".github/workflows/docs-pages.yml",
-      "kind": "mdBook publication workflow",
-      "disposition": "archive-in-git-history",
-      "retirement_owner": "referential-ai/platonic#557"
-    }
-  ],
-  "authored_assets": [
-    {
-      "path": "docs/images/desktop-phase-1.png",
-      "sha256": "408e9753ce9f5f939527912251cdc0a723733e5a98852fcef1aa8c3af93d8eb3",
-      "disposition": "intentionally-retire",
-      "rationale": "The unreferenced phase-one desktop proof uses an obsolete product surface and is not an instructional documentation asset."
-    },
-    {
-      "path": "docs/images/desktop-plato-agent.png",
-      "sha256": "ce70870e49d1ad8939796edaf7c797760684fe6244fb68e1303d4d9631d48a5f",
-      "disposition": "link-to-existing-authority",
-      "authority": "site/**",
-      "rationale": "The root marketing image remains owned and consumed by site; #551 does not copy it into documentation."
-    },
-    {
-      "path": "docs-site/src/assets/platonic-mark.svg",
-      "sha256": "c00fe37b47b3ad2de63f34d1f70c49b618f7df7b7e58eee9f260813e8f19d703",
-      "disposition": "replace-with-canonical-starlight-content",
-      "rationale": "Starlight's existing product mark replaces the generated mdBook mark treatment."
-    },
-    {
-      "path": "docs-site/public/favicon.svg",
-      "sha256": "9d4b4fabd76d5f7139770673088b6021b5307289cf2bbe0ff939d0af400b3af5",
-      "disposition": "replace-with-canonical-starlight-content",
-      "rationale": "Starlight's existing favicon replaces the generated mdBook favicons."
-    },
-    {
-      "path": "docs-site/src/assets/tui/manifest.json",
-      "sha256": "bab31389e63e670b775c39cdc8df4f5ec7b1afbc76e594aed34ac3f48347377e",
-      "disposition": "link-to-existing-authority",
-      "authority": "referential-ai/platonic#556",
-      "rationale": "The #556 manifest exclusively inventories the five useful TUI captures, their consuming pages, provenance, and byte digests."
-    }
-  ],
-  "licenses": [
-    {
-      "path": "LICENSE-MIT",
-      "disposition": "link-to-existing-authority",
-      "linked_from": [
-        "README.md",
-        "docs-site/src/content/docs/index.mdx"
-      ]
-    },
-    {
-      "path": "LICENSE-APACHE",
-      "disposition": "link-to-existing-authority",
-      "linked_from": [
-        "README.md",
-        "docs-site/src/content/docs/index.mdx"
-      ]
-    },
-    {
-      "path": "fonts/OPEN-SANS-LICENSE.txt",
-      "disposition": "intentionally-retire",
-      "rationale": "The Open Sans font and its mdBook-bundled attribution are not copied into the system-font Starlight build."
-    },
-    {
-      "path": "fonts/SOURCE-CODE-PRO-LICENSE.txt",
-      "disposition": "intentionally-retire",
-      "rationale": "The Source Code Pro font and its mdBook-bundled attribution are not copied into the system-font Starlight build."
-    }
-  ],
-  "entry_points": [
-    {
-      "path": "README.md",
-      "needle": "https://docs.referential.ai/",
-      "disposition": "migrate"
-    },
-    {
-      "path": "site/index.html",
-      "needle": "https://github.com/referential-ai/platonic/blob/main/docs/QUICKSTART.md",
-      "disposition": "link-to-existing-authority"
-    },
-    {
-      "path": "site/blog/introducing-platonic/index.html",
-      "needle": "https://github.com/referential-ai/platonic/blob/main/docs/QUICKSTART.md",
-      "disposition": "link-to-existing-authority"
-    },
-    {
-      "path": "docs-site/src/content/docs/user/operations/voice.md",
-      "needle": "https://github.com/referential-ai/platonic/blob/develop/docs/QUICKSTART.md#5-local-voice-activation-and-device-proof",
-      "disposition": "link-to-existing-authority"
-    },
-    {
-      "path": "docs-site/src/content/docs/user/operations/discord.md",
-      "needle": "https://github.com/referential-ai/platonic/blob/develop/docs/GATEWAY.md",
-      "disposition": "link-to-existing-authority"
-    },
-    {
-      "path": "crates/plato-agent/Cargo.toml",
-      "needle": "readme = \"../../README.md\"",
-      "disposition": "link-to-existing-authority"
-    },
-    {
-      "path": "book.toml",
-      "needle": "src = \"docs/book\"",
-      "disposition": "archive-in-git-history"
-    },
-    {
-      "path": "docs/book/SUMMARY.md",
-      "needle": "docs/QUICKSTART.md",
-      "disposition": "archive-in-git-history"
-    },
-    {
-      "path": ".github/workflows/docs-pages.yml",
-      "needle": "docs/book/**",
-      "disposition": "archive-in-git-history"
+      "destination": "https://docs.referential.ai/developer/"
     }
   ]
 }
