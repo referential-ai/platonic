@@ -338,8 +338,249 @@ pub(super) fn handle_agent_status(
     }
 }
 
+// Phase 1 installs daemon-owned profile operations without adding protocol-v1
+// methods. The v2 routing that calls these entry points belongs to a later issue.
+#[allow(dead_code)]
+pub(crate) mod profiles {
+    use super::*;
+    use crate::{
+        AppError,
+        server_store::{
+            MAX_PROFILE_LIST_ENTRIES, ProfileRecord, ProfileRevisionContent, ProfileRevisionRecord,
+            ProfileValidationError, mint_profile_id,
+        },
+    };
+    use platonic_core::{ActorId, ModelName, ProfileId, ToolName};
+    use platonic_protocol::{ReasoningEffort, ThreadApprovalPolicy};
+    use std::path::PathBuf;
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct ProfileCreateRequest {
+        pub(crate) workspace_id: String,
+        pub(crate) display_name: String,
+        pub(crate) model: String,
+        pub(crate) reasoning_effort: ReasoningEffort,
+        pub(crate) approval_policy: ThreadApprovalPolicy,
+        pub(crate) toolset: Vec<String>,
+        pub(crate) content: ProfileRevisionContent,
+        pub(crate) actor: String,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct ProfileListRequest {
+        pub(crate) workspace_id: Option<String>,
+        pub(crate) limit: usize,
+    }
+
+    impl Default for ProfileListRequest {
+        fn default() -> Self {
+            Self {
+                workspace_id: None,
+                limit: 50,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct ProfileSummary {
+        pub(crate) profile: ProfileRecord,
+        pub(crate) workspace_health: crate::server_store::WorkspaceHealth,
+        pub(crate) home_path: PathBuf,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct ProfileStatus {
+        pub(crate) summary: ProfileSummary,
+        pub(crate) revision: ProfileRevisionRecord,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct ProfileListResult {
+        pub(crate) profiles: Vec<ProfileSummary>,
+        pub(crate) truncated: bool,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    pub(crate) enum ProfileRegistryError {
+        #[error("workspace not found: {0}")]
+        WorkspaceNotFound(String),
+        #[error("workspace directory is missing: {0}")]
+        WorkspaceBroken(String),
+        #[error("profile already exists in workspace {workspace_id}: {display_name}")]
+        DuplicateName {
+            workspace_id: String,
+            display_name: String,
+        },
+        #[error("profile not found: {0}")]
+        ProfileNotFound(String),
+        #[error("invalid profile: {0}")]
+        Invalid(String),
+        #[error(transparent)]
+        Content(#[from] ProfileValidationError),
+        #[error(transparent)]
+        Store(#[from] AppError),
+    }
+
+    pub(crate) fn create(
+        runtime: &DaemonRuntime,
+        request: ProfileCreateRequest,
+    ) -> Result<ProfileStatus, ProfileRegistryError> {
+        let display_name = request.display_name.trim();
+        if display_name.is_empty() || request.model.trim().is_empty() || request.toolset.is_empty()
+        {
+            return Err(ProfileRegistryError::Invalid(
+                "name, model, and toolset must not be empty".into(),
+            ));
+        }
+        ModelName::new(request.model.clone())
+            .map_err(|error| ProfileRegistryError::Invalid(error.to_string()))?;
+        ActorId::new(request.actor.clone())
+            .map_err(|error| ProfileRegistryError::Invalid(error.to_string()))?;
+        for tool in &request.toolset {
+            ToolName::new(tool.clone())
+                .map_err(|error| ProfileRegistryError::Invalid(error.to_string()))?;
+            if !is_known_tool(tool) {
+                return Err(ProfileRegistryError::Invalid(format!(
+                    "unknown tool in profile toolset: {tool}"
+                )));
+            }
+        }
+        request.content.validate()?;
+
+        let mut store = runtime.paths.server_store()?;
+        let workspace = store
+            .workspace(&request.workspace_id)?
+            .ok_or_else(|| ProfileRegistryError::WorkspaceNotFound(request.workspace_id.clone()))?;
+        if workspace.health() == crate::server_store::WorkspaceHealth::Broken {
+            return Err(ProfileRegistryError::WorkspaceBroken(request.workspace_id));
+        }
+        if store
+            .profile_by_name(&request.workspace_id, display_name)?
+            .is_some()
+        {
+            return Err(ProfileRegistryError::DuplicateName {
+                workspace_id: request.workspace_id,
+                display_name: display_name.into(),
+            });
+        }
+
+        let created_at_ms = now_ms();
+        let profile_id = mint_profile_id(&request.workspace_id, display_name, created_at_ms);
+        let profile = ProfileRecord {
+            id: profile_id.clone(),
+            workspace_id: request.workspace_id.clone(),
+            display_name: display_name.into(),
+            model: request.model,
+            reasoning_effort: request.reasoning_effort,
+            approval_policy: request.approval_policy,
+            toolset: request.toolset,
+            current_revision: 1,
+            home_thread_id: None,
+            imported_agent_id: None,
+            created_at_ms,
+        };
+        let revision = ProfileRevisionRecord {
+            profile_id,
+            revision: 1,
+            parent_revision: None,
+            actor: request.actor,
+            created_at_ms,
+            content_hash: request.content.content_hash()?,
+            content: request.content,
+        };
+        if !store.create_profile(&profile, &revision)? {
+            return Err(ProfileRegistryError::DuplicateName {
+                workspace_id: profile.workspace_id,
+                display_name: profile.display_name,
+            });
+        }
+        status_from_records(runtime, &workspace, profile, revision)
+    }
+
+    pub(crate) fn list(
+        runtime: &DaemonRuntime,
+        request: ProfileListRequest,
+    ) -> Result<ProfileListResult, ProfileRegistryError> {
+        if request.limit == 0 || request.limit > MAX_PROFILE_LIST_ENTRIES {
+            return Err(ProfileRegistryError::Invalid(format!(
+                "profile list limit must be between 1 and {MAX_PROFILE_LIST_ENTRIES}"
+            )));
+        }
+        let store = runtime.paths.server_store()?;
+        let mut records = store.profiles(
+            request.workspace_id.as_deref(),
+            request.limit.saturating_add(1),
+        )?;
+        let truncated = records.len() > request.limit;
+        records.truncate(request.limit);
+        let mut profiles = Vec::with_capacity(records.len());
+        for profile in records {
+            let workspace = store.workspace(&profile.workspace_id)?.ok_or_else(|| {
+                ProfileRegistryError::WorkspaceNotFound(profile.workspace_id.clone())
+            })?;
+            profiles.push(summary(runtime, &workspace, profile)?);
+        }
+        Ok(ProfileListResult {
+            profiles,
+            truncated,
+        })
+    }
+
+    pub(crate) fn status(
+        runtime: &DaemonRuntime,
+        profile_id: &ProfileId,
+    ) -> Result<ProfileStatus, ProfileRegistryError> {
+        let store = runtime.paths.server_store()?;
+        let profile = store
+            .profile(profile_id)?
+            .ok_or_else(|| ProfileRegistryError::ProfileNotFound(profile_id.as_str().into()))?;
+        let workspace = store
+            .workspace(&profile.workspace_id)?
+            .ok_or_else(|| ProfileRegistryError::WorkspaceNotFound(profile.workspace_id.clone()))?;
+        let revision = store
+            .profile_revision(&profile.id, profile.current_revision)?
+            .ok_or_else(|| {
+                ProfileRegistryError::Invalid(format!(
+                    "profile {} is missing revision {}",
+                    profile.id, profile.current_revision
+                ))
+            })?;
+        status_from_records(runtime, &workspace, profile, revision)
+    }
+
+    fn status_from_records(
+        runtime: &DaemonRuntime,
+        workspace: &crate::server_store::WorkspaceRecord,
+        profile: ProfileRecord,
+        revision: ProfileRevisionRecord,
+    ) -> Result<ProfileStatus, ProfileRegistryError> {
+        Ok(ProfileStatus {
+            summary: summary(runtime, workspace, profile)?,
+            revision,
+        })
+    }
+
+    fn summary(
+        runtime: &DaemonRuntime,
+        workspace: &crate::server_store::WorkspaceRecord,
+        profile: ProfileRecord,
+    ) -> Result<ProfileSummary, ProfileRegistryError> {
+        let home_path = crate::paths::profile_home_path(
+            &runtime.paths.server_db_path,
+            &profile.workspace_id,
+            &profile.id,
+        )?;
+        Ok(ProfileSummary {
+            profile,
+            workspace_health: workspace.health(),
+            home_path,
+        })
+    }
+}
+
 #[cfg(test)]
 pub(in crate::daemon::handlers) mod tests {
+    use super::profiles::{ProfileCreateRequest, ProfileListRequest, ProfileRegistryError};
     use super::*;
 
     use serde_json::json;
@@ -352,6 +593,9 @@ pub(in crate::daemon::handlers) mod tests {
         threads::tests::{bare_thread_test_runtime, thread_test_runtime},
     };
     use crate::daemon::protocol::ThreadApprovalPolicy;
+    use crate::server_store::{
+        MAX_PROFILE_LIST_ENTRIES, ProfileRevisionContent, ProfileValidationError,
+    };
     use std::path::Path;
     pub(in crate::daemon::handlers) fn workspace_request(
         id: &str,
@@ -710,6 +954,235 @@ pub(in crate::daemon::handlers) mod tests {
         let listed = handle_request(&runtime, workspace_request("al2", "agent.list", json!({})));
         let listed: AgentListResult = response_result(&listed);
         assert_eq!(listed.agents.len(), 1);
+    }
+
+    fn profile_create_request(workspace_id: &str, display_name: &str) -> ProfileCreateRequest {
+        ProfileCreateRequest {
+            workspace_id: workspace_id.into(),
+            display_name: display_name.into(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: crate::daemon::protocol::ReasoningEffort::Xhigh,
+            approval_policy: ThreadApprovalPolicy::Prompt,
+            toolset: vec!["file.read".into()],
+            content: ProfileRevisionContent {
+                instructions_markdown: "Build carefully.".into(),
+                memory_markdown: "No secrets.".into(),
+                skill_refs: vec!["skill:review".into()],
+            },
+            actor: "local-operator".into(),
+        }
+    }
+
+    #[test]
+    fn profile_create_list_status_survive_move_and_report_broken_workspace() {
+        let (root, runtime) = bare_thread_test_runtime();
+        let first = root.path().join("profile-workspace");
+        std::fs::create_dir(&first).unwrap();
+        let workspace = handle_request(
+            &runtime,
+            workspace_request(
+                "profile-ws",
+                "workspace.create",
+                json!({"name": "profiles", "root": first.to_string_lossy()}),
+            ),
+        );
+        let workspace: WorkspaceCreateResult = response_result(&workspace);
+        let workspace_id = workspace.workspace.id;
+
+        let request = profile_create_request(&workspace_id, "builder");
+        let created = profiles::create(&runtime, request.clone()).unwrap();
+        assert_eq!(created.summary.profile.display_name, "builder");
+        assert_eq!(created.summary.profile.home_thread_id, None);
+        assert_eq!(created.revision.revision, 1);
+        assert_eq!(created.revision.content, request.content);
+        assert!(created.summary.home_path.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&created.summary.home_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+
+        assert!(matches!(
+            profiles::create(&runtime, request),
+            Err(ProfileRegistryError::DuplicateName { .. })
+        ));
+        assert!(matches!(
+            profiles::create(&runtime, profile_create_request("ws-missing", "orphan")),
+            Err(ProfileRegistryError::WorkspaceNotFound(_))
+        ));
+        let listed = profiles::list(
+            &runtime,
+            ProfileListRequest {
+                workspace_id: Some(workspace_id.clone()),
+                limit: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(listed.profiles.len(), 1);
+        assert!(!listed.truncated);
+        assert_eq!(
+            profiles::status(&runtime, &created.summary.profile.id).unwrap(),
+            created.clone()
+        );
+
+        let second = root.path().join("profile-workspace-moved");
+        std::fs::rename(&first, &second).unwrap();
+        assert!(
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .relocate_workspace(&workspace_id, &second.to_string_lossy())
+                .unwrap()
+        );
+        let moved = profiles::status(&runtime, &created.summary.profile.id).unwrap();
+        assert_eq!(moved.summary.home_path, created.summary.home_path);
+        assert_eq!(
+            moved.summary.workspace_health,
+            crate::server_store::WorkspaceHealth::Present
+        );
+
+        std::fs::remove_dir_all(second).unwrap();
+        let broken = profiles::list(&runtime, ProfileListRequest::default()).unwrap();
+        assert_eq!(broken.profiles.len(), 1);
+        assert_eq!(
+            broken.profiles[0].workspace_health,
+            crate::server_store::WorkspaceHealth::Broken
+        );
+        assert!(matches!(
+            profiles::create(&runtime, profile_create_request(&workspace_id, "blocked")),
+            Err(ProfileRegistryError::WorkspaceBroken(_))
+        ));
+        assert!(matches!(
+            profiles::list(
+                &runtime,
+                ProfileListRequest {
+                    workspace_id: None,
+                    limit: MAX_PROFILE_LIST_ENTRIES + 1,
+                }
+            ),
+            Err(ProfileRegistryError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn profile_home_and_database_roll_back_at_both_failure_boundaries() {
+        let (root, runtime) = bare_thread_test_runtime();
+        let workspace_root = root.path().join("rollback-workspace");
+        std::fs::create_dir(&workspace_root).unwrap();
+        let workspace = handle_request(
+            &runtime,
+            workspace_request(
+                "rollback-ws",
+                "workspace.create",
+                json!({"name": "rollback", "root": workspace_root.to_string_lossy()}),
+            ),
+        );
+        let workspace: WorkspaceCreateResult = response_result(&workspace);
+        let workspace_id = workspace.workspace.id;
+        let connection = rusqlite::Connection::open(&runtime.paths.server_db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_profile_revision_insert
+                 BEFORE INSERT ON profile_revisions
+                 BEGIN
+                   SELECT RAISE(FAIL, 'injected profile revision insert failure');
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            profiles::create(
+                &runtime,
+                profile_create_request(&workspace_id, "database-failure")
+            ),
+            Err(ProfileRegistryError::Store(_))
+        ));
+        let profiles_root = runtime
+            .paths
+            .server_db_path
+            .parent()
+            .unwrap()
+            .join("workspaces")
+            .join(&workspace_id)
+            .join("profiles");
+        assert_eq!(std::fs::read_dir(&profiles_root).unwrap().count(), 0);
+        let connection = rusqlite::Connection::open(&runtime.paths.server_db_path).unwrap();
+        connection
+            .execute_batch("DROP TRIGGER fail_profile_revision_insert")
+            .unwrap();
+        drop(connection);
+        std::fs::remove_dir(&profiles_root).unwrap();
+        std::fs::write(&profiles_root, b"not a directory").unwrap();
+
+        assert!(matches!(
+            profiles::create(
+                &runtime,
+                profile_create_request(&workspace_id, "filesystem-failure")
+            ),
+            Err(ProfileRegistryError::Store(_))
+        ));
+        assert!(
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .profiles(None, 2)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn profile_revision_limits_reject_each_oversized_shape() {
+        let valid = ProfileRevisionContent {
+            instructions_markdown: "i".repeat(128 * 1024),
+            memory_markdown: "m".repeat(128 * 1024),
+            skill_refs: vec!["skill".into(); 64],
+        };
+        valid.validate().unwrap();
+
+        let cases = [
+            (
+                ProfileRevisionContent {
+                    instructions_markdown: "i".repeat(128 * 1024 + 1),
+                    ..valid.clone()
+                },
+                ProfileValidationError::InstructionsTooLarge,
+            ),
+            (
+                ProfileRevisionContent {
+                    memory_markdown: "m".repeat(128 * 1024 + 1),
+                    ..valid.clone()
+                },
+                ProfileValidationError::MemoryTooLarge,
+            ),
+            (
+                ProfileRevisionContent {
+                    skill_refs: vec!["skill".into(); 65],
+                    ..valid.clone()
+                },
+                ProfileValidationError::TooManySkillRefs,
+            ),
+            (
+                ProfileRevisionContent {
+                    skill_refs: vec!["x".repeat(5_000); 64],
+                    ..valid
+                },
+                ProfileValidationError::RevisionTooLarge,
+            ),
+        ];
+        for (content, expected) in cases {
+            assert_eq!(content.validate().unwrap_err(), expected);
+        }
     }
 
     /// Unknown fields are rejected on the way in, not ignored.

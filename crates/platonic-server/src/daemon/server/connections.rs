@@ -839,7 +839,8 @@ mod tests {
         assert_eq!(recovered.records.len(), 2);
         assert!(matches!(
             &recovered.records[0].event,
-            HarnessEvent::RunStarted { run_id, .. } if run_id.as_str() == admitted.run_id
+            HarnessEvent::RunStarted(platonic_core::RunStartedEvent { run_id, .. })
+                if run_id.as_str() == admitted.run_id
         ));
         assert!(matches!(
             &recovered.records[1].event,
@@ -2990,7 +2991,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
                 "run_id": "run_2",
                 "status": "finished",
                 "final_answer": "second answer",
-                "transcript": "final_phase: Finished\nnext_seq: 5\n[turn_run_2] assistant: second answer",
+                "transcript": "final_phase: Finished\nnext_seq: 5\nlegacy_agent_id: agent_1\n[turn_run_2] assistant: second answer",
                 "typed": {
                     "runs": [{
                         "run_id": "run_2",
@@ -3021,10 +3022,12 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
                     "run_id: run_1\n",
                     "final_phase: Finished\n",
                     "next_seq: 5\n",
+                    "legacy_agent_id: agent_1\n",
                     "[turn_run_1] assistant: first answer\n",
                     "run_id: run_2\n",
                     "final_phase: Finished\n",
                     "next_seq: 5\n",
+                    "legacy_agent_id: agent_1\n",
                     "[turn_run_2] assistant: second answer"
                 ),
                 "typed": {
@@ -4061,10 +4064,12 @@ enabled = ["{enabled_tool}"]
                 &RecordedEvent {
                     seq: 0,
                     occurred_at_ms: 0,
-                    event: HarnessEvent::RunStarted {
+                    event: HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                         run_id: run_id.clone(),
-                        agent_id: AgentId::new("agent_1").unwrap(),
-                    },
+                        identity: platonic_core::RunIdentity::LegacyAgent {
+                            agent_id: AgentId::new("agent_1").unwrap(),
+                        },
+                    }),
                 },
             )
             .unwrap();
@@ -4078,10 +4083,12 @@ enabled = ["{enabled_tool}"]
             .begin_session_run(session_id, &run_id, question, true)
             .unwrap();
         for (seq, event) in [
-            HarnessEvent::RunStarted {
+            HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: run_id.clone(),
-                agent_id: AgentId::new("agent_1").unwrap(),
-            },
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("agent_1").unwrap(),
+                },
+            }),
             HarnessEvent::ContextBuilt {
                 run_id: run_id.clone(),
                 turn_id,
@@ -4128,10 +4135,12 @@ enabled = ["{enabled_tool}"]
             .unwrap()
             .with_session_jsonl_creation(ledger, &run_id, true);
         for event in [
-            HarnessEvent::RunStarted {
+            HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: run_id.clone(),
-                agent_id: AgentId::new("agent_1").unwrap(),
-            },
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("agent_1").unwrap(),
+                },
+            }),
             HarnessEvent::ContextBuilt {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
@@ -4253,10 +4262,12 @@ enabled = ["{enabled_tool}"]
             .begin_session_run(session_id, &run_id, question, create_session)
             .unwrap();
         let events = vec![
-            HarnessEvent::RunStarted {
+            HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: run_id.clone(),
-                agent_id: AgentId::new("agent_1").unwrap(),
-            },
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("agent_1").unwrap(),
+                },
+            }),
             HarnessEvent::ContextBuilt {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),

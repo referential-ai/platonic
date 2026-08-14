@@ -1480,10 +1480,12 @@ enabled = ["file.read"]
             .begin_session_run(session_id, &run_id, "question", create_session)
             .unwrap();
         for (seq, event) in [
-            HarnessEvent::RunStarted {
+            HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: run_id.clone(),
-                agent_id: AgentId::new("plato").unwrap(),
-            },
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+            }),
             HarnessEvent::ContextBuilt {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
@@ -1973,7 +1975,7 @@ enabled = ["file.read"]
             session.runs[0]
                 .records
                 .iter()
-                .filter(|record| matches!(record.event, HarnessEvent::RunStarted { .. }))
+                .filter(|record| matches!(record.event, HarnessEvent::RunStarted(_)))
                 .count(),
             1
         );
@@ -3091,10 +3093,12 @@ enabled = ["file.read"]
 
         let turn_id = TurnId::new("turn_terminal").unwrap();
         let nonterminal_events = vec![
-            HarnessEvent::RunStarted {
+            HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: run_id.clone(),
-                agent_id: AgentId::new("plato").unwrap(),
-            },
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+            }),
             HarnessEvent::ContextBuilt {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),

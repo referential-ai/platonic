@@ -805,10 +805,12 @@ fn seed_sqlite_session(path: &Path, session_id: &str, run_id: &str, question: &s
         .begin_session_run(session_id, &run_id, question, true)
         .unwrap();
     let events = [
-        HarnessEvent::RunStarted {
+        HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
             run_id: run_id.clone(),
-            agent_id: AgentId::new("plato").unwrap(),
-        },
+            identity: platonic_core::RunIdentity::LegacyAgent {
+                agent_id: AgentId::new("plato").unwrap(),
+            },
+        }),
         HarnessEvent::ContextBuilt {
             run_id: run_id.clone(),
             turn_id: turn_id.clone(),

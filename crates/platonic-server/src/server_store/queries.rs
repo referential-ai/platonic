@@ -1,17 +1,14 @@
 use super::{
     BranchClaimConflict, BranchClaimRecord,
     rows::{
-        agent_from_row, effect_to_text, invalid_thread_column, thread_authority_from_row,
+        agent_from_row, effect_to_text, invalid_thread_column, profile_from_row,
+        profile_revision_from_row, thread_authority_from_row, thread_profile_authority_from_row,
         tool_call_approval_from_row, workspace_from_row,
     },
-    schema::{
-        create_agent_table, create_run_cancellation_table, create_thread_authority_tables,
-        create_thread_repository_tables, create_thread_stop_table, create_tool_call_approval_table,
-        create_workspace_table,
-    },
+    schema::migrate_server_schema,
     types::{
-        AgentRecord, DurableThreadAuthority, RunCancellationRecord, ToolCallApprovalDecision,
-        ToolCallApprovalRecord, WorkspaceRecord,
+        AgentRecord, DurableThreadAuthority, ProfileRecord, ProfileRevisionRecord,
+        RunCancellationRecord, ToolCallApprovalDecision, ToolCallApprovalRecord, WorkspaceRecord,
     },
 };
 use crate::{
@@ -19,16 +16,17 @@ use crate::{
     ledger::{row_u64, sqlite_i64},
     paths,
     thread_authority::{
-        ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, ThreadStopRecord,
-        authority_working_directory, validate_child_authority, validate_complete_authority,
+        LegacyReason, ThreadKind, ThreadProfileAuthority, ThreadSpawnApprovalRecord,
+        ThreadSpawnDecisionName, ThreadStopRecord, authority_working_directory,
+        validate_child_authority, validate_complete_authority,
     },
 };
-use platonic_core::AgentId;
+use platonic_core::{AgentId, ProfileId};
 use platonic_protocol::{ThreadAuthorityRecord, ThreadConfinement};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use std::{
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -49,23 +47,16 @@ impl ServerStore {
         }
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
-        let journal_mode: String =
-            connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
-        if journal_mode != "wal" {
-            connection.pragma_update(None, "journal_mode", "WAL")?;
-        }
+        connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
-        create_thread_authority_tables(&mut connection)?;
-        create_thread_stop_table(&connection)?;
-        create_thread_repository_tables(&connection)?;
-        create_workspace_table(&connection)?;
-        create_agent_table(&connection)?;
-        create_tool_call_approval_table(&connection)?;
-        create_run_cancellation_table(&connection)?;
-        Ok(Self {
+        migrate_server_schema(&mut connection)?;
+        configure_server_wal(&connection)?;
+        let store = Self {
             connection,
             path: path.to_path_buf(),
-        })
+        };
+        store.ensure_profile_homes()?;
+        Ok(store)
     }
 
     /// Open the store without the ability to write, and without creating it.
@@ -376,6 +367,234 @@ impl ServerStore {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub(crate) fn create_profile(
+        &mut self,
+        profile: &ProfileRecord,
+        revision: &ProfileRevisionRecord,
+    ) -> AppResult<bool> {
+        if profile.display_name.trim().is_empty()
+            || profile.model.trim().is_empty()
+            || profile.toolset.is_empty()
+        {
+            return Err(AppError::Config(
+                "profile name, model, and toolset must not be empty".into(),
+            ));
+        }
+        if profile.current_revision != 1
+            || profile.home_thread_id.is_some()
+            || revision.profile_id != profile.id
+            || revision.revision != 1
+            || revision.parent_revision.is_some()
+        {
+            return Err(AppError::Config(
+                "new profile must contain revision 1 and no home thread".into(),
+            ));
+        }
+        revision
+            .content
+            .validate()
+            .map_err(|error| AppError::Config(error.to_string()))?;
+        if revision.content_hash
+            != revision
+                .content
+                .content_hash()
+                .map_err(|error| AppError::Config(error.to_string()))?
+        {
+            return Err(AppError::Config(
+                "profile revision content hash does not match content".into(),
+            ));
+        }
+
+        let store_path = self.path.clone();
+        let profile_created_at_ms = sqlite_i64(profile.created_at_ms, "profile created_at_ms")?;
+        let revision_created_at_ms =
+            sqlite_i64(revision.created_at_ms, "profile revision created_at_ms")?;
+        let toolset = serde_json::to_string(&profile.toolset)?;
+        let skill_refs = serde_json::to_string(&revision.content.skill_refs)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let workspace_exists = transaction
+            .query_row(
+                "SELECT 1 FROM workspaces WHERE id = ?1",
+                params![profile.workspace_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !workspace_exists {
+            return Err(AppError::Config(format!(
+                "profile workspace does not exist: {}",
+                profile.workspace_id
+            )));
+        }
+        let duplicate = transaction
+            .query_row(
+                "SELECT 1 FROM profiles
+                 WHERE id = ?1 OR (workspace_id = ?2 AND display_name = ?3)",
+                params![
+                    profile.id.as_str(),
+                    profile.workspace_id,
+                    profile.display_name
+                ],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if duplicate {
+            transaction.commit()?;
+            return Ok(false);
+        }
+
+        let home = paths::create_profile_home(&store_path, &profile.workspace_id, &profile.id)?;
+        let insert = transaction
+            .execute(
+                "INSERT INTO profiles
+                   (id, workspace_id, display_name, model, reasoning_effort,
+                    approval_policy, toolset, current_revision, home_thread_id,
+                    imported_agent_id, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, NULL, ?8, ?9)",
+                params![
+                    profile.id.as_str(),
+                    profile.workspace_id,
+                    profile.display_name,
+                    profile.model,
+                    profile.reasoning_effort.as_str(),
+                    profile.approval_policy.as_str(),
+                    toolset,
+                    profile.imported_agent_id,
+                    profile_created_at_ms,
+                ],
+            )
+            .and_then(|_| {
+                transaction.execute(
+                    "INSERT INTO profile_revisions
+                       (profile_id, revision, parent_revision, actor, created_at_ms,
+                        content_hash, instructions_markdown, memory_markdown, skill_refs)
+                     VALUES (?1, 1, NULL, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        revision.profile_id.as_str(),
+                        revision.actor,
+                        revision_created_at_ms,
+                        revision.content_hash,
+                        revision.content.instructions_markdown,
+                        revision.content.memory_markdown,
+                        skill_refs,
+                    ],
+                )
+            });
+        if let Err(error) = insert {
+            drop(transaction);
+            return Err(rollback_profile_home(&home, error.into()));
+        }
+        if let Err(error) = transaction.commit() {
+            return Err(rollback_profile_home(&home, error.into()));
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn profile(&self, id: &ProfileId) -> AppResult<Option<ProfileRecord>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT id, workspace_id, display_name, model, reasoning_effort,
+                        approval_policy, toolset, current_revision, home_thread_id,
+                        imported_agent_id, created_at_ms
+                 FROM profiles WHERE id = ?1",
+                params![id.as_str()],
+                profile_from_row,
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn profile_by_name(
+        &self,
+        workspace_id: &str,
+        display_name: &str,
+    ) -> AppResult<Option<ProfileRecord>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT id, workspace_id, display_name, model, reasoning_effort,
+                        approval_policy, toolset, current_revision, home_thread_id,
+                        imported_agent_id, created_at_ms
+                 FROM profiles WHERE workspace_id = ?1 AND display_name = ?2",
+                params![workspace_id, display_name],
+                profile_from_row,
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn profiles(
+        &self,
+        workspace_id: Option<&str>,
+        limit: usize,
+    ) -> AppResult<Vec<ProfileRecord>> {
+        if limit == 0 || limit > super::MAX_PROFILE_LIST_ENTRIES + 1 {
+            return Err(AppError::Config(
+                "profile list limit is out of range".into(),
+            ));
+        }
+        let limit = i64::try_from(limit)
+            .map_err(|_| AppError::Config("profile list limit exceeds i64".into()))?;
+        let select = "SELECT id, workspace_id, display_name, model, reasoning_effort,
+                             approval_policy, toolset, current_revision, home_thread_id,
+                             imported_agent_id, created_at_ms
+                      FROM profiles";
+        let mut records = Vec::new();
+        if let Some(workspace_id) = workspace_id {
+            let mut statement = self.connection.prepare(&format!(
+                "{select} WHERE workspace_id = ?1
+                 ORDER BY created_at_ms ASC, id ASC LIMIT ?2"
+            ))?;
+            for row in statement.query_map(params![workspace_id, limit], profile_from_row)? {
+                records.push(row?);
+            }
+        } else {
+            let mut statement = self.connection.prepare(&format!(
+                "{select} ORDER BY created_at_ms ASC, id ASC LIMIT ?1"
+            ))?;
+            for row in statement.query_map(params![limit], profile_from_row)? {
+                records.push(row?);
+            }
+        }
+        Ok(records)
+    }
+
+    pub(crate) fn profile_revision(
+        &self,
+        profile_id: &ProfileId,
+        revision: u64,
+    ) -> AppResult<Option<ProfileRevisionRecord>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT profile_id, revision, parent_revision, actor, created_at_ms,
+                        content_hash, instructions_markdown, memory_markdown, skill_refs
+                 FROM profile_revisions WHERE profile_id = ?1 AND revision = ?2",
+                params![
+                    profile_id.as_str(),
+                    sqlite_i64(revision, "profile revision")?
+                ],
+                profile_revision_from_row,
+            )
+            .optional()?)
+    }
+
+    fn ensure_profile_homes(&self) -> AppResult<()> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, workspace_id, display_name, model, reasoning_effort,
+                    approval_policy, toolset, current_revision, home_thread_id,
+                    imported_agent_id, created_at_ms
+             FROM profiles ORDER BY created_at_ms ASC, id ASC",
+        )?;
+        for row in statement.query_map([], profile_from_row)? {
+            let profile = row?;
+            paths::ensure_profile_home(&self.path, &profile.workspace_id, &profile.id)?;
+        }
+        Ok(())
+    }
+
     /// Record a tool-call approval before the run blocks on it.
     ///
     /// Written before the request is announced to clients, so a daemon that
@@ -609,12 +828,15 @@ impl ServerStore {
             let toolset = serde_json::to_string(&authority.toolset)?;
             let worktrees = serde_json::to_string(&authority.worktrees)?;
             let granted_paths = serde_json::to_string(&authority.granted_paths)?;
+            let profile_authority = legacy_profile_authority(&transaction, authority)?;
             transaction.execute(
                 "INSERT INTO thread_authorities
-                   (thread_id, parent_thread_id, spawning_actor, agent_id, model,
-                    reasoning_effort, approval_policy, toolset, worktrees,
-                    granted_paths, network, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                   (thread_id, parent_thread_id, spawning_actor, agent_id,
+                    workspace_id, profile_id, profile_revision, thread_kind,
+                    legacy_reason, model, reasoning_effort, approval_policy,
+                    toolset, worktrees, granted_paths, network, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                         ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     authority.thread_id,
                     authority.parent_thread_id,
@@ -624,6 +846,14 @@ impl ServerStore {
                         .as_ref()
                         .map(AgentId::as_str)
                         .expect("complete authority has an agent id"),
+                    profile_authority.workspace_id,
+                    profile_authority.profile_id.as_ref().map(ProfileId::as_str),
+                    profile_authority
+                        .profile_revision
+                        .map(|revision| sqlite_i64(revision, "thread profile revision"))
+                        .transpose()?,
+                    profile_authority.thread_kind.as_str(),
+                    profile_authority.legacy_reason.map(LegacyReason::as_str),
                     authority.model,
                     authority.reasoning_effort.as_str(),
                     authority.approval_policy.as_str(),
@@ -654,7 +884,20 @@ impl ServerStore {
         &self,
         thread_id: &str,
     ) -> AppResult<Option<ThreadAuthorityRecord>> {
-        thread_authority_from(&self.connection, thread_id)
+        let authority = thread_authority_from(&self.connection, thread_id)?;
+        if authority.is_some() && self.thread_profile_authority(thread_id)?.is_none() {
+            return Err(AppError::Config(format!(
+                "thread authority is missing profile classification: {thread_id}"
+            )));
+        }
+        Ok(authority)
+    }
+
+    pub(crate) fn thread_profile_authority(
+        &self,
+        thread_id: &str,
+    ) -> AppResult<Option<ThreadProfileAuthority>> {
+        thread_profile_authority_from(&self.connection, thread_id)
     }
 
     pub(crate) fn thread_authorities(&self) -> AppResult<Vec<ThreadAuthorityRecord>> {
@@ -665,9 +908,21 @@ impl ServerStore {
              FROM thread_authorities
              ORDER BY created_at_ms ASC, thread_id ASC",
         )?;
-        Ok(statement
+        let authorities = statement
             .query_map([], thread_authority_from_row)?
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect::<Result<Vec<_>, _>>()?;
+        for authority in &authorities {
+            if self
+                .thread_profile_authority(&authority.thread_id)?
+                .is_none()
+            {
+                return Err(AppError::Config(format!(
+                    "thread authority is missing profile classification: {}",
+                    authority.thread_id
+                )));
+            }
+        }
+        Ok(authorities)
     }
 
     pub(crate) fn thread_spawn_approval(
@@ -832,6 +1087,33 @@ impl ServerStore {
     }
 }
 
+fn configure_server_wal(connection: &Connection) -> AppResult<()> {
+    let deadline = Instant::now() + SQLITE_BUSY_TIMEOUT;
+    loop {
+        let result = (|| {
+            let journal_mode: String =
+                connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+            if journal_mode != "wal" {
+                connection.pragma_update(None, "journal_mode", "WAL")?;
+            }
+            Ok::<(), rusqlite::Error>(())
+        })();
+        match result {
+            Ok(()) => return Ok(()),
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+                ) && Instant::now() < deadline =>
+            {
+                // SQLite's journal-mode pragma can bypass the configured busy handler.
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 fn run_cancellation_from(
     connection: &Connection,
     run_id: &str,
@@ -872,6 +1154,15 @@ fn rollback_adopted_ledger(
     }
 }
 
+fn rollback_profile_home(home: &Path, operation_error: AppError) -> AppError {
+    match paths::remove_profile_home(home) {
+        Ok(()) => operation_error,
+        Err(rollback_error) => AppError::Config(format!(
+            "profile creation failed ({operation_error}) and home rollback failed ({rollback_error})"
+        )),
+    }
+}
+
 fn thread_authority_from(
     connection: &Connection,
     thread_id: &str,
@@ -887,6 +1178,91 @@ fn thread_authority_from(
             thread_authority_from_row,
         )
         .optional()?)
+}
+
+fn thread_profile_authority_from(
+    connection: &Connection,
+    thread_id: &str,
+) -> AppResult<Option<ThreadProfileAuthority>> {
+    Ok(connection
+        .query_row(
+            "SELECT workspace_id, profile_id, profile_revision, thread_kind, legacy_reason
+             FROM thread_authorities WHERE thread_id = ?1",
+            params![thread_id],
+            thread_profile_authority_from_row,
+        )
+        .optional()?)
+}
+
+fn legacy_profile_authority(
+    connection: &Connection,
+    authority: &ThreadAuthorityRecord,
+) -> AppResult<ThreadProfileAuthority> {
+    let agent_id = authority
+        .agent_id
+        .as_ref()
+        .expect("complete authority has an agent id");
+    let agent_workspace = connection
+        .query_row(
+            "SELECT workspace_id FROM agents WHERE id = ?1",
+            params![agent_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let profile = connection
+        .query_row(
+            "SELECT id, workspace_id, current_revision
+             FROM profiles WHERE imported_agent_id = ?1",
+            params![agent_id.as_str()],
+            |row| {
+                let id = ProfileId::new(row.get::<_, String>(0)?)
+                    .map_err(|error| invalid_thread_column(0, error.to_string()))?;
+                Ok((
+                    id,
+                    row.get::<_, String>(1)?,
+                    row_u64(row, 2, "profile revision")?,
+                ))
+            },
+        )
+        .optional()?;
+    let (profile_id, workspace_id, profile_revision) = match profile {
+        Some((profile_id, workspace_id, revision)) => {
+            (Some(profile_id), Some(workspace_id), Some(revision))
+        }
+        None => (None, agent_workspace.clone(), None),
+    };
+    let workspace_exists = match workspace_id.as_deref() {
+        Some(workspace_id) => connection
+            .query_row(
+                "SELECT 1 FROM workspaces WHERE id = ?1",
+                params![workspace_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some(),
+        None => false,
+    };
+    let legacy_reason = if agent_workspace.is_some() && !workspace_exists {
+        LegacyReason::MissingWorkspace
+    } else if profile_id.is_none() {
+        LegacyReason::MissingProfile
+    } else if let Some(parent_thread_id) = authority.parent_thread_id.as_deref() {
+        match thread_profile_authority_from(connection, parent_thread_id)? {
+            Some(parent) if parent.profile_id.is_some() && parent.profile_id != profile_id => {
+                LegacyReason::CrossProfileEdge
+            }
+            _ => LegacyReason::UnsupportedAuthority,
+        }
+    } else {
+        LegacyReason::AdditionalRoot
+    };
+    Ok(ThreadProfileAuthority {
+        workspace_id,
+        profile_id,
+        profile_revision,
+        thread_kind: ThreadKind::Legacy,
+        legacy_reason: Some(legacy_reason),
+    })
 }
 
 fn thread_spawn_approval_from(
@@ -1002,6 +1378,7 @@ pub(crate) fn thread_stop(path: &Path, thread_id: &str) -> AppResult<Option<Thre
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server_store::ProfileRevisionContent;
     use crate::thread_authority::legacy_status_authority;
     use platonic_core::EffectClass;
     use platonic_protocol::{ReasoningEffort, ThreadApprovalPolicy, ThreadGrantedPath};
@@ -1034,6 +1411,302 @@ mod tests {
         assert_eq!(journal_mode, "wal");
         assert_eq!(synchronous, 2);
         assert_eq!(autocheckpoint, 1_000);
+    }
+
+    #[test]
+    fn concurrent_initial_open_records_each_migration_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        let barrier = Arc::new(Barrier::new(5));
+        let handles = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    ServerStore::open_or_create(&path).map(|_| ())
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let connection = Connection::open(path).unwrap();
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let journal_count: u32 = connection
+            .query_row("SELECT count(*) FROM server_schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, super::super::schema::SERVER_SCHEMA_VERSION);
+        assert_eq!(journal_count, super::super::schema::SERVER_SCHEMA_VERSION);
+    }
+
+    fn seed_phase_zero_profile_fixture(path: &Path, present_root: &Path, broken_root: &Path) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE workspaces (
+                  id TEXT PRIMARY KEY,
+                  name TEXT NOT NULL UNIQUE,
+                  root TEXT NOT NULL,
+                  ledger_path TEXT NOT NULL,
+                  created_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE agents (
+                  id TEXT PRIMARY KEY,
+                  workspace_id TEXT NOT NULL,
+                  model TEXT NOT NULL,
+                  reasoning_effort TEXT NOT NULL,
+                  approval_policy TEXT NOT NULL,
+                  toolset TEXT NOT NULL,
+                  created_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE thread_authorities (
+                  thread_id TEXT PRIMARY KEY,
+                  parent_thread_id TEXT,
+                  spawning_actor TEXT NOT NULL,
+                  cwd TEXT,
+                  agent_id TEXT,
+                  model TEXT NOT NULL,
+                  reasoning_effort TEXT NOT NULL,
+                  approval_policy TEXT NOT NULL,
+                  toolset TEXT,
+                  worktrees TEXT,
+                  granted_paths TEXT,
+                  network INTEGER,
+                  created_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE thread_stops (
+                  thread_id TEXT PRIMARY KEY,
+                  actor TEXT NOT NULL,
+                  stopped_turn_id TEXT,
+                  occurred_at_ms INTEGER NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspaces VALUES
+                   ('ws-present', 'present', ?1, 'present.db', 1),
+                   ('ws-broken', 'broken', ?2, 'broken.db', 2)",
+                params![
+                    present_root.to_string_lossy(),
+                    broken_root.to_string_lossy()
+                ],
+            )
+            .unwrap();
+        for (id, workspace_id, toolset, created_at_ms) in [
+            ("builder", "ws-present", r#"["file.read"]"#, 10),
+            ("reviewer", "ws-broken", r#"["file.read"]"#, 11),
+            ("unsafe/path", "ws-present", r#"["file.read"]"#, 12),
+            ("orphan", "ws-missing", r#"["file.read"]"#, 13),
+            ("invalid", "ws-present", "[]", 14),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO agents
+                       (id, workspace_id, model, reasoning_effort, approval_policy,
+                        toolset, created_at_ms)
+                     VALUES (?1, ?2, 'gpt-5.6-sol', 'xhigh', 'prompt', ?3, ?4)",
+                    params![id, workspace_id, toolset, created_at_ms],
+                )
+                .unwrap();
+        }
+        for (thread_id, parent, agent_id, created_at_ms) in [
+            ("thread_root", None, Some("builder"), 20),
+            ("thread_second_root", None, Some("builder"), 21),
+            ("thread_child", Some("thread_root"), Some("builder"), 22),
+            ("thread_cross", Some("thread_root"), Some("reviewer"), 23),
+            ("thread_unscoped", None, None, 24),
+            ("thread_orphan", None, Some("orphan"), 25),
+            ("thread_invalid", None, Some("invalid"), 26),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO thread_authorities
+                       (thread_id, parent_thread_id, spawning_actor, cwd, agent_id,
+                        model, reasoning_effort, approval_policy, toolset, worktrees,
+                        granted_paths, network, created_at_ms)
+                     VALUES (?1, ?2, 'migration-fixture', ?3, ?4, 'gpt-5.6-sol',
+                             'xhigh', 'prompt', '[\"file.read\"]', '[]',
+                             '[{\"path\":\"/tmp\",\"writable\":false}]', 0, ?5)",
+                    params![
+                        thread_id,
+                        parent,
+                        present_root.to_string_lossy(),
+                        agent_id,
+                        created_at_ms
+                    ],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO thread_stops VALUES ('thread_child', 'operator', NULL, 30)",
+                [],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn phase_zero_agents_migrate_deterministically_without_fabricating_thread_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let present_root = dir.path().join("present");
+        let broken_root = dir.path().join("broken");
+        fs::create_dir(&present_root).unwrap();
+        let path = dir.path().join("state/server.db");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        seed_phase_zero_profile_fixture(&path, &present_root, &broken_root);
+
+        let store = ServerStore::open_or_create(&path).unwrap();
+        let profiles = store.profiles(None, 100).unwrap();
+        assert_eq!(profiles.len(), 3);
+        let builder_id = ProfileId::new("builder").unwrap();
+        let reviewer_id = ProfileId::new("reviewer").unwrap();
+        let builder = store.profile(&builder_id).unwrap().unwrap();
+        assert_eq!(builder.display_name, "builder");
+        assert_eq!(builder.current_revision, 1);
+        assert_eq!(builder.home_thread_id, None);
+        assert_eq!(builder.imported_agent_id.as_deref(), Some("builder"));
+        let revision = store.profile_revision(&builder_id, 1).unwrap().unwrap();
+        assert_eq!(revision.parent_revision, None);
+        assert_eq!(revision.actor, "migration:agents-v1");
+        assert_eq!(revision.content, ProfileRevisionContent::empty());
+        assert_eq!(
+            store.profile(&reviewer_id).unwrap().unwrap().workspace_id,
+            "ws-broken"
+        );
+        let unsafe_profile = profiles
+            .iter()
+            .find(|profile| profile.imported_agent_id.as_deref() == Some("unsafe/path"))
+            .unwrap();
+        assert!(unsafe_profile.id.as_str().starts_with("profile-import-"));
+        assert_eq!(unsafe_profile.display_name, "unsafe/path");
+
+        let classifications = [
+            (
+                "thread_root",
+                Some(builder_id.clone()),
+                LegacyReason::AdditionalRoot,
+            ),
+            (
+                "thread_second_root",
+                Some(builder_id.clone()),
+                LegacyReason::AdditionalRoot,
+            ),
+            (
+                "thread_child",
+                Some(builder_id.clone()),
+                LegacyReason::UnsupportedAuthority,
+            ),
+            (
+                "thread_cross",
+                Some(reviewer_id),
+                LegacyReason::CrossProfileEdge,
+            ),
+            ("thread_unscoped", None, LegacyReason::MissingProfile),
+            ("thread_orphan", None, LegacyReason::MissingWorkspace),
+            ("thread_invalid", None, LegacyReason::MissingProfile),
+        ];
+        for (thread_id, profile_id, reason) in classifications {
+            let profile_revision = profile_id.as_ref().map(|_| 1);
+            let classification = store.thread_profile_authority(thread_id).unwrap().unwrap();
+            assert_eq!(classification.thread_kind, ThreadKind::Legacy);
+            assert_eq!(classification.profile_id, profile_id);
+            assert_eq!(classification.profile_revision, profile_revision);
+            assert_eq!(classification.legacy_reason, Some(reason));
+        }
+        assert_eq!(
+            store
+                .thread_authority("thread_cross")
+                .unwrap()
+                .unwrap()
+                .parent_thread_id
+                .as_deref(),
+            Some("thread_root")
+        );
+        assert!(store.thread_stop("thread_child").unwrap().is_some());
+
+        let journal = store
+            .connection
+            .prepare("SELECT version, name FROM server_schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            journal,
+            [
+                (1, "server_store_baseline".into()),
+                (2, "profile_registry".into())
+            ]
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO thread_authorities
+                   (thread_id, parent_thread_id, spawning_actor, workspace_id,
+                    profile_id, profile_revision, thread_kind, legacy_reason,
+                    model, reasoning_effort, approval_policy, created_at_ms)
+                 VALUES ('constraint_home', NULL, 'fixture', 'ws-present',
+                         'builder', 1, 'home', NULL, 'gpt-5.6-sol', 'xhigh',
+                         'prompt', 40)",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .connection
+                .execute(
+                    "INSERT INTO thread_authorities
+                       (thread_id, parent_thread_id, spawning_actor, workspace_id,
+                        profile_id, profile_revision, thread_kind, legacy_reason,
+                        model, reasoning_effort, approval_policy, created_at_ms)
+                     VALUES ('constraint_second_home', NULL, 'fixture', 'ws-present',
+                             'builder', 1, 'home', NULL, 'gpt-5.6-sol', 'xhigh',
+                             'prompt', 41)",
+                    [],
+                )
+                .is_err()
+        );
+        let unsafe_id = unsafe_profile.id.clone();
+        drop(store);
+
+        let reopened = ServerStore::open_or_create(&path).unwrap();
+        assert_eq!(reopened.profiles(None, 100).unwrap().len(), 3);
+        assert_eq!(
+            reopened
+                .profiles(None, 100)
+                .unwrap()
+                .into_iter()
+                .find(|profile| profile.imported_agent_id.as_deref() == Some("unsafe/path"))
+                .unwrap()
+                .id,
+            unsafe_id
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for profile in reopened.profiles(None, 100).unwrap() {
+                let home =
+                    paths::profile_home_path(&path, &profile.workspace_id, &profile.id).unwrap();
+                assert!(home.is_dir());
+                assert_eq!(
+                    fs::metadata(home).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+        }
     }
 
     fn thread_authority(
@@ -1082,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_authority_persists_all_twelve_fields_and_is_immutable_after_restart() {
+    fn thread_authority_persists_profile_classification_and_is_immutable_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("threads.db");
         let mut ledger = ServerStore::open_or_create(&path).unwrap();
@@ -1102,6 +1775,11 @@ mod tests {
                 "spawning_actor",
                 "cwd",
                 "agent_id",
+                "workspace_id",
+                "profile_id",
+                "profile_revision",
+                "thread_kind",
+                "legacy_reason",
                 "model",
                 "reasoning_effort",
                 "approval_policy",
@@ -1134,6 +1812,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(durable.record(), &authority);
+        assert_eq!(
+            ledger
+                .thread_profile_authority("thread_root")
+                .unwrap()
+                .unwrap(),
+            ThreadProfileAuthority {
+                workspace_id: None,
+                profile_id: None,
+                profile_revision: None,
+                thread_kind: ThreadKind::Legacy,
+                legacy_reason: Some(LegacyReason::MissingProfile),
+            }
+        );
         let stored = ledger
             .connection
             .query_row(
@@ -2027,7 +2718,6 @@ mod tests {
                 INSERT INTO thread_authorities VALUES
                   ('thread_bad', NULL, 'fixture_actor', '/tmp', 'gpt-5.6-sol',
                    'xhigh', 'expanded', 42);
-                PRAGMA user_version = 4;
                 "#,
             )
             .unwrap();

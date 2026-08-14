@@ -19,6 +19,7 @@ pub(crate) use queries::{
 };
 pub(crate) use types::{
     AgentRecord, BranchClaimConflict, BranchClaimRecord, DurableThreadAuthority,
-    RunCancellationRecord, ToolCallApprovalDecision, ToolCallApprovalRecord, WorkspaceHealth,
-    WorkspaceRecord, mint_workspace_id,
+    MAX_PROFILE_LIST_ENTRIES, ProfileRecord, ProfileRevisionContent, ProfileRevisionRecord,
+    ProfileValidationError, RunCancellationRecord, ToolCallApprovalDecision,
+    ToolCallApprovalRecord, WorkspaceHealth, WorkspaceRecord, mint_profile_id, mint_workspace_id,
 };

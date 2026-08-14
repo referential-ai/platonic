@@ -923,10 +923,12 @@ mod tests {
                 RecordedEvent {
                     seq: 0,
                     occurred_at_ms: 0,
-                    event: HarnessEvent::RunStarted {
+                    event: HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                         run_id: run_id.clone(),
-                        agent_id: AgentId::new("agent_1").unwrap(),
-                    },
+                        identity: platonic_core::RunIdentity::LegacyAgent {
+                            agent_id: AgentId::new("agent_1").unwrap(),
+                        },
+                    }),
                 },
                 RecordedEvent {
                     seq: 1,
@@ -977,10 +979,12 @@ mod tests {
                 RecordedEvent {
                     seq: 0,
                     occurred_at_ms: 0,
-                    event: HarnessEvent::RunStarted {
+                    event: HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                         run_id: run_id.clone(),
-                        agent_id: AgentId::new("agent_1").unwrap(),
-                    },
+                        identity: platonic_core::RunIdentity::LegacyAgent {
+                            agent_id: AgentId::new("agent_1").unwrap(),
+                        },
+                    }),
                 },
                 RecordedEvent {
                     seq: 1,

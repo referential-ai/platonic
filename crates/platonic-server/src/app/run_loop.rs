@@ -102,10 +102,10 @@ pub(crate) fn run_prepared_question(
     record_event(
         recorder,
         &options,
-        HarnessEvent::RunStarted {
+        HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
             run_id: run_id.clone(),
-            agent_id,
-        },
+            identity: platonic_core::RunIdentity::LegacyAgent { agent_id },
+        }),
     )?;
 
     let mut computer = if config
@@ -1571,7 +1571,7 @@ base_url = "http://{}"
 
         let records =
             crate::ledger::read_sqlite_records(&ledger_path, Some("run_compacted")).unwrap();
-        assert!(matches!(records[0].event, HarnessEvent::RunStarted { .. }));
+        assert!(matches!(records[0].event, HarnessEvent::RunStarted(_)));
         match &records[1].event {
             HarnessEvent::ContextCompacted {
                 turn_id,
@@ -1671,7 +1671,7 @@ base_url = "http://{}"
                 .iter()
                 .any(|record| matches!(record.event, HarnessEvent::ContextCompacted { .. }))
         );
-        assert!(matches!(records[0].event, HarnessEvent::RunStarted { .. }));
+        assert!(matches!(records[0].event, HarnessEvent::RunStarted(_)));
         assert!(matches!(
             records[1].event,
             HarnessEvent::ContextBuilt { .. }
@@ -1709,7 +1709,7 @@ base_url = "http://{}"
             crate::ledger::read_sqlite_records(&ledger_path, Some("run_compacted_over_budget"))
                 .unwrap();
         assert_eq!(records.len(), 3);
-        assert!(matches!(records[0].event, HarnessEvent::RunStarted { .. }));
+        assert!(matches!(records[0].event, HarnessEvent::RunStarted(_)));
         assert!(matches!(
             records[1].event,
             HarnessEvent::ContextCompacted {
@@ -4160,10 +4160,12 @@ enabled = ["file.read"]
         record_event(
             &mut recorder,
             &options,
-            HarnessEvent::RunStarted {
+            HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: run_id.clone(),
-                agent_id: AgentId::new("plato").unwrap(),
-            },
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+            }),
         )
         .unwrap();
 
@@ -4807,10 +4809,12 @@ enabled = ["file.read"]
                 .unwrap();
             let turn_id = TurnId::new("turn_1").unwrap();
             let events = [
-                HarnessEvent::RunStarted {
+                HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                     run_id: run_id.clone(),
-                    agent_id: AgentId::new("plato").unwrap(),
-                },
+                    identity: platonic_core::RunIdentity::LegacyAgent {
+                        agent_id: AgentId::new("plato").unwrap(),
+                    },
+                }),
                 HarnessEvent::ContextBuilt {
                     run_id: run_id.clone(),
                     turn_id: turn_id.clone(),
@@ -5724,7 +5728,7 @@ enabled = ["file.read"]
 
     fn assert_context_budget_terminal_records(records: &[RecordedEvent]) {
         assert_eq!(records.len(), 2);
-        assert!(matches!(records[0].event, HarnessEvent::RunStarted { .. }));
+        assert!(matches!(records[0].event, HarnessEvent::RunStarted(_)));
         match &records[1].event {
             HarnessEvent::RunFailed { reason, .. } => {
                 assert!(reason.contains("context budget exceeded: used "));

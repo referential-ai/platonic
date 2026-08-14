@@ -473,7 +473,7 @@ fn harness_event_turn_id(event: &HarnessEvent) -> Option<&platonic_core::TurnId>
         | HarnessEvent::ModelResponded { turn_id, .. }
         | HarnessEvent::ToolProposalsRejected { turn_id, .. }
         | HarnessEvent::ToolCallProposed { turn_id, .. } => Some(turn_id),
-        HarnessEvent::RunStarted { .. }
+        HarnessEvent::RunStarted(_)
         | HarnessEvent::PolicyEvaluated { .. }
         | HarnessEvent::ApprovalGranted { .. }
         | HarnessEvent::ApprovalDenied { .. }
@@ -536,6 +536,7 @@ fn sqlite_record_from_row(row: &rusqlite::Row<'_>) -> AppResult<RecordedEvent> {
             Box::new(error),
         ))
     })?;
+    super::types::validate_ledger_identity(version, &event)?;
     Ok(RecordedEvent {
         seq: row_u64(row, 0, "seq")?,
         occurred_at_ms: row_u64(row, 1, "occurred_at_ms")?,
@@ -975,10 +976,12 @@ mod tests {
     }
 
     fn status_started_event(run_id: &str) -> HarnessEvent {
-        HarnessEvent::RunStarted {
+        HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
             run_id: RunId::new(run_id).unwrap(),
-            agent_id: AgentId::new("plato").unwrap(),
-        }
+            identity: platonic_core::RunIdentity::LegacyAgent {
+                agent_id: AgentId::new("plato").unwrap(),
+            },
+        })
     }
 
     fn status_response_event(
