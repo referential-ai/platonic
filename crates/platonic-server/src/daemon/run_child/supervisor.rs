@@ -1,6 +1,7 @@
 use super::messages::{
     ApprovalReply, ChildMessage, ChildRunResult, ParentMessage, RecordOperation,
 };
+use crate::tool_catalog::{COMPUTER_OBSERVE, COMPUTER_WINDOWS};
 use crate::{
     AppError, AppResult, ApprovalMode, RunEvent, RunOutcome,
     app::{ExternalApprovalOutcome, PreparedRun},
@@ -608,7 +609,12 @@ fn run_supervised_with_limits(
         event_sender,
         terminal: None,
     };
-    let child_env = match crate::tools::supervised_run_child_env(prepared.provider_api_key_env()) {
+    let computer_enabled =
+        prepared.has_tool(COMPUTER_WINDOWS) || prepared.has_tool(COMPUTER_OBSERVE);
+    let child_env = match crate::tools::supervised_run_child_env(
+        prepared.provider_api_key_env(),
+        computer_enabled,
+    ) {
         Ok(child_env) => child_env,
         Err(error) => return recorder.complete(&run_id, Err(error), false),
     };

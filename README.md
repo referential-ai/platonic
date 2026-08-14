@@ -93,6 +93,33 @@ Then run `platonic gateway http`. A non-loopback bind additionally requires
 external TLS. The generated OpenAPI 3.1 contract is
 [`openapi/gateway-v1.yaml`](openapi/gateway-v1.yaml).
 
+### Unreleased Linux desktop observation
+
+Platonic can expose screenshot-free, read-only X11/XWayland observation through
+an operator-supplied `cua-driver 0.19.3` executable. The server neither installs
+nor updates the driver. Enable both tools only from an explicit,
+`PLATO_CONFIG`, or canonical user configuration:
+
+```toml
+[computer]
+executable = "/absolute/path/to/cua-driver"
+
+[tools]
+enabled = [
+  "file.read",
+  "file.list",
+  "computer.windows",
+  "computer.observe",
+]
+```
+
+Omit `computer.executable` to resolve `cua-driver` from the server process
+`PATH`. Both tools remain disabled by default and require local approval;
+native Wayland, macOS, Windows, screenshots, and desktop mutation are outside
+this slice. The direct child uses Cua's `standard` permission mode; Platonic's
+fixed method allowlist and approvals remain the authority boundary. Workspace
+`plato.toml` files cannot configure or enable the tools.
+
 ## Boundary
 
 `platonic-core` is an independent harness contract, not the Platonic product

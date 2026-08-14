@@ -25,7 +25,7 @@ An explicit or `PLATO_CONFIG` path may start with `~`; a relative path resolves 
 
 A client-supplied `--config` path is carried by one-shot and unattached session runs. With `plato --tui --config FILE`, that file supplies the proposed root thread's model, but an attached durable-thread turn does not carry it in `thread.send`. Use `PLATO_CONFIG` in the server environment or user config for trusted provider settings that must govern attached turns. The thread's admitted model and toolset remain immutable.
 
-The auto-discovered workspace `plato.toml` is untrusted. It cannot contain `provider.api_key_env`, `provider.base_url`, `[gateway]`, `[principals]`, `limits.max_spawn_depth`, or `[confinement]`. Put trusted provider fields in an explicitly selected config, the `PLATO_CONFIG` file, or user config. The [Discord operations page](../../user/operations/discord/) routes gateway and principal configuration to its detailed owner.
+The auto-discovered workspace `plato.toml` is untrusted. It cannot contain `provider.api_key_env`, `provider.base_url`, `[gateway]`, `[principals]`, `[computer]`, `limits.max_spawn_depth`, `[confinement]`, or enable a `computer.*` tool. Put trusted provider and computer fields in an explicitly selected config, the `PLATO_CONFIG` file, or user config. The [Discord operations page](../../user/operations/discord/) routes gateway and principal configuration to its detailed owner.
 
 Server startup reads `limits.max_spawn_depth` and `confinement.require` only from `$HOME/.config/plato/config.toml`, then falls back to defaults. Restart an idle server after changing either field.
 
@@ -116,7 +116,7 @@ enabled = [
 ]
 ```
 
-The `tools.enabled` list must be nonempty and every name must be known. `thread.spawn` is implemented but is not enabled by default.
+The `tools.enabled` list must be nonempty and every name must be known. `thread.spawn`, `computer.windows`, and `computer.observe` are implemented but are not enabled by default.
 
 | Tool | Effect and operational control |
 | --- | --- |
@@ -125,8 +125,23 @@ The `tools.enabled` list must be nonempty and every name must be known. `thread.
 | `shell.exec` | External side effect; exact shipped tool always enters local approval policy |
 | `web.fetch` | Network; exact shipped tool always requires explicit local approval and never receives a yolo auto-grant |
 | `thread.spawn` | Workspace write; also bounded by immutable parent authority and `max_spawn_depth` |
+| `computer.windows`, `computer.observe` | Secret access; every window listing and the first observation of each opaque target require explicit local approval and never accept yolo |
 
 The root thread's resolved toolset determines whether it needs a writable path and whether it receives network authority. Removing `web.fetch` from the toolset prevents that tool and removes the network-effect source for newly admitted root threads. Existing thread authority does not change when TOML changes, and child threads cannot widen a parent's tools, paths, repositories, network, or approval policy.
+
+## Linux desktop observation
+
+The optional computer tools support screenshot-free, read-only X11 and XWayland observation through exactly `cua-driver 0.19.3`. Platonic does not install, update, bundle, or start a global Cua service. Select an operator-trusted absolute executable in an explicit, `PLATO_CONFIG`, or canonical user configuration:
+
+```toml
+[computer]
+executable = "/absolute/path/to/cua-driver"
+
+[tools]
+enabled = ["computer.windows", "computer.observe"]
+```
+
+When `computer.executable` is omitted, the server resolves `cua-driver` from its own `PATH`. Any other or malformed version fails closed. The direct child uses Cua's `standard` permission mode; Platonic's fixed method allowlist and approvals remain the authority boundary. Native Wayland, macOS, Windows, screenshots, image output, and desktop mutation are unsupported. `computer.windows` returns bounded run-local opaque references; `computer.observe` accepts only one of those references and returns bounded semantic accessibility fields. References expire with the run or whenever the driver, display, process, or window identity changes.
 
 ## Worktrees and confinement
 

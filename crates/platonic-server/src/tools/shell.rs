@@ -37,6 +37,15 @@ const SHELL_ENV_ALLOWLIST: &[&str] = &[
     "CARGO_HOME",
     "RUSTUP_HOME",
 ];
+const COMPUTER_ENV_ALLOWLIST: &[&str] = &[
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_SESSION_TYPE",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "AT_SPI_BUS_ADDRESS",
+    "XDG_RUNTIME_DIR",
+];
 #[cfg(unix)]
 type ShellChild = Child;
 #[derive(Debug, Deserialize)]
@@ -172,13 +181,15 @@ fn shell_child_env(provider_api_key_env: Option<&str>) -> Vec<(String, String)> 
 
 pub(crate) fn supervised_run_child_env(
     provider_api_key_env: &str,
+    computer_enabled: bool,
 ) -> AppResult<Vec<(OsString, OsString)>> {
-    supervised_run_child_env_from(env::vars_os(), provider_api_key_env)
+    supervised_run_child_env_from(env::vars_os(), provider_api_key_env, computer_enabled)
 }
 
 fn supervised_run_child_env_from(
     vars: impl IntoIterator<Item = (OsString, OsString)>,
     provider_api_key_env: &str,
+    computer_enabled: bool,
 ) -> AppResult<Vec<(OsString, OsString)>> {
     let mut child_env = Vec::new();
     let mut provider_api_key = None;
@@ -188,7 +199,9 @@ fn supervised_run_child_env_from(
         };
         if shell_env_names_equal(provider_api_key_env, name_text) {
             provider_api_key = Some(value);
-        } else if shell_child_env_name_is_allowed(name_text, Some(provider_api_key_env)) {
+        } else if shell_child_env_name_is_allowed(name_text, Some(provider_api_key_env))
+            || computer_enabled && COMPUTER_ENV_ALLOWLIST.contains(&name_text)
+        {
             child_env.push((name, value));
         }
     }
@@ -350,7 +363,7 @@ mod tests {
             ("UNKNOWN_PARENT_SETTING".into(), "unknown-sentinel".into()),
         ]);
 
-        let env = supervised_run_child_env_from(vars, "PLATONIC_CUSTOM_PROVIDER").unwrap();
+        let env = supervised_run_child_env_from(vars, "PLATONIC_CUSTOM_PROVIDER", false).unwrap();
         let mut expected = SHELL_ENV_ALLOWLIST
             .iter()
             .map(|name| ((*name).into(), format!("baseline-{name}").into()))
@@ -368,6 +381,7 @@ mod tests {
         let error = supervised_run_child_env_from(
             [("PATH".into(), "/bin".into())],
             "PLATONIC_MISSING_PROVIDER",
+            false,
         )
         .unwrap_err();
 
@@ -385,6 +399,7 @@ mod tests {
                 ("HOME".into(), "/home/user".into()),
             ],
             "PATH",
+            false,
         )
         .unwrap();
 
@@ -397,6 +412,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn supervised_run_child_forwards_desktop_session_only_for_computer_tools() {
+        let vars = [
+            (
+                OsString::from("PLATONIC_PROVIDER"),
+                OsString::from("secret"),
+            ),
+            (OsString::from("DISPLAY"), OsString::from(":1")),
+            (
+                OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+                OsString::from("unix:path=/run/user/1000/bus"),
+            ),
+        ];
+
+        let enabled =
+            supervised_run_child_env_from(vars.clone(), "PLATONIC_PROVIDER", true).unwrap();
+        assert_eq!(
+            enabled,
+            [
+                (OsString::from("DISPLAY"), OsString::from(":1")),
+                (
+                    OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+                    OsString::from("unix:path=/run/user/1000/bus"),
+                ),
+                (
+                    OsString::from("PLATONIC_PROVIDER"),
+                    OsString::from("secret")
+                ),
+            ]
+        );
+
+        let disabled = supervised_run_child_env_from(vars, "PLATONIC_PROVIDER", false).unwrap();
+        assert_eq!(
+            disabled,
+            [(
+                OsString::from("PLATONIC_PROVIDER"),
+                OsString::from("secret")
+            )]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn supervised_run_child_env_matches_unix_provider_names_case_sensitively() {
@@ -406,6 +462,7 @@ mod tests {
                 "provider-sentinel".into(),
             )],
             "PLATONIC_CUSTOM_PROVIDER",
+            false,
         )
         .unwrap_err();
 
@@ -432,6 +489,7 @@ mod tests {
                 ),
             ],
             "PLATONIC_CUSTOM_PROVIDER",
+            false,
         )
         .unwrap();
 
@@ -629,6 +687,7 @@ mod tests {
                 provider_api_key_env: None,
                 cancel: Some(&cancel),
                 thread_spawn: None,
+                computer: None,
                 approving_actor: None,
             },
             ToolCallId::new("call_1").unwrap(),

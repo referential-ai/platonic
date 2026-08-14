@@ -1,4 +1,5 @@
 mod approval;
+pub(crate) mod computer;
 mod files;
 pub mod github;
 mod memory;
@@ -14,11 +15,13 @@ pub(crate) use memory::{
 };
 pub(crate) use shell::supervised_run_child_env;
 
+use computer::ComputerToolHandler;
 use files::{list_directory, read_file, write_file};
 use shell::shell_exec;
 
 use crate::tool_catalog::{
-    FILE_EDIT, FILE_LIST, FILE_READ, FILE_WRITE, SHELL_EXEC, THREAD_SPAWN, WEB_FETCH,
+    COMPUTER_OBSERVE, COMPUTER_WINDOWS, FILE_EDIT, FILE_LIST, FILE_READ, FILE_WRITE, SHELL_EXEC,
+    THREAD_SPAWN, WEB_FETCH,
 };
 use crate::{AppError, AppResult};
 use platonic_core::{ResultVisibility, ToolResult};
@@ -89,12 +92,13 @@ impl ThreadSpawnToolHandler {
         (self.execute)(input, approving_actor)
     }
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct ToolExecutionContext<'a> {
     pub workspace_root: &'a Path,
     pub provider_api_key_env: Option<&'a str>,
     pub cancel: Option<&'a AtomicBool>,
     pub(crate) thread_spawn: Option<&'a ThreadSpawnToolHandler>,
+    pub(crate) computer: Option<&'a mut ComputerToolHandler>,
     pub(crate) approving_actor: Option<&'a str>,
 }
 
@@ -105,6 +109,7 @@ impl<'a> ToolExecutionContext<'a> {
             provider_api_key_env: None,
             cancel: None,
             thread_spawn: None,
+            computer: None,
             approving_actor: None,
         }
     }
@@ -138,6 +143,10 @@ pub fn execute_tool_with_context(
         SHELL_EXEC => shell_exec(context, call_id, input),
         WEB_FETCH => web::fetch(call_id, input, context.cancel),
         THREAD_SPAWN => spawn_thread(context, call_id, input),
+        COMPUTER_WINDOWS | COMPUTER_OBSERVE => context
+            .computer
+            .ok_or_else(|| AppError::Tool("computer_disabled".into()))?
+            .execute(call_id, tool_name, input),
         _ => Err(AppError::Tool(format!("unknown tool: {tool_name}"))),
     }
 }
@@ -192,6 +201,7 @@ mod tests {
                 provider_api_key_env: None,
                 cancel: None,
                 thread_spawn: Some(&handler),
+                computer: None,
                 approving_actor: Some("reviewer"),
             },
             ToolCallId::new("call_spawn").unwrap(),
@@ -215,6 +225,7 @@ mod tests {
                 provider_api_key_env: None,
                 cancel: None,
                 thread_spawn: Some(&handler),
+                computer: None,
                 approving_actor: None,
             },
             ToolCallId::new("call_without_actor").unwrap(),
