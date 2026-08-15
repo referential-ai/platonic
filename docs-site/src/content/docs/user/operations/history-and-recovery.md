@@ -7,7 +7,7 @@ sidebar:
 
 <p class="section-kicker user">User docs</p>
 
-This page is part of the [Platonic 0.2.0 operating guide](../).
+This page is part of the [Platonic 0.2.1 operating guide](../).
 
 ## What persists
 
@@ -77,7 +77,7 @@ A server restart preserves registered workspaces, profiles, thread authority, an
 | Provider rejects the model or endpoint | Use `/status` or `platonic status` to read `provider_kind`, `requested_alias`, and the served model when reported. Compare the resolved `kind`, `model`, and trusted `base_url`. | Correct the [provider configuration](../../../reference/configuration/#provider-shapes). Use `platonic profile update` for future defaults; existing thread authority does not change. |
 | Provider connection or stream stalls | Compare the failure timing with `connect_timeout_ms` and `stream_idle_timeout_ms`. | Correct the endpoint or set a positive bounded timeout in trusted config; do not expose the credential in a connectivity command. |
 | Run becomes `interrupted` after a server failure or restart | Reconnect and inspect `/status`, then replay the printed run ID. | Treat committed facts as authoritative. Start a deliberate follow-up turn; do not blindly repeat a tool with external effects. |
-| Replay says the run is missing or the ledger/version is invalid | Verify the exact run ID and ledger path from prior output or status. | Use the matching 0.2.0 client and the correct registered workspace or explicit ledger. Preserve the rejected data for diagnosis. |
+| Replay says the run is missing or the ledger/version is invalid | Verify the exact run ID and ledger path from prior output or status. | Use the client from the matching 0.2.1 bundle and the correct registered workspace or explicit ledger. Preserve the rejected data for diagnosis. |
 | TUI reports a lagged event stream | Wait for its bounded current-tip reload and inspect the warning or audit view. | If it becomes disconnected, use `r`; otherwise continue from the reloaded committed state. |
 | TUI says another controller owns the active turn | Read `plato thread status THREAD_ID` and attach as an observer if needed. | Let the owning controller finish or steer from that controller. Do not reset or delete the thread. |
 | Color or animation makes the terminal unreadable | Start once with `NO_COLOR=1 plato` or `plato --reduced-motion`. | Keep the setting that fixes the terminal; no server or ledger reset is needed. |

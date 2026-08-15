@@ -1,5 +1,10 @@
 # Changelog
 
+## Platonic 0.2.1 - 2026-08-15
+
+- Preserve profile yolo auto-approval for eligible tool calls made by
+  supervised run children.
+
 ## Platonic 0.2.0 - 2026-08-15
 
 - Complete the five-phase profile train: durable profile registry and revisions,

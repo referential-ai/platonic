@@ -7,7 +7,7 @@ sidebar:
 
 <p class="section-kicker user">User docs</p>
 
-This page is part of the [Platonic 0.2.0 operating guide](../).
+This page is part of the [Platonic 0.2.1 operating guide](../).
 
 The Platonic server evaluates every tool proposal against server-owned run limits: the configured toolset, any durable thread path and network grants, and the applicable approval policy and profile. A client can answer a prompt; it cannot widen those limits.
 
