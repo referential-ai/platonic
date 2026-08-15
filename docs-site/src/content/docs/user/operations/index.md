@@ -8,11 +8,9 @@ sidebar:
 
 <p class="section-kicker user">User docs</p>
 
-> **Unreleased 0.2.0 documentation:** These pages describe the current `develop`
-> behavior. The public release is still 0.1.0; no released 0.2.0 bundle or
-> bundle-install proof exists. The first journey was verified with binaries
-> built from its exact source commit. Do not treat or publish this guide as
-> release-current until `platonic-v0.2.0` exists.
+> **Platonic 0.2.0 documentation:** These pages describe the current public
+> release. Install its supported bundle through the [release track](../install/)
+> before using this guide.
 
 Complete the [first productive journey](../first-run/) before using this section as the daily reference.
 

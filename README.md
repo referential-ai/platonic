@@ -15,15 +15,12 @@ owns the product hierarchy and exact forms.
 
 ## Start here
 
-- **Current public release (0.1.0):** install the supported command bundle from
+- **Current public release (0.2.0):** install the supported command bundle from
   the concise [quickstart](docs/QUICKSTART.md), then use the
-  [matching release documentation](https://github.com/referential-ai/platonic/blob/platonic-v0.1.0/docs/QUICKSTART.md).
-- **Unreleased `develop` / 0.2.0:** read the Starlight
+  [matching release documentation](https://github.com/referential-ai/platonic/blob/platonic-v0.2.0/docs/QUICKSTART.md).
+- **Platonic 0.2.0 user guide:** read the Starlight
   [user overview](https://docs.referential.ai/user/) and complete the
   [first productive journey](https://docs.referential.ai/user/first-run/).
-  No released 0.2.0 bundle or bundle-install proof exists; the journey uses
-  exact-head local binaries and must not be published as current documentation
-  until the `platonic-v0.2.0` release exists.
 - **Release artifacts and verification:** use the
   [release contract](https://github.com/referential-ai/platonic/blob/develop/docs/RELEASE.md).
 
@@ -64,7 +61,7 @@ npm run build
 npm run crawl
 ```
 
-### Unreleased profile thread lifecycle
+### Profile thread lifecycle
 
 Protocol v2 clients use `profile.create`, `profile.list`, `profile.status`,
 `profile.update`, and `profile.open` to manage a profile and its one lazy home
@@ -81,7 +78,7 @@ model tools let a same-profile child return a bounded value and its parent
 answer it. `platonic profile` is the operator surface; bare `plato` selects or
 creates a profile and reuses its home.
 
-### Unreleased HTTP gateway
+### HTTP gateway
 
 `platonic gateway http` exposes the bounded authenticated `/v2` HTTP/SSE
 adapter on `127.0.0.1:8787` by default. It is plaintext and intended only for
@@ -115,7 +112,7 @@ generated OpenAPI 3.1 contract is
 was merged but never released, so v2 replaces it rather than serving a legacy
 adapter or deprecation window.
 
-### Unreleased Linux desktop observation
+### Linux desktop observation
 
 Platonic can expose screenshot-free, read-only X11/XWayland observation through
 an operator-supplied `cua-driver 0.19.3` executable. The server neither installs

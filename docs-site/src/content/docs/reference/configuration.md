@@ -7,7 +7,7 @@ sidebar:
 
 <p class="section-kicker reference">Reference</p>
 
-This page is part of the [unreleased 0.2.0 operating guide](../../user/operations/).
+This page is part of the [Platonic 0.2.0 operating guide](../../user/operations/).
 
 Configuration names environment variables that contain credentials. It never contains a credential value.
 
@@ -31,7 +31,7 @@ Server startup reads `limits.max_spawn_depth` and `confinement.require` only fro
 
 ## HTTP gateway scope
 
-The unreleased HTTP/SSE adapter serves `/v2` on loopback by default. Generate
+The HTTP/SSE adapter serves `/v2` on loopback by default. Generate
 bearer material with `platonic gateway http --generate-token`, store only its
 lowercase SHA-256 hash, and bind each principal to at least one workspace:
 

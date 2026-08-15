@@ -5,9 +5,9 @@ second copy of the user manual.
 
 <a id="0-one-time-setup"></a>
 
-## Current public release: 0.1.0
+## Current public release: 0.2.0
 
-Install the released 0.1.0 bundle for Linux x86-64 or macOS Apple silicon:
+Install the released 0.2.0 bundle for Linux x86-64 or macOS Apple silicon:
 
 ```bash
 case "$(uname -s)-$(uname -m)" in
@@ -16,8 +16,8 @@ case "$(uname -s)-$(uname -m)" in
   *) echo "unsupported platform" >&2; exit 1 ;;
 esac
 
-bundle="platonic-0.1.0-$target"
-release="https://github.com/referential-ai/platonic/releases/download/platonic-v0.1.0"
+bundle="platonic-0.2.0-$target"
+release="https://github.com/referential-ai/platonic/releases/download/platonic-v0.2.0"
 curl -fLO "$release/$bundle.tar.gz"
 curl -fLO "$release/$bundle.sha256"
 
@@ -39,19 +39,17 @@ plato --version
 plato-tui --version
 ```
 
-The tag is exactly `platonic-v0.1.0`. See the
+The tag is exactly `platonic-v0.2.0`. See the
 [release contract](https://github.com/referential-ai/platonic/blob/develop/docs/RELEASE.md)
 for archive contents, supported targets, and verification details.
 
-## Unreleased develop / 0.2.0
+## Platonic 0.2.0 user guide
 
 The Starlight [user overview](https://docs.referential.ai/user/) and
 [first productive journey](https://docs.referential.ai/user/first-run/)
-document current `develop` behavior. They use one OpenRouter route and exact
-what-you-see checkpoints with binaries built from the exact source commit. No
-released 0.2.0 bundle or bundle-install proof exists, so they are review
-documentation, not the current public release guide, until
-`platonic-v0.2.0` exists.
+document the released behavior. They use one OpenRouter route and exact
+what-you-see checkpoints. The tagged quickstart above owns bundle installation;
+the journey owns first-use verification.
 
 ## 5. Local voice activation and device proof
 
