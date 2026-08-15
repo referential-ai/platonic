@@ -702,6 +702,8 @@ mod tests {
                 cancel: Some(&cancel),
                 thread_spawn: None,
                 logical_read: None,
+                thread_return: None,
+                parent_answer: None,
                 computer: None,
                 approving_actor: None,
             },

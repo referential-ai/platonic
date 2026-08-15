@@ -9,7 +9,8 @@ pub(super) use runs::reconcile_one_shot_run_roots;
 pub(in crate::daemon) use sessions::typed_entries_for_run;
 #[cfg(test)]
 pub(in crate::daemon) use threads::tests::{
-    grant_thread, pending_spawn, start_thread_for_logical_read, thread_test_runtime,
+    child_return_test_runtime, grant_thread, pending_spawn, start_thread_for_logical_read,
+    thread_test_runtime,
 };
 pub(in crate::daemon) use threads::thread_session_id;
 

@@ -6,9 +6,11 @@ use crate::{
     AppError, AppResult, ApprovalMode, ApprovalRequest, AssistantDeltaEvent, RunEvent,
     app::{ExternalApprovalOutcome, run_prepared_question},
     ledger::RunEventRecorder,
-    tool_catalog::THREAD_SPAWN,
+    tool_catalog::{THREAD_ANSWER, THREAD_RETURN, THREAD_SPAWN},
     tools::{
-        LogicalReadRequest, LogicalReadToolHandler, LogicalReadToolOutput, ThreadSpawnToolHandler,
+        LogicalReadRequest, LogicalReadToolHandler, LogicalReadToolOutput, ParentAnswerToolHandler,
+        ParentAnswerToolInput, ParentAnswerToolOutput, ThreadReturnToolHandler,
+        ThreadReturnToolInput, ThreadReturnToolOutput, ThreadSpawnToolHandler,
         ThreadSpawnToolInput, ThreadSpawnToolOutput,
     },
 };
@@ -77,6 +79,18 @@ pub fn run_stdio_child() -> AppResult<()> {
         let logical_read_rpc = rpc.clone();
         LogicalReadToolHandler::new(move |request| logical_read_rpc.logical_read(request))
     });
+    let thread_return = prepared.has_tool(THREAD_RETURN).then(|| {
+        let thread_return_rpc = rpc.clone();
+        ThreadReturnToolHandler::new(move |input, call_id| {
+            thread_return_rpc.thread_return(call_id, input)
+        })
+    });
+    let parent_answer = prepared.has_tool(THREAD_ANSWER).then(|| {
+        let parent_answer_rpc = rpc.clone();
+        ParentAnswerToolHandler::new(move |input, call_id| {
+            parent_answer_rpc.parent_answer(call_id, input)
+        })
+    });
     let outcome = run_prepared_question(
         prepared,
         &mut recorder,
@@ -87,6 +101,8 @@ pub fn run_stdio_child() -> AppResult<()> {
         crate::tools::RunToolHandlers {
             thread_spawn,
             logical_read,
+            thread_return,
+            parent_answer,
         },
     );
     event_forwarder
@@ -243,6 +259,46 @@ impl ChildRpc {
         }
     }
 
+    fn thread_return(
+        &self,
+        call_id: platonic_core::ToolCallId,
+        input: ThreadReturnToolInput,
+    ) -> AppResult<ThreadReturnToolOutput> {
+        let _transaction = self.transaction.lock().expect("child RPC lock poisoned");
+        let request_id = self.next_request_id();
+        self.send(&ChildMessage::ThreadReturn {
+            request_id,
+            call_id,
+            input,
+        })?;
+        match self.next_reply(request_id)? {
+            ParentMessage::ThreadReturn { output, .. } => Ok(output),
+            _ => Err(AppError::SupervisedRun(
+                "parent sent a non-return reply to thread.return".into(),
+            )),
+        }
+    }
+
+    fn parent_answer(
+        &self,
+        call_id: platonic_core::ToolCallId,
+        input: ParentAnswerToolInput,
+    ) -> AppResult<ParentAnswerToolOutput> {
+        let _transaction = self.transaction.lock().expect("child RPC lock poisoned");
+        let request_id = self.next_request_id();
+        self.send(&ChildMessage::ParentAnswer {
+            request_id,
+            call_id,
+            input,
+        })?;
+        match self.next_reply(request_id)? {
+            ParentMessage::ParentAnswer { output, .. } => Ok(output),
+            _ => Err(AppError::SupervisedRun(
+                "parent sent a non-answer reply to thread.answer".into(),
+            )),
+        }
+    }
+
     fn result(&self, result: ChildRunResult) -> AppResult<()> {
         let _transaction = self.transaction.lock().expect("child RPC lock poisoned");
         let request_id = self.next_request_id();
@@ -293,6 +349,14 @@ impl ChildRpc {
                 ..
             }
             | ParentMessage::LogicalRead {
+                request_id: reply_id,
+                ..
+            }
+            | ParentMessage::ThreadReturn {
+                request_id: reply_id,
+                ..
+            }
+            | ParentMessage::ParentAnswer {
                 request_id: reply_id,
                 ..
             } if *reply_id == request_id => {}

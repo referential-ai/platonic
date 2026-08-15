@@ -1,15 +1,19 @@
 use super::{
     BranchClaimConflict, BranchClaimRecord,
     rows::{
-        agent_from_row, effect_to_text, invalid_thread_column, profile_from_row,
-        profile_revision_from_row, thread_authority_from_row, thread_profile_authority_from_row,
-        tool_call_approval_from_row, workspace_from_row,
+        agent_from_row, child_return_from_row, effect_to_text, invalid_thread_column,
+        parent_answer_from_row, profile_from_row, profile_revision_from_row,
+        thread_authority_from_row, thread_profile_authority_from_row,
+        thread_run_admission_from_row, tool_call_approval_from_row, workspace_from_row,
     },
     schema::migrate_server_schema,
     types::{
-        AgentRecord, DurableThreadAuthority, HomeReservationRecord, HomeReservationState,
-        ProfileHomeProposal, ProfileRecord, ProfileRevisionContent, ProfileRevisionRecord,
-        ReserveProfileHomeResult, RunCancellationRecord, ToolCallApprovalDecision,
+        AgentRecord, ChildReturnDraft, ChildReturnRecord, DurableThreadAuthority,
+        HomeReservationRecord, HomeReservationState, MAX_CHILD_RETURN_PAYLOAD_BYTES,
+        MAX_UNCONSUMED_NONTERMINAL_RETURNS, ParentAnswerDraft, ParentAnswerRecord,
+        PersistChildReturnResult, PersistParentAnswerResult, ProfileHomeProposal, ProfileRecord,
+        ProfileRevisionContent, ProfileRevisionRecord, ReserveProfileHomeResult,
+        RunCancellationRecord, ThreadRunAdmission, ToolCallApprovalDecision,
         ToolCallApprovalRecord, WorkspaceRecord,
     },
 };
@@ -32,6 +36,20 @@ use std::{
 };
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const CHILD_RETURN_SELECT: &str =
+    "SELECT sequence, message_id, spawn_id, profile_id, parent_thread_id,
+            child_thread_id, source_run_id, source_turn_id, kind, payload,
+            artifact_refs, truncated, created_at_ms, profile_revision, state,
+            reserved_by_run_id, reserved_by_turn_id, consumed_by_run_id,
+            consumed_by_turn_id, consumed_at_ms
+       FROM child_returns";
+const PARENT_ANSWER_SELECT: &str =
+    "SELECT sequence, message_id, spawn_id, profile_id, parent_thread_id,
+            child_thread_id, source_run_id, source_turn_id, kind, payload,
+            created_at_ms, profile_revision, state, reserved_by_run_id,
+            reserved_by_turn_id, consumed_by_run_id, consumed_by_turn_id,
+            consumed_at_ms
+       FROM parent_answers";
 
 pub(crate) struct ServerStore {
     connection: Connection,
@@ -1394,6 +1412,499 @@ impl ServerStore {
         thread_spawn_approval_from(&self.connection, spawn_id)
     }
 
+    pub(crate) fn persist_child_return(
+        &mut self,
+        draft: &ChildReturnDraft,
+    ) -> AppResult<PersistChildReturnResult> {
+        if draft.message_id.is_empty() {
+            return Ok(PersistChildReturnResult::Rejected {
+                code: "invalid_message_id".into(),
+                reason: "child return message id must not be empty".into(),
+            });
+        }
+        if !draft.kind.is_terminal() && draft.payload.len() > MAX_CHILD_RETURN_PAYLOAD_BYTES {
+            return Ok(PersistChildReturnResult::Rejected {
+                code: "payload_too_large".into(),
+                reason: format!(
+                    "child return payload exceeds {MAX_CHILD_RETURN_PAYLOAD_BYTES} bytes"
+                ),
+            });
+        }
+        let (payload, truncated) = if draft.kind.is_terminal() {
+            truncate_utf8_bytes(&draft.payload, MAX_CHILD_RETURN_PAYLOAD_BYTES)
+        } else {
+            (draft.payload.clone(), false)
+        };
+        let artifacts = serde_json::to_string(&draft.artifact_refs)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(edge) =
+            child_edge_from(&transaction, &draft.workspace_id, &draft.child_thread_id)?
+        else {
+            return Ok(PersistChildReturnResult::Rejected {
+                code: "source_denied".into(),
+                reason: "child return source is not an admitted child thread".into(),
+            });
+        };
+        let profile_revision = if let Some(run_id) = draft.source_run_id.as_deref() {
+            let Some(admission) = matching_thread_run(
+                &transaction,
+                run_id,
+                &draft.workspace_id,
+                &edge.profile_id,
+                &draft.child_thread_id,
+                draft.source_turn_id.as_deref(),
+            )?
+            else {
+                return Ok(PersistChildReturnResult::Rejected {
+                    code: "source_denied".into(),
+                    reason: "child return source run is not admitted for this child".into(),
+                });
+            };
+            admission.profile_revision
+        } else {
+            edge.profile_revision
+        };
+        if draft.kind.is_terminal()
+            && let Some(existing) = terminal_child_return(&transaction, &edge.spawn_id)?
+        {
+            return Ok(PersistChildReturnResult::Replayed(existing));
+        }
+        if let Some(existing) = child_return_by_id(&transaction, &draft.message_id)? {
+            return Ok(
+                if child_return_matches(
+                    &existing,
+                    draft,
+                    &edge,
+                    profile_revision,
+                    &payload,
+                    truncated,
+                ) {
+                    PersistChildReturnResult::Replayed(existing)
+                } else {
+                    PersistChildReturnResult::Rejected {
+                        code: "idempotency_conflict".into(),
+                        reason: "child return message id was already used for different content"
+                            .into(),
+                    }
+                },
+            );
+        }
+        if terminal_child_return(&transaction, &edge.spawn_id)?.is_some() {
+            return Ok(PersistChildReturnResult::Rejected {
+                code: "child_terminal".into(),
+                reason: "child already has a terminal return".into(),
+            });
+        }
+        if !draft.kind.is_terminal() {
+            let pending: i64 = transaction.query_row(
+                "SELECT count(*) FROM child_returns
+                 WHERE parent_thread_id = ?1
+                   AND kind IN ('progress', 'question')
+                   AND state != 'consumed'",
+                params![edge.parent_thread_id],
+                |row| row.get(0),
+            )?;
+            if pending >= MAX_UNCONSUMED_NONTERMINAL_RETURNS as i64 {
+                return Ok(PersistChildReturnResult::Rejected {
+                    code: "rate_limited".into(),
+                    reason: format!(
+                        "parent has {MAX_UNCONSUMED_NONTERMINAL_RETURNS} unconsumed nonterminal returns"
+                    ),
+                });
+            }
+        }
+        transaction.execute(
+            "INSERT INTO child_returns
+               (message_id, spawn_id, profile_id, parent_thread_id, child_thread_id,
+                source_run_id, source_turn_id, kind, payload, artifact_refs, truncated,
+                created_at_ms, profile_revision, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'available')",
+            params![
+                draft.message_id,
+                edge.spawn_id,
+                edge.profile_id.as_str(),
+                edge.parent_thread_id,
+                draft.child_thread_id,
+                draft.source_run_id,
+                draft.source_turn_id,
+                draft.kind.as_str(),
+                payload,
+                artifacts,
+                i64::from(truncated),
+                sqlite_i64(draft.created_at_ms, "child return created_at_ms")?,
+                sqlite_i64(profile_revision, "child return profile_revision")?,
+            ],
+        )?;
+        let record = child_return_by_id(&transaction, &draft.message_id)?
+            .expect("inserted child return is readable in its transaction");
+        transaction.commit()?;
+        Ok(PersistChildReturnResult::Stored(record))
+    }
+
+    pub(crate) fn persist_parent_answer(
+        &mut self,
+        draft: &ParentAnswerDraft,
+    ) -> AppResult<PersistParentAnswerResult> {
+        if draft.payload.len() > MAX_CHILD_RETURN_PAYLOAD_BYTES {
+            return Ok(PersistParentAnswerResult::Rejected {
+                code: "payload_too_large".into(),
+                reason: format!(
+                    "parent answer payload exceeds {MAX_CHILD_RETURN_PAYLOAD_BYTES} bytes"
+                ),
+            });
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(edge) = parent_answer_edge_from(
+            &transaction,
+            &draft.workspace_id,
+            &draft.parent_thread_id,
+            &draft.child_thread_id,
+        )?
+        else {
+            return Ok(PersistParentAnswerResult::Rejected {
+                code: "target_denied".into(),
+                reason: "target is not an immediate same-profile child".into(),
+            });
+        };
+        let Some(source_admission) = matching_thread_run(
+            &transaction,
+            &draft.source_run_id,
+            &draft.workspace_id,
+            &edge.profile_id,
+            &draft.parent_thread_id,
+            Some(&draft.source_turn_id),
+        )?
+        else {
+            return Ok(PersistParentAnswerResult::Rejected {
+                code: "source_denied".into(),
+                reason: "parent answer source run is not admitted for this parent".into(),
+            });
+        };
+        if let Some(existing) = parent_answer_by_id(&transaction, &draft.message_id)? {
+            return Ok(
+                if parent_answer_matches(&existing, draft, &edge, source_admission.profile_revision)
+                {
+                    PersistParentAnswerResult::Replayed(existing)
+                } else {
+                    PersistParentAnswerResult::Rejected {
+                        code: "idempotency_conflict".into(),
+                        reason: "parent answer message id was already used for different content"
+                            .into(),
+                    }
+                },
+            );
+        }
+        let stopped = transaction
+            .query_row(
+                "SELECT 1 FROM thread_stops WHERE thread_id = ?1",
+                params![draft.child_thread_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if stopped {
+            return Ok(PersistParentAnswerResult::Rejected {
+                code: "child_stopped".into(),
+                reason: "immediate child is stopped".into(),
+            });
+        }
+        if terminal_child_return(&transaction, &edge.spawn_id)?.is_some() {
+            return Ok(PersistParentAnswerResult::Rejected {
+                code: "child_terminal".into(),
+                reason: "immediate child already has a terminal return".into(),
+            });
+        }
+        transaction.execute(
+            "INSERT INTO parent_answers
+               (message_id, spawn_id, profile_id, parent_thread_id, child_thread_id,
+                source_run_id, source_turn_id, kind, payload, created_at_ms,
+                profile_revision, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'available')",
+            params![
+                draft.message_id,
+                edge.spawn_id,
+                edge.profile_id.as_str(),
+                draft.parent_thread_id,
+                draft.child_thread_id,
+                draft.source_run_id,
+                draft.source_turn_id,
+                draft.kind.as_str(),
+                draft.payload,
+                sqlite_i64(draft.created_at_ms, "parent answer created_at_ms")?,
+                sqlite_i64(
+                    source_admission.profile_revision,
+                    "parent answer profile_revision"
+                )?,
+            ],
+        )?;
+        let record = parent_answer_by_id(&transaction, &draft.message_id)?
+            .expect("inserted parent answer is readable in its transaction");
+        transaction.commit()?;
+        Ok(PersistParentAnswerResult::Stored(record))
+    }
+
+    pub(crate) fn available_child_returns(
+        &self,
+        parent_thread_id: &str,
+        run_id: &str,
+    ) -> AppResult<Vec<ChildReturnRecord>> {
+        let mut statement = self.connection.prepare(&format!(
+            "{CHILD_RETURN_SELECT}
+             WHERE parent_thread_id = ?1
+               AND ((state = 'available' AND NOT EXISTS (
+                       SELECT 1 FROM thread_run_admissions WHERE run_id = ?2
+                    )) OR reserved_by_run_id = ?2 OR consumed_by_run_id = ?2)
+             ORDER BY sequence ASC"
+        ))?;
+        Ok(statement
+            .query_map(params![parent_thread_id, run_id], child_return_from_row)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn available_parent_answers(
+        &self,
+        child_thread_id: &str,
+        run_id: &str,
+    ) -> AppResult<Vec<ParentAnswerRecord>> {
+        let mut statement = self.connection.prepare(&format!(
+            "{PARENT_ANSWER_SELECT}
+             WHERE child_thread_id = ?1
+               AND ((state = 'available' AND NOT EXISTS (
+                       SELECT 1 FROM thread_run_admissions WHERE run_id = ?2
+                    )) OR reserved_by_run_id = ?2 OR consumed_by_run_id = ?2)
+             ORDER BY sequence ASC"
+        ))?;
+        Ok(statement
+            .query_map(params![child_thread_id, run_id], parent_answer_from_row)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn admit_thread_run_and_reserve(
+        &mut self,
+        admission: &ThreadRunAdmission,
+        child_return_ids: &[String],
+        parent_answer_ids: &[String],
+    ) -> AppResult<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let authority_matches = transaction
+            .query_row(
+                "SELECT 1 FROM thread_authorities authority
+                 JOIN profiles profile ON profile.id = authority.profile_id
+                 JOIN profile_revisions revision
+                   ON revision.profile_id = authority.profile_id AND revision.revision = ?4
+                 WHERE authority.thread_id = ?1 AND authority.workspace_id = ?2
+                   AND authority.profile_id = ?3 AND revision.revision <= profile.current_revision
+                   AND authority.thread_kind IN ('home', 'child')",
+                params![
+                    admission.thread_id,
+                    admission.workspace_id,
+                    admission.profile_id.as_str(),
+                    sqlite_i64(admission.profile_revision, "thread run profile_revision")?,
+                ],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !authority_matches {
+            return Err(AppError::Config(
+                "thread run admission does not match durable authority".into(),
+            ));
+        }
+        let inserted = transaction.execute(
+            "INSERT INTO thread_run_admissions
+               (run_id, workspace_id, profile_id, thread_id, thread_turn_id,
+                profile_revision, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(run_id) DO NOTHING",
+            params![
+                admission.run_id,
+                admission.workspace_id,
+                admission.profile_id.as_str(),
+                admission.thread_id,
+                admission.thread_turn_id,
+                sqlite_i64(admission.profile_revision, "thread run profile_revision")?,
+                sqlite_i64(admission.created_at_ms, "thread run created_at_ms")?,
+            ],
+        )? == 1;
+        let stored = thread_run_admission_by_id(&transaction, &admission.run_id)?
+            .expect("inserted thread run admission is readable in its transaction");
+        if stored.run_id != admission.run_id
+            || stored.workspace_id != admission.workspace_id
+            || stored.profile_id != admission.profile_id
+            || stored.thread_id != admission.thread_id
+            || stored.thread_turn_id != admission.thread_turn_id
+            || stored.profile_revision != admission.profile_revision
+        {
+            return Err(AppError::Config(format!(
+                "thread run admission conflicts with durable run {}",
+                admission.run_id
+            )));
+        }
+        for message_id in child_return_ids {
+            reserve_delivery(
+                &transaction,
+                "child_returns",
+                "parent_thread_id",
+                message_id,
+                admission,
+                inserted,
+            )?;
+        }
+        for message_id in parent_answer_ids {
+            reserve_delivery(
+                &transaction,
+                "parent_answers",
+                "child_thread_id",
+                message_id,
+                admission,
+                inserted,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn settle_thread_run_deliveries(
+        &mut self,
+        run_id: &str,
+        consumed: bool,
+        at_ms: u64,
+    ) -> AppResult<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(admission) = thread_run_admission_by_id(&transaction, run_id)? else {
+            transaction.commit()?;
+            return Ok(());
+        };
+        for table in ["child_returns", "parent_answers"] {
+            if consumed {
+                transaction.execute(
+                    &format!(
+                        "UPDATE {table}
+                         SET state = 'consumed', consumed_by_run_id = reserved_by_run_id,
+                             consumed_by_turn_id = reserved_by_turn_id, consumed_at_ms = ?2
+                         WHERE reserved_by_run_id = ?1 AND reserved_by_turn_id = ?3
+                           AND state = 'reserved'"
+                    ),
+                    params![
+                        run_id,
+                        sqlite_i64(at_ms, "delivery consumed_at_ms")?,
+                        admission.thread_turn_id,
+                    ],
+                )?;
+            } else {
+                transaction.execute(
+                    &format!(
+                        "UPDATE {table}
+                         SET state = 'available', reserved_by_run_id = NULL,
+                             reserved_by_turn_id = NULL
+                         WHERE reserved_by_run_id = ?1 AND reserved_by_turn_id = ?2
+                           AND state = 'reserved'"
+                    ),
+                    params![run_id, admission.thread_turn_id],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn discard_thread_run_admission(&mut self, run_id: &str) -> AppResult<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(admission) = thread_run_admission_by_id(&transaction, run_id)? else {
+            transaction.commit()?;
+            return Ok(());
+        };
+        for table in ["child_returns", "parent_answers"] {
+            transaction.execute(
+                &format!(
+                    "UPDATE {table}
+                     SET state = 'available', reserved_by_run_id = NULL,
+                         reserved_by_turn_id = NULL
+                     WHERE reserved_by_run_id = ?1 AND reserved_by_turn_id = ?2
+                       AND state = 'reserved'"
+                ),
+                params![run_id, admission.thread_turn_id],
+            )?;
+        }
+        transaction.execute(
+            "DELETE FROM thread_run_admissions WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn thread_run_admissions(
+        &self,
+        workspace_id: &str,
+    ) -> AppResult<Vec<ThreadRunAdmission>> {
+        let mut statement = self.connection.prepare(
+            "SELECT run_id, workspace_id, profile_id, thread_id, thread_turn_id,
+                    profile_revision, created_at_ms
+             FROM thread_run_admissions WHERE workspace_id = ?1
+             ORDER BY created_at_ms, run_id",
+        )?;
+        Ok(statement
+            .query_map(params![workspace_id], thread_run_admission_from_row)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn thread_run_admission(
+        &self,
+        run_id: &str,
+    ) -> AppResult<Option<ThreadRunAdmission>> {
+        thread_run_admission_by_id(&self.connection, run_id)
+    }
+
+    pub(crate) fn stopped_children_without_terminal(
+        &self,
+        workspace_id: &str,
+    ) -> AppResult<Vec<(String, Option<String>, u64)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT authority.thread_id, stop.stopped_turn_id, stop.occurred_at_ms
+             FROM thread_authorities authority
+             JOIN thread_stops stop ON stop.thread_id = authority.thread_id
+             JOIN thread_spawn_approvals spawn
+               ON spawn.thread_id = authority.thread_id AND spawn.decision = 'granted'
+             WHERE authority.workspace_id = ?1 AND authority.thread_kind = 'child'
+               AND NOT EXISTS (
+                 SELECT 1 FROM child_returns returned
+                 WHERE returned.spawn_id = spawn.spawn_id
+                   AND returned.kind IN ('result', 'failed')
+               )
+             ORDER BY stop.occurred_at_ms, authority.thread_id",
+        )?;
+        Ok(statement
+            .query_map(params![workspace_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row_u64(row, 2, "thread stopped_at_ms")?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn child_return(&self, message_id: &str) -> AppResult<Option<ChildReturnRecord>> {
+        child_return_by_id(&self.connection, message_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parent_answer(&self, message_id: &str) -> AppResult<Option<ParentAnswerRecord>> {
+        parent_answer_by_id(&self.connection, message_id)
+    }
+
     pub(crate) fn thread_confinement(
         &self,
         thread_id: &str,
@@ -1552,6 +2063,264 @@ impl ServerStore {
     ) -> AppResult<Option<RunCancellationRecord>> {
         run_cancellation_from(&self.connection, run_id)
     }
+}
+
+#[derive(Debug)]
+struct SpawnEdge {
+    spawn_id: String,
+    profile_id: ProfileId,
+    profile_revision: u64,
+    parent_thread_id: String,
+}
+
+fn child_edge_from(
+    connection: &Connection,
+    workspace_id: &str,
+    child_thread_id: &str,
+) -> AppResult<Option<SpawnEdge>> {
+    Ok(connection
+        .query_row(
+            "SELECT spawn.spawn_id, authority.profile_id,
+                    authority.profile_revision, authority.parent_thread_id
+             FROM thread_authorities authority
+             JOIN thread_spawn_approvals spawn
+               ON spawn.thread_id = authority.thread_id AND spawn.decision = 'granted'
+             WHERE authority.thread_id = ?1 AND authority.workspace_id = ?2
+               AND authority.thread_kind = 'child'
+             ORDER BY spawn.occurred_at_ms, spawn.spawn_id LIMIT 1",
+            params![child_thread_id, workspace_id],
+            |row| {
+                let profile_id = ProfileId::new(row.get::<_, String>(1)?)
+                    .map_err(|error| invalid_thread_column(1, error.to_string()))?;
+                Ok(SpawnEdge {
+                    spawn_id: row.get(0)?,
+                    profile_id,
+                    profile_revision: row_u64(row, 2, "spawn edge profile_revision")?,
+                    parent_thread_id: row.get(3)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn parent_answer_edge_from(
+    connection: &Connection,
+    workspace_id: &str,
+    parent_thread_id: &str,
+    child_thread_id: &str,
+) -> AppResult<Option<SpawnEdge>> {
+    Ok(connection
+        .query_row(
+            "SELECT spawn.spawn_id, parent.profile_id, parent.profile_revision,
+                    child.parent_thread_id
+             FROM thread_authorities parent
+             JOIN thread_authorities child
+               ON child.parent_thread_id = parent.thread_id
+              AND child.workspace_id = parent.workspace_id
+              AND child.profile_id = parent.profile_id
+             JOIN thread_spawn_approvals spawn
+               ON spawn.thread_id = child.thread_id AND spawn.decision = 'granted'
+             WHERE parent.thread_id = ?1 AND child.thread_id = ?2
+               AND parent.workspace_id = ?3
+               AND parent.thread_kind IN ('home', 'child')
+               AND child.thread_kind = 'child'
+             ORDER BY spawn.occurred_at_ms, spawn.spawn_id LIMIT 1",
+            params![parent_thread_id, child_thread_id, workspace_id],
+            |row| {
+                let profile_id = ProfileId::new(row.get::<_, String>(1)?)
+                    .map_err(|error| invalid_thread_column(1, error.to_string()))?;
+                Ok(SpawnEdge {
+                    spawn_id: row.get(0)?,
+                    profile_id,
+                    profile_revision: row_u64(row, 2, "spawn edge profile_revision")?,
+                    parent_thread_id: row.get(3)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn matching_thread_run(
+    connection: &Connection,
+    run_id: &str,
+    workspace_id: &str,
+    profile_id: &ProfileId,
+    thread_id: &str,
+    turn_id: Option<&str>,
+) -> AppResult<Option<ThreadRunAdmission>> {
+    let admission = thread_run_admission_by_id(connection, run_id)?;
+    Ok(admission.filter(|admission| {
+        admission.workspace_id == workspace_id
+            && admission.profile_id == *profile_id
+            && admission.thread_id == thread_id
+            && turn_id.is_none_or(|turn_id| admission.thread_turn_id == turn_id)
+    }))
+}
+
+fn child_return_by_id(
+    connection: &Connection,
+    message_id: &str,
+) -> AppResult<Option<ChildReturnRecord>> {
+    Ok(connection
+        .query_row(
+            &format!("{CHILD_RETURN_SELECT} WHERE message_id = ?1"),
+            params![message_id],
+            child_return_from_row,
+        )
+        .optional()?)
+}
+
+fn terminal_child_return(
+    connection: &Connection,
+    spawn_id: &str,
+) -> AppResult<Option<ChildReturnRecord>> {
+    Ok(connection
+        .query_row(
+            &format!(
+                "{CHILD_RETURN_SELECT}
+                 WHERE spawn_id = ?1 AND kind IN ('result', 'failed') LIMIT 1"
+            ),
+            params![spawn_id],
+            child_return_from_row,
+        )
+        .optional()?)
+}
+
+fn parent_answer_by_id(
+    connection: &Connection,
+    message_id: &str,
+) -> AppResult<Option<ParentAnswerRecord>> {
+    Ok(connection
+        .query_row(
+            &format!("{PARENT_ANSWER_SELECT} WHERE message_id = ?1"),
+            params![message_id],
+            parent_answer_from_row,
+        )
+        .optional()?)
+}
+
+fn thread_run_admission_by_id(
+    connection: &Connection,
+    run_id: &str,
+) -> AppResult<Option<ThreadRunAdmission>> {
+    Ok(connection
+        .query_row(
+            "SELECT run_id, workspace_id, profile_id, thread_id, thread_turn_id,
+                    profile_revision, created_at_ms
+             FROM thread_run_admissions WHERE run_id = ?1",
+            params![run_id],
+            thread_run_admission_from_row,
+        )
+        .optional()?)
+}
+
+fn reserve_delivery(
+    connection: &Connection,
+    table: &str,
+    address_column: &str,
+    message_id: &str,
+    admission: &ThreadRunAdmission,
+    new_admission: bool,
+) -> AppResult<()> {
+    let changed = if new_admission {
+        connection.execute(
+            &format!(
+                "UPDATE {table}
+                 SET state = 'reserved', reserved_by_run_id = ?2, reserved_by_turn_id = ?3
+                 WHERE message_id = ?1 AND profile_id = ?4 AND {address_column} = ?5
+                   AND state = 'available'"
+            ),
+            params![
+                message_id,
+                admission.run_id,
+                admission.thread_turn_id,
+                admission.profile_id.as_str(),
+                admission.thread_id,
+            ],
+        )?
+    } else {
+        0
+    };
+    if changed == 1 {
+        return Ok(());
+    }
+    let replayed = connection
+        .query_row(
+            &format!(
+                "SELECT 1 FROM {table}
+                 WHERE message_id = ?1 AND profile_id = ?2 AND {address_column} = ?3
+                   AND ((state = 'reserved' AND reserved_by_run_id = ?4
+                         AND reserved_by_turn_id = ?5)
+                     OR (state = 'consumed' AND consumed_by_run_id = ?4
+                         AND consumed_by_turn_id = ?5))"
+            ),
+            params![
+                message_id,
+                admission.profile_id.as_str(),
+                admission.thread_id,
+                admission.run_id,
+                admission.thread_turn_id,
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if replayed {
+        Ok(())
+    } else {
+        Err(AppError::Config(format!(
+            "delivery reservation CAS failed for message {message_id}"
+        )))
+    }
+}
+
+fn child_return_matches(
+    record: &ChildReturnRecord,
+    draft: &ChildReturnDraft,
+    edge: &SpawnEdge,
+    profile_revision: u64,
+    payload: &str,
+    truncated: bool,
+) -> bool {
+    record.spawn_id == edge.spawn_id
+        && record.profile_id == edge.profile_id
+        && record.parent_thread_id == edge.parent_thread_id
+        && record.child_thread_id == draft.child_thread_id
+        && record.source_run_id == draft.source_run_id
+        && record.source_turn_id == draft.source_turn_id
+        && record.kind == draft.kind
+        && record.payload == payload
+        && record.artifact_refs == draft.artifact_refs
+        && record.truncated == truncated
+        && record.profile_revision == profile_revision
+}
+
+fn parent_answer_matches(
+    record: &ParentAnswerRecord,
+    draft: &ParentAnswerDraft,
+    edge: &SpawnEdge,
+    profile_revision: u64,
+) -> bool {
+    record.spawn_id == edge.spawn_id
+        && record.profile_id == edge.profile_id
+        && record.parent_thread_id == draft.parent_thread_id
+        && record.child_thread_id == draft.child_thread_id
+        && record.source_run_id == draft.source_run_id
+        && record.source_turn_id == draft.source_turn_id
+        && record.kind == draft.kind
+        && record.payload == draft.payload
+        && record.profile_revision == profile_revision
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value.into(), false);
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (value[..end].into(), true)
 }
 
 fn configure_server_wal(connection: &Connection) -> AppResult<()> {
@@ -1993,8 +2762,11 @@ pub(crate) fn thread_stop(path: &Path, thread_id: &str) -> AppResult<Option<Thre
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::{
+        ChildReturnKind, DeliveryState, MAX_CHILD_RETURN_PAYLOAD_BYTES,
+        MAX_UNCONSUMED_NONTERMINAL_RETURNS, ParentAnswerKind, ProfileRevisionContent,
+    };
     use super::*;
-    use crate::server_store::ProfileRevisionContent;
     use crate::thread_authority::legacy_status_authority;
     use platonic_core::EffectClass;
     use platonic_protocol::{ReasoningEffort, ThreadApprovalPolicy, ThreadGrantedPath};
@@ -2265,7 +3037,8 @@ mod tests {
             [
                 (1, "server_store_baseline".into()),
                 (2, "profile_registry".into()),
-                (3, "profile_home_lifecycle".into())
+                (3, "profile_home_lifecycle".into()),
+                (4, "child_return_channel".into())
             ]
         );
         store
@@ -3720,5 +4493,357 @@ mod tests {
             store.thread_confinement("thread_confined").unwrap(),
             Some(ThreadConfinement::None)
         );
+    }
+
+    fn seed_return_fixture(store: &ServerStore, root: &Path) {
+        store
+            .connection
+            .execute(
+                "INSERT INTO workspaces (id, name, root, ledger_path, created_at_ms)
+                 VALUES ('ws-return', 'returns', ?1, ?2, 1)",
+                params![
+                    root.canonicalize().unwrap().to_string_lossy(),
+                    root.join("ledger.db").to_string_lossy(),
+                ],
+            )
+            .unwrap();
+        for (profile_id, name) in [("profile-a", "Profile A"), ("profile-b", "Profile B")] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO profiles
+                       (id, workspace_id, display_name, model, reasoning_effort,
+                        approval_policy, toolset, current_revision, created_at_ms)
+                     VALUES (?1, 'ws-return', ?2, 'gpt-5.6-sol', 'xhigh', 'prompt',
+                             '[\"thread.return\",\"thread.answer\"]', 1, 2)",
+                    params![profile_id, name],
+                )
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO profile_revisions
+                       (profile_id, revision, parent_revision, actor, created_at_ms,
+                        content_hash, instructions_markdown, memory_markdown, skill_refs)
+                     VALUES (?1, 1, NULL, 'test', 2, 'hash', '', '', '[]')",
+                    params![profile_id],
+                )
+                .unwrap();
+        }
+        for (thread_id, parent, profile_id, kind, created_at_ms) in [
+            ("home-a", None, "profile-a", "home", 10),
+            ("child-a", Some("home-a"), "profile-a", "child", 11),
+            ("child-b", Some("home-a"), "profile-a", "child", 12),
+            ("grandchild-a", Some("child-a"), "profile-a", "child", 13),
+            ("home-b", None, "profile-b", "home", 20),
+            ("other-child", Some("home-b"), "profile-b", "child", 21),
+        ] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO thread_authorities
+                       (thread_id, parent_thread_id, spawning_actor, workspace_id,
+                        profile_id, profile_revision, thread_kind, model,
+                        reasoning_effort, approval_policy, toolset, worktrees,
+                        granted_paths, network, created_at_ms)
+                     VALUES (?1, ?2, 'test', 'ws-return', ?3, 1, ?4,
+                             'gpt-5.6-sol', 'xhigh', 'prompt',
+                             '[\"thread.return\",\"thread.answer\"]', '[]', '[]', 0, ?5)",
+                    params![thread_id, parent, profile_id, kind, created_at_ms],
+                )
+                .unwrap();
+            if kind == "child" {
+                store
+                    .connection
+                    .execute(
+                        "INSERT INTO thread_spawn_approvals
+                           (spawn_id, thread_id, decision, actor, occurred_at_ms)
+                         VALUES (?1, ?2, 'granted', 'test', ?3)",
+                        params![format!("spawn-{thread_id}"), thread_id, created_at_ms],
+                    )
+                    .unwrap();
+            }
+        }
+        store
+            .connection
+            .execute(
+                "UPDATE profiles SET home_thread_id = 'home-a' WHERE id = 'profile-a'",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE profiles SET home_thread_id = 'home-b' WHERE id = 'profile-b'",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn return_admission(run_id: &str, profile_id: &str, thread_id: &str) -> ThreadRunAdmission {
+        ThreadRunAdmission {
+            run_id: run_id.into(),
+            workspace_id: "ws-return".into(),
+            profile_id: ProfileId::new(profile_id).unwrap(),
+            thread_id: thread_id.into(),
+            thread_turn_id: format!("turn-{run_id}"),
+            profile_revision: 1,
+            created_at_ms: 30,
+        }
+    }
+
+    fn child_return_draft(
+        message_id: &str,
+        run_id: &str,
+        child_thread_id: &str,
+        kind: ChildReturnKind,
+        payload: String,
+    ) -> ChildReturnDraft {
+        ChildReturnDraft {
+            message_id: message_id.into(),
+            workspace_id: "ws-return".into(),
+            child_thread_id: child_thread_id.into(),
+            source_run_id: Some(run_id.into()),
+            source_turn_id: Some(format!("turn-{run_id}")),
+            kind,
+            payload,
+            artifact_refs: Vec::new(),
+            created_at_ms: 40,
+        }
+    }
+
+    #[test]
+    fn child_return_limits_terminal_preservation_and_delivery_cas_are_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ServerStore::open_or_create(&dir.path().join("server.db")).unwrap();
+        seed_return_fixture(&store, dir.path());
+        store
+            .connection
+            .execute(
+                "INSERT INTO profile_revisions
+                   (profile_id, revision, parent_revision, actor, created_at_ms,
+                    content_hash, instructions_markdown, memory_markdown, skill_refs)
+                 VALUES ('profile-a', 2, 1, 'test', 3, 'hash-2', '', '', '[]')",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE profiles SET current_revision = 2 WHERE id = 'profile-a'",
+                [],
+            )
+            .unwrap();
+        let mut child_run = return_admission("run-child", "profile-a", "child-a");
+        child_run.profile_revision = 2;
+        store
+            .admit_thread_run_and_reserve(&child_run, &[], &[])
+            .unwrap();
+
+        let exact = child_return_draft(
+            "return-0",
+            "run-child",
+            "child-a",
+            ChildReturnKind::Progress,
+            "x".repeat(MAX_CHILD_RETURN_PAYLOAD_BYTES),
+        );
+        assert!(matches!(
+            store.persist_child_return(&exact).unwrap(),
+            PersistChildReturnResult::Stored(record) if record.profile_revision == 2
+        ));
+        let oversized = child_return_draft(
+            "return-oversized",
+            "run-child",
+            "child-a",
+            ChildReturnKind::Question,
+            "x".repeat(MAX_CHILD_RETURN_PAYLOAD_BYTES + 1),
+        );
+        assert!(matches!(
+            store.persist_child_return(&oversized).unwrap(),
+            PersistChildReturnResult::Rejected { code, .. } if code == "payload_too_large"
+        ));
+        for index in 1..MAX_UNCONSUMED_NONTERMINAL_RETURNS {
+            let draft = child_return_draft(
+                &format!("return-{index}"),
+                "run-child",
+                "child-a",
+                ChildReturnKind::Progress,
+                format!("progress {index}"),
+            );
+            assert!(matches!(
+                store.persist_child_return(&draft).unwrap(),
+                PersistChildReturnResult::Stored(_)
+            ));
+        }
+        let limited = child_return_draft(
+            "return-limited",
+            "run-child",
+            "child-a",
+            ChildReturnKind::Progress,
+            "one too many".into(),
+        );
+        assert!(matches!(
+            store.persist_child_return(&limited).unwrap(),
+            PersistChildReturnResult::Rejected { code, .. } if code == "rate_limited"
+        ));
+
+        let terminal = child_return_draft(
+            "return-terminal",
+            "run-child",
+            "child-a",
+            ChildReturnKind::Result,
+            "é".repeat(MAX_CHILD_RETURN_PAYLOAD_BYTES),
+        );
+        let stored_terminal = match store.persist_child_return(&terminal).unwrap() {
+            PersistChildReturnResult::Stored(record) => record,
+            other => panic!("expected stored terminal, got {other:?}"),
+        };
+        assert!(stored_terminal.truncated);
+        assert!(stored_terminal.payload.len() <= MAX_CHILD_RETURN_PAYLOAD_BYTES);
+        assert!(
+            stored_terminal
+                .payload
+                .is_char_boundary(stored_terminal.payload.len())
+        );
+        assert!(matches!(
+            store.persist_child_return(&terminal).unwrap(),
+            PersistChildReturnResult::Replayed(record) if record.message_id == "return-terminal"
+        ));
+
+        let mut parent_run = return_admission("run-parent", "profile-a", "home-a");
+        parent_run.profile_revision = 2;
+        store
+            .admit_thread_run_and_reserve(&parent_run, &["return-0".into()], &[])
+            .unwrap();
+        let reserved = store.child_return("return-0").unwrap().unwrap();
+        assert_eq!(reserved.state, DeliveryState::Reserved);
+        assert_eq!(reserved.reserved_by_run_id.as_deref(), Some("run-parent"));
+        drop(store);
+
+        let mut restarted = ServerStore::open_or_create(&dir.path().join("server.db")).unwrap();
+        assert_eq!(
+            restarted.child_return("return-0").unwrap().unwrap().state,
+            DeliveryState::Reserved
+        );
+        restarted
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_child_return_consumption
+                 AFTER UPDATE OF state ON child_returns
+                 WHEN NEW.state = 'consumed'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'controlled consumption fault');
+                 END;",
+            )
+            .unwrap();
+        assert!(
+            restarted
+                .settle_thread_run_deliveries("run-parent", true, 49)
+                .is_err()
+        );
+        drop(restarted);
+
+        let mut restarted = ServerStore::open_or_create(&dir.path().join("server.db")).unwrap();
+        let still_reserved = restarted.child_return("return-0").unwrap().unwrap();
+        assert_eq!(still_reserved.state, DeliveryState::Reserved);
+        assert!(still_reserved.consumed_by_run_id.is_none());
+        restarted
+            .connection
+            .execute_batch("DROP TRIGGER fail_child_return_consumption")
+            .unwrap();
+        restarted
+            .settle_thread_run_deliveries("run-parent", true, 50)
+            .unwrap();
+        restarted
+            .settle_thread_run_deliveries("run-parent", true, 51)
+            .unwrap();
+        let consumed = restarted.child_return("return-0").unwrap().unwrap();
+        assert_eq!(consumed.state, DeliveryState::Consumed);
+        assert_eq!(consumed.consumed_by_run_id.as_deref(), Some("run-parent"));
+        assert_eq!(consumed.consumed_at_ms, Some(50));
+    }
+
+    #[test]
+    fn parent_answer_is_immediate_edge_only_and_stopped_parent_keeps_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ServerStore::open_or_create(&dir.path().join("server.db")).unwrap();
+        seed_return_fixture(&store, dir.path());
+        for admission in [
+            return_admission("run-home", "profile-a", "home-a"),
+            return_admission("run-child", "profile-a", "child-a"),
+            return_admission("run-grandchild", "profile-a", "grandchild-a"),
+        ] {
+            store
+                .admit_thread_run_and_reserve(&admission, &[], &[])
+                .unwrap();
+        }
+        let answer =
+            |message_id: &str, run_id: &str, parent: &str, child: &str| ParentAnswerDraft {
+                message_id: message_id.into(),
+                workspace_id: "ws-return".into(),
+                parent_thread_id: parent.into(),
+                child_thread_id: child.into(),
+                source_run_id: run_id.into(),
+                source_turn_id: format!("turn-{run_id}"),
+                kind: ParentAnswerKind::Answer,
+                payload: "attributed answer".into(),
+                created_at_ms: 40,
+            };
+        assert!(matches!(
+            store
+                .persist_parent_answer(&answer("answer-ok", "run-home", "home-a", "child-a"))
+                .unwrap(),
+            PersistParentAnswerResult::Stored(_)
+        ));
+        assert_eq!(
+            store.parent_answer("answer-ok").unwrap().unwrap().state,
+            DeliveryState::Available
+        );
+        assert!(matches!(
+            store
+                .persist_parent_answer(&answer("answer-ok", "run-home", "home-a", "child-a"))
+                .unwrap(),
+            PersistParentAnswerResult::Replayed(_)
+        ));
+        for denied in [
+            answer("answer-sibling", "run-child", "child-a", "child-b"),
+            answer("answer-ancestor", "run-child", "child-a", "home-a"),
+            answer("answer-cross", "run-home", "home-a", "other-child"),
+        ] {
+            assert!(matches!(
+                store.persist_parent_answer(&denied).unwrap(),
+                PersistParentAnswerResult::Rejected { code, .. } if code == "target_denied"
+            ));
+        }
+
+        store
+            .persist_thread_stop(
+                &ThreadStopRecord::new("child-a".into(), "test".into(), None, 45).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            store
+                .persist_parent_answer(&answer(
+                    "answer-stopped",
+                    "run-home",
+                    "home-a",
+                    "child-a"
+                ))
+                .unwrap(),
+            PersistParentAnswerResult::Rejected { code, .. } if code == "child_stopped"
+        ));
+        let stale_parent = child_return_draft(
+            "return-stale-parent",
+            "run-grandchild",
+            "grandchild-a",
+            ChildReturnKind::Progress,
+            "still durable".into(),
+        );
+        let record = match store.persist_child_return(&stale_parent).unwrap() {
+            PersistChildReturnResult::Stored(record) => record,
+            other => panic!("expected stale-parent delivery, got {other:?}"),
+        };
+        assert_eq!(record.parent_thread_id, "child-a");
+        assert_eq!(record.state, DeliveryState::Available);
     }
 }

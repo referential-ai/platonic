@@ -165,6 +165,20 @@ impl DaemonRuntime {
                 .is_some_and(|thread| thread.workspace_id == self.paths.workspace_id)
     }
 
+    pub(in crate::daemon) fn notify_thread_available(&self, thread_id: &str) {
+        let thread = self
+            .state
+            .lock()
+            .expect("runtime state lock poisoned")
+            .live_threads
+            .get(thread_id)
+            .filter(|thread| thread.workspace_id == self.paths.workspace_id)
+            .cloned();
+        if let Some(thread) = thread {
+            thread.notify_available();
+        }
+    }
+
     pub(in crate::daemon) fn load_thread(
         &self,
         thread_id: &str,
@@ -482,6 +496,10 @@ impl LiveThread {
             .current_turn
             .as_ref()
             .map(|turn| turn.turn_id.clone())
+    }
+
+    fn notify_available(&self) {
+        self.changed.notify_all();
     }
 
     fn live_snapshot(&self) -> (Option<String>, u64) {

@@ -118,6 +118,8 @@ impl HostRuntime {
             Arc::clone(&self.state),
             Arc::clone(&self.control_runtime.stop_requested),
         );
+        crate::daemon::returns::reconcile_workspace(&runtime)
+            .map_err(|error| (ERROR_INTERNAL, error.to_string()))?;
         workspaces.insert(workspace_root, runtime.clone());
         Ok(runtime)
     }

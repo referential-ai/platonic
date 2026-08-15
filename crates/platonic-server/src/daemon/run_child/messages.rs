@@ -2,10 +2,11 @@ use crate::{
     ApprovalRequest, AssistantDeltaEvent, RunOutcome,
     app::PreparedRun,
     tools::{
-        LogicalReadRequest, LogicalReadToolOutput, ThreadSpawnToolInput, ThreadSpawnToolOutput,
+        LogicalReadRequest, LogicalReadToolOutput, ParentAnswerToolInput, ParentAnswerToolOutput,
+        ThreadReturnToolInput, ThreadReturnToolOutput, ThreadSpawnToolInput, ThreadSpawnToolOutput,
     },
 };
-use platonic_core::{HarnessEvent, RecordedEvent, RunId};
+use platonic_core::{HarnessEvent, RecordedEvent, RunId, ToolCallId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,6 +35,14 @@ pub(super) enum ParentMessage {
     LogicalRead {
         request_id: u64,
         output: LogicalReadToolOutput,
+    },
+    ThreadReturn {
+        request_id: u64,
+        output: ThreadReturnToolOutput,
+    },
+    ParentAnswer {
+        request_id: u64,
+        output: ParentAnswerToolOutput,
     },
     Cancel,
 }
@@ -72,6 +81,16 @@ pub(super) enum ChildMessage {
     LogicalRead {
         request_id: u64,
         request: LogicalReadRequest,
+    },
+    ThreadReturn {
+        request_id: u64,
+        call_id: ToolCallId,
+        input: ThreadReturnToolInput,
+    },
+    ParentAnswer {
+        request_id: u64,
+        call_id: ToolCallId,
+        input: ParentAnswerToolInput,
     },
     Result {
         request_id: u64,
@@ -189,6 +208,69 @@ mod tests {
                 );
             }
             message => panic!("unexpected parent RPC message: {message:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_edge_rpc_preserves_host_call_ids_and_typed_results() {
+        let returned = ChildMessage::ThreadReturn {
+            request_id: 8,
+            call_id: ToolCallId::new("call-return").unwrap(),
+            input: ThreadReturnToolInput {
+                kind: crate::tools::ThreadReturnToolKind::Question,
+                payload: "which format?".into(),
+                artifact_refs: vec!["artifact_1".into()],
+            },
+        };
+        let encoded = serde_json::to_string(&returned).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ChildMessage>(&encoded).unwrap(),
+            ChildMessage::ThreadReturn { request_id: 8, call_id, input }
+                if call_id.as_str() == "call-return"
+                    && input.kind == crate::tools::ThreadReturnToolKind::Question
+                    && input.artifact_refs == ["artifact_1"]
+        ));
+
+        let answered = ChildMessage::ParentAnswer {
+            request_id: 9,
+            call_id: ToolCallId::new("call-answer").unwrap(),
+            input: ParentAnswerToolInput {
+                child_thread_id: "thread-child".into(),
+                kind: crate::tools::ParentAnswerToolKind::FollowUp,
+                payload: "use JSON".into(),
+            },
+        };
+        let encoded = serde_json::to_string(&answered).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ChildMessage>(&encoded).unwrap(),
+            ChildMessage::ParentAnswer { request_id: 9, call_id, input }
+                if call_id.as_str() == "call-answer"
+                    && input.child_thread_id == "thread-child"
+                    && input.kind == crate::tools::ParentAnswerToolKind::FollowUp
+        ));
+
+        for reply in [
+            ParentMessage::ThreadReturn {
+                request_id: 8,
+                output: ThreadReturnToolOutput::Delivered {
+                    message_id: "return-1".into(),
+                    replayed: true,
+                },
+            },
+            ParentMessage::ParentAnswer {
+                request_id: 9,
+                output: ParentAnswerToolOutput::Rejected {
+                    code: "target_denied".into(),
+                    reason: "not an immediate child".into(),
+                },
+            },
+        ] {
+            let encoded = serde_json::to_string(&reply).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<ParentMessage>(&encoded).unwrap(),
+                ParentMessage::ThreadReturn { request_id: 8, .. }
+                    | ParentMessage::ParentAnswer { request_id: 9, .. }
+            ));
         }
     }
 

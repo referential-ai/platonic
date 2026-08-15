@@ -6,6 +6,7 @@ mod child_process;
 mod handlers;
 pub mod lock;
 mod logical_reads;
+mod returns;
 pub use platonic_protocol as protocol;
 mod run_child;
 mod runtime;

@@ -2013,7 +2013,21 @@ pub(super) fn handle_thread_stop(
             );
         }
     };
+    let terminal = crate::daemon::returns::persist_stopped_child(
+        runtime,
+        &authority.thread_id,
+        stop.stopped_turn_id.clone(),
+        stop.occurred_at_ms,
+    );
     runtime.complete_thread_stop(&authority.thread_id);
+    if terminal.is_err() {
+        return Envelope::error(
+            request.id,
+            Some("thread.stop".into()),
+            ERROR_THREAD_STOP_FAILED,
+            "thread stopped, but its terminal return could not be persisted",
+        );
+    }
     Envelope::typed_response(
         request.id,
         ProtocolResponse::ThreadStop(thread_stop_result(stop, !inserted)),
@@ -2555,6 +2569,55 @@ pub(in crate::daemon::handlers) mod tests {
                 .unwrap(),
         )
         .unwrap()
+    }
+
+    pub(in crate::daemon) fn child_return_test_runtime() -> (
+        tempfile::TempDir,
+        DaemonRuntime,
+        String,
+        String,
+        String,
+        platonic_core::ProfileId,
+    ) {
+        let (root, runtime) = thread_test_runtime();
+        std::fs::write(
+            runtime.paths.workspace_root.join("plato.toml"),
+            "[tools]\nenabled = [\"file.read\", \"thread.spawn\", \"thread.return\", \"thread.answer\"]\n",
+        )
+        .unwrap();
+        let (spawn_id, home_thread_id) = pending_spawn(
+            start_thread(
+                &runtime,
+                None,
+                &runtime.paths.workspace_root,
+                ThreadApprovalPolicy::Prompt,
+            )
+            .unwrap(),
+        );
+        grant_thread(&runtime, &spawn_id, "return-test");
+        let child_thread_id = coordinator_child(&runtime, &home_thread_id, "return-test")
+            .authority
+            .thread_id;
+        let sibling_thread_id = coordinator_child(&runtime, &home_thread_id, "return-test")
+            .authority
+            .thread_id;
+        let profile_id = runtime
+            .paths
+            .server_store()
+            .unwrap()
+            .thread_authority(&home_thread_id)
+            .unwrap()
+            .unwrap()
+            .profile_id
+            .unwrap();
+        (
+            root,
+            runtime,
+            home_thread_id,
+            child_thread_id,
+            sibling_thread_id,
+            profile_id,
+        )
     }
 
     fn thread_worktree(runtime: &DaemonRuntime, thread_id: &str) -> PathBuf {

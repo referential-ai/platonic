@@ -6,12 +6,14 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-pub(super) const SERVER_SCHEMA_VERSION: u32 = 3;
+pub(super) const SERVER_SCHEMA_VERSION: u32 = 4;
 const BASE_SCHEMA_VERSION: u32 = 1;
 const PROFILE_SCHEMA_VERSION: u32 = 2;
+const HOME_LIFECYCLE_SCHEMA_VERSION: u32 = 3;
 const BASE_MIGRATION_NAME: &str = "server_store_baseline";
 const PROFILE_MIGRATION_NAME: &str = "profile_registry";
 const HOME_LIFECYCLE_MIGRATION_NAME: &str = "profile_home_lifecycle";
+const CHILD_RETURN_MIGRATION_NAME: &str = "child_return_channel";
 const IMPORT_ACTOR: &str = "migration:agents-v1";
 
 pub(super) fn migrate_server_schema(connection: &mut Connection) -> AppResult<()> {
@@ -47,8 +49,12 @@ pub(super) fn migrate_server_schema(connection: &mut Connection) -> AppResult<()
         migrate_profiles(&transaction)?;
         version = PROFILE_SCHEMA_VERSION;
     }
-    if version < SERVER_SCHEMA_VERSION {
+    if version < HOME_LIFECYCLE_SCHEMA_VERSION {
         migrate_home_lifecycle(&transaction)?;
+        version = HOME_LIFECYCLE_SCHEMA_VERSION;
+    }
+    if version < SERVER_SCHEMA_VERSION {
+        migrate_child_returns(&transaction)?;
     }
     validate_migration_journal(&transaction, SERVER_SCHEMA_VERSION)?;
     transaction.commit()?;
@@ -193,8 +199,164 @@ fn migrate_home_lifecycle(transaction: &Transaction<'_>) -> AppResult<()> {
     )?;
     record_migration(
         transaction,
-        SERVER_SCHEMA_VERSION,
+        HOME_LIFECYCLE_SCHEMA_VERSION,
         HOME_LIFECYCLE_MIGRATION_NAME,
+    )?;
+    transaction.pragma_update(None, "user_version", HOME_LIFECYCLE_SCHEMA_VERSION)?;
+    Ok(())
+}
+
+fn migrate_child_returns(transaction: &Transaction<'_>) -> AppResult<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE thread_run_admissions (
+          run_id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          profile_id TEXT NOT NULL,
+          thread_id TEXT NOT NULL,
+          thread_turn_id TEXT NOT NULL,
+          profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+          created_at_ms INTEGER NOT NULL,
+          FOREIGN KEY (profile_id) REFERENCES profiles(id),
+          FOREIGN KEY (thread_id) REFERENCES thread_authorities(thread_id)
+        );
+
+        CREATE INDEX thread_run_admissions_workspace
+          ON thread_run_admissions(workspace_id, created_at_ms, run_id);
+
+        CREATE TABLE child_returns (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          message_id TEXT NOT NULL UNIQUE,
+          spawn_id TEXT NOT NULL,
+          profile_id TEXT NOT NULL,
+          parent_thread_id TEXT NOT NULL,
+          child_thread_id TEXT NOT NULL,
+          source_run_id TEXT,
+          source_turn_id TEXT,
+          kind TEXT NOT NULL CHECK (kind IN ('progress', 'question', 'result', 'failed')),
+          payload TEXT NOT NULL,
+          artifact_refs TEXT NOT NULL,
+          truncated INTEGER NOT NULL CHECK (truncated IN (0, 1)),
+          created_at_ms INTEGER NOT NULL,
+          profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+          state TEXT NOT NULL CHECK (state IN ('available', 'reserved', 'consumed')),
+          reserved_by_run_id TEXT,
+          reserved_by_turn_id TEXT,
+          consumed_by_run_id TEXT,
+          consumed_by_turn_id TEXT,
+          consumed_at_ms INTEGER,
+          CHECK (
+            (state = 'available'
+              AND reserved_by_run_id IS NULL AND reserved_by_turn_id IS NULL
+              AND consumed_by_run_id IS NULL AND consumed_by_turn_id IS NULL
+              AND consumed_at_ms IS NULL)
+            OR (state = 'reserved'
+              AND reserved_by_run_id IS NOT NULL AND reserved_by_turn_id IS NOT NULL
+              AND consumed_by_run_id IS NULL AND consumed_by_turn_id IS NULL
+              AND consumed_at_ms IS NULL)
+            OR (state = 'consumed'
+              AND reserved_by_run_id IS NOT NULL AND reserved_by_turn_id IS NOT NULL
+              AND consumed_by_run_id = reserved_by_run_id
+              AND consumed_by_turn_id = reserved_by_turn_id
+              AND consumed_at_ms IS NOT NULL)
+          ),
+          FOREIGN KEY (spawn_id) REFERENCES thread_spawn_approvals(spawn_id),
+          FOREIGN KEY (profile_id) REFERENCES profiles(id),
+          FOREIGN KEY (parent_thread_id) REFERENCES thread_authorities(thread_id),
+          FOREIGN KEY (child_thread_id) REFERENCES thread_authorities(thread_id)
+        );
+
+        CREATE UNIQUE INDEX one_terminal_child_return_per_spawn
+          ON child_returns(spawn_id) WHERE kind IN ('result', 'failed');
+        CREATE INDEX child_returns_available_parent
+          ON child_returns(parent_thread_id, state, sequence);
+
+        CREATE TABLE parent_answers (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          message_id TEXT NOT NULL UNIQUE,
+          spawn_id TEXT NOT NULL,
+          profile_id TEXT NOT NULL,
+          parent_thread_id TEXT NOT NULL,
+          child_thread_id TEXT NOT NULL,
+          source_run_id TEXT NOT NULL,
+          source_turn_id TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK (kind IN ('answer', 'follow_up')),
+          payload TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL,
+          profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+          state TEXT NOT NULL CHECK (state IN ('available', 'reserved', 'consumed')),
+          reserved_by_run_id TEXT,
+          reserved_by_turn_id TEXT,
+          consumed_by_run_id TEXT,
+          consumed_by_turn_id TEXT,
+          consumed_at_ms INTEGER,
+          CHECK (
+            (state = 'available'
+              AND reserved_by_run_id IS NULL AND reserved_by_turn_id IS NULL
+              AND consumed_by_run_id IS NULL AND consumed_by_turn_id IS NULL
+              AND consumed_at_ms IS NULL)
+            OR (state = 'reserved'
+              AND reserved_by_run_id IS NOT NULL AND reserved_by_turn_id IS NOT NULL
+              AND consumed_by_run_id IS NULL AND consumed_by_turn_id IS NULL
+              AND consumed_at_ms IS NULL)
+            OR (state = 'consumed'
+              AND reserved_by_run_id IS NOT NULL AND reserved_by_turn_id IS NOT NULL
+              AND consumed_by_run_id = reserved_by_run_id
+              AND consumed_by_turn_id = reserved_by_turn_id
+              AND consumed_at_ms IS NOT NULL)
+          ),
+          FOREIGN KEY (spawn_id) REFERENCES thread_spawn_approvals(spawn_id),
+          FOREIGN KEY (profile_id) REFERENCES profiles(id),
+          FOREIGN KEY (parent_thread_id) REFERENCES thread_authorities(thread_id),
+          FOREIGN KEY (child_thread_id) REFERENCES thread_authorities(thread_id)
+        );
+
+        CREATE INDEX parent_answers_available_child
+          ON parent_answers(child_thread_id, state, sequence);
+
+        CREATE TRIGGER child_returns_payload_is_immutable
+        BEFORE UPDATE ON child_returns
+        WHEN OLD.sequence IS NOT NEW.sequence
+          OR OLD.message_id IS NOT NEW.message_id
+          OR OLD.spawn_id IS NOT NEW.spawn_id
+          OR OLD.profile_id IS NOT NEW.profile_id
+          OR OLD.parent_thread_id IS NOT NEW.parent_thread_id
+          OR OLD.child_thread_id IS NOT NEW.child_thread_id
+          OR OLD.source_run_id IS NOT NEW.source_run_id
+          OR OLD.source_turn_id IS NOT NEW.source_turn_id
+          OR OLD.kind IS NOT NEW.kind
+          OR OLD.payload IS NOT NEW.payload
+          OR OLD.artifact_refs IS NOT NEW.artifact_refs
+          OR OLD.truncated IS NOT NEW.truncated
+          OR OLD.created_at_ms IS NOT NEW.created_at_ms
+          OR OLD.profile_revision IS NOT NEW.profile_revision
+        BEGIN
+          SELECT RAISE(ABORT, 'child return payload is immutable');
+        END;
+
+        CREATE TRIGGER parent_answers_payload_is_immutable
+        BEFORE UPDATE ON parent_answers
+        WHEN OLD.sequence IS NOT NEW.sequence
+          OR OLD.message_id IS NOT NEW.message_id
+          OR OLD.spawn_id IS NOT NEW.spawn_id
+          OR OLD.profile_id IS NOT NEW.profile_id
+          OR OLD.parent_thread_id IS NOT NEW.parent_thread_id
+          OR OLD.child_thread_id IS NOT NEW.child_thread_id
+          OR OLD.source_run_id IS NOT NEW.source_run_id
+          OR OLD.source_turn_id IS NOT NEW.source_turn_id
+          OR OLD.kind IS NOT NEW.kind
+          OR OLD.payload IS NOT NEW.payload
+          OR OLD.created_at_ms IS NOT NEW.created_at_ms
+          OR OLD.profile_revision IS NOT NEW.profile_revision
+        BEGIN
+          SELECT RAISE(ABORT, 'parent answer payload is immutable');
+        END;
+        "#,
+    )?;
+    record_migration(
+        transaction,
+        SERVER_SCHEMA_VERSION,
+        CHILD_RETURN_MIGRATION_NAME,
     )?;
     transaction.pragma_update(None, "user_version", SERVER_SCHEMA_VERSION)?;
     Ok(())
@@ -234,7 +396,8 @@ fn validate_migration_journal(connection: &Connection, version: u32) -> AppResul
     let expected = [
         (BASE_SCHEMA_VERSION, BASE_MIGRATION_NAME),
         (PROFILE_SCHEMA_VERSION, PROFILE_MIGRATION_NAME),
-        (SERVER_SCHEMA_VERSION, HOME_LIFECYCLE_MIGRATION_NAME),
+        (HOME_LIFECYCLE_SCHEMA_VERSION, HOME_LIFECYCLE_MIGRATION_NAME),
+        (SERVER_SCHEMA_VERSION, CHILD_RETURN_MIGRATION_NAME),
     ];
     let expected_len = usize::try_from(version)
         .map_err(|_| AppError::Config("server schema version exceeds usize".into()))?;
@@ -1051,7 +1214,8 @@ mod tests {
             [
                 (1, BASE_MIGRATION_NAME.into()),
                 (2, PROFILE_MIGRATION_NAME.into()),
-                (3, HOME_LIFECYCLE_MIGRATION_NAME.into())
+                (3, HOME_LIFECYCLE_MIGRATION_NAME.into()),
+                (4, CHILD_RETURN_MIGRATION_NAME.into())
             ]
         );
         let schema_before: String = connection
@@ -1070,7 +1234,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(schema_after, schema_before);
-        assert_eq!(journal(&connection).len(), 3);
+        assert_eq!(journal(&connection).len(), 4);
     }
 
     #[test]
@@ -1083,7 +1247,7 @@ mod tests {
             migrate_server_schema(&mut future),
             Err(AppError::SqliteSchemaVersion {
                 expected: SERVER_SCHEMA_VERSION,
-                actual: 4,
+                actual: 5,
             })
         ));
 
