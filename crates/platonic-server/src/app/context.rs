@@ -1,4 +1,4 @@
-use super::session::PLATONIC_MEMORY_SEPARATOR;
+use super::{prepare::PreparedProfileContext, session::PLATONIC_MEMORY_SEPARATOR};
 use crate::{
     AppResult,
     model::{ModelRequest, system_prompt},
@@ -12,19 +12,20 @@ pub(super) fn context_pack(
     token_budget: u32,
     platonic_memory: Option<&str>,
 ) -> AppResult<ContextPack> {
-    context_pack_with_interruption(request, token_budget, platonic_memory, None)
+    context_pack_with_profile_and_interruption(request, token_budget, None, platonic_memory, None)
 }
 
-pub(super) fn context_pack_with_interruption(
+pub(super) fn context_pack_with_profile_and_interruption(
     request: &ModelRequest,
     token_budget: u32,
+    profile_context: Option<&PreparedProfileContext>,
     platonic_memory: Option<&str>,
     voice_interruption: Option<&str>,
 ) -> AppResult<ContextPack> {
     let messages = serde_json::to_string(&request.messages)?;
     let tools = serde_json::to_string(&request.tools)?;
     let mut system_contract = system_prompt().to_string();
-    if platonic_memory.is_some() || voice_interruption.is_some() {
+    if profile_context.is_some() || platonic_memory.is_some() || voice_interruption.is_some() {
         system_contract.push_str(PLATONIC_MEMORY_SEPARATOR);
     }
     // Keep the fragment sum equal to the estimate of the concatenated provider system text.
@@ -37,13 +38,27 @@ pub(super) fn context_pack_with_interruption(
         estimated_tokens: system_contract_tokens,
     }];
     let mut accounted_system_tokens = system_contract_tokens;
+    let mut through_system = system_contract;
+    if let Some(profile) = profile_context {
+        through_system.push_str(&profile.content);
+        if platonic_memory.is_some() || voice_interruption.is_some() {
+            through_system.push_str(PLATONIC_MEMORY_SEPARATOR);
+        }
+        let through_profile_tokens = estimate_tokens(&through_system);
+        fragments.push(ContextFragment {
+            lane: ContextLane::RetrievedContext,
+            source: profile.source(),
+            content: profile.content.clone(),
+            estimated_tokens: through_profile_tokens.saturating_sub(accounted_system_tokens),
+        });
+        accounted_system_tokens = through_profile_tokens;
+    }
     if let Some(content) = platonic_memory {
-        let through_memory = if voice_interruption.is_some() {
-            format!("{system_contract}{content}{PLATONIC_MEMORY_SEPARATOR}")
-        } else {
-            request.system.clone()
-        };
-        let through_memory_tokens = estimate_tokens(&through_memory);
+        through_system.push_str(content);
+        if voice_interruption.is_some() {
+            through_system.push_str(PLATONIC_MEMORY_SEPARATOR);
+        }
+        let through_memory_tokens = estimate_tokens(&through_system);
         fragments.push(ContextFragment {
             lane: ContextLane::RetrievedContext,
             source: PLATONIC_MEMORY_FILENAME.into(),
@@ -87,10 +102,54 @@ pub(super) fn estimate_tokens(content: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::super::session::{
-        estimated_context_tokens, hydrated_messages, provider_system_context, session_messages_from,
+        estimated_context_tokens, hydrated_messages, provider_system_context,
+        provider_system_context_with_profile_and_interruption, session_messages_from,
     };
     use super::*;
     use crate::{config::Config, ledger::SessionTurn, tool_catalog::tool_specs};
+    use platonic_core::ProfileId;
+
+    #[test]
+    fn profile_memory_and_interruption_fragments_sum_to_exact_provider_system_context() {
+        let profile = PreparedProfileContext {
+            profile_id: ProfileId::new("profile-context-accounting").unwrap(),
+            revision: 2,
+            content_hash: "hash".into(),
+            content: "profile content".into(),
+            truncated: false,
+        };
+        let memory = "workspace memory";
+        let interruption = "interruption context";
+        let system = provider_system_context_with_profile_and_interruption(
+            Some(&profile.content),
+            Some(memory),
+            Some(interruption),
+        );
+        let request = ModelRequest {
+            model: Config::default().provider.model,
+            system: system.clone(),
+            max_output_tokens: 1,
+            reasoning_effort: None,
+            messages: vec![],
+            tools: vec![],
+        };
+        let context = context_pack_with_profile_and_interruption(
+            &request,
+            u32::MAX,
+            Some(&profile),
+            Some(memory),
+            Some(interruption),
+        )
+        .unwrap();
+        let system_tokens = context.fragments[..4]
+            .iter()
+            .map(|fragment| fragment.estimated_tokens)
+            .sum::<u32>();
+        assert_eq!(system_tokens, estimate_tokens(&system));
+        assert_eq!(context.fragments[1].content, profile.content);
+        assert_eq!(context.fragments[2].content, memory);
+        assert_eq!(context.fragments[3].content, interruption);
+    }
 
     #[test]
     fn platonic_memory_budget_can_drop_oldest_turn_without_trimming_memory() {

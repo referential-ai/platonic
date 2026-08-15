@@ -7,7 +7,10 @@ use crate::{
     app::{ExternalApprovalOutcome, run_prepared_question},
     ledger::RunEventRecorder,
     tool_catalog::THREAD_SPAWN,
-    tools::{ThreadSpawnToolHandler, ThreadSpawnToolInput, ThreadSpawnToolOutput},
+    tools::{
+        LogicalReadRequest, LogicalReadToolHandler, LogicalReadToolOutput, ThreadSpawnToolHandler,
+        ThreadSpawnToolInput, ThreadSpawnToolOutput,
+    },
 };
 use platonic_core::{HarnessEvent, RecordedEvent, RunId};
 use std::{
@@ -70,6 +73,10 @@ pub fn run_stdio_child() -> AppResult<()> {
             thread_spawn_rpc.thread_spawn(input, approving_actor)
         })
     });
+    let logical_read = prepared.has_logical_read_tool().then(|| {
+        let logical_read_rpc = rpc.clone();
+        LogicalReadToolHandler::new(move |request| logical_read_rpc.logical_read(request))
+    });
     let outcome = run_prepared_question(
         prepared,
         &mut recorder,
@@ -77,7 +84,10 @@ pub fn run_stdio_child() -> AppResult<()> {
         Some(event_sender),
         false,
         Some(cancel),
-        thread_spawn,
+        crate::tools::RunToolHandlers {
+            thread_spawn,
+            logical_read,
+        },
     );
     event_forwarder
         .join()
@@ -218,6 +228,21 @@ impl ChildRpc {
         }
     }
 
+    fn logical_read(&self, request: LogicalReadRequest) -> AppResult<LogicalReadToolOutput> {
+        let _transaction = self.transaction.lock().expect("child RPC lock poisoned");
+        let request_id = self.next_request_id();
+        self.send(&ChildMessage::LogicalRead {
+            request_id,
+            request,
+        })?;
+        match self.next_reply(request_id)? {
+            ParentMessage::LogicalRead { output, .. } => Ok(output),
+            _ => Err(AppError::SupervisedRun(
+                "parent sent a non-read reply to a profile read".into(),
+            )),
+        }
+    }
+
     fn result(&self, result: ChildRunResult) -> AppResult<()> {
         let _transaction = self.transaction.lock().expect("child RPC lock poisoned");
         let request_id = self.next_request_id();
@@ -264,6 +289,10 @@ impl ChildRpc {
                 ..
             }
             | ParentMessage::ThreadSpawn {
+                request_id: reply_id,
+                ..
+            }
+            | ParentMessage::LogicalRead {
                 request_id: reply_id,
                 ..
             } if *reply_id == request_id => {}

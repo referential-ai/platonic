@@ -8,8 +8,9 @@ use super::{
     schema::migrate_server_schema,
     types::{
         AgentRecord, DurableThreadAuthority, HomeReservationRecord, HomeReservationState,
-        ProfileHomeProposal, ProfileRecord, ProfileRevisionRecord, ReserveProfileHomeResult,
-        RunCancellationRecord, ToolCallApprovalDecision, ToolCallApprovalRecord, WorkspaceRecord,
+        ProfileHomeProposal, ProfileRecord, ProfileRevisionContent, ProfileRevisionRecord,
+        ReserveProfileHomeResult, RunCancellationRecord, ToolCallApprovalDecision,
+        ToolCallApprovalRecord, WorkspaceRecord,
     },
 };
 use crate::{
@@ -381,6 +382,14 @@ impl ServerStore {
                 "profile name, model, and toolset must not be empty".into(),
             ));
         }
+        if revision.actor.trim().is_empty()
+            || revision.actor.len() > super::MAX_PROFILE_REVISION_ACTOR_BYTES
+        {
+            return Err(AppError::Config(format!(
+                "profile revision actor must be 1 to {} bytes",
+                super::MAX_PROFILE_REVISION_ACTOR_BYTES
+            )));
+        }
         if profile.current_revision != 1
             || profile.home_thread_id.is_some()
             || revision.profile_id != profile.id
@@ -580,6 +589,118 @@ impl ServerStore {
                 profile_revision_from_row,
             )
             .optional()?)
+    }
+
+    pub(crate) fn update_profile_content(
+        &mut self,
+        profile_id: &ProfileId,
+        actor: &str,
+        created_at_ms: u64,
+        content: ProfileRevisionContent,
+    ) -> AppResult<Option<ProfileRevisionRecord>> {
+        if actor.trim().is_empty() || actor.len() > super::MAX_PROFILE_REVISION_ACTOR_BYTES {
+            return Err(AppError::Config(format!(
+                "profile revision actor must be 1 to {} bytes",
+                super::MAX_PROFILE_REVISION_ACTOR_BYTES
+            )));
+        }
+        content
+            .validate()
+            .map_err(|error| AppError::Config(error.to_string()))?;
+        let content_hash = content
+            .content_hash()
+            .map_err(|error| AppError::Config(error.to_string()))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(parent_revision) = transaction
+            .query_row(
+                "SELECT current_revision FROM profiles WHERE id = ?1",
+                params![profile_id.as_str()],
+                |row| row_u64(row, 0, "profile current_revision"),
+            )
+            .optional()?
+        else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let revision = parent_revision
+            .checked_add(1)
+            .ok_or_else(|| AppError::Config("profile revision overflowed u64".into()))?;
+        let skill_refs = serde_json::to_string(&content.skill_refs)?;
+        transaction.execute(
+            "INSERT INTO profile_revisions
+               (profile_id, revision, parent_revision, actor, created_at_ms,
+                content_hash, instructions_markdown, memory_markdown, skill_refs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                profile_id.as_str(),
+                sqlite_i64(revision, "profile revision")?,
+                sqlite_i64(parent_revision, "profile parent revision")?,
+                actor,
+                sqlite_i64(created_at_ms, "profile revision created_at_ms")?,
+                content_hash,
+                content.instructions_markdown,
+                content.memory_markdown,
+                skill_refs,
+            ],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE profiles SET current_revision = ?2
+             WHERE id = ?1 AND current_revision = ?3",
+            params![
+                profile_id.as_str(),
+                sqlite_i64(revision, "profile revision")?,
+                sqlite_i64(parent_revision, "profile parent revision")?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(AppError::Config(format!(
+                "profile revision update changed {changed} rows for {profile_id}"
+            )));
+        }
+        transaction.commit()?;
+        Ok(Some(ProfileRevisionRecord {
+            profile_id: profile_id.clone(),
+            revision,
+            parent_revision: Some(parent_revision),
+            actor: actor.into(),
+            created_at_ms,
+            content_hash,
+            content,
+        }))
+    }
+
+    pub(crate) fn profile_revisions(
+        &self,
+        profile_id: &ProfileId,
+        after_revision: u64,
+        limit: usize,
+    ) -> AppResult<Vec<ProfileRevisionRecord>> {
+        if limit == 0 || limit > super::MAX_PROFILE_LIST_ENTRIES + 1 {
+            return Err(AppError::Config(
+                "profile revision list limit is out of range".into(),
+            ));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT profile_id, revision, parent_revision, actor, created_at_ms,
+                    content_hash, instructions_markdown, memory_markdown, skill_refs
+             FROM profile_revisions
+             WHERE profile_id = ?1 AND revision > ?2
+             ORDER BY revision ASC LIMIT ?3",
+        )?;
+        Ok(statement
+            .query_map(
+                params![
+                    profile_id.as_str(),
+                    sqlite_i64(after_revision, "profile revision cursor")?,
+                    i64::try_from(limit).map_err(|_| {
+                        AppError::Config("profile revision limit exceeds i64".into())
+                    })?,
+                ],
+                profile_revision_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     pub(crate) fn reserve_profile_home(
@@ -1212,6 +1333,57 @@ impl ServerStore {
                 )));
             }
         }
+        Ok(authorities)
+    }
+
+    pub(crate) fn profile_thread_authorities(
+        &self,
+        profile_id: &ProfileId,
+        after: Option<(u64, &str)>,
+        limit: usize,
+    ) -> AppResult<Vec<ThreadAuthorityRecord>> {
+        if limit == 0 || limit > super::MAX_PROFILE_LIST_ENTRIES + 1 {
+            return Err(AppError::Config(
+                "profile thread list limit is out of range".into(),
+            ));
+        }
+        let select = "SELECT thread_id, parent_thread_id, spawning_actor, cwd, agent_id,
+                             model, reasoning_effort, approval_policy, toolset, worktrees,
+                             granted_paths, network, created_at_ms, profile_id,
+                             profile_revision, thread_kind
+                      FROM thread_authorities";
+        let limit = i64::try_from(limit)
+            .map_err(|_| AppError::Config("profile thread limit exceeds i64".into()))?;
+        let authorities = if let Some((created_at_ms, thread_id)) = after {
+            let mut statement = self.connection.prepare(&format!(
+                "{select}
+                 WHERE profile_id = ?1
+                   AND (created_at_ms > ?2 OR (created_at_ms = ?2 AND thread_id > ?3))
+                 ORDER BY created_at_ms ASC, thread_id ASC LIMIT ?4"
+            ))?;
+            statement
+                .query_map(
+                    params![
+                        profile_id.as_str(),
+                        sqlite_i64(created_at_ms, "profile thread cursor timestamp")?,
+                        thread_id,
+                        limit,
+                    ],
+                    thread_authority_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut statement = self.connection.prepare(&format!(
+                "{select} WHERE profile_id = ?1
+                 ORDER BY created_at_ms ASC, thread_id ASC LIMIT ?2"
+            ))?;
+            statement
+                .query_map(
+                    params![profile_id.as_str(), limit],
+                    thread_authority_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
         Ok(authorities)
     }
 

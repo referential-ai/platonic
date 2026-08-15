@@ -2,6 +2,7 @@ use crate::{AppError, AppResult};
 use std::{path::PathBuf, process::Command};
 
 const CHILD_CONFINEMENT_ENV: &str = "PLATONIC_CHILD_CONFINEMENT";
+const CHILD_READABLE_PATHS_ENV: &str = "PLATONIC_CHILD_READABLE_PATHS";
 const CHILD_WRITABLE_PATHS_ENV: &str = "PLATONIC_CHILD_WRITABLE_PATHS";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +16,7 @@ pub(crate) enum ConfinementSupport {
 pub(crate) enum ChildConfinement {
     None,
     Landlock {
+        readable_paths: Vec<PathBuf>,
         writable_paths: Vec<PathBuf>,
         scratch: PathBuf,
     },
@@ -36,12 +38,20 @@ pub(crate) fn configure_child(
         ChildConfinement::None => {
             command
                 .env_remove(CHILD_CONFINEMENT_ENV)
+                .env_remove(CHILD_READABLE_PATHS_ENV)
                 .env_remove(CHILD_WRITABLE_PATHS_ENV);
         }
         ChildConfinement::Landlock {
+            readable_paths,
             writable_paths,
             scratch,
         } => {
+            let xdg_config_home = scratch.join("xdg-config");
+            std::fs::create_dir_all(&xdg_config_home)?;
+            let readable_paths = readable_paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
             let writable_paths = writable_paths
                 .iter()
                 .map(|path| path.to_string_lossy().into_owned())
@@ -49,9 +59,16 @@ pub(crate) fn configure_child(
             command
                 .env(CHILD_CONFINEMENT_ENV, "landlock")
                 .env(
+                    CHILD_READABLE_PATHS_ENV,
+                    serde_json::to_string(&readable_paths)?,
+                )
+                .env(
                     CHILD_WRITABLE_PATHS_ENV,
                     serde_json::to_string(&writable_paths)?,
                 )
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("XDG_CONFIG_HOME", xdg_config_home)
                 .env("TMPDIR", scratch);
         }
     }
@@ -67,16 +84,22 @@ pub(crate) fn apply_child() -> AppResult<()> {
             "run child received an unknown confinement backend".into(),
         ));
     }
-    let encoded = std::env::var(CHILD_WRITABLE_PATHS_ENV)
+    let readable = std::env::var(CHILD_READABLE_PATHS_ENV)
+        .map_err(|_| AppError::SupervisedRun("run child omitted Landlock readable paths".into()))?;
+    let readable_paths = serde_json::from_str::<Vec<String>>(&readable)?;
+    let writable = std::env::var(CHILD_WRITABLE_PATHS_ENV)
         .map_err(|_| AppError::SupervisedRun("run child omitted Landlock writable paths".into()))?;
-    let writable_paths = serde_json::from_str::<Vec<String>>(&encoded)?;
+    let writable_paths = serde_json::from_str::<Vec<String>>(&writable)?;
     #[cfg(target_os = "linux")]
     {
-        linux::restrict(writable_paths.iter().map(PathBuf::from).collect())
+        linux::restrict(
+            readable_paths.iter().map(PathBuf::from).collect(),
+            writable_paths.iter().map(PathBuf::from).collect(),
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = writable_paths;
+        let _ = (readable_paths, writable_paths);
         Err(AppError::SupervisedRun(
             "Landlock confinement is unavailable on this platform".into(),
         ))
@@ -87,8 +110,8 @@ pub(crate) fn apply_child() -> AppResult<()> {
 mod linux {
     use super::*;
     use landlock::{
-        ABI, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
-        RulesetCreated, RulesetCreatedAttr, RulesetStatus,
+        ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
+        RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
     };
 
     // ABI 5 is the first version that mediates device ioctls as write access.
@@ -97,29 +120,24 @@ mod linux {
     pub(super) fn ruleset() -> Result<RulesetCreated, landlock::RulesetError> {
         Ruleset::default()
             .set_compatibility(CompatLevel::HardRequirement)
-            .handle_access(AccessFs::from_write(ABI))?
+            .handle_access(AccessFs::from_all(ABI))?
             .create()
     }
 
-    pub(super) fn restrict(writable_paths: Vec<PathBuf>) -> AppResult<()> {
-        let directory_access = AccessFs::from_write(ABI);
-        let file_access = directory_access & AccessFs::from_file(ABI);
+    pub(super) fn restrict(
+        readable_paths: Vec<PathBuf>,
+        writable_paths: Vec<PathBuf>,
+    ) -> AppResult<()> {
+        let read_access = AccessFs::from_read(ABI);
+        let all_access = AccessFs::from_all(ABI);
         let mut ruleset = ruleset().map_err(landlock_error)?;
-        for path in writable_paths {
-            ruleset = ruleset
-                .add_rule(PathBeneath::new(
-                    PathFd::new(&path).map_err(landlock_error)?,
-                    directory_access,
-                ))
-                .map_err(landlock_error)?;
+        for path in system_read_paths().into_iter().chain(readable_paths) {
+            ruleset = add_path_rule(ruleset, &path, read_access)?;
         }
-        // Git requires an O_RDWR descriptor for this non-persistent pseudo-device.
-        ruleset = ruleset
-            .add_rule(PathBeneath::new(
-                PathFd::new("/dev/null").map_err(landlock_error)?,
-                file_access,
-            ))
-            .map_err(landlock_error)?;
+        for path in writable_paths {
+            ruleset = add_path_rule(ruleset, &path, all_access)?;
+        }
+        ruleset = add_path_rule(ruleset, std::path::Path::new("/dev/null"), all_access)?;
         let status = ruleset.restrict_self().map_err(landlock_error)?;
         if status.ruleset != RulesetStatus::FullyEnforced || !status.no_new_privs {
             return Err(AppError::SupervisedRun(
@@ -127,6 +145,45 @@ mod linux {
             ));
         }
         Ok(())
+    }
+
+    fn add_path_rule(
+        ruleset: RulesetCreated,
+        path: &std::path::Path,
+        access: BitFlags<AccessFs>,
+    ) -> AppResult<RulesetCreated> {
+        let metadata = std::fs::metadata(path).map_err(landlock_error)?;
+        let access = if metadata.is_dir() {
+            access
+        } else {
+            access & AccessFs::from_file(ABI)
+        };
+        ruleset
+            .add_rule(PathBeneath::new(
+                PathFd::new(path).map_err(landlock_error)?,
+                access,
+            ))
+            .map_err(landlock_error)
+    }
+
+    fn system_read_paths() -> Vec<PathBuf> {
+        [
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib64",
+            "/etc",
+            "/nix/store",
+            "/run/systemd/resolve",
+            "/dev/null",
+            "/dev/random",
+            "/dev/urandom",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .collect()
     }
 
     fn landlock_error(error: impl std::fmt::Display) -> AppError {
@@ -170,7 +227,14 @@ mod tests {
         let sibling = Path::new(&paths[3]);
         let other_thread = Path::new(&paths[4]);
         let outside = Path::new(&paths[5]);
+        let server_db = Path::new(&paths[6]);
+        let profile_home_secret = Path::new(&paths[7]);
+        let raw_transcript = Path::new(&paths[8]);
 
+        assert_eq!(
+            fs::read_to_string(private.join("seed.txt")).unwrap(),
+            "private\n"
+        );
         fs::write(private.join("allowed.txt"), "allowed\n").unwrap();
         fs::write(scratch.join("scratch.txt"), "scratch\n").unwrap();
         git(private, &["add", "allowed.txt"]);
@@ -184,6 +248,23 @@ mod tests {
                 .success()
         );
         assert!(fs::read("/etc/os-release").is_ok());
+
+        for denied in [
+            shared.join("secret"),
+            sibling.join("secret"),
+            other_thread.join("private.txt"),
+            outside.join("secret"),
+            server_db.to_path_buf(),
+            profile_home_secret.to_path_buf(),
+            raw_transcript.to_path_buf(),
+        ] {
+            let error = fs::read(&denied).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "read {denied:?}"
+            );
+        }
 
         for denied in [
             shared.join("object"),
@@ -235,6 +316,20 @@ mod tests {
         );
 
         for denied in [
+            sibling_workspace.join("secret"),
+            server_state.join("server.db"),
+            shared_objects.join("secret"),
+            outside.join("secret"),
+        ] {
+            let error = fs::read(&denied).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "read {denied:?}"
+            );
+        }
+
+        for denied in [
             sibling_workspace.join("denied.txt"),
             server_state.join("server.db"),
             shared_objects.join("denied-object"),
@@ -257,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn landlock_allows_private_git_and_scratch_but_denies_every_other_write_root() {
+    fn landlock_allows_private_git_and_scratch_but_denies_state_home_and_sibling_reads() {
         assert_eq!(detect_support(), ConfinementSupport::Landlock);
         let root = tempfile::tempdir().unwrap();
         let private = root.path().join("private");
@@ -266,6 +361,8 @@ mod tests {
         let sibling = root.path().join("sibling");
         let other_thread = root.path().join("other-thread");
         let outside = root.path().join("outside");
+        let server_state = root.path().join("server-state");
+        let profile_home = root.path().join("profile-home");
         for path in [
             &private,
             &scratch,
@@ -273,9 +370,20 @@ mod tests {
             &sibling,
             &other_thread,
             &outside,
+            &server_state,
+            &profile_home,
         ] {
             fs::create_dir_all(path).unwrap();
         }
+        fs::create_dir_all(server_state.join("transcripts")).unwrap();
+        fs::write(private.join("seed.txt"), "private\n").unwrap();
+        fs::write(shared.join("secret"), "shared\n").unwrap();
+        fs::write(sibling.join("secret"), "sibling\n").unwrap();
+        fs::write(other_thread.join("private.txt"), "other\n").unwrap();
+        fs::write(outside.join("secret"), "outside\n").unwrap();
+        fs::write(server_state.join("server.db"), "state\n").unwrap();
+        fs::write(profile_home.join("secret"), "home\n").unwrap();
+        fs::write(server_state.join("transcripts/raw.jsonl"), "raw\n").unwrap();
         git(&private, &["init", "--quiet", "--initial-branch", "main"]);
         git(&private, &["config", "user.name", "Platonic Test"]);
         git(
@@ -294,6 +402,15 @@ mod tests {
             sibling.to_string_lossy().into_owned(),
             other_thread.to_string_lossy().into_owned(),
             outside.to_string_lossy().into_owned(),
+            server_state
+                .join("server.db")
+                .to_string_lossy()
+                .into_owned(),
+            profile_home.join("secret").to_string_lossy().into_owned(),
+            server_state
+                .join("transcripts/raw.jsonl")
+                .to_string_lossy()
+                .into_owned(),
         ];
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
@@ -307,6 +424,7 @@ mod tests {
         configure_child(
             &mut command,
             &ChildConfinement::Landlock {
+                readable_paths: vec![private.clone(), scratch.clone()],
                 writable_paths: vec![private.clone(), scratch.clone()],
                 scratch,
             },
@@ -322,7 +440,10 @@ mod tests {
         assert!(private.join("allowed.txt").is_file());
         assert!(root.path().join("scratch/scratch.txt").is_file());
         assert!(!shared.join("object").exists());
-        assert!(!other_thread.join("private.txt").exists());
+        assert_eq!(
+            fs::read_to_string(other_thread.join("private.txt")).unwrap(),
+            "other\n"
+        );
         assert!(!outside.join("outside.txt").exists());
     }
 
@@ -346,6 +467,9 @@ mod tests {
             fs::create_dir_all(path).unwrap();
         }
         fs::write(server_state.join("server.db"), "server state\n").unwrap();
+        fs::write(sibling_workspace.join("secret"), "sibling\n").unwrap();
+        fs::write(shared_objects.join("secret"), "shared\n").unwrap();
+        fs::write(outside.join("secret"), "outside\n").unwrap();
 
         let fixture = vec![
             workspace.to_string_lossy().into_owned(),
@@ -370,6 +494,7 @@ mod tests {
         configure_child(
             &mut command,
             &ChildConfinement::Landlock {
+                readable_paths: vec![workspace.clone(), scratch.clone()],
                 writable_paths: vec![workspace.clone(), scratch.clone()],
                 scratch: scratch.clone(),
             },

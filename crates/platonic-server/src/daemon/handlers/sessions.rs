@@ -308,6 +308,13 @@ fn typed_run(run: &SessionRunRecords, readback_entries: Vec<ReadbackEntry>) -> T
     }
 }
 
+pub(in crate::daemon) fn typed_entries_for_run(
+    run: &SessionRunRecords,
+) -> AppResult<Vec<TypedTranscriptEntry>> {
+    let readback = RunReadback::from_events(&run.records)?;
+    Ok(typed_entries(&run.question, readback.entries))
+}
+
 fn model_status(records: &[RecordedEvent]) -> Option<ModelIdentityStatus> {
     records.iter().rev().find_map(|record| match &record.event {
         HarnessEvent::ModelRequested { model, .. } => Some(ModelIdentityStatus::Requested {

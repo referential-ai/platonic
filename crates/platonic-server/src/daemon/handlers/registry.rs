@@ -346,8 +346,8 @@ pub(crate) mod profiles {
     use crate::{
         AppError,
         server_store::{
-            MAX_PROFILE_LIST_ENTRIES, ProfileRecord, ProfileRevisionContent, ProfileRevisionRecord,
-            ProfileValidationError, mint_profile_id,
+            MAX_PROFILE_LIST_ENTRIES, MAX_PROFILE_REVISION_ACTOR_BYTES, ProfileRecord,
+            ProfileRevisionContent, ProfileRevisionRecord, ProfileValidationError, mint_profile_id,
         },
     };
     use platonic_core::{ActorId, ModelName, ProfileId, ToolName};
@@ -370,6 +370,13 @@ pub(crate) mod profiles {
     pub(crate) struct ProfileListRequest {
         pub(crate) workspace_id: Option<String>,
         pub(crate) limit: usize,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct ProfileUpdateRequest {
+        pub(crate) profile_id: ProfileId,
+        pub(crate) content: ProfileRevisionContent,
+        pub(crate) actor: String,
     }
 
     impl Default for ProfileListRequest {
@@ -436,6 +443,11 @@ pub(crate) mod profiles {
             .map_err(|error| ProfileRegistryError::Invalid(error.to_string()))?;
         ActorId::new(request.actor.clone())
             .map_err(|error| ProfileRegistryError::Invalid(error.to_string()))?;
+        if request.actor.len() > MAX_PROFILE_REVISION_ACTOR_BYTES {
+            return Err(ProfileRegistryError::Invalid(format!(
+                "revision actor exceeds {MAX_PROFILE_REVISION_ACTOR_BYTES} bytes"
+            )));
+        }
         for tool in &request.toolset {
             ToolName::new(tool.clone())
                 .map_err(|error| ProfileRegistryError::Invalid(error.to_string()))?;
@@ -548,6 +560,31 @@ pub(crate) mod profiles {
         status_from_records(runtime, &workspace, profile, revision)
     }
 
+    pub(crate) fn update(
+        runtime: &DaemonRuntime,
+        request: ProfileUpdateRequest,
+    ) -> Result<ProfileRevisionRecord, ProfileRegistryError> {
+        ActorId::new(request.actor.clone())
+            .map_err(|error| ProfileRegistryError::Invalid(error.to_string()))?;
+        if request.actor.len() > MAX_PROFILE_REVISION_ACTOR_BYTES {
+            return Err(ProfileRegistryError::Invalid(format!(
+                "revision actor exceeds {MAX_PROFILE_REVISION_ACTOR_BYTES} bytes"
+            )));
+        }
+        request.content.validate()?;
+        let mut store = runtime.paths.server_store()?;
+        store
+            .update_profile_content(
+                &request.profile_id,
+                &request.actor,
+                now_ms(),
+                request.content,
+            )?
+            .ok_or_else(|| {
+                ProfileRegistryError::ProfileNotFound(request.profile_id.as_str().into())
+            })
+    }
+
     fn status_from_records(
         runtime: &DaemonRuntime,
         workspace: &crate::server_store::WorkspaceRecord,
@@ -580,7 +617,9 @@ pub(crate) mod profiles {
 
 #[cfg(test)]
 pub(in crate::daemon::handlers) mod tests {
-    use super::profiles::{ProfileCreateRequest, ProfileListRequest, ProfileRegistryError};
+    use super::profiles::{
+        ProfileCreateRequest, ProfileListRequest, ProfileRegistryError, ProfileUpdateRequest,
+    };
     use super::*;
 
     use serde_json::json;
@@ -1070,6 +1109,112 @@ pub(in crate::daemon::handlers) mod tests {
             ),
             Err(ProfileRegistryError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn profile_update_appends_parented_hash_verified_revisions() {
+        let (root, runtime) = bare_thread_test_runtime();
+        let workspace_root = root.path().join("revision-workspace");
+        std::fs::create_dir(&workspace_root).unwrap();
+        let workspace = handle_request(
+            &runtime,
+            workspace_request(
+                "revision-ws",
+                "workspace.create",
+                json!({"name": "revisions", "root": workspace_root.to_string_lossy()}),
+            ),
+        );
+        let workspace: WorkspaceCreateResult = response_result(&workspace);
+        let created = profiles::create(
+            &runtime,
+            profile_create_request(&workspace.workspace.id, "builder"),
+        )
+        .unwrap();
+        let profile_id = created.summary.profile.id;
+        let second_content = ProfileRevisionContent {
+            instructions_markdown: "Second instructions.".into(),
+            memory_markdown: "Second memory.".into(),
+            skill_refs: vec!["skill:review-v2".into()],
+        };
+        let second = profiles::update(
+            &runtime,
+            ProfileUpdateRequest {
+                profile_id: profile_id.clone(),
+                content: second_content.clone(),
+                actor: "operator-two".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(second.revision, 2);
+        assert_eq!(second.parent_revision, Some(1));
+        assert_eq!(second.actor, "operator-two");
+        assert_eq!(second.content_hash, second_content.content_hash().unwrap());
+
+        let third_content = ProfileRevisionContent {
+            instructions_markdown: "Third instructions.".into(),
+            memory_markdown: "Third memory.".into(),
+            skill_refs: vec![],
+        };
+        let third = profiles::update(
+            &runtime,
+            ProfileUpdateRequest {
+                profile_id: profile_id.clone(),
+                content: third_content.clone(),
+                actor: "operator-three".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(third.revision, 3);
+        assert_eq!(third.parent_revision, Some(2));
+        assert_eq!(third.content_hash, third_content.content_hash().unwrap());
+        assert!(matches!(
+            profiles::update(
+                &runtime,
+                ProfileUpdateRequest {
+                    profile_id: profile_id.clone(),
+                    content: ProfileRevisionContent::empty(),
+                    actor: "a".repeat(crate::server_store::MAX_PROFILE_REVISION_ACTOR_BYTES + 1,),
+                },
+            ),
+            Err(ProfileRegistryError::Invalid(_))
+        ));
+
+        let status = profiles::status(&runtime, &profile_id).unwrap();
+        assert_eq!(status.summary.profile.current_revision, 3);
+        assert_eq!(status.revision, third);
+        let store = runtime.paths.server_store().unwrap();
+        assert_eq!(
+            store.profile_revision(&profile_id, 2).unwrap().unwrap(),
+            second
+        );
+        assert_eq!(
+            store
+                .profile_revisions(&profile_id, 0, 4)
+                .unwrap()
+                .iter()
+                .map(|revision| revision.revision)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        drop(store);
+        let connection = rusqlite::Connection::open(&runtime.paths.server_db_path).unwrap();
+        connection
+            .execute_batch("DROP TRIGGER profile_revisions_no_update")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE profile_revisions SET memory_markdown = 'tampered'\n                 WHERE profile_id = ?1 AND revision = 2",
+                [profile_id.as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        let error = runtime
+            .paths
+            .server_store()
+            .unwrap()
+            .profile_revision(&profile_id, 2)
+            .unwrap_err();
+        assert!(error.to_string().contains("content hash mismatch"));
     }
 
     #[test]

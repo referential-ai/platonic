@@ -1,7 +1,9 @@
 use crate::{
     ApprovalRequest, AssistantDeltaEvent, RunOutcome,
     app::PreparedRun,
-    tools::{ThreadSpawnToolInput, ThreadSpawnToolOutput},
+    tools::{
+        LogicalReadRequest, LogicalReadToolOutput, ThreadSpawnToolInput, ThreadSpawnToolOutput,
+    },
 };
 use platonic_core::{HarnessEvent, RecordedEvent, RunId};
 use serde::{Deserialize, Serialize};
@@ -28,6 +30,10 @@ pub(super) enum ParentMessage {
     ThreadSpawn {
         request_id: u64,
         output: ThreadSpawnToolOutput,
+    },
+    LogicalRead {
+        request_id: u64,
+        output: LogicalReadToolOutput,
     },
     Cancel,
 }
@@ -62,6 +68,10 @@ pub(super) enum ChildMessage {
         request_id: u64,
         input: ThreadSpawnToolInput,
         approving_actor: String,
+    },
+    LogicalRead {
+        request_id: u64,
+        request: LogicalReadRequest,
     },
     Result {
         request_id: u64,
@@ -180,5 +190,49 @@ mod tests {
             }
             message => panic!("unexpected parent RPC message: {message:?}"),
         }
+    }
+
+    #[test]
+    fn logical_read_rpc_preserves_typed_request_and_denial() {
+        let child = ChildMessage::LogicalRead {
+            request_id: 9,
+            request: LogicalReadRequest::Profile(crate::tools::ProfileReadInput {
+                profile_id: None,
+                revision: Some(3),
+                cursor: Some("2".into()),
+                limit: Some(1),
+            }),
+        };
+        let encoded = serde_json::to_string(&child).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ChildMessage>(&encoded).unwrap(),
+            ChildMessage::LogicalRead {
+                request_id: 9,
+                request: LogicalReadRequest::Profile(crate::tools::ProfileReadInput {
+                    revision: Some(3),
+                    limit: Some(1),
+                    ..
+                }),
+            }
+        ));
+
+        let parent = ParentMessage::LogicalRead {
+            request_id: 9,
+            output: LogicalReadToolOutput::error(
+                crate::tools::LogicalReadErrorCode::MembershipDenied,
+                "denied",
+            ),
+        };
+        let encoded = serde_json::to_string(&parent).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ParentMessage>(&encoded).unwrap(),
+            ParentMessage::LogicalRead {
+                request_id: 9,
+                output: LogicalReadToolOutput::Error {
+                    code: crate::tools::LogicalReadErrorCode::MembershipDenied,
+                    ..
+                },
+            }
+        ));
     }
 }

@@ -8,6 +8,10 @@ pub const FILE_WRITE: &str = "file.write";
 pub const FILE_EDIT: &str = "file.edit";
 pub const SHELL_EXEC: &str = "shell.exec";
 pub const WEB_FETCH: &str = "web.fetch";
+pub const PROFILE_READ: &str = "profile.read";
+pub const THREAD_TREE_READ: &str = "thread.tree";
+pub const THREAD_EVENTS_READ: &str = "thread.events";
+pub const THREAD_TRANSCRIPT_READ: &str = "thread.transcript";
 pub const THREAD_SPAWN: &str = "thread.spawn";
 pub const COMPUTER_WINDOWS: &str = "computer.windows";
 pub const COMPUTER_OBSERVE: &str = "computer.observe";
@@ -18,6 +22,10 @@ const PROVIDER_FILE_WRITE: &str = "file_write";
 const PROVIDER_FILE_EDIT: &str = "file_edit";
 const PROVIDER_SHELL_EXEC: &str = "shell_exec";
 const PROVIDER_WEB_FETCH: &str = "web_fetch";
+const PROVIDER_PROFILE_READ: &str = "profile_read";
+const PROVIDER_THREAD_TREE_READ: &str = "thread_tree";
+const PROVIDER_THREAD_EVENTS_READ: &str = "thread_events";
+const PROVIDER_THREAD_TRANSCRIPT_READ: &str = "thread_transcript";
 const PROVIDER_THREAD_SPAWN: &str = "thread_spawn";
 const PROVIDER_COMPUTER_WINDOWS: &str = "computer_windows";
 const PROVIDER_COMPUTER_OBSERVE: &str = "computer_observe";
@@ -66,6 +74,34 @@ const BOOTSTRAP_TOOLS: &[ToolDefinition] = &[
         input_schema: ToolInputSchema::WebFetch,
     },
     ToolDefinition {
+        internal_name: PROFILE_READ,
+        provider_name: PROVIDER_PROFILE_READ,
+        effect: EffectClass::ReadOnly,
+        description: "Read one own-profile content revision and bounded revision history.",
+        input_schema: ToolInputSchema::ProfileRead,
+    },
+    ToolDefinition {
+        internal_name: THREAD_TREE_READ,
+        provider_name: PROVIDER_THREAD_TREE_READ,
+        effect: EffectClass::ReadOnly,
+        description: "List bounded metadata for threads in the current profile tree.",
+        input_schema: ToolInputSchema::ThreadTree,
+    },
+    ToolDefinition {
+        internal_name: THREAD_EVENTS_READ,
+        provider_name: PROVIDER_THREAD_EVENTS_READ,
+        effect: EffectClass::ReadOnly,
+        description: "Read bounded committed events from one current-profile thread.",
+        input_schema: ToolInputSchema::ThreadHistory,
+    },
+    ToolDefinition {
+        internal_name: THREAD_TRANSCRIPT_READ,
+        provider_name: PROVIDER_THREAD_TRANSCRIPT_READ,
+        effect: EffectClass::ReadOnly,
+        description: "Read a bounded committed transcript from one current-profile thread.",
+        input_schema: ToolInputSchema::ThreadHistory,
+    },
+    ToolDefinition {
         internal_name: THREAD_SPAWN,
         provider_name: PROVIDER_THREAD_SPAWN,
         effect: EffectClass::WorkspaceWrite,
@@ -104,6 +140,9 @@ enum ToolInputSchema {
     Write,
     ShellExec,
     WebFetch,
+    ProfileRead,
+    ThreadTree,
+    ThreadHistory,
     ThreadSpawn,
     ComputerWindows,
     ComputerObserve,
@@ -127,7 +166,13 @@ pub fn default_enabled_tools() -> Vec<String> {
         .filter(|tool| {
             !matches!(
                 tool.internal_name,
-                THREAD_SPAWN | COMPUTER_WINDOWS | COMPUTER_OBSERVE
+                PROFILE_READ
+                    | THREAD_TREE_READ
+                    | THREAD_EVENTS_READ
+                    | THREAD_TRANSCRIPT_READ
+                    | THREAD_SPAWN
+                    | COMPUTER_WINDOWS
+                    | COMPUTER_OBSERVE
             )
         })
         .map(|tool| tool.internal_name.into())
@@ -153,6 +198,13 @@ pub fn internal_name_for_provider(name: &str) -> Option<&'static str> {
         .iter()
         .find(|tool| tool.provider_name == name || tool.internal_name == name)
         .map(|tool| tool.internal_name)
+}
+
+pub(crate) fn is_logical_read_tool(name: &str) -> bool {
+    matches!(
+        name,
+        PROFILE_READ | THREAD_TREE_READ | THREAD_EVENTS_READ | THREAD_TRANSCRIPT_READ
+    )
 }
 
 pub fn tool_specs(enabled_tools: &[String]) -> Vec<ToolSpec> {
@@ -246,6 +298,75 @@ impl ToolInputSchema {
                     }
                 },
                 "required": ["url"],
+                "additionalProperties": false
+            }),
+            Self::ProfileRead => json!({
+                "type": "object",
+                "properties": {
+                    "profile_id": {
+                        "type": "string",
+                        "description": "Optional target profile; only the current profile is permitted."
+                    },
+                    "revision": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Exact revision to read; defaults to current."
+                    },
+                    "cursor": {
+                        "type": "string",
+                        "description": "Revision-history cursor returned by the previous page."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 50
+                    }
+                },
+                "additionalProperties": false
+            }),
+            Self::ThreadTree => json!({
+                "type": "object",
+                "properties": {
+                    "profile_id": {
+                        "type": "string",
+                        "description": "Optional target profile; only the current profile is permitted."
+                    },
+                    "cursor": {
+                        "type": "string",
+                        "description": "Thread cursor returned by the previous page."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 50
+                    }
+                },
+                "additionalProperties": false
+            }),
+            Self::ThreadHistory => json!({
+                "type": "object",
+                "properties": {
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Target thread; defaults to the current thread."
+                    },
+                    "run_id": {
+                        "type": "string",
+                        "description": "Optional exact run within the target thread."
+                    },
+                    "cursor": {
+                        "type": "string",
+                        "description": "Committed-history cursor returned by the previous page."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 256,
+                        "default": 50
+                    }
+                },
                 "additionalProperties": false
             }),
             Self::ThreadSpawn => json!({
@@ -347,6 +468,10 @@ mod tests {
                 (FILE_EDIT, EffectClass::WorkspaceWrite),
                 (SHELL_EXEC, EffectClass::ExternalSideEffect),
                 (WEB_FETCH, EffectClass::Network),
+                (PROFILE_READ, EffectClass::ReadOnly),
+                (THREAD_TREE_READ, EffectClass::ReadOnly),
+                (THREAD_EVENTS_READ, EffectClass::ReadOnly),
+                (THREAD_TRANSCRIPT_READ, EffectClass::ReadOnly),
                 (THREAD_SPAWN, EffectClass::WorkspaceWrite),
                 (COMPUTER_WINDOWS, EffectClass::SecretAccess),
                 (COMPUTER_OBSERVE, EffectClass::SecretAccess),
@@ -366,6 +491,10 @@ mod tests {
                 PROVIDER_FILE_EDIT,
                 PROVIDER_SHELL_EXEC,
                 PROVIDER_WEB_FETCH,
+                PROVIDER_PROFILE_READ,
+                PROVIDER_THREAD_TREE_READ,
+                PROVIDER_THREAD_EVENTS_READ,
+                PROVIDER_THREAD_TRANSCRIPT_READ,
                 PROVIDER_THREAD_SPAWN,
                 PROVIDER_COMPUTER_WINDOWS,
                 PROVIDER_COMPUTER_OBSERVE,
