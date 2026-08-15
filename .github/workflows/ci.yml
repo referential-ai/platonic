@@ -33,6 +33,9 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version 0.22.0
 
+      - name: Audit root Rust dependencies
+        run: cargo audit --file Cargo.lock
+
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -81,9 +84,6 @@ jobs:
 
       - name: Check documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --locked --no-deps
-
-      - name: Audit root Rust dependencies
-        run: cargo audit --file Cargo.lock
 
       - name: Package platonic-core
         run: cargo package --locked -p platonic-core

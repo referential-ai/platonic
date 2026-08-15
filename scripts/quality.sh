@@ -93,7 +93,7 @@ stage_duplication() {
     cd "$repo_root"
     out="$(mktemp -d /tmp/quality-jscpd.XXXXXX)"
     trap 'rm -rf -- "$out"' EXIT
-    run npx --yes jscpd@5.0.14 --config .jscpd.json --reporters console,json --output "$out" --no-colors
+    run npx --yes jscpd@5.0.14 --config .jscpd.json --reporters console,json --output "$out" --no-colors --no-tips
     threshold="$(jq -er '.threshold' .jscpd.json)"
     jq -e --argjson threshold "$threshold" \
       '.statistics.total.percentageTokens <= $threshold' \
