@@ -6,19 +6,22 @@ use crate::{
     transport::{self, Stream},
 };
 use platonic_protocol::{
-    AgentCreateParams, AgentCreateResult, AgentId, AgentListParams, AgentListResult,
-    AgentStatusParams, AgentStatusResult, ApprovalDecideParams, ApprovalDecision, ApprovalProfile,
-    CommandAcceptedResult, DaemonStatusParams, DaemonStatusResult, Envelope, EnvelopeKind,
-    EventsStreamParams, EventsStreamResult, HelloParams, HelloResult, IssuePrepStartParams,
-    IssuePrepStartResult, MessageAppendParams, PROTOCOL_VERSION, ProtocolMethod, ProtocolRequest,
-    ProtocolResponse, ReasoningEffort, RunCancelParams, RunOverrides, RunStartParams,
-    RunStartResult, SessionApprovalProfileSetParams, SessionApprovalProfileSetResult,
-    SessionSummary, SessionsListResult, ShutdownIfIdleResult, ThreadApprovalPolicy,
-    ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams, ThreadEventsResult,
-    ThreadListResult, ThreadSendParams, ThreadSendResult, ThreadSpawnDecision, ThreadSpawnParams,
-    ThreadSpawnResult, ThreadStatusParams, ThreadStatusResult, ThreadStopParams, ThreadStopResult,
-    TranscriptReadParams, TranscriptReadResult, WorkspaceCreateParams, WorkspaceCreateResult,
-    WorkspaceListParams, WorkspaceListResult, WorkspaceStatusParams, WorkspaceStatusResult,
+    ApprovalDecideParams, ApprovalDecision, ApprovalProfile, CommandAcceptedResult,
+    DaemonStatusParams, DaemonStatusResult, Envelope, EnvelopeKind, EventsStreamParams,
+    EventsStreamResult, HelloParams, HelloResult, IssuePrepStartParams, IssuePrepStartResult,
+    MAX_PROTOCOL_LINE_BYTES, MessageAppendParams, PROTOCOL_VERSION, ProfileCreateParams,
+    ProfileCreateResult, ProfileId, ProfileListParams, ProfileListResult, ProfileOpenDecision,
+    ProfileOpenParams, ProfileOpenResult, ProfileStatusParams, ProfileStatusResult,
+    ProfileUpdateParams, ProfileUpdateResult, ProtocolMethod, ProtocolRequest, ProtocolResponse,
+    RunCancelParams, RunOverrides, RunStartParams, RunStartResult, SessionApprovalProfileSetParams,
+    SessionApprovalProfileSetResult, SessionSummary, SessionsListResult, ShutdownIfIdleResult,
+    ThreadApprovalPolicy, ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams,
+    ThreadEventsResult, ThreadListResult, ThreadSendParams, ThreadSendResult, ThreadSpawnDecision,
+    ThreadSpawnParams, ThreadSpawnResult, ThreadStatusParams, ThreadStatusResult, ThreadStopParams,
+    ThreadStopResult, TranscriptReadParams, TranscriptReadResult, VoiceEvent,
+    VoiceEventsCommitParams, VoiceEventsReadParams, VoiceEventsResult, WorkspaceCreateParams,
+    WorkspaceCreateResult, WorkspaceListParams, WorkspaceListResult, WorkspaceStatusParams,
+    WorkspaceStatusResult,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -33,23 +36,21 @@ pub struct DaemonClient {
     reader: BufReader<Stream>,
     writer: Stream,
     next_id: u64,
-    response_limit: Option<u64>,
     request_timeout: Option<Duration>,
+    workspace_id: Option<String>,
 }
 
-#[cfg(windows)]
-const CONTROL_RESPONSE_LIMIT: u64 = 64 * 1024;
 impl DaemonClient {
     /// Connects to a daemon endpoint using the platform's ordinary connect bound.
     pub fn connect(socket_path: &Path) -> ClientResult<Self> {
         let writer = transport::connect(socket_path)?;
-        Self::from_stream(writer, None, None)
+        Self::from_stream(writer, None)
     }
 
     /// Connects to a daemon endpoint within `timeout` and applies that bound to requests.
     pub fn connect_with_timeout(socket_path: &Path, timeout: Duration) -> ClientResult<Self> {
         let writer = transport::connect_with_timeout(socket_path, timeout)?;
-        Self::from_stream(writer, None, Some(timeout))
+        Self::from_stream(writer, Some(timeout))
     }
 
     #[cfg(unix)]
@@ -67,25 +68,14 @@ impl DaemonClient {
         Ok(())
     }
 
-    #[cfg(windows)]
-    /// Connects to the named-pipe server identified by lock metadata.
-    pub fn connect_expected_server(socket_path: &Path, expected_pid: u32) -> ClientResult<Self> {
-        let writer = transport::connect_expected_server(socket_path, expected_pid)?;
-        Self::from_stream(writer, Some(CONTROL_RESPONSE_LIMIT), None)
-    }
-
-    fn from_stream(
-        writer: Stream,
-        response_limit: Option<u64>,
-        request_timeout: Option<Duration>,
-    ) -> ClientResult<Self> {
+    fn from_stream(writer: Stream, request_timeout: Option<Duration>) -> ClientResult<Self> {
         let reader = BufReader::new(transport::try_clone(&writer)?);
         Ok(Self {
             reader,
             writer,
             next_id: 1,
-            response_limit,
             request_timeout,
+            workspace_id: None,
         })
     }
 
@@ -93,10 +83,17 @@ impl DaemonClient {
     pub fn hello(&mut self, workspace_root: &Path) -> ClientResult<HelloResult> {
         let workspace_root = workspace_root.canonicalize()?;
         let workspace_id = paths::workspace_id(&workspace_root)?;
-        self.request(ProtocolRequest::Hello(HelloParams {
+        let result: HelloResult = self.request(ProtocolRequest::Hello(HelloParams {
             workspace_root: workspace_root.to_string_lossy().into_owned(),
             workspace_id,
-        }))
+        }))?;
+        self.workspace_id = Some(result.workspace_id.clone());
+        Ok(result)
+    }
+
+    /// Returns the workspace selected by the successful handshake, if any.
+    pub fn workspace_id(&self) -> Option<&str> {
+        self.workspace_id.as_deref()
     }
 
     /// Lists daemon sessions for the connected workspace.
@@ -135,40 +132,85 @@ impl DaemonClient {
         }))
     }
 
-    /// Creates one configured agent profile with a hard workspace binding.
-    pub fn agent_create(
+    /// Creates one workspace-bound profile and its first content revision.
+    pub fn profile_create(
         &mut self,
-        agent_id: AgentId,
-        workspace_id: String,
-        model: String,
-        reasoning_effort: ReasoningEffort,
-        approval_policy: ThreadApprovalPolicy,
-        toolset: Vec<String>,
-    ) -> ClientResult<AgentCreateResult> {
-        self.request(ProtocolRequest::AgentCreate(AgentCreateParams {
-            agent_id,
+        params: ProfileCreateParams,
+    ) -> ClientResult<ProfileCreateResult> {
+        self.request(ProtocolRequest::ProfileCreate(params))
+    }
+
+    /// Lists profiles, optionally within one workspace.
+    pub fn profile_list(
+        &mut self,
+        workspace_id: Option<String>,
+        limit: Option<usize>,
+    ) -> ClientResult<ProfileListResult> {
+        self.request(ProtocolRequest::ProfileList(ProfileListParams {
             workspace_id,
-            model,
-            reasoning_effort,
-            approval_policy,
-            toolset,
+            limit,
         }))
     }
 
-    /// Lists every configured agent profile.
-    pub fn agent_list(&mut self) -> ClientResult<AgentListResult> {
-        self.request(ProtocolRequest::AgentList(AgentListParams::default()))
+    /// Reads one profile and its current content revision.
+    pub fn profile_status(&mut self, profile_id: ProfileId) -> ClientResult<ProfileStatusResult> {
+        self.request(ProtocolRequest::ProfileStatus(ProfileStatusParams {
+            profile_id,
+        }))
     }
 
-    /// Reads one configured agent profile.
-    pub fn agent_status(&mut self, agent_id: AgentId) -> ClientResult<AgentStatusResult> {
-        self.request(ProtocolRequest::AgentStatus(AgentStatusParams { agent_id }))
+    /// Atomically updates future-thread defaults and appends a content revision.
+    pub fn profile_update(
+        &mut self,
+        params: ProfileUpdateParams,
+    ) -> ClientResult<ProfileUpdateResult> {
+        self.request(ProtocolRequest::ProfileUpdate(params))
+    }
+
+    /// Resolves a profile's existing home without creating authority.
+    pub fn profile_open_resolve(
+        &mut self,
+        profile_id: ProfileId,
+    ) -> ClientResult<ProfileOpenResult> {
+        self.request(ProtocolRequest::ProfileOpen(ProfileOpenParams::Resolve {
+            profile_id,
+        }))
+    }
+
+    /// Starts one idempotent profile-home admission.
+    pub fn profile_open_start(
+        &mut self,
+        profile_id: ProfileId,
+        idempotency_key: String,
+        repositories: Vec<platonic_protocol::ThreadRepositoryRequest>,
+        working_repository: String,
+        working_subdir: String,
+    ) -> ClientResult<ProfileOpenResult> {
+        self.request(ProtocolRequest::ProfileOpen(ProfileOpenParams::Start {
+            profile_id,
+            idempotency_key,
+            repositories,
+            working_repository,
+            working_subdir,
+        }))
+    }
+
+    /// Resolves one pending profile-home admission.
+    pub fn profile_open_decide(
+        &mut self,
+        home_reservation_id: String,
+        decision: ProfileOpenDecision,
+    ) -> ClientResult<ProfileOpenResult> {
+        self.request(ProtocolRequest::ProfileOpen(ProfileOpenParams::Decide {
+            home_reservation_id,
+            decision,
+        }))
     }
 
     /// Starts one typed thread spawn admission.
     pub fn thread_spawn_start(
         &mut self,
-        parent_thread_id: Option<String>,
+        parent_thread_id: String,
         cwd: String,
         model: String,
         reasoning_effort: platonic_protocol::ReasoningEffort,
@@ -187,7 +229,7 @@ impl DaemonClient {
     /// Starts one typed thread spawn admission with explicit repository claims.
     pub fn thread_spawn_start_with_repositories(
         &mut self,
-        parent_thread_id: Option<String>,
+        parent_thread_id: String,
         cwd: String,
         model: String,
         reasoning_effort: platonic_protocol::ReasoningEffort,
@@ -228,7 +270,7 @@ impl DaemonClient {
         }))
     }
 
-    /// Reads one complete immutable twelve-field thread authority record.
+    /// Reads one complete immutable thread authority record.
     pub fn thread_authority(&mut self, thread_id: String) -> ClientResult<ThreadAuthorityResult> {
         self.request(ProtocolRequest::ThreadAuthority(ThreadAuthorityParams {
             thread_id,
@@ -243,10 +285,23 @@ impl DaemonClient {
         turn_id: Option<String>,
         message: String,
     ) -> ClientResult<ThreadSendResult> {
+        self.thread_send_with_prior_interruption(thread_id, controller_id, turn_id, message, None)
+    }
+
+    /// Starts an idle thread turn with an optional committed prior interruption reference.
+    pub fn thread_send_with_prior_interruption(
+        &mut self,
+        thread_id: String,
+        controller_id: String,
+        turn_id: Option<String>,
+        message: String,
+        prior_interrupted_run_id: Option<String>,
+    ) -> ClientResult<ThreadSendResult> {
         self.request(ProtocolRequest::ThreadSend(ThreadSendParams {
             thread_id,
             controller_id,
             turn_id,
+            prior_interrupted_run_id,
             message,
         }))
     }
@@ -259,8 +314,21 @@ impl DaemonClient {
         limit: usize,
         wait_ms: u64,
     ) -> ClientResult<ThreadEventsResult> {
+        self.thread_events_in_epoch(thread_id, None, from_offset, limit, wait_ms)
+    }
+
+    /// Reads one retained event page paired with a daemon live epoch.
+    pub fn thread_events_in_epoch(
+        &mut self,
+        thread_id: String,
+        live_epoch_id: Option<String>,
+        from_offset: Option<u64>,
+        limit: usize,
+        wait_ms: u64,
+    ) -> ClientResult<ThreadEventsResult> {
         self.request(ProtocolRequest::ThreadEvents(ThreadEventsParams {
             thread_id,
+            live_epoch_id,
             from_offset,
             limit: Some(limit),
             wait_ms: Some(wait_ms),
@@ -430,6 +498,28 @@ impl DaemonClient {
             config_path,
             overrides,
             approval_profile,
+            prior_interrupted_run_id: None,
+            wait: Some(wait),
+        }))
+    }
+
+    /// Appends a message with a server-verified prior interruption reference.
+    pub fn message_append_to_session_with_prior_interruption(
+        &mut self,
+        message: String,
+        session_id: Option<String>,
+        config_path: Option<String>,
+        approval_profile: Option<ApprovalProfile>,
+        prior_interrupted_run_id: Option<String>,
+        wait: bool,
+    ) -> ClientResult<RunStartResult> {
+        self.request(ProtocolRequest::MessageAppend(MessageAppendParams {
+            message,
+            session_id,
+            config_path,
+            overrides: RunOverrides::default(),
+            approval_profile,
+            prior_interrupted_run_id,
             wait: Some(wait),
         }))
     }
@@ -457,6 +547,27 @@ impl DaemonClient {
             run_id: run_id.into(),
             from_offset,
             limit: Some(limit),
+        }))
+    }
+
+    /// Commits one complete raw voice event batch for a terminal run.
+    pub fn voice_events_commit(
+        &mut self,
+        run_id: &str,
+        events: Vec<VoiceEvent>,
+    ) -> ClientResult<VoiceEventsResult> {
+        self.request(ProtocolRequest::VoiceEventsCommit(
+            VoiceEventsCommitParams {
+                run_id: run_id.into(),
+                events,
+            },
+        ))
+    }
+
+    /// Reads the committed voice event batch for `run_id`.
+    pub fn voice_events_read(&mut self, run_id: &str) -> ClientResult<VoiceEventsResult> {
+        self.request(ProtocolRequest::VoiceEventsRead(VoiceEventsReadParams {
+            run_id: run_id.into(),
         }))
     }
 
@@ -543,6 +654,19 @@ impl DaemonClient {
     pub fn run_cancel(&mut self, run_id: &str) -> ClientResult<CommandAcceptedResult> {
         self.request(ProtocolRequest::RunCancel(RunCancelParams {
             run_id: run_id.into(),
+            actor: None,
+        }))
+    }
+
+    /// Requests cancellation for an active daemon run and attributes the request.
+    pub fn run_cancel_as(
+        &mut self,
+        run_id: &str,
+        actor: String,
+    ) -> ClientResult<CommandAcceptedResult> {
+        self.request(ProtocolRequest::RunCancel(RunCancelParams {
+            run_id: run_id.into(),
+            actor: Some(actor),
         }))
     }
 
@@ -556,11 +680,6 @@ impl DaemonClient {
         let mut request = serde_json::to_vec(&envelope)?;
         request.push(b'\n');
         let deadline = self.request_timeout.map(|timeout| Instant::now() + timeout);
-        #[cfg(windows)]
-        if deadline.is_none() && self.response_limit.is_some() {
-            transport::reset_deadline(self.reader.get_mut());
-            transport::reset_deadline(&mut self.writer);
-        }
         if let Some(deadline) = deadline {
             transport::set_deadline(self.reader.get_mut(), deadline)?;
             transport::set_deadline(&mut self.writer, deadline)?;
@@ -574,18 +693,18 @@ impl DaemonClient {
         if let Some(deadline) = deadline {
             let bytes_read = self.read_line_until_deadline(
                 method.as_str(),
-                self.response_limit,
+                MAX_PROTOCOL_LINE_BYTES as u64,
                 deadline,
                 &mut line,
             )?;
             return self.decode_response(method, id, bytes_read, line);
         }
-        let bytes_read = match self.response_limit {
-            Some(limit) => {
-                Self::read_limited_line(&mut self.reader, method.as_str(), limit, &mut line)?
-            }
-            None => self.reader.read_until(b'\n', &mut line)?,
-        };
+        let bytes_read = Self::read_limited_line(
+            &mut self.reader,
+            method.as_str(),
+            MAX_PROTOCOL_LINE_BYTES as u64,
+            &mut line,
+        )?;
         self.decode_response(method, id, bytes_read, line)
     }
 
@@ -652,7 +771,7 @@ impl DaemonClient {
     ) -> ClientResult<usize> {
         let mut reader = std::io::Read::take(reader, limit + 1);
         let bytes_read = reader.read_until(b'\n', line)?;
-        if bytes_read as u64 > limit {
+        if Self::response_payload_len(line) > limit {
             return Err(ClientError::DaemonProtocol(format!(
                 "{method} response exceeds {limit} bytes"
             )));
@@ -691,7 +810,7 @@ impl DaemonClient {
     fn read_line_until_deadline(
         &mut self,
         method: &str,
-        limit: Option<u64>,
+        limit: u64,
         deadline: Instant,
         line: &mut Vec<u8>,
     ) -> ClientResult<usize> {
@@ -708,22 +827,22 @@ impl DaemonClient {
                 .position(|byte| *byte == b'\n')
                 .map_or(available.len(), |position| position + 1);
             let ended = available[consumed - 1] == b'\n';
-            let retained = match limit {
-                Some(limit) => consumed.min((limit + 1).saturating_sub(line.len() as u64) as usize),
-                None => consumed,
-            };
+            let retained = consumed.min((limit + 1).saturating_sub(line.len() as u64) as usize);
             line.extend_from_slice(&available[..retained]);
             self.reader.consume(consumed);
-            if limit.is_some_and(|limit| line.len() as u64 > limit) {
+            if Self::response_payload_len(line) > limit {
                 return Err(ClientError::DaemonProtocol(format!(
-                    "{method} response exceeds {} bytes",
-                    limit.expect("checked as present")
+                    "{method} response exceeds {limit} bytes"
                 )));
             }
             if ended {
                 return Ok(line.len());
             }
         }
+    }
+
+    fn response_payload_len(line: &[u8]) -> u64 {
+        (line.len() - usize::from(line.last() == Some(&b'\n'))) as u64
     }
 
     fn ensure_deadline(method: &str, deadline: Instant) -> ClientResult<()> {
@@ -768,6 +887,8 @@ fn response_result_value(response: ProtocolResponse) -> serde_json::Result<Value
         ProtocolResponse::MessageAppend(result) => serde_json::to_value(result),
         ProtocolResponse::IssuePrepStart(result) => serde_json::to_value(result),
         ProtocolResponse::EventsStream(result) => serde_json::to_value(result),
+        ProtocolResponse::VoiceEventsCommit(result) => serde_json::to_value(result),
+        ProtocolResponse::VoiceEventsRead(result) => serde_json::to_value(result),
         ProtocolResponse::ApprovalDecide(result) => serde_json::to_value(result),
         ProtocolResponse::RunCancel(result) => serde_json::to_value(result),
         ProtocolResponse::SessionsList(result) => serde_json::to_value(result),
@@ -782,12 +903,14 @@ fn response_result_value(response: ProtocolResponse) -> serde_json::Result<Value
         ProtocolResponse::ThreadSend(result) => serde_json::to_value(result),
         ProtocolResponse::ThreadEvents(result) => serde_json::to_value(result),
         ProtocolResponse::ThreadStop(result) => serde_json::to_value(result),
+        ProtocolResponse::ProfileOpen(result) => serde_json::to_value(result),
         ProtocolResponse::WorkspaceCreate(result) => serde_json::to_value(result),
         ProtocolResponse::WorkspaceList(result) => serde_json::to_value(result),
         ProtocolResponse::WorkspaceStatus(result) => serde_json::to_value(result),
-        ProtocolResponse::AgentCreate(result) => serde_json::to_value(result),
-        ProtocolResponse::AgentList(result) => serde_json::to_value(result),
-        ProtocolResponse::AgentStatus(result) => serde_json::to_value(result),
+        ProtocolResponse::ProfileCreate(result) => serde_json::to_value(result),
+        ProtocolResponse::ProfileList(result) => serde_json::to_value(result),
+        ProtocolResponse::ProfileStatus(result) => serde_json::to_value(result),
+        ProtocolResponse::ProfileUpdate(result) => serde_json::to_value(result),
     }
 }
 
@@ -1037,16 +1160,6 @@ mod timeout_tests {
                     _directory: Some(directory),
                 }
             }
-            #[cfg(windows)]
-            {
-                Self {
-                    path: PathBuf::from(format!(
-                        r"\\.\pipe\plato-agent-client-{name}-{}",
-                        std::process::id()
-                    )),
-                    _directory: None,
-                }
-            }
         }
     }
 }
@@ -1055,8 +1168,8 @@ mod timeout_tests {
 mod tests {
     use super::*;
     use platonic_protocol::{
-        DaemonStatusProviderKind, ERROR_NOT_FOUND, ProtocolError, RunStateName, SessionSummary,
-        ShutdownIfIdleResultName,
+        DaemonStatusProviderKind, ERROR_NOT_FOUND, ProfileContent, ProtocolError, RunStateName,
+        SessionSummary, ShutdownIfIdleResultName,
     };
     use serde_json::json;
     use std::{
@@ -1160,17 +1273,34 @@ mod tests {
             "created_at_ms": 41,
             "health": "present"
         });
-        let agent_json = json!({
-            "id": "builder",
+        let profile_json = json!({
+            "id": "profile-builder",
+            "display_name": "builder",
             "workspace_id": "ws-alpha",
             "model": "gpt-5.6-sol",
             "reasoning_effort": "xhigh",
             "approval_policy": "prompt",
             "toolset": ["file.read", "file.write"],
+            "current_revision": 1,
+            "home_thread_id": null,
+            "workspace_health": "present",
             "created_at_ms": 42
         });
+        let revision_json = json!({
+            "revision": 1,
+            "parent_revision": null,
+            "actor": "host_operator",
+            "created_at_ms": 42,
+            "content_hash": "hash-1",
+            "content": {
+                "instructions_markdown": "Build carefully.",
+                "memory_markdown": "",
+                "skill_refs": []
+            }
+        });
         let server_workspace = workspace_json.clone();
-        let server_agent = agent_json.clone();
+        let server_profile = profile_json.clone();
+        let server_revision = revision_json.clone();
         let handle = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut writer = stream.try_clone().unwrap();
@@ -1213,46 +1343,51 @@ mod tests {
             );
 
             let request = read_request(&mut reader);
-            assert_eq!(request.method.as_deref(), Some("agent.create"));
+            assert_eq!(request.method.as_deref(), Some("profile.create"));
             assert_eq!(
                 request_params_value(&request),
                 Some(json!({
-                    "agent_id": "builder",
                     "workspace_id": "ws-alpha",
+                    "display_name": "builder",
                     "model": "gpt-5.6-sol",
                     "reasoning_effort": "xhigh",
                     "approval_policy": "prompt",
-                    "toolset": ["file.read", "file.write"]
+                    "toolset": ["file.read", "file.write"],
+                    "content": {
+                        "instructions_markdown": "Build carefully.",
+                        "memory_markdown": "",
+                        "skill_refs": []
+                    }
                 }))
             );
             write_response(
                 &mut writer,
                 request.id,
-                "agent.create",
-                json!({"agent": server_agent.clone()}),
+                "profile.create",
+                json!({"status": {"profile": server_profile.clone(), "revision": server_revision.clone()}}),
             );
 
             let request = read_request(&mut reader);
-            assert_eq!(request.method.as_deref(), Some("agent.list"));
+            assert_eq!(request.method.as_deref(), Some("profile.list"));
             assert_eq!(request_params_value(&request), Some(json!({})));
             write_response(
                 &mut writer,
                 request.id,
-                "agent.list",
-                json!({"agents": [server_agent.clone()]}),
+                "profile.list",
+                json!({"profiles": [server_profile.clone()], "truncated": false}),
             );
 
             let request = read_request(&mut reader);
-            assert_eq!(request.method.as_deref(), Some("agent.status"));
+            assert_eq!(request.method.as_deref(), Some("profile.status"));
             assert_eq!(
                 request_params_value(&request),
-                Some(json!({"agent_id": "builder"}))
+                Some(json!({"profile_id": "profile-builder"}))
             );
             write_response(
                 &mut writer,
                 request.id,
-                "agent.status",
-                json!({"agent": server_agent}),
+                "profile.status",
+                json!({"status": {"profile": server_profile, "revision": server_revision}}),
             );
         });
 
@@ -1279,29 +1414,37 @@ mod tests {
         assert_eq!(
             serde_json::to_value(
                 client
-                    .agent_create(
-                        AgentId::new("builder").unwrap(),
-                        "ws-alpha".into(),
-                        "gpt-5.6-sol".into(),
-                        ReasoningEffort::Xhigh,
-                        ThreadApprovalPolicy::Prompt,
-                        vec!["file.read".into(), "file.write".into()],
-                    )
+                    .profile_create(ProfileCreateParams {
+                        workspace_id: "ws-alpha".into(),
+                        display_name: "builder".into(),
+                        model: Some("gpt-5.6-sol".into()),
+                        reasoning_effort: platonic_protocol::ReasoningEffort::Xhigh,
+                        approval_policy: ThreadApprovalPolicy::Prompt,
+                        toolset: Some(vec!["file.read".into(), "file.write".into()]),
+                        content: ProfileContent {
+                            instructions_markdown: "Build carefully.".into(),
+                            memory_markdown: String::new(),
+                            skill_refs: Vec::new(),
+                        },
+                        config_path: None,
+                    })
                     .unwrap()
-                    .agent
+                    .status
+                    .profile
             )
             .unwrap(),
-            agent_json
+            profile_json
         );
-        assert_eq!(client.agent_list().unwrap().agents.len(), 1);
+        assert_eq!(client.profile_list(None, None).unwrap().profiles.len(), 1);
         assert_eq!(
             client
-                .agent_status(AgentId::new("builder").unwrap())
+                .profile_status(ProfileId::new("profile-builder").unwrap())
                 .unwrap()
-                .agent
+                .status
+                .profile
                 .id
                 .as_str(),
-            "builder"
+            "profile-builder"
         );
         handle.join().unwrap();
     }
@@ -1313,9 +1456,12 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).unwrap();
         let authority = json!({
             "thread_id": "thread_1",
-            "parent_thread_id": null,
+            "parent_thread_id": "thread_home",
             "spawning_actor": "stdin",
-            "agent_id": "plato",
+            "profile_id": "profile_builder",
+            "profile_revision": 1,
+            "thread_kind": "child",
+            "cwd": "/tmp/work",
             "model": "gpt-5.6-sol",
             "reasoning_effort": "xhigh",
             "approval_policy": "prompt",
@@ -1325,10 +1471,14 @@ mod tests {
             "network": false,
             "created_at_ms": 42
         });
-        let legacy_authority = json!({
+        let status_authority = json!({
             "thread_id": "thread_1",
-            "parent_thread_id": null,
+            "parent_thread_id": "thread_home",
             "spawning_actor": "stdin",
+            "profile_id": "profile_builder",
+            "profile_revision": 1,
+            "thread_kind": "child",
+            "home_thread_id": "thread_home",
             "cwd": "/tmp/work",
             "model": "gpt-5.6-sol",
             "reasoning_effort": "xhigh",
@@ -1336,7 +1486,7 @@ mod tests {
             "created_at_ms": 42
         });
         let server_authority = authority.clone();
-        let server_legacy_authority = legacy_authority.clone();
+        let server_status_authority = status_authority.clone();
         let handle = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut writer = stream.try_clone().unwrap();
@@ -1348,7 +1498,7 @@ mod tests {
                 request_params_value(&start),
                 Some(json!({
                     "action": "start",
-                    "parent_thread_id": null,
+                    "parent_thread_id": "thread_home",
                     "cwd": "/tmp/work",
                     "model": "gpt-5.6-sol",
                     "reasoning_effort": "xhigh",
@@ -1385,8 +1535,9 @@ mod tests {
                 json!({
                     "status": "spawned",
                     "thread": {
-                        "authority": server_legacy_authority.clone(),
-                        "live": {"loaded": true, "current_turn_id": null, "last_activity_at_ms": 42}
+                        "authority": server_status_authority.clone(),
+                        "live": {"live_epoch_id": "epoch_1", "loaded": true, "current_turn_id": null, "last_activity_at_ms": 42},
+                        "return_availability": {"child_returns": 0, "parent_answers": 0}
                     }
                 }),
             );
@@ -1400,8 +1551,9 @@ mod tests {
                 "thread.list",
                 json!({
                     "threads": [{
-                        "authority": server_legacy_authority.clone(),
-                        "live": {"loaded": true, "current_turn_id": null}
+                        "authority": server_status_authority.clone(),
+                        "live": {"live_epoch_id": "epoch_1", "loaded": true, "current_turn_id": null},
+                        "return_availability": {"child_returns": 0, "parent_answers": 0}
                     }]
                 }),
             );
@@ -1418,8 +1570,9 @@ mod tests {
                 "thread.status",
                 json!({
                     "thread": {
-                        "authority": server_legacy_authority,
-                        "live": {"loaded": true, "current_turn_id": null}
+                        "authority": server_status_authority,
+                        "live": {"live_epoch_id": "epoch_1", "loaded": true, "current_turn_id": null},
+                        "return_availability": {"child_returns": 0, "parent_answers": 0}
                     }
                 }),
             );
@@ -1486,6 +1639,7 @@ mod tests {
                 request_params_value(&events),
                 Some(json!({
                     "thread_id": "thread_1",
+                    "live_epoch_id": "epoch_1",
                     "from_offset": 0,
                     "limit": 128,
                     "wait_ms": 1000
@@ -1497,6 +1651,7 @@ mod tests {
                 "thread.events",
                 json!({
                     "thread_id": "thread_1",
+                    "live_epoch_id": "epoch_1",
                     "from_offset": 0,
                     "next_offset": 0,
                     "current_turn_id": "thread_turn_1",
@@ -1527,7 +1682,7 @@ mod tests {
         assert!(matches!(
             client
                 .thread_spawn_start(
-                    None,
+                    "thread_home".into(),
                     "/tmp/work".into(),
                     "gpt-5.6-sol".into(),
                     platonic_protocol::ReasoningEffort::Xhigh,
@@ -1555,7 +1710,7 @@ mod tests {
                     .authority
             )
             .unwrap(),
-            legacy_authority
+            status_authority
         );
         assert_eq!(
             serde_json::to_value(
@@ -1592,7 +1747,13 @@ mod tests {
             ThreadSendResult::Steered { ref turn_id, .. } if turn_id == "thread_turn_1"
         ));
         let events = client
-            .thread_events("thread_1".into(), Some(0), 128, 1_000)
+            .thread_events_in_epoch(
+                "thread_1".into(),
+                Some("epoch_1".into()),
+                Some(0),
+                128,
+                1_000,
+            )
             .unwrap();
         assert_eq!(events.thread_id, "thread_1");
         assert_eq!(events.current_turn_id.as_deref(), Some("thread_turn_1"));
@@ -1793,6 +1954,46 @@ mod tests {
     }
 
     #[test]
+    fn client_rejects_terminated_and_unterminated_overlong_responses_with_or_without_timeout() {
+        for timed in [false, true] {
+            for terminated in [false, true] {
+                let socket_dir = tempfile::tempdir().unwrap();
+                let socket_path = socket_dir.path().join("agent.sock");
+                let listener = UnixListener::bind(&socket_path).unwrap();
+                let handle = thread::spawn(move || {
+                    let (stream, _) = listener.accept().unwrap();
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let request = read_request(&mut reader);
+                    assert_eq!(request.method.as_deref(), Some("sessions.list"));
+                    let mut response = vec![b'x'; MAX_PROTOCOL_LINE_BYTES + 1];
+                    if terminated {
+                        response.push(b'\n');
+                    }
+                    writer.write_all(&response).unwrap();
+                    writer.flush().unwrap();
+                });
+                let mut client = if timed {
+                    DaemonClient::connect_with_timeout(&socket_path, Duration::from_secs(5))
+                        .unwrap()
+                } else {
+                    DaemonClient::connect(&socket_path).unwrap()
+                };
+
+                let error = client.sessions_list().unwrap_err();
+                drop(client);
+                handle.join().unwrap();
+
+                assert!(matches!(
+                    error,
+                    ClientError::DaemonProtocol(message)
+                        if message == "sessions.list response exceeds 1048576 bytes"
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn client_rejects_an_unsupported_response_protocol_version() {
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
@@ -1819,7 +2020,7 @@ mod tests {
         assert!(matches!(
             error,
             ClientError::DaemonProtocol(message)
-                if message == "unsupported response protocol version: 2"
+                if message == "unsupported response protocol version: 3"
         ));
     }
 
@@ -1909,6 +2110,75 @@ mod tests {
         assert_eq!(events.events.len(), 1);
         assert_eq!(tail.from_offset, 3);
         assert!(tail.events.is_empty());
+    }
+
+    #[test]
+    fn client_sends_raw_voice_commit_and_typed_read_requests() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let event = json!({
+            "event": "voice_spoken",
+            "run_id": "run_voice",
+            "turn_id": "turn_voice",
+            "ttfa_ms": 287,
+            "sentence_count": 2,
+            "interrupted_at": null
+        });
+        let response_events = json!([{"v": 1, "sequence": 0, "event": event.clone()}]);
+        let expected = response_events.clone();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+
+            let commit = read_request(&mut reader);
+            assert_eq!(commit.method.as_deref(), Some("voice.events.commit"));
+            assert_eq!(
+                request_params_value(&commit),
+                Some(json!({"run_id": "run_voice", "events": [event]}))
+            );
+            write_response(
+                &mut writer,
+                commit.id,
+                "voice.events.commit",
+                json!({"run_id": "run_voice", "events": response_events}),
+            );
+
+            let read = read_request(&mut reader);
+            assert_eq!(read.method.as_deref(), Some("voice.events.read"));
+            assert_eq!(
+                request_params_value(&read),
+                Some(json!({"run_id": "run_voice"}))
+            );
+            write_response(
+                &mut writer,
+                read.id,
+                "voice.events.read",
+                json!({"run_id": "run_voice", "events": expected}),
+            );
+        });
+
+        let event = serde_json::from_value::<VoiceEvent>(json!({
+            "event": "voice_spoken",
+            "run_id": "run_voice",
+            "turn_id": "turn_voice",
+            "ttfa_ms": 287,
+            "sentence_count": 2,
+            "interrupted_at": null
+        }))
+        .unwrap();
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        let committed = client
+            .voice_events_commit("run_voice", vec![event])
+            .unwrap();
+        let read = client.voice_events_read("run_voice").unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(committed.run_id, "run_voice");
+        assert_eq!(committed.events.len(), 1);
+        assert_eq!(committed.events[0].sequence, 0);
+        assert_eq!(read, committed);
     }
 
     #[test]
@@ -2111,11 +2381,30 @@ mod tests {
             let cancel = read_request(&mut reader);
             assert_eq!(cancel.method.as_deref(), Some("run.cancel"));
             assert_eq!(request_params_value(&cancel).unwrap()["run_id"], "run_3");
+            assert!(
+                request_params_value(&cancel)
+                    .unwrap()
+                    .get("actor")
+                    .is_none()
+            );
             write_response(
                 &mut writer,
                 cancel.id,
                 "run.cancel",
                 json!({"run_id": "run_3", "status": "cancel_requested"}),
+            );
+
+            let attributed_cancel = read_request(&mut reader);
+            assert_eq!(attributed_cancel.method.as_deref(), Some("run.cancel"));
+            assert_eq!(
+                request_params_value(&attributed_cancel).unwrap(),
+                json!({"run_id": "run_4", "actor": "remote_laptop"})
+            );
+            write_response(
+                &mut writer,
+                attributed_cancel.id,
+                "run.cancel",
+                json!({"run_id": "run_4", "status": "cancel_requested"}),
             );
         });
 
@@ -2128,12 +2417,16 @@ mod tests {
             .approval_deny("run_2", "call_2", "denied by plato-tui".into())
             .unwrap();
         let canceled = client.run_cancel("run_3").unwrap();
+        let attributed = client
+            .run_cancel_as("run_4", "remote_laptop".into())
+            .unwrap();
         handle.join().unwrap();
 
         assert_eq!(granted.status, RunStateName::Running);
         assert_eq!(session_granted.status, RunStateName::Running);
         assert_eq!(denied.status, RunStateName::Running);
         assert_eq!(canceled.status, RunStateName::CancelRequested);
+        assert_eq!(attributed.status, RunStateName::CancelRequested);
     }
 
     fn read_request(reader: &mut BufReader<UnixStream>) -> Envelope {

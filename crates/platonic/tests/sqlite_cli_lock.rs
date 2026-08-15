@@ -7,6 +7,8 @@ use platonic_protocol::{ShutdownIfIdleResultName, VoiceEvent};
 use platonic_server::ledger::SqliteLedger;
 use rusqlite::{Connection, params};
 use serde_json::json;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     ffi::OsString,
     fs,
@@ -307,37 +309,33 @@ struct ProofContext {
     workspace: PathBuf,
     socket_path: PathBuf,
     #[cfg(unix)]
-    runtime_root: PathBuf,
+    runtime_root: tempfile::TempDir,
     #[cfg(unix)]
     state_root: PathBuf,
-    #[cfg(windows)]
-    local_app_data: PathBuf,
 }
 
 impl ProofContext {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
+        let root_path = root.path().canonicalize().unwrap();
+        let workspace = root_path.join("workspace");
         fs::create_dir(&workspace).unwrap();
 
         #[cfg(unix)]
         let (socket_path, runtime_root, state_root) = {
-            let runtime_root = root.path().join("runtime");
-            let state_root = root.path().join("state");
-            (
-                runtime_root
-                    .join("platonic")
-                    .join("host")
-                    .join("agent.sock"),
-                runtime_root,
-                state_root,
-            )
-        };
-
-        #[cfg(windows)]
-        let (socket_path, local_app_data) = {
-            let local_app_data = root.path().join("local-app-data");
-            (PathBuf::from(r"\\.\pipe\plato-agent-host"), local_app_data)
+            let runtime_root = tempfile::Builder::new()
+                .prefix("p465-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            fs::set_permissions(runtime_root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let socket_path = runtime_root.path().join("platonic/host/agent.sock");
+            assert!(
+                socket_path.as_os_str().len() < 100,
+                "socket path must stay under the sockaddr_un limit: {}",
+                socket_path.display()
+            );
+            eprintln!("sqlite-lock proof endpoint={}", socket_path.display());
+            (socket_path, runtime_root, root_path.join("state"))
         };
 
         Self {
@@ -348,18 +346,14 @@ impl ProofContext {
             runtime_root,
             #[cfg(unix)]
             state_root,
-            #[cfg(windows)]
-            local_app_data,
         }
     }
 
     fn apply_environment(&self, command: &mut Command) {
         #[cfg(unix)]
         command
-            .env("XDG_RUNTIME_DIR", &self.runtime_root)
+            .env("XDG_RUNTIME_DIR", self.runtime_root.path())
             .env("XDG_STATE_HOME", &self.state_root);
-        #[cfg(windows)]
-        command.env("LOCALAPPDATA", &self.local_app_data);
         command.env(API_KEY_ENV, "test-key");
     }
 
@@ -390,13 +384,7 @@ impl ProofContext {
         #[cfg(unix)]
         {
             self.runtime_root
-                .join("platonic")
-                .join("host")
-                .join("agent.lock")
-        }
-        #[cfg(windows)]
-        {
-            self.local_app_data
+                .path()
                 .join("platonic")
                 .join("host")
                 .join("agent.lock")
@@ -407,13 +395,10 @@ impl ProofContext {
         #[cfg(unix)]
         {
             self.runtime_root
+                .path()
                 .join("platonic")
                 .join("host")
                 .join("agent.sock")
-        }
-        #[cfg(windows)]
-        {
-            PathBuf::from(r"\\.\pipe\plato-agent-host")
         }
     }
 
@@ -491,11 +476,6 @@ impl ProofDaemon {
             &self.workspace,
             self.child.as_mut().unwrap(),
         );
-    }
-
-    #[cfg(windows)]
-    fn id(&self) -> u32 {
-        self.child.as_ref().unwrap().id()
     }
 
     fn stop(mut self) {
@@ -825,10 +805,12 @@ fn seed_sqlite_session(path: &Path, session_id: &str, run_id: &str, question: &s
         .begin_session_run(session_id, &run_id, question, true)
         .unwrap();
     let events = [
-        HarnessEvent::RunStarted {
+        HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
             run_id: run_id.clone(),
-            agent_id: AgentId::new("plato").unwrap(),
-        },
+            identity: platonic_core::RunIdentity::LegacyAgent {
+                agent_id: AgentId::new("plato").unwrap(),
+            },
+        }),
         HarnessEvent::ContextBuilt {
             run_id: run_id.clone(),
             turn_id: turn_id.clone(),

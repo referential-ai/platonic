@@ -1,0 +1,10 @@
+**
+!package.json
+!package-lock.json
+!astro.config.mjs
+!config.mjs
+!nginx.conf
+!public/
+!public/**
+!src/
+!src/**

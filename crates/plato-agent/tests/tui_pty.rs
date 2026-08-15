@@ -1,20 +1,26 @@
 #![cfg(unix)]
 
+use plato_agent::tui::{
+    TuiOptions, VOICE_CONTROL_CAPACITY, VoiceControl, VoiceControlEvent, VoiceControlRequest,
+    VoiceControlResponse, run_tui,
+};
 use platonic_client::paths;
 use platonic_client::{
     ClientError,
     client::{DaemonClient, DaemonConnectionConfig},
 };
+use platonic_core::{RunId, TurnId};
 use platonic_protocol::{
-    ApprovalProfile, ERROR_LAGGED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_UNREGISTERED,
-    Envelope, EnvelopeKind, PROTOCOL_VERSION, ProtocolRequest, RunStateName,
-    ShutdownIfIdleResultName,
+    ERROR_INTERNAL, ERROR_LAGGED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_UNREGISTERED, Envelope,
+    EnvelopeKind, PROTOCOL_VERSION, ProtocolRequest, RunStateName, ShutdownIfIdleResultName,
+    StreamEvent, VoiceEvent, VoiceEventEnvelope,
 };
 use pty_process::{
     Size,
     blocking::{Command, Pty, open},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
     io::{BufRead, BufReader, ErrorKind, Read, Write},
@@ -24,9 +30,10 @@ use std::{
         unix::net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
-    process::{Child, ExitStatus},
+    process::{Child, Command as ProcessCommand, ExitStatus},
     sync::{
         Arc, Mutex,
+        atomic::AtomicBool,
         mpsc::{self, Receiver, Sender, TryRecvError},
     },
     thread::{self, JoinHandle},
@@ -44,6 +51,10 @@ const PENDING_RUN_ID: &str = "run_pty_pending";
 const PENDING_CALL_ID: &str = "call_pty_pending";
 const CONVERSATION_RUN_ID: &str = "run_pty_conversation_full_identifier";
 const STREAMING_RUN_ID: &str = "run_pty_streaming_384";
+const VOICE_RUN_ID: &str = "run_pty_voice_interrupted";
+const VOICE_NEXT_RUN_ID: &str = "run_pty_voice_follow_up";
+const VOICE_FIRST_QUESTION: &str = "First voice question";
+const VOICE_NEXT_QUESTION: &str = "Same barge-in utterance";
 const STREAMING_SOURCE: &str = concat!(
     "Burst line one.\n",
     "quiet partial\n",
@@ -101,7 +112,11 @@ const DISABLE_ALTERNATE_SCROLL: &[u8] = b"\x1b[?1007l";
 const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
 
 #[test]
-fn plato_tui_yolo_cold_starts_host_thread_and_remote_reuses_it() {
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "inline PTY viewport omits the preserved title on macOS; #465"
+)]
+fn plato_tui_cold_start_creates_one_profile_home_without_an_unrelated_root() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
     let runtime = root.path().join("runtime");
@@ -120,65 +135,46 @@ fn plato_tui_yolo_cold_starts_host_thread_and_remote_reuses_it() {
     let mut local = PtyShell::spawn(&workspace, &runtime, &state, &home);
 
     local.write(
-        br#""$PLATO_ROOT_BIN" --tui --yolo; printf '\n%sLOCAL_STATUS:%s\n' "$PTY_MARK" "$?"
+        br#"OPENROUTER_API_KEY=pty-test "$PLATO_ROOT_BIN" --tui --yolo; printf '\n%sLOCAL_STATUS:%s\n' "$PTY_MARK" "$?"
 "#,
     );
     local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Workspace name [workspace]");
     local.write(b"\r");
-    local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Approve thread.spawn?");
+    local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Profile name [workspace]");
+    local.write(b"\r");
+    local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Approve profile home?");
     local.write(b"y\r");
-    local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Plato Agent");
-    let local_screen = local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "yolo ·");
-    assert!(local_screen.contains("Plato Agent"));
+    local.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Try \"read README.md and summarize it\"",
+    );
 
     let mut client = connect_pty_daemon(&config);
     client.hello(&workspace).unwrap();
+    let profiles = client.profile_list(None, None).unwrap().profiles;
     let threads = client.thread_list().unwrap().threads;
+    assert_eq!(profiles.len(), 1);
     assert_eq!(threads.len(), 1);
-    let thread = &threads[0];
-    assert!(thread.live.loaded);
-    assert_eq!(thread.authority.spawning_actor, "local_tui");
-    let thread_id = thread.authority.thread_id.clone();
+    assert_eq!(
+        profiles[0].home_thread_id,
+        Some(threads[0].authority.thread_id.clone())
+    );
+    assert_eq!(
+        threads[0].authority.thread_kind,
+        platonic_protocol::ThreadKind::Home
+    );
     assert_eq!(
         client
-            .daemon_status(Some(format!("session_{thread_id}")), None)
+            .daemon_status(
+                Some(format!("session_{}", threads[0].authority.thread_id)),
+                None,
+            )
             .unwrap()
             .trust
             .approval_profile,
-        ApprovalProfile::Yolo
+        platonic_protocol::ApprovalProfile::Yolo
     );
-    let authority = client
-        .thread_authority(thread_id.clone())
-        .unwrap()
-        .authority;
-    assert_eq!(authority.spawning_actor, "local_tui");
-    assert_eq!(authority.worktrees.len(), 1);
-    assert_eq!(thread.authority.cwd, authority.worktrees[0].path);
-    assert_eq!(authority.granted_paths.len(), 1);
-    assert!(authority.granted_paths[0].writable);
-    assert_eq!(
-        client
-            .thread_status(thread_id.clone())
-            .unwrap()
-            .thread
-            .authority,
-        thread.authority
-    );
-
-    let mut remote = PtyShell::spawn(&workspace, &runtime, &state, &home);
-    remote.write(
-        format!(
-            "\"$PLATO_ROOT_BIN\" --remote \"{thread_id}\"; printf '\\n%sREMOTE_STATUS:%s\\n' \"$PTY_MARK\" \"$?\"\n"
-        )
-        .as_bytes(),
-    );
-    remote.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Plato Agent");
-    assert_eq!(client.thread_list().unwrap().threads.len(), 1);
-
-    remote.write(b"q");
-    assert_eq!(remote.wait_for_marker("REMOTE_STATUS"), "0");
-    remote.write(b"exit\r");
-    assert!(remote.wait_bounded(PROOF_TIMEOUT).success());
     local.write(b"q");
     assert_eq!(local.wait_for_marker("LOCAL_STATUS"), "0");
     local.write(b"exit\r");
@@ -251,7 +247,10 @@ fn local_interactive_one_shot_asks_once_and_enter_registers_the_directory() {
     let workspaces = client.workspace_list().unwrap().workspaces;
     assert_eq!(workspaces.len(), 1);
     assert_eq!(workspaces[0].name, "workspace");
-    assert_eq!(Path::new(&workspaces[0].root), workspace);
+    assert_eq!(
+        Path::new(&workspaces[0].root),
+        workspace.canonicalize().unwrap()
+    );
     daemon.kill().unwrap();
     daemon.wait().unwrap();
     assert_ne!(shell.wait_for_marker("STATUS"), "0");
@@ -271,6 +270,7 @@ fn standalone_tui_default_local_endpoint_asks_once_and_registers() {
     for directory in [&workspace, &runtime, &state, &home] {
         fs::create_dir(directory).unwrap();
     }
+    init_git_repository(&workspace);
     let endpoint = runtime.join("platonic").join("host").join("agent.sock");
     let config = DaemonConnectionConfig::resolve(&workspace, Some(endpoint.clone())).unwrap();
     let mut daemon = spawn_host_daemon(&workspace, &runtime, &state, &home);
@@ -282,22 +282,55 @@ fn standalone_tui_default_local_endpoint_asks_once_and_registers() {
     let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
 
     shell.write(
-        br#""$PLATO_BIN" --run run_missing; printf '\n%sSTATUS:%s\n' "$PTY_MARK" "$?"
+        br#""$PLATO_BIN"; printf '\n%sSTATUS1:%s\n' "$PTY_MARK" "$?"
 "#,
     );
     shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Workspace name [workspace]");
     shell.write(b"\r");
-    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Transcript unavailable");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Profile name [workspace]");
+    shell.write(b"\r");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Approve profile home?");
+    shell.write(b"y\r");
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Try \"read README.md and summarize it\"",
+    );
 
     let mut client = connect_pty_daemon(&config);
     client.hello(&workspace).unwrap();
     let workspaces = client.workspace_list().unwrap().workspaces;
     assert_eq!(workspaces.len(), 1);
     assert_eq!(workspaces[0].name, "workspace");
-    assert_eq!(Path::new(&workspaces[0].root), workspace);
+    assert_eq!(
+        Path::new(&workspaces[0].root),
+        workspace.canonicalize().unwrap()
+    );
+    let profiles = client.profile_list(None, None).unwrap().profiles;
+    assert_eq!(profiles.len(), 1);
+    let home_thread_id = profiles[0].home_thread_id.clone().unwrap();
 
     shell.write(b"q");
-    assert_eq!(shell.wait_for_marker("STATUS"), "0");
+    assert_eq!(shell.wait_for_marker("STATUS1"), "0");
+    let second_at = shell.output_len();
+    shell.write(
+        br#""$PLATO_BIN"; printf '\n%sSTATUS2:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Try \"read README.md and summarize it\"",
+    );
+    let second_output = String::from_utf8_lossy(&shell.output_since(second_at)).into_owned();
+    assert!(
+        second_output.contains(&format!("Home: {home_thread_id} (reused)")),
+        "{second_output}"
+    );
+    assert!(!second_output.contains("Profile name [workspace]"));
+    assert!(!second_output.contains("Approve profile home?"));
+    shell.write(b"q");
+    assert_eq!(shell.wait_for_marker("STATUS2"), "0");
     shell.write(b"exit\r");
     assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
     assert_eq!(
@@ -428,6 +461,10 @@ fn standalone_tui_absent_default_endpoint_keeps_the_offline_view_without_prompti
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "inline PTY viewport omits the preserved title on macOS; #465"
+)]
 fn standalone_tui_reconnects_to_registered_host_after_restart() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -531,7 +568,6 @@ fn standalone_tui_surfaces_registration_io_failure_after_prompt() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_preserves_draft_and_restores_parent_terminal() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -580,7 +616,11 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
     let keypress_at = Instant::now();
     shell.write(b"?");
     let shortcuts = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Shortcuts");
-    assert!(shortcuts.contains("alt + enter"));
+    assert!(shortcuts.contains(if cfg!(target_os = "macos") {
+        "⌥ enter"
+    } else {
+        "alt + enter"
+    }));
     assert!(shortcuts.contains("? shortcuts · Esc close"));
     assert!(
         keypress_at.elapsed() < Duration::from_secs(1),
@@ -622,13 +662,19 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
     let daemon_event_at = Instant::now();
     let daemon_output_at = shell.output_len();
     shell.write(b"\r");
-    let run_start = fake.wait_for_request("run.start");
-    let run_start_params = request_params_value(&run_start);
-    let question = run_start_params
-        .get("question")
+    let thread_send = fake.wait_for_request("thread.send");
+    let thread_send_params = request_params_value(&thread_send);
+    let question = thread_send_params
+        .get("message")
         .and_then(Value::as_str)
-        .expect("run.start.question should be a string");
+        .expect("thread.send.message should be a string");
     assert_eq!(question, visible_draft);
+    assert_eq!(thread_send_params["thread_id"], "tui_pty");
+    assert!(
+        thread_send_params["controller_id"]
+            .as_str()
+            .is_some_and(|controller| controller.starts_with("tui_"))
+    );
     assert!(!question.contains("\x1b[200~"));
     assert!(!question.contains("\x1b[201~"));
 
@@ -669,11 +715,11 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
     assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
 
     let requests = fake.finish();
-    let run_starts: Vec<_> = requests
+    let thread_sends: Vec<_> = requests
         .iter()
-        .filter(|request| request.method.as_deref() == Some("run.start"))
+        .filter(|request| request.method.as_deref() == Some("thread.send"))
         .collect();
-    assert_eq!(run_starts.len(), 1);
+    assert_eq!(thread_sends.len(), 1);
     assert_eq!(
         requests
             .iter()
@@ -693,7 +739,6 @@ fn bare_plato_preserves_draft_and_restores_parent_terminal() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn composer_cursor_stays_real_at_placeholder_origin_and_narrow_wrap() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -732,7 +777,7 @@ fn composer_cursor_stays_real_at_placeholder_origin_and_narrow_wrap() {
     shell.write(b"\x15");
     shell.wait_for_screen_row(12, 10, Some(resize_at), 10, "Try");
     shell.wait_for_cursor_position(12, 10, Some(resize_at), (10, 2));
-    assert!(fake.requests_for("run.start").is_empty());
+    assert!(fake.requests_for("thread.send").is_empty());
 
     shell.write(b"q");
     assert_eq!(shell.wait_for_marker("STATUS"), "0");
@@ -742,7 +787,6 @@ fn composer_cursor_stays_real_at_placeholder_origin_and_narrow_wrap() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn composer_textarea_features_preserve_submit_queue_slash_and_history_contracts() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -773,7 +817,7 @@ fn composer_textarea_features_preserve_submit_queue_slash_and_history_contracts(
     let pasted = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "beta");
     assert!(pasted.contains("> alpha"));
     assert!(pasted.contains("| beta"));
-    assert!(fake.requests_for("run.start").is_empty());
+    assert!(fake.requests_for("thread.send").is_empty());
 
     shell.write(b"\x1a");
     shell.wait_for_screen_text(
@@ -792,15 +836,23 @@ fn composer_textarea_features_preserve_submit_queue_slash_and_history_contracts(
     assert!(contains_sgr_parameter(&shell.output_since(selection_at), 7));
     shell.write(b"Y");
     shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "| Ybeta");
-    assert!(fake.requests_for("run.start").is_empty());
+    assert!(fake.requests_for("thread.send").is_empty());
 
     shell.write(b"\r");
-    let run_start = fake.wait_for_request("run.start");
-    assert_eq!(request_params_value(&run_start)["question"], "alpha\nYbeta");
+    let thread_send = fake.wait_for_request("thread.send");
+    assert_eq!(
+        request_params_value(&thread_send)["message"],
+        "alpha\nYbeta"
+    );
     shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Working");
 
     shell.write(b"next by tab\t");
-    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "1 next by tab");
+    fake.wait_for_request_count("thread.send", 2);
+    let sends = fake.requests_for("thread.send");
+    let steer = request_params_value(&sends[1]);
+    assert_eq!(steer["message"], "next by tab");
+    assert_eq!(steer["turn_id"], "turn_tui_pty");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "next by tab");
     assert!(fake.requests_for("message.append").is_empty());
 
     shell.write(b"\x1b[A");
@@ -833,7 +885,7 @@ fn composer_textarea_features_preserve_submit_queue_slash_and_history_contracts(
         INITIAL_COLS,
         "Try \"read README.md and summarize it\"",
     );
-    assert_eq!(fake.requests_for("run.start").len(), 1);
+    assert_eq!(fake.requests_for("thread.send").len(), 2);
 
     shell.write(b"q");
     assert_eq!(shell.wait_for_marker("STATUS"), "0");
@@ -844,9 +896,9 @@ fn composer_textarea_features_preserve_submit_queue_slash_and_history_contracts(
     assert_eq!(
         requests
             .iter()
-            .filter(|request| request.method.as_deref() == Some("run.start"))
+            .filter(|request| request.method.as_deref() == Some("thread.send"))
             .count(),
-        1
+        2
     );
     assert!(
         !requests
@@ -856,7 +908,6 @@ fn composer_textarea_features_preserve_submit_queue_slash_and_history_contracts(
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn nonempty_no_color_suppresses_only_color_sgr_in_the_pty() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -882,7 +933,10 @@ fn nonempty_no_color_suppresses_only_color_sgr_in_the_pty() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "alternate-screen restore omits the inline title on macOS PTYs; #464"
+)]
 fn bare_plato_status_modal_sends_one_read_only_request_and_escape_closes() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -911,8 +965,9 @@ fn bare_plato_status_modal_sends_one_read_only_request_and_escape_closes() {
     );
 
     shell.write(b"/status\r");
-    let request = fake.wait_for_request("daemon.status");
-    let params = request_params_value(&request);
+    fake.wait_for_request_count("daemon.status", 2);
+    let requests = fake.requests_for("daemon.status");
+    let params = request_params_value(&requests[1]);
     assert!(params["session_id"].is_null());
     assert!(params["config_path"].is_null());
     let modal = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "TRUST");
@@ -927,7 +982,7 @@ fn bare_plato_status_modal_sends_one_read_only_request_and_escape_closes() {
     shell.write(b"g");
     thread::sleep(Duration::from_millis(50));
     assert!(fake.requests_for("approval.decide").is_empty());
-    assert_eq!(fake.requests_for("daemon.status").len(), 1);
+    assert_eq!(fake.requests_for("daemon.status").len(), 2);
 
     shell.write(b"\x1b");
     let closed = shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "MODEL");
@@ -946,16 +1001,15 @@ fn bare_plato_status_modal_sends_one_read_only_request_and_escape_closes() {
             .iter()
             .filter(|request| request.method.as_deref() == Some("daemon.status"))
             .count(),
-        1
+        2
     );
     assert!(!requests.iter().any(|request| matches!(
         request.method.as_deref(),
-        Some("run.start" | "message.append" | "approval.decide" | "run.cancel")
+        Some("thread.send" | "run.start" | "message.append" | "approval.decide" | "run.cancel")
     )));
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_voice_fails_closed_locally_without_a_dedicated_config() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -1008,7 +1062,376 @@ fn bare_plato_voice_fails_closed_locally_without_a_dedicated_config() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
+fn hands_free_voice_bridge_preserves_barge_in_order_through_the_production_tui() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+
+    let workspace_id = paths::workspace_id(&workspace).unwrap();
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
+    let ledger = state.join("fake-agent.db");
+    let fake = FakeDaemon::bind_voice_bridge(&endpoint, &workspace, &workspace_id, &ledger);
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        br#"PLATO_VOICE_FIXTURE_CHILD=1 "$PLATO_TUI_PTY_TEST_BIN" --exact voice_bridge_fixture_child --nocapture; printf '\n%sSTATUS:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Try \"read README.md and summarize it\"",
+    );
+    shell.write(b"/voice on\r");
+
+    let start = fake.wait_for_request("run.start");
+    assert_eq!(
+        request_params_value(&start)["question"],
+        VOICE_FIRST_QUESTION
+    );
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, VOICE_FIRST_QUESTION);
+    let append = fake.wait_for_request("message.append");
+    let append_params = request_params_value(&append);
+    assert_eq!(append_params["message"], VOICE_NEXT_QUESTION);
+    assert_eq!(append_params["session_id"], "session_tui_pty");
+    assert_eq!(append_params["prior_interrupted_run_id"], VOICE_RUN_ID);
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, VOICE_NEXT_QUESTION);
+    shell.write(b"\x03");
+    fake.wait_for_request_count("run.cancel", 2);
+    shell.write(b"q");
+
+    assert_eq!(shell.wait_for_marker("STATUS"), "0");
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+
+    let requests = fake.finish();
+    for method in [
+        "run.start",
+        "run.cancel",
+        "voice.events.commit",
+        "message.append",
+    ] {
+        let expected = match method {
+            "run.cancel" | "voice.events.commit" => 2,
+            _ => 1,
+        };
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method.as_deref() == Some(method))
+                .count(),
+            expected,
+            "unexpected {method} request count"
+        );
+    }
+    let request_index = |method: &str| {
+        requests
+            .iter()
+            .position(|request| request.method.as_deref() == Some(method))
+            .unwrap()
+    };
+    assert!(request_index("run.start") < request_index("run.cancel"));
+    assert!(request_index("run.cancel") < request_index("voice.events.commit"));
+    let commit_positions = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| {
+            (request.method.as_deref() == Some("voice.events.commit")).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert!(commit_positions[1] < request_index("message.append"));
+    let cancel_positions = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| {
+            (request.method.as_deref() == Some("run.cancel")).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert!(request_index("message.append") < cancel_positions[1]);
+    let canceled_runs = requests
+        .iter()
+        .filter(|request| request.method.as_deref() == Some("run.cancel"))
+        .map(|request| {
+            request_params_value(request)["run_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(canceled_runs, [VOICE_RUN_ID, VOICE_NEXT_RUN_ID]);
+
+    let commits = requests
+        .iter()
+        .filter(|request| request.method.as_deref() == Some("voice.events.commit"))
+        .collect::<Vec<_>>();
+    assert_eq!(commits[0].params, commits[1].params);
+    let ProtocolRequest::VoiceEventsCommit(params) = commits[0].params.as_ref().unwrap() else {
+        panic!("voice commit request did not retain typed parameters");
+    };
+    assert_eq!(params.run_id, VOICE_RUN_ID);
+    assert_eq!(params.events.len(), 3);
+    assert!(matches!(
+        &params.events[1],
+        VoiceEvent::VoiceSpoken {
+            interrupted_at: Some(0),
+            ..
+        }
+    ));
+    assert!(matches!(
+        &params.events[2],
+        VoiceEvent::VoiceInterrupted { spoken_prefix, .. }
+            if spoken_prefix == "First audible sentence."
+    ));
+}
+
+#[test]
+fn voice_restart_does_not_recover_an_unacknowledged_in_memory_batch() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+
+    let workspace_id = paths::workspace_id(&workspace).unwrap();
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
+    let ledger = state.join("fake-agent.db");
+    let fake = FakeDaemon::bind_voice_bridge(&endpoint, &workspace, &workspace_id, &ledger);
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        br#"PLATO_VOICE_FIXTURE_CHILD=crash "$PLATO_TUI_PTY_TEST_BIN" --exact voice_bridge_fixture_child --nocapture; printf '\n%sCRASH:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Try \"read README.md and summarize it\"",
+    );
+    shell.write(b"/voice on\r");
+    fake.wait_for_request_count("voice.events.commit", 1);
+    let pid = fs::read_to_string(workspace.join("voice-fixture.pid")).unwrap();
+    assert!(
+        ProcessCommand::new("kill")
+            .args(["-KILL", pid.trim()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(shell.wait_for_marker("CRASH"), "137");
+
+    shell.write(
+        br#"stty sane; printf '\n%sVOICE_TTY_SANE:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    assert_eq!(shell.wait_for_marker("VOICE_TTY_SANE"), "0");
+
+    let restart_at = shell.output_len();
+    shell.write(
+        br#"PLATO_VOICE_FIXTURE_CHILD=restart "$PLATO_TUI_PTY_TEST_BIN" --exact voice_bridge_fixture_child --nocapture; printf '\n%sRESTART:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text_after(INITIAL_ROWS, INITIAL_COLS, restart_at, VOICE_FIRST_QUESTION);
+    shell.write(b"/voice on\r");
+    shell.wait_for_screen_text_after(INITIAL_ROWS, INITIAL_COLS, restart_at, "voice enabled");
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(fake.requests_for("voice.events.commit").len(), 1);
+    assert!(fake.requests_for("message.append").is_empty());
+    shell.write(b"q");
+    assert_eq!(shell.wait_for_marker("RESTART"), "0");
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+
+    let requests = fake.finish();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method.as_deref() == Some("voice.events.commit"))
+            .count(),
+        1
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.method.as_deref() == Some("message.append"))
+    );
+}
+
+#[test]
+fn voice_bridge_fixture_child() {
+    let Some(mode) = std::env::var_os("PLATO_VOICE_FIXTURE_CHILD") else {
+        return;
+    };
+    let workspace = std::env::current_dir().unwrap();
+    if mode == "crash" {
+        fs::write(
+            workspace.join("voice-fixture.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+    }
+    let socket = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
+        .join("platonic")
+        .join("host")
+        .join("agent.sock");
+    let mut options = TuiOptions::new(workspace);
+    options.socket = Some(socket);
+    options.voice = Some(voice_bridge_fixture_control(&mode.to_string_lossy()));
+    run_tui(options).unwrap();
+}
+
+#[test]
+fn session_grant_fixture_child() {
+    let Some(config_path) = std::env::var_os("PLATO_SESSION_GRANT_CONFIG") else {
+        return;
+    };
+    let workspace = std::env::current_dir().unwrap();
+    let socket = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
+        .join("platonic")
+        .join("host")
+        .join("agent.sock");
+    let mut options = TuiOptions::new(workspace);
+    options.socket = Some(socket);
+    options.config = Some(config_path.into());
+    options.run = std::env::var_os("PLATO_SESSION_GRANT_RUN")
+        .map(|run_id| run_id.to_string_lossy().into_owned());
+    run_tui(options).unwrap();
+}
+
+fn voice_bridge_fixture_control(mode: &str) -> VoiceControl {
+    let (request_sender, requests) = mpsc::sync_channel(VOICE_CONTROL_CAPACITY);
+    let (response_sender, responses) = mpsc::channel();
+    let (event_sender, events) = mpsc::channel();
+    let abandon = Arc::new(AtomicBool::new(false));
+    let retry_commit = mode == "1";
+    let emit_capture = mode != "restart";
+    let worker = thread::spawn(move || {
+        let mut cancel_sent = false;
+        let mut commit_sent = false;
+        let mut pending_commit = None;
+        for request in requests {
+            match request {
+                VoiceControlRequest::Enable { .. } => {
+                    response_sender.send(VoiceControlResponse::Enabled).unwrap();
+                    if emit_capture {
+                        event_sender
+                            .send(VoiceControlEvent::Captured {
+                                transcript: VOICE_FIRST_QUESTION.into(),
+                                prior_interrupted_run_id: None,
+                            })
+                            .unwrap();
+                    }
+                }
+                VoiceControlRequest::Stream(StreamEvent::AssistantDelta { run_id, .. })
+                    if run_id == VOICE_RUN_ID && !cancel_sent =>
+                {
+                    cancel_sent = true;
+                    event_sender
+                        .send(VoiceControlEvent::CancelRun { run_id })
+                        .unwrap();
+                }
+                VoiceControlRequest::Terminal { run_id, .. }
+                    if run_id == VOICE_RUN_ID && !commit_sent =>
+                {
+                    commit_sent = true;
+                    let run_id = RunId::new(run_id).unwrap();
+                    let turn_id = TurnId::new("turn_pty_voice").unwrap();
+                    let events = vec![
+                        VoiceEvent::VoiceCaptured {
+                            run_id: run_id.clone(),
+                            turn_id: turn_id.clone(),
+                            transcript_sha256: format!(
+                                "{:x}",
+                                Sha256::digest(VOICE_FIRST_QUESTION.as_bytes())
+                            ),
+                            transcript_bytes: u64::try_from(VOICE_FIRST_QUESTION.len()).unwrap(),
+                            transcript_span_ms: 400,
+                            input_frames: 19_200,
+                            output_frames: 6_400,
+                            vad_start_sample: 100,
+                            vad_speech_end_sample: 5_000,
+                            vad_close_sample: 6_400,
+                            vad_close_to_final_us: 20_000,
+                            normalization_resampling_us: 100,
+                        },
+                        VoiceEvent::VoiceSpoken {
+                            run_id: run_id.clone(),
+                            turn_id: turn_id.clone(),
+                            ttfa_ms: 40,
+                            sentence_count: 1,
+                            interrupted_at: Some(0),
+                        },
+                        VoiceEvent::VoiceInterrupted {
+                            run_id: run_id.clone(),
+                            turn_id,
+                            spoken_prefix: "First audible sentence.".into(),
+                            delta_index: 0,
+                        },
+                    ];
+                    pending_commit = Some(events.clone());
+                    event_sender
+                        .send(VoiceControlEvent::Commit {
+                            run_id: run_id.to_string(),
+                            events,
+                        })
+                        .unwrap();
+                }
+                VoiceControlRequest::CommitAcknowledged { run_id } if run_id == VOICE_RUN_ID => {
+                    event_sender
+                        .send(VoiceControlEvent::Captured {
+                            transcript: VOICE_NEXT_QUESTION.into(),
+                            prior_interrupted_run_id: Some(run_id),
+                        })
+                        .unwrap();
+                }
+                VoiceControlRequest::CommitFailed { run_id }
+                    if retry_commit && run_id == VOICE_RUN_ID =>
+                {
+                    event_sender
+                        .send(VoiceControlEvent::Commit {
+                            run_id,
+                            events: pending_commit.clone().unwrap(),
+                        })
+                        .unwrap();
+                }
+                VoiceControlRequest::Cancel { .. } => {
+                    response_sender
+                        .send(VoiceControlResponse::Silenced)
+                        .unwrap();
+                }
+                VoiceControlRequest::Disable => {
+                    response_sender
+                        .send(VoiceControlResponse::Disabled)
+                        .unwrap();
+                }
+                VoiceControlRequest::Shutdown => {
+                    response_sender
+                        .send(VoiceControlResponse::AlreadyDisabled)
+                        .unwrap();
+                    break;
+                }
+                VoiceControlRequest::SubmissionStarted
+                | VoiceControlRequest::RunObserved { .. }
+                | VoiceControlRequest::Stream(_)
+                | VoiceControlRequest::Terminal { .. }
+                | VoiceControlRequest::SubmissionFailed
+                | VoiceControlRequest::Loaded { .. }
+                | VoiceControlRequest::CommitAcknowledged { .. }
+                | VoiceControlRequest::CommitFailed { .. } => {}
+            }
+        }
+    });
+    VoiceControl::new(request_sender, responses, events, abandon, worker)
+}
+
+#[test]
 fn bare_plato_yolo_slash_command_round_trips_typed_session_mutation() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -1035,7 +1458,7 @@ fn bare_plato_yolo_slash_command_round_trips_typed_session_mutation() {
     fake.wait_for_request_count("session.approval_profile.set", 1);
     let on = fake.requests_for("session.approval_profile.set");
     let on = request_params_value(&on[0]);
-    assert_eq!(on["session_id"], "session_pty_conversation");
+    assert_eq!(on["session_id"], "session_thread_pty_conversation");
     assert_eq!(on["profile"], "yolo");
     let enabled = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "yolo ·");
     assert!(enabled.contains("yolo ·"));
@@ -1044,7 +1467,7 @@ fn bare_plato_yolo_slash_command_round_trips_typed_session_mutation() {
     fake.wait_for_request_count("session.approval_profile.set", 2);
     let off = fake.requests_for("session.approval_profile.set");
     let off = request_params_value(&off[1]);
-    assert_eq!(off["session_id"], "session_pty_conversation");
+    assert_eq!(off["session_id"], "session_thread_pty_conversation");
     assert_eq!(off["profile"], "prompt");
     shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "yolo ·");
 
@@ -1056,7 +1479,6 @@ fn bare_plato_yolo_slash_command_round_trips_typed_session_mutation() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -1101,14 +1523,19 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
         "overlay resize must refresh inline geometry while the event reader is paused"
     );
 
-    fake.wait_for_request_count("events.stream", 2);
-    let stream_requests = fake.requests_for("events.stream");
-    assert_eq!(request_params_value(&stream_requests[0])["from_offset"], 0);
+    fake.wait_for_request_count("thread.events", 2);
+    let stream_requests = fake.requests_for("thread.events");
+    assert!(
+        request_params_value(&stream_requests[0])
+            .get("from_offset")
+            .is_none(),
+        "initial thread observation must request the current tip"
+    );
     assert!(
         request_params_value(&stream_requests[1])
             .get("from_offset")
             .is_none(),
-        "lag recovery must request the current tip"
+        "lag recovery must request the current thread tip"
     );
 
     let deny_at = shell.output_len();
@@ -1167,6 +1594,10 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "inline PTY viewport omits the preserved title on macOS; #465"
+)]
 fn bare_plato_shell_session_grant_flow_is_scoped_and_expires_on_daemon_restart() {
     let root = tempfile::tempdir().unwrap();
     let root_path = root.path().to_path_buf();
@@ -1178,6 +1609,7 @@ fn bare_plato_shell_session_grant_flow_is_scoped_and_expires_on_daemon_restart()
     for directory in [&workspace, &runtime, &state, &home] {
         fs::create_dir(directory).unwrap();
     }
+    init_git_repository(&workspace);
     let provider = spawn_pty_shell_sequence_provider(&[
         ("printf once > pty-session.txt", "done-once"),
         ("printf session >> pty-session.txt", "done-session"),
@@ -1226,7 +1658,7 @@ enabled = ["shell.exec"]
 
     shell.write(
         format!(
-            "\"$PLATO_BIN\" --config \"{}\"; printf '\\n%sSTATUS1:%s\\n' \"$PTY_MARK\" \"$?\"\n",
+            "PLATO_SESSION_GRANT_CONFIG=\"{}\" \"$PLATO_TUI_PTY_TEST_BIN\" --exact session_grant_fixture_child --nocapture; printf '\\n%sSTATUS1:%s\\n' \"$PTY_MARK\" \"$?\"\n",
             config_path.display()
         )
         .as_bytes(),
@@ -1253,6 +1685,13 @@ enabled = ["shell.exec"]
     let mut client = connect_pty_daemon(&config);
     client.hello(&workspace).unwrap();
     let session_id = wait_for_finished_session(&mut client, "allow once");
+    let session_run_id = client
+        .sessions_list()
+        .unwrap()
+        .into_iter()
+        .find(|session| session.session_id == session_id)
+        .unwrap()
+        .run_id;
     let ready = shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "Esc interrupt");
     assert!(ready.contains("? shortcuts · Tab queue 0"));
 
@@ -1325,18 +1764,12 @@ enabled = ["shell.exec"]
     let restart_at = shell.output_len();
     shell.write(
         format!(
-            "\"$PLATO_BIN\" --config \"{}\"; printf '\\n%sSTATUS2:%s\\n' \"$PTY_MARK\" \"$?\"\n",
-            config_path.display()
+            "PLATO_SESSION_GRANT_CONFIG=\"{}\" PLATO_SESSION_GRANT_RUN=\"{}\" \"$PLATO_TUI_PTY_TEST_BIN\" --exact session_grant_fixture_child --nocapture; printf '\\n%sSTATUS2:%s\\n' \"$PTY_MARK\" \"$?\"\n",
+            config_path.display(), session_run_id
         )
         .as_bytes(),
     );
     shell.wait_for_ordered_output_after(restart_at, b"\x1b[6n", b"\x1b[?2026l");
-    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "different session");
-    shell.write(b"/sessions\r");
-    let picker = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Sessions");
-    assert!(picker.contains("allow once"));
-    assert!(picker.contains("different session"));
-    shell.write(b"\x1b[B\r");
     shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "repeat shell");
 
     shell.write(b"restart expires grant\r");
@@ -1397,7 +1830,6 @@ enabled = ["shell.exec"]
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -1419,7 +1851,7 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
 "#,
     );
     let before_termios = shell.wait_for_marker("PRE");
-    fake.wait_for_request_count("events.stream", 1);
+    fake.wait_for_request_count("thread.events", 1);
     let default = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Trace");
     assert!(default.contains("Plato"));
     assert!(default.contains("**Conversation-first PTY question**"));
@@ -1554,7 +1986,6 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
 fn streamed_markdown_smooths_holds_tables_and_survives_reload_and_resize() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -1582,11 +2013,11 @@ fn streamed_markdown_smooths_holds_tables_and_survives_reload_and_resize() {
     );
     let stream_at = shell.output_len();
     shell.write(b"stream the answer\r");
-    fake.wait_for_request("run.start");
+    fake.wait_for_request("thread.send");
 
     shell.wait_for_current_screen_text_after(stream_at, "Burst line one.");
     shell.wait_for_current_screen_text_after(stream_at, "quiet partial");
-    fake.wait_for_request_count("events.stream", 2);
+    fake.wait_for_request_count("thread.events", 3);
     thread::sleep(Duration::from_millis(50));
     let output = shell.output.lock().unwrap().clone();
     let resizes = shell.resizes.lock().unwrap().clone();
@@ -1610,7 +2041,8 @@ fn streamed_markdown_smooths_holds_tables_and_survives_reload_and_resize() {
     shell.wait_for_current_screen_text("final mid-tok");
 
     shell.write(b"/sessions\r");
-    shell.wait_for_current_screen_text("Sessions");
+    let picker = shell.wait_for_current_screen_text("thread_pty_streaming_384");
+    assert!(picker.contains("Threads"));
     shell.write(b"\r");
     fake.wait_for_request_count("transcript.read", 2);
     let reloaded = shell.wait_for_current_screen_text("final mid-tok");
@@ -1648,8 +2080,7 @@ fn streamed_markdown_smooths_holds_tables_and_survives_reload_and_resize() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "pty semantics diverge on macOS; #464")]
-fn bare_plato_session_picker_resumes_exact_hidden_session_id() {
+fn bare_plato_threads_picker_lists_durable_state_and_attaches_exact_thread() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
     let runtime = root.path().join("runtime");
@@ -1675,19 +2106,26 @@ fn bare_plato_session_picker_resumes_exact_hidden_session_id() {
         "Conversation-first PTY question",
     );
 
-    shell.write(b"/sessions\r");
-    let picker = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Sessions");
-    assert!(picker.contains("running"));
-    assert!(picker.contains("Conversation-first PTY question"));
-    assert!(!picker.contains("approved, go ahead"));
-    assert!(!picker.contains("session_pty_conversation"));
+    shell.write(b"/threads\r");
+    let picker = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "thread_pty_conversation");
+    assert!(picker.contains("Threads"));
+    assert!(picker.contains("active"));
+    assert!(picker.contains("thread_pty_conversation"));
+    assert!(picker.contains("unloaded"));
+    assert!(picker.contains("thread_pty_unloaded"));
+    assert!(!picker.contains("Conversation-first PTY question"));
 
     shell.write(b"\r");
     fake.wait_for_request_count("transcript.read", 2);
     let transcript_requests = fake.requests_for("transcript.read");
     assert_eq!(
         request_params_value(&transcript_requests[1])["session_id"],
-        "session_pty_conversation"
+        "session_thread_pty_conversation"
+    );
+    let status_requests = fake.requests_for("thread.status");
+    assert_eq!(
+        request_params_value(&status_requests[0])["thread_id"],
+        "thread_pty_conversation"
     );
 
     shell.write(b"q");
@@ -1702,6 +2140,13 @@ fn bare_plato_session_picker_resumes_exact_hidden_session_id() {
             .filter(|request| request.method.as_deref() == Some("transcript.read"))
             .count(),
         2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method.as_deref() == Some("thread.list"))
+            .count(),
+        1
     );
 }
 
@@ -1941,6 +2386,7 @@ fn spawn_host_daemon(workspace: &Path, runtime: &Path, state: &Path, home: &Path
         .env("HOME", home)
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_STATE_HOME", state)
+        .env("OPENROUTER_API_KEY", "pty-test")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -2090,6 +2536,7 @@ impl PtyShell {
             .env("XDG_STATE_HOME", state)
             .env("PLATO_BIN", env!("CARGO_BIN_EXE_plato-tui"))
             .env("PLATO_ROOT_BIN", env!("CARGO_BIN_EXE_plato"))
+            .env("PLATO_TUI_PTY_TEST_BIN", std::env::current_exe().unwrap())
             .env("PTY_MARK", MARKER)
             .env("PS1", "")
             .env("PS2", "")
@@ -2696,6 +3143,7 @@ enum FakeScenario {
     PendingApproval,
     ConversationAudit,
     Streaming,
+    VoiceBridge,
 }
 
 struct FakeDaemon {
@@ -2757,6 +3205,21 @@ impl FakeDaemon {
             workspace_id,
             ledger,
             FakeScenario::Streaming,
+        )
+    }
+
+    fn bind_voice_bridge(
+        endpoint: &Path,
+        workspace: &Path,
+        workspace_id: &str,
+        ledger: &Path,
+    ) -> Self {
+        Self::bind_scenario(
+            endpoint,
+            workspace,
+            workspace_id,
+            ledger,
+            FakeScenario::VoiceBridge,
         )
     }
 
@@ -2890,14 +3353,20 @@ fn serve_fake_daemon(
             Err(TryRecvError::Empty) => {}
         }
         match listener.accept() {
-            Ok((stream, _)) => handle_connection(
-                stream,
-                &requests,
-                &workspace_root,
-                &workspace_id,
-                &ledger,
-                scenario,
-            )?,
+            Ok((stream, _)) => {
+                // macOS accepts inherit the listener's nonblocking mode.
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|error| format!("fake daemon blocking mode failed: {error}"))?;
+                handle_connection(
+                    stream,
+                    &requests,
+                    &workspace_root,
+                    &workspace_id,
+                    &ledger,
+                    scenario,
+                )?
+            }
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(5));
             }
@@ -2933,12 +3402,15 @@ fn handle_connection(
         if request.v != PROTOCOL_VERSION || request.kind != EnvelopeKind::Request {
             return Err(format!("invalid daemon envelope: {request:?}"));
         }
-        let request_index = requests
-            .lock()
-            .unwrap()
+        let recorded = requests.lock().unwrap();
+        let request_index = recorded
             .iter()
             .filter(|recorded| recorded.method == request.method)
             .count();
+        let thread_started = recorded
+            .iter()
+            .any(|recorded| recorded.method.as_deref() == Some("thread.send"));
+        drop(recorded);
         let response = fake_response(
             &request,
             workspace_root,
@@ -2946,6 +3418,7 @@ fn handle_connection(
             ledger,
             scenario,
             request_index,
+            thread_started,
         )?;
         let mut response = serde_json::to_vec(&response)
             .map_err(|error| format!("fake daemon response failed: {error}"))?;
@@ -2970,18 +3443,32 @@ fn fake_response(
     ledger: &Path,
     scenario: FakeScenario,
     request_index: usize,
+    thread_started: bool,
 ) -> Result<Envelope, String> {
     let method = request
         .method
         .as_deref()
         .ok_or_else(|| "daemon request omitted method".to_owned())?;
-    if scenario == FakeScenario::PendingApproval && method == "events.stream" && request_index == 0
+    if scenario == FakeScenario::PendingApproval
+        && matches!(method, "events.stream" | "thread.events")
+        && request_index == 0
     {
         return Ok(Envelope::error(
             request.id.clone(),
             Some(method.into()),
             ERROR_LAGGED,
             "offset is no longer buffered",
+        ));
+    }
+    if scenario == FakeScenario::VoiceBridge
+        && method == "voice.events.commit"
+        && request_index == 0
+    {
+        return Ok(Envelope::error(
+            request.id.clone(),
+            Some(method.into()),
+            ERROR_INTERNAL,
+            "synthetic lost acknowledgement",
         ));
     }
     let result = match method {
@@ -3001,10 +3488,18 @@ fn fake_response(
                 "ledger_path": ledger.to_string_lossy(),
                 "capabilities": [
                     "hello",
+                    "profile.list",
+                    "profile.open",
+                    "thread.send",
                     "run.start",
+                    "message.append",
                     "run.cancel",
                     "events.stream",
+                    "voice.events.commit",
                     "sessions.list",
+                    "thread.list",
+                    "thread.status",
+                    "thread.events",
                     "transcript.read",
                     "transcript.read.typed",
                     "transcript.read.pending_approval",
@@ -3012,6 +3507,112 @@ fn fake_response(
                     "session.approval_profile.set",
                     "approval.decide"
                 ]
+            })
+        }
+        "profile.list" => json!({
+            "profiles": [fake_profile_summary(workspace_id, fake_home_thread(scenario))],
+            "truncated": false
+        }),
+        "profile.open" => json!({
+            "status": "opened",
+            "profile_id": "profile-pty",
+            "thread": fake_thread_status(fake_home_thread(scenario), true, None),
+            "created": false
+        }),
+        "thread.list" => match scenario {
+            FakeScenario::ConversationAudit => json!({
+                "threads": [
+                    fake_thread_status("thread_pty_conversation", true, Some("turn_pty")),
+                    fake_thread_status("thread_pty_unloaded", false, None)
+                ]
+            }),
+            FakeScenario::Streaming => json!({
+                "threads": [fake_thread_status("thread_pty_streaming_384", true, None)]
+            }),
+            FakeScenario::FreshRun | FakeScenario::PendingApproval | FakeScenario::VoiceBridge => {
+                json!({"threads": []})
+            }
+        },
+        "thread.status" => {
+            let Some(ProtocolRequest::ThreadStatus(params)) = request.params.as_ref() else {
+                return Err("thread.status omitted typed params".to_owned());
+            };
+            json!({
+                "thread": fake_thread_status(
+                    &params.thread_id,
+                    params.thread_id != "thread_pty_unloaded",
+                    None
+                )
+            })
+        }
+        "thread.events" => {
+            let Some(ProtocolRequest::ThreadEvents(params)) = request.params.as_ref() else {
+                return Err("thread.events omitted typed params".to_owned());
+            };
+            let from_offset = params.from_offset.unwrap_or(0);
+            let (next_offset, status, events) = match scenario {
+                FakeScenario::FreshRun if thread_started && from_offset == 0 => (
+                    1,
+                    "running",
+                    json!([{
+                        "offset": 0,
+                        "event": {
+                            "kind": "assistant_delta",
+                            "run_id": "run_tui_pty",
+                            "turn_id": "turn_tui_pty",
+                            "step": 0,
+                            "delta_index": 0,
+                            "text": ""
+                        }
+                    }]),
+                ),
+                FakeScenario::ConversationAudit if request_index == 0 => {
+                    fake_event_page(scenario, 0, from_offset)
+                }
+                FakeScenario::Streaming if thread_started && params.from_offset.is_some() => {
+                    let page = match from_offset {
+                        0 => 0,
+                        2 => 1,
+                        5 => 2,
+                        _ => 3,
+                    };
+                    fake_event_page(scenario, page, from_offset)
+                }
+                _ => (from_offset, "running", json!([])),
+            };
+            let turn_id = match scenario {
+                FakeScenario::Streaming => "turn_384",
+                FakeScenario::FreshRun => "turn_tui_pty",
+                FakeScenario::PendingApproval => "turn_pty_pending",
+                FakeScenario::ConversationAudit => "turn_pty",
+                FakeScenario::VoiceBridge => "turn_pty_voice",
+            };
+            let events = events
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|event| {
+                    json!({
+                        "offset": event["offset"],
+                        "turn_id": turn_id,
+                        "event": event["event"]
+                    })
+                })
+                .collect::<Vec<_>>();
+            let current_turn_id = match scenario {
+                FakeScenario::FreshRun if thread_started => Some(turn_id),
+                FakeScenario::Streaming if thread_started && status == "running" => Some(turn_id),
+                FakeScenario::PendingApproval | FakeScenario::ConversationAudit => Some(turn_id),
+                _ => None,
+            };
+            json!({
+                "thread_id": params.thread_id,
+                "live_epoch_id": "epoch-pty",
+                "reset": null,
+                "from_offset": from_offset,
+                "next_offset": next_offset,
+                "current_turn_id": current_turn_id,
+                "events": events
             })
         }
         "sessions.list" => match scenario {
@@ -3040,7 +3641,7 @@ fn fake_response(
             }),
             FakeScenario::ConversationAudit => json!({
                 "sessions": [{
-                    "session_id": "session_pty_conversation",
+                    "session_id": "session_thread_pty_conversation",
                     "run_id": CONVERSATION_RUN_ID,
                     "status": "running",
                     "latest_question": "approved, go ahead",
@@ -3052,11 +3653,23 @@ fn fake_response(
             FakeScenario::Streaming if request_index == 0 => json!({"sessions": []}),
             FakeScenario::Streaming => json!({
                 "sessions": [{
-                    "session_id": "session_pty_streaming_384",
+                    "session_id": "session_thread_pty_streaming_384",
                     "run_id": STREAMING_RUN_ID,
                     "status": "finished",
                     "latest_question": "stream the answer",
                     "first_question": "stream the answer",
+                    "updated_at_ms": 1_785_638_400_000_u64,
+                    "ledger_path": ledger.to_string_lossy()
+                }]
+            }),
+            FakeScenario::VoiceBridge if request_index == 0 => json!({"sessions": []}),
+            FakeScenario::VoiceBridge => json!({
+                "sessions": [{
+                    "session_id": "session_tui_pty",
+                    "run_id": VOICE_RUN_ID,
+                    "status": "canceled",
+                    "latest_question": VOICE_FIRST_QUESTION,
+                    "first_question": VOICE_FIRST_QUESTION,
                     "updated_at_ms": 1_785_638_400_000_u64,
                     "ledger_path": ledger.to_string_lossy()
                 }]
@@ -3127,21 +3740,95 @@ fn fake_response(
                 }]
             }
         }),
+        "transcript.read" if scenario == FakeScenario::VoiceBridge => json!({
+            "run_id": VOICE_RUN_ID,
+            "status": "canceled",
+            "final_answer": null,
+            "transcript": format!(
+                "run_id: {VOICE_RUN_ID}\n[turn_pty_voice] user: {VOICE_FIRST_QUESTION}\n[turn_pty_voice] assistant: First audible sentence.\n"
+            ),
+            "typed": {
+                "runs": [{
+                    "run_id": VOICE_RUN_ID,
+                    "session_index": 0,
+                    "status": "canceled",
+                    "entries": [
+                        {"kind": "user", "text": VOICE_FIRST_QUESTION},
+                        {"kind": "assistant", "text": "First audible sentence."}
+                    ]
+                }]
+            }
+        }),
         "run.start" => json!({
-            "run_id": if scenario == FakeScenario::Streaming {
-                STREAMING_RUN_ID
-            } else {
-                "run_tui_pty"
+            "run_id": match scenario {
+                FakeScenario::Streaming => STREAMING_RUN_ID,
+                FakeScenario::VoiceBridge => VOICE_RUN_ID,
+                _ => "run_tui_pty",
             },
             "session_id": "session_tui_pty",
             "ledger_path": ledger.to_string_lossy(),
             "status": "running",
             "final_answer": null
         }),
-        "run.cancel" => json!({
-            "run_id": "run_tui_pty",
-            "status": "cancel_requested"
-        }),
+        "thread.send" => {
+            let Some(ProtocolRequest::ThreadSend(params)) = request.params.as_ref() else {
+                return Err("thread.send omitted typed params".to_owned());
+            };
+            json!({
+                "status": if thread_started { "steered" } else { "started" },
+                "thread_id": params.thread_id,
+                "turn_id": match scenario {
+                    FakeScenario::Streaming => "turn_384",
+                    _ => "turn_tui_pty",
+                }
+            })
+        }
+        "message.append" if scenario == FakeScenario::VoiceBridge => {
+            let Some(ProtocolRequest::MessageAppend(params)) = request.params.as_ref() else {
+                return Err("message.append omitted typed params".to_owned());
+            };
+            if params.message != VOICE_NEXT_QUESTION
+                || params.session_id.as_deref() != Some("session_tui_pty")
+                || params.prior_interrupted_run_id.as_deref() != Some(VOICE_RUN_ID)
+            {
+                return Err(format!(
+                    "voice follow-up changed routing or prior run: {params:?}"
+                ));
+            }
+            json!({
+                "run_id": VOICE_NEXT_RUN_ID,
+                "session_id": "session_tui_pty",
+                "ledger_path": ledger.to_string_lossy(),
+                "status": "running",
+                "final_answer": null
+            })
+        }
+        "run.cancel" => {
+            let Some(ProtocolRequest::RunCancel(params)) = request.params.as_ref() else {
+                return Err("run.cancel omitted typed params".to_owned());
+            };
+            json!({"run_id": params.run_id, "status": "cancel_requested"})
+        }
+        "voice.events.commit" if scenario == FakeScenario::VoiceBridge => {
+            let Some(ProtocolRequest::VoiceEventsCommit(params)) = request.params.as_ref() else {
+                return Err("voice.events.commit omitted typed params".to_owned());
+            };
+            if params.run_id != VOICE_RUN_ID || params.events.len() != 3 {
+                return Err(format!(
+                    "voice commit changed the exact fixture batch: {params:?}"
+                ));
+            }
+            let events = params
+                .events
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(sequence, event)| {
+                    VoiceEventEnvelope::revision_one(u64::try_from(sequence).unwrap(), event)
+                })
+                .collect::<Vec<_>>();
+            json!({"run_id": VOICE_RUN_ID, "events": events})
+        }
         "daemon.status" => json!({
             "model": {
                 "requested_alias": "~openai/gpt-latest",
@@ -3201,130 +3888,10 @@ fn fake_response(
                 FakeScenario::ConversationAudit => CONVERSATION_RUN_ID,
                 FakeScenario::FreshRun => "run_tui_pty",
                 FakeScenario::Streaming => STREAMING_RUN_ID,
+                FakeScenario::VoiceBridge => params.run_id.as_str(),
             };
-            let (next_offset, status, events) = match (scenario, request_index) {
-                (FakeScenario::ConversationAudit, 0) => (
-                    8,
-                    "running",
-                    json!([{"offset": 7, "event": {"kind": "model_stage"}}]),
-                ),
-                (FakeScenario::Streaming, 0) => (
-                    2,
-                    "running",
-                    json!([
-                        {
-                            "offset": 0,
-                            "event": {
-                                "kind": "assistant_delta",
-                                "run_id": STREAMING_RUN_ID,
-                                "turn_id": "turn_384",
-                                "step": 0,
-                                "delta_index": 0,
-                                "text": "Burst line one.\n"
-                            }
-                        },
-                        {
-                            "offset": 1,
-                            "event": {
-                                "kind": "assistant_delta",
-                                "run_id": STREAMING_RUN_ID,
-                                "turn_id": "turn_384",
-                                "step": 0,
-                                "delta_index": 1,
-                                "text": "quiet partial"
-                            }
-                        }
-                    ]),
-                ),
-                (FakeScenario::Streaming, 1) => (
-                    5,
-                    "running",
-                    json!([
-                        {
-                            "offset": 2,
-                            "event": {
-                                "kind": "assistant_delta",
-                                "run_id": STREAMING_RUN_ID,
-                                "turn_id": "turn_384",
-                                "step": 0,
-                                "delta_index": 2,
-                                "text": "\n| Name | Value |\n"
-                            }
-                        },
-                        {
-                            "offset": 3,
-                            "event": {
-                                "kind": "assistant_delta",
-                                "run_id": STREAMING_RUN_ID,
-                                "turn_id": "turn_384",
-                                "step": 0,
-                                "delta_index": 3,
-                                "text": "| --- | --- |\n"
-                            }
-                        },
-                        {
-                            "offset": 4,
-                            "event": {
-                                "kind": "assistant_delta",
-                                "run_id": STREAMING_RUN_ID,
-                                "turn_id": "turn_384",
-                                "step": 0,
-                                "delta_index": 4,
-                                "text": "| alpha | one"
-                            }
-                        }
-                    ]),
-                ),
-                (FakeScenario::Streaming, _) => (
-                    8,
-                    "finished",
-                    json!([
-                        {
-                            "offset": 5,
-                            "event": {
-                                "kind": "assistant_delta",
-                                "run_id": STREAMING_RUN_ID,
-                                "turn_id": "turn_384",
-                                "step": 0,
-                                "delta_index": 5,
-                                "text": " |\nfinal mid-tok"
-                            }
-                        },
-                        {
-                            "offset": 6,
-                            "event": {
-                                "kind": "ledger",
-                                "record": {
-                                    "seq": 6,
-                                    "occurred_at_ms": 6,
-                                    "event": {
-                                        "event": "model_responded",
-                                        "run_id": STREAMING_RUN_ID,
-                                        "turn_id": "turn_384",
-                                        "step": 0,
-                                        "output": {"role": "assistant", "content": STREAMING_SOURCE},
-                                        "proposed_calls": [],
-                                        "served_model": "test/streaming",
-                                        "usage": null
-                                    }
-                                }
-                            }
-                        },
-                        {
-                            "offset": 7,
-                            "event": {
-                                "kind": "ledger",
-                                "record": {
-                                    "seq": 7,
-                                    "occurred_at_ms": 7,
-                                    "event": {"event": "run_finished", "run_id": STREAMING_RUN_ID}
-                                }
-                            }
-                        }
-                    ]),
-                ),
-                _ => (from_offset, "running", json!([])),
-            };
+            let (next_offset, status, events) =
+                fake_event_page(scenario, request_index, from_offset);
             json!({
                 "run_id": run_id,
                 "from_offset": from_offset,
@@ -3351,4 +3918,227 @@ fn fake_response(
         Some(method.to_owned()),
         result,
     ))
+}
+
+fn fake_event_page(
+    scenario: FakeScenario,
+    page: usize,
+    from_offset: u64,
+) -> (u64, &'static str, Value) {
+    match (scenario, page) {
+        (FakeScenario::ConversationAudit, 0) => (
+            8,
+            "running",
+            json!([
+                {
+                    "offset": 6,
+                    "event": {
+                        "kind": "assistant_delta",
+                        "run_id": CONVERSATION_RUN_ID,
+                        "turn_id": "turn_pty",
+                        "step": 0,
+                        "delta_index": 0,
+                        "text": ""
+                    }
+                },
+                {
+                    "offset": 7,
+                    "event": {"kind": "model_stage", "run_id": CONVERSATION_RUN_ID}
+                }
+            ]),
+        ),
+        (FakeScenario::Streaming, 0) => (
+            2,
+            "running",
+            json!([
+                {
+                    "offset": 0,
+                    "event": {
+                        "kind": "assistant_delta",
+                        "run_id": STREAMING_RUN_ID,
+                        "turn_id": "turn_384",
+                        "step": 0,
+                        "delta_index": 0,
+                        "text": "Burst line one.\n"
+                    }
+                },
+                {
+                    "offset": 1,
+                    "event": {
+                        "kind": "assistant_delta",
+                        "run_id": STREAMING_RUN_ID,
+                        "turn_id": "turn_384",
+                        "step": 0,
+                        "delta_index": 1,
+                        "text": "quiet partial"
+                    }
+                }
+            ]),
+        ),
+        (FakeScenario::Streaming, 1) => (
+            5,
+            "running",
+            json!([
+                {
+                    "offset": 2,
+                    "event": {
+                        "kind": "assistant_delta",
+                        "run_id": STREAMING_RUN_ID,
+                        "turn_id": "turn_384",
+                        "step": 0,
+                        "delta_index": 2,
+                        "text": "\n| Name | Value |\n"
+                    }
+                },
+                {
+                    "offset": 3,
+                    "event": {
+                        "kind": "assistant_delta",
+                        "run_id": STREAMING_RUN_ID,
+                        "turn_id": "turn_384",
+                        "step": 0,
+                        "delta_index": 3,
+                        "text": "| --- | --- |\n"
+                    }
+                },
+                {
+                    "offset": 4,
+                    "event": {
+                        "kind": "assistant_delta",
+                        "run_id": STREAMING_RUN_ID,
+                        "turn_id": "turn_384",
+                        "step": 0,
+                        "delta_index": 4,
+                        "text": "| alpha | one"
+                    }
+                }
+            ]),
+        ),
+        (FakeScenario::Streaming, 2) => (
+            8,
+            "finished",
+            json!([
+                {
+                    "offset": 5,
+                    "event": {
+                        "kind": "assistant_delta",
+                        "run_id": STREAMING_RUN_ID,
+                        "turn_id": "turn_384",
+                        "step": 0,
+                        "delta_index": 5,
+                        "text": " |\nfinal mid-tok"
+                    }
+                },
+                {
+                    "offset": 6,
+                    "event": {
+                        "kind": "ledger",
+                        "record": {
+                            "seq": 6,
+                            "occurred_at_ms": 6,
+                            "event": {
+                                "event": "model_responded",
+                                "run_id": STREAMING_RUN_ID,
+                                "turn_id": "turn_384",
+                                "step": 0,
+                                "output": {"role": "assistant", "content": STREAMING_SOURCE},
+                                "proposed_calls": [],
+                                "served_model": "test/streaming",
+                                "usage": null
+                            }
+                        }
+                    }
+                },
+                {
+                    "offset": 7,
+                    "event": {
+                        "kind": "ledger",
+                        "record": {
+                            "seq": 7,
+                            "occurred_at_ms": 7,
+                            "event": {"event": "run_finished", "run_id": STREAMING_RUN_ID}
+                        }
+                    }
+                }
+            ]),
+        ),
+        (FakeScenario::Streaming, _) => (from_offset, "finished", json!([])),
+        (FakeScenario::VoiceBridge, 0) => (
+            1,
+            "running",
+            json!([{
+                "offset": 0,
+                "event": {
+                    "kind": "assistant_delta",
+                    "run_id": VOICE_RUN_ID,
+                    "turn_id": "turn_pty_voice",
+                    "step": 0,
+                    "delta_index": 0,
+                    "text": "First audible sentence."
+                }
+            }]),
+        ),
+        (FakeScenario::VoiceBridge, 1) => (1, "canceled", json!([])),
+        (FakeScenario::VoiceBridge, _) => (from_offset, "running", json!([])),
+        _ => (from_offset, "running", json!([])),
+    }
+}
+
+fn fake_home_thread(scenario: FakeScenario) -> &'static str {
+    match scenario {
+        FakeScenario::FreshRun | FakeScenario::VoiceBridge => "tui_pty",
+        FakeScenario::PendingApproval => "pty_pending",
+        FakeScenario::ConversationAudit => "thread_pty_conversation",
+        FakeScenario::Streaming => "thread_pty_streaming_384",
+    }
+}
+
+fn fake_profile_summary(workspace_id: &str, home_thread_id: &str) -> Value {
+    json!({
+        "id": "profile-pty",
+        "display_name": "PTY profile",
+        "workspace_id": workspace_id,
+        "model": "test-model",
+        "reasoning_effort": "none",
+        "approval_policy": "prompt",
+        "toolset": [],
+        "current_revision": 1,
+        "home_thread_id": home_thread_id,
+        "workspace_health": "present",
+        "created_at_ms": 1_785_638_400_000_u64
+    })
+}
+
+fn fake_thread_status(thread_id: &str, loaded: bool, current_turn_id: Option<&str>) -> Value {
+    let (parent_thread_id, thread_kind, home_thread_id) = if thread_id == "thread_pty_unloaded" {
+        (
+            Some("thread_pty_conversation"),
+            "child",
+            "thread_pty_conversation",
+        )
+    } else {
+        (None, "home", thread_id)
+    };
+    json!({
+        "authority": {
+            "thread_id": thread_id,
+            "parent_thread_id": parent_thread_id,
+            "spawning_actor": "pty",
+            "profile_id": "profile-pty",
+            "profile_revision": 1,
+            "thread_kind": thread_kind,
+            "home_thread_id": home_thread_id,
+            "cwd": "/tmp/pty-work",
+            "model": "test-model",
+            "reasoning_effort": "none",
+            "approval_policy": "prompt",
+            "created_at_ms": 1_785_638_400_000_u64
+        },
+        "live": {
+            "live_epoch_id": "epoch-pty",
+            "loaded": loaded,
+            "current_turn_id": current_turn_id
+        },
+        "return_availability": {"child_returns": 0, "parent_answers": 0}
+    })
 }

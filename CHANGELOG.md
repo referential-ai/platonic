@@ -1,6 +1,13 @@
 # Changelog
 
-## Platonic 0.1.0 - Unreleased
+## Platonic 0.2.0 - 2026-08-15
+
+- Complete the five-phase profile train: durable profile registry and revisions,
+  one resumable home thread per profile, bounded profile-scoped context reads,
+  typed child returns, and the protocol v2 cutover across the server, clients,
+  CLI, TUI, HTTP gateway, and documentation.
+
+## Platonic 0.1.0 - 2026-08-10
 
 - Establish the product release identity independently of workspace crate
   versions and embed the exact source commit and UTC build date in server

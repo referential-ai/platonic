@@ -1,0 +1,101 @@
+name: Docs site
+
+on:
+  pull_request:
+    branches:
+      - develop
+    paths:
+      - docs-site/**
+      - "**/*.md"
+      - .github/workflows/docs-site.yml
+  push:
+    branches:
+      - develop
+    paths:
+      - docs-site/**
+      - "**/*.md"
+      - .github/workflows/docs-site.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Build and crawl
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out Platonic
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: docs-site/package-lock.json
+
+      - name: Install locked dependencies
+        working-directory: docs-site
+        run: npm ci
+
+      - name: Audit dependencies
+        working-directory: docs-site
+        run: npm run audit
+
+      - name: Build and crawl at the root
+        working-directory: docs-site
+        run: |
+          npm run build
+          npm run crawl
+          npm run search
+
+      - name: Build and crawl at a subpath
+        working-directory: docs-site
+        env:
+          DOCS_BASE: /platonic-docs/
+        run: |
+          npm run build
+          npm run crawl
+          npm run search
+
+      - name: Prove controlled failures
+        working-directory: docs-site
+        env:
+          DOCS_BASE: /platonic-docs/
+        run: npm run negative
+
+      - name: Audit CI path inputs
+        working-directory: docs-site
+        run: npm run paths
+
+      - name: Install pinned Chromium
+        working-directory: docs-site
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser quality gate
+        working-directory: docs-site
+        env:
+          DOCS_BROWSER_ARTIFACTS: ${{ runner.temp }}/platonic-docs-browser
+        run: npm run browser
+
+      - name: Upload browser quality report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: docs-browser-${{ github.sha }}
+          path: ${{ runner.temp }}/platonic-docs-browser
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build and smoke-test the static container
+        run: docs-site/scripts/smoke-container.sh platonic-docs:verify
+
+      - name: Prove the local publisher fails closed
+        run: docs-site/scripts/test-publish-image.sh

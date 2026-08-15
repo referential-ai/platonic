@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "Platonic agent server: workspaces, agents, threads, tools, providers, ledger, policy, approvals, and protocol."
+description = "Platonic agent server: workspaces, profiles, threads, tools, providers, ledger, policy, approvals, and protocol."
 license.workspace = true
 repository.workspace = true
 documentation = "https://docs.rs/platonic-server"
@@ -12,6 +12,7 @@ readme = "README.md"
 
 [dependencies]
 html2text.workspace = true
+httparse.workspace = true
 platonic-client.workspace = true
 platonic-core.workspace = true
 platonic-protocol.workspace = true

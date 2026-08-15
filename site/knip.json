@@ -1,0 +1,5 @@
+{
+  "$schema": "https://unpkg.com/knip@6.32.1/schema.json",
+  "entry": ["scripts/browser-proof.mjs", "scripts/check-site.mjs"],
+  "project": ["scripts/**/*.mjs"]
+}

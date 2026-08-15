@@ -27,7 +27,7 @@ pub use error::{
 };
 pub use io::{
     CPAL_RUNTIME_VERSION, CaptureConfig, CaptureDeviceDescriptor, CaptureDeviceInfo,
-    CaptureMetrics, CaptureOverflow, CapturePartial, CaptureReport, CaptureWorker,
+    CaptureMetrics, CaptureOverflow, CapturePartial, CaptureReport, CaptureRequest, CaptureWorker,
     CaptureWorkerShutdown, DeviceBufferSize, InferenceBackend, InputDeviceSelection,
     KOKORO_MODEL_REVISION, KOKORO_MODEL_SHA256, KOKORO_MODEL_SOURCE, KOKORO_SAMPLE_RATE,
     KOKORO_TOKENIZER_SHA256, KOKORO_VOICE_SHA256, KokoroConfig, KokoroMetrics, KokoroMetricsReader,

@@ -1,9 +1,8 @@
 use crate::{AppError, AppResult};
-#[cfg(windows)]
-pub(crate) use platonic_client::paths::runtime_home;
 #[cfg(unix)]
 pub(crate) use platonic_client::paths::runtime_home_and_fallback;
 pub use platonic_client::paths::{host_lock_path, host_socket_path, workspace_id};
+use platonic_core::ProfileId;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +71,14 @@ pub(crate) fn thread_repository_root(server_db_path: &Path, thread_id: &str) -> 
     Ok(thread_repositories_root(server_db_path)?.join(thread_id))
 }
 
+pub(crate) fn one_shot_runs_root(server_db_path: &Path) -> AppResult<PathBuf> {
+    Ok(server_state_parent(server_db_path)?.join("one-shot-runs"))
+}
+
+pub(crate) fn one_shot_run_root(server_db_path: &Path, run_id: &str) -> AppResult<PathBuf> {
+    Ok(one_shot_runs_root(server_db_path)?.join(run_id))
+}
+
 /// Server-owned shared Git storage. Thread processes receive read-only alternates into it.
 pub(crate) fn shared_git_root(server_db_path: &Path) -> AppResult<PathBuf> {
     Ok(server_state_parent(server_db_path)?.join("git"))
@@ -98,6 +105,85 @@ pub(crate) fn workspace_sqlite_path(
         .join("workspaces")
         .join(workspace_id)
         .join("ledger.db"))
+}
+
+pub(crate) fn profile_home_path(
+    server_db_path: &Path,
+    workspace_id: &str,
+    profile_id: &ProfileId,
+) -> AppResult<PathBuf> {
+    validate_state_component("workspace id", workspace_id)?;
+    validate_state_component("profile id", profile_id.as_str())?;
+    Ok(server_state_parent(server_db_path)?
+        .join("workspaces")
+        .join(workspace_id)
+        .join("profiles")
+        .join(profile_id.as_str()))
+}
+
+pub(crate) fn create_profile_home(
+    server_db_path: &Path,
+    workspace_id: &str,
+    profile_id: &ProfileId,
+) -> AppResult<PathBuf> {
+    let path = profile_home_path(server_db_path, workspace_id, profile_id)?;
+    let parent = path.parent().ok_or_else(|| {
+        AppError::Config(format!("profile home has no parent: {}", path.display()))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir(&path)?;
+    Ok(path)
+}
+
+pub(crate) fn ensure_profile_home(
+    server_db_path: &Path,
+    workspace_id: &str,
+    profile_id: &ProfileId,
+) -> AppResult<PathBuf> {
+    let path = profile_home_path(server_db_path, workspace_id, profile_id)?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+            }
+            Ok(path)
+        }
+        Ok(_) => Err(AppError::Config(format!(
+            "profile home is not a directory: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            create_profile_home(server_db_path, workspace_id, profile_id)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn remove_profile_home(path: &Path) -> AppResult<()> {
+    std::fs::remove_dir(path)?;
+    Ok(())
+}
+
+fn validate_state_component(name: &str, value: &str) -> AppResult<()> {
+    if matches!(value, "" | "." | "..")
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(AppError::Config(format!("invalid {name}: {value}")));
+    }
+    Ok(())
 }
 
 fn server_state_parent(server_db_path: &Path) -> AppResult<&Path> {
@@ -240,19 +326,6 @@ fn state_home() -> AppResult<PathBuf> {
     Ok(PathBuf::from(home).join(".local").join("state"))
 }
 
-#[cfg(windows)]
-fn state_home() -> AppResult<PathBuf> {
-    local_app_data("default --db path")
-}
-
-#[cfg(windows)]
-fn local_app_data(purpose: &str) -> AppResult<PathBuf> {
-    let value = std::env::var_os("LOCALAPPDATA")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::Config(format!("LOCALAPPDATA is required for {purpose}")))?;
-    Ok(PathBuf::from(value))
-}
-
 #[cfg(test)]
 pub(crate) fn with_test_xdg<T>(root: &Path, run: impl FnOnce() -> T) -> T {
     #[cfg(unix)]
@@ -266,11 +339,6 @@ pub(crate) fn with_test_xdg<T>(root: &Path, run: impl FnOnce() -> T) -> T {
             ],
             run,
         )
-    }
-    #[cfg(windows)]
-    {
-        let local_app_data = root.join("local-app-data");
-        temp_env::with_var("LOCALAPPDATA", Some(local_app_data.as_os_str()), run)
     }
 }
 

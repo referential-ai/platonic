@@ -3,12 +3,10 @@ use std::path::{Path, PathBuf};
 
 pub use platonic_client::{client, transport};
 mod child_process;
-#[cfg(windows)]
-pub mod control;
 mod handlers;
-#[cfg(windows)]
-pub use platonic_client::installer_gate;
 pub mod lock;
+mod logical_reads;
+mod returns;
 pub use platonic_protocol as protocol;
 mod run_child;
 mod runtime;

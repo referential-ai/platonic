@@ -8,6 +8,7 @@
 
 mod error;
 pub mod offline;
+mod profile;
 pub mod run;
 pub mod tui;
 pub mod voice;
@@ -16,6 +17,7 @@ pub use error::{AppError, AppResult};
 pub use platonic_protocol::{
     ReasoningEffort, RunOverrides, VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope,
 };
+pub use profile::select_profile_home;
 pub use run::{
     ApprovalMode, AssistantDeltaEvent, RunEvent, RunOptions, RunOutcome, attach_server_interactive,
     ensure_server, ensure_server_interactive, run_question,

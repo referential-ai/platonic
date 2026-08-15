@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="520" viewBox="0 0 1040 520" preserveAspectRatio="xMinYMin meet">
+<rect width="1040" height="520" fill="#0b0f14"/>
+<g font-family="DejaVu Sans Mono, Liberation Mono, monospace" font-size="16" font-variant-ligatures="none">
+<text x="20" y="36" textLength="180" lengthAdjust="spacingAndGlyphs" fill="#f87171" font-weight="700" font-style="normal" opacity="1" xml:space="preserve">daemon unavailable</text>
+<text x="20" y="56" textLength="460" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">connection refused at configured host endpoint</text>
+<text x="20" y="96" textLength="510" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">Quit and run plato --tui to ensure the host daemon.</text>
+<text x="20" y="116" textLength="510" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="1" xml:space="preserve">Or start platonic serve, then press r to reconnect.</text>
+<text x="20" y="476" textLength="10" lengthAdjust="spacingAndGlyphs" fill="#00ffff" font-weight="700" font-style="normal" opacity="1" xml:space="preserve">&gt;</text>
+<text x="60" y="476" textLength="370" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="0.64" xml:space="preserve">Try &quot;read README.md and summarize it&quot;</text>
+<text x="20" y="496" textLength="200" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="0.64" xml:space="preserve">daemon unavailable —</text>
+<text x="230" y="496" textLength="10" lengthAdjust="spacingAndGlyphs" fill="#00ffff" font-weight="700" font-style="normal" opacity="1" xml:space="preserve">r</text>
+<text x="240" y="496" textLength="130" lengthAdjust="spacingAndGlyphs" fill="#e6edf3" font-weight="400" font-style="normal" opacity="0.64" xml:space="preserve"> to reconnect</text>
+</g>
+</svg>

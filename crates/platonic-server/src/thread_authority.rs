@@ -1,10 +1,11 @@
 use crate::thread_repository::ThreadRepositoryDraft;
 use crate::{AppError, AppResult};
-use platonic_core::{ActorId, AgentId, EffectClass, ModelName, ToolName};
+use platonic_core::{ActorId, AgentId, EffectClass, ModelName, ProfileId, ToolName};
 use platonic_protocol::{
-    ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadGrantedPath,
+    ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadGrantedPath, ThreadKind,
     ThreadSpawnDecision, ThreadStatusAuthority, ThreadWorktree,
 };
+use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -16,24 +17,71 @@ pub(crate) const THREAD_SPAWN_APPROVAL_REASON: &str =
 
 static THREAD_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LegacyReason {
+    AdditionalRoot,
+    MissingProfile,
+    CrossProfileEdge,
+    MissingWorkspace,
+    UnsupportedAuthority,
+}
+
+impl LegacyReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AdditionalRoot => "additional_root",
+            Self::MissingProfile => "missing_profile",
+            Self::CrossProfileEdge => "cross_profile_edge",
+            Self::MissingWorkspace => "missing_workspace",
+            Self::UnsupportedAuthority => "unsupported_authority",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "additional_root" => Some(Self::AdditionalRoot),
+            "missing_profile" => Some(Self::MissingProfile),
+            "cross_profile_edge" => Some(Self::CrossProfileEdge),
+            "missing_workspace" => Some(Self::MissingWorkspace),
+            "unsupported_authority" => Some(Self::UnsupportedAuthority),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ThreadProfileAuthority {
+    pub(crate) workspace_id: Option<String>,
+    pub(crate) profile_id: Option<ProfileId>,
+    pub(crate) profile_revision: Option<u64>,
+    pub(crate) thread_kind: ThreadKind,
+    pub(crate) legacy_reason: Option<LegacyReason>,
+}
+
 pub(crate) struct ThreadAuthorityDraftParams<'a> {
     pub(crate) parent_thread_id: Option<String>,
     pub(crate) cwd: &'a Path,
     pub(crate) model: String,
     pub(crate) reasoning_effort: ReasoningEffort,
     pub(crate) approval_policy: ThreadApprovalPolicy,
-    pub(crate) agent_id: AgentId,
+    pub(crate) agent_id: Option<AgentId>,
+    pub(crate) profile_id: ProfileId,
+    pub(crate) profile_revision: u64,
+    pub(crate) thread_kind: ThreadKind,
     pub(crate) toolset: Vec<String>,
     pub(crate) writable: bool,
     pub(crate) network: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ThreadAuthorityDraft {
     pub(crate) thread_id: String,
     pub(crate) parent_thread_id: Option<String>,
     pub(crate) cwd: String,
-    pub(crate) agent_id: AgentId,
+    pub(crate) agent_id: Option<AgentId>,
+    pub(crate) profile_id: ProfileId,
+    pub(crate) profile_revision: u64,
+    pub(crate) thread_kind: ThreadKind,
     pub(crate) model: String,
     pub(crate) reasoning_effort: ReasoningEffort,
     pub(crate) approval_policy: ThreadApprovalPolicy,
@@ -90,6 +138,14 @@ pub(crate) struct ThreadStopRecord {
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub(crate) enum ThreadAuthorityError {
+    #[error("thread spawn requires a same-profile parent")]
+    ParentRequired,
+    #[error("child and parent must belong to the same non-legacy profile")]
+    SameProfileParent,
+    #[error("child ancestry must terminate at its profile home")]
+    InvalidLineage,
+    #[error("stopped threads cannot parent children")]
+    StoppedParent,
     #[error("child approval policy {child} exceeds parent policy {parent}")]
     ApprovalPolicy {
         parent: ThreadApprovalPolicy,
@@ -118,6 +174,9 @@ impl ThreadAuthorityDraft {
             reasoning_effort,
             approval_policy,
             agent_id,
+            profile_id,
+            profile_revision,
+            thread_kind,
             toolset,
             writable,
             network,
@@ -133,6 +192,9 @@ impl ThreadAuthorityDraft {
             parent_thread_id,
             cwd: cwd.clone(),
             agent_id,
+            profile_id,
+            profile_revision,
+            thread_kind,
             model,
             reasoning_effort,
             approval_policy,
@@ -157,7 +219,11 @@ impl ThreadAuthorityDraft {
             thread_id: self.thread_id.clone(),
             parent_thread_id: self.parent_thread_id.clone(),
             spawning_actor,
-            agent_id: Some(self.agent_id.clone()),
+            cwd: Some(self.cwd.clone()),
+            agent_id: self.agent_id.clone(),
+            profile_id: Some(self.profile_id.clone()),
+            profile_revision: Some(self.profile_revision),
+            thread_kind: self.thread_kind,
             model: self.model.clone(),
             reasoning_effort: self.reasoning_effort,
             approval_policy: self.approval_policy,
@@ -381,12 +447,41 @@ pub(crate) fn validate_complete_authority(authority: &ThreadAuthorityRecord) -> 
         }
     }
     ActorId::new(authority.spawning_actor.clone())?;
-    if authority.agent_id.is_none() {
+    match authority.thread_kind {
+        ThreadKind::Home if authority.parent_thread_id.is_some() => {
+            return Err(AppError::Config(
+                "home thread authority cannot have a parent".into(),
+            ));
+        }
+        ThreadKind::Child if authority.parent_thread_id.is_none() => {
+            return Err(AppError::Config(
+                "child thread authority requires a parent".into(),
+            ));
+        }
+        ThreadKind::Legacy if authority.agent_id.is_none() => {
+            return Err(AppError::Config(
+                "legacy thread authority requires an agent id".into(),
+            ));
+        }
+        ThreadKind::Home | ThreadKind::Child if authority.agent_id.is_some() => {
+            return Err(AppError::Config(
+                "profile thread authority cannot carry a legacy agent id".into(),
+            ));
+        }
+        _ => {}
+    }
+    if authority.thread_kind != ThreadKind::Legacy
+        && (authority.profile_id.is_none()
+            || authority.profile_revision.is_none_or(|value| value == 0))
+    {
         return Err(AppError::Config(
-            "new thread authority requires an agent id".into(),
+            "profile thread authority requires a profile and positive revision".into(),
         ));
     }
     ModelName::new(authority.model.clone())?;
+    if let Some(cwd) = authority.cwd.as_deref() {
+        validate_authority_path(cwd)?;
+    }
     for tool in &authority.toolset {
         ToolName::new(tool.clone())?;
     }
@@ -410,16 +505,18 @@ pub(crate) fn validate_complete_authority(authority: &ThreadAuthorityRecord) -> 
 }
 
 pub(crate) fn authority_working_directory(authority: &ThreadAuthorityRecord) -> Option<&Path> {
-    authority
-        .worktrees
-        .first()
-        .map(|worktree| Path::new(&worktree.path))
-        .or_else(|| {
-            authority
-                .granted_paths
-                .first()
-                .map(|grant| Path::new(&grant.path))
-        })
+    authority.cwd.as_deref().map(Path::new).or_else(|| {
+        authority
+            .worktrees
+            .first()
+            .map(|worktree| Path::new(&worktree.path))
+            .or_else(|| {
+                authority
+                    .granted_paths
+                    .first()
+                    .map(|grant| Path::new(&grant.path))
+            })
+    })
 }
 
 pub(crate) fn legacy_status_authority(
@@ -431,6 +528,10 @@ pub(crate) fn legacy_status_authority(
         thread_id: authority.thread_id.clone(),
         parent_thread_id: authority.parent_thread_id.clone(),
         spawning_actor: authority.spawning_actor.clone(),
+        profile_id: authority.profile_id.clone(),
+        profile_revision: authority.profile_revision,
+        thread_kind: authority.thread_kind,
+        home_thread_id: None,
         cwd: cwd.to_string_lossy().into_owned(),
         model: authority.model.clone(),
         reasoning_effort: authority.reasoning_effort,
@@ -449,6 +550,14 @@ pub(crate) fn new_spawn_id() -> String {
 
 pub(crate) fn new_thread_turn_id() -> String {
     generated_id("thread_turn")
+}
+
+pub(crate) fn new_home_reservation_id() -> String {
+    generated_id("home_reservation")
+}
+
+pub(crate) fn new_live_epoch_id() -> String {
+    generated_id("live_epoch")
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -497,7 +606,11 @@ mod tests {
             thread_id: "thread_parent".into(),
             parent_thread_id: None,
             spawning_actor: "stdin".into(),
+            cwd: None,
             agent_id: Some(AgentId::new("plato").unwrap()),
+            profile_id: None,
+            profile_revision: None,
+            thread_kind: ThreadKind::Legacy,
             model: "gpt-parent".into(),
             reasoning_effort: ReasoningEffort::High,
             approval_policy: policy,
@@ -571,7 +684,10 @@ mod tests {
                 model: "gpt-child".into(),
                 reasoning_effort: ReasoningEffort::Xhigh,
                 approval_policy: child_policy,
-                agent_id: AgentId::new("plato").unwrap(),
+                agent_id: None,
+                profile_id: ProfileId::new("profile_test").unwrap(),
+                profile_revision: 1,
+                thread_kind: ThreadKind::Child,
                 toolset: vec!["file.read".into()],
                 writable: false,
                 network: false,
@@ -589,7 +705,10 @@ mod tests {
             model: "gpt-child".into(),
             reasoning_effort: ReasoningEffort::Xhigh,
             approval_policy: ThreadApprovalPolicy::Prompt,
-            agent_id: AgentId::new("plato").unwrap(),
+            agent_id: None,
+            profile_id: ProfileId::new("profile_test").unwrap(),
+            profile_revision: 1,
+            thread_kind: ThreadKind::Child,
             toolset: vec!["file.read".into()],
             writable: false,
             network: false,
@@ -626,7 +745,10 @@ mod tests {
                 model: "gpt-child".into(),
                 reasoning_effort: ReasoningEffort::High,
                 approval_policy: ThreadApprovalPolicy::Prompt,
-                agent_id: AgentId::new("plato").unwrap(),
+                agent_id: None,
+                profile_id: ProfileId::new("profile_test").unwrap(),
+                profile_revision: 1,
+                thread_kind: ThreadKind::Child,
                 toolset,
                 writable: true,
                 network: false,
@@ -649,7 +771,10 @@ mod tests {
             model: "gpt-child".into(),
             reasoning_effort: ReasoningEffort::High,
             approval_policy: ThreadApprovalPolicy::Prompt,
-            agent_id: AgentId::new("plato").unwrap(),
+            agent_id: None,
+            profile_id: ProfileId::new("profile_test").unwrap(),
+            profile_revision: 1,
+            thread_kind: ThreadKind::Child,
             toolset: vec!["file.write".into()],
             writable: true,
             network: false,
@@ -666,7 +791,10 @@ mod tests {
             model: "gpt-child".into(),
             reasoning_effort: ReasoningEffort::High,
             approval_policy: ThreadApprovalPolicy::Prompt,
-            agent_id: AgentId::new("plato").unwrap(),
+            agent_id: None,
+            profile_id: ProfileId::new("profile_test").unwrap(),
+            profile_revision: 1,
+            thread_kind: ThreadKind::Child,
             toolset: vec!["web.fetch".into()],
             writable: false,
             network: true,

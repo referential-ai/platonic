@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "toolchain": {
+    "node": "24",
+    "playwright": "1.61.1",
+    "chromiumRevision": "1228",
+    "chromiumVersion": "149.0.7827.55",
+    "axe": "4.12.1",
+    "systemDependencies": "ubuntu-24.04 + playwright install --with-deps chromium"
+  },
+  "baselines": [
+    {
+      "name": "homepage",
+      "file": "homepage.png",
+      "route": "/",
+      "viewport": { "width": 1440, "height": 900 },
+      "theme": "light",
+      "fullPage": true,
+      "rationale": "Pinned Ubuntu 24.04 Phase 5 capture: the desktop overview names workspace profiles and the five-step product model uses Profile instead of Agent.",
+      "sha256": "cf4b20842535c72b8008f08f457ab4124fa1e1b6d913fb21808b6f2c436da510"
+    },
+    {
+      "name": "user",
+      "file": "user.png",
+      "route": "/user/operations/tui-and-cli/",
+      "viewport": { "width": 390, "height": 844 },
+      "theme": "light",
+      "fullPage": true,
+      "rationale": "Pinned Ubuntu 24.04 Phase 5 capture: the mobile TUI and CLI guide covers profile-home selection, reuse, and profile default operations.",
+      "sha256": "d8f4ae2e568c1a778434f724d626ec774a18af33524484b19aa15b35ceede0f5"
+    },
+    {
+      "name": "developer",
+      "file": "developer.png",
+      "route": "/developer/runtime-boundaries/",
+      "viewport": { "width": 1440, "height": 900 },
+      "theme": "dark",
+      "fullPage": true,
+      "rationale": "Pinned Ubuntu 24.04 Phase 5 capture: the request lifecycle routes TUI work through profile.open, home attachment, and profile revisions.",
+      "sha256": "74261f1dc98a4b776f9fadddccc0327d842b7836de6ecf06bcd668a6102aaa36"
+    },
+    {
+      "name": "search",
+      "file": "search.png",
+      "route": "/",
+      "viewport": { "width": 1440, "height": 900 },
+      "theme": "light",
+      "fullPage": false,
+      "rationale": "Initial pinned Ubuntu 24.04 capture: search overlay locks the fixed approval query, expected owned result, and selection surface.",
+      "sha256": "e9d43c10edc4c48f4a2b36cbc9d473ab8b10443b0d13b5aa3d6dfcec73769d19"
+    },
+    {
+      "name": "404",
+      "file": "404.png",
+      "route": "/missing-baseline-route/",
+      "status": 404,
+      "viewport": { "width": 390, "height": 844 },
+      "theme": "dark",
+      "fullPage": true,
+      "rationale": "Initial pinned Ubuntu 24.04 capture: mobile dark 404 locks the real missing-route response and recovery controls.",
+      "sha256": "8f3875cba610c8bc9cb9ea9817301cbbba66bb563058b7ed5f8cf9f39e1ce417"
+    }
+  ]
+}

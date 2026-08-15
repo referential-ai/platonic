@@ -1,0 +1,405 @@
+name: macOS Desktop DMG
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      signed:
+        description: Build the protected signed and notarized DMG artifact
+        required: true
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      signed:
+        description: Build the protected signed and notarized DMG artifact
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  APPLE_SIGNING_CERT_SHA1: F2AF2679916030D003B1FC25B0C497BDF64F81EA
+  APPLE_SIGNING_IDENTITY: "Developer ID Application: alan wilhelm (ARR4D3S4V3)"
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  MACOSX_DEPLOYMENT_TARGET: "14.0"
+  RUSTUP_TOOLCHAIN: 1.88.0
+
+jobs:
+  validate:
+    name: Apple Silicon package (macOS 14)
+    runs-on: macos-14
+    timeout-minutes: 75
+    steps:
+      - name: Check out Platonic
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Require a native Apple Silicon runner
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          sw_vers
+          test "$(sw_vers -productVersion | cut -d. -f1)" -eq 14
+
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+          workspaces: |
+            . -> target
+            desktop/src-tauri -> ../../target
+
+      - name: Fetch locked Rust dependencies
+        run: |
+          cargo fetch --locked
+          cargo fetch --manifest-path desktop/src-tauri/Cargo.toml --locked
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build native root and server targets
+        run: cargo build --workspace --locked --all-targets
+
+      - name: Lint native root and server targets
+        run: cargo clippy --workspace --locked --all-targets -- -D warnings
+
+      - name: Check desktop Rust formatting
+        working-directory: desktop
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      # Shared macOS runner test execution is nondeterministic under #465.
+      # Compile every test here; the protected Wikus job executes them serially.
+      - name: Compile native desktop Rust tests
+        working-directory: desktop
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --no-run
+
+      - name: Run native desktop Rust clippy
+        working-directory: desktop
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+
+      - name: Run desktop chat browser tests
+        working-directory: desktop
+        run: |
+          npx playwright install chromium
+          npm run check
+          npm test
+
+      - name: Build credential-free macOS package
+        working-directory: desktop
+        run: npm run tauri:bundle:macos -- --ci --no-sign -- --locked
+
+      - name: Prove DMG contents, architecture, and deployment target
+        working-directory: desktop
+        run: |
+          set -euo pipefail
+          bundle="$CARGO_TARGET_DIR/aarch64-apple-darwin/release/bundle"
+          staged="src-tauri/binaries/platonic-aarch64-apple-darwin"
+          dmg_count=$(find "$bundle/dmg" -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d ' ')
+          test "$dmg_count" = 1
+          dmg=$(find "$bundle/dmg" -maxdepth 1 -type f -name '*.dmg')
+
+          mount="$RUNNER_TEMP/p167-dmg-mount"
+          test ! -e "$mount"
+          mkdir -m 700 "$mount"
+          hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mount" "$dmg"
+          trap 'hdiutil detach -quiet "$mount"; rmdir "$mount"' EXIT
+          test -L "$mount/Applications"
+          test "$(readlink "$mount/Applications")" = /Applications
+          mounted_count=$(find "$mount" -maxdepth 1 -type d -name '*.app' | wc -l | tr -d ' ')
+          test "$mounted_count" = 1
+          mounted_app=$(find "$mount" -maxdepth 1 -type d -name '*.app')
+          main="$mounted_app/Contents/MacOS/plato-desktop"
+          sidecar="$mounted_app/Contents/MacOS/platonic"
+          test -x "$main"
+          test -x "$sidecar"
+          cmp "$staged" "$sidecar"
+
+          for binary in "$main" "$sidecar"; do
+            test "$(lipo -archs "$binary")" = arm64
+            minos=$(otool -l "$binary" | awk '
+              $1 == "cmd" && $2 == "LC_BUILD_VERSION" { build = 1 }
+              build && $1 == "minos" { print $2; exit }
+            ')
+            test "$minos" = 14.0
+          done
+          test "$(plutil -extract LSMinimumSystemVersion raw "$mounted_app/Contents/Info.plist")" = 14.0
+
+  signed-dmg:
+    name: Signed and notarized DMG
+    if: >-
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') &&
+      inputs.signed
+    needs: validate
+    runs-on: [self-hosted, macOS, ARM64, wikus]
+    timeout-minutes: 75
+    environment: macos-release
+    steps:
+      - name: Check out Platonic
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Require a native Apple Silicon runner
+        run: test "$(uname -m)" = arm64
+
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+          workspaces: |
+            . -> target
+            desktop/src-tauri -> ../../target
+
+      - name: Fetch locked Rust dependencies
+        run: |
+          cargo fetch --locked
+          cargo fetch --manifest-path desktop/src-tauri/Cargo.toml --locked
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Create the disposable signing keychain and require protected credentials
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in \
+            APPLE_API_ISSUER \
+            APPLE_API_KEY \
+            APPLE_API_KEY_P8 \
+            APPLE_CERTIFICATE_P12 \
+            APPLE_CERTIFICATE_PASSWORD
+          do
+            test -n "${!name:-}" || {
+              echo "protected macos-release input $name is unavailable" >&2
+              exit 1
+            }
+          done
+
+          umask 077
+          signing_root="$RUNNER_TEMP/p167-signing"
+          test ! -e "$signing_root"
+          mkdir -m 700 "$signing_root"
+          touch "$signing_root/.owned-by-p167"
+
+          certificate_path="$signing_root/DeveloperID.p12"
+          certificate_password_path="$signing_root/certificate-password"
+          keychain_path="$signing_root/platonic-signing.keychain-db"
+          original_keychains_path="$signing_root/original-keychains"
+          api_key_path="$RUNNER_TEMP/AuthKey.p8"
+
+          printf '%s' "$APPLE_CERTIFICATE_P12" | /usr/bin/base64 -D > "$certificate_path"
+          printf '%s' "$APPLE_CERTIFICATE_PASSWORD" > "$certificate_password_path"
+          printf '%s' "$APPLE_API_KEY_P8" > "$api_key_path"
+
+          security list-keychains -d user \
+            | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//' \
+            > "$original_keychains_path"
+
+          security create-keychain -p "" "$keychain_path"
+          security unlock-keychain -p "" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          certificate_password=$(< "$certificate_password_path")
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$certificate_password" \
+            -T /usr/bin/codesign
+          unset certificate_password
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "" \
+            "$keychain_path" \
+            > /dev/null
+
+          keychains=("$keychain_path")
+          while IFS= read -r existing; do
+            test -n "$existing" && keychains+=("$existing")
+          done < "$original_keychains_path"
+          security list-keychains -d user -s "${keychains[@]}"
+
+          identity=$(security find-identity -v -p codesigning "$keychain_path" \
+            | grep -F -- "$APPLE_SIGNING_CERT_SHA1" || true)
+          test -n "$identity"
+          grep -Fq -- "\"$APPLE_SIGNING_IDENTITY\"" <<< "$identity"
+          printf 'APPLE_API_KEY_PATH=%s\n' "$api_key_path" >> "$GITHUB_ENV"
+
+      - name: Run native desktop Rust tests on Wikus
+        working-directory: desktop
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked -- --test-threads=1
+
+      - name: Build, sign, and notarize the app and signed DMG
+        working-directory: desktop
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: npm run tauri:bundle:macos -- --ci -- --locked
+
+      - name: Notarize and staple the signed DMG
+        working-directory: desktop
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          set -euo pipefail
+          bundle="$CARGO_TARGET_DIR/aarch64-apple-darwin/release/bundle"
+          dmg_count=$(find "$bundle/dmg" -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d ' ')
+          test "$dmg_count" = 1
+          dmg=$(find "$bundle/dmg" -maxdepth 1 -type f -name '*.dmg')
+          xcrun notarytool submit "$dmg" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait
+          xcrun stapler staple "$dmg"
+
+      - name: Validate signed and notarized DMG
+        working-directory: desktop
+        run: |
+          set -euo pipefail
+          bundle="$CARGO_TARGET_DIR/aarch64-apple-darwin/release/bundle"
+          dmg_count=$(find "$bundle/dmg" -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d ' ')
+          test "$dmg_count" = 1
+          dmg=$(find "$bundle/dmg" -maxdepth 1 -type f -name '*.dmg')
+
+          codesign --verify --strict --verbose=2 "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+
+          mount="$RUNNER_TEMP/p167-signed-dmg-mount"
+          test ! -e "$mount"
+          mkdir -m 700 "$mount"
+          hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mount" "$dmg"
+          trap 'hdiutil detach -quiet "$mount"; rmdir "$mount"' EXIT
+          test -L "$mount/Applications"
+          test "$(readlink "$mount/Applications")" = /Applications
+          mounted_count=$(find "$mount" -maxdepth 1 -type d -name '*.app' | wc -l | tr -d ' ')
+          test "$mounted_count" = 1
+          mounted_app=$(find "$mount" -maxdepth 1 -type d -name '*.app')
+          main="$mounted_app/Contents/MacOS/plato-desktop"
+          sidecar="$mounted_app/Contents/MacOS/platonic"
+          for binary in "$main" "$sidecar"; do
+            test "$(lipo -archs "$binary")" = arm64
+            minos=$(otool -l "$binary" | awk '
+              $1 == "cmd" && $2 == "LC_BUILD_VERSION" { build = 1 }
+              build && $1 == "minos" { print $2; exit }
+            ')
+            test "$minos" = 14.0
+          done
+          test "$(plutil -extract LSMinimumSystemVersion raw "$mounted_app/Contents/Info.plist")" = 14.0
+          codesign --verify --strict --verbose=2 "$sidecar"
+          codesign --verify --deep --strict --verbose=2 "$mounted_app"
+          for binary in "$main" "$sidecar"; do
+            details=$(codesign -d --verbose=4 "$binary" 2>&1)
+            grep -q 'flags=.*runtime' <<< "$details"
+            grep -q 'TeamIdentifier=ARR4D3S4V3' <<< "$details"
+          done
+          spctl --assess --type execute --verbose=2 "$mounted_app"
+
+          install_root="$HOME/Applications"
+          installed_app="$install_root/Plato-p167.app"
+          install_marker="$RUNNER_TEMP/p167-installed-app-owned"
+          test ! -e "$installed_app"
+          test ! -e "$install_marker"
+          mkdir -p "$install_root"
+          touch "$install_marker"
+          ditto "$mounted_app" "$installed_app"
+          codesign --verify --strict --verbose=2 "$installed_app/Contents/MacOS/platonic"
+          codesign --verify --deep --strict --verbose=2 "$installed_app"
+          spctl --assess --type execute --verbose=2 "$installed_app"
+          printf 'PLATONIC_INSTALLED_APP=%s\n' "$installed_app" >> "$GITHUB_ENV"
+
+          version=$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json')).version")
+          out="$GITHUB_WORKSPACE/artifacts/macos-arm64"
+          mkdir -p "$out"
+          asset="Plato-${version}-aarch64.dmg"
+          cp "$dmg" "$out/$asset"
+          (
+            cd "$out"
+            shasum -a 256 "$asset" > "$asset.sha256"
+            shasum -a 256 -c "$asset.sha256"
+            printf 'source_sha=%s\ntarget=aarch64-apple-darwin\nminimum_macos=14.0\n' \
+              "$GITHUB_SHA" > proof.txt
+          )
+
+      - name: Prove the installed signed package on wikus
+        working-directory: desktop
+        run: |
+          PLATONIC_MACOS_APP="$PLATONIC_INSTALLED_APP" \
+            PLATONIC_MACOS_PROOF_DIR="$GITHUB_WORKSPACE/artifacts/macos-arm64" \
+            scripts/prove-macos-package.sh
+
+      - name: Upload signed DMG proof artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-arm64-signed-dmg-${{ github.sha }}
+          path: artifacts/macos-arm64/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove protected signing material
+        if: always()
+        run: |
+          set +e
+          cleanup_failed=0
+          install_marker="$RUNNER_TEMP/p167-installed-app-owned"
+          if test -f "$install_marker"; then
+            rm -rf "$HOME/Applications/Plato-p167.app" || cleanup_failed=1
+            rm -f "$install_marker" || cleanup_failed=1
+          fi
+
+          signing_root="$RUNNER_TEMP/p167-signing"
+          if test -f "$signing_root/.owned-by-p167"; then
+            original_keychains_path="$signing_root/original-keychains"
+            keychain_path="$signing_root/platonic-signing.keychain-db"
+
+            if test -s "$original_keychains_path"; then
+              keychains=()
+              while IFS= read -r existing; do
+                test -n "$existing" && keychains+=("$existing")
+              done < "$original_keychains_path"
+              if test "${#keychains[@]}" -gt 0; then
+                security list-keychains -d user -s "${keychains[@]}" || cleanup_failed=1
+              fi
+            fi
+            if test -e "$keychain_path"; then
+              security delete-keychain "$keychain_path" || cleanup_failed=1
+            fi
+            rm -rf "$signing_root" || cleanup_failed=1
+          fi
+          rm -f "$RUNNER_TEMP/AuthKey.p8" || cleanup_failed=1
+          exit "$cleanup_failed"

@@ -1,18 +1,22 @@
 use platonic_client::{ClientError, client::DaemonClient};
-use platonic_core::{AgentId, EffectClass, HarnessEvent};
-#[cfg(any(target_os = "linux", windows))]
+use platonic_core::{EffectClass, HarnessEvent, ProfileId};
+#[cfg(target_os = "linux")]
 use platonic_protocol::RunStateName;
 use platonic_protocol::{
-    BufferedThreadEvent, CAPABILITY_AGENT_CREATE, CAPABILITY_AGENT_LIST, CAPABILITY_AGENT_STATUS,
+    BufferedThreadEvent, CAPABILITY_PROFILE_CREATE, CAPABILITY_PROFILE_LIST,
+    CAPABILITY_PROFILE_OPEN, CAPABILITY_PROFILE_STATUS, CAPABILITY_PROFILE_UPDATE,
     CAPABILITY_THREAD_AUTHORITY, CAPABILITY_THREAD_EVENTS, CAPABILITY_THREAD_LIST,
     CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_SPAWN, CAPABILITY_THREAD_STATUS,
     CAPABILITY_THREAD_STOP, CAPABILITY_WORKSPACE_CREATE, CAPABILITY_WORKSPACE_LIST,
-    CAPABILITY_WORKSPACE_STATUS, ERROR_NOT_FOUND, ERROR_WORKSPACE_UNREGISTERED, ReasoningEffort,
-    ShutdownIfIdleResultName, StreamEvent, ThreadApprovalPolicy, ThreadSendRejectedReason,
-    ThreadSendResult, ThreadSpawnDecision, ThreadSpawnResult, ThreadStopResult,
+    CAPABILITY_WORKSPACE_STATUS, ERROR_NOT_FOUND, ERROR_THREAD_STOP_FAILED,
+    ERROR_WORKSPACE_UNREGISTERED, ProfileContent, ProfileCreateParams, ProfileOpenDecision,
+    ProfileOpenResult, ProfileUpdateParams, ReasoningEffort, ShutdownIfIdleResultName, StreamEvent,
+    ThreadApprovalPolicy, ThreadConfinement, ThreadKind, ThreadRepositoryRequest,
+    ThreadSendRejectedReason, ThreadSendResult, ThreadSpawnResult, ThreadStopResult,
 };
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
 use std::{
@@ -32,7 +36,105 @@ const PROOF_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 static SCENARIO_SERIAL: Mutex<()> = Mutex::new(());
 
-#[cfg(any(target_os = "linux", windows))]
+fn seed_profile(
+    proof: &ProofContext,
+    workspace_id: &str,
+    name: &str,
+    model: &str,
+    reasoning_effort: ReasoningEffort,
+    approval_policy: ThreadApprovalPolicy,
+    toolset: &[&str],
+) -> ProfileId {
+    let profile_id = ProfileId::new(format!("profile-{name}")).unwrap();
+    let content_hash = format!(
+        "{:x}",
+        Sha256::digest(br#"{"instructions_markdown":"","memory_markdown":"","skill_refs":[]}"#)
+    );
+    let mut connection = Connection::open(&proof.server_db_path).unwrap();
+    let transaction = connection.transaction().unwrap();
+    transaction
+        .execute(
+            "INSERT INTO profiles
+               (id, workspace_id, display_name, model, reasoning_effort,
+                approval_policy, toolset, current_revision, home_thread_id,
+                imported_agent_id, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, NULL, NULL, 1)",
+            params![
+                profile_id.as_str(),
+                workspace_id,
+                name,
+                model,
+                reasoning_effort.as_str(),
+                approval_policy.as_str(),
+                serde_json::to_string(toolset).unwrap(),
+            ],
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "INSERT INTO profile_revisions
+               (profile_id, revision, parent_revision, actor, created_at_ms,
+                content_hash, instructions_markdown, memory_markdown, skill_refs)
+             VALUES (?1, 1, NULL, 'semantic-fixture', 1, ?2, '', '', '[]')",
+            params![profile_id.as_str(), content_hash],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    profile_id
+}
+
+fn open_profile_home(
+    client: &mut DaemonClient,
+    profile_id: ProfileId,
+) -> platonic_protocol::ThreadStatus {
+    assert_eq!(
+        client.profile_open_resolve(profile_id.clone()).unwrap(),
+        ProfileOpenResult::NoHome {
+            profile_id: profile_id.clone()
+        }
+    );
+    let (reservation_id, thread_id) = match client
+        .profile_open_start(
+            profile_id.clone(),
+            "semantic-home".into(),
+            vec![ThreadRepositoryRequest {
+                repo: ".".into(),
+                branch: None,
+            }],
+            ".".into(),
+            ".".into(),
+        )
+        .unwrap()
+    {
+        ProfileOpenResult::ApprovalRequired {
+            home_reservation_id,
+            thread_id,
+            effect,
+            ..
+        } => {
+            assert_eq!(effect, EffectClass::WorkspaceWrite);
+            (home_reservation_id, thread_id)
+        }
+        result => panic!("expected home approval, got {result:?}"),
+    };
+    match client
+        .profile_open_decide(reservation_id, ProfileOpenDecision::Grant)
+        .unwrap()
+    {
+        ProfileOpenResult::Opened {
+            profile_id: opened_profile,
+            thread,
+            created: true,
+        } => {
+            assert_eq!(opened_profile, profile_id);
+            assert_eq!(thread.authority.thread_id, thread_id);
+            *thread
+        }
+        result => panic!("expected opened home, got {result:?}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn killed_wedged_child_has_no_ledger_handle_and_other_run_stays_healthy() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
@@ -118,10 +220,9 @@ fn killed_wedged_child_has_no_ledger_handle_and_other_run_stays_healthy() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
 fn one_host_daemon_serves_two_workspaces() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
-    let root = Arc::new(tempfile::tempdir().unwrap());
+    let root = Arc::new(ProofRoot::Temporary(tempfile::tempdir().unwrap()));
     let first = ProofContext::in_root(Arc::clone(&root), "workspace-a");
     let second = ProofContext::in_root(root, "workspace-b");
     let host = ProofDaemon::start(&first);
@@ -150,7 +251,7 @@ fn one_host_daemon_serves_two_workspaces() {
     host.stop(first_client);
 }
 #[test]
-fn workspace_and_agent_six_method_control_plane_is_semantically_conformant() {
+fn workspace_and_profile_control_plane_is_semantically_conformant() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     let proof = ProofContext::new();
     let host = ProofDaemon::start(&proof);
@@ -160,17 +261,18 @@ fn workspace_and_agent_six_method_control_plane_is_semantically_conformant() {
         CAPABILITY_WORKSPACE_CREATE,
         CAPABILITY_WORKSPACE_LIST,
         CAPABILITY_WORKSPACE_STATUS,
-        CAPABILITY_AGENT_CREATE,
-        CAPABILITY_AGENT_LIST,
-        CAPABILITY_AGENT_STATUS,
+        CAPABILITY_PROFILE_CREATE,
+        CAPABILITY_PROFILE_LIST,
+        CAPABILITY_PROFILE_STATUS,
+        CAPABILITY_PROFILE_UPDATE,
     ] {
         assert!(hello.capabilities.contains(&capability));
     }
 
-    let second = proof._root.path().join("agent-control-workspace");
+    let second = proof.workspace.with_file_name("profile-control-workspace");
     fs::create_dir(&second).unwrap();
     let created = client
-        .workspace_create("agent-control".into(), second.clone())
+        .workspace_create("profile-control".into(), second.clone())
         .unwrap()
         .workspace;
     assert_eq!(Path::new(&created.root), second);
@@ -184,27 +286,51 @@ fn workspace_and_agent_six_method_control_plane_is_semantically_conformant() {
         created
     );
 
-    let created_agent = client
-        .agent_create(
-            AgentId::new("builder").unwrap(),
-            created.id.clone(),
-            "gpt-5.6-sol".into(),
-            ReasoningEffort::High,
-            ThreadApprovalPolicy::Prompt,
-            vec!["file.read".into(), "file.write".into()],
-        )
+    let created_profile = client
+        .profile_create(ProfileCreateParams {
+            workspace_id: created.id.clone(),
+            display_name: "builder".into(),
+            model: Some("gpt-5.6-sol".into()),
+            reasoning_effort: ReasoningEffort::High,
+            approval_policy: ThreadApprovalPolicy::Prompt,
+            toolset: Some(vec!["file.read".into(), "file.write".into()]),
+            content: ProfileContent::default(),
+            config_path: None,
+        })
         .unwrap()
-        .agent;
-    assert_eq!(created_agent.workspace_id, created.id);
-    assert_eq!(created_agent.toolset, ["file.read", "file.write"]);
-    assert_eq!(client.agent_list().unwrap().agents, [created_agent.clone()]);
+        .status;
+    assert_eq!(created_profile.profile.workspace_id, created.id);
+    assert_eq!(created_profile.profile.toolset, ["file.read", "file.write"]);
     assert_eq!(
         client
-            .agent_status(AgentId::new("builder").unwrap())
+            .profile_list(Some(created.id.clone()), None)
             .unwrap()
-            .agent,
-        created_agent
+            .profiles,
+        [created_profile.profile.clone()]
     );
+    assert_eq!(
+        client
+            .profile_status(created_profile.profile.id.clone())
+            .unwrap()
+            .status,
+        created_profile
+    );
+    let updated = client
+        .profile_update(ProfileUpdateParams {
+            profile_id: created_profile.profile.id,
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: ReasoningEffort::Xhigh,
+            approval_policy: ThreadApprovalPolicy::Yolo,
+            toolset: vec!["file.read".into()],
+            content: ProfileContent {
+                instructions_markdown: "Build carefully.".into(),
+                ..ProfileContent::default()
+            },
+        })
+        .unwrap()
+        .status;
+    assert_eq!(updated.profile.current_revision, 2);
+    assert_eq!(updated.revision.parent_revision, Some(1));
     host.stop(client);
 }
 
@@ -243,7 +369,6 @@ fn headless_one_shot_and_remote_never_prompt_or_register() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
 fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     let proof = ProofContext::new();
@@ -256,6 +381,7 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     let mut client = host.connect();
     let hello = client.hello(&proof.workspace).unwrap();
     for capability in [
+        CAPABILITY_PROFILE_OPEN,
         CAPABILITY_THREAD_SPAWN,
         CAPABILITY_THREAD_LIST,
         CAPABILITY_THREAD_STATUS,
@@ -265,52 +391,41 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
         assert!(hello.capabilities.contains(&capability));
     }
 
-    let (spawn_id, root_thread_id) = match client
-        .thread_spawn_start(
-            None,
-            proof
-                .workspace
-                .canonicalize()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-            "gpt-5.6-sol".into(),
-            ReasoningEffort::Xhigh,
-            ThreadApprovalPolicy::Yolo,
-        )
-        .unwrap()
-    {
-        ThreadSpawnResult::ApprovalRequired {
-            spawn_id,
-            thread_id,
-            effect,
-            ..
-        } => {
-            assert_eq!(effect, EffectClass::WorkspaceWrite);
-            (spawn_id, thread_id)
-        }
-        unexpected => panic!("expected root approval, got {unexpected:?}"),
-    };
-    let root_status = match client
-        .thread_spawn_decide(
-            spawn_id,
-            ThreadSpawnDecision::Grant {
-                actor: "semantic_fixture".into(),
-            },
-        )
-        .unwrap()
-    {
-        ThreadSpawnResult::Spawned { thread } => thread,
-        unexpected => panic!("expected spawned root, got {unexpected:?}"),
-    };
+    let profile_id = seed_profile(
+        &proof,
+        &hello.workspace_id,
+        "thread-management",
+        "gpt-5.6-sol",
+        ReasoningEffort::Xhigh,
+        ThreadApprovalPolicy::Yolo,
+        &[
+            "file.read",
+            "file.list",
+            "file.write",
+            "file.edit",
+            "shell.exec",
+            "web.fetch",
+        ],
+    );
+    let opened_home = open_profile_home(&mut client, profile_id.clone());
+    let root_thread_id = opened_home.authority.thread_id.clone();
+    assert!(!opened_home.live.loaded);
+    client
+        .thread_events(root_thread_id.clone(), None, 1, 0)
+        .unwrap();
+    let root_status = client.thread_status(root_thread_id.clone()).unwrap().thread;
     assert_eq!(root_status.authority.thread_id, root_thread_id);
     assert_eq!(root_status.authority.parent_thread_id, None);
-    assert_eq!(root_status.authority.spawning_actor, "semantic_fixture");
+    assert_eq!(root_status.authority.spawning_actor, "local-operator");
+    assert_eq!(root_status.authority.profile_id, Some(profile_id.clone()));
+    assert_eq!(root_status.authority.thread_kind, ThreadKind::Home);
     let root = client
         .thread_authority(root_thread_id.clone())
         .unwrap()
         .authority;
-    assert_eq!(root.agent_id, Some(AgentId::new("plato").unwrap()));
+    assert_eq!(root.agent_id, None);
+    assert_eq!(root.profile_id, Some(profile_id.clone()));
+    assert_eq!(root.thread_kind, ThreadKind::Home);
     assert_eq!(root.worktrees.len(), 1);
     assert_eq!(
         Path::new(&root_status.authority.cwd),
@@ -336,16 +451,12 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     assert!(root.created_at_ms > 0);
     assert!(root_status.live.loaded);
     assert_eq!(root_status.live.current_turn_id, None);
-    assert_eq!(
-        root_status.live.last_activity_at_ms,
-        Some(root.created_at_ms)
-    );
-    let child_cwd = PathBuf::from(&root.worktrees[0].path).join("child");
-    fs::create_dir(&child_cwd).unwrap();
+    assert!(root_status.live.last_activity_at_ms >= Some(root.created_at_ms));
+    let child_cwd = PathBuf::from(&root.worktrees[0].path);
 
     let child_status = match client
         .thread_spawn_start(
-            Some(root_thread_id.clone()),
+            root_thread_id.clone(),
             child_cwd
                 .canonicalize()
                 .unwrap()
@@ -375,7 +486,9 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
         Some(root_thread_id.as_str())
     );
     assert_eq!(child.spawning_actor, "yolo");
-    assert_eq!(child.agent_id, root.agent_id);
+    assert_eq!(child.agent_id, None);
+    assert_eq!(child.profile_id, root.profile_id);
+    assert_eq!(child.thread_kind, ThreadKind::Child);
     assert_eq!(child.toolset, root.toolset);
     assert!(child_status.live.loaded);
     assert_eq!(
@@ -395,45 +508,51 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     );
     let root_stop = client
         .thread_stop(root_thread_id.clone(), "semantic_fixture".into())
+        .unwrap_err();
+    assert!(matches!(
+        root_stop,
+        ClientError::DaemonResponse(error) if error.code == ERROR_THREAD_STOP_FAILED
+    ));
+    let child_stop = client
+        .thread_stop(child_thread_id.clone(), "semantic_fixture".into())
         .unwrap();
-    let root_stopped_at_ms = match root_stop {
+    let child_stopped_at_ms = match child_stop {
         ThreadStopResult::Stopped {
             thread_id,
             stopped_turn_id,
             stopped_at_ms,
         } => {
-            assert_eq!(thread_id, root_thread_id);
+            assert_eq!(thread_id, child_thread_id);
             assert_eq!(stopped_turn_id, None);
             stopped_at_ms
         }
-        unexpected => panic!("expected stopped root, got {unexpected:?}"),
+        unexpected => panic!("expected stopped child, got {unexpected:?}"),
     };
     let listed = client.thread_list().unwrap().threads;
-    let stopped_root = listed
+    let live_home = listed
         .iter()
         .find(|thread| thread.authority.thread_id == root_thread_id)
         .unwrap();
-    let orphaned_child = listed
+    let stopped_child = listed
         .iter()
         .find(|thread| thread.authority.thread_id == child_thread_id)
         .unwrap();
-    assert!(!stopped_root.live.loaded);
-    assert_eq!(stopped_root.live.last_activity_at_ms, None);
-    assert!(orphaned_child.live.loaded);
-    assert_eq!(orphaned_child.authority, child_status.authority);
+    assert!(live_home.live.loaded);
+    assert!(!stopped_child.live.loaded);
+    assert_eq!(stopped_child.authority, child_status.authority);
     let connection = rusqlite::Connection::open(&proof.server_db_path).unwrap();
     assert_eq!(
         connection
             .query_row(
                 "SELECT actor, stopped_turn_id, occurred_at_ms FROM thread_stops WHERE thread_id = ?1",
-                [&root_thread_id],
+                [&child_thread_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)?))
             )
             .unwrap(),
         (
             "semantic_fixture".into(),
             None,
-            i64::try_from(root_stopped_at_ms).unwrap()
+            i64::try_from(child_stopped_at_ms).unwrap()
         )
     );
     drop(connection);
@@ -478,7 +597,7 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     );
     let stale_parent = restarted_client
         .thread_spawn_start(
-            Some(root_thread_id),
+            root_thread_id,
             proof.workspace.to_string_lossy().into_owned(),
             "gpt-5.6-sol".into(),
             ReasoningEffort::High,
@@ -493,7 +612,274 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
+fn pending_profile_home_replays_and_grants_after_daemon_restart() {
+    let _serial = SCENARIO_SERIAL.lock().unwrap();
+    let proof = ProofContext::new();
+    let host = ProofDaemon::start(&proof);
+    let mut client = host.connect();
+    let hello = client.hello(&proof.workspace).unwrap();
+    let profile_id = seed_profile(
+        &proof,
+        &hello.workspace_id,
+        "pending-restart",
+        "test-model",
+        ReasoningEffort::High,
+        ThreadApprovalPolicy::Prompt,
+        &["file.read"],
+    );
+    let (reservation_id, thread_id) = match client
+        .profile_open_start(
+            profile_id.clone(),
+            "pending-restart".into(),
+            vec![ThreadRepositoryRequest {
+                repo: ".".into(),
+                branch: None,
+            }],
+            ".".into(),
+            ".".into(),
+        )
+        .unwrap()
+    {
+        ProfileOpenResult::ApprovalRequired {
+            home_reservation_id,
+            thread_id,
+            ..
+        } => (home_reservation_id, thread_id),
+        result => panic!("expected pending home, got {result:?}"),
+    };
+    host.stop(client);
+
+    let restarted = ProofDaemon::start(&proof);
+    let mut client = restarted.connect();
+    assert_eq!(
+        client.profile_open_resolve(profile_id.clone()).unwrap(),
+        ProfileOpenResult::NoHome {
+            profile_id: profile_id.clone()
+        }
+    );
+    assert!(matches!(
+        client
+            .profile_open_start(
+                profile_id.clone(),
+                "pending-restart".into(),
+                vec![ThreadRepositoryRequest {
+                    repo: ".".into(),
+                    branch: None,
+                }],
+                ".".into(),
+                ".".into(),
+            )
+            .unwrap(),
+        ProfileOpenResult::ApprovalRequired {
+            home_reservation_id,
+            thread_id: replayed_thread_id,
+            ..
+        } if home_reservation_id == reservation_id && replayed_thread_id == thread_id
+    ));
+    assert!(matches!(
+        client
+            .profile_open_decide(reservation_id, ProfileOpenDecision::Grant)
+            .unwrap(),
+        ProfileOpenResult::Opened {
+            created: true,
+            thread,
+            ..
+        } if thread.authority.thread_id == thread_id
+            && Path::new(&thread.authority.cwd).is_dir()
+    ));
+    restarted.stop(client);
+}
+
+#[test]
+fn issue_580_profile_home_product_journey_survives_restart() {
+    const QUESTION: &str = "Which release label should the child use?";
+    const ANSWER: &str = "Use protocol-v2.";
+
+    let _serial = SCENARIO_SERIAL.lock().unwrap();
+    let proof = ProofContext::issue_580();
+    let worker_cwd = Arc::new(Mutex::new(proof.workspace.clone()));
+    let provider = ProfileJourneyProvider::start(Arc::clone(&worker_cwd), QUESTION, ANSWER);
+    write_journey_config(&proof.config_path, &provider.base_url);
+    let host = ProofDaemon::start(&proof);
+    let mut client = host.connect();
+    let hello = client.hello(&proof.workspace).unwrap();
+    client.daemon_status(None, None).unwrap();
+    let profile = client
+        .profile_create(ProfileCreateParams {
+            workspace_id: hello.workspace_id,
+            display_name: "journey".into(),
+            model: Some("test-model".into()),
+            reasoning_effort: ReasoningEffort::High,
+            approval_policy: ThreadApprovalPolicy::Prompt,
+            toolset: Some(vec![
+                "file.read".into(),
+                "thread.spawn".into(),
+                "thread.return".into(),
+                "thread.answer".into(),
+            ]),
+            content: ProfileContent {
+                instructions_markdown: "Complete the bounded protocol journey.".into(),
+                ..ProfileContent::default()
+            },
+            config_path: None,
+        })
+        .unwrap()
+        .status
+        .profile;
+    let profile_id = profile.id.clone();
+    let home = open_profile_home(&mut client, profile_id.clone());
+    let home_thread_id = home.authority.thread_id;
+    let home_confinement = client
+        .thread_authority(home_thread_id.clone())
+        .unwrap()
+        .confinement
+        .expect("new home authority records confinement");
+    assert!(matches!(
+        home_confinement,
+        ThreadConfinement::Landlock | ThreadConfinement::None
+    ));
+    #[cfg(target_os = "macos")]
+    assert_eq!(home_confinement, ThreadConfinement::None);
+    *worker_cwd.lock().unwrap() = PathBuf::from(home.authority.cwd);
+
+    assert!(matches!(
+        client
+            .thread_send(
+                home_thread_id.clone(),
+                "journey-home".into(),
+                None,
+                "Spawn the bounded child.".into(),
+            )
+            .unwrap(),
+        ThreadSendResult::Started { .. }
+    ));
+    drive_thread_turn_granting_approvals(&mut client, &home_thread_id);
+    let child = client
+        .thread_list()
+        .unwrap()
+        .threads
+        .into_iter()
+        .find(|thread| thread.authority.parent_thread_id.as_deref() == Some(&home_thread_id));
+    let child_thread_id = child
+        .unwrap_or_else(|| {
+            panic!(
+                "home did not spawn a child: {:?}",
+                client
+                    .thread_events(home_thread_id.clone(), Some(0), 128, 0)
+                    .unwrap()
+                    .events
+            )
+        })
+        .authority
+        .thread_id;
+    let child_confinement = client
+        .thread_authority(child_thread_id.clone())
+        .unwrap()
+        .confinement
+        .expect("new child authority records confinement");
+    assert!(matches!(
+        child_confinement,
+        ThreadConfinement::Landlock | ThreadConfinement::None
+    ));
+    #[cfg(target_os = "macos")]
+    assert_eq!(child_confinement, ThreadConfinement::None);
+
+    assert!(matches!(
+        client
+            .thread_send(
+                child_thread_id.clone(),
+                "journey-child".into(),
+                None,
+                "Ask the parent for the release label.".into(),
+            )
+            .unwrap(),
+        ThreadSendResult::Started { .. }
+    ));
+    provider.question_ready.recv_timeout(PROOF_TIMEOUT).unwrap();
+    assert_eq!(
+        client
+            .thread_status(home_thread_id.clone())
+            .unwrap()
+            .thread
+            .return_availability
+            .child_returns,
+        1
+    );
+
+    assert!(matches!(
+        client
+            .thread_send(
+                home_thread_id.clone(),
+                "journey-home".into(),
+                None,
+                "Answer the child's question.".into(),
+            )
+            .unwrap(),
+        ThreadSendResult::Started { .. }
+    ));
+    drive_thread_turn_granting_approvals(&mut client, &home_thread_id);
+    wait_for_thread_idle(&mut client, &child_thread_id);
+    assert_eq!(
+        client
+            .thread_status(child_thread_id.clone())
+            .unwrap()
+            .thread
+            .return_availability
+            .parent_answers,
+        1
+    );
+
+    assert!(matches!(
+        client
+            .thread_send(
+                child_thread_id.clone(),
+                "journey-child".into(),
+                None,
+                "Confirm the parent's answer.".into(),
+            )
+            .unwrap(),
+        ThreadSendResult::Started { .. }
+    ));
+    wait_for_thread_idle(&mut client, &child_thread_id);
+    host.stop(client);
+
+    let restarted = ProofDaemon::start(&proof);
+    let mut client = restarted.connect();
+    let reopened = client.profile_open_resolve(profile_id).unwrap();
+    assert!(matches!(
+        reopened,
+        ProfileOpenResult::Opened {
+            created: false,
+            ref thread,
+            ..
+        } if thread.authority.thread_id == home_thread_id
+    ));
+    assert_eq!(
+        client
+            .thread_authority(home_thread_id.clone())
+            .unwrap()
+            .confinement,
+        Some(home_confinement)
+    );
+    assert!(matches!(
+        client
+            .thread_send(
+                home_thread_id.clone(),
+                "journey-home-restarted".into(),
+                None,
+                "Start the post-restart turn.".into(),
+            )
+            .unwrap(),
+        ThreadSendResult::Started { .. }
+    ));
+    wait_for_thread_idle(&mut client, &home_thread_id);
+    let proof = provider.join();
+    assert_eq!(proof.child_thread_id, child_thread_id);
+    assert_eq!(proof.request_count, 8);
+    restarted.stop(client);
+}
+
+#[test]
 fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     let proof = ProofContext::new();
@@ -502,70 +888,24 @@ fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
     write_coordinator_config(&proof.config_path, &provider.base_url);
     let host = ProofDaemon::start(&proof);
     let mut client = host.connect();
-    client.hello(&proof.workspace).unwrap();
-    let workspace_id = client
-        .workspace_list()
-        .unwrap()
-        .workspaces
-        .into_iter()
-        .find(|workspace| Path::new(&workspace.root) == proof.workspace.canonicalize().unwrap())
-        .unwrap()
-        .id;
-    client
-        .agent_create(
-            AgentId::new("bounded-worker").unwrap(),
-            workspace_id,
-            "worker-model".into(),
-            ReasoningEffort::High,
-            ThreadApprovalPolicy::Prompt,
-            vec!["file.read".into()],
-        )
-        .unwrap();
-
-    let (spawn_id, coordinator_thread_id) = match client
-        .thread_spawn_start(
-            None,
-            proof
-                .workspace
-                .canonicalize()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-            "test-model".into(),
-            ReasoningEffort::High,
-            ThreadApprovalPolicy::Prompt,
-        )
-        .unwrap()
-    {
-        ThreadSpawnResult::ApprovalRequired {
-            spawn_id,
-            thread_id,
-            effect,
-            ..
-        } => {
-            assert_eq!(effect, EffectClass::WorkspaceWrite);
-            (spawn_id, thread_id)
-        }
-        result => panic!("expected coordinator approval, got {result:?}"),
-    };
-    assert!(matches!(
-        client
-            .thread_spawn_decide(
-                spawn_id,
-                ThreadSpawnDecision::Grant {
-                    actor: "semantic_fixture".into(),
-                },
-            )
-            .unwrap(),
-        ThreadSpawnResult::Spawned { .. }
-    ));
+    let hello = client.hello(&proof.workspace).unwrap();
+    let profile_id = seed_profile(
+        &proof,
+        &hello.workspace_id,
+        "coordinator",
+        "test-model",
+        ReasoningEffort::High,
+        ThreadApprovalPolicy::Prompt,
+        &["file.read", "thread.spawn"],
+    );
+    let coordinator_thread_id = open_profile_home(&mut client, profile_id.clone())
+        .authority
+        .thread_id;
     let coordinator = client
         .thread_authority(coordinator_thread_id.clone())
         .unwrap()
         .authority;
-    let private_worker_cwd = PathBuf::from(&coordinator.worktrees[0].path).join("worker");
-    fs::create_dir(&private_worker_cwd).unwrap();
-    *worker_cwd.lock().unwrap() = private_worker_cwd.canonicalize().unwrap();
+    *worker_cwd.lock().unwrap() = PathBuf::from(&coordinator.worktrees[0].path);
     assert!(matches!(
         client
             .thread_send(
@@ -645,10 +985,10 @@ fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
         Some(coordinator_thread_id.as_str())
     );
     assert_eq!(worker.spawning_actor, "jerome");
-    assert_eq!(
-        worker.agent_id,
-        Some(AgentId::new("bounded-worker").unwrap())
-    );
+    assert_eq!(worker.agent_id, None);
+    assert_eq!(worker.profile_id, Some(profile_id));
+    assert_eq!(worker.thread_kind, ThreadKind::Child);
+    assert_eq!(worker.model, "test-model");
     assert_eq!(worker.toolset, ["file.read"]);
     assert_eq!(worker.approval_policy, ThreadApprovalPolicy::Prompt);
     assert_eq!(worker.worktrees.len(), 1);
@@ -715,7 +1055,6 @@ fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "EINVAL on macOS; #463")]
 fn thread_send_and_three_observers_are_semantically_conformant_on_host_daemon() {
     const INITIAL_MESSAGE: &str = "begin the controlled thread proof";
     const STEERED_MESSAGE: &str = "include the exact steered phrase in the continuation";
@@ -730,6 +1069,7 @@ fn thread_send_and_three_observers_are_semantically_conformant_on_host_daemon() 
     let mut controller_b = host.connect();
     let hello = controller_a.hello(&proof.workspace).unwrap();
     for capability in [
+        CAPABILITY_PROFILE_OPEN,
         CAPABILITY_THREAD_SEND,
         CAPABILITY_THREAD_EVENTS,
         CAPABILITY_THREAD_SPAWN,
@@ -739,39 +1079,18 @@ fn thread_send_and_three_observers_are_semantically_conformant_on_host_daemon() 
     ] {
         assert!(hello.capabilities.contains(&capability));
     }
-    let (spawn_id, thread_id) = match controller_a
-        .thread_spawn_start(
-            None,
-            proof
-                .workspace
-                .canonicalize()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-            "test-model".into(),
-            ReasoningEffort::High,
-            ThreadApprovalPolicy::Yolo,
-        )
-        .unwrap()
-    {
-        ThreadSpawnResult::ApprovalRequired {
-            spawn_id,
-            thread_id,
-            ..
-        } => (spawn_id, thread_id),
-        unexpected => panic!("expected root approval, got {unexpected:?}"),
-    };
-    assert!(matches!(
-        controller_a
-            .thread_spawn_decide(
-                spawn_id,
-                ThreadSpawnDecision::Grant {
-                    actor: "semantic_fixture".into(),
-                },
-            )
-            .unwrap(),
-        ThreadSpawnResult::Spawned { .. }
-    ));
+    let profile_id = seed_profile(
+        &proof,
+        &hello.workspace_id,
+        "controlled-thread",
+        "test-model",
+        ReasoningEffort::High,
+        ThreadApprovalPolicy::Yolo,
+        &["file.read"],
+    );
+    let thread_id = open_profile_home(&mut controller_a, profile_id)
+        .authority
+        .thread_id;
 
     let mut observers = Vec::new();
     let mut observer_ready = Vec::new();
@@ -1033,6 +1352,48 @@ fn wait_for_thread_idle(client: &mut DaemonClient, thread_id: &str) {
     }
 }
 
+fn drive_thread_turn_granting_approvals(client: &mut DaemonClient, thread_id: &str) {
+    let Some(turn_id) = client
+        .thread_status(thread_id.into())
+        .unwrap()
+        .thread
+        .live
+        .current_turn_id
+    else {
+        return;
+    };
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    let mut offset = 0;
+    loop {
+        let page = client
+            .thread_events(thread_id.into(), Some(offset), 128, 1_000)
+            .unwrap();
+        offset = page.next_offset;
+        for (run_id, tool_call_id) in page.events.iter().filter_map(|event| {
+            if event.turn_id != turn_id {
+                return None;
+            }
+            let StreamEvent::ApprovalRequested {
+                run_id,
+                tool_call_id,
+                ..
+            } = &event.event
+            else {
+                return None;
+            };
+            Some((run_id, tool_call_id))
+        }) {
+            client
+                .approval_grant_as(run_id, tool_call_id, "journey-proof".into())
+                .unwrap();
+        }
+        if page.current_turn_id.as_deref() != Some(&turn_id) && page.events.is_empty() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "thread turn did not finish");
+    }
+}
+
 #[test]
 fn accepted_provider_stream_blocks_until_delayed_request_bytes_arrive() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1054,8 +1415,24 @@ fn accepted_provider_stream_blocks_until_delayed_request_bytes_arrive() {
     assert_eq!(server.join().unwrap(), json!({"delayed": true}));
 }
 
+enum ProofRoot {
+    Temporary(tempfile::TempDir),
+    #[cfg(unix)]
+    Issue580(PathBuf),
+}
+
+impl ProofRoot {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Temporary(root) => root.path(),
+            #[cfg(unix)]
+            Self::Issue580(root) => root,
+        }
+    }
+}
+
 struct ProofContext {
-    _root: Arc<tempfile::TempDir>,
+    _root: Arc<ProofRoot>,
     workspace: PathBuf,
     config_path: PathBuf,
     /// The host's server-wide store, where thread state lives.
@@ -1064,8 +1441,6 @@ struct ProofContext {
     runtime_root: PathBuf,
     #[cfg(unix)]
     state_root: PathBuf,
-    #[cfg(windows)]
-    local_app_data: PathBuf,
 }
 
 #[cfg(unix)]
@@ -1082,11 +1457,30 @@ impl Drop for ProofContext {
 
 impl ProofContext {
     fn new() -> Self {
-        Self::in_root(Arc::new(tempfile::tempdir().unwrap()), "workspace")
+        Self::in_root(
+            Arc::new(ProofRoot::Temporary(tempfile::tempdir().unwrap())),
+            "workspace",
+        )
     }
 
-    fn in_root(root: Arc<tempfile::TempDir>, workspace_name: &str) -> Self {
-        let workspace = root.path().join(workspace_name);
+    #[cfg(unix)]
+    fn issue_580() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = PathBuf::from("/tmp/p580");
+        fs::create_dir(&root).expect("issue #580 proof root /tmp/p580 must be pre-absent");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        Self::in_root(Arc::new(ProofRoot::Issue580(root)), "workspace")
+    }
+
+    #[cfg(not(unix))]
+    fn issue_580() -> Self {
+        Self::new()
+    }
+
+    fn in_root(root: Arc<ProofRoot>, workspace_name: &str) -> Self {
+        let root_path = root.path().canonicalize().unwrap();
+        let workspace = root_path.join(workspace_name);
         fs::create_dir(&workspace).unwrap();
         init_git_repository(&workspace);
 
@@ -1104,13 +1498,19 @@ impl ProofContext {
             let root_key = {
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                root.path().hash(&mut hasher);
+                root_path.hash(&mut hasher);
                 hasher.finish() as u32
             };
-            let runtime_root =
-                PathBuf::from(format!("/tmp/pconf-{}-{root_key:08x}", std::process::id()));
+            let runtime_root = match root.as_ref() {
+                ProofRoot::Temporary(_) => {
+                    PathBuf::from(format!("/tmp/pconf-{}-{root_key:08x}", std::process::id()))
+                }
+                ProofRoot::Issue580(root) => root.clone(),
+            };
             fs::create_dir_all(&runtime_root).unwrap();
-            let state_root = root.path().join("state");
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700)).unwrap();
+            let state_root = root_path.join("state");
             (runtime_root, state_root)
         };
         #[cfg(unix)]
@@ -1124,15 +1524,10 @@ impl ProofContext {
             runtime_root.join("platonic/host/agent.sock").display()
         );
 
-        #[cfg(windows)]
-        let local_app_data = root.path().join("local-app-data");
-
         // The server store sits beside the workspaces directory, not inside
         // any one workspace.
         #[cfg(unix)]
         let server_db_path = state_root.join("platonic").join("server.db");
-        #[cfg(windows)]
-        let server_db_path = local_app_data.join("platonic").join("server.db");
 
         Self {
             config_path: workspace.join("plato.toml"),
@@ -1143,8 +1538,6 @@ impl ProofContext {
             runtime_root,
             #[cfg(unix)]
             state_root,
-            #[cfg(windows)]
-            local_app_data,
         }
     }
 
@@ -1170,10 +1563,6 @@ impl ProofContext {
                 .join("host")
                 .join("agent.sock")
         }
-        #[cfg(windows)]
-        {
-            PathBuf::from(r"\\.\pipe\plato-agent-host")
-        }
     }
 
     fn apply_environment(&self, command: &mut Command) {
@@ -1181,8 +1570,6 @@ impl ProofContext {
         command
             .env("XDG_RUNTIME_DIR", &self.runtime_root)
             .env("XDG_STATE_HOME", &self.state_root);
-        #[cfg(windows)]
-        command.env("LOCALAPPDATA", &self.local_app_data);
         command
             .env(API_KEY_ENV, "test-key")
             .env("PLATO_CONFIG", &self.config_path);
@@ -1250,6 +1637,7 @@ struct ProofDaemon {
 impl ProofDaemon {
     fn start(proof: &ProofContext) -> Self {
         let socket_path = proof.host_socket_path();
+        eprintln!("external daemon socket: {}", socket_path.display());
         let mut child = proof.daemon_command().spawn().unwrap();
         wait_for_endpoint(&socket_path, &mut child);
         let daemon = Self {
@@ -1320,7 +1708,16 @@ fn connect_registered_workspace(socket_path: &Path, workspace: &Path) -> DaemonC
 fn wait_for_endpoint(socket_path: &Path, child: &mut Child) {
     let deadline = Instant::now() + PROOF_TIMEOUT;
     loop {
-        if DaemonClient::connect_with_timeout(socket_path, Duration::from_millis(200)).is_ok() {
+        #[cfg(unix)]
+        let socket_ready = {
+            use std::os::unix::fs::FileTypeExt;
+            fs::symlink_metadata(socket_path).is_ok_and(|meta| meta.file_type().is_socket())
+        };
+        #[cfg(not(unix))]
+        let socket_ready = socket_path.exists();
+        if socket_ready
+            && DaemonClient::connect_with_timeout(socket_path, Duration::from_millis(200)).is_ok()
+        {
             return;
         }
         if let Some(status) = child.try_wait().unwrap() {
@@ -1363,7 +1760,7 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> ExitStatus {
     }
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(target_os = "linux")]
 fn wait_for_terminal_status(client: &mut DaemonClient, run_id: &str) -> RunStateName {
     let deadline = Instant::now() + PROOF_TIMEOUT;
     loop {
@@ -1428,107 +1825,6 @@ fn wait_for_platform_process_absence(pid: u32) {
     }
 }
 
-#[cfg(windows)]
-fn platform_direct_children(parent: u32) -> HashSet<u32> {
-    windows_processes()
-        .into_iter()
-        .filter_map(|(pid, process_parent)| (process_parent == parent).then_some(pid))
-        .collect()
-}
-
-#[cfg(windows)]
-fn kill_process_exact(pid: u32) {
-    windows_process_proof::kill(pid).unwrap();
-}
-
-#[cfg(windows)]
-fn wait_for_platform_process_absence(pid: u32) {
-    let deadline = Instant::now() + PROOF_TIMEOUT;
-    while windows_processes()
-        .into_iter()
-        .any(|(current, _)| current == pid)
-    {
-        assert!(
-            Instant::now() < deadline,
-            "run child process {pid} remained after lifecycle cleanup"
-        );
-        thread::yield_now();
-    }
-}
-
-#[cfg(windows)]
-fn windows_processes() -> Vec<(u32, u32)> {
-    windows_process_proof::list().unwrap()
-}
-
-#[cfg(windows)]
-mod windows_process_proof {
-    #![allow(unsafe_code)]
-
-    use std::{
-        io, mem,
-        os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
-    };
-    use windows_sys::Win32::{
-        Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
-        System::{
-            Diagnostics::ToolHelp::{
-                CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-                TH32CS_SNAPPROCESS,
-            },
-            Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess},
-        },
-    };
-
-    pub(super) fn list() -> io::Result<Vec<(u32, u32)>> {
-        // SAFETY: the snapshot handle is checked before ownership is assumed.
-        let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if raw == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: CreateToolhelp32Snapshot returned a new owned handle.
-        let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
-        let mut entry = PROCESSENTRY32W {
-            dwSize: mem::size_of::<PROCESSENTRY32W>()
-                .try_into()
-                .expect("PROCESSENTRY32W size fits u32"),
-            ..Default::default()
-        };
-        // SAFETY: snapshot is live and entry is initialized writable storage.
-        if unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut processes = Vec::new();
-        loop {
-            processes.push((entry.th32ProcessID, entry.th32ParentProcessID));
-            // SAFETY: snapshot and entry remain live for enumeration.
-            if unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) } == 0 {
-                let error = io::Error::last_os_error();
-                return if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
-                    Ok(processes)
-                } else {
-                    Err(error)
-                };
-            }
-        }
-    }
-
-    pub(super) fn kill(pid: u32) -> io::Result<()> {
-        // SAFETY: the returned process handle is checked before ownership is assumed.
-        let raw = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-        if raw.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: OpenProcess returned a new owned handle.
-        let process = unsafe { OwnedHandle::from_raw_handle(raw) };
-        // SAFETY: process is live and was opened with PROCESS_TERMINATE.
-        if unsafe { TerminateProcess(process.as_raw_handle(), 137) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-}
-
 fn read_pipe(pipe: Option<impl Read>) -> String {
     let mut output = String::new();
     if let Some(mut pipe) = pipe {
@@ -1540,7 +1836,7 @@ fn read_pipe(pipe: Option<impl Read>) -> String {
 #[derive(Clone, Copy, Debug)]
 enum UsageFixture {
     Known(u32, u32),
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     Unknown,
 }
 
@@ -1600,6 +1896,31 @@ impl ProviderReply {
     }
 }
 
+fn provider_request_has_tool(request: &Value, provider_name: &str) -> bool {
+    request["tools"].as_array().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == provider_name)
+    })
+}
+
+fn provider_tool_output(request: &Value, internal_name: &str) -> Value {
+    let wrapped = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .expect("provider request omitted the tool result");
+    let prefix = format!("<tool_output name=\"{internal_name}\" trust=\"untrusted\">\n");
+    let body = wrapped
+        .strip_prefix(&prefix)
+        .and_then(|body| body.strip_suffix("\n</tool_output>"))
+        .expect("tool result was not wrapped as untrusted output");
+    serde_json::from_str(body).unwrap()
+}
+
 fn event_stream(events: [Value; 2], usage: UsageFixture) -> String {
     let mut body = String::new();
     for mut event in events {
@@ -1620,7 +1941,7 @@ fn event_stream(events: [Value; 2], usage: UsageFixture) -> String {
                 })
             ));
         }
-        #[cfg(any(target_os = "linux", windows))]
+        #[cfg(target_os = "linux")]
         UsageFixture::Unknown => {}
     }
     body.push_str("data: [DONE]\n\n");
@@ -1641,10 +1962,196 @@ struct CoordinatorProvider {
     handle: Option<thread::JoinHandle<CoordinatorProviderProof>>,
 }
 
+struct ProfileJourneyProvider {
+    base_url: String,
+    question_ready: mpsc::Receiver<()>,
+    handle: Option<thread::JoinHandle<ProfileJourneyProviderProof>>,
+}
+
+struct ProfileJourneyProviderProof {
+    child_thread_id: String,
+    request_count: usize,
+}
+
 struct CoordinatorProviderProof {
     thread_id: String,
     wrapped_result: String,
     request_count: usize,
+}
+
+impl ProfileJourneyProvider {
+    fn start(
+        worker_cwd: Arc<Mutex<PathBuf>>,
+        question: &'static str,
+        answer: &'static str,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (question_sender, question_ready) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut request_count = 0;
+
+            let mut home_spawn = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let home_spawn_request = read_http_request(&mut home_spawn);
+            request_count += 1;
+            assert!(provider_request_has_tool(
+                &home_spawn_request,
+                "thread_spawn"
+            ));
+            assert!(provider_request_has_tool(
+                &home_spawn_request,
+                "thread_answer"
+            ));
+            write_http_response(
+                &mut home_spawn,
+                &ProviderReply::tool_call(
+                    "thread_spawn",
+                    json!({
+                        "cwd": worker_cwd.lock().unwrap().to_string_lossy(),
+                        "toolset": ["file.read", "thread.return"]
+                    }),
+                    UsageFixture::Known(8, 3),
+                )
+                .body,
+            );
+
+            let mut home_spawn_result = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let home_spawn_result_request = read_http_request(&mut home_spawn_result);
+            request_count += 1;
+            let spawned = provider_tool_output(&home_spawn_result_request, "thread.spawn");
+            let child_thread_id = spawned["thread_id"].as_str().unwrap().to_owned();
+            write_http_response(
+                &mut home_spawn_result,
+                &ProviderReply::answer("The bounded child is ready.", UsageFixture::Known(9, 3))
+                    .body,
+            );
+
+            let mut child_question = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let child_question_request = read_http_request(&mut child_question);
+            request_count += 1;
+            assert!(provider_request_has_tool(
+                &child_question_request,
+                "thread_return"
+            ));
+            assert!(!provider_request_has_tool(
+                &child_question_request,
+                "thread_answer"
+            ));
+            write_http_response(
+                &mut child_question,
+                &ProviderReply::tool_call(
+                    "thread_return",
+                    json!({"kind": "question", "payload": question}),
+                    UsageFixture::Known(7, 3),
+                )
+                .body,
+            );
+
+            let mut waiting_child = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let waiting_child_request = read_http_request(&mut waiting_child);
+            request_count += 1;
+            assert_eq!(
+                provider_tool_output(&waiting_child_request, "thread.return")["status"],
+                "delivered"
+            );
+            question_sender.send(()).unwrap();
+
+            let mut parent_answer = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let parent_answer_request = read_http_request(&mut parent_answer);
+            request_count += 1;
+            assert!(parent_answer_request.to_string().contains(question));
+            assert!(provider_request_has_tool(
+                &parent_answer_request,
+                "thread_answer"
+            ));
+            write_http_response(
+                &mut parent_answer,
+                &ProviderReply::tool_call(
+                    "thread_answer",
+                    json!({
+                        "child_thread_id": child_thread_id.clone(),
+                        "kind": "answer",
+                        "payload": answer
+                    }),
+                    UsageFixture::Known(10, 3),
+                )
+                .body,
+            );
+
+            let mut parent_answer_result = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let parent_answer_result_request = read_http_request(&mut parent_answer_result);
+            request_count += 1;
+            assert_eq!(
+                provider_tool_output(&parent_answer_result_request, "thread.answer")["status"],
+                "delivered"
+            );
+            write_http_response(
+                &mut parent_answer_result,
+                &ProviderReply::answer("The child was answered.", UsageFixture::Known(11, 3)).body,
+            );
+            write_http_response(
+                &mut waiting_child,
+                &ProviderReply::answer(
+                    "The child paused after its question.",
+                    UsageFixture::Known(8, 3),
+                )
+                .body,
+            );
+
+            let mut child_confirmation = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let child_confirmation_request = read_http_request(&mut child_confirmation);
+            request_count += 1;
+            assert!(child_confirmation_request.to_string().contains(answer));
+            write_http_response(
+                &mut child_confirmation,
+                &ProviderReply::answer(
+                    "The child observed the parent answer.",
+                    UsageFixture::Known(9, 3),
+                )
+                .body,
+            );
+
+            let mut restarted_home = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let restarted_home_request = read_http_request(&mut restarted_home);
+            request_count += 1;
+            assert!(
+                restarted_home_request
+                    .to_string()
+                    .contains("post-restart turn")
+            );
+            write_http_response(
+                &mut restarted_home,
+                &ProviderReply::answer(
+                    "The same home completed a new turn after restart.",
+                    UsageFixture::Known(9, 3),
+                )
+                .body,
+            );
+
+            ProfileJourneyProviderProof {
+                child_thread_id,
+                request_count,
+            }
+        });
+        Self {
+            base_url,
+            question_ready,
+            handle: Some(handle),
+        }
+    }
+
+    fn join(mut self) -> ProfileJourneyProviderProof {
+        self.handle.take().unwrap().join().unwrap()
+    }
+}
+
+impl Drop for ProfileJourneyProvider {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl CoordinatorProvider {
@@ -1668,7 +2175,6 @@ impl CoordinatorProvider {
                 &ProviderReply::tool_call(
                     "thread_spawn",
                     json!({
-                        "agent_id": "bounded-worker",
                         "cwd": worker_cwd.lock().unwrap().to_string_lossy(),
                         "toolset": ["file.read"]
                     }),
@@ -1792,7 +2298,7 @@ impl Drop for ControlledThreadProvider {
     }
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(target_os = "linux")]
 struct KillIsolationProvider {
     base_url: String,
     first_requested: mpsc::Receiver<()>,
@@ -1801,7 +2307,7 @@ struct KillIsolationProvider {
     handle: thread::JoinHandle<()>,
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(target_os = "linux")]
 impl KillIsolationProvider {
     fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1942,6 +2448,32 @@ max_spawn_depth = 1
 [tools]
 enabled = ["file.read", "thread.spawn"]
 "#
+        ),
+    )
+    .unwrap();
+}
+
+fn write_journey_config(path: &Path, base_url: &str) {
+    fs::write(
+        path,
+        format!(
+            r#"[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "{API_KEY_ENV}"
+base_url = "{base_url}"
+connect_timeout_ms = 5000
+stream_idle_timeout_ms = 5000
+
+[limits]
+token_budget = 8000
+max_output_tokens = 64
+max_turns = 2
+max_spawn_depth = 1
+
+[tools]
+enabled = ["file.read", "thread.spawn", "thread.return", "thread.answer"]
+"#,
         ),
     )
     .unwrap();

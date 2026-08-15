@@ -32,10 +32,12 @@ fn host_conflict_crash_recovery_and_persistent_normal_exit() {
             &RecordedEvent {
                 seq: 0,
                 occurred_at_ms: 0,
-                event: HarnessEvent::RunStarted {
+                event: HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                     run_id: run_id.clone(),
-                    agent_id: AgentId::new("plato").unwrap(),
-                },
+                    identity: platonic_core::RunIdentity::LegacyAgent {
+                        agent_id: AgentId::new("plato").unwrap(),
+                    },
+                }),
             },
         )
         .unwrap();

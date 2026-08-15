@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use plato_agent::{
     AppError, AppResult, ApprovalMode, RunOptions, ensure_server, ensure_server_interactive,
-    offline, run_question,
+    offline, run_question, select_profile_home,
     tui::{ThreadAttachment, TuiOptions, run_tui, voice_control},
 };
 use platonic_client::{client::DaemonClient, paths};
@@ -12,7 +12,6 @@ use platonic_protocol::{
 use std::{
     io::{self, BufRead, IsTerminal, Read, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 const THREAD_EVENT_PAGE: usize = 128;
@@ -68,6 +67,14 @@ struct Cli {
     )]
     remote: Option<String>,
 
+    #[arg(
+        long,
+        global = true,
+        value_name = "NAME",
+        help = "Select a workspace profile for the terminal UI"
+    )]
+    profile: Option<String>,
+
     #[arg(long, global = true, help = "Use a static TUI working indicator")]
     reduced_motion: bool,
 
@@ -113,7 +120,7 @@ enum ThreadCommand {
     /// Create a thread after its spawning policy admits the typed effect.
     Spawn {
         #[arg(long, value_name = "THREAD_ID")]
-        parent: Option<String>,
+        parent: String,
         #[arg(long, value_name = "DIR", default_value = ".")]
         cwd: PathBuf,
         #[arg(long, value_name = "MODEL")]
@@ -230,10 +237,11 @@ fn validate_replay_cli(cli: &Cli, file: Option<&Path>) -> AppResult<()> {
         || cli.continue_session
         || cli.tui
         || cli.remote.is_some()
+        || cli.profile.is_some()
         || !cli.question.is_empty()
     {
         return Err(AppError::Config(
-            "plato replay cannot be combined with --config, --voice-config, --yolo, -c, --tui, --remote, or a question"
+            "plato replay cannot be combined with --config, --voice-config, --yolo, -c, --tui, --remote, --profile, or a question"
                 .into(),
         ));
     }
@@ -252,10 +260,11 @@ fn validate_using_subcommand(cli: &Cli, name: &str) -> AppResult<()> {
         || cli.continue_session
         || cli.tui
         || cli.remote.is_some()
+        || cli.profile.is_some()
         || !cli.question.is_empty()
     {
         return Err(AppError::Config(format!(
-            "plato {name} cannot be combined with --db, --voice-config, --yolo, -c, --tui, --remote, or a question"
+            "plato {name} cannot be combined with --db, --voice-config, --yolo, -c, --tui, --remote, --profile, or a question"
         )));
     }
     Ok(())
@@ -280,6 +289,11 @@ fn replay_path(
 }
 
 fn run_prompt(cli: Cli, workspace_root: PathBuf, interactive: bool) -> AppResult<()> {
+    if cli.profile.is_some() {
+        return Err(AppError::Config(
+            "--profile requires the terminal UI and cannot be combined with a question".into(),
+        ));
+    }
     if cli.voice_config.is_some() {
         return Err(AppError::Config(
             "--voice-config is available only in the TUI".into(),
@@ -396,10 +410,6 @@ fn shell_quote(value: &str) -> String {
     {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
-    #[cfg(windows)]
-    {
-        format!("\"{}\"", value.replace('"', "\\\""))
-    }
 }
 
 fn run_issue_prep_cli(
@@ -460,61 +470,23 @@ fn run_tui_mode(cli: Cli, workspace_root: PathBuf, local_interactive: bool) -> A
     let yolo = cli.yolo;
     let thread_id = match cli.remote {
         Some(thread_id) => client.thread_status(thread_id)?.thread.authority.thread_id,
-        None => spawn_local_tui_thread(
+        None => select_profile_home(
             &mut client,
             &options.workspace,
+            cli.profile.as_deref(),
             cli.config.as_deref(),
             &mut io::stdin().lock(),
             &mut io::stderr(),
         )?,
     };
     if yolo {
+        client.thread_events(thread_id.clone(), None, 1, 0)?;
         client
             .session_approval_profile_set(format!("session_{thread_id}"), ApprovalProfile::Yolo)?;
     }
-    options.thread = Some(ThreadAttachment {
-        thread_id,
-        controller_id: new_tui_controller_id(),
-    });
+    drop(client);
+    options.thread = Some(ThreadAttachment::new(thread_id));
     run_tui(options)
-}
-
-fn spawn_local_tui_thread(
-    client: &mut DaemonClient,
-    workspace_root: &Path,
-    config_path: Option<&Path>,
-    input: &mut dyn BufRead,
-    errors: &mut dyn Write,
-) -> AppResult<String> {
-    let config_path = config_path.map(|path| {
-        resolve_cli_path(path.to_path_buf(), workspace_root)
-            .to_string_lossy()
-            .into_owned()
-    });
-    let model = client
-        .daemon_status(None, config_path)?
-        .model
-        .requested_alias;
-    let result = client.thread_spawn_start(
-        None,
-        workspace_root
-            .canonicalize()?
-            .to_string_lossy()
-            .into_owned(),
-        model,
-        ReasoningEffort::None,
-        ThreadApprovalPolicy::Prompt,
-    )?;
-    match resolve_thread_spawn(result, client, input, errors, "local_tui")? {
-        ThreadSpawnResult::Spawned { thread } => Ok(thread.authority.thread_id),
-        ThreadSpawnResult::Denied { reason, .. } => {
-            Err(AppError::Config(format!("thread spawn denied: {reason}")))
-        }
-        ThreadSpawnResult::Canceled { .. } => Err(AppError::Config("thread spawn canceled".into())),
-        ThreadSpawnResult::ApprovalRequired { .. } => Err(AppError::DaemonProtocol(
-            "thread spawn remained pending after a decision".into(),
-        )),
-    }
 }
 
 fn validate_tui_cli(cli: &Cli) -> AppResult<()> {
@@ -538,15 +510,12 @@ fn validate_tui_cli(cli: &Cli) -> AppResult<()> {
             "plato --tui --yolo cannot be combined with --remote".into(),
         ));
     }
+    if cli.remote.is_some() && cli.profile.is_some() {
+        return Err(AppError::Config(
+            "plato --remote cannot be combined with --profile".into(),
+        ));
+    }
     Ok(())
-}
-
-fn new_tui_controller_id() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    format!("tui_{millis}_{}", std::process::id())
 }
 
 fn run_thread_cli(command: ThreadCommand, workspace_root: PathBuf) -> AppResult<()> {
@@ -939,10 +908,12 @@ mod tests {
                 RecordedEvent {
                     seq: 0,
                     occurred_at_ms: 0,
-                    event: HarnessEvent::RunStarted {
+                    event: HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                         run_id: run_id.clone(),
-                        agent_id: AgentId::new("agent_1").unwrap(),
-                    },
+                        identity: platonic_core::RunIdentity::LegacyAgent {
+                            agent_id: AgentId::new("agent_1").unwrap(),
+                        },
+                    }),
                 },
                 RecordedEvent {
                     seq: 1,
@@ -993,10 +964,12 @@ mod tests {
                 RecordedEvent {
                     seq: 0,
                     occurred_at_ms: 0,
-                    event: HarnessEvent::RunStarted {
+                    event: HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                         run_id: run_id.clone(),
-                        agent_id: AgentId::new("agent_1").unwrap(),
-                    },
+                        identity: platonic_core::RunIdentity::LegacyAgent {
+                            agent_id: AgentId::new("agent_1").unwrap(),
+                        },
+                    }),
                 },
                 RecordedEvent {
                     seq: 1,
@@ -1126,7 +1099,7 @@ mod tests {
 
     #[test]
     fn daemon_probe_bounds_a_stalled_hello() {
-        assert_eq!(platonic_protocol::PROTOCOL_VERSION, 1);
+        assert_eq!(platonic_protocol::PROTOCOL_VERSION, 2);
         assert!(Cli::command().get_name() == "plato");
     }
 

@@ -1,8 +1,8 @@
 use platonic_core::{
     ActorId, AgentId, ContextFragment, ContextLane, ContextPack, EffectClass, HarnessEvent,
     Message, MessageRole, ModelName, ModelUsage, PolicyDecision, RecordedEvent, ResultVisibility,
-    RunCommand, RunId, RunPhase, RunReadback, RunState, ToolCall, ToolCallId, ToolName,
-    ToolProposal, ToolResult, TurnId,
+    RunCommand, RunId, RunIdentity, RunPhase, RunReadback, RunState, ToolCall, ToolCallId,
+    ToolName, ToolProposal, ToolResult, TurnId,
 };
 use serde_json::json;
 
@@ -36,10 +36,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let events = vec![
-        HarnessEvent::RunStarted {
+        HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
             run_id: run_id.clone(),
-            agent_id: AgentId::new("agent-1")?,
-        },
+            identity: RunIdentity::LegacyAgent {
+                agent_id: AgentId::new("agent-1")?,
+            },
+        }),
         HarnessEvent::ContextBuilt {
             run_id: run_id.clone(),
             turn_id: turn_id.clone(),

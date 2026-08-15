@@ -344,7 +344,7 @@ fn harness_event_turn_id(event: &HarnessEvent) -> Option<&platonic_core::TurnId>
         | HarnessEvent::ModelResponded { turn_id, .. }
         | HarnessEvent::ToolProposalsRejected { turn_id, .. }
         | HarnessEvent::ToolCallProposed { turn_id, .. } => Some(turn_id),
-        HarnessEvent::RunStarted { .. }
+        HarnessEvent::RunStarted(_)
         | HarnessEvent::PolicyEvaluated { .. }
         | HarnessEvent::ApprovalGranted { .. }
         | HarnessEvent::ApprovalDenied { .. }
@@ -485,10 +485,12 @@ mod tests {
         RecordedEvent {
             seq: 0,
             occurred_at_ms: 0,
-            event: HarnessEvent::RunStarted {
+            event: HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
                 run_id: RunId::new(run_id).unwrap(),
-                agent_id: AgentId::new("plato").unwrap(),
-            },
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+            }),
         }
     }
 

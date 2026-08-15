@@ -63,10 +63,23 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: desktop/package-lock.json
+          cache-dependency-path: |
+            desktop/package-lock.json
+            site/package-lock.json
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Install site dependencies
+        working-directory: site
+        run: npm ci
+
+      - name: Check desktop exports and dependencies
+        run: npx --yes knip@6.32.1 --config knip.json
+
+      - name: Check site exports and dependencies
+        working-directory: site
+        run: npx --yes knip@6.32.1 --config knip.json
 
       - name: Install Chromium
         run: npx playwright install --with-deps chromium
@@ -168,53 +181,5 @@ jobs:
       - name: Run Rust clippy
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
 
-      - name: Build Linux AppImage
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: "1"
-        run: npm run tauri:bundle:linux -- --ci -- --locked
-
-      - name: Prove AppImage contents and checksum
-        run: |
-          set -euo pipefail
-          bundle="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/bundle/appimage"
-          mapfile -t appimages < <(find "$bundle" -maxdepth 1 -type f -name '*.AppImage')
-          test "${#appimages[@]}" -eq 1
-          appimage="${appimages[0]}"
-          chmod +x "$appimage"
-
-          extract="$RUNNER_TEMP/plato-appimage-extract"
-          mkdir -p "$extract"
-          (cd "$extract" && "$appimage" --appimage-extract >/dev/null)
-          bin="$extract/squashfs-root/usr/bin"
-          diff -u \
-            <(printf '%s\n' plato-desktop platonic) \
-            <(find "$bin" -maxdepth 1 -type f -perm /111 -printf '%f\n' | LC_ALL=C sort)
-          file -b "$bin/platonic" | grep -Eq '^ELF 64-bit .*x86-64'
-          file -b "$bin/plato-desktop" | grep -Eq '^ELF 64-bit .*x86-64'
-          "$bin/platonic" --help >/dev/null
-
-          version=$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json')).version")
-          out="$GITHUB_WORKSPACE/artifacts/linux-appimage"
-          mkdir -p "$out"
-          asset="Plato-${version}-x86_64.AppImage"
-          cp "$appimage" "$out/$asset"
-          (
-            cd "$out"
-            sha256sum "$asset" > "$asset.sha256"
-            sha256sum -c "$asset.sha256"
-            printf '\0' >> "$asset"
-            if sha256sum -c "$asset.sha256"; then
-              echo "corrupted AppImage passed checksum verification" >&2
-              exit 1
-            fi
-            truncate -s -1 "$asset"
-            sha256sum -c "$asset.sha256"
-          )
-
-      - name: Upload Linux AppImage proof artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: linux-appimage
-          path: artifacts/linux-appimage/*
-          if-no-files-found: error
-          retention-days: 7
+      - name: Compile Linux desktop shell without bundling
+        run: npm run tauri:build -- --ci -- --locked

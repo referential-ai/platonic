@@ -21,18 +21,6 @@ thiserror.workspace = true
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-interprocess.workspace = true
-widestring.workspace = true
-windows-sys = { workspace = true, features = [
-  "Win32_Foundation",
-  "Win32_Security",
-  "Win32_Security_Authorization",
-  "Win32_Storage_FileSystem",
-  "Win32_System_Pipes",
-  "Win32_System_Threading",
-] }
-
 [dev-dependencies]
 temp-env.workspace = true
 tempfile.workspace = true

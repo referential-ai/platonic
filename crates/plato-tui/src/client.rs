@@ -1,6 +1,6 @@
 use crate::{
     ActiveRunView, ApprovalModalView, ThreadAttachment, TranscriptState, TranscriptView, TuiState,
-    VoiceControl, VoiceControlRequest, VoiceControlResponse,
+    VoiceControl, VoiceControlEvent, VoiceControlRequest, VoiceControlResponse,
 };
 use platonic_client::{
     ClientError, ClientResult,
@@ -8,10 +8,11 @@ use platonic_client::{
 };
 use platonic_protocol::{
     ApprovalDecisionName, ApprovalProfile, BufferedStreamEvent, CommandAcceptedResult,
-    DaemonStatusResult, ERROR_LAGGED, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
+    DaemonStatusResult, ERROR_LAGGED, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
     ERROR_WORKSPACE_MISMATCH, EventsStreamResult, HarnessEvent, IssuePrepResult,
     IssuePrepStartResult, RunOverrides, RunStartResult, RunStateName,
-    SessionApprovalProfileSetResult, StreamEvent, ThreadEventsResult, ThreadSendResult,
+    SessionApprovalProfileSetResult, StreamEvent, ThreadEventsResult, ThreadListResult,
+    ThreadSendResult, VoiceEvent, VoiceEventsResult,
 };
 use std::{
     collections::HashMap,
@@ -27,7 +28,7 @@ use std::sync::mpsc::Receiver;
 use super::{
     app::{
         UiEvent, push_live_event, push_live_event_at, select_fresh_session, send_command,
-        start_next_queued,
+        start_next_queued, submit_voice_transcript,
     },
     state::approval_from_snapshot,
 };
@@ -70,14 +71,19 @@ fn load_connected_thread_state(
     let status = client.thread_status(attachment.thread_id.clone())?;
     let sessions = client.sessions_list()?;
     let session_id = format!("session_{}", attachment.thread_id);
-    let approval_profile = client
-        .daemon_status(Some(session_id.clone()), None)?
-        .trust
-        .approval_profile;
-    let (transcript, approval) = if sessions
+    let has_session = sessions
         .iter()
-        .any(|session| session.session_id == session_id)
-    {
+        .any(|session| session.session_id == session_id);
+    let approval_profile = match client.daemon_status(Some(session_id.clone()), None) {
+        Ok(status) => status.trust.approval_profile,
+        Err(ClientError::DaemonResponse(error))
+            if !has_session && error.code == ERROR_NOT_FOUND =>
+        {
+            ApprovalProfile::Prompt
+        }
+        Err(error) => return Err(error),
+    };
+    let (transcript, approval) = if has_session {
         match client.transcript_read_session(&session_id) {
             Ok(transcript) => loaded_transcript_state(transcript),
             Err(error) => (
@@ -98,7 +104,8 @@ fn load_connected_thread_state(
         sessions,
         transcript,
     );
-    state.selected_session_id = Some(session_id.clone());
+    state.selected_session_id = has_session.then_some(session_id.clone());
+    state.selected_thread_id = Some(attachment.thread_id.clone());
     state.approval_profile = approval_profile;
     state.approval = approval;
     state.status_message = Some(format!("attached to thread {}", attachment.thread_id));
@@ -203,17 +210,6 @@ fn loaded_transcript_state(
         TranscriptState::Loaded(TranscriptView::from(transcript)),
         approval,
     )
-}
-
-fn load_selected_session_state(config: &DaemonConnectionConfig, session_id: &str) -> TuiState {
-    match load_connected_state(config, None, Some(session_id)) {
-        Ok(state) => state,
-        Err(error) => TuiState::disconnected(
-            config.workspace_root.to_string_lossy().into_owned(),
-            config.socket_path.to_string_lossy().into_owned(),
-            error.to_string(),
-        ),
-    }
 }
 
 #[derive(Debug)]
@@ -360,12 +356,21 @@ impl UiRuntime {
     }
 
     pub(super) fn thread_send_command(&self, message: String) -> Option<ClientCommand> {
+        self.thread_send_command_with_prior(message, None)
+    }
+
+    pub(super) fn thread_send_command_with_prior(
+        &self,
+        message: String,
+        prior_interrupted_run_id: Option<String>,
+    ) -> Option<ClientCommand> {
         let thread = self.thread.as_ref()?;
         Some(ClientCommand::ThreadSend {
             thread_id: thread.thread_id.clone(),
             controller_id: thread.controller_id.clone(),
             turn_id: self.thread_turn_id.clone(),
             message,
+            prior_interrupted_run_id,
         })
     }
 }
@@ -375,8 +380,9 @@ pub(super) enum ClientCommand {
     Load {
         run_id: Option<String>,
     },
-    LoadSession {
-        session_id: String,
+    ThreadList,
+    LoadThread {
+        attachment: ThreadAttachment,
     },
     DaemonStatus {
         session_id: Option<String>,
@@ -392,6 +398,7 @@ pub(super) enum ClientCommand {
         session_id: String,
         config_path: Option<String>,
         approval_profile: Option<ApprovalProfile>,
+        prior_interrupted_run_id: Option<String>,
     },
     ApprovalProfileSet {
         session_id: String,
@@ -399,6 +406,8 @@ pub(super) enum ClientCommand {
     },
     VoiceSet {
         enabled: bool,
+        active_run_id: Option<String>,
+        capture_idle: bool,
     },
     VoiceResetForNewSession,
     ThreadSend {
@@ -406,6 +415,14 @@ pub(super) enum ClientCommand {
         controller_id: String,
         turn_id: Option<String>,
         message: String,
+        prior_interrupted_run_id: Option<String>,
+    },
+    VoiceCommit {
+        run_id: String,
+        events: Vec<VoiceEvent>,
+    },
+    VoiceSubmissionFailed {
+        reason: String,
     },
     IssuePrepStart {
         input: String,
@@ -434,16 +451,39 @@ pub(super) enum ClientCommand {
     },
     RunCancel {
         run_id: String,
+        silence_locally: bool,
     },
 }
 
 #[derive(Debug)]
 pub(super) enum ClientEvent {
     Loaded(Box<TuiState>),
+    ThreadLoaded {
+        state: Box<TuiState>,
+        attachment: ThreadAttachment,
+    },
+    ThreadsLoaded(ThreadListResult),
     StatusLoaded(Box<DaemonStatusResult>),
     ApprovalProfileSet(SessionApprovalProfileSetResult),
     VoiceSet(VoiceControlResponse),
     VoiceResetForNewSession(VoiceControlResponse),
+    VoiceCaptured {
+        transcript: String,
+        prior_interrupted_run_id: Option<String>,
+    },
+    VoiceCancelRun {
+        run_id: String,
+    },
+    VoiceCommit {
+        run_id: String,
+        events: Vec<VoiceEvent>,
+    },
+    VoiceCommitted(VoiceEventsResult),
+    VoiceCommitFailed {
+        run_id: String,
+        error: ClientError,
+    },
+    VoiceFailed(String),
     RunStarted(RunStartResult),
     ThreadSent(ThreadSendResult),
     IssuePrepFinished(IssuePrepStartResult),
@@ -464,6 +504,7 @@ pub(super) enum ClientEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ClientOperation {
     DaemonStatus,
+    ThreadList,
     ApprovalProfileSet,
     RunStart,
     MessageAppend,
@@ -479,6 +520,7 @@ impl ClientOperation {
     fn method(self) -> &'static str {
         match self {
             Self::DaemonStatus => "daemon.status",
+            Self::ThreadList => "thread.list",
             Self::ApprovalProfileSet => "session.approval_profile.set",
             Self::RunStart => "run.start",
             Self::MessageAppend => "message.append",
@@ -516,24 +558,55 @@ pub(super) fn spawn_client_worker_to(
     event_sender: Sender<UiEvent>,
 ) -> ClientWorker {
     let (command_sender, command_receiver) = mpsc::channel();
+    let voice_events = voice.as_ref().and_then(VoiceControl::take_events);
+    let relay_sender = event_sender.clone();
+    let voice_relay = voice_events.map(|events| {
+        thread::spawn(move || {
+            for event in events {
+                if relay_sender
+                    .send(UiEvent::Daemon(Box::new(client_event_from_voice(event))))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    });
+    let worker_voice = voice.clone();
     let worker = thread::spawn(move || {
         for command in command_receiver {
             let event =
-                handle_client_command(&config, attachment.as_ref(), voice.as_ref(), command);
+                handle_client_command(&config, attachment.as_ref(), worker_voice.as_ref(), command);
+            let notifications = voice_notifications(&event);
+            let abandon = voice_should_abandon(&event);
             if event_sender.send(UiEvent::Daemon(Box::new(event))).is_err() {
                 break;
+            }
+            if let Some(voice) = worker_voice.as_ref() {
+                if abandon {
+                    voice.abandon_current();
+                }
+                for notification in notifications {
+                    if !voice.try_notify(notification) {
+                        break;
+                    }
+                }
             }
         }
     });
     ClientWorker {
         commands: Some(command_sender),
         worker: Some(worker),
+        voice,
+        voice_relay,
     }
 }
 
 pub(super) struct ClientWorker {
     commands: Option<Sender<ClientCommand>>,
     worker: Option<JoinHandle<()>>,
+    voice: Option<VoiceControl>,
+    voice_relay: Option<JoinHandle<()>>,
 }
 
 impl Deref for ClientWorker {
@@ -552,6 +625,10 @@ impl Drop for ClientWorker {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        self.voice.take();
+        if let Some(relay) = self.voice_relay.take() {
+            let _ = relay.join();
+        }
     }
 }
 
@@ -566,9 +643,14 @@ fn handle_client_command(
             Some(attachment) => load_thread_state(config, attachment),
             None => load_state(config, run_id.as_deref()),
         })),
-        ClientCommand::LoadSession { session_id } => {
-            ClientEvent::Loaded(Box::new(load_selected_session_state(config, &session_id)))
-        }
+        ClientCommand::ThreadList => with_client(config, DaemonClient::thread_list).map_or_else(
+            failed_event(ClientOperation::ThreadList),
+            ClientEvent::ThreadsLoaded,
+        ),
+        ClientCommand::LoadThread { attachment } => ClientEvent::ThreadLoaded {
+            state: Box::new(load_thread_state(config, &attachment)),
+            attachment,
+        },
         ClientCommand::DaemonStatus {
             session_id,
             config_path,
@@ -582,38 +664,45 @@ fn handle_client_command(
             question,
             config_path,
             approval_profile,
-        } => with_client(config, |client| {
-            client.run_start_with_overrides_and_profile(
-                question,
-                config_path,
-                RunOverrides::default(),
-                Some(approval_profile),
-                false,
+        } => {
+            notify_submission_started(voice);
+            with_client(config, |client| {
+                client.run_start_with_overrides_and_profile(
+                    question,
+                    config_path,
+                    RunOverrides::default(),
+                    Some(approval_profile),
+                    false,
+                )
+            })
+            .map_or_else(
+                failed_event(ClientOperation::RunStart),
+                ClientEvent::RunStarted,
             )
-        })
-        .map_or_else(
-            failed_event(ClientOperation::RunStart),
-            ClientEvent::RunStarted,
-        ),
+        }
         ClientCommand::MessageAppend {
             message,
             session_id,
             config_path,
             approval_profile,
-        } => with_client(config, |client| {
-            client.message_append_to_session_with_overrides_and_profile(
-                message,
-                Some(session_id),
-                config_path,
-                RunOverrides::default(),
-                approval_profile,
-                false,
+            prior_interrupted_run_id,
+        } => {
+            notify_submission_started(voice);
+            with_client(config, |client| {
+                client.message_append_to_session_with_prior_interruption(
+                    message,
+                    Some(session_id),
+                    config_path,
+                    approval_profile,
+                    prior_interrupted_run_id,
+                    false,
+                )
+            })
+            .map_or_else(
+                failed_event(ClientOperation::MessageAppend),
+                ClientEvent::RunStarted,
             )
-        })
-        .map_or_else(
-            failed_event(ClientOperation::MessageAppend),
-            ClientEvent::RunStarted,
-        ),
+        }
         ClientCommand::ApprovalProfileSet {
             session_id,
             profile,
@@ -624,9 +713,16 @@ fn handle_client_command(
             failed_event(ClientOperation::ApprovalProfileSet),
             ClientEvent::ApprovalProfileSet,
         ),
-        ClientCommand::VoiceSet { enabled } => ClientEvent::VoiceSet(match voice {
+        ClientCommand::VoiceSet {
+            enabled,
+            active_run_id,
+            capture_idle,
+        } => ClientEvent::VoiceSet(match voice {
             Some(voice) => voice.request(if enabled {
-                VoiceControlRequest::Enable
+                VoiceControlRequest::Enable {
+                    active_run_id,
+                    capture_idle,
+                }
             } else {
                 VoiceControlRequest::Disable
             }),
@@ -645,13 +741,35 @@ fn handle_client_command(
             controller_id,
             turn_id,
             message,
-        } => with_client(config, |client| {
-            client.thread_send(thread_id, controller_id, turn_id, message)
-        })
-        .map_or_else(
-            failed_event(ClientOperation::ThreadSend),
-            ClientEvent::ThreadSent,
-        ),
+            prior_interrupted_run_id,
+        } => {
+            notify_submission_started(voice);
+            with_client(config, |client| {
+                client.thread_send_with_prior_interruption(
+                    thread_id,
+                    controller_id,
+                    turn_id,
+                    message,
+                    prior_interrupted_run_id,
+                )
+            })
+            .map_or_else(
+                failed_event(ClientOperation::ThreadSend),
+                ClientEvent::ThreadSent,
+            )
+        }
+        ClientCommand::VoiceCommit { run_id, events } => {
+            match with_client(config, |client| client.voice_events_commit(&run_id, events)) {
+                Ok(result) => ClientEvent::VoiceCommitted(result),
+                Err(error) => ClientEvent::VoiceCommitFailed { run_id, error },
+            }
+        }
+        ClientCommand::VoiceSubmissionFailed { reason } => {
+            if let Some(voice) = voice {
+                let _ = voice.try_notify(VoiceControlRequest::SubmissionFailed);
+            }
+            ClientEvent::VoiceFailed(reason)
+        }
         ClientCommand::IssuePrepStart { input, config_path } => {
             let result = (|| {
                 let mut client = connect_daemon(config, DAEMON_CLIENT_TIMEOUT)?;
@@ -730,13 +848,134 @@ fn handle_client_command(
                 }
             })
         }
-        ClientCommand::RunCancel { run_id } => {
+        ClientCommand::RunCancel {
+            run_id,
+            silence_locally,
+        } => {
+            if silence_locally && let Some(voice) = voice {
+                let _ = voice.request(VoiceControlRequest::Cancel {
+                    run_id: run_id.clone(),
+                });
+            }
             with_client(config, |client| client.run_cancel(&run_id)).map_or_else(
                 failed_event(ClientOperation::RunCancel),
                 ClientEvent::RunCanceled,
             )
         }
     }
+}
+
+fn notify_submission_started(voice: Option<&VoiceControl>) {
+    if let Some(voice) = voice {
+        let _ = voice.try_notify(VoiceControlRequest::SubmissionStarted);
+    }
+}
+
+fn client_event_from_voice(event: VoiceControlEvent) -> ClientEvent {
+    match event {
+        VoiceControlEvent::Captured {
+            transcript,
+            prior_interrupted_run_id,
+        } => ClientEvent::VoiceCaptured {
+            transcript,
+            prior_interrupted_run_id,
+        },
+        VoiceControlEvent::CancelRun { run_id } => ClientEvent::VoiceCancelRun { run_id },
+        VoiceControlEvent::Commit { run_id, events } => ClientEvent::VoiceCommit { run_id, events },
+        VoiceControlEvent::Failed(error) => ClientEvent::VoiceFailed(error),
+    }
+}
+
+fn voice_notifications(event: &ClientEvent) -> Vec<VoiceControlRequest> {
+    match event {
+        ClientEvent::Loaded(state) | ClientEvent::ThreadLoaded { state, .. } => {
+            vec![VoiceControlRequest::Loaded {
+                active_run_id: state.active_run.as_ref().and_then(|run| {
+                    matches!(
+                        run.status,
+                        RunStateName::Running | RunStateName::CancelRequested
+                    )
+                    .then(|| run.run_id.clone())
+                }),
+            }]
+        }
+        ClientEvent::RunStarted(result) => vec![VoiceControlRequest::RunObserved {
+            run_id: result.run_id.clone(),
+        }],
+        ClientEvent::ThreadSent(
+            ThreadSendResult::Steered { .. } | ThreadSendResult::Rejected { .. },
+        )
+        | ClientEvent::Failed {
+            operation:
+                ClientOperation::RunStart | ClientOperation::MessageAppend | ClientOperation::ThreadSend,
+            ..
+        } => vec![VoiceControlRequest::SubmissionFailed],
+        ClientEvent::EventsPolled(result) => {
+            let mut notifications = result
+                .events
+                .iter()
+                .map(|event| VoiceControlRequest::Stream(event.event.clone()))
+                .collect::<Vec<_>>();
+            let needs_catch_up =
+                result.events.len() == EVENT_LIMIT && result.next_offset > result.from_offset;
+            if !needs_catch_up
+                && matches!(
+                    result.status,
+                    RunStateName::Finished
+                        | RunStateName::Failed
+                        | RunStateName::Canceled
+                        | RunStateName::Interrupted
+                )
+            {
+                notifications.push(VoiceControlRequest::Terminal {
+                    run_id: result.run_id.clone(),
+                    status: result.status,
+                });
+            }
+            notifications
+        }
+        ClientEvent::ThreadEventsPolled(result) => {
+            let mut notifications = Vec::new();
+            for event in &result.events {
+                notifications.push(VoiceControlRequest::Stream(event.event.clone()));
+                if let Some((run_id, status)) = voice_terminal_from_stream_event(&event.event) {
+                    notifications.push(VoiceControlRequest::Terminal { run_id, status });
+                }
+            }
+            notifications
+        }
+        ClientEvent::VoiceCommitted(result) => vec![VoiceControlRequest::CommitAcknowledged {
+            run_id: result.run_id.clone(),
+        }],
+        ClientEvent::VoiceCommitFailed { run_id, .. } => {
+            vec![VoiceControlRequest::CommitFailed {
+                run_id: run_id.clone(),
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn voice_terminal_from_stream_event(event: &StreamEvent) -> Option<(String, RunStateName)> {
+    let StreamEvent::Ledger { record } = event else {
+        return None;
+    };
+    let status = match &record.event {
+        HarnessEvent::RunFinished { .. } => RunStateName::Finished,
+        HarnessEvent::RunFailed { .. } => RunStateName::Failed,
+        _ => return None,
+    };
+    Some((record.event.run_id().to_string(), status))
+}
+
+fn voice_should_abandon(event: &ClientEvent) -> bool {
+    matches!(
+        event,
+        ClientEvent::Failed {
+            operation: ClientOperation::EventsStream | ClientOperation::ThreadEvents,
+            ..
+        }
+    )
 }
 
 fn with_client<T>(
@@ -782,6 +1021,31 @@ pub(super) fn apply_client_event(
             apply_loaded_state(state, *loaded);
             runtime.sync_from_state(state);
         }
+        ClientEvent::ThreadLoaded {
+            state: loaded,
+            attachment,
+        } => {
+            apply_loaded_state(state, *loaded);
+            runtime.attach_thread(Some(attachment));
+            runtime.sync_from_state(state);
+        }
+        ClientEvent::ThreadsLoaded(result) => {
+            state.threads = result.threads;
+            if let Some(picker) = state.session_picker.as_mut() {
+                picker.selected = state
+                    .selected_thread_id
+                    .as_deref()
+                    .and_then(|thread_id| {
+                        state
+                            .threads
+                            .iter()
+                            .position(|thread| thread.authority.thread_id == thread_id)
+                    })
+                    .unwrap_or(0)
+                    .min(state.threads.len().saturating_sub(1));
+            }
+            state.status_message = Some("thread picker loaded".into());
+        }
         ClientEvent::StatusLoaded(status) => {
             if state.selected_session_id.is_some()
                 && status.session.session_id == state.selected_session_id
@@ -812,6 +1076,56 @@ pub(super) fn apply_client_event(
                 apply_voice_response(state, response);
             }
         },
+        ClientEvent::VoiceCaptured {
+            transcript,
+            prior_interrupted_run_id,
+        } => submit_voice_transcript(
+            commands,
+            state,
+            runtime,
+            transcript,
+            prior_interrupted_run_id,
+        ),
+        ClientEvent::VoiceCancelRun { run_id } => {
+            let matches_active = state.active_run.as_ref().is_some_and(|active| {
+                active.run_id == run_id && active.status == RunStateName::Running
+            });
+            if matches_active && !state.cancel_requested {
+                state.cancel_requested = true;
+                state.status_message = Some(format!("cancel requested for {run_id}"));
+                send_command(
+                    commands,
+                    ClientCommand::RunCancel {
+                        run_id,
+                        silence_locally: false,
+                    },
+                    state,
+                );
+            } else {
+                let message = format!("voice cancel did not match the active run: {run_id}");
+                state.status_message = Some(message.clone());
+                push_live_event(state, crate::LiveEventLine::warning(None, message));
+            }
+        }
+        ClientEvent::VoiceCommit { run_id, events } => {
+            send_command(
+                commands,
+                ClientCommand::VoiceCommit { run_id, events },
+                state,
+            );
+        }
+        ClientEvent::VoiceCommitted(result) => {
+            state.status_message = Some(format!("voice facts committed for {}", result.run_id));
+        }
+        ClientEvent::VoiceCommitFailed { run_id, error } => {
+            let message = format!("voice.events.commit failed for {run_id}: {error}");
+            state.status_message = Some(message.clone());
+            push_live_event(state, crate::LiveEventLine::warning(None, message));
+        }
+        ClientEvent::VoiceFailed(error) => {
+            state.status_message = Some(error.clone());
+            push_live_event(state, crate::LiveEventLine::warning(None, error));
+        }
         ClientEvent::RunStarted(result) => {
             apply_run_response(state, runtime, result, "run started")
         }
@@ -858,7 +1172,7 @@ pub(super) fn apply_client_event(
         }
         ClientEvent::EventsPolled(result) => apply_events_result(state, runtime, commands, result),
         ClientEvent::ThreadEventsPolled(result) => {
-            apply_thread_events_result(state, runtime, result)
+            apply_thread_events_result(state, runtime, commands, result)
         }
         ClientEvent::ApprovalDecided {
             result,
@@ -943,6 +1257,7 @@ pub(super) fn apply_client_event(
                     }
                     ClientOperation::RunStart
                     | ClientOperation::MessageAppend
+                    | ClientOperation::ThreadList
                     | ClientOperation::ApprovalProfileSet
                     | ClientOperation::ThreadSend
                     | ClientOperation::EventsStream
@@ -962,6 +1277,7 @@ fn apply_voice_response(state: &mut TuiState, response: VoiceControlResponse) {
         VoiceControlResponse::Disabled => "voice disabled".into(),
         VoiceControlResponse::AlreadyDisabled => "voice already disabled".into(),
         VoiceControlResponse::Denied => "voice grant denied".into(),
+        VoiceControlResponse::Silenced => "voice playback silenced".into(),
         VoiceControlResponse::Failed(error) => {
             state.status_message = Some(error.clone());
             push_live_event(state, crate::LiveEventLine::warning(None, error));
@@ -1155,8 +1471,16 @@ pub(super) fn apply_events_result(
 fn apply_thread_events_result(
     state: &mut TuiState,
     runtime: &mut UiRuntime,
+    commands: &Sender<ClientCommand>,
     result: ThreadEventsResult,
 ) {
+    if runtime
+        .thread
+        .as_ref()
+        .is_none_or(|thread| thread.thread_id != result.thread_id)
+    {
+        return;
+    }
     runtime.poll_in_flight = false;
     runtime.thread_next_offset = Some(result.next_offset);
     runtime.thread_turn_id = result.current_turn_id;
@@ -1184,6 +1508,13 @@ fn apply_thread_events_result(
                 .elapsed_at(Instant::now())
                 .map(|elapsed| elapsed.as_secs());
             runtime.active_timer.stop();
+            send_command(
+                commands,
+                ClientCommand::Load {
+                    run_id: Some(run_id),
+                },
+                state,
+            );
         } else if !runtime.active_timer.is_active() {
             runtime
                 .active_timer
@@ -1388,6 +1719,7 @@ mod tests {
         path::PathBuf,
         sync::{
             Arc, Mutex,
+            atomic::AtomicBool,
             mpsc::{self, RecvTimeoutError},
         },
         thread::{self, JoinHandle},
@@ -1397,18 +1729,58 @@ mod tests {
     const DEADLINE_MARGIN: Duration = Duration::from_millis(100);
 
     #[test]
+    fn voice_notifications_preserve_daemon_event_then_terminal_order() {
+        let delta = StreamEvent::AssistantDelta {
+            run_id: "run_voice".into(),
+            turn_id: "turn_voice".into(),
+            step: 0,
+            delta_index: 0,
+            text: "hello".into(),
+        };
+        let notifications = voice_notifications(&ClientEvent::EventsPolled(EventsStreamResult {
+            run_id: "run_voice".into(),
+            from_offset: 0,
+            next_offset: 1,
+            status: RunStateName::Finished,
+            events: vec![BufferedStreamEvent {
+                offset: 0,
+                event: delta.clone(),
+            }],
+        }));
+
+        assert_eq!(
+            notifications,
+            [
+                VoiceControlRequest::Stream(delta),
+                VoiceControlRequest::Terminal {
+                    run_id: "run_voice".into(),
+                    status: RunStateName::Finished,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn client_worker_drop_waits_for_voice_shutdown() {
-        let (request_sender, requests) = mpsc::channel();
+        let (request_sender, requests) = mpsc::sync_channel(crate::VOICE_CONTROL_CAPACITY);
         let (response_sender, responses) = mpsc::channel();
+        let (voice_event_sender, voice_events) = mpsc::channel();
         let (observed_sender, observed) = mpsc::channel();
         let voice_worker = thread::spawn(move || {
+            let _voice_event_sender = voice_event_sender;
             let request = requests.recv().unwrap();
             observed_sender.send(request).unwrap();
             response_sender
                 .send(VoiceControlResponse::AlreadyDisabled)
                 .unwrap();
         });
-        let voice = VoiceControl::new(request_sender, responses, voice_worker);
+        let voice = VoiceControl::new(
+            request_sender,
+            responses,
+            voice_events,
+            Arc::new(AtomicBool::new(false)),
+            voice_worker,
+        );
         let workspace = tempfile::tempdir().unwrap();
         let config = DaemonConnectionConfig::resolve(
             workspace.path(),
@@ -1431,6 +1803,59 @@ mod tests {
     fn request_params_value(request: &Envelope) -> serde_json::Value {
         let request = serde_json::to_value(request.params.as_ref().unwrap()).unwrap();
         request.get("params").cloned().unwrap()
+    }
+
+    #[test]
+    fn thread_picker_request_uses_thread_list_and_keeps_loaded_and_unloaded_threads() {
+        let harness = ScriptedDaemon::start("thread-list", |workspace_id| {
+            vec![
+                hello_reply(workspace_id),
+                ScriptedReply::result(
+                    "thread.list",
+                    json!({
+                        "threads": [
+                            {
+                                "authority": {
+                                    "thread_id": "thread_loaded",
+                                    "parent_thread_id": null,
+                                    "spawning_actor": "test",
+                                    "cwd": "/work/loaded",
+                                    "model": "test-model",
+                                    "reasoning_effort": "none",
+                                    "approval_policy": "prompt",
+                                    "created_at_ms": 42
+                                },
+                                "live": {"loaded": true, "current_turn_id": "turn_1"}
+                            },
+                            {
+                                "authority": {
+                                    "thread_id": "thread_unloaded",
+                                    "parent_thread_id": null,
+                                    "spawning_actor": "test",
+                                    "cwd": "/work/unloaded",
+                                    "model": "test-model",
+                                    "reasoning_effort": "none",
+                                    "approval_policy": "prompt",
+                                    "created_at_ms": 41
+                                },
+                                "live": {"loaded": false, "current_turn_id": null}
+                            }
+                        ]
+                    }),
+                ),
+            ]
+        });
+
+        let ClientEvent::ThreadsLoaded(result) =
+            handle_client_command(&harness.config, None, None, ClientCommand::ThreadList)
+        else {
+            panic!("expected thread list result")
+        };
+
+        assert!(result.threads[0].live.loaded);
+        assert!(!result.threads[1].live.loaded);
+        let requests = harness.finish();
+        assert_eq!(requests[1].method.as_deref(), Some("thread.list"));
     }
 
     #[test]
@@ -1496,6 +1921,7 @@ mod tests {
             state.selected_session_id.as_deref(),
             Some("session_thread_selected")
         );
+        assert_eq!(state.selected_thread_id.as_deref(), Some("thread_selected"));
         assert_eq!(
             state.active_run.as_ref().map(|run| run.run_id.as_str()),
             Some("run_selected")
@@ -1541,6 +1967,7 @@ mod tests {
                 controller_id,
                 turn_id: Some(turn_id),
                 message,
+                ..
             } if thread_id == "thread_selected"
                 && controller_id == "controller_remote"
                 && turn_id == "thread_turn_active"
@@ -1566,6 +1993,39 @@ mod tests {
                 .iter()
                 .any(|event| event.text.contains("controller_owned"))
         );
+    }
+
+    #[test]
+    fn switched_attachment_ignores_late_events_from_the_previous_thread() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = DaemonConnectionConfig {
+            workspace_root: workspace.path().to_owned(),
+            socket_path: workspace.path().join("agent.sock"),
+        };
+        let mut state = connected_state(&config);
+        let mut runtime = UiRuntime::from_state(&state, None);
+        runtime.attach_thread(Some(ThreadAttachment {
+            thread_id: "thread_new".into(),
+            controller_id: "controller_new".into(),
+        }));
+
+        apply_thread_events_result(
+            &mut state,
+            &mut runtime,
+            &mpsc::channel().0,
+            ThreadEventsResult {
+                thread_id: "thread_old".into(),
+                live_epoch_id: "epoch_old".into(),
+                reset: None,
+                from_offset: 0,
+                next_offset: 4,
+                current_turn_id: Some("turn_old".into()),
+                events: vec![],
+            },
+        );
+
+        assert_eq!(runtime.thread_next_offset, None);
+        assert_eq!(runtime.thread_turn_id, None);
     }
 
     #[test]
@@ -2201,6 +2661,7 @@ mod tests {
                 "capabilities": [
                     "hello",
                     "sessions.list",
+                    "thread.list",
                     "transcript.read",
                     "transcript.read.pending_approval",
                     "events.stream",
@@ -2467,16 +2928,6 @@ mod tests {
                 Self {
                     path,
                     _directory: Some(directory),
-                }
-            }
-            #[cfg(windows)]
-            {
-                Self {
-                    path: PathBuf::from(format!(
-                        r"\\.\pipe\plato-agent-tui-{name}-{}",
-                        std::process::id()
-                    )),
-                    _directory: None,
                 }
             }
         }

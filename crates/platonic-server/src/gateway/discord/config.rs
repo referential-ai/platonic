@@ -30,7 +30,7 @@ fn resolve_discord_gateway_runtime(
     let discord = config
         .gateway
         .clone()
-        .map(|gateway| gateway.discord)
+        .and_then(|gateway| gateway.discord)
         .ok_or_else(|| AppError::Config("gateway.discord configuration is required".into()))?;
     let principals = server_discord_principals()?;
     let token = gateway_token(&config, &discord, |name| std::env::var_os(name))?;
@@ -279,7 +279,7 @@ remote_ceiling = "yolo"
         )
         .unwrap();
 
-        let home_env = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let home_env = "HOME";
         for through_environment in [false, true] {
             temp_env::with_vars(
                 [

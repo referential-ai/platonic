@@ -11,9 +11,9 @@ mod device;
 mod worker;
 
 pub use device::capture_devices;
-pub use worker::CaptureWorker;
 #[cfg(all(test, feature = "whisper-cuda"))]
 pub(crate) use worker::recognize_segment;
+pub use worker::{CaptureRequest, CaptureWorker};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct TimedCaptureSample {

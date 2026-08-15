@@ -1,0 +1,49 @@
+---
+title: Develop with Platonic
+description: Orient a change across Platonic products, runtime authority, protocol, persistence, and crate boundaries.
+sidebar:
+  label: Developer overview
+  order: 1
+---
+
+<span id="plato-agent-architecture"></span>
+<span id="read-this-before-using-the-document-below"></span>
+
+<p class="section-kicker developer">Developer docs</p>
+
+> **Orientation, not architecture law.** These pages explain the current tree and route you to its owners. The workspace [naming authority](https://github.com/referential-ai/platonic-workspace/blob/main/product/branding.md), the repository [agent guide](https://github.com/referential-ai/platonic/blob/develop/AGENTS.md), the accepted [decision map](https://github.com/referential-ai/platonic-workspace/issues/83), typed source, and executable tests remain authoritative.
+
+<span id="runtime-topology"></span>
+
+## The boundary
+
+**Platonic** is the agent server and product. Its `platonic` command is a thin entry point over the technical `platonic-server` crate. **Plato Agent** is the client distribution built on that server; it provides the `plato` and `plato-tui` commands. Those exact forms come from the [branding authority](https://github.com/referential-ai/platonic-workspace/blob/main/product/branding.md), while dependency ownership is enforced by the [repository boundary rules](https://github.com/referential-ai/platonic/blob/develop/AGENTS.md#repo-boundary).
+
+Clients submit typed protocol requests. The server owns workspace and thread authority, run admission, policy, approvals, provider and tool effects, and persistence. The pure `platonic-core` kernel owns typed state-machine rules, but never performs an effect. The [architecture invariant test](https://github.com/referential-ai/platonic/blob/develop/crates/platonic/tests/architecture_invariants.rs) prevents the client distribution from acquiring server ownership through a dependency.
+
+## The working vocabulary
+
+| Term | Meaning | Authority |
+| --- | --- | --- |
+| Workspace | A named, registered directory with a stable server-minted identity and one workspace ledger. Moving the directory does not mint a new identity. | [Decision map, P006/P021](https://github.com/referential-ai/platonic-workspace/issues/83) and [`WorkspaceRecord`](https://github.com/referential-ai/platonic/blob/develop/crates/platonic-server/src/server_store/types.rs) |
+| Profile | Workspace-bound defaults plus immutable content revisions and one durable home relation. It can serve many turns and same-profile child threads; it is not a process or plugin. | [Repository agent guide](https://github.com/referential-ai/platonic/blob/develop/AGENTS.md#repo-boundary) and [server schema](https://github.com/referential-ai/platonic/blob/develop/crates/platonic-server/src/server_store/schema.rs) |
+| Thread | Durable authority for an ongoing conversation and its runs. Its complete authority record is written before the first turn. | [Decision map, P020](https://github.com/referential-ai/platonic-workspace/issues/83) and [`ThreadAuthorityRecord`](https://github.com/referential-ai/platonic/blob/develop/crates/platonic-protocol/src/lib.rs) |
+| Run | One ordered execution within a thread or session. Its state is derived from contiguous recorded events. | [`RunState` on docs.rs](https://docs.rs/platonic-core/0.3.1/platonic_core/run/struct.RunState.html) |
+| Approval | A server-persisted question about one tool call, followed by a single decision. A client can present or decide it; the client does not own the approval state. | [`tool_call_approvals`](https://github.com/referential-ai/platonic/blob/develop/crates/platonic-server/src/server_store/queries.rs) |
+| Command | On the wire, a callable protocol method. Inside the kernel, a `RunCommand` is a pure request for the host to call a model, await approval, or execute a tool. Neither is a new authority owner. | [`ProtocolMethod`](https://github.com/referential-ai/platonic/blob/develop/crates/platonic-protocol/src/lib.rs) and [`RunCommand` on docs.rs](https://docs.rs/platonic-core/0.3.1/platonic_core/run/enum.RunCommand.html) |
+
+<span id="boundary-ladder"></span>
+<span id="sequence"></span>
+<span id="ledger-versioning"></span>
+
+## Follow one request
+
+Start with the [request lifecycle](./runtime-boundaries/#one-request-end-to-end). It follows a real one-shot request through local transport, server admission, the pure kernel boundary, provider or tool effects, the ledger, and ordered observation.
+
+Then use the page that matches the boundary you are changing:
+
+- [Protocol and observation](./protocol-and-observation/) for the handshake, callable methods, capabilities, controllers, observers, gateways, and the remote-transport gate.
+- [Durability and replay](./durability-and-replay/) for JSONL commits, SQLite state, crash repair, interrupted runs, approvals, and offline replay.
+- [Crates and change routing](./crate-map/) for dependency rules and the small set of modules where these boundaries meet.
+
+Operational setup and troubleshooting belong to the [User operations guide](../user/operations/), not to this architecture journey. Deployment remains separately gated.

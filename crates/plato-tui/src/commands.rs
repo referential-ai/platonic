@@ -10,7 +10,7 @@ pub(crate) enum SlashCommandAction {
     Voice,
     Yolo,
     Clear,
-    Sessions,
+    Threads,
     NewSession,
     IssuePrep,
     Reconnect,
@@ -36,9 +36,14 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         action: SlashCommandAction::Clear,
     },
     SlashCommandSpec {
+        name: "threads",
+        description: "open the thread picker",
+        action: SlashCommandAction::Threads,
+    },
+    SlashCommandSpec {
         name: "sessions",
-        description: "open the session picker",
-        action: SlashCommandAction::Sessions,
+        description: "compatibility alias for /threads",
+        action: SlashCommandAction::Threads,
     },
     SlashCommandSpec {
         name: "new",
@@ -362,5 +367,16 @@ mod tests {
         for _ in 0..32 {
             assert_eq!(names("s"), matches);
         }
+    }
+
+    #[test]
+    fn threads_is_canonical_and_sessions_is_its_alias() {
+        let threads = find_slash_command("threads").unwrap();
+        let sessions = find_slash_command("sessions").unwrap();
+
+        assert_eq!(threads.action, SlashCommandAction::Threads);
+        assert_eq!(sessions.action, threads.action);
+        assert_eq!(threads.description, "open the thread picker");
+        assert_eq!(sessions.description, "compatibility alias for /threads");
     }
 }

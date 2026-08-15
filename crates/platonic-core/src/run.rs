@@ -153,10 +153,12 @@ pub enum RunPhase {
 /// };
 ///
 /// let events = vec![
-///     HarnessEvent::RunStarted {
+///     HarnessEvent::RunStarted(RunStartedEvent {
 ///         run_id: run_id.clone(),
-///         agent_id: AgentId::new("agent-1")?,
-///     },
+///         identity: RunIdentity::LegacyAgent {
+///             agent_id: AgentId::new("agent-1")?,
+///         },
+///     }),
 ///     HarnessEvent::ContextBuilt {
 ///         run_id: run_id.clone(),
 ///         turn_id: turn_id.clone(),
@@ -349,7 +351,10 @@ impl RunState {
         }
 
         match (&self.phase, event) {
-            (RunPhase::NotStarted, HarnessEvent::RunStarted { run_id, .. }) => {
+            (
+                RunPhase::NotStarted,
+                HarnessEvent::RunStarted(crate::RunStartedEvent { run_id, .. }),
+            ) => {
                 self.run_id = Some(run_id.clone());
                 self.phase = RunPhase::ReadyForContext;
                 Ok(())

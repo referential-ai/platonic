@@ -1,0 +1,146 @@
+name: Experimental Desktop AppImage
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/desktop-appimage.yml
+      - .github/workflows/desktop.yml
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - crates/**
+      - desktop/**
+  workflow_dispatch:
+  schedule:
+    - cron: "17 7 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: 1.88.0
+
+jobs:
+  appimage:
+    name: Experimental Linux AppImage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - name: Check out plato-agent
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+          workspaces: |
+            . -> target
+            desktop/src-tauri -> ../../target
+
+      - name: Fetch locked Rust dependencies
+        run: |
+          cargo fetch --manifest-path ../Cargo.toml --locked
+          cargo fetch --manifest-path src-tauri/Cargo.toml --locked
+          ort_cache_dir="$RUNNER_TEMP/plato-ort-cache"
+          ort_prime_target="$RUNNER_TEMP/plato-ort-prime-target"
+          test ! -e "$ort_cache_dir"
+          test ! -e "$ort_prime_target"
+          mkdir -p "$ort_cache_dir" "$ort_prime_target"
+          ORT_CACHE_DIR="$ort_cache_dir" \
+            CARGO_TARGET_DIR="$ort_prime_target" \
+            cargo check --manifest-path ../Cargo.toml --locked -p ort-sys
+          mapfile -t ort_lib_dirs < <(
+            find "$ort_cache_dir/dfbin" -type f -name 'libonnxruntime.a' \
+              -printf '%h\n' | LC_ALL=C sort -u
+          )
+          test "${#ort_lib_dirs[@]}" -eq 1
+          printf '%s\n' \
+            "ORT_CACHE_DIR=$ort_cache_dir" \
+            "ORT_LIB_PATH=${ort_lib_dirs[0]}" \
+            'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libayatana-appindicator3-dev \
+            libasound2-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install web dependencies
+        run: npm ci
+
+      - name: Build Linux AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: npm run tauri:bundle:linux -- --ci -- --locked
+
+      - name: Prove AppImage contents and checksum
+        run: |
+          set -euo pipefail
+          bundle="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/bundle/appimage"
+          mapfile -t appimages < <(find "$bundle" -maxdepth 1 -type f -name '*.AppImage')
+          test "${#appimages[@]}" -eq 1
+          appimage="${appimages[0]}"
+          chmod +x "$appimage"
+
+          extract="$RUNNER_TEMP/plato-appimage-extract"
+          mkdir -p "$extract"
+          (cd "$extract" && "$appimage" --appimage-extract >/dev/null)
+          bin="$extract/squashfs-root/usr/bin"
+          diff -u \
+            <(printf '%s\n' plato-desktop platonic) \
+            <(find "$bin" -maxdepth 1 -type f -perm /111 -printf '%f\n' | LC_ALL=C sort)
+          file -b "$bin/platonic" | grep -Eq '^ELF 64-bit .*x86-64'
+          file -b "$bin/plato-desktop" | grep -Eq '^ELF 64-bit .*x86-64'
+          "$bin/platonic" --help >/dev/null
+
+          version=$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json')).version")
+          out="$GITHUB_WORKSPACE/artifacts/linux-appimage"
+          mkdir -p "$out"
+          asset="Plato-${version}-x86_64.AppImage"
+          cp "$appimage" "$out/$asset"
+          (
+            cd "$out"
+            sha256sum "$asset" > "$asset.sha256"
+            sha256sum -c "$asset.sha256"
+            printf '\0' >> "$asset"
+            if sha256sum -c "$asset.sha256"; then
+              echo "corrupted AppImage passed checksum verification" >&2
+              exit 1
+            fi
+            truncate -s -1 "$asset"
+            sha256sum -c "$asset.sha256"
+          )
+
+      - name: Upload Linux AppImage proof artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-appimage
+          path: artifacts/linux-appimage/*
+          if-no-files-found: error
+          retention-days: 7
