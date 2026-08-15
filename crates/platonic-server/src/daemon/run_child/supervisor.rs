@@ -7,7 +7,10 @@ use crate::{
     app::{ExternalApprovalOutcome, PreparedRun},
     daemon::child_process::ProcessTreeChild,
     ledger::{EventRecorder, RUN_CANCELED_REASON},
-    tools::{LogicalReadRequest, LogicalReadToolHandler, RunToolHandlers},
+    tools::{
+        LogicalReadRequest, LogicalReadToolHandler, ParentAnswerToolHandler, ParentAnswerToolInput,
+        RunToolHandlers, ThreadReturnToolHandler, ThreadReturnToolInput,
+    },
 };
 use platonic_core::{RecordedEvent, RunId};
 use std::{
@@ -531,6 +534,8 @@ pub(in crate::daemon) fn run_supervised_for_test(
         RunToolHandlers {
             thread_spawn,
             logical_read: None,
+            thread_return: None,
+            parent_answer: None,
         },
         ChildLaunch {
             limits: ChildLifecycleLimits::default(),
@@ -609,6 +614,8 @@ fn run_supervised_with_limits(
     let RunToolHandlers {
         thread_spawn,
         logical_read,
+        thread_return,
+        parent_answer,
     } = handlers;
     let run_id = prepared.run_id().clone();
     let mut recorder = ParentRunRecorder {
@@ -775,6 +782,28 @@ fn run_supervised_with_limits(
                         request_id,
                         request,
                     )?,
+                    ChildMessage::ThreadReturn {
+                        request_id,
+                        call_id,
+                        input,
+                    } => reply_to_thread_return(
+                        &mut child,
+                        thread_return.as_ref(),
+                        request_id,
+                        call_id,
+                        input,
+                    )?,
+                    ChildMessage::ParentAnswer {
+                        request_id,
+                        call_id,
+                        input,
+                    } => reply_to_parent_answer(
+                        &mut child,
+                        parent_answer.as_ref(),
+                        request_id,
+                        call_id,
+                        input,
+                    )?,
                     ChildMessage::Result {
                         request_id,
                         result: child_result,
@@ -857,6 +886,52 @@ fn reply_to_logical_read(
         None => ParentMessage::Reject {
             request_id,
             error: "profile reads require a profile thread".into(),
+        },
+    };
+    child.write(&reply)
+}
+
+fn reply_to_thread_return(
+    child: &mut SupervisedChild,
+    handler: Option<&ThreadReturnToolHandler>,
+    request_id: u64,
+    call_id: platonic_core::ToolCallId,
+    input: ThreadReturnToolInput,
+) -> AppResult<()> {
+    let reply = match handler {
+        Some(handler) => match handler.execute(input, call_id) {
+            Ok(output) => ParentMessage::ThreadReturn { request_id, output },
+            Err(error) => ParentMessage::Reject {
+                request_id,
+                error: error.to_string(),
+            },
+        },
+        None => ParentMessage::Reject {
+            request_id,
+            error: "thread.return requires an admitted child thread".into(),
+        },
+    };
+    child.write(&reply)
+}
+
+fn reply_to_parent_answer(
+    child: &mut SupervisedChild,
+    handler: Option<&ParentAnswerToolHandler>,
+    request_id: u64,
+    call_id: platonic_core::ToolCallId,
+    input: ParentAnswerToolInput,
+) -> AppResult<()> {
+    let reply = match handler {
+        Some(handler) => match handler.execute(input, call_id) {
+            Ok(output) => ParentMessage::ParentAnswer { request_id, output },
+            Err(error) => ParentMessage::Reject {
+                request_id,
+                error: error.to_string(),
+            },
+        },
+        None => ParentMessage::Reject {
+            request_id,
+            error: "thread.answer requires an admitted profile thread".into(),
         },
     };
     child.write(&reply)

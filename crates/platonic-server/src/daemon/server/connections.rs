@@ -655,6 +655,9 @@ mod tests {
                     require_confinement,
                     confinement_support,
                 );
+                if runtime.paths.is_registered() {
+                    crate::daemon::returns::reconcile_workspace(&runtime)?;
+                }
                 Ok(Self {
                     endpoint,
                     runtime,

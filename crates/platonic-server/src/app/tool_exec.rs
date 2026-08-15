@@ -8,13 +8,14 @@ use crate::{
     ledger::RunEventRecorder,
     model::ModelResponse,
     tool_catalog::{
-        COMPUTER_OBSERVE, COMPUTER_WINDOWS, SHELL_EXEC, THREAD_SPAWN, WEB_FETCH, effect_for_tool,
-        is_logical_read_tool,
+        COMPUTER_OBSERVE, COMPUTER_WINDOWS, SHELL_EXEC, THREAD_ANSWER, THREAD_RETURN, THREAD_SPAWN,
+        WEB_FETCH, effect_for_tool, is_logical_read_tool,
     },
     tools::{
         ApprovalOutcome, LogicalReadToolHandler, MAX_LOGICAL_READ_SERIALIZED_BYTES,
-        ThreadSpawnToolHandler, ToolExecutionContext, computer::ComputerToolHandler,
-        execute_tool_with_context, targets_platonic_memory,
+        ParentAnswerToolHandler, ThreadReturnToolHandler, ThreadSpawnToolHandler,
+        ToolExecutionContext, computer::ComputerToolHandler, execute_tool_with_context,
+        targets_platonic_memory,
     },
 };
 use platonic_core::{
@@ -626,6 +627,14 @@ fn neutralize_tool_output_closers(body: &str) -> String {
     output.push_str(&body[cursor..]);
     output
 }
+pub(super) struct ToolHandlerRefs<'a> {
+    pub(super) thread_spawn: Option<&'a ThreadSpawnToolHandler>,
+    pub(super) logical_read: Option<&'a LogicalReadToolHandler>,
+    pub(super) thread_return: Option<&'a ThreadReturnToolHandler>,
+    pub(super) parent_answer: Option<&'a ParentAnswerToolHandler>,
+    pub(super) computer: Option<&'a mut ComputerToolHandler>,
+}
+
 pub(super) fn execute_and_record_tool(
     recorder: &mut dyn RunEventRecorder,
     options: &RunOptions,
@@ -633,13 +642,15 @@ pub(super) fn execute_and_record_tool(
     run_id: &RunId,
     call: ToolCall,
     approving_actor: Option<&str>,
-    handlers: (
-        Option<&ThreadSpawnToolHandler>,
-        Option<&LogicalReadToolHandler>,
-        Option<&mut ComputerToolHandler>,
-    ),
+    handlers: ToolHandlerRefs<'_>,
 ) -> AppResult<ToolMessage> {
-    let (thread_spawn, logical_read, computer) = handlers;
+    let ToolHandlerRefs {
+        thread_spawn,
+        logical_read,
+        thread_return,
+        parent_answer,
+        computer,
+    } = handlers;
     check_cancel(recorder, options, run_id)?;
     let ToolCall {
         id: call_id,
@@ -662,6 +673,8 @@ pub(super) fn execute_and_record_tool(
         cancel: options.cancel.as_deref(),
         thread_spawn,
         logical_read,
+        thread_return,
+        parent_answer,
         computer,
         approving_actor,
     };
@@ -708,6 +721,8 @@ fn tool_result_is_error(tool_name: &str, result: &platonic_core::ToolResult) -> 
             && result.data.get("status").and_then(Value::as_str) == Some("rejected"))
         || (is_logical_read_tool(tool_name)
             && result.data.get("status").and_then(Value::as_str) == Some("error"))
+        || (matches!(tool_name, THREAD_RETURN | THREAD_ANSWER)
+            && result.data.get("status").and_then(Value::as_str) == Some("rejected"))
 }
 
 pub(super) fn proposals_from_response(response: &ModelResponse) -> AppResult<Vec<ToolProposal>> {
@@ -741,6 +756,9 @@ pub(super) fn evaluate_policy(enabled_tools: &[String], call: &ToolCall) -> Poli
         .iter()
         .any(|enabled| enabled == call.tool.as_str())
     {
+        if matches!(call.tool.as_str(), THREAD_RETURN | THREAD_ANSWER) {
+            return PolicyDecision::Allow;
+        }
         if call.tool.as_str() == SHELL_EXEC {
             return PolicyDecision::RequireApproval {
                 reason: "shell.exec requires explicit local approval".into(),

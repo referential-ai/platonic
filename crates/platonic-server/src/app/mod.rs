@@ -11,7 +11,9 @@ pub use types::{
     RunOptions, RunOutcome,
 };
 
-pub(crate) use prepare::{PreparedRun, prepare_run, prepare_run_for_thread};
+pub(crate) use prepare::{
+    PreparedRun, SPAWN_EDGE_CONTEXT_TOKEN_BUDGET, prepare_run, prepare_run_for_thread,
+};
 pub(crate) use run_loop::run_prepared_question;
 pub(crate) use types::ExternalApprovalOutcome;
 

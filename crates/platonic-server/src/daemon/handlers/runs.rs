@@ -28,8 +28,11 @@ use crate::{
     ledger::{EventRecorder, SqliteLedger},
     model::RunOverrides,
     new_run_id, new_session_id,
-    tool_catalog::SHELL_EXEC,
-    tools::{LogicalReadToolHandler, ThreadSpawnToolHandler},
+    tool_catalog::{SHELL_EXEC, THREAD_ANSWER, THREAD_RETURN},
+    tools::{
+        LogicalReadToolHandler, ParentAnswerToolHandler, ThreadReturnToolHandler,
+        ThreadSpawnToolHandler,
+    },
 };
 use platonic_core::{ActorId, EffectClass, HarnessEvent, RunId, RunIdentity};
 use sha2::{Digest, Sha256};
@@ -201,6 +204,8 @@ struct RunAuthorityProjection {
     toolset: Option<Vec<String>>,
     thread_spawn: Option<ThreadSpawnToolHandler>,
     logical_read: Option<LogicalReadToolHandler>,
+    thread_return: Option<ThreadReturnToolHandler>,
+    parent_answer: Option<ParentAnswerToolHandler>,
     confinement: ChildConfinement,
 }
 
@@ -405,6 +410,24 @@ pub(super) fn start_run(
             &context.toolset,
         )
     });
+    let thread_return = thread_context.as_ref().and_then(|context| {
+        crate::daemon::returns::projected_thread_return_handler(
+            runtime,
+            &context.turn.thread_id,
+            &context.turn.turn_id,
+            &run_id_string,
+            context.toolset.iter().any(|tool| tool == THREAD_RETURN),
+        )
+    });
+    let parent_answer = thread_context.as_ref().and_then(|context| {
+        crate::daemon::returns::projected_parent_answer_handler(
+            runtime,
+            &context.turn.thread_id,
+            &context.turn.turn_id,
+            &run_id_string,
+            context.toolset.iter().any(|tool| tool == THREAD_ANSWER),
+        )
+    });
     let child_confinement = thread_context
         .as_ref()
         .map_or(one_shot_confinement, |context| context.confinement.clone());
@@ -413,17 +436,36 @@ pub(super) fn start_run(
         toolset: run_toolset,
         thread_spawn,
         logical_read,
+        thread_return,
+        parent_answer,
         confinement: child_confinement,
     };
 
     let admission =
         selected_profile_revision(runtime, authority.identity.as_ref()).and_then(|revision| {
-            crate::app::prepare_run_for_thread(
+            let (mut prepared, recorder) = crate::app::prepare_run_for_thread(
                 &options,
                 authority.identity.clone(),
                 authority.toolset.as_deref(),
                 revision.as_ref(),
-            )
+            )?;
+            if let (Some(context), Some(identity)) =
+                (thread_context.as_ref(), authority.identity.as_ref())
+                && let Err(error) = crate::daemon::returns::admit_spawn_edge_context(
+                    runtime,
+                    &mut prepared,
+                    identity,
+                    &context.turn.thread_id,
+                    &context.turn.turn_id,
+                    &run_id_string,
+                )
+            {
+                let release =
+                    crate::daemon::returns::discard_run_admission(runtime, &run_id_string);
+                let ledger = recorder.discard_empty_session_admission();
+                return Err(combine_run_admission_errors(error, release, ledger));
+            }
+            Ok((prepared, recorder))
         });
     let (prepared, recorder) = match admission {
         Ok(admission) => admission,
@@ -586,7 +628,15 @@ fn discard_unstarted_run(
     let collector = event_collector
         .join()
         .map_err(|_| AppError::RunFailed(EVENT_COLLECTOR_PANIC.into()));
+    let returns = crate::daemon::returns::discard_run_admission(runtime, &record.run_id);
     let admission = recorder.discard_empty_session_admission();
+    let admission = match (returns, admission) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(returns), Err(admission)) => Err(AppError::Config(format!(
+            "{returns}; failed to discard ledger run admission: {admission}"
+        ))),
+    };
     let admission = match (collector, admission) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -613,6 +663,21 @@ fn handoff_error(error: String, cleanup: AppResult<()>) -> String {
         Ok(()) => error,
         Err(cleanup) => format!("{error}; run admission cleanup failed: {cleanup}"),
     }
+}
+
+fn combine_run_admission_errors(
+    error: AppError,
+    return_cleanup: AppResult<()>,
+    ledger_cleanup: AppResult<()>,
+) -> AppError {
+    let mut message = error.to_string();
+    if let Err(cleanup) = return_cleanup {
+        message.push_str(&format!("; return reservation cleanup failed: {cleanup}"));
+    }
+    if let Err(cleanup) = ledger_cleanup {
+        message.push_str(&format!("; ledger admission cleanup failed: {cleanup}"));
+    }
+    AppError::Config(message)
 }
 
 fn drive_thread_turn(
@@ -661,6 +726,8 @@ fn run_to_completion(
     let RunAuthorityProjection {
         thread_spawn,
         logical_read,
+        thread_return,
+        parent_answer,
         confinement,
         ..
     } = authority;
@@ -679,6 +746,8 @@ fn run_to_completion(
         crate::tools::RunToolHandlers {
             thread_spawn,
             logical_read,
+            thread_return,
+            parent_answer,
         },
     ));
     #[cfg(not(test))]
@@ -691,6 +760,8 @@ fn run_to_completion(
         crate::tools::RunToolHandlers {
             thread_spawn,
             logical_read,
+            thread_return,
+            parent_answer,
         },
         confinement,
     )));
@@ -834,6 +905,10 @@ pub(super) fn finish_run_after_event_collection(
                 Err(error) => Err(error),
             }
         }
+    };
+    let outcome = match crate::daemon::returns::reconcile_run(runtime, &record.run_id) {
+        Ok(()) => outcome,
+        Err(error) => Err(error),
     };
     match &outcome {
         Ok(outcome) => runtime.finish_run(
@@ -2392,6 +2467,15 @@ enabled = ["file.read"]
             None
         );
         assert_eq!(session_run_count(&handoff_runtime), 0);
+        assert!(
+            handoff_runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .thread_run_admissions(&handoff_runtime.paths.workspace_id)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             std::fs::read_dir(
                 handoff_runtime

@@ -13,6 +13,8 @@ pub const THREAD_TREE_READ: &str = "thread.tree";
 pub const THREAD_EVENTS_READ: &str = "thread.events";
 pub const THREAD_TRANSCRIPT_READ: &str = "thread.transcript";
 pub const THREAD_SPAWN: &str = "thread.spawn";
+pub const THREAD_RETURN: &str = "thread.return";
+pub const THREAD_ANSWER: &str = "thread.answer";
 pub const COMPUTER_WINDOWS: &str = "computer.windows";
 pub const COMPUTER_OBSERVE: &str = "computer.observe";
 
@@ -27,6 +29,8 @@ const PROVIDER_THREAD_TREE_READ: &str = "thread_tree";
 const PROVIDER_THREAD_EVENTS_READ: &str = "thread_events";
 const PROVIDER_THREAD_TRANSCRIPT_READ: &str = "thread_transcript";
 const PROVIDER_THREAD_SPAWN: &str = "thread_spawn";
+const PROVIDER_THREAD_RETURN: &str = "thread_return";
+const PROVIDER_THREAD_ANSWER: &str = "thread_answer";
 const PROVIDER_COMPUTER_WINDOWS: &str = "computer_windows";
 const PROVIDER_COMPUTER_OBSERVE: &str = "computer_observe";
 
@@ -109,6 +113,20 @@ const BOOTSTRAP_TOOLS: &[ToolDefinition] = &[
         input_schema: ToolInputSchema::ThreadSpawn,
     },
     ToolDefinition {
+        internal_name: THREAD_RETURN,
+        provider_name: PROVIDER_THREAD_RETURN,
+        effect: EffectClass::WorkspaceWrite,
+        description: "Return typed progress or a question to this thread's immediate parent.",
+        input_schema: ToolInputSchema::ThreadReturn,
+    },
+    ToolDefinition {
+        internal_name: THREAD_ANSWER,
+        provider_name: PROVIDER_THREAD_ANSWER,
+        effect: EffectClass::WorkspaceWrite,
+        description: "Send an attributed answer or follow-up to one immediate child thread.",
+        input_schema: ToolInputSchema::ThreadAnswer,
+    },
+    ToolDefinition {
         internal_name: COMPUTER_WINDOWS,
         provider_name: PROVIDER_COMPUTER_WINDOWS,
         effect: EffectClass::SecretAccess,
@@ -144,6 +162,8 @@ enum ToolInputSchema {
     ThreadTree,
     ThreadHistory,
     ThreadSpawn,
+    ThreadReturn,
+    ThreadAnswer,
     ComputerWindows,
     ComputerObserve,
 }
@@ -171,6 +191,8 @@ pub fn default_enabled_tools() -> Vec<String> {
                     | THREAD_EVENTS_READ
                     | THREAD_TRANSCRIPT_READ
                     | THREAD_SPAWN
+                    | THREAD_RETURN
+                    | THREAD_ANSWER
                     | COMPUTER_WINDOWS
                     | COMPUTER_OBSERVE
             )
@@ -420,6 +442,46 @@ impl ToolInputSchema {
                 "required": ["cwd"],
                 "additionalProperties": false
             }),
+            Self::ThreadReturn => json!({
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["progress", "question"]
+                    },
+                    "payload": {
+                        "type": "string",
+                        "description": "Untrusted UTF-8 child data for the immediate parent."
+                    },
+                    "artifact_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "uniqueItems": true,
+                        "description": "Optional artifacts already produced by this run."
+                    }
+                },
+                "required": ["kind", "payload"],
+                "additionalProperties": false
+            }),
+            Self::ThreadAnswer => json!({
+                "type": "object",
+                "properties": {
+                    "child_thread_id": {
+                        "type": "string",
+                        "description": "One immediate child of the executing parent thread."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["answer", "follow_up"]
+                    },
+                    "payload": {
+                        "type": "string",
+                        "description": "Untrusted UTF-8 parent data for the immediate child."
+                    }
+                },
+                "required": ["child_thread_id", "kind", "payload"],
+                "additionalProperties": false
+            }),
             Self::ComputerWindows => json!({
                 "type": "object",
                 "properties": {},
@@ -473,6 +535,8 @@ mod tests {
                 (THREAD_EVENTS_READ, EffectClass::ReadOnly),
                 (THREAD_TRANSCRIPT_READ, EffectClass::ReadOnly),
                 (THREAD_SPAWN, EffectClass::WorkspaceWrite),
+                (THREAD_RETURN, EffectClass::WorkspaceWrite),
+                (THREAD_ANSWER, EffectClass::WorkspaceWrite),
                 (COMPUTER_WINDOWS, EffectClass::SecretAccess),
                 (COMPUTER_OBSERVE, EffectClass::SecretAccess),
             ]
@@ -496,6 +560,8 @@ mod tests {
                 PROVIDER_THREAD_EVENTS_READ,
                 PROVIDER_THREAD_TRANSCRIPT_READ,
                 PROVIDER_THREAD_SPAWN,
+                PROVIDER_THREAD_RETURN,
+                PROVIDER_THREAD_ANSWER,
                 PROVIDER_COMPUTER_WINDOWS,
                 PROVIDER_COMPUTER_OBSERVE,
             ]
@@ -654,6 +720,8 @@ mod tests {
             })
         );
         assert!(!default_enabled_tools().contains(&THREAD_SPAWN.to_owned()));
+        assert!(!default_enabled_tools().contains(&THREAD_RETURN.to_owned()));
+        assert!(!default_enabled_tools().contains(&THREAD_ANSWER.to_owned()));
         assert!(!default_enabled_tools().contains(&COMPUTER_WINDOWS.to_owned()));
         assert!(!default_enabled_tools().contains(&COMPUTER_OBSERVE.to_owned()));
     }

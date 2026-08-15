@@ -14,6 +14,8 @@ pub(crate) const MAX_PROFILE_SKILL_REFS: usize = 64;
 pub(crate) const MAX_PROFILE_REVISION_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_PROFILE_REVISION_ACTOR_BYTES: usize = 256;
 pub(crate) const MAX_PROFILE_LIST_ENTRIES: usize = 100;
+pub(crate) const MAX_CHILD_RETURN_PAYLOAD_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_UNCONSUMED_NONTERMINAL_RETURNS: usize = 128;
 
 static PROFILE_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -140,6 +142,180 @@ pub(crate) struct RunCancellationRecord {
     pub(crate) run_id: String,
     pub(crate) actor: String,
     pub(crate) requested_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ChildReturnKind {
+    Progress,
+    Question,
+    Result,
+    Failed,
+}
+
+impl ChildReturnKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Progress => "progress",
+            Self::Question => "question",
+            Self::Result => "result",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "progress" => Some(Self::Progress),
+            "question" => Some(Self::Question),
+            "result" => Some(Self::Result),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn is_terminal(self) -> bool {
+        matches!(self, Self::Result | Self::Failed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ParentAnswerKind {
+    Answer,
+    FollowUp,
+}
+
+impl ParentAnswerKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Answer => "answer",
+            Self::FollowUp => "follow_up",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "answer" => Some(Self::Answer),
+            "follow_up" => Some(Self::FollowUp),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DeliveryState {
+    Available,
+    Reserved,
+    Consumed,
+}
+
+impl DeliveryState {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "available" => Some(Self::Available),
+            "reserved" => Some(Self::Reserved),
+            "consumed" => Some(Self::Consumed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct ChildReturnRecord {
+    pub(crate) message_id: String,
+    pub(crate) sequence: u64,
+    pub(crate) spawn_id: String,
+    pub(crate) profile_id: ProfileId,
+    pub(crate) parent_thread_id: String,
+    pub(crate) child_thread_id: String,
+    pub(crate) source_run_id: Option<String>,
+    pub(crate) source_turn_id: Option<String>,
+    pub(crate) kind: ChildReturnKind,
+    pub(crate) payload: String,
+    pub(crate) artifact_refs: Vec<String>,
+    pub(crate) truncated: bool,
+    pub(crate) created_at_ms: u64,
+    pub(crate) profile_revision: u64,
+    pub(crate) state: DeliveryState,
+    pub(crate) reserved_by_run_id: Option<String>,
+    pub(crate) reserved_by_turn_id: Option<String>,
+    pub(crate) consumed_by_run_id: Option<String>,
+    pub(crate) consumed_by_turn_id: Option<String>,
+    pub(crate) consumed_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct ParentAnswerRecord {
+    pub(crate) message_id: String,
+    pub(crate) sequence: u64,
+    pub(crate) spawn_id: String,
+    pub(crate) profile_id: ProfileId,
+    pub(crate) parent_thread_id: String,
+    pub(crate) child_thread_id: String,
+    pub(crate) source_run_id: String,
+    pub(crate) source_turn_id: String,
+    pub(crate) kind: ParentAnswerKind,
+    pub(crate) payload: String,
+    pub(crate) created_at_ms: u64,
+    pub(crate) profile_revision: u64,
+    pub(crate) state: DeliveryState,
+    pub(crate) reserved_by_run_id: Option<String>,
+    pub(crate) reserved_by_turn_id: Option<String>,
+    pub(crate) consumed_by_run_id: Option<String>,
+    pub(crate) consumed_by_turn_id: Option<String>,
+    pub(crate) consumed_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ThreadRunAdmission {
+    pub(crate) run_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) profile_id: ProfileId,
+    pub(crate) thread_id: String,
+    pub(crate) thread_turn_id: String,
+    pub(crate) profile_revision: u64,
+    pub(crate) created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ChildReturnDraft {
+    pub(crate) message_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) child_thread_id: String,
+    pub(crate) source_run_id: Option<String>,
+    pub(crate) source_turn_id: Option<String>,
+    pub(crate) kind: ChildReturnKind,
+    pub(crate) payload: String,
+    pub(crate) artifact_refs: Vec<String>,
+    pub(crate) created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ParentAnswerDraft {
+    pub(crate) message_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) parent_thread_id: String,
+    pub(crate) child_thread_id: String,
+    pub(crate) source_run_id: String,
+    pub(crate) source_turn_id: String,
+    pub(crate) kind: ParentAnswerKind,
+    pub(crate) payload: String,
+    pub(crate) created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PersistChildReturnResult {
+    Stored(ChildReturnRecord),
+    Replayed(ChildReturnRecord),
+    Rejected { code: String, reason: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PersistParentAnswerResult {
+    Stored(ParentAnswerRecord),
+    Replayed(ParentAnswerRecord),
+    Rejected { code: String, reason: String },
 }
 
 /// A thread authority record proven to be durably written.

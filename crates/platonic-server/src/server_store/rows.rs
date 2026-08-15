@@ -1,6 +1,7 @@
 use super::types::{
-    AgentRecord, ProfileRecord, ProfileRevisionContent, ProfileRevisionRecord,
-    ToolCallApprovalDecision, ToolCallApprovalRecord, WorkspaceRecord,
+    AgentRecord, ChildReturnKind, ChildReturnRecord, DeliveryState, ParentAnswerKind,
+    ParentAnswerRecord, ProfileRecord, ProfileRevisionContent, ProfileRevisionRecord,
+    ThreadRunAdmission, ToolCallApprovalDecision, ToolCallApprovalRecord, WorkspaceRecord,
 };
 use crate::{
     AppError, AppResult,
@@ -155,6 +156,112 @@ pub(super) fn invalid_thread_column(index: usize, message: String) -> rusqlite::
             message,
         )),
     )
+}
+
+pub(super) fn child_return_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ChildReturnRecord> {
+    let profile_id = ProfileId::new(row.get::<_, String>(3)?)
+        .map_err(|error| invalid_thread_column(3, error.to_string()))?;
+    let kind_text: String = row.get(8)?;
+    let kind = ChildReturnKind::parse(&kind_text).ok_or_else(|| {
+        invalid_thread_column(8, format!("unknown child return kind: {kind_text}"))
+    })?;
+    let artifact_refs = serde_json::from_str::<Vec<String>>(&row.get::<_, String>(10)?)
+        .map_err(|error| invalid_thread_column(10, error.to_string()))?;
+    let truncated = sqlite_bool(row, 11, "child return truncated")?;
+    let state_text: String = row.get(14)?;
+    let state = DeliveryState::parse(&state_text).ok_or_else(|| {
+        invalid_thread_column(14, format!("unknown child return state: {state_text}"))
+    })?;
+    Ok(ChildReturnRecord {
+        sequence: row_u64(row, 0, "child return sequence")?,
+        message_id: row.get(1)?,
+        spawn_id: row.get(2)?,
+        profile_id,
+        parent_thread_id: row.get(4)?,
+        child_thread_id: row.get(5)?,
+        source_run_id: row.get(6)?,
+        source_turn_id: row.get(7)?,
+        kind,
+        payload: row.get(9)?,
+        artifact_refs,
+        truncated,
+        created_at_ms: row_u64(row, 12, "child return created_at_ms")?,
+        profile_revision: row_u64(row, 13, "child return profile_revision")?,
+        state,
+        reserved_by_run_id: row.get(15)?,
+        reserved_by_turn_id: row.get(16)?,
+        consumed_by_run_id: row.get(17)?,
+        consumed_by_turn_id: row.get(18)?,
+        consumed_at_ms: row
+            .get::<_, Option<i64>>(19)?
+            .map(|value| value.max(0) as u64),
+    })
+}
+
+pub(super) fn parent_answer_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ParentAnswerRecord> {
+    let profile_id = ProfileId::new(row.get::<_, String>(3)?)
+        .map_err(|error| invalid_thread_column(3, error.to_string()))?;
+    let kind_text: String = row.get(8)?;
+    let kind = ParentAnswerKind::parse(&kind_text).ok_or_else(|| {
+        invalid_thread_column(8, format!("unknown parent answer kind: {kind_text}"))
+    })?;
+    let state_text: String = row.get(12)?;
+    let state = DeliveryState::parse(&state_text).ok_or_else(|| {
+        invalid_thread_column(12, format!("unknown parent answer state: {state_text}"))
+    })?;
+    Ok(ParentAnswerRecord {
+        sequence: row_u64(row, 0, "parent answer sequence")?,
+        message_id: row.get(1)?,
+        spawn_id: row.get(2)?,
+        profile_id,
+        parent_thread_id: row.get(4)?,
+        child_thread_id: row.get(5)?,
+        source_run_id: row.get(6)?,
+        source_turn_id: row.get(7)?,
+        kind,
+        payload: row.get(9)?,
+        created_at_ms: row_u64(row, 10, "parent answer created_at_ms")?,
+        profile_revision: row_u64(row, 11, "parent answer profile_revision")?,
+        state,
+        reserved_by_run_id: row.get(13)?,
+        reserved_by_turn_id: row.get(14)?,
+        consumed_by_run_id: row.get(15)?,
+        consumed_by_turn_id: row.get(16)?,
+        consumed_at_ms: row
+            .get::<_, Option<i64>>(17)?
+            .map(|value| value.max(0) as u64),
+    })
+}
+
+pub(super) fn thread_run_admission_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ThreadRunAdmission> {
+    let profile_id = ProfileId::new(row.get::<_, String>(2)?)
+        .map_err(|error| invalid_thread_column(2, error.to_string()))?;
+    Ok(ThreadRunAdmission {
+        run_id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        profile_id,
+        thread_id: row.get(3)?,
+        thread_turn_id: row.get(4)?,
+        profile_revision: row_u64(row, 5, "thread run profile_revision")?,
+        created_at_ms: row_u64(row, 6, "thread run created_at_ms")?,
+    })
+}
+
+fn sqlite_bool(row: &rusqlite::Row<'_>, index: usize, name: &str) -> rusqlite::Result<bool> {
+    match row.get::<_, i64>(index)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(invalid_thread_column(
+            index,
+            format!("invalid {name} flag: {value}"),
+        )),
+    }
 }
 
 pub(super) fn effect_to_text(effect: &EffectClass) -> AppResult<String> {

@@ -94,7 +94,7 @@ pub(super) fn context_pack_with_profile_and_interruption(
         fragments,
     })
 }
-pub(super) fn estimate_tokens(content: &str) -> u32 {
+pub(crate) fn estimate_tokens(content: &str) -> u32 {
     let estimate = (content.chars().count() / 4).saturating_add(1);
     estimate.try_into().unwrap_or(u32::MAX)
 }

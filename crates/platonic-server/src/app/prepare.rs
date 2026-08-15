@@ -11,7 +11,7 @@ use crate::{
     AppError, AppResult,
     config::{ComputerConfig, Config, LimitsConfig, ProviderConfig, ProviderKind, ToolsConfig},
     ledger::{EventRecorder, SqliteLedger, run_jsonl_path},
-    model::{ModelMessage, RunOverrides},
+    model::{ModelBlock, ModelMessage, RunOverrides},
     paths::DefaultSqlitePath,
     provider::openai_compat::{OpenAiCompatibleClient, TokenLimitField},
     server_store::ProfileRevisionRecord,
@@ -40,6 +40,7 @@ pub(crate) struct PreparedRun {
 }
 
 pub(super) const PROFILE_CONTEXT_TOKEN_BUDGET: u32 = 8_192;
+pub(crate) const SPAWN_EDGE_CONTEXT_TOKEN_BUDGET: u32 = 4_096;
 const PROFILE_CONTEXT_CONTENT_TOKEN_BUDGET: u32 = PROFILE_CONTEXT_TOKEN_BUDGET - 2;
 const PROFILE_CONTEXT_TRUNCATION_MARKER: &str =
     "\n\n[profile context truncated to the 8192-token lane]";
@@ -294,6 +295,34 @@ impl PreparedRun {
             .enabled
             .iter()
             .any(|tool| crate::tool_catalog::is_logical_read_tool(tool))
+    }
+
+    pub(crate) fn add_spawn_edge_context(&mut self, content: String) -> AppResult<()> {
+        let before = super::context::estimate_tokens(&serde_json::to_string(&self.messages)?);
+        let message = ModelMessage::assistant_blocks(vec![ModelBlock::Text { text: content }]);
+        let insert_at = self.messages.len().saturating_sub(1);
+        self.messages.insert(insert_at, message);
+        let after = super::context::estimate_tokens(&serde_json::to_string(&self.messages)?);
+        let added = after.saturating_sub(before);
+        if added > SPAWN_EDGE_CONTEXT_TOKEN_BUDGET {
+            return Err(AppError::Config(format!(
+                "spawn-edge context uses {added} estimated tokens, maximum is {SPAWN_EDGE_CONTEXT_TOKEN_BUDGET}"
+            )));
+        }
+        self.config.limits.token_budget = self
+            .config
+            .limits
+            .token_budget
+            .checked_add(added)
+            .ok_or_else(|| {
+                AppError::Config("spawn-edge context token budget overflowed u32".into())
+            })?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn messages(&self) -> &[ModelMessage] {
+        &self.messages
     }
 }
 
