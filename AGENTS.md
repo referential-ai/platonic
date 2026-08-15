@@ -49,21 +49,23 @@ Architecture is indexed on the
 - Unix external-daemon proofs use a pre-absent, issue-named short `/tmp/p<issue>` root with mode `0700`; derive and print the final socket path before spawn and require its byte length to be below 100; readiness uses `-S` followed by the existing bounded client/status/hello readback, never `-s`; preserve the original timeouts and assertions; clean up only the exact owned tmux session, process/group, socket, state, and root, never a broad `/tmp` scan.
 
 ```bash
-cargo fmt --check
-cargo test --workspace --locked
-cargo clippy --workspace --locked --all-targets -- -D warnings
-cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
+./scripts/quality.sh        # full battery: rust, desktop, web, duplication, security
+./scripts/quality.sh rust   # single stage (see --help)
 ```
 
-`cargo test` takes `--workspace` because the repository root is a virtual
+`scripts/quality.sh` runs the exact command lines CI runs and maps to jobs:
+`rust` → `ci.yml` Rust, `desktop` → `desktop.yml` Linux shell, `web` →
+`desktop.yml` Web, `duplication` → `quality.yml`, `security` → root and
+desktop lockfile audits.
+
+The Rust stage takes `--workspace` because the repository root is a virtual
 workspace; package-scoped tests cover only one member and report a fraction of
 the suite.
 
-`desktop/src-tauri` is excluded from the Cargo workspace because it needs GTK
-and webkit system libraries. Even `--workspace` therefore does **not** cover
-it, and the fourth command is required: CI proves the desktop crate in the
-`Linux shell` job, so a change that builds locally can still break CI without
-it. Clippy takes `--workspace` to match CI exactly.
+The `desktop` stage is required: `desktop/src-tauri` is excluded from the
+Cargo workspace because it needs GTK and webkit system libraries, and CI
+proves it in the `Linux shell` job — a change that builds locally can still
+break CI without it.
 
 **Run the battery on the pinned toolchain, or its verdict is not CI's.** CI
 pins `1.88.0`; a newer toolchain reports lints CI does not, and an older one
