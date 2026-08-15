@@ -367,6 +367,12 @@ pub(super) fn start_run(
 
     let continuation_config_path = config_path.clone();
     let continuation_overrides = overrides.clone();
+    let thread_yolo = matches!(
+        thread_context
+            .as_ref()
+            .map(|context| context.approval_policy),
+        Some(ThreadApprovalPolicy::Yolo)
+    );
     let options = RunOptions {
         question,
         config_path: config_path.map(PathBuf::from),
@@ -376,16 +382,10 @@ pub(super) fn start_run(
             || runtime.paths.workspace_root.clone(),
             |context| context.workspace_root.clone(),
         ),
-        approval_mode: match thread_context
-            .as_ref()
-            .map(|context| context.approval_policy)
-        {
-            Some(ThreadApprovalPolicy::Yolo) => ApprovalMode::from_yolo(true),
-            _ => ApprovalMode::external_with_actor(
-                "daemon",
-                approval_handler(runtime.clone(), record.clone()),
-            ),
-        },
+        approval_mode: ApprovalMode::external_with_actor(
+            "daemon",
+            approval_handler(runtime.clone(), record.clone(), thread_yolo),
+        ),
         run_id: Some(run_id),
         session: Some(session),
         event_sender: None,
@@ -3556,7 +3556,7 @@ enabled = ["file.read"]
         runtime: &DaemonRuntime,
         record: &Arc<RunRecord>,
     ) -> thread::JoinHandle<ExternalApprovalOutcome> {
-        let decide = approval_handler(runtime.clone(), record.clone());
+        let decide = approval_handler(runtime.clone(), record.clone(), false);
         let request = test_approval_request(
             &record.run_id,
             "call_1",

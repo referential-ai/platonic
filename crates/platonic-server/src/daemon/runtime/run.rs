@@ -422,6 +422,7 @@ impl RunRecord {
 pub(in crate::daemon) fn approval_handler(
     runtime: DaemonRuntime,
     record: Arc<RunRecord>,
+    thread_yolo: bool,
 ) -> impl Fn(ApprovalRequest) -> AppResult<ExternalApprovalOutcome> + Send + Sync + 'static {
     move |request| {
         let call_id = request.call_id.to_string();
@@ -441,6 +442,11 @@ pub(in crate::daemon) fn approval_handler(
             return Ok(ExternalApprovalOutcome::Denied {
                 actor: "daemon".into(),
                 reason: "run is no longer active".into(),
+            });
+        }
+        if request.yolo_eligible && thread_yolo {
+            return Ok(ExternalApprovalOutcome::Granted {
+                actor: "yolo".into(),
             });
         }
         if request.yolo_eligible && runtime.session_yolo_enabled_for_decision(&record.session_id) {
@@ -727,7 +733,7 @@ mod tests {
         runtime.set_approval_profile("session_1", ApprovalProfile::Yolo);
         let record = run_record(1);
         let outcome =
-            approval_handler(runtime, record.clone())(yolo_request("run_1", "call_1", true))
+            approval_handler(runtime, record.clone(), false)(yolo_request("run_1", "call_1", true))
                 .unwrap();
 
         assert_eq!(
@@ -741,6 +747,55 @@ mod tests {
     }
 
     #[test]
+    fn thread_yolo_grants_only_eligible_approval_requests() {
+        let runtime = runtime();
+        let granted_record = run_record(1);
+        let outcome = approval_handler(runtime.clone(), granted_record.clone(), true)(
+            yolo_request("run_1", "call_1", true),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            ExternalApprovalOutcome::Granted {
+                actor: "yolo".into()
+            }
+        );
+        assert!(granted_record.approvals.lock().unwrap().is_empty());
+        assert!(granted_record.events.lock().unwrap().events.is_empty());
+
+        let pending_record = run_record(2);
+        let decide = approval_handler(runtime, pending_record.clone(), true);
+        let worker = thread::spawn(move || decide(yolo_request("run_2", "call_2", false)).unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while pending_record.pending_approval().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ineligible request did not become pending"
+            );
+            thread::yield_now();
+        }
+        let mut approvals = pending_record.approvals.lock().unwrap();
+        approvals.get_mut("call_2").unwrap().decision = Some(PendingApprovalDecision {
+            decision: ApprovalDecision::Deny,
+            outcome: ExternalApprovalOutcome::Denied {
+                actor: "tester".into(),
+                reason: "test complete".into(),
+            },
+        });
+        pending_record.approval_changed.notify_all();
+        drop(approvals);
+
+        assert_eq!(
+            worker.join().unwrap(),
+            ExternalApprovalOutcome::Denied {
+                actor: "tester".into(),
+                reason: "test complete".into()
+            }
+        );
+    }
+
+    #[test]
     fn profile_toggle_after_yolo_decision_does_not_revoke_the_grant() {
         let runtime = runtime();
         runtime.set_approval_profile("session_1", ApprovalProfile::Yolo);
@@ -748,7 +803,7 @@ mod tests {
         let release = Arc::new(Barrier::new(2));
         runtime.set_approval_profile_decision_barriers(reached.clone(), release.clone());
         let record = run_record(1);
-        let decide = approval_handler(runtime.clone(), record);
+        let decide = approval_handler(runtime.clone(), record, false);
         let worker = thread::spawn(move || decide(yolo_request("run_1", "call_1", true)).unwrap());
 
         reached.wait();
@@ -778,7 +833,7 @@ mod tests {
         let release = Arc::new(Barrier::new(2));
         runtime.set_approval_profile_decision_barriers(reached.clone(), release.clone());
         let record = run_record(1);
-        let decide = approval_handler(runtime.clone(), record.clone());
+        let decide = approval_handler(runtime.clone(), record.clone(), false);
         let worker = thread::spawn(move || decide(yolo_request("run_1", "call_1", true)).unwrap());
 
         reached.wait();
@@ -826,7 +881,7 @@ mod tests {
         let release = Arc::new(Barrier::new(2));
         runtime.set_approval_profile_decision_barriers(reached.clone(), release.clone());
         let record = run_record(1);
-        let decide = approval_handler(runtime, record.clone());
+        let decide = approval_handler(runtime, record.clone(), false);
         let decision =
             thread::spawn(move || decide(yolo_request("run_1", "call_1", true)).unwrap());
 
@@ -865,7 +920,7 @@ mod tests {
         let release = Arc::new(Barrier::new(2));
         runtime.set_approval_profile_decision_barriers(reached.clone(), release.clone());
         let record = run_record(1);
-        let decide = approval_handler(runtime.clone(), record.clone());
+        let decide = approval_handler(runtime.clone(), record.clone(), false);
         let decision =
             thread::spawn(move || decide(yolo_request("run_1", "call_1", true)).unwrap());
 
@@ -904,7 +959,7 @@ mod tests {
         record.status.lock().unwrap().state = RunStateName::Finished;
 
         let outcome =
-            approval_handler(runtime, record.clone())(yolo_request("run_1", "call_1", true))
+            approval_handler(runtime, record.clone(), false)(yolo_request("run_1", "call_1", true))
                 .unwrap();
 
         assert_eq!(
@@ -925,7 +980,7 @@ mod tests {
             PathBuf::from("/tmp/agent.db"),
         ));
         record.cancel.store(true, Ordering::SeqCst);
-        let decide = approval_handler(runtime(), record.clone());
+        let decide = approval_handler(runtime(), record.clone(), false);
 
         let outcome = decide(ApprovalRequest {
             run_id: RunId::new("run_1").unwrap(),
@@ -958,7 +1013,7 @@ mod tests {
             "session_1".into(),
             PathBuf::from("/tmp/agent.db"),
         ));
-        let decide = approval_handler(runtime(), record.clone());
+        let decide = approval_handler(runtime(), record.clone(), false);
         let worker = thread::spawn(move || {
             decide(ApprovalRequest {
                 run_id: RunId::new("run_1").unwrap(),

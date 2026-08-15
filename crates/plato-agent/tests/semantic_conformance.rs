@@ -1055,6 +1055,89 @@ fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
 }
 
 #[test]
+fn yolo_coordinator_auto_grants_a_supervised_worker_spawn() {
+    let _serial = SCENARIO_SERIAL.lock().unwrap();
+    let proof = ProofContext::new();
+    let worker_cwd = Arc::new(Mutex::new(proof.workspace.clone()));
+    let provider = CoordinatorProvider::start(Arc::clone(&worker_cwd));
+    write_coordinator_config(&proof.config_path, &provider.base_url);
+    let host = ProofDaemon::start(&proof);
+    let mut client = host.connect();
+    let hello = client.hello(&proof.workspace).unwrap();
+    let profile_id = seed_profile(
+        &proof,
+        &hello.workspace_id,
+        "yolo-coordinator",
+        "test-model",
+        ReasoningEffort::High,
+        ThreadApprovalPolicy::Yolo,
+        &["file.read", "thread.spawn"],
+    );
+    let coordinator_thread_id = open_profile_home(&mut client, profile_id)
+        .authority
+        .thread_id;
+    let coordinator = client
+        .thread_authority(coordinator_thread_id.clone())
+        .unwrap()
+        .authority;
+    *worker_cwd.lock().unwrap() = PathBuf::from(&coordinator.worktrees[0].path);
+
+    assert!(matches!(
+        client
+            .thread_send(
+                coordinator_thread_id.clone(),
+                "semantic_controller".into(),
+                None,
+                "Dispatch exactly one bounded worker and report its durable thread id.".into(),
+            )
+            .unwrap(),
+        ThreadSendResult::Started { .. }
+    ));
+    wait_for_thread_idle(&mut client, &coordinator_thread_id);
+
+    let events = client
+        .thread_events(coordinator_thread_id.clone(), Some(0), 128, 0)
+        .unwrap()
+        .events;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.event, StreamEvent::ApprovalRequested { .. })),
+        "yolo spawn published a pending approval"
+    );
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        StreamEvent::Ledger { record }
+            if matches!(
+                &record.event,
+                HarnessEvent::ApprovalGranted { actor_id, .. }
+                    if actor_id.to_string() == "yolo"
+            )
+    )));
+
+    let provider_proof = provider.join();
+    let child = client
+        .thread_authority(provider_proof.thread_id.clone())
+        .unwrap()
+        .authority;
+    assert_eq!(child.spawning_actor, "yolo");
+    let connection = Connection::open(&proof.server_db_path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM thread_spawn_approvals
+                 WHERE thread_id = ?1 AND decision = 'granted' AND actor = 'yolo'",
+                [&provider_proof.thread_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+    host.stop(client);
+}
+
+#[test]
 fn thread_send_and_three_observers_are_semantically_conformant_on_host_daemon() {
     const INITIAL_MESSAGE: &str = "begin the controlled thread proof";
     const STEERED_MESSAGE: &str = "include the exact steered phrase in the continuation";
