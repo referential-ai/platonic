@@ -2084,6 +2084,7 @@ pub(in crate::daemon::handlers) mod tests {
     use platonic_core::EffectClass;
     #[cfg(target_os = "linux")]
     use platonic_core::RunId;
+    #[cfg(target_os = "linux")]
     use serde_json::json;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
