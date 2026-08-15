@@ -72,6 +72,12 @@ home thread per profile. Home threads persist across server restarts and reject
 same-profile child is targeted again. Thread event cursors pair offsets with the
 server-provided `live_epoch_id` and reset when that epoch is stale.
 
+Each new profile turn selects the latest immutable instruction, memory, and
+skill-reference revision and records its exact revision hash in durable context.
+Profile-configured logical read tools expose only bounded, paginated content,
+same-profile thread metadata, and committed event or transcript history. Native
+wire and CLI management for these internal profile operations remains deferred.
+
 ### Unreleased HTTP gateway
 
 `platonic gateway http` exposes the bounded authenticated `/v1` HTTP/SSE

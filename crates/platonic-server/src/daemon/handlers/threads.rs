@@ -799,8 +799,15 @@ fn start_thread_spawn(
         .ok_or(ThreadSpawnFailure::Authority(
             ThreadAuthorityError::SameProfileParent,
         ))?;
-    let profile_revision = parent
-        .profile_revision
+    if parent.profile_revision.is_none() {
+        return Err(ThreadSpawnFailure::Authority(
+            ThreadAuthorityError::SameProfileParent,
+        ));
+    }
+    let profile = store
+        .profile(&profile_id)
+        .map_err(|_| ThreadSpawnFailure::Persistence)?
+        .filter(|profile| profile.workspace_id == runtime.paths.workspace_id)
         .ok_or(ThreadSpawnFailure::Authority(
             ThreadAuthorityError::SameProfileParent,
         ))?;
@@ -815,7 +822,7 @@ fn start_thread_spawn(
         approval_policy,
         agent_id: None,
         profile_id,
-        profile_revision,
+        profile_revision: profile.current_revision,
         thread_kind: crate::daemon::protocol::ThreadKind::Child,
         writable: toolset_requires_writable_path(&toolset),
         network: toolset_has_effect(&toolset, EffectClass::Network),
@@ -1539,23 +1546,14 @@ pub(super) fn handle_thread_send(
             );
         }
     };
-    let identity = match (
-        authority.thread_kind,
-        authority.profile_id.clone(),
-        authority.profile_revision,
-    ) {
-        (ThreadKind::Home | ThreadKind::Child, Some(profile_id), Some(profile_revision)) => {
-            RunIdentity::Profile {
-                profile_id,
-                profile_revision,
-            }
-        }
-        _ => {
+    let identity = match current_profile_identity(runtime, &authority) {
+        Ok(identity) => identity,
+        Err(message) => {
             return Envelope::error(
                 request.id,
                 Some("thread.send".into()),
                 ERROR_THREAD_SEND_FAILED,
-                "legacy threads are replay-only and cannot start new turns",
+                message,
             );
         }
     };
@@ -1674,6 +1672,31 @@ pub(super) fn handle_thread_send(
     Envelope::typed_response(request.id, ProtocolResponse::ThreadSend(receipt))
 }
 
+fn current_profile_identity(
+    runtime: &DaemonRuntime,
+    authority: &crate::daemon::protocol::ThreadAuthorityRecord,
+) -> Result<RunIdentity, &'static str> {
+    let profile_id = match (
+        authority.thread_kind,
+        authority.profile_id.clone(),
+        authority.profile_revision,
+    ) {
+        (ThreadKind::Home | ThreadKind::Child, Some(profile_id), Some(_)) => profile_id,
+        _ => return Err("legacy threads are replay-only and cannot start new turns"),
+    };
+    let profile = runtime
+        .paths
+        .server_store()
+        .and_then(|store| store.profile(&profile_id))
+        .map_err(|_| "thread profile revision readback failed")?
+        .filter(|profile| profile.workspace_id == runtime.paths.workspace_id)
+        .ok_or("thread profile revision readback failed")?;
+    Ok(RunIdentity::Profile {
+        profile_id,
+        profile_revision: profile.current_revision,
+    })
+}
+
 fn thread_child_confinement(
     runtime: &DaemonRuntime,
     authority: &crate::daemon::protocol::ThreadAuthorityRecord,
@@ -1691,6 +1714,24 @@ fn thread_child_confinement(
                 .ok_or_else(|| {
                     AppError::Config("confined thread authority has no scratch path".into())
                 })?;
+            let mut readable_paths = authority
+                .worktrees
+                .iter()
+                .map(|worktree| PathBuf::from(&worktree.path))
+                .collect::<Vec<_>>();
+            readable_paths.extend(
+                authority
+                    .granted_paths
+                    .iter()
+                    .map(|grant| PathBuf::from(&grant.path)),
+            );
+            for worktree in &authority.worktrees {
+                readable_paths.push(crate::thread_repository::shared_repository_path(
+                    &runtime.paths.server_db_path,
+                    &runtime.paths.workspace_id,
+                    &worktree.repo,
+                )?);
+            }
             let mut writable_paths = authority
                 .worktrees
                 .iter()
@@ -1704,6 +1745,7 @@ fn thread_child_confinement(
                     .map(|grant| PathBuf::from(&grant.path)),
             );
             Ok(ChildConfinement::Landlock {
+                readable_paths,
                 writable_paths,
                 scratch,
             })
@@ -1994,7 +2036,7 @@ fn thread_stop_result(stop: ThreadStopRecord, already_stopped: bool) -> ThreadSt
     }
 }
 
-pub(super) fn thread_session_id(thread_id: &str) -> String {
+pub(in crate::daemon) fn thread_session_id(thread_id: &str) -> String {
     format!("session_{thread_id}")
 }
 
@@ -2073,7 +2115,7 @@ pub(in crate::daemon::handlers) mod tests {
         (root, runtime)
     }
 
-    pub(in crate::daemon::handlers) fn thread_test_runtime() -> (tempfile::TempDir, DaemonRuntime) {
+    pub(in crate::daemon) fn thread_test_runtime() -> (tempfile::TempDir, DaemonRuntime) {
         thread_test_runtime_with_max_spawn_depth(1)
     }
 
@@ -2164,6 +2206,14 @@ pub(in crate::daemon::handlers) mod tests {
                 repositories: Vec::new(),
             },
         )
+    }
+
+    pub(in crate::daemon) fn start_thread_for_logical_read(
+        runtime: &DaemonRuntime,
+        cwd: &Path,
+        approval_policy: ThreadApprovalPolicy,
+    ) -> ThreadSpawnResult {
+        start_thread(runtime, None, cwd, approval_policy).unwrap()
     }
 
     fn start_thread_with_repositories(
@@ -2330,9 +2380,7 @@ pub(in crate::daemon::handlers) mod tests {
         git(path, &["rev-parse", "HEAD"])
     }
 
-    pub(in crate::daemon::handlers) fn pending_spawn(
-        result: ThreadSpawnResult,
-    ) -> (String, String) {
+    pub(in crate::daemon) fn pending_spawn(result: ThreadSpawnResult) -> (String, String) {
         match result {
             ThreadSpawnResult::ApprovalRequired {
                 spawn_id,
@@ -2404,7 +2452,7 @@ pub(in crate::daemon::handlers) mod tests {
         )
     }
 
-    pub(in crate::daemon::handlers) fn grant_thread(
+    pub(in crate::daemon) fn grant_thread(
         runtime: &DaemonRuntime,
         spawn_id: &str,
         actor: &str,
@@ -2573,6 +2621,46 @@ pub(in crate::daemon::handlers) mod tests {
                 .unwrap(),
             ("granted".into(), "daemon".into())
         );
+    }
+
+    #[test]
+    fn each_new_turn_selects_the_latest_committed_profile_revision() {
+        let (_root, runtime) = thread_test_runtime();
+        let thread_id = coordinator_root(&runtime);
+        let authority = runtime
+            .paths
+            .server_store()
+            .unwrap()
+            .thread_authority(&thread_id)
+            .unwrap()
+            .unwrap();
+        let profile_id = authority.profile_id.clone().unwrap();
+        assert_eq!(authority.profile_revision, Some(1));
+        runtime
+            .paths
+            .server_store()
+            .unwrap()
+            .update_profile_content(
+                &profile_id,
+                "operator",
+                authority.created_at_ms + 1,
+                crate::server_store::ProfileRevisionContent {
+                    instructions_markdown: "latest instructions".into(),
+                    memory_markdown: "latest memory".into(),
+                    skill_refs: vec![],
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            current_profile_identity(&runtime, &authority).unwrap(),
+            RunIdentity::Profile {
+                profile_id,
+                profile_revision: 2,
+            }
+        );
+        assert_eq!(authority.profile_revision, Some(1));
     }
 
     #[test]

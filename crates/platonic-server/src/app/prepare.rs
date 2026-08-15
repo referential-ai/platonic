@@ -2,7 +2,8 @@ use super::{
     RunSession, new_run_id,
     session::{
         SessionHydration, hydrated_messages, load_platonic_memory, provider_system_context,
-        provider_system_context_with_interruption,
+        provider_system_context_with_interruption, provider_system_context_with_profile,
+        provider_system_context_with_profile_and_interruption,
     },
     types::{RunLedger, RunOptions},
 };
@@ -13,9 +14,10 @@ use crate::{
     model::{ModelMessage, RunOverrides},
     paths::DefaultSqlitePath,
     provider::openai_compat::{OpenAiCompatibleClient, TokenLimitField},
+    server_store::ProfileRevisionRecord,
     tool_catalog::{ToolSpec, tool_specs},
 };
-use platonic_core::{AgentId, RunId, RunIdentity};
+use platonic_core::{AgentId, ProfileId, RunId, RunIdentity};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
@@ -32,14 +34,47 @@ pub(crate) struct PreparedRun {
     pub(super) session_hydration: Option<SessionHydration>,
     pub(super) messages: Vec<ModelMessage>,
     pub(super) platonic_memory: Option<String>,
+    pub(super) profile_context: Option<PreparedProfileContext>,
     pub(super) system_context: String,
     pub(super) first_system_context: String,
+}
+
+pub(super) const PROFILE_CONTEXT_TOKEN_BUDGET: u32 = 8_192;
+const PROFILE_CONTEXT_CONTENT_TOKEN_BUDGET: u32 = PROFILE_CONTEXT_TOKEN_BUDGET - 2;
+const PROFILE_CONTEXT_TRUNCATION_MARKER: &str =
+    "\n\n[profile context truncated to the 8192-token lane]";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparedProfileContext {
+    pub(super) profile_id: ProfileId,
+    pub(super) revision: u64,
+    pub(super) content_hash: String,
+    pub(super) content: String,
+    pub(super) truncated: bool,
+}
+
+impl PreparedProfileContext {
+    pub(super) fn source(&self) -> String {
+        format!(
+            "profile:{}@{}#sha256:{}",
+            self.profile_id, self.revision, self.content_hash
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ApprovalMode, RunLedger, model::RunOverrides, tool_catalog::THREAD_SPAWN};
+    use crate::{
+        ApprovalMode, RunLedger,
+        model::{ModelRequest, RunOverrides},
+        server_store::ProfileRevisionContent,
+        tool_catalog::THREAD_SPAWN,
+    };
+    use platonic_core::{
+        ContextLane, HarnessEvent, RecordedEvent, RunReadback, RunStartedEvent, TurnId,
+    };
 
     #[test]
     fn thread_preparation_projects_immutable_agent_and_toolset() {
@@ -75,9 +110,13 @@ enabled = ["file.read", "file.write"]
         };
         let resolved_toolset = vec!["file.read".into(), THREAD_SPAWN.into()];
 
-        let (prepared, _) =
-            prepare_run_for_thread(&options, Some(identity.clone()), Some(&resolved_toolset))
-                .unwrap();
+        let (prepared, _) = prepare_run_for_thread(
+            &options,
+            Some(identity.clone()),
+            Some(&resolved_toolset),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(prepared.identity, identity);
         assert!(prepared.has_tool(THREAD_SPAWN));
@@ -88,6 +127,141 @@ enabled = ["file.read", "file.write"]
                 .map(|spec| spec.name.as_str())
                 .collect::<Vec<_>>(),
             ["file_read", "thread_spawn"]
+        );
+    }
+
+    #[test]
+    fn profile_context_records_exact_verified_revision_hash_and_replays_embedded_content() {
+        let profile_id = ProfileId::new("profile-context-test").unwrap();
+        let content = ProfileRevisionContent {
+            instructions_markdown: "Follow the profile instruction.".into(),
+            memory_markdown: "Remember the durable fact.".into(),
+            skill_refs: vec!["skill:review@sha256:abc".into()],
+        };
+        let revision = ProfileRevisionRecord {
+            profile_id: profile_id.clone(),
+            revision: 7,
+            parent_revision: Some(6),
+            actor: "operator".into(),
+            created_at_ms: 70,
+            content_hash: content.content_hash().unwrap(),
+            content,
+        };
+        let identity = RunIdentity::Profile {
+            profile_id: profile_id.clone(),
+            profile_revision: 7,
+        };
+        let selected = prepare_profile_context(Some(&identity), Some(&revision))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected.source(),
+            format!("profile:{profile_id}@7#sha256:{}", revision.content_hash)
+        );
+
+        let request = ModelRequest {
+            model: crate::config::Config::default().provider.model,
+            system: provider_system_context_with_profile(Some(&selected.content), None),
+            max_output_tokens: 1,
+            reasoning_effort: None,
+            messages: vec![],
+            tools: vec![],
+        };
+        let context = super::super::context::context_pack_with_profile_and_interruption(
+            &request,
+            u32::MAX,
+            Some(&selected),
+            None,
+            None,
+        )
+        .unwrap();
+        let run_id = RunId::new("run-profile-context").unwrap();
+        let records = [
+            RecordedEvent {
+                seq: 0,
+                occurred_at_ms: 1,
+                event: HarnessEvent::RunStarted(RunStartedEvent {
+                    run_id: run_id.clone(),
+                    identity,
+                }),
+            },
+            RecordedEvent {
+                seq: 1,
+                occurred_at_ms: 2,
+                event: HarnessEvent::ContextBuilt {
+                    run_id,
+                    turn_id: TurnId::new("turn-profile-context").unwrap(),
+                    context,
+                },
+            },
+        ];
+        let replay = RunReadback::from_events(&records).unwrap();
+        let profile_fragment = replay
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                platonic_core::ReadbackEntry::ContextFragment { fragment, .. }
+                    if fragment.lane == ContextLane::RetrievedContext
+                        && fragment.source.starts_with("profile:") =>
+                {
+                    Some(fragment)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(profile_fragment.source, selected.source());
+        assert_eq!(profile_fragment.content, selected.content);
+
+        let mut tampered = revision;
+        tampered.content.memory_markdown.push_str(" changed");
+        assert!(
+            prepare_profile_context(
+                Some(&RunIdentity::Profile {
+                    profile_id,
+                    profile_revision: 7,
+                }),
+                Some(&tampered),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("content hash mismatch")
+        );
+    }
+
+    #[test]
+    fn profile_context_truncation_is_deterministic_and_inside_its_lane() {
+        let profile_id = ProfileId::new("profile-context-bound").unwrap();
+        let content = ProfileRevisionContent {
+            instructions_markdown: "instruction ".repeat(10_000),
+            memory_markdown: "memory ".repeat(16_000),
+            skill_refs: vec![],
+        };
+        content.validate().unwrap();
+        let revision = ProfileRevisionRecord {
+            profile_id: profile_id.clone(),
+            revision: 1,
+            parent_revision: None,
+            actor: "operator".into(),
+            created_at_ms: 1,
+            content_hash: content.content_hash().unwrap(),
+            content,
+        };
+        let identity = RunIdentity::Profile {
+            profile_id,
+            profile_revision: 1,
+        };
+        let first = prepare_profile_context(Some(&identity), Some(&revision))
+            .unwrap()
+            .unwrap();
+        let second = prepare_profile_context(Some(&identity), Some(&revision))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, second);
+        assert!(first.truncated);
+        assert!(first.content.ends_with(PROFILE_CONTEXT_TRUNCATION_MARKER));
+        assert!(
+            super::super::context::estimate_tokens(&first.content)
+                <= PROFILE_CONTEXT_CONTENT_TOKEN_BUDGET
         );
     }
 }
@@ -112,6 +286,14 @@ impl PreparedRun {
 
     pub(crate) fn has_tool(&self, name: &str) -> bool {
         self.config.tools.enabled.iter().any(|tool| tool == name)
+    }
+
+    pub(crate) fn has_logical_read_tool(&self) -> bool {
+        self.config
+            .tools
+            .enabled
+            .iter()
+            .any(|tool| crate::tool_catalog::is_logical_read_tool(tool))
     }
 }
 
@@ -179,25 +361,56 @@ fn begin_default_jsonl_session_recorder(
     }
 }
 pub(crate) fn prepare_run(options: &RunOptions) -> AppResult<(PreparedRun, EventRecorder)> {
-    prepare_run_for_thread(options, None, None)
+    prepare_run_for_thread(options, None, None, None)
 }
 
 pub(crate) fn prepare_run_for_thread(
     options: &RunOptions,
     identity: Option<RunIdentity>,
     toolset: Option<&[String]>,
+    profile_revision: Option<&ProfileRevisionRecord>,
 ) -> AppResult<(PreparedRun, EventRecorder)> {
     if options.question.trim().is_empty() {
         return Err(AppError::EmptyQuestion);
     }
 
+    let profile_context = prepare_profile_context(identity.as_ref(), profile_revision)?;
     let platonic_memory = load_platonic_memory(&options.workspace_root)?;
-    let system_context = provider_system_context(platonic_memory.as_deref());
-    let first_system_context = provider_system_context_with_interruption(
+    let base_system_context = provider_system_context(platonic_memory.as_deref());
+    let base_first_system_context = provider_system_context_with_interruption(
+        platonic_memory.as_deref(),
+        options.voice_interruption_context.as_deref(),
+    );
+    let system_context = provider_system_context_with_profile(
+        profile_context
+            .as_ref()
+            .map(|context| context.content.as_str()),
+        platonic_memory.as_deref(),
+    );
+    let first_system_context = provider_system_context_with_profile_and_interruption(
+        profile_context
+            .as_ref()
+            .map(|context| context.content.as_str()),
         platonic_memory.as_deref(),
         options.voice_interruption_context.as_deref(),
     );
     let mut config = Config::load(&options.workspace_root, options.config_path.as_deref())?;
+    let profile_tokens = super::context::estimate_tokens(&system_context)
+        .saturating_sub(super::context::estimate_tokens(&base_system_context))
+        .max(
+            super::context::estimate_tokens(&first_system_context)
+                .saturating_sub(super::context::estimate_tokens(&base_first_system_context)),
+        );
+    if profile_tokens > PROFILE_CONTEXT_TOKEN_BUDGET {
+        return Err(AppError::Config(format!(
+            "profile context uses {profile_tokens} estimated tokens, maximum is {PROFILE_CONTEXT_TOKEN_BUDGET}"
+        )));
+    }
+    config.limits.token_budget = config
+        .limits
+        .token_budget
+        .checked_add(profile_tokens)
+        .ok_or_else(|| AppError::Config("profile context token budget overflowed u32".into()))?;
     if let Some(model) = &options.overrides.model {
         config.provider.model = model.clone();
     }
@@ -275,11 +488,88 @@ pub(crate) fn prepare_run_for_thread(
             session_hydration,
             messages,
             platonic_memory,
+            profile_context,
             system_context,
             first_system_context,
         },
         recorder,
     ))
+}
+
+fn prepare_profile_context(
+    identity: Option<&RunIdentity>,
+    revision: Option<&ProfileRevisionRecord>,
+) -> AppResult<Option<PreparedProfileContext>> {
+    match (identity, revision) {
+        (
+            Some(RunIdentity::Profile {
+                profile_id,
+                profile_revision,
+            }),
+            Some(revision),
+        ) if profile_id == &revision.profile_id && profile_revision == &revision.revision => {}
+        (Some(RunIdentity::Profile { .. }), Some(_)) => {
+            return Err(AppError::Config(
+                "selected profile revision does not match run identity".into(),
+            ));
+        }
+        (Some(RunIdentity::Profile { .. }), None) => {
+            return Err(AppError::Config(
+                "profile run is missing its selected content revision".into(),
+            ));
+        }
+        (Some(RunIdentity::LegacyAgent { .. }) | None, Some(_)) => {
+            return Err(AppError::Config(
+                "legacy run cannot select profile context".into(),
+            ));
+        }
+        (Some(RunIdentity::LegacyAgent { .. }) | None, None) => return Ok(None),
+    }
+    let revision = revision.expect("matched profile revision above");
+    revision
+        .content
+        .validate()
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    let verified_hash = revision
+        .content
+        .content_hash()
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    if revision.content_hash != verified_hash {
+        return Err(AppError::Config(
+            "selected profile revision content hash mismatch".into(),
+        ));
+    }
+    let skill_refs = serde_json::to_string(&revision.content.skill_refs)?;
+    let rendered = format!(
+        "Profile instructions:\n{}\n\nProfile memory:\n{}\n\nProfile skill references (read-only context; no tool authority):\n{}",
+        revision.content.instructions_markdown, revision.content.memory_markdown, skill_refs
+    );
+    let (content, truncated) = truncate_profile_context(&rendered);
+    Ok(Some(PreparedProfileContext {
+        profile_id: revision.profile_id.clone(),
+        revision: revision.revision,
+        content_hash: revision.content_hash.clone(),
+        content,
+        truncated,
+    }))
+}
+
+fn truncate_profile_context(content: &str) -> (String, bool) {
+    if super::context::estimate_tokens(content) <= PROFILE_CONTEXT_CONTENT_TOKEN_BUDGET {
+        return (content.into(), false);
+    }
+    let marker_chars = PROFILE_CONTEXT_TRUNCATION_MARKER.chars().count();
+    let max_chars = usize::try_from(PROFILE_CONTEXT_CONTENT_TOKEN_BUDGET)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(4)
+        .saturating_sub(1);
+    let retained = max_chars.saturating_sub(marker_chars);
+    let mut truncated = content.chars().take(retained).collect::<String>();
+    truncated.push_str(PROFILE_CONTEXT_TRUNCATION_MARKER);
+    debug_assert!(
+        super::context::estimate_tokens(&truncated) <= PROFILE_CONTEXT_CONTENT_TOKEN_BUDGET
+    );
+    (truncated, true)
 }
 pub(super) fn token_limit_field(kind: &ProviderKind) -> TokenLimitField {
     match kind {

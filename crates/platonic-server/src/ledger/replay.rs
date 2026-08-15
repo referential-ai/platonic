@@ -159,6 +159,56 @@ impl SqliteLedger {
         })
     }
 
+    pub(crate) fn run_session_location(&self, run_id: &str) -> AppResult<Option<(String, u64)>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT session_id, session_index FROM session_runs WHERE run_id = ?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row_u64(row, 1, "session_index")?)),
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn read_session_run_at_or_after(
+        &self,
+        session_id: &str,
+        session_index: u64,
+    ) -> AppResult<Option<SessionRunRecords>> {
+        if !self.session_exists(session_id)? {
+            return Err(AppError::SessionNotFound(session_id.into()));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let run = transaction
+            .query_row(
+                "SELECT run_id, session_index, question, status, final_answer
+                 FROM session_runs
+                 WHERE session_id = ?1 AND session_index >= ?2
+                 ORDER BY session_index ASC LIMIT 1",
+                params![
+                    session_id,
+                    i64::try_from(session_index)
+                        .map_err(|_| AppError::Config("session index exceeds i64".into()))?
+                ],
+                session_run_metadata_from_row,
+            )
+            .optional()?;
+        let Some(run) = run else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let records = read_run_from(&transaction, &self.path, &run.run_id)?;
+        transaction.commit()?;
+        Ok(Some(SessionRunRecords {
+            records,
+            run_id: run.run_id,
+            session_index: run.session_index,
+            question: run.question,
+            status: run.status,
+            final_answer: run.final_answer,
+        }))
+    }
+
     pub fn session_summaries(&self) -> AppResult<Vec<PersistedSessionSummary>> {
         let mut statement = self.connection.prepare(
             "SELECT s.session_id, sr.run_id, sr.status, sr.question,

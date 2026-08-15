@@ -7,7 +7,7 @@ use crate::{
     app::{ExternalApprovalOutcome, PreparedRun},
     daemon::child_process::ProcessTreeChild,
     ledger::{EventRecorder, RUN_CANCELED_REASON},
-    tools::ThreadSpawnToolHandler,
+    tools::{LogicalReadRequest, LogicalReadToolHandler, RunToolHandlers},
 };
 use platonic_core::{RecordedEvent, RunId};
 use std::{
@@ -484,7 +484,7 @@ pub(in crate::daemon) fn run_supervised(
     approval_mode: ApprovalMode,
     event_sender: mpsc::Sender<RunEvent>,
     cancel: Arc<AtomicBool>,
-    thread_spawn: Option<ThreadSpawnToolHandler>,
+    handlers: RunToolHandlers,
     confinement: crate::confinement::ChildConfinement,
 ) -> SupervisedRunCompletion {
     let executable = match resolve_run_child_executable() {
@@ -500,7 +500,7 @@ pub(in crate::daemon) fn run_supervised(
         approval_mode,
         event_sender,
         cancel,
-        thread_spawn,
+        handlers,
         ChildLaunch {
             limits: ChildLifecycleLimits::default(),
             executable,
@@ -519,7 +519,7 @@ pub(in crate::daemon) fn run_supervised_for_test(
     approval_mode: ApprovalMode,
     event_sender: mpsc::Sender<RunEvent>,
     cancel: Arc<AtomicBool>,
-    thread_spawn: Option<ThreadSpawnToolHandler>,
+    thread_spawn: Option<crate::tools::ThreadSpawnToolHandler>,
     launch: SupervisedTestLaunch,
 ) -> SupervisedRunCompletion {
     run_supervised_with_limits(
@@ -528,7 +528,10 @@ pub(in crate::daemon) fn run_supervised_for_test(
         approval_mode,
         event_sender,
         cancel,
-        thread_spawn,
+        RunToolHandlers {
+            thread_spawn,
+            logical_read: None,
+        },
         ChildLaunch {
             limits: ChildLifecycleLimits::default(),
             executable: launch.executable,
@@ -592,7 +595,7 @@ fn run_supervised_with_limits(
     approval_mode: ApprovalMode,
     event_sender: mpsc::Sender<RunEvent>,
     cancel: Arc<AtomicBool>,
-    thread_spawn: Option<ThreadSpawnToolHandler>,
+    handlers: RunToolHandlers,
     launch: ChildLaunch,
 ) -> SupervisedRunCompletion {
     let ChildLaunch {
@@ -603,6 +606,10 @@ fn run_supervised_with_limits(
         #[cfg(test)]
         terminal_stage_barriers,
     } = launch;
+    let RunToolHandlers {
+        thread_spawn,
+        logical_read,
+    } = handlers;
     let run_id = prepared.run_id().clone();
     let mut recorder = ParentRunRecorder {
         recorder,
@@ -759,6 +766,15 @@ fn run_supervised_with_limits(
                             error: "thread.spawn requires a coordinator thread".into(),
                         })?,
                     },
+                    ChildMessage::LogicalRead {
+                        request_id,
+                        request,
+                    } => reply_to_logical_read(
+                        &mut child,
+                        logical_read.as_ref(),
+                        request_id,
+                        request,
+                    )?,
                     ChildMessage::Result {
                         request_id,
                         result: child_result,
@@ -822,6 +838,28 @@ fn run_supervised_with_limits(
             recorder.complete(&run_id, Err(error), false)
         }
     }
+}
+
+fn reply_to_logical_read(
+    child: &mut SupervisedChild,
+    handler: Option<&LogicalReadToolHandler>,
+    request_id: u64,
+    request: LogicalReadRequest,
+) -> AppResult<()> {
+    let reply = match handler {
+        Some(handler) => match handler.execute(request) {
+            Ok(output) => ParentMessage::LogicalRead { request_id, output },
+            Err(error) => ParentMessage::Reject {
+                request_id,
+                error: error.to_string(),
+            },
+        },
+        None => ParentMessage::Reject {
+            request_id,
+            error: "profile reads require a profile thread".into(),
+        },
+    };
+    child.write(&reply)
 }
 
 fn stop_reason(cause: StopCause, pid: u32, status: Option<ExitStatus>) -> String {
@@ -1211,7 +1249,7 @@ while :; do :; done
                     }),
                     event_sender,
                     Arc::new(AtomicBool::new(false)),
-                    None,
+                    RunToolHandlers::default(),
                     ChildLaunch {
                         limits: ChildLifecycleLimits {
                             deadline: Duration::from_secs(5),
@@ -1331,7 +1369,7 @@ IFS= read -r _
                     ApprovalMode::Deny { actor: "test" },
                     healthy_event_sender,
                     Arc::new(AtomicBool::new(false)),
-                    None,
+                    RunToolHandlers::default(),
                     ChildLaunch {
                         limits: ChildLifecycleLimits::default(),
                         executable: healthy_fixture,
@@ -1483,7 +1521,7 @@ while :; do :; done
                     ApprovalMode::Deny { actor: "test" },
                     event_sender,
                     cancel,
-                    None,
+                    RunToolHandlers::default(),
                     ChildLaunch {
                         limits: ChildLifecycleLimits {
                             deadline,
@@ -1721,7 +1759,7 @@ done
                 }),
                 event_sender,
                 Arc::new(AtomicBool::new(false)),
-                None,
+                RunToolHandlers::default(),
                 ChildLaunch {
                     limits: ChildLifecycleLimits {
                         deadline: Duration::from_secs(10),

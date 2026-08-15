@@ -15,6 +15,7 @@ use platonic_protocol::{
 };
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
 use std::{
@@ -44,6 +45,10 @@ fn seed_profile(
     toolset: &[&str],
 ) -> ProfileId {
     let profile_id = ProfileId::new(format!("profile-{name}")).unwrap();
+    let content_hash = format!(
+        "{:x}",
+        Sha256::digest(br#"{"instructions_markdown":"","memory_markdown":"","skill_refs":[]}"#)
+    );
     let mut connection = Connection::open(&proof.server_db_path).unwrap();
     let transaction = connection.transaction().unwrap();
     transaction
@@ -70,10 +75,7 @@ fn seed_profile(
                (profile_id, revision, parent_revision, actor, created_at_ms,
                 content_hash, instructions_markdown, memory_markdown, skill_refs)
              VALUES (?1, 1, NULL, 'semantic-fixture', 1, ?2, '', '', '[]')",
-            params![
-                profile_id.as_str(),
-                "0000000000000000000000000000000000000000000000000000000000000000"
-            ],
+            params![profile_id.as_str(), content_hash],
         )
         .unwrap();
     transaction.commit().unwrap();

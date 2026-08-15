@@ -30,7 +30,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         options.event_sender,
         options.stream_to_stderr,
         options.cancel,
-        None,
+        crate::tools::RunToolHandlers::default(),
     )
 }
 

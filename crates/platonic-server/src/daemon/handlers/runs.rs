@@ -29,7 +29,7 @@ use crate::{
     model::RunOverrides,
     new_run_id, new_session_id,
     tool_catalog::SHELL_EXEC,
-    tools::ThreadSpawnToolHandler,
+    tools::{LogicalReadToolHandler, ThreadSpawnToolHandler},
 };
 use platonic_core::{ActorId, EffectClass, HarnessEvent, RunId, RunIdentity};
 use sha2::{Digest, Sha256};
@@ -200,6 +200,7 @@ struct RunAuthorityProjection {
     identity: Option<platonic_core::RunIdentity>,
     toolset: Option<Vec<String>>,
     thread_spawn: Option<ThreadSpawnToolHandler>,
+    logical_read: Option<LogicalReadToolHandler>,
     confinement: ChildConfinement,
 }
 
@@ -396,6 +397,14 @@ pub(super) fn start_run(
     let thread_spawn = thread_context
         .as_ref()
         .and_then(|context| projected_thread_spawn_handler(runtime, context));
+    let logical_read = thread_context.as_ref().and_then(|context| {
+        crate::daemon::logical_reads::projected_handler(
+            runtime,
+            &context.turn.thread_id,
+            &context.identity,
+            &context.toolset,
+        )
+    });
     let child_confinement = thread_context
         .as_ref()
         .map_or(one_shot_confinement, |context| context.confinement.clone());
@@ -403,14 +412,20 @@ pub(super) fn start_run(
         identity: run_identity,
         toolset: run_toolset,
         thread_spawn,
+        logical_read,
         confinement: child_confinement,
     };
 
-    let (prepared, recorder) = match crate::app::prepare_run_for_thread(
-        &options,
-        authority.identity.clone(),
-        authority.toolset.as_deref(),
-    ) {
+    let admission =
+        selected_profile_revision(runtime, authority.identity.as_ref()).and_then(|revision| {
+            crate::app::prepare_run_for_thread(
+                &options,
+                authority.identity.clone(),
+                authority.toolset.as_deref(),
+                revision.as_ref(),
+            )
+        });
+    let (prepared, recorder) = match admission {
         Ok(admission) => admission,
         Err(error) => {
             runtime.release_run_reservation(&record);
@@ -519,6 +534,37 @@ pub(super) fn start_run(
     }
 }
 
+fn selected_profile_revision(
+    runtime: &DaemonRuntime,
+    identity: Option<&RunIdentity>,
+) -> AppResult<Option<crate::server_store::ProfileRevisionRecord>> {
+    let Some(RunIdentity::Profile {
+        profile_id,
+        profile_revision,
+    }) = identity
+    else {
+        return Ok(None);
+    };
+    let store = runtime.paths.server_store()?;
+    let profile = store
+        .profile(profile_id)?
+        .filter(|profile| profile.workspace_id == runtime.paths.workspace_id)
+        .ok_or_else(|| AppError::Config("run profile is not a member of its workspace".into()))?;
+    if *profile_revision > profile.current_revision {
+        return Err(AppError::Config(format!(
+            "run selected future profile revision {profile_revision} for {profile_id}"
+        )));
+    }
+    store
+        .profile_revision(profile_id, *profile_revision)?
+        .map(Some)
+        .ok_or_else(|| {
+            AppError::Config(format!(
+                "profile {profile_id} is missing selected revision {profile_revision}"
+            ))
+        })
+}
+
 fn discard_unstarted_run(
     runtime: &DaemonRuntime,
     record: &RunRecord,
@@ -614,6 +660,7 @@ fn run_to_completion(
     } = admitted;
     let RunAuthorityProjection {
         thread_spawn,
+        logical_read,
         confinement,
         ..
     } = authority;
@@ -629,7 +676,10 @@ fn run_to_completion(
         Some(event_sender),
         false,
         Some(cancel),
-        thread_spawn,
+        crate::tools::RunToolHandlers {
+            thread_spawn,
+            logical_read,
+        },
     ));
     #[cfg(not(test))]
     let completion = RunCompletion::Supervised(Box::new(crate::daemon::run_child::run_supervised(
@@ -638,7 +688,10 @@ fn run_to_completion(
         approval_mode,
         event_sender,
         cancel,
-        thread_spawn,
+        crate::tools::RunToolHandlers {
+            thread_spawn,
+            logical_read,
+        },
         confinement,
     )));
     let completion = match remove_one_shot_run_root(
@@ -689,6 +742,7 @@ fn prepare_one_shot_confinement(
             };
             Ok((
                 ChildConfinement::Landlock {
+                    readable_paths: vec![runtime.paths.workspace_root.clone(), scratch.clone()],
                     writable_paths: vec![runtime.paths.workspace_root.clone(), scratch.clone()],
                     scratch,
                 },
@@ -2525,6 +2579,10 @@ enabled = ["file.read"]
         assert_eq!(
             confinement,
             ChildConfinement::Landlock {
+                readable_paths: vec![
+                    runtime.paths.workspace_root.clone(),
+                    scratch.canonicalize().unwrap(),
+                ],
                 writable_paths: vec![
                     runtime.paths.workspace_root.clone(),
                     scratch.canonicalize().unwrap(),

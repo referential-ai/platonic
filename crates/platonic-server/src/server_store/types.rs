@@ -12,6 +12,7 @@ use std::{
 pub(crate) const MAX_PROFILE_MARKDOWN_BYTES: usize = 128 * 1024;
 pub(crate) const MAX_PROFILE_SKILL_REFS: usize = 64;
 pub(crate) const MAX_PROFILE_REVISION_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_PROFILE_REVISION_ACTOR_BYTES: usize = 256;
 pub(crate) const MAX_PROFILE_LIST_ENTRIES: usize = 100;
 
 static PROFILE_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);

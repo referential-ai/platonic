@@ -348,11 +348,30 @@ pub(super) fn provider_system_context(platonic_memory: Option<&str>) -> String {
     provider_system_context_with_interruption(platonic_memory, None)
 }
 
+pub(super) fn provider_system_context_with_profile(
+    profile_context: Option<&str>,
+    platonic_memory: Option<&str>,
+) -> String {
+    provider_system_context_with_profile_and_interruption(profile_context, platonic_memory, None)
+}
+
 pub(super) fn provider_system_context_with_interruption(
     platonic_memory: Option<&str>,
     voice_interruption: Option<&str>,
 ) -> String {
+    provider_system_context_with_profile_and_interruption(None, platonic_memory, voice_interruption)
+}
+
+pub(super) fn provider_system_context_with_profile_and_interruption(
+    profile_context: Option<&str>,
+    platonic_memory: Option<&str>,
+    voice_interruption: Option<&str>,
+) -> String {
     let mut context = system_prompt().to_string();
+    if let Some(content) = profile_context {
+        context.push_str(PLATONIC_MEMORY_SEPARATOR);
+        context.push_str(content);
+    }
     if let Some(content) = platonic_memory {
         context.push_str(PLATONIC_MEMORY_SEPARATOR);
         context.push_str(content);

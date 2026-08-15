@@ -9,10 +9,12 @@ use crate::{
     model::ModelResponse,
     tool_catalog::{
         COMPUTER_OBSERVE, COMPUTER_WINDOWS, SHELL_EXEC, THREAD_SPAWN, WEB_FETCH, effect_for_tool,
+        is_logical_read_tool,
     },
     tools::{
-        ApprovalOutcome, ThreadSpawnToolHandler, ToolExecutionContext,
-        computer::ComputerToolHandler, execute_tool_with_context, targets_platonic_memory,
+        ApprovalOutcome, LogicalReadToolHandler, MAX_LOGICAL_READ_SERIALIZED_BYTES,
+        ThreadSpawnToolHandler, ToolExecutionContext, computer::ComputerToolHandler,
+        execute_tool_with_context, targets_platonic_memory,
     },
 };
 use platonic_core::{
@@ -162,6 +164,19 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn logical_read_wrapper_preserves_the_bounded_response_and_cursor() {
+        let body = format!(
+            "{{\"content\":\"{}\",\"next_cursor\":\"4:20\"}}",
+            "a".repeat(TOOL_OUTPUT_LIMIT)
+        );
+        let output = provider_tool_output(crate::tool_catalog::PROFILE_READ, &body);
+        assert!(output.len() > TOOL_OUTPUT_LIMIT);
+        assert!(output.contains("\"next_cursor\":\"4:20\""));
+        assert!(!output.contains(TOOL_OUTPUT_TRUNCATION_MARKER));
+        assert!(output.len() <= LOGICAL_TOOL_OUTPUT_LIMIT);
     }
 
     #[test]
@@ -524,6 +539,7 @@ pub(super) fn yolo_eligible(
 pub(super) const EXTRA_TOOL_CALL_ERROR: &str = "not executed: at most one tool call runs per response; re-issue this call alone if still needed";
 pub(super) const HOST_VALIDATION_ACTOR: &str = "host-validation";
 const TOOL_OUTPUT_LIMIT: usize = 65_536;
+const LOGICAL_TOOL_OUTPUT_LIMIT: usize = MAX_LOGICAL_READ_SERIALIZED_BYTES + 16 * 1024;
 const TOOL_OUTPUT_TRUNCATION_MARKER: &str = "\n... output truncated";
 const TOOL_OUTPUT_CLOSE: &str = "\n</tool_output>";
 #[derive(Debug)]
@@ -559,9 +575,14 @@ pub(super) fn record_approval_preview_denial(
 pub(super) fn provider_tool_output(tool_name: &str, body: &str) -> String {
     let body = neutralize_tool_output_closers(body);
     let open = format!("<tool_output name=\"{tool_name}\" trust=\"untrusted\">\n");
-    let truncated = open.len() + body.len() + TOOL_OUTPUT_CLOSE.len() > TOOL_OUTPUT_LIMIT;
+    let limit = if is_logical_read_tool(tool_name) {
+        LOGICAL_TOOL_OUTPUT_LIMIT
+    } else {
+        TOOL_OUTPUT_LIMIT
+    };
+    let truncated = open.len() + body.len() + TOOL_OUTPUT_CLOSE.len() > limit;
     let body = if truncated {
-        let available = TOOL_OUTPUT_LIMIT
+        let available = limit
             .checked_sub(open.len() + TOOL_OUTPUT_TRUNCATION_MARKER.len() + TOOL_OUTPUT_CLOSE.len())
             .expect("known tool output wrapper fits the limit");
         let mut end = available.min(body.len());
@@ -574,7 +595,7 @@ pub(super) fn provider_tool_output(tool_name: &str, body: &str) -> String {
     };
 
     let capacity = if truncated {
-        TOOL_OUTPUT_LIMIT
+        limit
     } else {
         open.len() + body.len() + TOOL_OUTPUT_CLOSE.len()
     };
@@ -614,10 +635,11 @@ pub(super) fn execute_and_record_tool(
     approving_actor: Option<&str>,
     handlers: (
         Option<&ThreadSpawnToolHandler>,
+        Option<&LogicalReadToolHandler>,
         Option<&mut ComputerToolHandler>,
     ),
 ) -> AppResult<ToolMessage> {
-    let (thread_spawn, computer) = handlers;
+    let (thread_spawn, logical_read, computer) = handlers;
     check_cancel(recorder, options, run_id)?;
     let ToolCall {
         id: call_id,
@@ -639,6 +661,7 @@ pub(super) fn execute_and_record_tool(
         provider_api_key_env: Some(&config.provider.api_key_env),
         cancel: options.cancel.as_deref(),
         thread_spawn,
+        logical_read,
         computer,
         approving_actor,
     };
@@ -683,6 +706,8 @@ fn tool_result_is_error(tool_name: &str, result: &platonic_core::ToolResult) -> 
             .is_some_and(|exit_code| exit_code.as_i64() != Some(0)))
         || (tool_name == THREAD_SPAWN
             && result.data.get("status").and_then(Value::as_str) == Some("rejected"))
+        || (is_logical_read_tool(tool_name)
+            && result.data.get("status").and_then(Value::as_str) == Some("error"))
 }
 
 pub(super) fn proposals_from_response(response: &ModelResponse) -> AppResult<Vec<ToolProposal>> {

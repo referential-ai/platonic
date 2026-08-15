@@ -2,6 +2,7 @@ mod approval;
 pub(crate) mod computer;
 mod files;
 pub mod github;
+mod logical;
 mod memory;
 mod shell;
 pub mod web;
@@ -9,6 +10,14 @@ pub mod web;
 pub use approval::{
     ApprovalOutcome, approval_command_preview, approval_diff_preview, approval_input_preview,
     ask_for_approval,
+};
+pub(crate) use logical::{
+    LogicalReadErrorCode, LogicalReadRequest, LogicalReadResult, LogicalReadToolHandler,
+    LogicalReadToolOutput, MAX_LOGICAL_READ_SERIALIZED_BYTES, ProfileContentView,
+    ProfileEventEntry, ProfileFilesystemIsolation, ProfileReadInput, ProfileReadResult,
+    ProfileRevisionMetadata, ProfileRevisionView, ProfileThreadMetadata, ProfileTranscriptEntry,
+    ThreadEventsResult, ThreadHistoryInput, ThreadTranscriptResult, ThreadTreeInput,
+    ThreadTreeResult,
 };
 pub(crate) use memory::{
     PLATONIC_MEMORY_FILENAME, PLATONIC_MEMORY_MAX_BYTES, targets_platonic_memory,
@@ -21,7 +30,7 @@ use shell::shell_exec;
 
 use crate::tool_catalog::{
     COMPUTER_OBSERVE, COMPUTER_WINDOWS, FILE_EDIT, FILE_LIST, FILE_READ, FILE_WRITE, SHELL_EXEC,
-    THREAD_SPAWN, WEB_FETCH,
+    THREAD_SPAWN, WEB_FETCH, is_logical_read_tool,
 };
 use crate::{AppError, AppResult};
 use platonic_core::{ResultVisibility, ToolResult};
@@ -91,12 +100,20 @@ impl ThreadSpawnToolHandler {
         (self.execute)(input, approving_actor)
     }
 }
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RunToolHandlers {
+    pub(crate) thread_spawn: Option<ThreadSpawnToolHandler>,
+    pub(crate) logical_read: Option<LogicalReadToolHandler>,
+}
+
 #[derive(Debug)]
 pub struct ToolExecutionContext<'a> {
     pub workspace_root: &'a Path,
     pub provider_api_key_env: Option<&'a str>,
     pub cancel: Option<&'a AtomicBool>,
     pub(crate) thread_spawn: Option<&'a ThreadSpawnToolHandler>,
+    pub(crate) logical_read: Option<&'a LogicalReadToolHandler>,
     pub(crate) computer: Option<&'a mut ComputerToolHandler>,
     pub(crate) approving_actor: Option<&'a str>,
 }
@@ -108,6 +125,7 @@ impl<'a> ToolExecutionContext<'a> {
             provider_api_key_env: None,
             cancel: None,
             thread_spawn: None,
+            logical_read: None,
             computer: None,
             approving_actor: None,
         }
@@ -141,6 +159,9 @@ pub fn execute_tool_with_context(
         FILE_EDIT => write_file(context.workspace_root, call_id, input, "edited", "at"),
         SHELL_EXEC => shell_exec(context, call_id, input),
         WEB_FETCH => web::fetch(call_id, input, context.cancel),
+        _ if is_logical_read_tool(tool_name) => {
+            logical::execute(context.logical_read, call_id, tool_name, input)
+        }
         THREAD_SPAWN => spawn_thread(context, call_id, input),
         COMPUTER_WINDOWS | COMPUTER_OBSERVE => context
             .computer
@@ -200,6 +221,7 @@ mod tests {
                 provider_api_key_env: None,
                 cancel: None,
                 thread_spawn: Some(&handler),
+                logical_read: None,
                 computer: None,
                 approving_actor: Some("reviewer"),
             },
@@ -223,6 +245,7 @@ mod tests {
                 provider_api_key_env: None,
                 cancel: None,
                 thread_spawn: Some(&handler),
+                logical_read: None,
                 computer: None,
                 approving_actor: None,
             },

@@ -5,6 +5,7 @@ pub use platonic_client::{client, transport};
 mod child_process;
 mod handlers;
 pub mod lock;
+mod logical_reads;
 pub use platonic_protocol as protocol;
 mod run_child;
 mod runtime;

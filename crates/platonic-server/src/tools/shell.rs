@@ -176,7 +176,21 @@ pub(super) fn normalize_timeout_seconds(timeout_seconds: Option<u64>) -> u64 {
 }
 
 fn shell_child_env(provider_api_key_env: Option<&str>) -> Vec<(String, String)> {
-    shell_child_env_from(env::vars(), provider_api_key_env)
+    let mut child_env = shell_child_env_from(env::vars(), provider_api_key_env);
+    if env::var_os("PLATONIC_CHILD_CONFINEMENT").as_deref()
+        == Some(std::ffi::OsStr::new("landlock"))
+    {
+        child_env.extend(
+            [
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_NOSYSTEM",
+                "XDG_CONFIG_HOME",
+            ]
+            .into_iter()
+            .filter_map(|name| env::var(name).ok().map(|value| (name.into(), value))),
+        );
+    }
+    child_env
 }
 
 pub(crate) fn supervised_run_child_env(
@@ -687,6 +701,7 @@ mod tests {
                 provider_api_key_env: None,
                 cancel: Some(&cancel),
                 thread_spawn: None,
+                logical_read: None,
                 computer: None,
                 approving_actor: None,
             },

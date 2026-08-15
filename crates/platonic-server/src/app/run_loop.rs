@@ -1,5 +1,5 @@
 use super::{
-    context::context_pack_with_interruption,
+    context::context_pack_with_profile_and_interruption,
     prepare::{PreparedRun, token_limit_field},
     tool_exec::{
         EXTRA_TOOL_CALL_ERROR, ToolMessage, evaluate_policy, execute_and_record_tool,
@@ -19,7 +19,7 @@ use crate::{
     provider::openai_compat::OpenAiCompatibleClient,
     tool_catalog::{COMPUTER_OBSERVE, COMPUTER_WINDOWS, tool_specs},
     tools::{
-        ApprovalOutcome, ThreadSpawnToolHandler, approval_command_preview, approval_diff_preview,
+        ApprovalOutcome, RunToolHandlers, approval_command_preview, approval_diff_preview,
         approval_input_preview, ask_for_approval, computer::ComputerToolHandler,
     },
 };
@@ -48,8 +48,12 @@ pub(crate) fn run_prepared_question(
     event_sender: Option<Sender<RunEvent>>,
     stream_to_stderr: bool,
     cancel: Option<Arc<AtomicBool>>,
-    thread_spawn: Option<ThreadSpawnToolHandler>,
+    handlers: RunToolHandlers,
 ) -> AppResult<RunOutcome> {
+    let RunToolHandlers {
+        thread_spawn,
+        logical_read,
+    } = handlers;
     let PreparedRun {
         question,
         overrides,
@@ -61,6 +65,7 @@ pub(crate) fn run_prepared_question(
         session_hydration,
         mut messages,
         platonic_memory,
+        profile_context,
         system_context,
         first_system_context,
     } = prepared;
@@ -144,9 +149,10 @@ pub(crate) fn run_prepared_question(
             messages: messages.clone(),
             tools: tools.clone(),
         };
-        let context = context_pack_with_interruption(
+        let context = context_pack_with_profile_and_interruption(
             &request,
             config.limits.token_budget,
+            profile_context.as_ref(),
             platonic_memory.as_deref(),
             voice_interruption,
         )?;
@@ -421,7 +427,11 @@ pub(crate) fn run_prepared_question(
                 &run_id,
                 call.clone(),
                 None,
-                (thread_spawn.as_ref(), computer.as_mut()),
+                (
+                    thread_spawn.as_ref(),
+                    logical_read.as_ref(),
+                    computer.as_mut(),
+                ),
             )?,
             PolicyDecision::RequireApproval { ref reason } => {
                 if let Some(actor) =
@@ -447,7 +457,11 @@ pub(crate) fn run_prepared_question(
                         &run_id,
                         call.clone(),
                         Some(actor),
-                        (thread_spawn.as_ref(), computer.as_mut()),
+                        (
+                            thread_spawn.as_ref(),
+                            logical_read.as_ref(),
+                            computer.as_mut(),
+                        ),
                     )?
                 } else if let Some(actor) = options.approval_mode.deny_actor(&policy) {
                     deny_computer_approval(&mut computer, &call);
@@ -514,7 +528,11 @@ pub(crate) fn run_prepared_question(
                                         &run_id,
                                         call.clone(),
                                         Some(&actor),
-                                        (thread_spawn.as_ref(), computer.as_mut()),
+                                        (
+                                            thread_spawn.as_ref(),
+                                            logical_read.as_ref(),
+                                            computer.as_mut(),
+                                        ),
                                     )?
                                 }
                                 ExternalApprovalOutcome::Denied { actor, reason } => {
@@ -572,7 +590,11 @@ pub(crate) fn run_prepared_question(
                                         &run_id,
                                         call.clone(),
                                         Some("stdin"),
-                                        (thread_spawn.as_ref(), computer.as_mut()),
+                                        (
+                                            thread_spawn.as_ref(),
+                                            logical_read.as_ref(),
+                                            computer.as_mut(),
+                                        ),
                                     )?
                                 }
                                 ApprovalOutcome::Denied { reason } => {
