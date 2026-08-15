@@ -35,7 +35,6 @@ use std::{
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ThreadSpawnToolInput {
-    pub(crate) agent_id: String,
     pub(crate) cwd: String,
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<platonic_protocol::ReasoningEffort>,
@@ -206,7 +205,7 @@ mod tests {
             },
             ToolCallId::new("call_spawn").unwrap(),
             THREAD_SPAWN,
-            json!({"agent_id": "worker", "cwd": root.path()}),
+            json!({"cwd": root.path()}),
         )
         .unwrap();
 
@@ -215,7 +214,6 @@ mod tests {
             json!({"status": "spawned", "thread_id": "thread_worker"})
         );
         let (input, actor) = observed.lock().unwrap().clone().unwrap();
-        assert_eq!(input.agent_id, "worker");
         assert_eq!(input.cwd, root.path().to_string_lossy());
         assert_eq!(actor, "reviewer");
 
@@ -230,7 +228,7 @@ mod tests {
             },
             ToolCallId::new("call_without_actor").unwrap(),
             THREAD_SPAWN,
-            json!({"agent_id": "worker", "cwd": root.path()}),
+            json!({"cwd": root.path()}),
         )
         .unwrap_err();
         assert!(matches!(

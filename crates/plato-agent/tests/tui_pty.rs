@@ -11,9 +11,9 @@ use platonic_client::{
 };
 use platonic_core::{RunId, TurnId};
 use platonic_protocol::{
-    ApprovalProfile, ERROR_INTERNAL, ERROR_LAGGED, ERROR_UNSUPPORTED_METHOD,
-    ERROR_WORKSPACE_UNREGISTERED, Envelope, EnvelopeKind, PROTOCOL_VERSION, ProtocolRequest,
-    RunStateName, ShutdownIfIdleResultName, StreamEvent, VoiceEvent, VoiceEventEnvelope,
+    ERROR_INTERNAL, ERROR_LAGGED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_UNREGISTERED, Envelope,
+    EnvelopeKind, PROTOCOL_VERSION, ProtocolRequest, RunStateName, ShutdownIfIdleResultName,
+    StreamEvent, VoiceEvent, VoiceEventEnvelope,
 };
 use pty_process::{
     Size,
@@ -116,7 +116,7 @@ const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
     target_os = "macos",
     ignore = "inline PTY viewport omits the preserved title on macOS; #465"
 )]
-fn plato_tui_yolo_cold_starts_host_thread_and_remote_reuses_it() {
+fn plato_tui_cold_start_cannot_create_an_unrelated_root_thread() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
     let runtime = root.path().join("runtime");
@@ -140,62 +140,16 @@ fn plato_tui_yolo_cold_starts_host_thread_and_remote_reuses_it() {
     );
     local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Workspace name [workspace]");
     local.write(b"\r");
-    local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Approve thread.spawn?");
-    local.write(b"y\r");
-    local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Plato Agent");
-    let local_screen = local.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "yolo ·");
-    assert!(local_screen.contains("Plato Agent"));
+    local.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "thread spawn requires a same-profile parent",
+    );
+    assert_eq!(local.wait_for_marker("LOCAL_STATUS"), "1");
 
     let mut client = connect_pty_daemon(&config);
     client.hello(&workspace).unwrap();
-    let threads = client.thread_list().unwrap().threads;
-    assert_eq!(threads.len(), 1);
-    let thread = &threads[0];
-    assert!(thread.live.loaded);
-    assert_eq!(thread.authority.spawning_actor, "local_tui");
-    let thread_id = thread.authority.thread_id.clone();
-    assert_eq!(
-        client
-            .daemon_status(Some(format!("session_{thread_id}")), None)
-            .unwrap()
-            .trust
-            .approval_profile,
-        ApprovalProfile::Yolo
-    );
-    let authority = client
-        .thread_authority(thread_id.clone())
-        .unwrap()
-        .authority;
-    assert_eq!(authority.spawning_actor, "local_tui");
-    assert_eq!(authority.worktrees.len(), 1);
-    assert_eq!(thread.authority.cwd, authority.worktrees[0].path);
-    assert_eq!(authority.granted_paths.len(), 1);
-    assert!(authority.granted_paths[0].writable);
-    assert_eq!(
-        client
-            .thread_status(thread_id.clone())
-            .unwrap()
-            .thread
-            .authority,
-        thread.authority
-    );
-
-    let mut remote = PtyShell::spawn(&workspace, &runtime, &state, &home);
-    remote.write(
-        format!(
-            "\"$PLATO_ROOT_BIN\" --remote \"{thread_id}\"; printf '\\n%sREMOTE_STATUS:%s\\n' \"$PTY_MARK\" \"$?\"\n"
-        )
-        .as_bytes(),
-    );
-    remote.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Plato Agent");
-    assert_eq!(client.thread_list().unwrap().threads.len(), 1);
-
-    remote.write(b"q");
-    assert_eq!(remote.wait_for_marker("REMOTE_STATUS"), "0");
-    remote.write(b"exit\r");
-    assert!(remote.wait_bounded(PROOF_TIMEOUT).success());
-    local.write(b"q");
-    assert_eq!(local.wait_for_marker("LOCAL_STATUS"), "0");
+    assert!(client.thread_list().unwrap().threads.is_empty());
     local.write(b"exit\r");
     assert!(local.wait_bounded(PROOF_TIMEOUT).success());
 

@@ -1,5 +1,7 @@
 use platonic_core::{AgentId, EffectClass, ProfileId};
-use platonic_protocol::{ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord};
+use platonic_protocol::{
+    ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadRepositoryRequest,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -167,6 +169,65 @@ pub(crate) struct BranchClaimConflict {
     pub(crate) repo: String,
     pub(crate) branch: String,
     pub(crate) thread_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProfileHomeProposal {
+    pub(crate) repositories: Vec<ThreadRepositoryRequest>,
+    pub(crate) working_repository: String,
+    pub(crate) working_subdir: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HomeReservationState {
+    Pending,
+    Granted,
+    Denied,
+    Canceled,
+}
+
+impl HomeReservationState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Granted => "granted",
+            Self::Denied => "denied",
+            Self::Canceled => "canceled",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "granted" => Some(Self::Granted),
+            "denied" => Some(Self::Denied),
+            "canceled" => Some(Self::Canceled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HomeReservationRecord {
+    pub(crate) id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) profile_id: ProfileId,
+    pub(crate) idempotency_key: String,
+    pub(crate) proposal: ProfileHomeProposal,
+    pub(crate) draft: crate::thread_authority::ThreadAuthorityDraft,
+    pub(crate) state: HomeReservationState,
+    pub(crate) decided_by: Option<String>,
+    pub(crate) reason: Option<String>,
+    pub(crate) created_at_ms: u64,
+    pub(crate) decided_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReserveProfileHomeResult {
+    Reserved(HomeReservationRecord),
+    Replayed(HomeReservationRecord),
+    Conflict(String),
 }
 
 /// Mint a workspace id that does not depend on where the workspace lives.

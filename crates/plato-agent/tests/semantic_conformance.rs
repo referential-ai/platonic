@@ -1,15 +1,17 @@
 use platonic_client::{ClientError, client::DaemonClient};
-use platonic_core::{AgentId, EffectClass, HarnessEvent};
+use platonic_core::{AgentId, EffectClass, HarnessEvent, ProfileId};
 #[cfg(target_os = "linux")]
 use platonic_protocol::RunStateName;
 use platonic_protocol::{
     BufferedThreadEvent, CAPABILITY_AGENT_CREATE, CAPABILITY_AGENT_LIST, CAPABILITY_AGENT_STATUS,
-    CAPABILITY_THREAD_AUTHORITY, CAPABILITY_THREAD_EVENTS, CAPABILITY_THREAD_LIST,
-    CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_SPAWN, CAPABILITY_THREAD_STATUS,
-    CAPABILITY_THREAD_STOP, CAPABILITY_WORKSPACE_CREATE, CAPABILITY_WORKSPACE_LIST,
-    CAPABILITY_WORKSPACE_STATUS, ERROR_NOT_FOUND, ERROR_WORKSPACE_UNREGISTERED, ReasoningEffort,
-    ShutdownIfIdleResultName, StreamEvent, ThreadApprovalPolicy, ThreadSendRejectedReason,
-    ThreadSendResult, ThreadSpawnDecision, ThreadSpawnResult, ThreadStopResult,
+    CAPABILITY_PROFILE_OPEN, CAPABILITY_THREAD_AUTHORITY, CAPABILITY_THREAD_EVENTS,
+    CAPABILITY_THREAD_LIST, CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_SPAWN,
+    CAPABILITY_THREAD_STATUS, CAPABILITY_THREAD_STOP, CAPABILITY_WORKSPACE_CREATE,
+    CAPABILITY_WORKSPACE_LIST, CAPABILITY_WORKSPACE_STATUS, ERROR_NOT_FOUND,
+    ERROR_THREAD_STOP_FAILED, ERROR_WORKSPACE_UNREGISTERED, ProfileOpenDecision, ProfileOpenResult,
+    ReasoningEffort, ShutdownIfIdleResultName, StreamEvent, ThreadApprovalPolicy, ThreadKind,
+    ThreadRepositoryRequest, ThreadSendRejectedReason, ThreadSendResult, ThreadSpawnResult,
+    ThreadStopResult,
 };
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
@@ -31,6 +33,103 @@ const SERVED_MODEL: &str = "provider/test-model-2026-08-01";
 const PROOF_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 static SCENARIO_SERIAL: Mutex<()> = Mutex::new(());
+
+fn seed_profile(
+    proof: &ProofContext,
+    workspace_id: &str,
+    name: &str,
+    model: &str,
+    reasoning_effort: ReasoningEffort,
+    approval_policy: ThreadApprovalPolicy,
+    toolset: &[&str],
+) -> ProfileId {
+    let profile_id = ProfileId::new(format!("profile-{name}")).unwrap();
+    let mut connection = Connection::open(&proof.server_db_path).unwrap();
+    let transaction = connection.transaction().unwrap();
+    transaction
+        .execute(
+            "INSERT INTO profiles
+               (id, workspace_id, display_name, model, reasoning_effort,
+                approval_policy, toolset, current_revision, home_thread_id,
+                imported_agent_id, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, NULL, NULL, 1)",
+            params![
+                profile_id.as_str(),
+                workspace_id,
+                name,
+                model,
+                reasoning_effort.as_str(),
+                approval_policy.as_str(),
+                serde_json::to_string(toolset).unwrap(),
+            ],
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "INSERT INTO profile_revisions
+               (profile_id, revision, parent_revision, actor, created_at_ms,
+                content_hash, instructions_markdown, memory_markdown, skill_refs)
+             VALUES (?1, 1, NULL, 'semantic-fixture', 1, ?2, '', '', '[]')",
+            params![
+                profile_id.as_str(),
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            ],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    profile_id
+}
+
+fn open_profile_home(
+    client: &mut DaemonClient,
+    profile_id: ProfileId,
+) -> platonic_protocol::ThreadStatus {
+    assert_eq!(
+        client.profile_open_resolve(profile_id.clone()).unwrap(),
+        ProfileOpenResult::NoHome {
+            profile_id: profile_id.clone()
+        }
+    );
+    let (reservation_id, thread_id) = match client
+        .profile_open_start(
+            profile_id.clone(),
+            "semantic-home".into(),
+            vec![ThreadRepositoryRequest {
+                repo: ".".into(),
+                branch: None,
+            }],
+            ".".into(),
+            ".".into(),
+        )
+        .unwrap()
+    {
+        ProfileOpenResult::ApprovalRequired {
+            home_reservation_id,
+            thread_id,
+            effect,
+            ..
+        } => {
+            assert_eq!(effect, EffectClass::WorkspaceWrite);
+            (home_reservation_id, thread_id)
+        }
+        result => panic!("expected home approval, got {result:?}"),
+    };
+    match client
+        .profile_open_decide(reservation_id, ProfileOpenDecision::Grant)
+        .unwrap()
+    {
+        ProfileOpenResult::Opened {
+            profile_id: opened_profile,
+            thread,
+            created: true,
+        } => {
+            assert_eq!(opened_profile, profile_id);
+            assert_eq!(thread.authority.thread_id, thread_id);
+            thread
+        }
+        result => panic!("expected opened home, got {result:?}"),
+    }
+}
 
 #[cfg(target_os = "linux")]
 #[test]
@@ -254,6 +353,7 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     let mut client = host.connect();
     let hello = client.hello(&proof.workspace).unwrap();
     for capability in [
+        CAPABILITY_PROFILE_OPEN,
         CAPABILITY_THREAD_SPAWN,
         CAPABILITY_THREAD_LIST,
         CAPABILITY_THREAD_STATUS,
@@ -263,52 +363,41 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
         assert!(hello.capabilities.contains(&capability));
     }
 
-    let (spawn_id, root_thread_id) = match client
-        .thread_spawn_start(
-            None,
-            proof
-                .workspace
-                .canonicalize()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-            "gpt-5.6-sol".into(),
-            ReasoningEffort::Xhigh,
-            ThreadApprovalPolicy::Yolo,
-        )
-        .unwrap()
-    {
-        ThreadSpawnResult::ApprovalRequired {
-            spawn_id,
-            thread_id,
-            effect,
-            ..
-        } => {
-            assert_eq!(effect, EffectClass::WorkspaceWrite);
-            (spawn_id, thread_id)
-        }
-        unexpected => panic!("expected root approval, got {unexpected:?}"),
-    };
-    let root_status = match client
-        .thread_spawn_decide(
-            spawn_id,
-            ThreadSpawnDecision::Grant {
-                actor: "semantic_fixture".into(),
-            },
-        )
-        .unwrap()
-    {
-        ThreadSpawnResult::Spawned { thread } => thread,
-        unexpected => panic!("expected spawned root, got {unexpected:?}"),
-    };
+    let profile_id = seed_profile(
+        &proof,
+        &hello.workspace_id,
+        "thread-management",
+        "gpt-5.6-sol",
+        ReasoningEffort::Xhigh,
+        ThreadApprovalPolicy::Yolo,
+        &[
+            "file.read",
+            "file.list",
+            "file.write",
+            "file.edit",
+            "shell.exec",
+            "web.fetch",
+        ],
+    );
+    let opened_home = open_profile_home(&mut client, profile_id.clone());
+    let root_thread_id = opened_home.authority.thread_id.clone();
+    assert!(!opened_home.live.loaded);
+    client
+        .thread_events(root_thread_id.clone(), None, 1, 0)
+        .unwrap();
+    let root_status = client.thread_status(root_thread_id.clone()).unwrap().thread;
     assert_eq!(root_status.authority.thread_id, root_thread_id);
     assert_eq!(root_status.authority.parent_thread_id, None);
-    assert_eq!(root_status.authority.spawning_actor, "semantic_fixture");
+    assert_eq!(root_status.authority.spawning_actor, "local-operator");
+    assert_eq!(root_status.authority.profile_id, Some(profile_id.clone()));
+    assert_eq!(root_status.authority.thread_kind, ThreadKind::Home);
     let root = client
         .thread_authority(root_thread_id.clone())
         .unwrap()
         .authority;
-    assert_eq!(root.agent_id, Some(AgentId::new("plato").unwrap()));
+    assert_eq!(root.agent_id, None);
+    assert_eq!(root.profile_id, Some(profile_id.clone()));
+    assert_eq!(root.thread_kind, ThreadKind::Home);
     assert_eq!(root.worktrees.len(), 1);
     assert_eq!(
         Path::new(&root_status.authority.cwd),
@@ -334,12 +423,8 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     assert!(root.created_at_ms > 0);
     assert!(root_status.live.loaded);
     assert_eq!(root_status.live.current_turn_id, None);
-    assert_eq!(
-        root_status.live.last_activity_at_ms,
-        Some(root.created_at_ms)
-    );
-    let child_cwd = PathBuf::from(&root.worktrees[0].path).join("child");
-    fs::create_dir(&child_cwd).unwrap();
+    assert!(root_status.live.last_activity_at_ms >= Some(root.created_at_ms));
+    let child_cwd = PathBuf::from(&root.worktrees[0].path);
 
     let child_status = match client
         .thread_spawn_start(
@@ -373,7 +458,9 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
         Some(root_thread_id.as_str())
     );
     assert_eq!(child.spawning_actor, "yolo");
-    assert_eq!(child.agent_id, root.agent_id);
+    assert_eq!(child.agent_id, None);
+    assert_eq!(child.profile_id, root.profile_id);
+    assert_eq!(child.thread_kind, ThreadKind::Child);
     assert_eq!(child.toolset, root.toolset);
     assert!(child_status.live.loaded);
     assert_eq!(
@@ -393,45 +480,51 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     );
     let root_stop = client
         .thread_stop(root_thread_id.clone(), "semantic_fixture".into())
+        .unwrap_err();
+    assert!(matches!(
+        root_stop,
+        ClientError::DaemonResponse(error) if error.code == ERROR_THREAD_STOP_FAILED
+    ));
+    let child_stop = client
+        .thread_stop(child_thread_id.clone(), "semantic_fixture".into())
         .unwrap();
-    let root_stopped_at_ms = match root_stop {
+    let child_stopped_at_ms = match child_stop {
         ThreadStopResult::Stopped {
             thread_id,
             stopped_turn_id,
             stopped_at_ms,
         } => {
-            assert_eq!(thread_id, root_thread_id);
+            assert_eq!(thread_id, child_thread_id);
             assert_eq!(stopped_turn_id, None);
             stopped_at_ms
         }
-        unexpected => panic!("expected stopped root, got {unexpected:?}"),
+        unexpected => panic!("expected stopped child, got {unexpected:?}"),
     };
     let listed = client.thread_list().unwrap().threads;
-    let stopped_root = listed
+    let live_home = listed
         .iter()
         .find(|thread| thread.authority.thread_id == root_thread_id)
         .unwrap();
-    let orphaned_child = listed
+    let stopped_child = listed
         .iter()
         .find(|thread| thread.authority.thread_id == child_thread_id)
         .unwrap();
-    assert!(!stopped_root.live.loaded);
-    assert_eq!(stopped_root.live.last_activity_at_ms, None);
-    assert!(orphaned_child.live.loaded);
-    assert_eq!(orphaned_child.authority, child_status.authority);
+    assert!(live_home.live.loaded);
+    assert!(!stopped_child.live.loaded);
+    assert_eq!(stopped_child.authority, child_status.authority);
     let connection = rusqlite::Connection::open(&proof.server_db_path).unwrap();
     assert_eq!(
         connection
             .query_row(
                 "SELECT actor, stopped_turn_id, occurred_at_ms FROM thread_stops WHERE thread_id = ?1",
-                [&root_thread_id],
+                [&child_thread_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)?))
             )
             .unwrap(),
         (
             "semantic_fixture".into(),
             None,
-            i64::try_from(root_stopped_at_ms).unwrap()
+            i64::try_from(child_stopped_at_ms).unwrap()
         )
     );
     drop(connection);
@@ -491,6 +584,85 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
 }
 
 #[test]
+fn pending_profile_home_replays_and_grants_after_daemon_restart() {
+    let _serial = SCENARIO_SERIAL.lock().unwrap();
+    let proof = ProofContext::new();
+    let host = ProofDaemon::start(&proof);
+    let mut client = host.connect();
+    let hello = client.hello(&proof.workspace).unwrap();
+    let profile_id = seed_profile(
+        &proof,
+        &hello.workspace_id,
+        "pending-restart",
+        "test-model",
+        ReasoningEffort::High,
+        ThreadApprovalPolicy::Prompt,
+        &["file.read"],
+    );
+    let (reservation_id, thread_id) = match client
+        .profile_open_start(
+            profile_id.clone(),
+            "pending-restart".into(),
+            vec![ThreadRepositoryRequest {
+                repo: ".".into(),
+                branch: None,
+            }],
+            ".".into(),
+            ".".into(),
+        )
+        .unwrap()
+    {
+        ProfileOpenResult::ApprovalRequired {
+            home_reservation_id,
+            thread_id,
+            ..
+        } => (home_reservation_id, thread_id),
+        result => panic!("expected pending home, got {result:?}"),
+    };
+    host.stop(client);
+
+    let restarted = ProofDaemon::start(&proof);
+    let mut client = restarted.connect();
+    assert_eq!(
+        client.profile_open_resolve(profile_id.clone()).unwrap(),
+        ProfileOpenResult::NoHome {
+            profile_id: profile_id.clone()
+        }
+    );
+    assert!(matches!(
+        client
+            .profile_open_start(
+                profile_id.clone(),
+                "pending-restart".into(),
+                vec![ThreadRepositoryRequest {
+                    repo: ".".into(),
+                    branch: None,
+                }],
+                ".".into(),
+                ".".into(),
+            )
+            .unwrap(),
+        ProfileOpenResult::ApprovalRequired {
+            home_reservation_id,
+            thread_id: replayed_thread_id,
+            ..
+        } if home_reservation_id == reservation_id && replayed_thread_id == thread_id
+    ));
+    assert!(matches!(
+        client
+            .profile_open_decide(reservation_id, ProfileOpenDecision::Grant)
+            .unwrap(),
+        ProfileOpenResult::Opened {
+            created: true,
+            thread,
+            ..
+        } if thread.authority.thread_id == thread_id
+            && Path::new(&thread.authority.cwd).is_dir()
+    ));
+    restarted.stop(client);
+}
+
+#[test]
 fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     let proof = ProofContext::new();
@@ -499,70 +671,24 @@ fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
     write_coordinator_config(&proof.config_path, &provider.base_url);
     let host = ProofDaemon::start(&proof);
     let mut client = host.connect();
-    client.hello(&proof.workspace).unwrap();
-    let workspace_id = client
-        .workspace_list()
-        .unwrap()
-        .workspaces
-        .into_iter()
-        .find(|workspace| Path::new(&workspace.root) == proof.workspace.canonicalize().unwrap())
-        .unwrap()
-        .id;
-    client
-        .agent_create(
-            AgentId::new("bounded-worker").unwrap(),
-            workspace_id,
-            "worker-model".into(),
-            ReasoningEffort::High,
-            ThreadApprovalPolicy::Prompt,
-            vec!["file.read".into()],
-        )
-        .unwrap();
-
-    let (spawn_id, coordinator_thread_id) = match client
-        .thread_spawn_start(
-            None,
-            proof
-                .workspace
-                .canonicalize()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-            "test-model".into(),
-            ReasoningEffort::High,
-            ThreadApprovalPolicy::Prompt,
-        )
-        .unwrap()
-    {
-        ThreadSpawnResult::ApprovalRequired {
-            spawn_id,
-            thread_id,
-            effect,
-            ..
-        } => {
-            assert_eq!(effect, EffectClass::WorkspaceWrite);
-            (spawn_id, thread_id)
-        }
-        result => panic!("expected coordinator approval, got {result:?}"),
-    };
-    assert!(matches!(
-        client
-            .thread_spawn_decide(
-                spawn_id,
-                ThreadSpawnDecision::Grant {
-                    actor: "semantic_fixture".into(),
-                },
-            )
-            .unwrap(),
-        ThreadSpawnResult::Spawned { .. }
-    ));
+    let hello = client.hello(&proof.workspace).unwrap();
+    let profile_id = seed_profile(
+        &proof,
+        &hello.workspace_id,
+        "coordinator",
+        "test-model",
+        ReasoningEffort::High,
+        ThreadApprovalPolicy::Prompt,
+        &["file.read", "thread.spawn"],
+    );
+    let coordinator_thread_id = open_profile_home(&mut client, profile_id.clone())
+        .authority
+        .thread_id;
     let coordinator = client
         .thread_authority(coordinator_thread_id.clone())
         .unwrap()
         .authority;
-    let private_worker_cwd = PathBuf::from(&coordinator.worktrees[0].path).join("worker");
-    fs::create_dir(&private_worker_cwd).unwrap();
-    *worker_cwd.lock().unwrap() = private_worker_cwd.canonicalize().unwrap();
+    *worker_cwd.lock().unwrap() = PathBuf::from(&coordinator.worktrees[0].path);
     assert!(matches!(
         client
             .thread_send(
@@ -642,10 +768,10 @@ fn coordinator_tool_dispatches_one_bounded_worker_and_reports_its_durable_id() {
         Some(coordinator_thread_id.as_str())
     );
     assert_eq!(worker.spawning_actor, "jerome");
-    assert_eq!(
-        worker.agent_id,
-        Some(AgentId::new("bounded-worker").unwrap())
-    );
+    assert_eq!(worker.agent_id, None);
+    assert_eq!(worker.profile_id, Some(profile_id));
+    assert_eq!(worker.thread_kind, ThreadKind::Child);
+    assert_eq!(worker.model, "test-model");
     assert_eq!(worker.toolset, ["file.read"]);
     assert_eq!(worker.approval_policy, ThreadApprovalPolicy::Prompt);
     assert_eq!(worker.worktrees.len(), 1);
@@ -726,6 +852,7 @@ fn thread_send_and_three_observers_are_semantically_conformant_on_host_daemon() 
     let mut controller_b = host.connect();
     let hello = controller_a.hello(&proof.workspace).unwrap();
     for capability in [
+        CAPABILITY_PROFILE_OPEN,
         CAPABILITY_THREAD_SEND,
         CAPABILITY_THREAD_EVENTS,
         CAPABILITY_THREAD_SPAWN,
@@ -735,39 +862,18 @@ fn thread_send_and_three_observers_are_semantically_conformant_on_host_daemon() 
     ] {
         assert!(hello.capabilities.contains(&capability));
     }
-    let (spawn_id, thread_id) = match controller_a
-        .thread_spawn_start(
-            None,
-            proof
-                .workspace
-                .canonicalize()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-            "test-model".into(),
-            ReasoningEffort::High,
-            ThreadApprovalPolicy::Yolo,
-        )
-        .unwrap()
-    {
-        ThreadSpawnResult::ApprovalRequired {
-            spawn_id,
-            thread_id,
-            ..
-        } => (spawn_id, thread_id),
-        unexpected => panic!("expected root approval, got {unexpected:?}"),
-    };
-    assert!(matches!(
-        controller_a
-            .thread_spawn_decide(
-                spawn_id,
-                ThreadSpawnDecision::Grant {
-                    actor: "semantic_fixture".into(),
-                },
-            )
-            .unwrap(),
-        ThreadSpawnResult::Spawned { .. }
-    ));
+    let profile_id = seed_profile(
+        &proof,
+        &hello.workspace_id,
+        "controlled-thread",
+        "test-model",
+        ReasoningEffort::High,
+        ThreadApprovalPolicy::Yolo,
+        &["file.read"],
+    );
+    let thread_id = open_profile_home(&mut controller_a, profile_id)
+        .authority
+        .thread_id;
 
     let mut observers = Vec::new();
     let mut observer_ready = Vec::new();
@@ -1549,7 +1655,6 @@ impl CoordinatorProvider {
                 &ProviderReply::tool_call(
                     "thread_spawn",
                     json!({
-                        "agent_id": "bounded-worker",
                         "cwd": worker_cwd.lock().unwrap().to_string_lossy(),
                         "toolset": ["file.read"]
                     }),

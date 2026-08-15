@@ -2001,6 +2001,8 @@ mod tests {
             &mut runtime,
             ThreadEventsResult {
                 thread_id: "thread_old".into(),
+                live_epoch_id: "epoch_old".into(),
+                reset: None,
                 from_offset: 0,
                 next_offset: 4,
                 current_turn_id: Some("turn_old".into()),

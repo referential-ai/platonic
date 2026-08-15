@@ -2,13 +2,18 @@ use crate::{
     AppResult,
     thread_authority::{ThreadStopRecord, now_ms},
 };
-use std::{collections::HashMap, path::Path};
+use platonic_protocol::ThreadKind;
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 const RECONCILIATION_ACTOR: &str = "startup-reconciliation";
 
 pub(super) fn reconcile_thread_repositories(server_db_path: &Path) -> AppResult<()> {
     let mut store = crate::server_store::ServerStore::open_or_create(server_db_path)?;
     let mut claims = HashMap::<String, (String, Vec<String>)>::new();
+    let mut retained = HashSet::new();
     for claim in store.branch_claims()? {
         let entry = claims
             .entry(claim.thread_id)
@@ -22,20 +27,44 @@ pub(super) fn reconcile_thread_repositories(server_db_path: &Path) -> AppResult<
     }
     for (thread_id, (workspace_id, repos)) in claims {
         match store.thread_authority(&thread_id)? {
-            Some(authority) if store.thread_stop(&thread_id)?.is_none() => {
-                crate::thread_repository::reconcile_and_discard(
+            Some(authority) => match store.thread_stop(&thread_id)? {
+                None if matches!(authority.thread_kind, ThreadKind::Home | ThreadKind::Child) => {
+                    retained.insert(thread_id);
+                    continue;
+                }
+                None => {
+                    crate::thread_repository::reconcile_and_discard(
+                        server_db_path,
+                        &workspace_id,
+                        &authority,
+                    )?;
+                    store.persist_thread_stop(&ThreadStopRecord::new(
+                        thread_id.clone(),
+                        RECONCILIATION_ACTOR.into(),
+                        None,
+                        now_ms(),
+                    )?)?;
+                }
+                Some(_) => crate::thread_repository::discard_claims(
                     server_db_path,
                     &workspace_id,
-                    &authority,
+                    &thread_id,
+                    &repos,
+                )?,
+            },
+            None if store
+                .pending_home_reservation_for_thread(&thread_id)?
+                .is_some() =>
+            {
+                crate::thread_repository::discard_claims(
+                    server_db_path,
+                    &workspace_id,
+                    &thread_id,
+                    &repos,
                 )?;
-                store.persist_thread_stop(&ThreadStopRecord::new(
-                    thread_id.clone(),
-                    RECONCILIATION_ACTOR.into(),
-                    None,
-                    now_ms(),
-                )?)?;
+                continue;
             }
-            Some(_) | None => crate::thread_repository::discard_claims(
+            None => crate::thread_repository::discard_claims(
                 server_db_path,
                 &workspace_id,
                 &thread_id,
@@ -44,7 +73,7 @@ pub(super) fn reconcile_thread_repositories(server_db_path: &Path) -> AppResult<
         }
         store.release_thread_claims(&thread_id)?;
     }
-    crate::thread_repository::remove_all_thread_roots(server_db_path)
+    crate::thread_repository::remove_thread_roots_except(server_db_path, &retained)
 }
 
 #[cfg(all(test, unix))]
@@ -123,7 +152,11 @@ mod tests {
             thread_id: "thread_crashed".into(),
             parent_thread_id: None,
             spawning_actor: "test".into(),
+            cwd: None,
             agent_id: Some(AgentId::new("plato").unwrap()),
+            profile_id: None,
+            profile_revision: None,
+            thread_kind: platonic_protocol::ThreadKind::Legacy,
             model: "gpt-test".into(),
             reasoning_effort: ReasoningEffort::None,
             approval_policy: ThreadApprovalPolicy::Prompt,

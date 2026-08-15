@@ -69,7 +69,7 @@ const BOOTSTRAP_TOOLS: &[ToolDefinition] = &[
         internal_name: THREAD_SPAWN,
         provider_name: PROVIDER_THREAD_SPAWN,
         effect: EffectClass::WorkspaceWrite,
-        description: "Spawn one bounded worker thread from a configured agent after approval.",
+        description: "Spawn one bounded same-profile child thread after approval.",
         input_schema: ToolInputSchema::ThreadSpawn,
     },
     ToolDefinition {
@@ -251,10 +251,6 @@ impl ToolInputSchema {
             Self::ThreadSpawn => json!({
                 "type": "object",
                 "properties": {
-                    "agent_id": {
-                        "type": "string",
-                        "description": "Configured target agent in the coordinator's workspace."
-                    },
                     "cwd": {
                         "type": "string",
                         "description": "Absolute worker directory within the coordinator's granted paths."
@@ -277,7 +273,7 @@ impl ToolInputSchema {
                         "type": "array",
                         "items": {"type": "string"},
                         "uniqueItems": true,
-                        "description": "Optional narrowing override of the target agent's default toolset."
+                        "description": "Optional narrowing override of the profile's default toolset."
                     },
                     "repositories": {
                         "type": "array",
@@ -300,7 +296,7 @@ impl ToolInputSchema {
                         "description": "Optional repository and branch claims."
                     }
                 },
-                "required": ["agent_id", "cwd"],
+                "required": ["cwd"],
                 "additionalProperties": false
             }),
             Self::ComputerWindows => json!({
@@ -449,10 +445,6 @@ mod tests {
             json!({
                 "type": "object",
                 "properties": {
-                    "agent_id": {
-                        "type": "string",
-                        "description": "Configured target agent in the coordinator's workspace."
-                    },
                     "cwd": {
                         "type": "string",
                         "description": "Absolute worker directory within the coordinator's granted paths."
@@ -475,7 +467,7 @@ mod tests {
                         "type": "array",
                         "items": {"type": "string"},
                         "uniqueItems": true,
-                        "description": "Optional narrowing override of the target agent's default toolset."
+                        "description": "Optional narrowing override of the profile's default toolset."
                     },
                     "repositories": {
                         "type": "array",
@@ -498,7 +490,7 @@ mod tests {
                         "description": "Optional repository and branch claims."
                     }
                 },
-                "required": ["agent_id", "cwd"],
+                "required": ["cwd"],
                 "additionalProperties": false
             })
         );

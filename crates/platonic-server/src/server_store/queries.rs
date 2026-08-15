@@ -7,7 +7,8 @@ use super::{
     },
     schema::migrate_server_schema,
     types::{
-        AgentRecord, DurableThreadAuthority, ProfileRecord, ProfileRevisionRecord,
+        AgentRecord, DurableThreadAuthority, HomeReservationRecord, HomeReservationState,
+        ProfileHomeProposal, ProfileRecord, ProfileRevisionRecord, ReserveProfileHomeResult,
         RunCancellationRecord, ToolCallApprovalDecision, ToolCallApprovalRecord, WorkspaceRecord,
     },
 };
@@ -16,13 +17,13 @@ use crate::{
     ledger::{row_u64, sqlite_i64},
     paths,
     thread_authority::{
-        LegacyReason, ThreadKind, ThreadProfileAuthority, ThreadSpawnApprovalRecord,
-        ThreadSpawnDecisionName, ThreadStopRecord, authority_working_directory,
-        validate_child_authority, validate_complete_authority,
+        LegacyReason, ThreadProfileAuthority, ThreadSpawnApprovalRecord, ThreadSpawnDecisionName,
+        ThreadStopRecord, authority_working_directory, validate_child_authority,
+        validate_complete_authority,
     },
 };
 use platonic_core::{AgentId, ProfileId};
-use platonic_protocol::{ThreadAuthorityRecord, ThreadConfinement};
+use platonic_protocol::{ThreadAuthorityRecord, ThreadConfinement, ThreadKind};
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use std::{
     path::{Path, PathBuf},
@@ -581,6 +582,307 @@ impl ServerStore {
             .optional()?)
     }
 
+    pub(crate) fn reserve_profile_home(
+        &mut self,
+        reservation: &HomeReservationRecord,
+        claims: &[(String, String)],
+    ) -> AppResult<ReserveProfileHomeResult> {
+        if reservation.state != HomeReservationState::Pending
+            || reservation.decided_by.is_some()
+            || reservation.reason.is_some()
+            || reservation.decided_at_ms.is_some()
+        {
+            return Err(AppError::Config(
+                "new home reservation must be pending and undecided".into(),
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let profile = transaction
+            .query_row(
+                "SELECT id, workspace_id, display_name, model, reasoning_effort,
+                        approval_policy, toolset, current_revision, home_thread_id,
+                        imported_agent_id, created_at_ms
+                 FROM profiles WHERE id = ?1",
+                params![reservation.profile_id.as_str()],
+                profile_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                AppError::Config(format!("profile not found: {}", reservation.profile_id))
+            })?;
+        if profile.workspace_id != reservation.workspace_id {
+            return Err(AppError::Config(format!(
+                "profile {} belongs to another workspace",
+                reservation.profile_id
+            )));
+        }
+        if let Some(existing) = home_reservation_by_key_from(
+            &transaction,
+            &reservation.profile_id,
+            &reservation.idempotency_key,
+        )? {
+            transaction.commit()?;
+            return if existing.proposal == reservation.proposal {
+                Ok(ReserveProfileHomeResult::Replayed(existing))
+            } else {
+                Ok(ReserveProfileHomeResult::Conflict(format!(
+                    "idempotency key {} names a different home proposal",
+                    reservation.idempotency_key
+                )))
+            };
+        }
+        if profile.home_thread_id.is_some() {
+            transaction.commit()?;
+            return Ok(ReserveProfileHomeResult::Conflict(format!(
+                "profile {} already has a home",
+                reservation.profile_id
+            )));
+        }
+        if let Some(existing) =
+            pending_home_reservation_from(&transaction, &reservation.profile_id)?
+        {
+            transaction.commit()?;
+            return Ok(ReserveProfileHomeResult::Conflict(format!(
+                "profile {} already has pending home reservation {}",
+                reservation.profile_id, existing.id
+            )));
+        }
+        for (repo, branch) in claims {
+            if let Some(thread_id) = transaction
+                .query_row(
+                    "SELECT thread_id FROM thread_branch_claims
+                     WHERE workspace_id = ?1 AND repo = ?2 AND branch = ?3",
+                    params![reservation.workspace_id, repo, branch],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                transaction.commit()?;
+                return Ok(ReserveProfileHomeResult::Conflict(format!(
+                    "branch {branch} in repository {repo} is already claimed by thread {thread_id}"
+                )));
+            }
+        }
+        transaction.execute(
+            "INSERT INTO home_reservations
+               (id, workspace_id, profile_id, idempotency_key, proposal, draft,
+                state, decided_by, reason, created_at_ms, decided_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, NULL, ?7, NULL)",
+            params![
+                reservation.id,
+                reservation.workspace_id,
+                reservation.profile_id.as_str(),
+                reservation.idempotency_key,
+                serde_json::to_string(&reservation.proposal)?,
+                serde_json::to_string(&reservation.draft)?,
+                sqlite_i64(reservation.created_at_ms, "home reservation created_at_ms")?,
+            ],
+        )?;
+        for (repo, branch) in claims {
+            transaction.execute(
+                "INSERT INTO thread_branch_claims
+                   (workspace_id, repo, branch, thread_id, claimed_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    reservation.workspace_id,
+                    repo,
+                    branch,
+                    reservation.draft.thread_id,
+                    sqlite_i64(reservation.created_at_ms, "branch claim claimed_at_ms")?,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(ReserveProfileHomeResult::Reserved(reservation.clone()))
+    }
+
+    pub(crate) fn home_reservation(
+        &self,
+        reservation_id: &str,
+    ) -> AppResult<Option<HomeReservationRecord>> {
+        home_reservation_from(&self.connection, reservation_id)
+    }
+
+    pub(crate) fn profile_home_reservation(
+        &self,
+        profile_id: &ProfileId,
+        idempotency_key: &str,
+    ) -> AppResult<Option<HomeReservationRecord>> {
+        home_reservation_by_key_from(&self.connection, profile_id, idempotency_key)
+    }
+
+    pub(crate) fn pending_home_reservation_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> AppResult<Option<HomeReservationRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, workspace_id, profile_id, idempotency_key, proposal, draft,
+                    state, decided_by, reason, created_at_ms, decided_at_ms
+             FROM home_reservations WHERE state = 'pending'",
+        )?;
+        for reservation in statement.query_map([], home_reservation_from_row)? {
+            let reservation = reservation?;
+            if reservation.draft.thread_id == thread_id {
+                return Ok(Some(reservation));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn decide_profile_home_without_authority(
+        &mut self,
+        reservation_id: &str,
+        state: HomeReservationState,
+        actor: &str,
+        reason: Option<&str>,
+        decided_at_ms: u64,
+    ) -> AppResult<HomeReservationRecord> {
+        if !matches!(
+            state,
+            HomeReservationState::Denied | HomeReservationState::Canceled
+        ) || (state == HomeReservationState::Denied) != reason.is_some()
+        {
+            return Err(AppError::Config("invalid home reservation decision".into()));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reservation =
+            home_reservation_from(&transaction, reservation_id)?.ok_or_else(|| {
+                AppError::Config(format!("home reservation not found: {reservation_id}"))
+            })?;
+        if reservation.state != HomeReservationState::Pending {
+            transaction.commit()?;
+            return Ok(reservation);
+        }
+        transaction.execute(
+            "UPDATE home_reservations
+                SET state = ?2, decided_by = ?3, reason = ?4, decided_at_ms = ?5
+              WHERE id = ?1 AND state = 'pending'",
+            params![
+                reservation_id,
+                state.as_str(),
+                actor,
+                reason,
+                sqlite_i64(decided_at_ms, "home reservation decided_at_ms")?,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM thread_branch_claims WHERE thread_id = ?1",
+            params![reservation.draft.thread_id],
+        )?;
+        let decided = home_reservation_from(&transaction, reservation_id)?
+            .expect("updated home reservation remains readable");
+        transaction.commit()?;
+        Ok(decided)
+    }
+
+    pub(crate) fn persist_profile_home(
+        &mut self,
+        reservation_id: &str,
+        authority: &ThreadAuthorityRecord,
+        confinement: ThreadConfinement,
+        actor: &str,
+        decided_at_ms: u64,
+    ) -> AppResult<(DurableThreadAuthority, bool)> {
+        validate_complete_authority(authority)?;
+        if authority.thread_kind != ThreadKind::Home || authority.parent_thread_id.is_some() {
+            return Err(AppError::Config(
+                "profile home persistence requires a parentless home authority".into(),
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reservation =
+            home_reservation_from(&transaction, reservation_id)?.ok_or_else(|| {
+                AppError::Config(format!("home reservation not found: {reservation_id}"))
+            })?;
+        if reservation.state == HomeReservationState::Granted {
+            let existing = thread_authority_from(&transaction, &reservation.draft.thread_id)?
+                .ok_or_else(|| {
+                    AppError::Config(format!(
+                        "granted home reservation {reservation_id} has no authority"
+                    ))
+                })?;
+            transaction.commit()?;
+            return Ok((DurableThreadAuthority(existing), false));
+        }
+        if reservation.state != HomeReservationState::Pending
+            || authority.thread_id != reservation.draft.thread_id
+            || authority.profile_id.as_ref() != Some(&reservation.profile_id)
+            || authority.profile_revision != Some(reservation.draft.profile_revision)
+            || authority.model != reservation.draft.model
+            || authority.reasoning_effort != reservation.draft.reasoning_effort
+            || authority.approval_policy != reservation.draft.approval_policy
+            || authority.toolset != reservation.draft.toolset
+            || authority.network != reservation.draft.network
+        {
+            return Err(AppError::Config(format!(
+                "home authority conflicts with reservation {reservation_id}"
+            )));
+        }
+        let current_home = transaction
+            .query_row(
+                "SELECT home_thread_id FROM profiles
+                 WHERE id = ?1 AND workspace_id = ?2",
+                params![reservation.profile_id.as_str(), reservation.workspace_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                AppError::Config(format!("profile not found: {}", reservation.profile_id))
+            })?;
+        if current_home.is_some() {
+            return Err(AppError::Config(format!(
+                "profile {} already has a home",
+                reservation.profile_id
+            )));
+        }
+        let profile_authority = ThreadProfileAuthority {
+            workspace_id: Some(reservation.workspace_id.clone()),
+            profile_id: Some(reservation.profile_id.clone()),
+            profile_revision: authority.profile_revision,
+            thread_kind: ThreadKind::Home,
+            legacy_reason: None,
+        };
+        insert_thread_authority(&transaction, authority, &profile_authority)?;
+        transaction.execute(
+            "INSERT INTO thread_confinements (thread_id, backend, recorded_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![
+                authority.thread_id,
+                confinement.as_str(),
+                sqlite_i64(decided_at_ms, "thread confinement recorded_at_ms")?,
+            ],
+        )?;
+        let designated = transaction.execute(
+            "UPDATE profiles SET home_thread_id = ?2
+             WHERE id = ?1 AND home_thread_id IS NULL",
+            params![reservation.profile_id.as_str(), authority.thread_id],
+        )?;
+        if designated != 1 {
+            return Err(AppError::Config(format!(
+                "profile {} home designation raced",
+                reservation.profile_id
+            )));
+        }
+        transaction.execute(
+            "UPDATE home_reservations
+                SET state = 'granted', decided_by = ?2, decided_at_ms = ?3
+              WHERE id = ?1 AND state = 'pending'",
+            params![
+                reservation_id,
+                actor,
+                sqlite_i64(decided_at_ms, "home reservation decided_at_ms")?,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok((DurableThreadAuthority(authority.clone()), true))
+    }
+
     fn ensure_profile_homes(&self) -> AppResult<()> {
         let mut statement = self.connection.prepare(
             "SELECT id, workspace_id, display_name, model, reasoning_effort,
@@ -779,6 +1081,13 @@ impl ServerStore {
         }
 
         if let Some(authority) = authority
+            && authority.thread_kind == ThreadKind::Home
+        {
+            return Err(AppError::Config(
+                "home authority requires a profile.open reservation".into(),
+            ));
+        }
+        if let Some(authority) = authority
             && let Some(parent_thread_id) = authority.parent_thread_id.as_deref()
         {
             let parent =
@@ -794,10 +1103,14 @@ impl ServerStore {
                 thread_id: authority.thread_id.clone(),
                 parent_thread_id: authority.parent_thread_id.clone(),
                 cwd: cwd.to_string_lossy().into_owned(),
-                agent_id: authority
-                    .agent_id
+                agent_id: authority.agent_id.clone(),
+                profile_id: authority
+                    .profile_id
                     .clone()
-                    .expect("complete authority has an agent id"),
+                    .or_else(|| parent.profile_id.clone())
+                    .unwrap_or_else(|| ProfileId::new("legacy_validation").unwrap()),
+                profile_revision: authority.profile_revision.unwrap_or(1),
+                thread_kind: authority.thread_kind,
                 model: authority.model.clone(),
                 reasoning_effort: authority.reasoning_effort,
                 approval_policy: authority.approval_policy,
@@ -809,6 +1122,15 @@ impl ServerStore {
             };
             validate_child_authority(&parent, &draft)
                 .map_err(|error| AppError::Config(error.to_string()))?;
+            if authority.thread_kind == ThreadKind::Child
+                && (parent.profile_id != authority.profile_id
+                    || !matches!(parent.thread_kind, ThreadKind::Home | ThreadKind::Child)
+                    || thread_stop_from(&transaction, parent_thread_id)?.is_some())
+            {
+                return Err(AppError::Config(
+                    "child requires a live same-profile parent".into(),
+                ));
+            }
         }
 
         transaction.execute(
@@ -825,45 +1147,12 @@ impl ServerStore {
             ],
         )?;
         if let Some(authority) = authority {
-            let toolset = serde_json::to_string(&authority.toolset)?;
-            let worktrees = serde_json::to_string(&authority.worktrees)?;
-            let granted_paths = serde_json::to_string(&authority.granted_paths)?;
-            let profile_authority = legacy_profile_authority(&transaction, authority)?;
-            transaction.execute(
-                "INSERT INTO thread_authorities
-                   (thread_id, parent_thread_id, spawning_actor, agent_id,
-                    workspace_id, profile_id, profile_revision, thread_kind,
-                    legacy_reason, model, reasoning_effort, approval_policy,
-                    toolset, worktrees, granted_paths, network, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                         ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-                params![
-                    authority.thread_id,
-                    authority.parent_thread_id,
-                    authority.spawning_actor,
-                    authority
-                        .agent_id
-                        .as_ref()
-                        .map(AgentId::as_str)
-                        .expect("complete authority has an agent id"),
-                    profile_authority.workspace_id,
-                    profile_authority.profile_id.as_ref().map(ProfileId::as_str),
-                    profile_authority
-                        .profile_revision
-                        .map(|revision| sqlite_i64(revision, "thread profile revision"))
-                        .transpose()?,
-                    profile_authority.thread_kind.as_str(),
-                    profile_authority.legacy_reason.map(LegacyReason::as_str),
-                    authority.model,
-                    authority.reasoning_effort.as_str(),
-                    authority.approval_policy.as_str(),
-                    toolset,
-                    worktrees,
-                    granted_paths,
-                    authority.network,
-                    sqlite_i64(authority.created_at_ms, "thread created_at_ms")?
-                ],
-            )?;
+            let profile_authority = match authority.thread_kind {
+                ThreadKind::Legacy => legacy_profile_authority(&transaction, authority)?,
+                ThreadKind::Child => new_profile_authority(&transaction, authority)?,
+                ThreadKind::Home => unreachable!("home authorities were rejected above"),
+            };
+            insert_thread_authority(&transaction, authority, &profile_authority)?;
             if let Some(confinement) = confinement {
                 transaction.execute(
                     "INSERT INTO thread_confinements (thread_id, backend, recorded_at_ms)
@@ -904,7 +1193,8 @@ impl ServerStore {
         let mut statement = self.connection.prepare(
             "SELECT thread_id, parent_thread_id, spawning_actor, cwd, agent_id,
                     model, reasoning_effort, approval_policy, toolset, worktrees,
-                    granted_paths, network, created_at_ms
+                    granted_paths, network, created_at_ms, profile_id,
+                    profile_revision, thread_kind
              FROM thread_authorities
              ORDER BY created_at_ms ASC, thread_id ASC",
         )?;
@@ -1023,11 +1313,16 @@ impl ServerStore {
             transaction.commit()?;
             return Ok((existing, false));
         }
-        if thread_authority_from(&transaction, &stop.thread_id)?.is_none() {
-            return Err(AppError::Config(format!(
+        let authority = thread_authority_from(&transaction, &stop.thread_id)?.ok_or_else(|| {
+            AppError::Config(format!(
                 "thread stop has no durable authority: {}",
                 stop.thread_id
-            )));
+            ))
+        })?;
+        if authority.thread_kind == ThreadKind::Home {
+            return Err(AppError::Config(
+                "profile home threads cannot be stopped".into(),
+            ));
         }
         transaction.execute(
             "INSERT INTO thread_stops (thread_id, actor, stopped_turn_id, occurred_at_ms)
@@ -1171,13 +1466,94 @@ fn thread_authority_from(
         .query_row(
             "SELECT thread_id, parent_thread_id, spawning_actor, cwd, agent_id,
                     model, reasoning_effort, approval_policy, toolset, worktrees,
-                    granted_paths, network, created_at_ms
+                    granted_paths, network, created_at_ms, profile_id,
+                    profile_revision, thread_kind
              FROM thread_authorities
              WHERE thread_id = ?1",
             params![thread_id],
             thread_authority_from_row,
         )
         .optional()?)
+}
+
+fn home_reservation_from(
+    connection: &Connection,
+    reservation_id: &str,
+) -> AppResult<Option<HomeReservationRecord>> {
+    Ok(connection
+        .query_row(
+            "SELECT id, workspace_id, profile_id, idempotency_key, proposal, draft,
+                    state, decided_by, reason, created_at_ms, decided_at_ms
+             FROM home_reservations WHERE id = ?1",
+            params![reservation_id],
+            home_reservation_from_row,
+        )
+        .optional()?)
+}
+
+fn home_reservation_by_key_from(
+    connection: &Connection,
+    profile_id: &ProfileId,
+    idempotency_key: &str,
+) -> AppResult<Option<HomeReservationRecord>> {
+    Ok(connection
+        .query_row(
+            "SELECT id, workspace_id, profile_id, idempotency_key, proposal, draft,
+                    state, decided_by, reason, created_at_ms, decided_at_ms
+             FROM home_reservations WHERE profile_id = ?1 AND idempotency_key = ?2",
+            params![profile_id.as_str(), idempotency_key],
+            home_reservation_from_row,
+        )
+        .optional()?)
+}
+
+fn pending_home_reservation_from(
+    connection: &Connection,
+    profile_id: &ProfileId,
+) -> AppResult<Option<HomeReservationRecord>> {
+    Ok(connection
+        .query_row(
+            "SELECT id, workspace_id, profile_id, idempotency_key, proposal, draft,
+                    state, decided_by, reason, created_at_ms, decided_at_ms
+             FROM home_reservations WHERE profile_id = ?1 AND state = 'pending'",
+            params![profile_id.as_str()],
+            home_reservation_from_row,
+        )
+        .optional()?)
+}
+
+fn home_reservation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HomeReservationRecord> {
+    let profile_id = ProfileId::new(row.get::<_, String>(2)?)
+        .map_err(|error| invalid_thread_column(2, error.to_string()))?;
+    let proposal = serde_json::from_str::<ProfileHomeProposal>(&row.get::<_, String>(4)?)
+        .map_err(|error| invalid_thread_column(4, error.to_string()))?;
+    let draft = serde_json::from_str(&row.get::<_, String>(5)?)
+        .map_err(|error| invalid_thread_column(5, error.to_string()))?;
+    let state_value: String = row.get(6)?;
+    let state = HomeReservationState::parse(&state_value).ok_or_else(|| {
+        invalid_thread_column(6, format!("unknown home reservation state: {state_value}"))
+    })?;
+    let decided_at_ms = row
+        .get::<_, Option<i64>>(10)?
+        .map(|value| {
+            value.try_into().map_err(|_| {
+                invalid_thread_column(10, format!("negative reservation timestamp: {value}"))
+            })
+        })
+        .transpose()?;
+    Ok(HomeReservationRecord {
+        id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        profile_id,
+        idempotency_key: row.get(3)?,
+        proposal,
+        draft,
+        state,
+        decided_by: row.get(7)?,
+        reason: row.get(8)?,
+        created_at_ms: row_u64(row, 9, "home reservation created_at_ms")?,
+        decided_at_ms,
+    })
 }
 
 fn thread_profile_authority_from(
@@ -1192,6 +1568,74 @@ fn thread_profile_authority_from(
             thread_profile_authority_from_row,
         )
         .optional()?)
+}
+
+fn new_profile_authority(
+    connection: &Connection,
+    authority: &ThreadAuthorityRecord,
+) -> AppResult<ThreadProfileAuthority> {
+    let profile_id = authority
+        .profile_id
+        .clone()
+        .ok_or_else(|| AppError::Config("new thread authority has no profile id".into()))?;
+    let profile_revision = authority
+        .profile_revision
+        .ok_or_else(|| AppError::Config("new thread authority has no profile revision".into()))?;
+    let workspace_id = connection
+        .query_row(
+            "SELECT workspace_id FROM profiles WHERE id = ?1",
+            params![profile_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::Config(format!("profile not found: {profile_id}")))?;
+    Ok(ThreadProfileAuthority {
+        workspace_id: Some(workspace_id),
+        profile_id: Some(profile_id),
+        profile_revision: Some(profile_revision),
+        thread_kind: authority.thread_kind,
+        legacy_reason: None,
+    })
+}
+
+fn insert_thread_authority(
+    connection: &Connection,
+    authority: &ThreadAuthorityRecord,
+    profile_authority: &ThreadProfileAuthority,
+) -> AppResult<()> {
+    connection.execute(
+        "INSERT INTO thread_authorities
+           (thread_id, parent_thread_id, spawning_actor, cwd, agent_id,
+            workspace_id, profile_id, profile_revision, thread_kind,
+            legacy_reason, model, reasoning_effort, approval_policy,
+            toolset, worktrees, granted_paths, network, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        params![
+            authority.thread_id,
+            authority.parent_thread_id,
+            authority.spawning_actor,
+            authority.cwd,
+            authority.agent_id.as_ref().map(AgentId::as_str),
+            profile_authority.workspace_id,
+            profile_authority.profile_id.as_ref().map(ProfileId::as_str),
+            profile_authority
+                .profile_revision
+                .map(|revision| sqlite_i64(revision, "thread profile revision"))
+                .transpose()?,
+            profile_authority.thread_kind.as_str(),
+            profile_authority.legacy_reason.map(LegacyReason::as_str),
+            authority.model,
+            authority.reasoning_effort.as_str(),
+            authority.approval_policy.as_str(),
+            serde_json::to_string(&authority.toolset)?,
+            serde_json::to_string(&authority.worktrees)?,
+            serde_json::to_string(&authority.granted_paths)?,
+            authority.network,
+            sqlite_i64(authority.created_at_ms, "thread created_at_ms")?,
+        ],
+    )?;
+    Ok(())
 }
 
 fn legacy_profile_authority(
@@ -1648,7 +2092,8 @@ mod tests {
             journal,
             [
                 (1, "server_store_baseline".into()),
-                (2, "profile_registry".into())
+                (2, "profile_registry".into()),
+                (3, "profile_home_lifecycle".into())
             ]
         );
         store
@@ -1721,7 +2166,11 @@ mod tests {
             thread_id: thread_id.into(),
             parent_thread_id: parent_thread_id.map(str::to_owned),
             spawning_actor: actor.into(),
+            cwd: Some(cwd.canonicalize().unwrap().to_string_lossy().into_owned()),
             agent_id: Some(AgentId::new("plato").unwrap()),
+            profile_id: None,
+            profile_revision: None,
+            thread_kind: ThreadKind::Legacy,
             model: "gpt-5.6-sol".into(),
             reasoning_effort: ReasoningEffort::Xhigh,
             approval_policy: policy,
@@ -1846,7 +2295,13 @@ mod tests {
         assert_eq!(
             stored,
             (
-                None,
+                Some(
+                    dir.path()
+                        .canonicalize()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                ),
                 "plato".into(),
                 r#"["file.read","file.write"]"#.into(),
                 "[]".into(),
@@ -2633,7 +3088,11 @@ mod tests {
                 thread_id: "thread_literal".into(),
                 parent_thread_id: Some("thread_parent".into()),
                 spawning_actor: "fixture_actor".into(),
+                cwd: Some(cwd.to_string_lossy().into_owned()),
                 agent_id: None,
+                profile_id: None,
+                profile_revision: None,
+                thread_kind: ThreadKind::Legacy,
                 model: "gpt-5.6-sol".into(),
                 reasoning_effort: ReasoningEffort::Xhigh,
                 approval_policy: ThreadApprovalPolicy::Prompt,

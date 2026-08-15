@@ -2,6 +2,7 @@ use crate::{AppError, AppResult, paths};
 use platonic_protocol::{
     ThreadAuthorityRecord, ThreadGrantedPath, ThreadRepositoryRequest, ThreadWorktree,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
@@ -10,7 +11,7 @@ use std::{
     process::{Command, Output},
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ThreadRepositoryDraft {
     pub(crate) repo: String,
     pub(crate) source_path: PathBuf,
@@ -371,7 +372,10 @@ pub(crate) fn remove_thread_root(server_db_path: &Path, thread_id: &str) -> AppR
     }
 }
 
-pub(crate) fn remove_all_thread_roots(server_db_path: &Path) -> AppResult<()> {
+pub(crate) fn remove_thread_roots_except(
+    server_db_path: &Path,
+    retained: &HashSet<String>,
+) -> AppResult<()> {
     let root = paths::thread_repositories_root(server_db_path)?;
     let entries = match fs::read_dir(&root) {
         Ok(entries) => entries,
@@ -380,6 +384,13 @@ pub(crate) fn remove_all_thread_roots(server_db_path: &Path) -> AppResult<()> {
     };
     for entry in entries {
         let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|thread_id| retained.contains(thread_id))
+        {
+            continue;
+        }
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             fs::remove_dir_all(entry.path())?;
@@ -692,7 +703,11 @@ mod tests {
             thread_id: "thread_test".into(),
             parent_thread_id: None,
             spawning_actor: "test".into(),
+            cwd: None,
             agent_id: Some(AgentId::new("plato").unwrap()),
+            profile_id: None,
+            profile_revision: None,
+            thread_kind: platonic_protocol::ThreadKind::Legacy,
             model: "gpt-test".into(),
             reasoning_effort: ReasoningEffort::None,
             approval_policy: ThreadApprovalPolicy::Prompt,
@@ -815,7 +830,11 @@ mod tests {
                         thread_id: thread_id.into(),
                         parent_thread_id: None,
                         spawning_actor: "test".into(),
+                        cwd: None,
                         agent_id: Some(AgentId::new("plato").unwrap()),
+                        profile_id: None,
+                        profile_revision: None,
+                        thread_kind: platonic_protocol::ThreadKind::Legacy,
                         model: "gpt-test".into(),
                         reasoning_effort: ReasoningEffort::None,
                         approval_policy: ThreadApprovalPolicy::Prompt,

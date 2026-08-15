@@ -137,7 +137,6 @@ mod tests {
         let child = ChildMessage::ThreadSpawn {
             request_id: 7,
             input: ThreadSpawnToolInput {
-                agent_id: "worker".into(),
                 cwd: "/tmp/workspace".into(),
                 model: None,
                 reasoning_effort: None,
@@ -155,7 +154,7 @@ mod tests {
                 approving_actor,
             } => {
                 assert_eq!(request_id, 7);
-                assert_eq!(input.agent_id, "worker");
+                assert_eq!(input.cwd, "/tmp/workspace");
                 assert_eq!(input.toolset.unwrap(), ["file.read"]);
                 assert_eq!(approving_actor, "daemon");
             }

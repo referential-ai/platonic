@@ -57,7 +57,7 @@ pub(super) struct DaemonRuntime {
     shutdown_flush_barrier: Arc<Mutex<Option<Arc<Barrier>>>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct RuntimeState {
     pub(super) runs: HashMap<String, Arc<RunRecord>>,
     live_threads: HashMap<String, Arc<LiveThread>>,
@@ -69,6 +69,27 @@ pub(super) struct RuntimeState {
     shutdown_accepted: bool,
     issue_prep_active: bool,
     approval_profiles: HashMap<String, ApprovalProfile>,
+    live_epoch_id: String,
+    deciding_home_reservations: HashSet<String>,
+}
+
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self {
+            runs: HashMap::new(),
+            live_threads: HashMap::new(),
+            active_thread_runs: HashMap::new(),
+            stopping_threads: HashSet::new(),
+            stopped_threads: HashSet::new(),
+            pending_thread_spawns: HashMap::new(),
+            terminal_runs: VecDeque::new(),
+            shutdown_accepted: false,
+            issue_prep_active: false,
+            approval_profiles: HashMap::new(),
+            live_epoch_id: crate::thread_authority::new_live_epoch_id(),
+            deciding_home_reservations: HashSet::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,6 +178,30 @@ impl DaemonRuntime {
 
     pub(super) fn max_spawn_depth(&self) -> u32 {
         self.max_spawn_depth
+    }
+
+    pub(super) fn live_epoch_id(&self) -> String {
+        self.state
+            .lock()
+            .expect("runtime state lock poisoned")
+            .live_epoch_id
+            .clone()
+    }
+
+    pub(super) fn claim_home_reservation_decision(&self, reservation_id: &str) -> bool {
+        self.state
+            .lock()
+            .expect("runtime state lock poisoned")
+            .deciding_home_reservations
+            .insert(reservation_id.into())
+    }
+
+    pub(super) fn release_home_reservation_decision(&self, reservation_id: &str) {
+        self.state
+            .lock()
+            .expect("runtime state lock poisoned")
+            .deciding_home_reservations
+            .remove(reservation_id);
     }
 
     pub(super) fn require_confinement(&self) -> bool {

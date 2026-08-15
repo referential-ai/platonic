@@ -6,10 +6,12 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-pub(super) const SERVER_SCHEMA_VERSION: u32 = 2;
+pub(super) const SERVER_SCHEMA_VERSION: u32 = 3;
 const BASE_SCHEMA_VERSION: u32 = 1;
+const PROFILE_SCHEMA_VERSION: u32 = 2;
 const BASE_MIGRATION_NAME: &str = "server_store_baseline";
 const PROFILE_MIGRATION_NAME: &str = "profile_registry";
+const HOME_LIFECYCLE_MIGRATION_NAME: &str = "profile_home_lifecycle";
 const IMPORT_ACTOR: &str = "migration:agents-v1";
 
 pub(super) fn migrate_server_schema(connection: &mut Connection) -> AppResult<()> {
@@ -41,8 +43,12 @@ pub(super) fn migrate_server_schema(connection: &mut Connection) -> AppResult<()
         migrate_baseline(&transaction)?;
         version = BASE_SCHEMA_VERSION;
     }
-    if version < SERVER_SCHEMA_VERSION {
+    if version < PROFILE_SCHEMA_VERSION {
         migrate_profiles(&transaction)?;
+        version = PROFILE_SCHEMA_VERSION;
+    }
+    if version < SERVER_SCHEMA_VERSION {
+        migrate_home_lifecycle(&transaction)?;
     }
     validate_migration_journal(&transaction, SERVER_SCHEMA_VERSION)?;
     transaction.commit()?;
@@ -75,7 +81,121 @@ fn migrate_profiles(transaction: &Transaction<'_>) -> AppResult<()> {
     create_profile_tables(transaction)?;
     let agents = import_agents(transaction)?;
     migrate_thread_authorities(transaction, &agents)?;
-    record_migration(transaction, SERVER_SCHEMA_VERSION, PROFILE_MIGRATION_NAME)?;
+    record_migration(transaction, PROFILE_SCHEMA_VERSION, PROFILE_MIGRATION_NAME)?;
+    transaction.pragma_update(None, "user_version", PROFILE_SCHEMA_VERSION)?;
+    Ok(())
+}
+
+fn migrate_home_lifecycle(transaction: &Transaction<'_>) -> AppResult<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE home_reservations (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          profile_id TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          proposal TEXT NOT NULL,
+          draft TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('pending', 'granted', 'denied', 'canceled')),
+          decided_by TEXT,
+          reason TEXT,
+          created_at_ms INTEGER NOT NULL,
+          decided_at_ms INTEGER,
+          UNIQUE (profile_id, idempotency_key),
+          CHECK (
+            (state = 'pending' AND decided_by IS NULL AND reason IS NULL AND decided_at_ms IS NULL)
+            OR (state = 'granted' AND decided_by IS NOT NULL AND reason IS NULL AND decided_at_ms IS NOT NULL)
+            OR (state = 'denied' AND decided_by IS NOT NULL AND reason IS NOT NULL AND decided_at_ms IS NOT NULL)
+            OR (state = 'canceled' AND decided_by IS NOT NULL AND reason IS NULL AND decided_at_ms IS NOT NULL)
+          ),
+          FOREIGN KEY (profile_id) REFERENCES profiles(id)
+        );
+
+        CREATE UNIQUE INDEX one_pending_home_reservation_per_profile
+          ON home_reservations(profile_id) WHERE state = 'pending';
+
+        CREATE UNIQUE INDEX one_home_authority_per_profile
+          ON thread_authorities(profile_id) WHERE thread_kind = 'home';
+
+        CREATE TRIGGER home_reservations_request_is_immutable
+        BEFORE UPDATE ON home_reservations
+        WHEN OLD.id IS NOT NEW.id
+          OR OLD.workspace_id IS NOT NEW.workspace_id
+          OR OLD.profile_id IS NOT NEW.profile_id
+          OR OLD.idempotency_key IS NOT NEW.idempotency_key
+          OR OLD.proposal IS NOT NEW.proposal
+          OR OLD.draft IS NOT NEW.draft
+          OR OLD.created_at_ms IS NOT NEW.created_at_ms
+        BEGIN
+          SELECT RAISE(ABORT, 'home reservation request is immutable');
+        END;
+
+        CREATE TRIGGER home_reservations_decide_once
+        BEFORE UPDATE ON home_reservations
+        WHEN OLD.state != 'pending'
+        BEGIN
+          SELECT RAISE(ABORT, 'home reservation decision is immutable');
+        END;
+
+        CREATE TRIGGER home_reservations_no_delete
+        BEFORE DELETE ON home_reservations
+        BEGIN
+          SELECT RAISE(ABORT, 'home reservations are immutable');
+        END;
+
+        CREATE TRIGGER thread_authorities_profile_admission
+        BEFORE INSERT ON thread_authorities
+        WHEN NEW.thread_kind IN ('home', 'child')
+        BEGIN
+          SELECT CASE WHEN NOT EXISTS (
+            SELECT 1 FROM profiles p
+             WHERE p.id = NEW.profile_id
+               AND p.workspace_id = NEW.workspace_id
+          ) THEN RAISE(ABORT, 'thread profile workspace does not exist') END;
+          SELECT CASE WHEN NOT EXISTS (
+            SELECT 1 FROM profile_revisions r
+             WHERE r.profile_id = NEW.profile_id
+               AND r.revision = NEW.profile_revision
+          ) THEN RAISE(ABORT, 'thread profile revision does not exist') END;
+          SELECT CASE WHEN NEW.thread_kind = 'home' AND NEW.parent_thread_id IS NOT NULL
+            THEN RAISE(ABORT, 'home thread cannot have a parent') END;
+          SELECT CASE WHEN NEW.thread_kind = 'child' AND NEW.parent_thread_id IS NULL
+            THEN RAISE(ABORT, 'child thread requires a parent') END;
+          SELECT CASE WHEN NEW.thread_kind = 'child' AND NEW.parent_thread_id = NEW.thread_id
+            THEN RAISE(ABORT, 'thread cannot parent itself') END;
+          SELECT CASE WHEN NEW.thread_kind = 'child' AND NOT EXISTS (
+            SELECT 1 FROM thread_authorities parent
+             WHERE parent.thread_id = NEW.parent_thread_id
+               AND parent.workspace_id = NEW.workspace_id
+               AND parent.profile_id = NEW.profile_id
+               AND parent.thread_kind IN ('home', 'child')
+               AND NOT EXISTS (
+                 SELECT 1 FROM thread_stops stop WHERE stop.thread_id = parent.thread_id
+               )
+          ) THEN RAISE(ABORT, 'child requires a live same-profile parent') END;
+        END;
+
+        CREATE TRIGGER profiles_home_designation
+        BEFORE UPDATE OF home_thread_id ON profiles
+        BEGIN
+          SELECT CASE WHEN OLD.home_thread_id IS NOT NULL
+            THEN RAISE(ABORT, 'profile home designation is immutable') END;
+          SELECT CASE WHEN NEW.home_thread_id IS NULL OR NOT EXISTS (
+            SELECT 1 FROM thread_authorities authority
+             WHERE authority.thread_id = NEW.home_thread_id
+               AND authority.profile_id = NEW.id
+               AND authority.workspace_id = NEW.workspace_id
+               AND authority.thread_kind = 'home'
+               AND authority.parent_thread_id IS NULL
+          ) THEN RAISE(ABORT, 'profile home designation requires its home authority') END;
+        END;
+        "#,
+    )?;
+    record_migration(
+        transaction,
+        SERVER_SCHEMA_VERSION,
+        HOME_LIFECYCLE_MIGRATION_NAME,
+    )?;
     transaction.pragma_update(None, "user_version", SERVER_SCHEMA_VERSION)?;
     Ok(())
 }
@@ -113,7 +233,8 @@ fn validate_migration_journal(connection: &Connection, version: u32) -> AppResul
         .collect::<Result<Vec<_>, _>>()?;
     let expected = [
         (BASE_SCHEMA_VERSION, BASE_MIGRATION_NAME),
-        (SERVER_SCHEMA_VERSION, PROFILE_MIGRATION_NAME),
+        (PROFILE_SCHEMA_VERSION, PROFILE_MIGRATION_NAME),
+        (SERVER_SCHEMA_VERSION, HOME_LIFECYCLE_MIGRATION_NAME),
     ];
     let expected_len = usize::try_from(version)
         .map_err(|_| AppError::Config("server schema version exceeds usize".into()))?;
@@ -929,7 +1050,8 @@ mod tests {
             journal(&connection),
             [
                 (1, BASE_MIGRATION_NAME.into()),
-                (2, PROFILE_MIGRATION_NAME.into())
+                (2, PROFILE_MIGRATION_NAME.into()),
+                (3, HOME_LIFECYCLE_MIGRATION_NAME.into())
             ]
         );
         let schema_before: String = connection
@@ -948,7 +1070,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(schema_after, schema_before);
-        assert_eq!(journal(&connection).len(), 2);
+        assert_eq!(journal(&connection).len(), 3);
     }
 
     #[test]
@@ -961,7 +1083,7 @@ mod tests {
             migrate_server_schema(&mut future),
             Err(AppError::SqliteSchemaVersion {
                 expected: SERVER_SCHEMA_VERSION,
-                actual: 3,
+                actual: 4,
             })
         ));
 

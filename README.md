@@ -64,6 +64,14 @@ npm run build
 npm run crawl
 ```
 
+### Unreleased profile thread lifecycle
+
+Protocol v1 clients use `profile.open` to resolve, reserve, and decide one lazy
+home thread per profile. Home threads persist across server restarts and reject
+`thread.stop`; `thread.send` starts a new turn when an unloaded home or
+same-profile child is targeted again. Thread event cursors pair offsets with the
+server-provided `live_epoch_id` and reset when that epoch is stale.
+
 ### Unreleased HTTP gateway
 
 `platonic gateway http` exposes the bounded authenticated `/v1` HTTP/SSE

@@ -56,7 +56,7 @@ pub(crate) fn run_prepared_question(
         workspace_root,
         voice_interruption_context,
         config,
-        agent_id,
+        identity,
         run_id,
         session_hydration,
         mut messages,
@@ -104,7 +104,7 @@ pub(crate) fn run_prepared_question(
         &options,
         HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
             run_id: run_id.clone(),
-            identity: platonic_core::RunIdentity::LegacyAgent { agent_id },
+            identity,
         }),
     )?;
 

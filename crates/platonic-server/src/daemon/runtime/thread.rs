@@ -1,8 +1,8 @@
 use super::{DaemonRuntime, RunRecord};
 use crate::{
     daemon::protocol::{
-        BufferedThreadEvent, RunStateName, StreamEvent, ThreadEventsResult, ThreadLiveState,
-        ThreadSendRejectedReason, ThreadSendResult,
+        BufferedThreadEvent, RunStateName, StreamEvent, ThreadEventsResetReason,
+        ThreadEventsResult, ThreadLiveState, ThreadSendRejectedReason, ThreadSendResult,
     },
     server_store::DurableThreadAuthority,
     thread_authority::ThreadAuthorityDraft,
@@ -47,7 +47,6 @@ pub(in crate::daemon) enum ThreadSendAdmission {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::daemon) enum ThreadEventsError {
-    Lagged { first_offset: u64 },
     Stopped,
 }
 
@@ -248,12 +247,20 @@ impl DaemonRuntime {
     pub(in crate::daemon) fn thread_events(
         &self,
         thread_id: &str,
+        live_epoch_id: Option<&str>,
         from_offset: Option<u64>,
         limit: usize,
         wait: Duration,
     ) -> Result<ThreadEventsResult, ThreadEventsError> {
-        self.load_thread(thread_id)?
-            .events(thread_id, from_offset, limit, wait)
+        let epoch = self.live_epoch_id();
+        Ok(self.load_thread(thread_id)?.events(
+            thread_id,
+            &epoch,
+            live_epoch_id,
+            from_offset,
+            limit,
+            wait,
+        ))
     }
 
     pub(in crate::daemon) fn bind_thread_run(
@@ -363,6 +370,7 @@ impl DaemonRuntime {
 
     pub(in crate::daemon) fn thread_live_state(&self, thread_id: &str) -> ThreadLiveState {
         let state = self.state.lock().expect("runtime state lock poisoned");
+        let live_epoch_id = state.live_epoch_id.clone();
         match state
             .live_threads
             .get(thread_id)
@@ -371,12 +379,14 @@ impl DaemonRuntime {
             Some(thread) => {
                 let (current_turn_id, last_activity_at_ms) = thread.live_snapshot();
                 ThreadLiveState {
+                    live_epoch_id,
                     loaded: true,
                     current_turn_id,
                     last_activity_at_ms: Some(last_activity_at_ms),
                 }
             }
             None => ThreadLiveState {
+                live_epoch_id,
                 loaded: false,
                 current_turn_id: None,
                 last_activity_at_ms: None,
@@ -615,17 +625,40 @@ impl LiveThread {
     fn events(
         &self,
         thread_id: &str,
+        live_epoch_id: &str,
+        expected_live_epoch_id: Option<&str>,
         from_offset: Option<u64>,
         limit: usize,
         wait: Duration,
-    ) -> Result<ThreadEventsResult, ThreadEventsError> {
+    ) -> ThreadEventsResult {
         let mut state = self.state.lock().expect("live thread lock poisoned");
         state.observers += 1;
+        if expected_live_epoch_id.is_some_and(|expected| expected != live_epoch_id) {
+            let result = ThreadEventsResult {
+                thread_id: thread_id.into(),
+                live_epoch_id: live_epoch_id.into(),
+                reset: Some(ThreadEventsResetReason::EpochChanged),
+                from_offset: state.next_offset,
+                next_offset: state.next_offset,
+                current_turn_id: state.current_turn.as_ref().map(|turn| turn.turn_id.clone()),
+                events: Vec::new(),
+            };
+            state.observers -= 1;
+            return result;
+        }
         let from_offset = from_offset.unwrap_or(state.next_offset);
         if from_offset < state.first_offset {
-            let first_offset = state.first_offset;
+            let result = ThreadEventsResult {
+                thread_id: thread_id.into(),
+                live_epoch_id: live_epoch_id.into(),
+                reset: Some(ThreadEventsResetReason::Lagged),
+                from_offset: state.first_offset,
+                next_offset: state.first_offset,
+                current_turn_id: state.current_turn.as_ref().map(|turn| turn.turn_id.clone()),
+                events: Vec::new(),
+            };
             state.observers -= 1;
-            return Err(ThreadEventsError::Lagged { first_offset });
+            return result;
         }
         if from_offset >= state.next_offset && !wait.is_zero() {
             let (next, _) = self
@@ -635,9 +668,17 @@ impl LiveThread {
             state = next;
         }
         if from_offset < state.first_offset {
-            let first_offset = state.first_offset;
+            let result = ThreadEventsResult {
+                thread_id: thread_id.into(),
+                live_epoch_id: live_epoch_id.into(),
+                reset: Some(ThreadEventsResetReason::Lagged),
+                from_offset: state.first_offset,
+                next_offset: state.first_offset,
+                current_turn_id: state.current_turn.as_ref().map(|turn| turn.turn_id.clone()),
+                events: Vec::new(),
+            };
             state.observers -= 1;
-            return Err(ThreadEventsError::Lagged { first_offset });
+            return result;
         }
         let start = (from_offset - state.first_offset) as usize;
         let events = state
@@ -649,13 +690,15 @@ impl LiveThread {
             .collect::<Vec<_>>();
         let result = ThreadEventsResult {
             thread_id: thread_id.into(),
+            live_epoch_id: live_epoch_id.into(),
+            reset: None,
             from_offset,
             next_offset: from_offset + events.len() as u64,
             current_turn_id: state.current_turn.as_ref().map(|turn| turn.turn_id.clone()),
             events,
         };
         state.observers -= 1;
-        Ok(result)
+        result
     }
 
     fn next_message_or_finish(&self, turn_id: &str) -> Option<String> {
@@ -763,7 +806,10 @@ mod tests {
             model: "gpt-5.6-sol".into(),
             reasoning_effort: crate::daemon::protocol::ReasoningEffort::Xhigh,
             approval_policy: crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
-            agent_id: platonic_core::AgentId::new("plato").unwrap(),
+            agent_id: None,
+            profile_id: platonic_core::ProfileId::new("profile_test").unwrap(),
+            profile_revision: 1,
+            thread_kind: crate::daemon::protocol::ThreadKind::Home,
             toolset: vec!["file.read".into()],
             writable: false,
             network: false,
@@ -898,9 +944,16 @@ mod tests {
                     ready.wait();
                     let mut offset = 0;
                     let mut received = Vec::new();
+                    let epoch = runtime.live_epoch_id();
                     while received.len() < 3 {
                         let page = runtime
-                            .thread_events("thread_1", Some(offset), 3, Duration::from_secs(1))
+                            .thread_events(
+                                "thread_1",
+                                Some(&epoch),
+                                Some(offset),
+                                3,
+                                Duration::from_secs(1),
+                            )
                             .unwrap();
                         offset = page.next_offset;
                         received.extend(page.events);
@@ -957,11 +1010,40 @@ mod tests {
                 "sequence": sequence,
             })));
         }
-        assert_eq!(
-            runtime.thread_events("thread_1", Some(0), 1, Duration::ZERO),
-            Err(ThreadEventsError::Lagged { first_offset: 1 })
-        );
+        let epoch = runtime.live_epoch_id();
+        let result = runtime
+            .thread_events("thread_1", Some(&epoch), Some(0), 1, Duration::ZERO)
+            .unwrap();
+        assert_eq!(result.reset, Some(ThreadEventsResetReason::Lagged));
+        assert_eq!(result.next_offset, 1);
         assert_eq!(runtime.load_thread("thread_1").unwrap().observer_count(), 0);
+    }
+
+    #[test]
+    fn stale_epoch_cursor_resets_at_current_tip_without_aliasing_offsets() {
+        let runtime = runtime();
+        let turn = match runtime.send_thread(
+            "thread_1",
+            "controller_a".into(),
+            None,
+            "start".into(),
+            "thread_turn_1".into(),
+        ) {
+            ThreadSendAdmission::Started { turn, .. } => turn,
+            other => panic!("unexpected start admission: {other:?}"),
+        };
+        turn.publish(StreamEvent::Unknown(
+            serde_json::json!({"kind": "test_event"}),
+        ));
+
+        let result = runtime
+            .thread_events("thread_1", Some("prior_epoch"), Some(99), 1, Duration::ZERO)
+            .unwrap();
+        assert_eq!(result.live_epoch_id, runtime.live_epoch_id());
+        assert_eq!(result.reset, Some(ThreadEventsResetReason::EpochChanged));
+        assert_eq!(result.from_offset, 1);
+        assert_eq!(result.next_offset, 1);
+        assert!(result.events.is_empty());
     }
 
     #[test]
@@ -1162,7 +1244,7 @@ mod tests {
             ThreadSendAdmission::Stopped
         ));
         assert_eq!(
-            runtime.thread_events("thread_1", Some(0), 1, Duration::ZERO),
+            runtime.thread_events("thread_1", None, Some(0), 1, Duration::ZERO),
             Err(ThreadEventsError::Stopped)
         );
         assert!(matches!(
