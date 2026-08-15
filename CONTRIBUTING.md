@@ -16,9 +16,8 @@ Implementation starts only after the issue is **Ready for dev** and a maintainer
 
 ## Verify
 
-Run the canonical battery described in `AGENTS.md`:
-
 ```bash
-./scripts/quality.sh        # full battery: rust, desktop, web, duplication, security
-./scripts/quality.sh rust   # single stage (see --help)
+cargo fmt --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
 ```
