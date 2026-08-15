@@ -113,6 +113,7 @@ mod linux {
         ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
         RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
     };
+    use std::{collections::BTreeSet, ffi::OsStr, path::Path};
 
     // ABI 5 is the first version that mediates device ioctls as write access.
     const ABI: ABI = ABI::V5;
@@ -131,7 +132,11 @@ mod linux {
         let read_access = AccessFs::from_read(ABI);
         let all_access = AccessFs::from_all(ABI);
         let mut ruleset = ruleset().map_err(landlock_error)?;
-        for path in system_read_paths().into_iter().chain(readable_paths) {
+        for path in system_read_paths()
+            .into_iter()
+            .chain(host_toolchain_read_paths())
+            .chain(readable_paths)
+        {
             ruleset = add_path_rule(ruleset, &path, read_access)?;
         }
         for path in writable_paths {
@@ -186,6 +191,91 @@ mod linux {
         .collect()
     }
 
+    fn host_toolchain_read_paths() -> Vec<PathBuf> {
+        let path = std::env::var_os("PATH");
+        let path_dirs = path
+            .as_deref()
+            .into_iter()
+            .flat_map(std::env::split_paths)
+            .filter(|path| path.is_absolute() && path.is_dir())
+            .collect::<Vec<_>>();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .and_then(|path| path.canonicalize().ok());
+        let mut paths = BTreeSet::new();
+        for path in &path_dirs {
+            insert_existing(&mut paths, path, home.as_deref());
+            if path.file_name() == Some(OsStr::new("shims")) {
+                if let Some(tool_manager_root) = path.parent() {
+                    insert_existing(
+                        &mut paths,
+                        &tool_manager_root.join("installs"),
+                        home.as_deref(),
+                    );
+                }
+            }
+            if let Some(root) = managed_install_root(path) {
+                insert_existing(&mut paths, root, home.as_deref());
+            }
+        }
+
+        let has_cargo = path_dirs.iter().any(|path| path.join("cargo").is_file());
+        if let Some(cargo_home) = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                has_cargo
+                    .then(|| std::env::var_os("HOME").map(PathBuf::from))
+                    .flatten()
+                    .map(|home| home.join(".cargo"))
+            })
+        {
+            for path in ["bin", "registry", "git"] {
+                insert_existing(&mut paths, &cargo_home.join(path), home.as_deref());
+            }
+        }
+
+        let has_rustup = has_cargo
+            || path_dirs
+                .iter()
+                .any(|path| path.join("rustc").is_file() || path.join("rustup").is_file());
+        if let Some(rustup_home) =
+            std::env::var_os("RUSTUP_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    has_rustup
+                        .then(|| std::env::var_os("HOME").map(PathBuf::from))
+                        .flatten()
+                        .map(|home| home.join(".rustup"))
+                })
+        {
+            for path in ["settings.toml", "toolchains"] {
+                insert_existing(&mut paths, &rustup_home.join(path), home.as_deref());
+            }
+        }
+        paths.into_iter().collect()
+    }
+
+    fn managed_install_root(bin_dir: &Path) -> Option<&Path> {
+        if bin_dir.file_name() != Some(OsStr::new("bin")) {
+            return None;
+        }
+        let version = bin_dir.parent()?;
+        let tool = version.parent()?;
+        (tool.parent()?.file_name() == Some(OsStr::new("installs"))).then_some(version)
+    }
+
+    fn insert_existing(paths: &mut BTreeSet<PathBuf>, path: &Path, home: Option<&Path>) {
+        if !path.is_absolute() {
+            return;
+        }
+        if let Ok(path) = path.canonicalize() {
+            if path == Path::new("/") || home.is_some_and(|home| home.starts_with(&path)) {
+                return;
+            }
+            paths.insert(path);
+        }
+    }
+
     fn landlock_error(error: impl std::fmt::Display) -> AppError {
         AppError::SupervisedRun(format!("Landlock confinement failed: {error}"))
     }
@@ -194,7 +284,7 @@ mod linux {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::{fs, path::Path, process::Stdio};
+    use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Stdio};
 
     const FIXTURE_ENV: &str = "PLATONIC_LANDLOCK_TEST_FIXTURE";
     const ONE_SHOT_FIXTURE_ENV: &str = "PLATONIC_ONE_SHOT_LANDLOCK_TEST_FIXTURE";
@@ -230,6 +320,8 @@ mod tests {
         let server_db = Path::new(&paths[6]);
         let profile_home_secret = Path::new(&paths[7]);
         let raw_transcript = Path::new(&paths[8]);
+        let toolchain_payload = Path::new(&paths[9]);
+        let unrelated_home_secret = Path::new(&paths[10]);
 
         assert_eq!(
             fs::read_to_string(private.join("seed.txt")).unwrap(),
@@ -248,6 +340,13 @@ mod tests {
                 .success()
         );
         assert!(fs::read("/etc/os-release").is_ok());
+        let tool = Command::new("p578-toolchain").output().unwrap();
+        assert!(
+            tool.status.success(),
+            "toolchain failed: {}",
+            String::from_utf8_lossy(&tool.stderr)
+        );
+        assert_eq!(tool.stdout, b"toolchain payload\n");
 
         for denied in [
             shared.join("secret"),
@@ -257,6 +356,7 @@ mod tests {
             server_db.to_path_buf(),
             profile_home_secret.to_path_buf(),
             raw_transcript.to_path_buf(),
+            unrelated_home_secret.to_path_buf(),
         ] {
             let error = fs::read(&denied).unwrap_err();
             assert_eq!(
@@ -271,6 +371,7 @@ mod tests {
             sibling.join(".git/refs/heads/sibling"),
             other_thread.join("private.txt"),
             outside.join("outside.txt"),
+            toolchain_payload.to_path_buf(),
         ] {
             let error = fs::write(&denied, "denied\n").unwrap_err();
             assert_eq!(
@@ -352,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn landlock_allows_private_git_and_scratch_but_denies_state_home_and_sibling_reads() {
+    fn landlock_allows_read_only_host_toolchain_but_denies_state_home_and_sibling_reads() {
         assert_eq!(detect_support(), ConfinementSupport::Landlock);
         let root = tempfile::tempdir().unwrap();
         let private = root.path().join("private");
@@ -363,6 +464,9 @@ mod tests {
         let outside = root.path().join("outside");
         let server_state = root.path().join("server-state");
         let profile_home = root.path().join("profile-home");
+        let home = root.path().join("home");
+        let toolchain_shims = home.join(".local/share/mise/shims");
+        let toolchain_install = home.join(".local/share/mise/installs/test/1.0");
         for path in [
             &private,
             &scratch,
@@ -372,6 +476,8 @@ mod tests {
             &outside,
             &server_state,
             &profile_home,
+            &toolchain_shims,
+            &toolchain_install,
         ] {
             fs::create_dir_all(path).unwrap();
         }
@@ -384,6 +490,18 @@ mod tests {
         fs::write(server_state.join("server.db"), "state\n").unwrap();
         fs::write(profile_home.join("secret"), "home\n").unwrap();
         fs::write(server_state.join("transcripts/raw.jsonl"), "raw\n").unwrap();
+        fs::write(home.join("unrelated-secret"), "unrelated home\n").unwrap();
+        let toolchain_payload = toolchain_install.join("payload");
+        fs::write(&toolchain_payload, "toolchain payload\n").unwrap();
+        let toolchain = toolchain_shims.join("p578-toolchain");
+        fs::write(
+            &toolchain,
+            "#!/bin/sh\nexec cat \"$P578_TOOLCHAIN_PAYLOAD\"\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&toolchain).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&toolchain, permissions).unwrap();
         git(&private, &["init", "--quiet", "--initial-branch", "main"]);
         git(&private, &["config", "user.name", "Platonic Test"]);
         git(
@@ -411,12 +529,27 @@ mod tests {
                 .join("transcripts/raw.jsonl")
                 .to_string_lossy()
                 .into_owned(),
+            toolchain_payload.to_string_lossy().into_owned(),
+            home.join("unrelated-secret").to_string_lossy().into_owned(),
         ];
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .arg("--exact")
             .arg("confinement::tests::landlock_child_fixture")
             .arg("--nocapture")
+            .env_clear()
+            .env(
+                "PATH",
+                std::env::join_paths([
+                    home.as_path(),
+                    toolchain_shims.as_path(),
+                    Path::new("/usr/bin"),
+                    Path::new("/bin"),
+                ])
+                .unwrap(),
+            )
+            .env("HOME", &home)
+            .env("P578_TOOLCHAIN_PAYLOAD", &toolchain_payload)
             .env(FIXTURE_ENV, serde_json::to_string(&fixture).unwrap())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -443,6 +576,10 @@ mod tests {
         assert_eq!(
             fs::read_to_string(other_thread.join("private.txt")).unwrap(),
             "other\n"
+        );
+        assert_eq!(
+            fs::read_to_string(toolchain_payload).unwrap(),
+            "toolchain payload\n"
         );
         assert!(!outside.join("outside.txt").exists());
     }
