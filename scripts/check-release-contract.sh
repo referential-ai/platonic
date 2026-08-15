@@ -24,8 +24,8 @@ check_metadata() {
   cargo_metadata="$(metadata)"
   jq -e '
     .metadata["platonic-release"] as $release
-    | ($release["product-version"] == "0.2.0")
-      and ($release["product-tag"] == "platonic-v0.2.0")
+    | ($release["product-version"] == "0.2.1")
+      and ($release["product-tag"] == "platonic-v0.2.1")
       and ($release["product-channel"] == "bundles")
       and ($release["public-code-crates"] == ["platonic-core"])
       and ($release["bundle-targets"] == ["linux-x86_64", "macos-arm64"])
@@ -40,7 +40,7 @@ check_metadata() {
       )
   ' <<<"$cargo_metadata" >/dev/null \
     || die 'Cargo metadata violates the Platonic release or P029 publication contract'
-  printf 'release metadata: product=0.2.0 tag=platonic-v0.2.0 channel=bundles public-code=platonic-core\n'
+  printf 'release metadata: product=0.2.1 tag=platonic-v0.2.1 channel=bundles public-code=platonic-core\n'
 }
 
 product_version() {
