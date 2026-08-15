@@ -1,6 +1,6 @@
 ---
 title: Install and release tracks
-description: Choose the current public release or the exact-head unreleased journey without mixing their commands.
+description: Choose the current public release or exact-head develop without mixing their commands.
 sidebar:
   order: 2
 ---
@@ -12,13 +12,13 @@ sidebar:
 
 The public release and current `develop` tree are not interchangeable. Choose one track and keep its version, commands, and proof together.
 
-## Current public release: 0.1.0
+## Current public release: 0.2.0
 
-Install the supported bundle with the tagged [0.1.0 quickstart](https://github.com/referential-ai/platonic/blob/platonic-v0.1.0/docs/QUICKSTART.md). Archive contents, target names, checksums, and signing expectations remain owned by the repository [release contract](https://github.com/referential-ai/platonic/blob/develop/docs/RELEASE.md).
+Install the supported bundle with the tagged [0.2.0 quickstart](https://github.com/referential-ai/platonic/blob/platonic-v0.2.0/docs/QUICKSTART.md). Archive contents, target names, checksums, and signing expectations remain owned by the repository [release contract](https://github.com/referential-ai/platonic/blob/develop/docs/RELEASE.md).
 
-## Unreleased develop / 0.2.0
+## Exact-head develop
 
-No released 0.2.0 bundle or bundle-install proof exists yet. Build binaries from one exact source commit and follow the [first productive journey](../first-run/); do not rename or substitute a 0.1.0 archive.
+For behavior after 0.2.0, build binaries from one exact source commit and keep that identity separate from the tagged release bundle.
 
 <span id="5-local-voice-activation-and-device-proof"></span>
 

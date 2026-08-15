@@ -2,7 +2,7 @@
 
 Downloadable command bundles are the sole Platonic product distribution
 channel. Crate versions are independent implementation metadata: the product
-release version is `0.1.0`, while `platonic-core` keeps its own public semver.
+release version is `0.2.0`, while `platonic-core` keeps its own public semver.
 Cargo's structured `workspace.metadata.platonic-release` and each package's
 `publish` value enforce [P029](https://github.com/referential-ai/platonic-workspace/issues/83):
 `platonic-core` is the only publishable product-code crate. Internal and client
@@ -10,7 +10,7 @@ crates are not product publication channels.
 
 Launch support is exactly Linux x86-64 and macOS Apple silicon. Windows server
 and client support is withdrawn; every additional target is post-launch and
-proof-first. Desktop packages are not Platonic 0.1.0 launch artifacts.
+proof-first. Desktop packages are not Platonic 0.2.0 release artifacts.
 
 ## Identity
 
@@ -18,7 +18,7 @@ Release builds embed the exact source commit and the workflow's UTC build date.
 The server command and daemon hello report:
 
 ```text
-platonic 0.1.0 (<40-character commit>, <YYYY-MM-DD>)
+platonic 0.2.0 (<40-character commit>, <YYYY-MM-DD>)
 ```
 
 The `plato` and `plato-tui` commands continue to report the independently
@@ -27,12 +27,12 @@ truthful Plato Agent package version with the same commit and date.
 ## Branch and tag
 
 Normal work integrates through `develop`. For an admitted release, cut
-`release/0.1.0` from the accepted `develop` commit and limit it to release
+`release/platonic-0.2.0` from the accepted `develop` commit and limit it to release
 proof, versioning, packaging, and release-blocking fixes. Promote that branch
 to `main` only through a human-authorized pull request, return any release-only
 fix to `develop`, and do not retain a permanent release branch.
 
-Tag the exact accepted `main` merge as `platonic-v0.1.0`. The historical
+Tag the exact accepted `main` merge as `platonic-v0.2.0`. The historical
 Plato Agent tag `v0.1.0` is never moved or deleted. The release workflow checks
 that the tag, product metadata, requested source commit, and current `main`
 commit are identical before it can create a draft release.
@@ -43,8 +43,8 @@ The locked artifact set is:
 
 | Target | Rust target | Bundle |
 | --- | --- | --- |
-| Linux x86-64 | `x86_64-unknown-linux-gnu` | `platonic-0.1.0-linux-x86_64.tar.gz` |
-| macOS Apple silicon | `aarch64-apple-darwin` | `platonic-0.1.0-macos-arm64.tar.gz` |
+| Linux x86-64 | `x86_64-unknown-linux-gnu` | `platonic-0.2.0-linux-x86_64.tar.gz` |
+| macOS Apple silicon | `aarch64-apple-darwin` | `platonic-0.2.0-macos-arm64.tar.gz` |
 
 Each archive has one root directory named after the archive stem. It contains
 the Platonic server command `platonic` and the Plato Agent client commands
@@ -68,10 +68,10 @@ After downloading an archive and its manifest, verify it before extraction:
 
 ```bash
 # Linux x86-64
-sha256sum --check platonic-0.1.0-linux-x86_64.sha256
+sha256sum --check platonic-0.2.0-linux-x86_64.sha256
 
 # macOS Apple silicon
-shasum -a 256 --check platonic-0.1.0-macos-arm64.sha256
+shasum -a 256 --check platonic-0.2.0-macos-arm64.sha256
 ```
 
 For releases produced by the attestation-enabled workflow, verify each
@@ -90,7 +90,7 @@ backfilled with attestations.
 human-gated. Dispatch it with an exact 40-character commit and an empty
 `release_tag` for the two-target dry run. After the release branch is promoted
 and the approved tag exists, dispatch the same exact commit with
-`release_tag=platonic-v0.1.0`; the workflow validates the tag against `main`,
+`release_tag=platonic-v0.2.0`; the workflow validates the tag against `main`,
 builds both bundles, verifies their manifests, and creates a draft GitHub
 release for final human review.
 
