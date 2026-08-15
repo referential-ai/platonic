@@ -11,8 +11,9 @@ use platonic_protocol::{
     CommandAcceptedResult, DaemonStatusParams, DaemonStatusResult, Envelope, EnvelopeKind,
     EventsStreamParams, EventsStreamResult, HelloParams, HelloResult, IssuePrepStartParams,
     IssuePrepStartResult, MAX_PROTOCOL_LINE_BYTES, MessageAppendParams, PROTOCOL_VERSION,
-    ProtocolMethod, ProtocolRequest, ProtocolResponse, ReasoningEffort, RunCancelParams,
-    RunOverrides, RunStartParams, RunStartResult, SessionApprovalProfileSetParams,
+    ProfileId, ProfileOpenDecision, ProfileOpenParams, ProfileOpenResult, ProtocolMethod,
+    ProtocolRequest, ProtocolResponse, ReasoningEffort, RunCancelParams, RunOverrides,
+    RunStartParams, RunStartResult, SessionApprovalProfileSetParams,
     SessionApprovalProfileSetResult, SessionSummary, SessionsListResult, ShutdownIfIdleResult,
     ThreadApprovalPolicy, ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams,
     ThreadEventsResult, ThreadListResult, ThreadSendParams, ThreadSendResult, ThreadSpawnDecision,
@@ -152,6 +153,46 @@ impl DaemonClient {
         self.request(ProtocolRequest::AgentStatus(AgentStatusParams { agent_id }))
     }
 
+    /// Resolves a profile's existing home without creating authority.
+    pub fn profile_open_resolve(
+        &mut self,
+        profile_id: ProfileId,
+    ) -> ClientResult<ProfileOpenResult> {
+        self.request(ProtocolRequest::ProfileOpen(ProfileOpenParams::Resolve {
+            profile_id,
+        }))
+    }
+
+    /// Starts one idempotent profile-home admission.
+    pub fn profile_open_start(
+        &mut self,
+        profile_id: ProfileId,
+        idempotency_key: String,
+        repositories: Vec<platonic_protocol::ThreadRepositoryRequest>,
+        working_repository: String,
+        working_subdir: String,
+    ) -> ClientResult<ProfileOpenResult> {
+        self.request(ProtocolRequest::ProfileOpen(ProfileOpenParams::Start {
+            profile_id,
+            idempotency_key,
+            repositories,
+            working_repository,
+            working_subdir,
+        }))
+    }
+
+    /// Resolves one pending profile-home admission.
+    pub fn profile_open_decide(
+        &mut self,
+        home_reservation_id: String,
+        decision: ProfileOpenDecision,
+    ) -> ClientResult<ProfileOpenResult> {
+        self.request(ProtocolRequest::ProfileOpen(ProfileOpenParams::Decide {
+            home_reservation_id,
+            decision,
+        }))
+    }
+
     /// Starts one typed thread spawn admission.
     pub fn thread_spawn_start(
         &mut self,
@@ -215,7 +256,7 @@ impl DaemonClient {
         }))
     }
 
-    /// Reads one complete immutable twelve-field thread authority record.
+    /// Reads one complete immutable thread authority record.
     pub fn thread_authority(&mut self, thread_id: String) -> ClientResult<ThreadAuthorityResult> {
         self.request(ProtocolRequest::ThreadAuthority(ThreadAuthorityParams {
             thread_id,
@@ -259,8 +300,21 @@ impl DaemonClient {
         limit: usize,
         wait_ms: u64,
     ) -> ClientResult<ThreadEventsResult> {
+        self.thread_events_in_epoch(thread_id, None, from_offset, limit, wait_ms)
+    }
+
+    /// Reads one retained event page paired with a daemon live epoch.
+    pub fn thread_events_in_epoch(
+        &mut self,
+        thread_id: String,
+        live_epoch_id: Option<String>,
+        from_offset: Option<u64>,
+        limit: usize,
+        wait_ms: u64,
+    ) -> ClientResult<ThreadEventsResult> {
         self.request(ProtocolRequest::ThreadEvents(ThreadEventsParams {
             thread_id,
+            live_epoch_id,
             from_offset,
             limit: Some(limit),
             wait_ms: Some(wait_ms),
@@ -835,6 +889,7 @@ fn response_result_value(response: ProtocolResponse) -> serde_json::Result<Value
         ProtocolResponse::ThreadSend(result) => serde_json::to_value(result),
         ProtocolResponse::ThreadEvents(result) => serde_json::to_value(result),
         ProtocolResponse::ThreadStop(result) => serde_json::to_value(result),
+        ProtocolResponse::ProfileOpen(result) => serde_json::to_value(result),
         ProtocolResponse::WorkspaceCreate(result) => serde_json::to_value(result),
         ProtocolResponse::WorkspaceList(result) => serde_json::to_value(result),
         ProtocolResponse::WorkspaceStatus(result) => serde_json::to_value(result),
@@ -1429,7 +1484,7 @@ mod tests {
                     "status": "spawned",
                     "thread": {
                         "authority": server_legacy_authority.clone(),
-                        "live": {"loaded": true, "current_turn_id": null, "last_activity_at_ms": 42}
+                        "live": {"live_epoch_id": "epoch_1", "loaded": true, "current_turn_id": null, "last_activity_at_ms": 42}
                     }
                 }),
             );
@@ -1444,7 +1499,7 @@ mod tests {
                 json!({
                     "threads": [{
                         "authority": server_legacy_authority.clone(),
-                        "live": {"loaded": true, "current_turn_id": null}
+                        "live": {"live_epoch_id": "epoch_1", "loaded": true, "current_turn_id": null}
                     }]
                 }),
             );
@@ -1462,7 +1517,7 @@ mod tests {
                 json!({
                     "thread": {
                         "authority": server_legacy_authority,
-                        "live": {"loaded": true, "current_turn_id": null}
+                        "live": {"live_epoch_id": "epoch_1", "loaded": true, "current_turn_id": null}
                     }
                 }),
             );
@@ -1529,6 +1584,7 @@ mod tests {
                 request_params_value(&events),
                 Some(json!({
                     "thread_id": "thread_1",
+                    "live_epoch_id": "epoch_1",
                     "from_offset": 0,
                     "limit": 128,
                     "wait_ms": 1000
@@ -1635,7 +1691,13 @@ mod tests {
             ThreadSendResult::Steered { ref turn_id, .. } if turn_id == "thread_turn_1"
         ));
         let events = client
-            .thread_events("thread_1".into(), Some(0), 128, 1_000)
+            .thread_events_in_epoch(
+                "thread_1".into(),
+                Some("epoch_1".into()),
+                Some(0),
+                128,
+                1_000,
+            )
             .unwrap();
         assert_eq!(events.thread_id, "thread_1");
         assert_eq!(events.current_turn_id.as_deref(), Some("thread_turn_1"));

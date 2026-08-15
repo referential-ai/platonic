@@ -5,11 +5,12 @@ use super::types::{
 use crate::{
     AppError, AppResult,
     ledger::row_u64,
-    thread_authority::{LegacyReason, ThreadKind, ThreadProfileAuthority},
+    thread_authority::{LegacyReason, ThreadProfileAuthority},
 };
 use platonic_core::{AgentId, EffectClass, ProfileId};
 use platonic_protocol::{
-    ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadGrantedPath, ThreadWorktree,
+    ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadGrantedPath, ThreadKind,
+    ThreadWorktree,
 };
 use rusqlite::types::Type;
 
@@ -55,6 +56,7 @@ pub(super) fn thread_authority_from_row(
         .transpose()?
         .unwrap_or_else(|| {
             legacy_cwd
+                .clone()
                 .map(|path| {
                     vec![ThreadGrantedPath {
                         path,
@@ -73,11 +75,31 @@ pub(super) fn thread_authority_from_row(
             ));
         }
     };
+    let profile_id = row
+        .get::<_, Option<String>>(13)?
+        .map(ProfileId::new)
+        .transpose()
+        .map_err(|error| invalid_thread_column(13, error.to_string()))?;
+    let profile_revision = row
+        .get::<_, Option<i64>>(14)?
+        .map(|value| {
+            value.try_into().map_err(|_| {
+                invalid_thread_column(14, format!("negative profile revision: {value}"))
+            })
+        })
+        .transpose()?;
+    let kind_value: String = row.get(15)?;
+    let thread_kind = ThreadKind::parse(&kind_value)
+        .ok_or_else(|| invalid_thread_column(15, format!("unknown thread kind: {kind_value}")))?;
     Ok(ThreadAuthorityRecord {
         thread_id: row.get(0)?,
         parent_thread_id: row.get(1)?,
         spawning_actor: row.get(2)?,
+        cwd: legacy_cwd,
         agent_id,
+        profile_id,
+        profile_revision,
+        thread_kind,
         model: row.get(5)?,
         reasoning_effort,
         approval_policy,

@@ -9,17 +9,18 @@ use crate::{
     confinement::ChildConfinement,
     daemon::{
         protocol::{
-            ERROR_DAEMON_SHUTTING_DOWN, ERROR_LAGGED, ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND,
-            ERROR_OVERLOAD, ERROR_THREAD_AUTHORITY_EXCEEDED, ERROR_THREAD_AUTHORITY_FAILED,
+            ERROR_DAEMON_SHUTTING_DOWN, ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD,
+            ERROR_PROFILE_OPEN_CONFLICT, ERROR_PROFILE_OPEN_FAILED,
+            ERROR_THREAD_AUTHORITY_EXCEEDED, ERROR_THREAD_AUTHORITY_FAILED,
             ERROR_THREAD_BRANCH_CLAIM_CONFLICT, ERROR_THREAD_CONFINEMENT_UNAVAILABLE,
             ERROR_THREAD_EVENTS_FAILED, ERROR_THREAD_LIST_FAILED, ERROR_THREAD_SEND_FAILED,
             ERROR_THREAD_SPAWN_FAILED, ERROR_THREAD_STATUS_FAILED, ERROR_THREAD_STOP_FAILED,
             ERROR_WORKSPACE_BROKEN, ERROR_WORKSPACE_MISMATCH, ERROR_WORKSPACE_UNREGISTERED,
-            Envelope, ProtocolResponse, ThreadAuthorityParams, ThreadAuthorityResult,
-            ThreadConfinement, ThreadEventsParams, ThreadListResult, ThreadRepositoryRequest,
-            ThreadSendParams, ThreadSpawnDecision, ThreadSpawnParams, ThreadSpawnResult,
-            ThreadStatus, ThreadStatusParams, ThreadStatusResult, ThreadStopParams,
-            ThreadStopResult,
+            Envelope, ProfileOpenDecision, ProfileOpenParams, ProfileOpenResult, ProtocolResponse,
+            ThreadAuthorityParams, ThreadAuthorityResult, ThreadConfinement, ThreadEventsParams,
+            ThreadKind, ThreadListResult, ThreadRepositoryRequest, ThreadSendParams,
+            ThreadSpawnDecision, ThreadSpawnParams, ThreadSpawnResult, ThreadStatus,
+            ThreadStatusParams, ThreadStatusResult, ThreadStopParams, ThreadStopResult,
         },
         runtime::{
             DaemonRuntime, ThreadEventsError, ThreadSendAdmission, ThreadSpawnAdmissionError,
@@ -27,24 +28,593 @@ use crate::{
         },
     },
     model::RunOverrides,
-    server_store::ServerStore,
+    server_store::{
+        HomeReservationRecord, HomeReservationState, ProfileHomeProposal, ReserveProfileHomeResult,
+        ServerStore,
+    },
     thread_authority::{
         THREAD_SPAWN_APPROVAL_REASON, ThreadAuthorityDraft, ThreadAuthorityDraftParams,
         ThreadAuthorityError, ThreadSpawnApprovalRecord, ThreadSpawnDecisionName, ThreadStopRecord,
-        authority_working_directory, legacy_status_authority, new_spawn_id, new_thread_turn_id,
-        now_ms, thread_spawn_effect, validate_child_authority,
+        authority_working_directory, legacy_status_authority, new_home_reservation_id,
+        new_spawn_id, new_thread_turn_id, now_ms, thread_spawn_effect, validate_child_authority,
     },
     tool_catalog::{FILE_EDIT, FILE_WRITE, SHELL_EXEC, THREAD_SPAWN, effect_for_tool},
     tools::{ThreadSpawnToolHandler, ThreadSpawnToolInput, ThreadSpawnToolOutput},
 };
-use platonic_core::{ActorId, AgentId, EffectClass, TurnId};
+use platonic_core::{ActorId, EffectClass, ProfileId, RunIdentity, TurnId};
 use std::{
-    path::{Path, PathBuf},
+    collections::HashSet,
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
 const MAX_THREAD_EVENT_WAIT_MS: u64 = 1_000;
 const THREAD_STOP_WAIT: Duration = Duration::from_secs(10);
+const LOCAL_OPERATOR_ACTOR: &str = "local-operator";
+const PROFILE_OPEN_APPROVAL_REASON: &str =
+    "profile.open requires approval before home authority is created";
+
+#[derive(Debug)]
+enum ProfileOpenFailure {
+    ShuttingDown,
+    Malformed(String),
+    NotFound(String),
+    WorkspaceBroken(String),
+    WorkspaceMismatch(String),
+    Conflict(String),
+    Overload(String),
+    ConfinementUnavailable,
+    Persistence,
+}
+
+pub(super) fn handle_profile_open(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: ProfileOpenParams,
+) -> Envelope {
+    match profile_open(runtime, params) {
+        Ok(result) => Envelope::typed_response(request.id, ProtocolResponse::ProfileOpen(result)),
+        Err(ProfileOpenFailure::ShuttingDown) => shutting_down_response(request.id, "profile.open"),
+        Err(ProfileOpenFailure::Malformed(message)) => Envelope::error(
+            request.id,
+            Some("profile.open".into()),
+            ERROR_MALFORMED_REQUEST,
+            message,
+        ),
+        Err(ProfileOpenFailure::NotFound(message)) => Envelope::error(
+            request.id,
+            Some("profile.open".into()),
+            ERROR_NOT_FOUND,
+            message,
+        ),
+        Err(ProfileOpenFailure::WorkspaceBroken(message)) => Envelope::error(
+            request.id,
+            Some("profile.open".into()),
+            ERROR_WORKSPACE_BROKEN,
+            message,
+        ),
+        Err(ProfileOpenFailure::WorkspaceMismatch(message)) => Envelope::error(
+            request.id,
+            Some("profile.open".into()),
+            ERROR_WORKSPACE_MISMATCH,
+            message,
+        ),
+        Err(ProfileOpenFailure::Conflict(message)) => Envelope::error(
+            request.id,
+            Some("profile.open".into()),
+            ERROR_PROFILE_OPEN_CONFLICT,
+            message,
+        ),
+        Err(ProfileOpenFailure::Overload(message)) => Envelope::error(
+            request.id,
+            Some("profile.open".into()),
+            ERROR_OVERLOAD,
+            message,
+        ),
+        Err(ProfileOpenFailure::ConfinementUnavailable) => Envelope::error(
+            request.id,
+            Some("profile.open".into()),
+            ERROR_THREAD_CONFINEMENT_UNAVAILABLE,
+            "server policy requires confinement, but this home cannot be confined",
+        ),
+        Err(ProfileOpenFailure::Persistence) => Envelope::error(
+            request.id,
+            Some("profile.open".into()),
+            ERROR_PROFILE_OPEN_FAILED,
+            "profile home could not be resolved or persisted",
+        ),
+    }
+}
+
+fn profile_open(
+    runtime: &DaemonRuntime,
+    params: ProfileOpenParams,
+) -> Result<ProfileOpenResult, ProfileOpenFailure> {
+    if runtime.shutdown_accepted() {
+        return Err(ProfileOpenFailure::ShuttingDown);
+    }
+    match params {
+        ProfileOpenParams::Resolve { profile_id } => resolve_profile_home(runtime, &profile_id),
+        ProfileOpenParams::Start {
+            profile_id,
+            idempotency_key,
+            repositories,
+            working_repository,
+            working_subdir,
+        } => start_profile_home(
+            runtime,
+            profile_id,
+            idempotency_key,
+            repositories,
+            working_repository,
+            working_subdir,
+        ),
+        ProfileOpenParams::Decide {
+            home_reservation_id,
+            decision,
+        } => decide_profile_home(runtime, &home_reservation_id, decision),
+    }
+}
+
+fn resolve_profile_home(
+    runtime: &DaemonRuntime,
+    profile_id: &ProfileId,
+) -> Result<ProfileOpenResult, ProfileOpenFailure> {
+    let store = runtime
+        .paths
+        .server_store()
+        .map_err(|_| ProfileOpenFailure::Persistence)?;
+    let profile = checked_profile(runtime, &store, profile_id)?;
+    let Some(home_thread_id) = profile.home_thread_id else {
+        return Ok(ProfileOpenResult::NoHome {
+            profile_id: profile_id.clone(),
+        });
+    };
+    opened_profile_home(runtime, &store, profile_id, &home_thread_id, false)
+}
+
+fn start_profile_home(
+    runtime: &DaemonRuntime,
+    profile_id: ProfileId,
+    idempotency_key: String,
+    repositories: Vec<ThreadRepositoryRequest>,
+    working_repository: String,
+    working_subdir: String,
+) -> Result<ProfileOpenResult, ProfileOpenFailure> {
+    validate_home_proposal(
+        &idempotency_key,
+        &repositories,
+        &working_repository,
+        &working_subdir,
+    )?;
+    let mut store = runtime
+        .paths
+        .server_store()
+        .map_err(|_| ProfileOpenFailure::Persistence)?;
+    let profile = checked_profile(runtime, &store, &profile_id)?;
+    let proposal = ProfileHomeProposal {
+        repositories,
+        working_repository,
+        working_subdir,
+    };
+    if let Some(existing) = store
+        .profile_home_reservation(&profile_id, &idempotency_key)
+        .map_err(|_| ProfileOpenFailure::Persistence)?
+    {
+        if existing.proposal != proposal {
+            return Err(ProfileOpenFailure::Conflict(format!(
+                "idempotency key {idempotency_key} names a different home proposal"
+            )));
+        }
+        return profile_home_reservation_result(runtime, &store, existing);
+    }
+    if profile.home_thread_id.is_some() {
+        return Err(ProfileOpenFailure::Conflict(format!(
+            "profile {profile_id} already has a home"
+        )));
+    }
+    let source_working_directory = runtime
+        .paths
+        .workspace_root
+        .join(&proposal.working_repository)
+        .join(&proposal.working_subdir);
+    let toolset = profile.toolset.clone();
+    let mut draft = ThreadAuthorityDraft::new(ThreadAuthorityDraftParams {
+        parent_thread_id: None,
+        cwd: &source_working_directory,
+        model: profile.model,
+        reasoning_effort: profile.reasoning_effort,
+        approval_policy: profile.approval_policy,
+        agent_id: None,
+        profile_id: profile_id.clone(),
+        profile_revision: profile.current_revision,
+        thread_kind: ThreadKind::Home,
+        writable: toolset_requires_writable_path(&toolset),
+        network: toolset_has_effect(&toolset, EffectClass::Network),
+        toolset,
+    })
+    .map_err(|error| ProfileOpenFailure::Malformed(error.to_string()))?;
+    draft.repositories = crate::thread_repository::resolve(
+        &runtime.paths.workspace_root,
+        &draft.thread_id,
+        &source_working_directory,
+        None,
+        &proposal.repositories,
+    )
+    .map_err(|error| ProfileOpenFailure::Malformed(error.to_string()))?;
+    let created_at_ms = now_ms();
+    let reservation = HomeReservationRecord {
+        id: new_home_reservation_id(),
+        workspace_id: runtime.paths.workspace_id.clone(),
+        profile_id,
+        idempotency_key,
+        proposal,
+        draft,
+        state: HomeReservationState::Pending,
+        decided_by: None,
+        reason: None,
+        created_at_ms,
+        decided_at_ms: None,
+    };
+    let claims = reservation
+        .draft
+        .repositories
+        .iter()
+        .map(|repository| (repository.repo.clone(), repository.branch.clone()))
+        .collect::<Vec<_>>();
+    match store
+        .reserve_profile_home(&reservation, &claims)
+        .map_err(|_| ProfileOpenFailure::Persistence)?
+    {
+        ReserveProfileHomeResult::Reserved(reservation)
+        | ReserveProfileHomeResult::Replayed(reservation) => {
+            profile_home_reservation_result(runtime, &store, reservation)
+        }
+        ReserveProfileHomeResult::Conflict(message) => Err(ProfileOpenFailure::Conflict(message)),
+    }
+}
+
+fn validate_home_proposal(
+    idempotency_key: &str,
+    repositories: &[ThreadRepositoryRequest],
+    working_repository: &str,
+    working_subdir: &str,
+) -> Result<(), ProfileOpenFailure> {
+    if idempotency_key.is_empty() || idempotency_key.len() > 128 {
+        return Err(ProfileOpenFailure::Malformed(
+            "profile.open idempotency_key must contain 1..128 UTF-8 bytes".into(),
+        ));
+    }
+    if repositories.is_empty() || repositories.len() > 16 {
+        return Err(ProfileOpenFailure::Malformed(
+            "profile.open repositories must contain 1..16 entries".into(),
+        ));
+    }
+    let mut seen = HashSet::new();
+    for repository in repositories {
+        if !seen.insert(repository.repo.as_str()) {
+            return Err(ProfileOpenFailure::Malformed(format!(
+                "profile.open names repository {} more than once",
+                repository.repo
+            )));
+        }
+    }
+    if !seen.contains(working_repository) {
+        return Err(ProfileOpenFailure::Malformed(
+            "profile.open working_repository must name one requested repository".into(),
+        ));
+    }
+    let subdir = Path::new(working_subdir);
+    if working_subdir.is_empty()
+        || subdir.is_absolute()
+        || subdir.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ProfileOpenFailure::Malformed(
+            "profile.open working_subdir must stay beneath its repository".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn checked_profile(
+    runtime: &DaemonRuntime,
+    store: &ServerStore,
+    profile_id: &ProfileId,
+) -> Result<crate::server_store::ProfileRecord, ProfileOpenFailure> {
+    let profile = store
+        .profile(profile_id)
+        .map_err(|_| ProfileOpenFailure::Persistence)?
+        .ok_or_else(|| ProfileOpenFailure::NotFound(format!("profile not found: {profile_id}")))?;
+    if profile.workspace_id != runtime.paths.workspace_id {
+        return Err(ProfileOpenFailure::WorkspaceMismatch(format!(
+            "profile {profile_id} belongs to another workspace"
+        )));
+    }
+    let workspace = store
+        .workspace(&profile.workspace_id)
+        .map_err(|_| ProfileOpenFailure::Persistence)?
+        .ok_or_else(|| {
+            ProfileOpenFailure::NotFound(format!(
+                "profile workspace not found: {}",
+                profile.workspace_id
+            ))
+        })?;
+    if workspace.health() != crate::server_store::WorkspaceHealth::Present {
+        return Err(ProfileOpenFailure::WorkspaceBroken(format!(
+            "workspace directory is missing: {}",
+            profile.workspace_id
+        )));
+    }
+    Ok(profile)
+}
+
+fn profile_home_reservation_result(
+    runtime: &DaemonRuntime,
+    store: &ServerStore,
+    reservation: HomeReservationRecord,
+) -> Result<ProfileOpenResult, ProfileOpenFailure> {
+    match reservation.state {
+        HomeReservationState::Pending => Ok(ProfileOpenResult::ApprovalRequired {
+            profile_id: reservation.profile_id,
+            home_reservation_id: reservation.id,
+            thread_id: reservation.draft.thread_id,
+            effect: thread_spawn_effect(),
+            reason: PROFILE_OPEN_APPROVAL_REASON.into(),
+        }),
+        HomeReservationState::Granted => opened_profile_home(
+            runtime,
+            store,
+            &reservation.profile_id,
+            &reservation.draft.thread_id,
+            false,
+        ),
+        HomeReservationState::Denied => Ok(ProfileOpenResult::Denied {
+            profile_id: reservation.profile_id,
+            home_reservation_id: reservation.id,
+            thread_id: reservation.draft.thread_id,
+            reason: reservation.reason.ok_or(ProfileOpenFailure::Persistence)?,
+        }),
+        HomeReservationState::Canceled => Ok(ProfileOpenResult::Canceled {
+            profile_id: reservation.profile_id,
+            home_reservation_id: reservation.id,
+            thread_id: reservation.draft.thread_id,
+        }),
+    }
+}
+
+fn decide_profile_home(
+    runtime: &DaemonRuntime,
+    reservation_id: &str,
+    decision: ProfileOpenDecision,
+) -> Result<ProfileOpenResult, ProfileOpenFailure> {
+    ActorId::new(reservation_id.to_owned())
+        .map_err(|error| ProfileOpenFailure::Malformed(error.to_string()))?;
+    if !runtime.claim_home_reservation_decision(reservation_id) {
+        return Err(ProfileOpenFailure::Overload(format!(
+            "profile home decision is already in progress: {reservation_id}"
+        )));
+    }
+    let result = decide_profile_home_inner(runtime, reservation_id, decision);
+    runtime.release_home_reservation_decision(reservation_id);
+    result
+}
+
+fn decide_profile_home_inner(
+    runtime: &DaemonRuntime,
+    reservation_id: &str,
+    decision: ProfileOpenDecision,
+) -> Result<ProfileOpenResult, ProfileOpenFailure> {
+    let mut store = runtime
+        .paths
+        .server_store()
+        .map_err(|_| ProfileOpenFailure::Persistence)?;
+    let reservation = store
+        .home_reservation(reservation_id)
+        .map_err(|_| ProfileOpenFailure::Persistence)?
+        .ok_or_else(|| {
+            ProfileOpenFailure::NotFound(format!("home reservation not found: {reservation_id}"))
+        })?;
+    if reservation.workspace_id != runtime.paths.workspace_id {
+        return Err(ProfileOpenFailure::NotFound(format!(
+            "home reservation not found: {reservation_id}"
+        )));
+    }
+    if reservation.state != HomeReservationState::Pending {
+        let matches = matches!(
+            (&decision, reservation.state),
+            (ProfileOpenDecision::Grant, HomeReservationState::Granted)
+                | (ProfileOpenDecision::Cancel, HomeReservationState::Canceled)
+        ) || matches!(
+            (&decision, reservation.state),
+            (ProfileOpenDecision::Deny { reason }, HomeReservationState::Denied)
+                if reservation.reason.as_deref() == Some(reason)
+        );
+        if !matches {
+            return Err(ProfileOpenFailure::Conflict(format!(
+                "home reservation {reservation_id} already has a different durable decision"
+            )));
+        }
+        return profile_home_reservation_result(runtime, &store, reservation);
+    }
+    match decision {
+        ProfileOpenDecision::Deny { reason } => {
+            if reason.trim().is_empty() {
+                return Err(ProfileOpenFailure::Malformed(
+                    "profile.open denial reason cannot be empty".into(),
+                ));
+            }
+            let reservation = store
+                .decide_profile_home_without_authority(
+                    reservation_id,
+                    HomeReservationState::Denied,
+                    LOCAL_OPERATOR_ACTOR,
+                    Some(&reason),
+                    now_ms(),
+                )
+                .map_err(|_| ProfileOpenFailure::Persistence)?;
+            profile_home_reservation_result(runtime, &store, reservation)
+        }
+        ProfileOpenDecision::Cancel => {
+            let reservation = store
+                .decide_profile_home_without_authority(
+                    reservation_id,
+                    HomeReservationState::Canceled,
+                    LOCAL_OPERATOR_ACTOR,
+                    None,
+                    now_ms(),
+                )
+                .map_err(|_| ProfileOpenFailure::Persistence)?;
+            profile_home_reservation_result(runtime, &store, reservation)
+        }
+        ProfileOpenDecision::Grant => grant_profile_home(runtime, &mut store, reservation),
+    }
+}
+
+fn grant_profile_home(
+    runtime: &DaemonRuntime,
+    store: &mut ServerStore,
+    reservation: HomeReservationRecord,
+) -> Result<ProfileOpenResult, ProfileOpenFailure> {
+    checked_profile(runtime, store, &reservation.profile_id)?;
+    let confinement = match runtime.thread_confinement() {
+        Ok(confinement) => confinement,
+        Err(()) => {
+            store
+                .decide_profile_home_without_authority(
+                    &reservation.id,
+                    HomeReservationState::Canceled,
+                    LOCAL_OPERATOR_ACTOR,
+                    None,
+                    now_ms(),
+                )
+                .map_err(|_| ProfileOpenFailure::Persistence)?;
+            return Err(ProfileOpenFailure::ConfinementUnavailable);
+        }
+    };
+    let mut draft = reservation.draft.clone();
+    let prepared = match crate::thread_repository::prepare(
+        &runtime.paths.server_db_path,
+        &runtime.paths.workspace_id,
+        &draft.thread_id,
+        &draft.repositories,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = store.decide_profile_home_without_authority(
+                &reservation.id,
+                HomeReservationState::Canceled,
+                LOCAL_OPERATOR_ACTOR,
+                None,
+                now_ms(),
+            );
+            return Err(ProfileOpenFailure::Malformed(error.to_string()));
+        }
+    };
+    draft.worktrees = prepared.worktrees;
+    draft.granted_paths = prepared.granted_paths;
+    let working = draft
+        .worktrees
+        .iter()
+        .find(|worktree| worktree.repo == reservation.proposal.working_repository)
+        .map(|worktree| Path::new(&worktree.path).join(&reservation.proposal.working_subdir))
+        .ok_or(ProfileOpenFailure::Persistence)
+        .and_then(|path| {
+            let canonical = path
+                .canonicalize()
+                .map_err(|error| ProfileOpenFailure::Malformed(error.to_string()))?;
+            let worktree = draft
+                .worktrees
+                .iter()
+                .find(|worktree| worktree.repo == reservation.proposal.working_repository)
+                .expect("working repository was selected above");
+            if !canonical.starts_with(&worktree.path) || !canonical.is_dir() {
+                return Err(ProfileOpenFailure::Malformed(
+                    "profile.open working_subdir is not a directory beneath its repository".into(),
+                ));
+            }
+            Ok(canonical)
+        });
+    let working = match working {
+        Ok(working) => working,
+        Err(error) => {
+            let _ = crate::thread_repository::discard(
+                &runtime.paths.server_db_path,
+                &runtime.paths.workspace_id,
+                &draft.thread_id,
+                &draft.repositories,
+            );
+            let _ = store.decide_profile_home_without_authority(
+                &reservation.id,
+                HomeReservationState::Canceled,
+                LOCAL_OPERATOR_ACTOR,
+                None,
+                now_ms(),
+            );
+            return Err(error);
+        }
+    };
+    draft.cwd = working.to_string_lossy().into_owned();
+    let decided_at_ms = now_ms();
+    let authority = draft
+        .complete(LOCAL_OPERATOR_ACTOR.into(), decided_at_ms)
+        .map_err(|error| ProfileOpenFailure::Malformed(error.to_string()))?;
+    let (durable, created) = match store.persist_profile_home(
+        &reservation.id,
+        &authority,
+        confinement,
+        LOCAL_OPERATOR_ACTOR,
+        decided_at_ms,
+    ) {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = crate::thread_repository::discard(
+                &runtime.paths.server_db_path,
+                &runtime.paths.workspace_id,
+                &draft.thread_id,
+                &draft.repositories,
+            );
+            return Err(ProfileOpenFailure::Persistence);
+        }
+    };
+    let authority = durable.record().clone();
+    let thread =
+        joined_thread_status(runtime, authority).map_err(|_| ProfileOpenFailure::Persistence)?;
+    Ok(ProfileOpenResult::Opened {
+        profile_id: reservation.profile_id,
+        thread,
+        created,
+    })
+}
+
+fn opened_profile_home(
+    runtime: &DaemonRuntime,
+    store: &ServerStore,
+    profile_id: &ProfileId,
+    thread_id: &str,
+    created: bool,
+) -> Result<ProfileOpenResult, ProfileOpenFailure> {
+    let authority = store
+        .thread_authority(thread_id)
+        .map_err(|_| ProfileOpenFailure::Persistence)?
+        .ok_or(ProfileOpenFailure::Persistence)?;
+    if authority.thread_kind != ThreadKind::Home
+        || authority.parent_thread_id.is_some()
+        || authority.profile_id.as_ref() != Some(profile_id)
+    {
+        return Err(ProfileOpenFailure::Persistence);
+    }
+    Ok(ProfileOpenResult::Opened {
+        profile_id: profile_id.clone(),
+        thread: joined_thread_status(runtime, authority)
+            .map_err(|_| ProfileOpenFailure::Persistence)?,
+        created,
+    })
+}
 
 #[derive(Debug)]
 pub(super) enum ThreadSpawnFailure {
@@ -205,17 +775,48 @@ fn start_thread_spawn(
             )));
         }
     }
+    let parent_thread_id = parent_thread_id.ok_or(ThreadSpawnFailure::Authority(
+        ThreadAuthorityError::ParentRequired,
+    ))?;
+    let parent = store
+        .thread_authority(&parent_thread_id)
+        .map_err(|_| ThreadSpawnFailure::Persistence)?
+        .ok_or_else(|| {
+            ThreadSpawnFailure::NotFound(format!(
+                "parent thread authority not found: {parent_thread_id}"
+            ))
+        })?;
+    let profile_id = parent
+        .profile_id
+        .clone()
+        .filter(|_| {
+            matches!(
+                parent.thread_kind,
+                crate::daemon::protocol::ThreadKind::Home
+                    | crate::daemon::protocol::ThreadKind::Child
+            )
+        })
+        .ok_or(ThreadSpawnFailure::Authority(
+            ThreadAuthorityError::SameProfileParent,
+        ))?;
+    let profile_revision = parent
+        .profile_revision
+        .ok_or(ThreadSpawnFailure::Authority(
+            ThreadAuthorityError::SameProfileParent,
+        ))?;
     let config = Config::load(cwd, None)
         .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
     let toolset = config.tools.enabled;
     let draft = ThreadAuthorityDraft::new(ThreadAuthorityDraftParams {
-        parent_thread_id,
+        parent_thread_id: Some(parent_thread_id),
         cwd,
         model,
         reasoning_effort,
         approval_policy,
-        agent_id: AgentId::new("plato")
-            .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?,
+        agent_id: None,
+        profile_id,
+        profile_revision,
+        thread_kind: crate::daemon::protocol::ThreadKind::Child,
         writable: toolset_requires_writable_path(&toolset),
         network: toolset_has_effect(&toolset, EffectClass::Network),
         toolset,
@@ -244,16 +845,12 @@ fn start_thread_spawn_draft(
         &runtime.paths.workspace_root,
         &draft.thread_id,
         Path::new(&draft.cwd),
-        parent.as_ref(),
+        Some(&parent),
         &repository_requests,
     )
     .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
-    if let Some(parent) = parent.as_ref() {
-        validate_child_authority(parent, &draft).map_err(ThreadSpawnFailure::Authority)?;
-    }
-    let auto_grant = parent.as_ref().is_some_and(|parent| {
-        parent.approval_policy == crate::daemon::protocol::ThreadApprovalPolicy::Yolo
-    });
+    validate_child_authority(&parent, &draft).map_err(ThreadSpawnFailure::Authority)?;
+    let auto_grant = parent.approval_policy == crate::daemon::protocol::ThreadApprovalPolicy::Yolo;
     let spawn_id = new_spawn_id();
     runtime
         .reserve_thread_spawn(spawn_id.clone(), draft.clone(), max_spawn_depth)
@@ -348,27 +945,47 @@ fn model_thread_spawn_inner(
             "thread cwd must be an absolute path".into(),
         ));
     }
-    let agent_id = AgentId::new(input.agent_id)
-        .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
     let mut store = runtime
         .paths
         .server_store()
         .map_err(|_| ThreadSpawnFailure::Persistence)?;
-    let agent = store
-        .agent(&agent_id)
+    let parent = store
+        .thread_authority(parent_thread_id)
         .map_err(|_| ThreadSpawnFailure::Persistence)?
-        .ok_or_else(|| ThreadSpawnFailure::NotFound(format!("agent not found: {agent_id}")))?;
-    if agent.workspace_id != runtime.paths.workspace_id {
+        .ok_or_else(|| {
+            ThreadSpawnFailure::NotFound(format!(
+                "parent thread authority not found: {parent_thread_id}"
+            ))
+        })?;
+    let profile_id = parent
+        .profile_id
+        .clone()
+        .ok_or(ThreadSpawnFailure::Authority(
+            ThreadAuthorityError::SameProfileParent,
+        ))?;
+    if !matches!(
+        parent.thread_kind,
+        crate::daemon::protocol::ThreadKind::Home | crate::daemon::protocol::ThreadKind::Child
+    ) {
+        return Err(ThreadSpawnFailure::Authority(
+            ThreadAuthorityError::SameProfileParent,
+        ));
+    }
+    let profile = store
+        .profile(&profile_id)
+        .map_err(|_| ThreadSpawnFailure::Persistence)?
+        .ok_or_else(|| ThreadSpawnFailure::NotFound(format!("profile not found: {profile_id}")))?;
+    if profile.workspace_id != runtime.paths.workspace_id {
         return Err(ThreadSpawnFailure::WorkspaceMismatch(format!(
-            "agent {agent_id} belongs to workspace {}, not {}",
-            agent.workspace_id, runtime.paths.workspace_id
+            "profile {profile_id} belongs to workspace {}, not {}",
+            profile.workspace_id, runtime.paths.workspace_id
         )));
     }
 
-    let toolset = input.toolset.unwrap_or_else(|| agent.toolset.clone());
+    let toolset = input.toolset.unwrap_or_else(|| profile.toolset.clone());
     let excess = toolset
         .iter()
-        .filter(|tool| !agent.toolset.contains(tool))
+        .filter(|tool| !profile.toolset.contains(tool))
         .cloned()
         .collect::<Vec<_>>();
     if !excess.is_empty() {
@@ -379,10 +996,13 @@ fn model_thread_spawn_inner(
     let draft = ThreadAuthorityDraft::new(ThreadAuthorityDraftParams {
         parent_thread_id: Some(parent_thread_id.into()),
         cwd: Path::new(&input.cwd),
-        model: input.model.unwrap_or(agent.model),
-        reasoning_effort: input.reasoning_effort.unwrap_or(agent.reasoning_effort),
-        approval_policy: input.approval_policy.unwrap_or(agent.approval_policy),
-        agent_id,
+        model: input.model.unwrap_or(profile.model),
+        reasoning_effort: input.reasoning_effort.unwrap_or(profile.reasoning_effort),
+        approval_policy: input.approval_policy.unwrap_or(profile.approval_policy),
+        agent_id: None,
+        profile_id,
+        profile_revision: profile.current_revision,
+        thread_kind: crate::daemon::protocol::ThreadKind::Child,
         writable: toolset_requires_writable_path(&toolset),
         network: toolset_has_effect(&toolset, EffectClass::Network),
         toolset,
@@ -554,8 +1174,45 @@ fn resolve_thread_spawn_inner(
                         return Err(ThreadSpawnFailure::Malformed(error.to_string()));
                     }
                 };
+                let prepared_cwd = (|| {
+                    let source_cwd = Path::new(&draft.cwd);
+                    let working_repository = draft
+                        .repositories
+                        .iter()
+                        .find(|repository| source_cwd.starts_with(&repository.source_path))
+                        .ok_or_else(|| {
+                            ThreadSpawnFailure::Malformed(
+                                "thread cwd is outside its requested repositories".into(),
+                            )
+                        })?;
+                    let relative = source_cwd
+                        .strip_prefix(&working_repository.source_path)
+                        .expect("working repository containment was checked above");
+                    prepared
+                        .worktrees
+                        .iter()
+                        .find(|worktree| worktree.repo == working_repository.repo)
+                        .map(|worktree| Path::new(&worktree.path).join(relative))
+                        .ok_or(ThreadSpawnFailure::Persistence)?
+                        .canonicalize()
+                        .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))
+                })();
+                let prepared_cwd = match prepared_cwd {
+                    Ok(cwd) => cwd,
+                    Err(error) => {
+                        let _ = crate::thread_repository::discard(
+                            &runtime.paths.server_db_path,
+                            &runtime.paths.workspace_id,
+                            &draft.thread_id,
+                            &draft.repositories,
+                        );
+                        let _ = store.release_thread_claims(&draft.thread_id);
+                        return Err(error);
+                    }
+                };
                 draft.worktrees = prepared.worktrees;
                 draft.granted_paths = prepared.granted_paths;
+                draft.cwd = prepared_cwd.to_string_lossy().into_owned();
             }
             let authority = draft
                 .complete(actor, decided_at_ms)
@@ -650,11 +1307,13 @@ fn read_live_parent(
     store: &ServerStore,
     draft: &ThreadAuthorityDraft,
     max_spawn_depth: u32,
-) -> Result<Option<crate::daemon::protocol::ThreadAuthorityRecord>, ThreadSpawnFailure> {
+) -> Result<crate::daemon::protocol::ThreadAuthorityRecord, ThreadSpawnFailure> {
     let Some(parent_thread_id) = draft.parent_thread_id.as_deref() else {
-        return Ok(None);
+        return Err(ThreadSpawnFailure::Authority(
+            ThreadAuthorityError::ParentRequired,
+        ));
     };
-    validate_spawn_depth(store, parent_thread_id, max_spawn_depth)?;
+    validate_spawn_lineage(store, parent_thread_id, &draft.profile_id, max_spawn_depth)?;
     let parent = store
         .thread_authority(parent_thread_id)
         .map_err(|_| ThreadSpawnFailure::Persistence)?
@@ -668,33 +1327,85 @@ fn read_live_parent(
             "parent thread is not loaded: {parent_thread_id}"
         )));
     }
+    if parent.profile_id.as_ref() != Some(&draft.profile_id)
+        || !matches!(
+            parent.thread_kind,
+            crate::daemon::protocol::ThreadKind::Home | crate::daemon::protocol::ThreadKind::Child
+        )
+    {
+        return Err(ThreadSpawnFailure::Authority(
+            ThreadAuthorityError::SameProfileParent,
+        ));
+    }
     validate_child_authority(&parent, draft).map_err(ThreadSpawnFailure::Authority)?;
-    Ok(Some(parent))
+    Ok(parent)
 }
 
-fn validate_spawn_depth(
+fn validate_spawn_lineage(
     store: &ServerStore,
     parent_thread_id: &str,
+    profile_id: &platonic_core::ProfileId,
     maximum: u32,
 ) -> Result<(), ThreadSpawnFailure> {
     let mut next = Some(parent_thread_id.to_owned());
     let mut depth = 0_u32;
+    let mut seen = HashSet::new();
     while let Some(thread_id) = next {
+        if !seen.insert(thread_id.clone()) {
+            return Err(ThreadSpawnFailure::Authority(
+                ThreadAuthorityError::InvalidLineage,
+            ));
+        }
         depth = depth.saturating_add(1);
         if depth > maximum {
             return Err(ThreadSpawnFailure::Authority(
                 ThreadAuthorityError::SpawnDepth { maximum },
             ));
         }
-        next = store
+        let authority = store
             .thread_authority(&thread_id)
             .map_err(|_| ThreadSpawnFailure::Persistence)?
             .ok_or_else(|| {
                 ThreadSpawnFailure::NotFound(format!(
                     "parent thread authority not found: {thread_id}"
                 ))
-            })?
-            .parent_thread_id;
+            })?;
+        if authority.profile_id.as_ref() != Some(profile_id)
+            || !matches!(
+                authority.thread_kind,
+                crate::daemon::protocol::ThreadKind::Home
+                    | crate::daemon::protocol::ThreadKind::Child
+            )
+        {
+            return Err(ThreadSpawnFailure::Authority(
+                ThreadAuthorityError::SameProfileParent,
+            ));
+        }
+        if store
+            .thread_stop(&thread_id)
+            .map_err(|_| ThreadSpawnFailure::Persistence)?
+            .is_some()
+        {
+            return Err(ThreadSpawnFailure::Authority(
+                ThreadAuthorityError::StoppedParent,
+            ));
+        }
+        next = authority.parent_thread_id;
+        if next.is_none() {
+            let profile = store
+                .profile(profile_id)
+                .map_err(|_| ThreadSpawnFailure::Persistence)?
+                .ok_or_else(|| {
+                    ThreadSpawnFailure::NotFound(format!("profile not found: {profile_id}"))
+                })?;
+            if authority.thread_kind != crate::daemon::protocol::ThreadKind::Home
+                || profile.home_thread_id.as_deref() != Some(&thread_id)
+            {
+                return Err(ThreadSpawnFailure::Authority(
+                    ThreadAuthorityError::InvalidLineage,
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -828,6 +1539,26 @@ pub(super) fn handle_thread_send(
             );
         }
     };
+    let identity = match (
+        authority.thread_kind,
+        authority.profile_id.clone(),
+        authority.profile_revision,
+    ) {
+        (ThreadKind::Home | ThreadKind::Child, Some(profile_id), Some(profile_revision)) => {
+            RunIdentity::Profile {
+                profile_id,
+                profile_revision,
+            }
+        }
+        _ => {
+            return Envelope::error(
+                request.id,
+                Some("thread.send".into()),
+                ERROR_THREAD_SEND_FAILED,
+                "legacy threads are replay-only and cannot start new turns",
+            );
+        }
+    };
     match crate::server_store::thread_stop(&runtime.paths.server_db_path, &params.thread_id) {
         Ok(Some(_)) => {
             return Envelope::error(
@@ -914,9 +1645,7 @@ pub(super) fn handle_thread_send(
     let context = ThreadRunContext {
         workspace_root,
         approval_policy: authority.approval_policy,
-        agent_id: authority
-            .agent_id
-            .unwrap_or_else(|| AgentId::new("plato").expect("static agent id is valid")),
+        identity,
         toolset: authority.toolset,
         turn: turn.clone(),
         confinement,
@@ -1005,6 +1734,7 @@ pub(super) fn handle_thread_events(
 ) -> Envelope {
     let ThreadEventsParams {
         thread_id,
+        live_epoch_id,
         from_offset,
         limit,
         wait_ms,
@@ -1075,19 +1805,12 @@ pub(super) fn handle_thread_events(
     }
     match runtime.thread_events(
         &thread_id,
+        live_epoch_id.as_deref(),
         from_offset,
         limit,
         std::time::Duration::from_millis(wait_ms),
     ) {
         Ok(result) => Envelope::typed_response(request.id, ProtocolResponse::ThreadEvents(result)),
-        Err(ThreadEventsError::Lagged { first_offset }) => Envelope::error(
-            request.id,
-            Some("thread.events".into()),
-            ERROR_LAGGED,
-            format!(
-                "requested thread events were evicted; first available offset is {first_offset}"
-            ),
-        ),
         Err(ThreadEventsError::Stopped) => Envelope::error(
             request.id,
             Some("thread.events".into()),
@@ -1132,6 +1855,14 @@ pub(super) fn handle_thread_stop(
             );
         }
     };
+    if authority.thread_kind == ThreadKind::Home {
+        return Envelope::error(
+            request.id,
+            Some("thread.stop".into()),
+            ERROR_THREAD_STOP_FAILED,
+            "profile home threads cannot be stopped; cancel an active run instead",
+        );
+    }
     let validated =
         match ThreadStopRecord::new(authority.thread_id.clone(), params.actor, None, now_ms()) {
             Ok(record) => record,
@@ -1284,7 +2015,7 @@ pub(in crate::daemon::handlers) mod tests {
 
     use platonic_core::EffectClass;
     #[cfg(target_os = "linux")]
-    use platonic_core::{AgentId, RunId};
+    use platonic_core::RunId;
     use serde_json::json;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
@@ -1306,7 +2037,6 @@ pub(in crate::daemon::handlers) mod tests {
             runtime::{RunRecord, ThreadTurnBinding},
         },
         ledger::SqliteLedger,
-        server_store::AgentRecord,
     };
     #[cfg(target_os = "linux")]
     use std::sync::mpsc;
@@ -1364,7 +2094,7 @@ pub(in crate::daemon::handlers) mod tests {
             .server_store()
             .unwrap()
             .register_workspace(
-                "workspace-thread-tests",
+                &runtime.paths.workspace_id,
                 "thread-tests",
                 &runtime.paths.workspace_root.to_string_lossy(),
                 &runtime.paths.ledger_path.to_string_lossy(),
@@ -1415,6 +2145,14 @@ pub(in crate::daemon::handlers) mod tests {
         cwd: &Path,
         approval_policy: crate::daemon::protocol::ThreadApprovalPolicy,
     ) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
+        if parent_thread_id.is_none() {
+            if !cwd.is_absolute() {
+                return Err(ThreadSpawnFailure::Malformed(
+                    "thread cwd must be an absolute path".into(),
+                ));
+            }
+            return start_test_home(runtime, cwd, approval_policy, Vec::new());
+        }
         thread_spawn(
             runtime,
             ThreadSpawnParams::Start {
@@ -1432,17 +2170,135 @@ pub(in crate::daemon::handlers) mod tests {
         runtime: &DaemonRuntime,
         repositories: Vec<ThreadRepositoryRequest>,
     ) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
-        thread_spawn(
+        start_test_home(
             runtime,
-            ThreadSpawnParams::Start {
-                parent_thread_id: None,
-                cwd: runtime.paths.workspace_root.to_string_lossy().into_owned(),
-                model: "gpt-5.6-sol".into(),
-                reasoning_effort: crate::daemon::protocol::ReasoningEffort::Xhigh,
-                approval_policy: ThreadApprovalPolicy::Prompt,
-                repositories,
-            },
+            &runtime.paths.workspace_root,
+            ThreadApprovalPolicy::Prompt,
+            repositories,
         )
+    }
+
+    fn start_test_home(
+        runtime: &DaemonRuntime,
+        cwd: &Path,
+        approval_policy: ThreadApprovalPolicy,
+        mut repositories: Vec<ThreadRepositoryRequest>,
+    ) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
+        if repositories.is_empty() {
+            repositories.push(ThreadRepositoryRequest {
+                repo: ".".into(),
+                branch: None,
+            });
+        }
+        let working_repository = repositories[0].repo.clone();
+        let repository_root = runtime.paths.workspace_root.join(&working_repository);
+        let working_subdir = cwd
+            .canonicalize()
+            .ok()
+            .and_then(|cwd| {
+                repository_root
+                    .canonicalize()
+                    .ok()
+                    .and_then(|root| cwd.strip_prefix(root).ok().map(Path::to_path_buf))
+            })
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| PathBuf::from("."))
+            .to_string_lossy()
+            .into_owned();
+        let config = Config::load(cwd, None)
+            .map_err(|error| ThreadSpawnFailure::Malformed(error.to_string()))?;
+        let profile_id = create_test_profile(runtime, approval_policy, config.tools.enabled);
+        let result = start_profile_home(
+            runtime,
+            profile_id,
+            new_spawn_id(),
+            repositories,
+            working_repository,
+            working_subdir,
+        )
+        .map_err(profile_open_test_failure)?;
+        match result {
+            ProfileOpenResult::ApprovalRequired {
+                home_reservation_id,
+                thread_id,
+                effect,
+                reason,
+                ..
+            } => Ok(ThreadSpawnResult::ApprovalRequired {
+                spawn_id: home_reservation_id,
+                thread_id,
+                effect,
+                reason,
+            }),
+            ProfileOpenResult::Opened { thread, .. } => Ok(ThreadSpawnResult::Spawned { thread }),
+            unexpected => Err(ThreadSpawnFailure::Conflict(format!(
+                "unexpected test home result: {unexpected:?}"
+            ))),
+        }
+    }
+
+    fn create_test_profile(
+        runtime: &DaemonRuntime,
+        approval_policy: ThreadApprovalPolicy,
+        toolset: Vec<String>,
+    ) -> ProfileId {
+        let created_at_ms = now_ms();
+        let profile_id = crate::server_store::mint_profile_id(
+            &runtime.paths.workspace_id,
+            "thread test",
+            created_at_ms,
+        );
+        let content = crate::server_store::ProfileRevisionContent::empty();
+        let content_hash = content.content_hash().unwrap();
+        let profile = crate::server_store::ProfileRecord {
+            id: profile_id.clone(),
+            workspace_id: runtime.paths.workspace_id.clone(),
+            display_name: profile_id.to_string(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: crate::daemon::protocol::ReasoningEffort::Xhigh,
+            approval_policy,
+            toolset,
+            current_revision: 1,
+            home_thread_id: None,
+            imported_agent_id: None,
+            created_at_ms,
+        };
+        let revision = crate::server_store::ProfileRevisionRecord {
+            profile_id: profile_id.clone(),
+            revision: 1,
+            parent_revision: None,
+            actor: "test".into(),
+            created_at_ms: profile.created_at_ms,
+            content_hash,
+            content,
+        };
+        runtime
+            .paths
+            .server_store()
+            .unwrap()
+            .create_profile(&profile, &revision)
+            .unwrap();
+        profile_id
+    }
+
+    fn profile_open_test_failure(error: ProfileOpenFailure) -> ThreadSpawnFailure {
+        match error {
+            ProfileOpenFailure::ShuttingDown => ThreadSpawnFailure::ShuttingDown,
+            ProfileOpenFailure::Malformed(message) => ThreadSpawnFailure::Malformed(message),
+            ProfileOpenFailure::NotFound(message) => ThreadSpawnFailure::NotFound(message),
+            ProfileOpenFailure::WorkspaceBroken(message) => {
+                ThreadSpawnFailure::WorkspaceBroken(message)
+            }
+            ProfileOpenFailure::WorkspaceMismatch(message) => {
+                ThreadSpawnFailure::WorkspaceMismatch(message)
+            }
+            ProfileOpenFailure::Conflict(message) => ThreadSpawnFailure::Conflict(message),
+            ProfileOpenFailure::Overload(message) => ThreadSpawnFailure::Overload(message),
+            ProfileOpenFailure::ConfinementUnavailable => {
+                ThreadSpawnFailure::ConfinementUnavailable
+            }
+            ProfileOpenFailure::Persistence => ThreadSpawnFailure::Persistence,
+        }
     }
 
     fn git(cwd: &Path, args: &[&str]) -> String {
@@ -1485,7 +2341,10 @@ pub(in crate::daemon::handlers) mod tests {
                 reason,
             } => {
                 assert_eq!(effect, EffectClass::WorkspaceWrite);
-                assert_eq!(reason, THREAD_SPAWN_APPROVAL_REASON);
+                assert!(matches!(
+                    reason.as_str(),
+                    THREAD_SPAWN_APPROVAL_REASON | PROFILE_OPEN_APPROVAL_REASON
+                ));
                 (spawn_id, thread_id)
             }
             unexpected => panic!("expected approval-required spawn, got {unexpected:?}"),
@@ -1497,6 +2356,45 @@ pub(in crate::daemon::handlers) mod tests {
         spawn_id: &str,
         approval: ThreadSpawnDecision,
     ) -> Result<ThreadSpawnResult, ThreadSpawnFailure> {
+        if spawn_id.starts_with("home_reservation_") {
+            let (decision, actor) = match approval {
+                ThreadSpawnDecision::Grant { actor } => (ProfileOpenDecision::Grant, actor),
+                ThreadSpawnDecision::Deny { actor, reason } => {
+                    (ProfileOpenDecision::Deny { reason }, actor)
+                }
+                ThreadSpawnDecision::Cancel { actor } => (ProfileOpenDecision::Cancel, actor),
+            };
+            return match decide_profile_home(runtime, spawn_id, decision)
+                .map_err(profile_open_test_failure)?
+            {
+                ProfileOpenResult::Opened { thread, .. } => {
+                    Ok(ThreadSpawnResult::Spawned { thread })
+                }
+                ProfileOpenResult::Denied {
+                    home_reservation_id,
+                    thread_id,
+                    reason,
+                    ..
+                } => Ok(ThreadSpawnResult::Denied {
+                    spawn_id: home_reservation_id,
+                    thread_id,
+                    actor,
+                    reason,
+                }),
+                ProfileOpenResult::Canceled {
+                    home_reservation_id,
+                    thread_id,
+                    ..
+                } => Ok(ThreadSpawnResult::Canceled {
+                    spawn_id: home_reservation_id,
+                    thread_id,
+                    actor,
+                }),
+                unexpected => Err(ThreadSpawnFailure::Conflict(format!(
+                    "unexpected test home decision: {unexpected:?}"
+                ))),
+            };
+        }
         thread_spawn(
             runtime,
             ThreadSpawnParams::Decide {
@@ -1520,31 +2418,28 @@ pub(in crate::daemon::handlers) mod tests {
         )
         .unwrap()
         {
-            ThreadSpawnResult::Spawned { thread } => thread,
+            ThreadSpawnResult::Spawned { thread } => {
+                if thread.authority.thread_kind == ThreadKind::Home {
+                    runtime
+                        .load_thread(&thread.authority.thread_id)
+                        .expect("test home can be explicitly loaded");
+                    joined_thread_status(
+                        runtime,
+                        runtime
+                            .paths
+                            .server_store()
+                            .unwrap()
+                            .thread_authority(&thread.authority.thread_id)
+                            .unwrap()
+                            .unwrap(),
+                    )
+                    .unwrap()
+                } else {
+                    thread
+                }
+            }
             unexpected => panic!("expected spawned thread, got {unexpected:?}"),
         }
-    }
-
-    fn register_test_agent(
-        runtime: &DaemonRuntime,
-        id: &str,
-        policy: ThreadApprovalPolicy,
-        toolset: Vec<String>,
-    ) {
-        runtime
-            .paths
-            .server_store()
-            .unwrap()
-            .register_agent(&AgentRecord {
-                id: platonic_core::AgentId::new(id).unwrap(),
-                workspace_id: runtime.paths.workspace_id.clone(),
-                model: "worker-model".into(),
-                reasoning_effort: crate::daemon::protocol::ReasoningEffort::High,
-                approval_policy: policy,
-                toolset,
-                created_at_ms: 1,
-            })
-            .unwrap();
     }
 
     fn coordinator_root(runtime: &DaemonRuntime) -> String {
@@ -1569,7 +2464,6 @@ pub(in crate::daemon::handlers) mod tests {
     fn model_spawn_input(
         runtime: &DaemonRuntime,
         parent_thread_id: &str,
-        agent_id: &str,
         toolset: Option<Vec<String>>,
         approval_policy: Option<ThreadApprovalPolicy>,
     ) -> ThreadSpawnToolInput {
@@ -1577,7 +2471,6 @@ pub(in crate::daemon::handlers) mod tests {
             .to_string_lossy()
             .into_owned();
         ThreadSpawnToolInput {
-            agent_id: agent_id.into(),
             cwd,
             model: None,
             reasoning_effort: None,
@@ -1585,6 +2478,35 @@ pub(in crate::daemon::handlers) mod tests {
             toolset,
             repositories: None,
         }
+    }
+
+    fn coordinator_child(
+        runtime: &DaemonRuntime,
+        parent_thread_id: &str,
+        actor: &str,
+    ) -> ThreadStatus {
+        let thread_id = match model_thread_spawn(
+            runtime,
+            parent_thread_id,
+            model_spawn_input(runtime, parent_thread_id, None, None),
+            actor.into(),
+        )
+        .unwrap()
+        {
+            ThreadSpawnToolOutput::Spawned { thread_id } => thread_id,
+            output => panic!("expected spawned child, got {output:?}"),
+        };
+        joined_thread_status(
+            runtime,
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .thread_authority(&thread_id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap()
     }
 
     fn thread_worktree(runtime: &DaemonRuntime, thread_id: &str) -> PathBuf {
@@ -1603,20 +2525,14 @@ pub(in crate::daemon::handlers) mod tests {
     }
 
     #[test]
-    fn model_spawn_reuses_durable_admission_and_records_the_approving_actor() {
+    fn model_spawn_reuses_durable_same_profile_admission_and_records_the_approving_actor() {
         let (_root, runtime) = thread_test_runtime();
         let parent_thread_id = coordinator_root(&runtime);
-        register_test_agent(
-            &runtime,
-            "worker",
-            ThreadApprovalPolicy::Prompt,
-            vec!["file.read".into()],
-        );
 
         let output = model_thread_spawn(
             &runtime,
             &parent_thread_id,
-            model_spawn_input(&runtime, &parent_thread_id, "worker", None, None),
+            model_spawn_input(&runtime, &parent_thread_id, None, None),
             "daemon".into(),
         )
         .unwrap();
@@ -1626,18 +2542,19 @@ pub(in crate::daemon::handlers) mod tests {
         };
 
         let store = runtime.paths.server_store().unwrap();
+        let parent = store.thread_authority(&parent_thread_id).unwrap().unwrap();
         let child = store.thread_authority(&child_thread_id).unwrap().unwrap();
         assert_eq!(
             child.parent_thread_id.as_deref(),
             Some(parent_thread_id.as_str())
         );
         assert_eq!(child.spawning_actor, "daemon");
-        assert_eq!(
-            child.agent_id,
-            Some(platonic_core::AgentId::new("worker").unwrap())
-        );
-        assert_eq!(child.model, "worker-model");
-        assert_eq!(child.toolset, ["file.read"]);
+        assert_eq!(child.agent_id, None);
+        assert_eq!(child.profile_id, parent.profile_id);
+        assert_eq!(child.profile_revision, parent.profile_revision);
+        assert_eq!(child.thread_kind, ThreadKind::Child);
+        assert_eq!(child.model, "gpt-5.6-sol");
+        assert_eq!(child.toolset, ["file.read", "thread.spawn"]);
         assert_eq!(child.worktrees.len(), 1);
         assert_eq!(child.granted_paths.len(), 1);
         assert!(child.granted_paths[0].writable);
@@ -1662,24 +2579,6 @@ pub(in crate::daemon::handlers) mod tests {
     fn model_spawn_returns_typed_rejections_for_authority_escalation() {
         let (_root, runtime) = thread_test_runtime();
         let parent_thread_id = coordinator_root(&runtime);
-        register_test_agent(
-            &runtime,
-            "broad-worker",
-            ThreadApprovalPolicy::Prompt,
-            vec![
-                "file.read".into(),
-                "file.write".into(),
-                "web.fetch".into(),
-                "thread.spawn".into(),
-            ],
-        );
-        register_test_agent(
-            &runtime,
-            "narrow-worker",
-            ThreadApprovalPolicy::Prompt,
-            vec!["file.read".into()],
-        );
-
         let outside = tempfile::tempdir().unwrap();
         for (label, input) in [
             (
@@ -1687,7 +2586,6 @@ pub(in crate::daemon::handlers) mod tests {
                 model_spawn_input(
                     &runtime,
                     &parent_thread_id,
-                    "broad-worker",
                     Some(vec!["file.read".into(), "web.fetch".into()]),
                     None,
                 ),
@@ -1697,17 +2595,15 @@ pub(in crate::daemon::handlers) mod tests {
                 model_spawn_input(
                     &runtime,
                     &parent_thread_id,
-                    "broad-worker",
                     Some(vec!["file.read".into()]),
                     Some(ThreadApprovalPolicy::Yolo),
                 ),
             ),
             (
-                "agent toolset",
+                "profile toolset",
                 model_spawn_input(
                     &runtime,
                     &parent_thread_id,
-                    "narrow-worker",
                     Some(vec!["file.write".into()]),
                     None,
                 ),
@@ -1723,7 +2619,6 @@ pub(in crate::daemon::handlers) mod tests {
                     ..model_spawn_input(
                         &runtime,
                         &parent_thread_id,
-                        "broad-worker",
                         Some(vec!["file.read".into()]),
                         None,
                     )
@@ -1759,7 +2654,6 @@ pub(in crate::daemon::handlers) mod tests {
             model_spawn_input(
                 &runtime,
                 &parent_thread_id,
-                "broad-worker",
                 Some(vec!["file.read".into(), "thread.spawn".into()]),
                 None,
             ),
@@ -1773,13 +2667,7 @@ pub(in crate::daemon::handlers) mod tests {
         let depth = model_thread_spawn(
             &runtime,
             &first_child,
-            model_spawn_input(
-                &runtime,
-                &first_child,
-                "broad-worker",
-                Some(vec!["file.read".into()]),
-                None,
-            ),
+            model_spawn_input(&runtime, &first_child, Some(vec!["file.read".into()]), None),
             "daemon".into(),
         )
         .unwrap();
@@ -1803,16 +2691,51 @@ pub(in crate::daemon::handlers) mod tests {
     }
 
     #[test]
+    fn child_admission_rejects_a_cross_profile_parent_before_reservation() {
+        let (_root, runtime) = thread_test_runtime();
+        let parent_thread_id = coordinator_root(&runtime);
+        let parent = runtime
+            .paths
+            .server_store()
+            .unwrap()
+            .thread_authority(&parent_thread_id)
+            .unwrap()
+            .unwrap();
+        let other_profile = create_test_profile(
+            &runtime,
+            ThreadApprovalPolicy::Prompt,
+            vec!["file.read".into()],
+        );
+        let draft = ThreadAuthorityDraft::new(ThreadAuthorityDraftParams {
+            parent_thread_id: Some(parent_thread_id),
+            cwd: Path::new(parent.cwd.as_deref().unwrap()),
+            model: parent.model,
+            reasoning_effort: parent.reasoning_effort,
+            approval_policy: ThreadApprovalPolicy::Prompt,
+            agent_id: None,
+            profile_id: other_profile,
+            profile_revision: 1,
+            thread_kind: ThreadKind::Child,
+            toolset: vec!["file.read".into()],
+            writable: false,
+            network: false,
+        })
+        .unwrap();
+        let mut store = runtime.paths.server_store().unwrap();
+        assert!(matches!(
+            start_thread_spawn_draft(&runtime, &mut store, draft, Vec::new(), 1, "test"),
+            Err(ThreadSpawnFailure::Authority(
+                ThreadAuthorityError::SameProfileParent
+            ))
+        ));
+        assert_eq!(store.thread_authorities().unwrap().len(), 1);
+        assert_eq!(store.branch_claims().unwrap().len(), 1);
+    }
+
+    #[test]
     fn model_spawn_enforces_frozen_server_depth_after_workspace_mutation() {
         let (_root, runtime) = thread_test_runtime_with_max_spawn_depth(1);
         let parent_thread_id = coordinator_root(&runtime);
-        register_test_agent(
-            &runtime,
-            "worker",
-            ThreadApprovalPolicy::Prompt,
-            vec!["file.read".into(), "thread.spawn".into()],
-        );
-
         std::fs::write(
             runtime.paths.workspace_root.join("plato.toml"),
             "[limits]\nmax_spawn_depth = 99\n\n[tools]\nenabled = [\"file.read\", \"thread.spawn\"]\n",
@@ -1825,7 +2748,6 @@ pub(in crate::daemon::handlers) mod tests {
             model_spawn_input(
                 &runtime,
                 &parent_thread_id,
-                "worker",
                 Some(vec!["file.read".into(), "thread.spawn".into()]),
                 None,
             ),
@@ -1842,7 +2764,6 @@ pub(in crate::daemon::handlers) mod tests {
             model_spawn_input(
                 &runtime,
                 &child_thread_id,
-                "worker",
                 Some(vec!["file.read".into()]),
                 None,
             ),
@@ -1874,20 +2795,12 @@ pub(in crate::daemon::handlers) mod tests {
     fn model_spawn_enforces_configured_server_depth_at_admission() {
         let (_root, runtime) = thread_test_runtime_with_max_spawn_depth(2);
         let parent_thread_id = coordinator_root(&runtime);
-        register_test_agent(
-            &runtime,
-            "worker",
-            ThreadApprovalPolicy::Prompt,
-            vec!["file.read".into(), "thread.spawn".into()],
-        );
-
         let child_thread_id = match model_thread_spawn(
             &runtime,
             &parent_thread_id,
             model_spawn_input(
                 &runtime,
                 &parent_thread_id,
-                "worker",
                 Some(vec!["file.read".into(), "thread.spawn".into()]),
                 None,
             ),
@@ -1904,7 +2817,6 @@ pub(in crate::daemon::handlers) mod tests {
             model_spawn_input(
                 &runtime,
                 &child_thread_id,
-                "worker",
                 Some(vec!["file.read".into(), "thread.spawn".into()]),
                 None,
             ),
@@ -1921,7 +2833,6 @@ pub(in crate::daemon::handlers) mod tests {
             model_spawn_input(
                 &runtime,
                 &grandchild_thread_id,
-                "worker",
                 Some(vec!["file.read".into()]),
                 None,
             ),
@@ -1959,7 +2870,7 @@ pub(in crate::daemon::handlers) mod tests {
     }
 
     #[test]
-    fn thread_spawn_becomes_live_only_after_complete_authority_is_durable() {
+    fn profile_home_becomes_durable_without_becoming_live_or_stoppable() {
         let (_root, runtime) = thread_test_runtime();
         let (spawn_id, thread_id) = pending_spawn(
             start_thread(
@@ -1975,10 +2886,22 @@ pub(in crate::daemon::handlers) mod tests {
         assert!(!runtime.thread_is_loaded(&thread_id));
         drop(store);
 
-        let status = grant_thread(&runtime, &spawn_id, "stdin");
+        let status = match decide_thread(
+            &runtime,
+            &spawn_id,
+            ThreadSpawnDecision::Grant {
+                actor: "ignored-client-actor".into(),
+            },
+        )
+        .unwrap()
+        {
+            ThreadSpawnResult::Spawned { thread } => thread,
+            result => panic!("expected opened home, got {result:?}"),
+        };
         assert_eq!(status.authority.thread_id, thread_id);
-        assert_eq!(status.authority.spawning_actor, "stdin");
+        assert_eq!(status.authority.spawning_actor, LOCAL_OPERATOR_ACTOR);
         assert_eq!(status.authority.parent_thread_id, None);
+        assert_eq!(status.authority.thread_kind, ThreadKind::Home);
         let authority_response = handle_line(
             &runtime,
             &format!(
@@ -1992,7 +2915,10 @@ pub(in crate::daemon::handlers) mod tests {
         };
         assert_eq!(authority.confinement, Some(expected_confinement));
         let authority = authority.authority;
-        assert_eq!(authority.agent_id, Some(AgentId::new("plato").unwrap()));
+        assert_eq!(authority.agent_id, None);
+        assert_eq!(authority.profile_id, status.authority.profile_id);
+        assert_eq!(authority.profile_revision, Some(1));
+        assert_eq!(authority.thread_kind, ThreadKind::Home);
         assert_eq!(authority.worktrees.len(), 1);
         assert_eq!(authority.worktrees[0].repo, ".");
         assert_eq!(authority.worktrees[0].branch, format!("thread/{thread_id}"));
@@ -2024,16 +2950,216 @@ pub(in crate::daemon::handlers) mod tests {
         assert_eq!(
             status.live,
             crate::daemon::protocol::ThreadLiveState {
-                loaded: true,
+                live_epoch_id: runtime.live_epoch_id(),
+                loaded: false,
                 current_turn_id: None,
-                last_activity_at_ms: Some(authority.created_at_ms),
+                last_activity_at_ms: None,
             }
         );
         let store = runtime.paths.server_store().unwrap();
         assert_eq!(store.thread_authority(&thread_id).unwrap(), Some(authority));
-        let approval = store.thread_spawn_approval(&spawn_id).unwrap().unwrap();
-        assert_eq!(approval.decision, ThreadSpawnDecisionName::Granted);
-        assert_eq!(approval.actor, status.authority.spawning_actor);
+        let reservation = store.home_reservation(&spawn_id).unwrap().unwrap();
+        assert_eq!(reservation.state, HomeReservationState::Granted);
+        assert_eq!(
+            reservation.decided_by.as_deref(),
+            Some(LOCAL_OPERATOR_ACTOR)
+        );
+        assert_eq!(
+            store
+                .profile(status.authority.profile_id.as_ref().unwrap())
+                .unwrap()
+                .unwrap()
+                .home_thread_id
+                .as_deref(),
+            Some(thread_id.as_str())
+        );
+        drop(store);
+        let stopped = stop_thread(&runtime, &thread_id, "operator");
+        let error = stopped.error.unwrap();
+        assert_eq!(error.code, ERROR_THREAD_STOP_FAILED);
+        assert!(error.message.contains("cannot be stopped"));
+    }
+
+    #[test]
+    fn profile_open_converges_concurrently_replays_and_resolves_across_restart() {
+        let (_root, runtime) = thread_test_runtime();
+        let profile_id = create_test_profile(
+            &runtime,
+            ThreadApprovalPolicy::Prompt,
+            vec!["file.read".into()],
+        );
+        assert_eq!(
+            resolve_profile_home(&runtime, &profile_id).unwrap(),
+            ProfileOpenResult::NoHome {
+                profile_id: profile_id.clone()
+            }
+        );
+        assert!(
+            runtime
+                .paths
+                .server_store()
+                .unwrap()
+                .thread_authorities()
+                .unwrap()
+                .is_empty()
+        );
+
+        let ready = Arc::new(std::sync::Barrier::new(3));
+        let starts = (0..2)
+            .map(|_| {
+                let runtime = runtime.clone();
+                let profile_id = profile_id.clone();
+                let ready = ready.clone();
+                thread::spawn(move || {
+                    ready.wait();
+                    start_profile_home(
+                        &runtime,
+                        profile_id,
+                        "same-request".into(),
+                        vec![ThreadRepositoryRequest {
+                            repo: ".".into(),
+                            branch: None,
+                        }],
+                        ".".into(),
+                        ".".into(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        ready.wait();
+        let pending = starts
+            .into_iter()
+            .map(|start| match start.join().unwrap().unwrap() {
+                ProfileOpenResult::ApprovalRequired {
+                    home_reservation_id,
+                    thread_id,
+                    ..
+                } => (home_reservation_id, thread_id),
+                result => panic!("expected pending home, got {result:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pending[0], pending[1]);
+        let (reservation_id, thread_id) = pending[0].clone();
+
+        assert!(matches!(
+            start_profile_home(
+                &runtime,
+                profile_id.clone(),
+                "same-request".into(),
+                vec![ThreadRepositoryRequest {
+                    repo: ".".into(),
+                    branch: None,
+                }],
+                ".".into(),
+                ".".into(),
+            )
+            .unwrap(),
+            ProfileOpenResult::ApprovalRequired {
+                home_reservation_id,
+                thread_id: replayed_thread_id,
+                ..
+            } if home_reservation_id == reservation_id && replayed_thread_id == thread_id
+        ));
+        std::fs::create_dir(runtime.paths.workspace_root.join("other")).unwrap();
+        assert!(matches!(
+            start_profile_home(
+                &runtime,
+                profile_id.clone(),
+                "same-request".into(),
+                vec![ThreadRepositoryRequest {
+                    repo: ".".into(),
+                    branch: None,
+                }],
+                ".".into(),
+                "other".into(),
+            ),
+            Err(ProfileOpenFailure::Conflict(message))
+                if message.contains("different home proposal")
+        ));
+        assert!(matches!(
+            start_profile_home(
+                &runtime,
+                profile_id.clone(),
+                "different-request".into(),
+                vec![ThreadRepositoryRequest {
+                    repo: ".".into(),
+                    branch: None,
+                }],
+                ".".into(),
+                ".".into(),
+            ),
+            Err(ProfileOpenFailure::Conflict(message))
+                if message.contains("pending home reservation")
+        ));
+
+        let opened =
+            decide_profile_home(&runtime, &reservation_id, ProfileOpenDecision::Grant).unwrap();
+        assert!(matches!(
+            opened,
+            ProfileOpenResult::Opened {
+                created: true,
+                ref thread,
+                ..
+            } if thread.authority.thread_id == thread_id && !thread.live.loaded
+        ));
+        assert!(matches!(
+            resolve_profile_home(&runtime, &profile_id).unwrap(),
+            ProfileOpenResult::Opened {
+                created: false,
+                ref thread,
+                ..
+            } if thread.authority.thread_id == thread_id && !thread.live.loaded
+        ));
+        assert!(matches!(
+            start_profile_home(
+                &runtime,
+                profile_id.clone(),
+                "same-request".into(),
+                vec![ThreadRepositoryRequest {
+                    repo: ".".into(),
+                    branch: None,
+                }],
+                ".".into(),
+                ".".into(),
+            )
+            .unwrap(),
+            ProfileOpenResult::Opened {
+                created: false,
+                ref thread,
+                ..
+            } if thread.authority.thread_id == thread_id
+        ));
+        assert!(matches!(
+            start_profile_home(
+                &runtime,
+                profile_id.clone(),
+                "second-home".into(),
+                vec![ThreadRepositoryRequest {
+                    repo: ".".into(),
+                    branch: None,
+                }],
+                ".".into(),
+                ".".into(),
+            ),
+            Err(ProfileOpenFailure::Conflict(message)) if message.contains("already has a home")
+        ));
+
+        let old_epoch = runtime.live_epoch_id();
+        let restarted = DaemonRuntime::new(runtime.paths.clone());
+        assert_ne!(restarted.live_epoch_id(), old_epoch);
+        assert!(matches!(
+            resolve_profile_home(&restarted, &profile_id).unwrap(),
+            ProfileOpenResult::Opened {
+                created: false,
+                ref thread,
+                ..
+            } if thread.authority.thread_id == thread_id
+                && !thread.live.loaded
+                && thread.live.live_epoch_id == restarted.live_epoch_id()
+        ));
+        let store = restarted.paths.server_store().unwrap();
+        assert_eq!(store.thread_authorities().unwrap().len(), 1);
+        assert_eq!(store.branch_claims().unwrap().len(), 1);
     }
 
     #[test]
@@ -2052,7 +3178,7 @@ pub(in crate::daemon::handlers) mod tests {
             matches!(
                 &error,
                 ThreadSpawnFailure::Malformed(message)
-                    if message.contains("thread spawn requires a named Git repository and claimed branch")
+                    if message.contains("thread repository is not a Git repository")
             ),
             "unexpected repository-less spawn failure: {error:?}"
         );
@@ -2102,22 +3228,16 @@ pub(in crate::daemon::handlers) mod tests {
     fn git_thread_stop_integrates_private_commit_and_cleans_only_server_owned_state() {
         let (_root, runtime) = thread_test_runtime();
         let user_commit = init_git_repository(&runtime.paths.workspace_root);
-        let (spawn_id, thread_id) = pending_spawn(
-            start_thread(
-                &runtime,
-                None,
-                &runtime.paths.workspace_root,
-                ThreadApprovalPolicy::Prompt,
-            )
-            .unwrap(),
-        );
-        grant_thread(&runtime, &spawn_id, "stdin");
+        let home_thread_id = coordinator_root(&runtime);
+        let thread_id = coordinator_child(&runtime, &home_thread_id, "stdin")
+            .authority
+            .thread_id;
         let store = runtime.paths.server_store().unwrap();
         let authority = store.thread_authority(&thread_id).unwrap().unwrap();
         assert_eq!(authority.worktrees.len(), 1);
         assert_eq!(authority.worktrees[0].repo, ".");
         assert_eq!(authority.worktrees[0].branch, format!("thread/{thread_id}"));
-        assert_eq!(store.branch_claims().unwrap().len(), 1);
+        assert_eq!(store.branch_claims().unwrap().len(), 2);
         drop(store);
         let response = handle_line(
             &runtime,
@@ -2152,7 +3272,7 @@ pub(in crate::daemon::handlers) mod tests {
                 .exists()
         );
         let store = runtime.paths.server_store().unwrap();
-        assert!(store.branch_claims().unwrap().is_empty());
+        assert_eq!(store.branch_claims().unwrap().len(), 1);
         drop(store);
         let shared = crate::thread_repository::shared_repository_path(
             &runtime.paths.server_db_path,
@@ -2190,31 +3310,20 @@ pub(in crate::daemon::handlers) mod tests {
         let (first_spawn, _) =
             pending_spawn(start_thread_with_repositories(&runtime, vec![request.clone()]).unwrap());
         grant_thread(&runtime, &first_spawn, "stdin");
-        let (second_spawn, second_thread) =
-            pending_spawn(start_thread_with_repositories(&runtime, vec![request]).unwrap());
-        let conflict = handle_line(
-            &runtime,
-            &format!(
-                r#"{{"v":1,"id":"conflict","kind":"request","method":"thread.spawn","params":{{"action":"decide","spawn_id":"{second_spawn}","approval":{{"decision":"grant","actor":"stdin"}}}}}}"#
-            ),
-        );
+        assert!(matches!(
+            start_thread_with_repositories(&runtime, vec![request]),
+            Err(ThreadSpawnFailure::Conflict(message))
+                if message.contains("already claimed")
+        ));
         assert_eq!(
-            conflict.error.unwrap().code,
-            ERROR_THREAD_BRANCH_CLAIM_CONFLICT
-        );
-        assert!(
             runtime
                 .paths
                 .server_store()
                 .unwrap()
-                .thread_authority(&second_thread)
+                .thread_authorities()
                 .unwrap()
-                .is_none()
-        );
-        assert!(
-            !crate::paths::thread_repository_root(&runtime.paths.server_db_path, &second_thread,)
-                .unwrap()
-                .exists()
+                .len(),
+            1
         );
 
         let paths = runtime.paths.clone();
@@ -2272,7 +3381,7 @@ pub(in crate::daemon::handlers) mod tests {
         let unavailable = handle_line(
             &required,
             &format!(
-                r#"{{"v":1,"id":"required","kind":"request","method":"thread.spawn","params":{{"action":"decide","spawn_id":"{spawn_id}","approval":{{"decision":"grant","actor":"stdin"}}}}}}"#
+                r#"{{"v":1,"id":"required","kind":"request","method":"profile.open","params":{{"action":"decide","home_reservation_id":"{spawn_id}","decision":{{"decision":"grant"}}}}}}"#
             ),
         );
         assert_eq!(
@@ -2308,14 +3417,14 @@ pub(in crate::daemon::handlers) mod tests {
                     actor: "reviewer".into(),
                     reason: "not admitted".into(),
                 },
-                ThreadSpawnDecisionName::Denied,
+                HomeReservationState::Denied,
             ),
             (
                 "canceled",
                 ThreadSpawnDecision::Cancel {
                     actor: "stdin".into(),
                 },
-                ThreadSpawnDecisionName::Canceled,
+                HomeReservationState::Canceled,
             ),
         ] {
             let (_root, runtime) = thread_test_runtime();
@@ -2335,8 +3444,12 @@ pub(in crate::daemon::handlers) mod tests {
                     | (ThreadSpawnResult::Canceled { .. }, "canceled")
             ));
             let store = runtime.paths.server_store().unwrap();
-            let approval = store.thread_spawn_approval(&spawn_id).unwrap().unwrap();
-            assert_eq!(approval.decision, expected);
+            let reservation = store.home_reservation(&spawn_id).unwrap().unwrap();
+            assert_eq!(reservation.state, expected);
+            assert_eq!(
+                reservation.decided_by.as_deref(),
+                Some(LOCAL_OPERATOR_ACTOR)
+            );
             assert!(store.thread_authority(&thread_id).unwrap().is_none());
             assert!(!runtime.thread_is_loaded(&thread_id));
         }
@@ -2363,19 +3476,11 @@ pub(in crate::daemon::handlers) mod tests {
     #[test]
     fn idle_thread_stop_is_durable_idempotent_and_leaves_sibling_untouched() {
         let (_root, runtime) = thread_test_runtime();
-        let mut threads = Vec::new();
-        for _ in 0..2 {
-            let (spawn_id, _) = pending_spawn(
-                start_thread(
-                    &runtime,
-                    None,
-                    &runtime.paths.workspace_root,
-                    crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
-                )
-                .unwrap(),
-            );
-            threads.push(grant_thread(&runtime, &spawn_id, "stdin"));
-        }
+        let home_thread_id = coordinator_root(&runtime);
+        let threads = [
+            coordinator_child(&runtime, &home_thread_id, "stdin"),
+            coordinator_child(&runtime, &home_thread_id, "stdin"),
+        ];
         let target_id = threads[0].authority.thread_id.clone();
         let sibling_id = threads[1].authority.thread_id.clone();
         let sibling_before = runtime.thread_live_state(&sibling_id);
@@ -2397,6 +3502,7 @@ pub(in crate::daemon::handlers) mod tests {
         assert_eq!(
             runtime.thread_live_state(&target_id),
             crate::daemon::protocol::ThreadLiveState {
+                live_epoch_id: runtime.live_epoch_id(),
                 loaded: false,
                 current_turn_id: None,
                 last_activity_at_ms: None,
@@ -2426,19 +3532,11 @@ pub(in crate::daemon::handlers) mod tests {
     #[test]
     fn active_thread_stop_cancels_bound_run_before_unloading_only_that_thread() {
         let (_root, runtime) = thread_test_runtime();
-        let mut threads = Vec::new();
-        for _ in 0..2 {
-            let (spawn_id, _) = pending_spawn(
-                start_thread(
-                    &runtime,
-                    None,
-                    &runtime.paths.workspace_root,
-                    crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
-                )
-                .unwrap(),
-            );
-            threads.push(grant_thread(&runtime, &spawn_id, "stdin"));
-        }
+        let home_thread_id = coordinator_root(&runtime);
+        let threads = [
+            coordinator_child(&runtime, &home_thread_id, "stdin"),
+            coordinator_child(&runtime, &home_thread_id, "stdin"),
+        ];
         let target_id = threads[0].authority.thread_id.clone();
         let sibling_id = threads[1].authority.thread_id.clone();
         let sibling_before = runtime.thread_live_state(&sibling_id);
@@ -2505,19 +3603,11 @@ pub(in crate::daemon::handlers) mod tests {
         };
 
         let (_root, runtime) = thread_test_runtime();
-        let mut threads = Vec::new();
-        for _ in 0..2 {
-            let (spawn_id, _) = pending_spawn(
-                start_thread(
-                    &runtime,
-                    None,
-                    &runtime.paths.workspace_root,
-                    crate::daemon::protocol::ThreadApprovalPolicy::Prompt,
-                )
-                .unwrap(),
-            );
-            threads.push(grant_thread(&runtime, &spawn_id, "stdin"));
-        }
+        let home_thread_id = coordinator_root(&runtime);
+        let threads = [
+            coordinator_child(&runtime, &home_thread_id, "stdin"),
+            coordinator_child(&runtime, &home_thread_id, "stdin"),
+        ];
         let target_id = threads[0].authority.thread_id.clone();
         let sibling_id = threads[1].authority.thread_id.clone();
         let case = if wedged { "wedged" } else { "active" };
@@ -2763,6 +3853,7 @@ IFS= read -r _
         assert_eq!(
             restarted.thread_live_state(&thread_id),
             crate::daemon::protocol::ThreadLiveState {
+                live_epoch_id: restarted.live_epoch_id(),
                 loaded: false,
                 current_turn_id: None,
                 last_activity_at_ms: None,
@@ -2849,8 +3940,7 @@ IFS= read -r _
             .unwrap(),
         );
         let parent = grant_thread(&runtime, &spawn_id, "stdin");
-        let child_dir = thread_worktree(&runtime, &parent.authority.thread_id).join("child");
-        std::fs::create_dir(&child_dir).unwrap();
+        let child_dir = thread_worktree(&runtime, &parent.authority.thread_id);
 
         assert!(matches!(
             start_thread(
@@ -2904,8 +3994,7 @@ IFS= read -r _
             .unwrap(),
         );
         let parent = grant_thread(&runtime, &spawn_id, "stdin");
-        let child_dir = thread_worktree(&runtime, &parent.authority.thread_id).join("child");
-        std::fs::create_dir(&child_dir).unwrap();
+        let child_dir = thread_worktree(&runtime, &parent.authority.thread_id);
         std::fs::write(
             child_dir.join("plato.toml"),
             "[tools]\nenabled = [\"file.read\", \"file.write\"]\n",
@@ -2948,8 +4037,7 @@ IFS= read -r _
             .unwrap(),
         );
         let parent = grant_thread(&runtime, &spawn_id, "stdin");
-        let child_dir = thread_worktree(&runtime, &parent.authority.thread_id).join("child");
-        std::fs::create_dir(&child_dir).unwrap();
+        let child_dir = thread_worktree(&runtime, &parent.authority.thread_id);
         let child = match start_thread(
             &runtime,
             Some(parent.authority.thread_id),
@@ -2986,8 +4074,7 @@ IFS= read -r _
             .unwrap(),
         );
         let parent = grant_thread(&runtime, &spawn_id, "stdin");
-        let child_dir = thread_worktree(&runtime, &parent.authority.thread_id).join("child");
-        std::fs::create_dir(&child_dir).unwrap();
+        let child_dir = thread_worktree(&runtime, &parent.authority.thread_id);
         let child = match start_thread(
             &runtime,
             Some(parent.authority.thread_id.clone()),

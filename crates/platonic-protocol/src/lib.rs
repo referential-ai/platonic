@@ -6,7 +6,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-pub use platonic_core::{AgentId, HarnessEvent, PolicyDecision};
+pub use platonic_core::{AgentId, HarnessEvent, PolicyDecision, ProfileId};
 use platonic_core::{EffectClass, RecordedEvent};
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::SerializeStruct,
@@ -194,6 +194,9 @@ pub enum Capability {
     /// Stop one durable thread and its active child process.
     #[serde(rename = "thread.stop")]
     ThreadStop,
+    /// Resolve or create one profile's home thread.
+    #[serde(rename = "profile.open")]
+    ProfileOpen,
     /// Register one named workspace.
     #[serde(rename = "workspace.create")]
     WorkspaceCreate,
@@ -241,6 +244,7 @@ impl Capability {
             Self::ThreadSend => "thread.send",
             Self::ThreadEvents => "thread.events",
             Self::ThreadStop => "thread.stop",
+            Self::ProfileOpen => "profile.open",
             Self::WorkspaceCreate => "workspace.create",
             Self::WorkspaceList => "workspace.list",
             Self::WorkspaceStatus => "workspace.status",
@@ -305,6 +309,8 @@ pub const CAPABILITY_THREAD_SEND: Capability = Capability::ThreadSend;
 pub const CAPABILITY_THREAD_EVENTS: Capability = Capability::ThreadEvents;
 /// Capability name for stopping one durable thread and its active child process.
 pub const CAPABILITY_THREAD_STOP: Capability = Capability::ThreadStop;
+/// Capability name for resolving or creating one profile's home thread.
+pub const CAPABILITY_PROFILE_OPEN: Capability = Capability::ProfileOpen;
 /// Capability name for registering one named workspace.
 pub const CAPABILITY_WORKSPACE_CREATE: Capability = Capability::WorkspaceCreate;
 /// Capability name for listing every registered workspace.
@@ -319,7 +325,7 @@ pub const CAPABILITY_AGENT_LIST: Capability = Capability::AgentList;
 pub const CAPABILITY_AGENT_STATUS: Capability = Capability::AgentStatus;
 
 /// Capabilities advertised by a protocol v1 daemon, in wire order.
-pub const CAPABILITIES: [Capability; 29] = [
+pub const CAPABILITIES: [Capability; 30] = [
     CAPABILITY_HELLO,
     CAPABILITY_RUN_START,
     CAPABILITY_MESSAGE_APPEND,
@@ -343,6 +349,7 @@ pub const CAPABILITIES: [Capability; 29] = [
     CAPABILITY_THREAD_SEND,
     CAPABILITY_THREAD_EVENTS,
     CAPABILITY_THREAD_STOP,
+    CAPABILITY_PROFILE_OPEN,
     CAPABILITY_WORKSPACE_CREATE,
     CAPABILITY_WORKSPACE_LIST,
     CAPABILITY_WORKSPACE_STATUS,
@@ -395,6 +402,10 @@ pub enum ProtocolErrorCode {
     ThreadStatusFailed,
     /// A thread could not be stopped and recorded.
     ThreadStopFailed,
+    /// A profile-home proposal conflicts with an existing reservation or home.
+    ProfileOpenConflict,
+    /// A profile home could not be resolved or persisted.
+    ProfileOpenFailed,
     /// The method is not supported.
     UnsupportedMethod,
     /// The protocol version is not supported.
@@ -431,6 +442,8 @@ impl ProtocolErrorCode {
             Self::ThreadSendFailed => "thread_send_failed",
             Self::ThreadStatusFailed => "thread_status_failed",
             Self::ThreadStopFailed => "thread_stop_failed",
+            Self::ProfileOpenConflict => "profile_open_conflict",
+            Self::ProfileOpenFailed => "profile_open_failed",
             Self::UnsupportedMethod => "unsupported_method",
             Self::UnsupportedVersion => "unsupported_version",
             Self::WorkspaceMismatch => "workspace_mismatch",
@@ -490,6 +503,10 @@ pub const ERROR_THREAD_SEND_FAILED: ProtocolErrorCode = ProtocolErrorCode::Threa
 pub const ERROR_THREAD_STATUS_FAILED: ProtocolErrorCode = ProtocolErrorCode::ThreadStatusFailed;
 /// Error code returned when a thread cannot be stopped and recorded.
 pub const ERROR_THREAD_STOP_FAILED: ProtocolErrorCode = ProtocolErrorCode::ThreadStopFailed;
+/// Error code returned when a profile-home proposal conflicts with durable state.
+pub const ERROR_PROFILE_OPEN_CONFLICT: ProtocolErrorCode = ProtocolErrorCode::ProfileOpenConflict;
+/// Error code returned when a profile home cannot be resolved or persisted.
+pub const ERROR_PROFILE_OPEN_FAILED: ProtocolErrorCode = ProtocolErrorCode::ProfileOpenFailed;
 /// Error code returned for an unknown method.
 pub const ERROR_UNSUPPORTED_METHOD: ProtocolErrorCode = ProtocolErrorCode::UnsupportedMethod;
 /// Error code returned for an unsupported protocol version.
@@ -620,6 +637,9 @@ pub enum ProtocolMethod {
     /// Stop one durable thread and its active child process.
     #[serde(rename = "thread.stop")]
     ThreadStop,
+    /// Resolve or create one profile's home thread.
+    #[serde(rename = "profile.open")]
+    ProfileOpen,
     /// Register one named workspace.
     #[serde(rename = "workspace.create")]
     WorkspaceCreate,
@@ -665,6 +685,7 @@ impl ProtocolMethod {
             Self::ThreadSend => "thread.send",
             Self::ThreadEvents => "thread.events",
             Self::ThreadStop => "thread.stop",
+            Self::ProfileOpen => "profile.open",
             Self::WorkspaceCreate => "workspace.create",
             Self::WorkspaceList => "workspace.list",
             Self::WorkspaceStatus => "workspace.status",
@@ -725,6 +746,7 @@ impl ProtocolMethod {
             "thread.send" => Some(Self::ThreadSend),
             "thread.events" => Some(Self::ThreadEvents),
             "thread.stop" => Some(Self::ThreadStop),
+            "profile.open" => Some(Self::ProfileOpen),
             "workspace.create" => Some(Self::WorkspaceCreate),
             "workspace.list" => Some(Self::WorkspaceList),
             "workspace.status" => Some(Self::WorkspaceStatus),
@@ -803,6 +825,9 @@ pub enum ProtocolRequest {
     /// Stop one durable thread and its active child process.
     #[serde(rename = "thread.stop")]
     ThreadStop(ThreadStopParams),
+    /// Resolve or create one profile's home thread.
+    #[serde(rename = "profile.open")]
+    ProfileOpen(ProfileOpenParams),
     /// Register one named workspace.
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateParams),
@@ -848,6 +873,7 @@ impl ProtocolRequest {
             Self::ThreadSend(_) => ProtocolMethod::ThreadSend,
             Self::ThreadEvents(_) => ProtocolMethod::ThreadEvents,
             Self::ThreadStop(_) => ProtocolMethod::ThreadStop,
+            Self::ProfileOpen(_) => ProtocolMethod::ProfileOpen,
             Self::WorkspaceCreate(_) => ProtocolMethod::WorkspaceCreate,
             Self::WorkspaceList(_) => ProtocolMethod::WorkspaceList,
             Self::WorkspaceStatus(_) => ProtocolMethod::WorkspaceStatus,
@@ -900,6 +926,7 @@ impl ProtocolRequest {
             ProtocolMethod::ThreadSend => decode_params(params, method).map(Self::ThreadSend),
             ProtocolMethod::ThreadEvents => decode_params(params, method).map(Self::ThreadEvents),
             ProtocolMethod::ThreadStop => decode_params(params, method).map(Self::ThreadStop),
+            ProtocolMethod::ProfileOpen => decode_params(params, method).map(Self::ProfileOpen),
             ProtocolMethod::WorkspaceCreate => {
                 decode_params(params, method).map(Self::WorkspaceCreate)
             }
@@ -941,6 +968,7 @@ impl ProtocolRequest {
             Self::ThreadSend(params) => serialize_sorted_field(envelope, "params", params),
             Self::ThreadEvents(params) => serialize_sorted_field(envelope, "params", params),
             Self::ThreadStop(params) => serialize_sorted_field(envelope, "params", params),
+            Self::ProfileOpen(params) => serialize_sorted_field(envelope, "params", params),
             Self::WorkspaceCreate(params) => serialize_sorted_field(envelope, "params", params),
             Self::WorkspaceList(params) => serialize_sorted_field(envelope, "params", params),
             Self::WorkspaceStatus(params) => serialize_sorted_field(envelope, "params", params),
@@ -1018,6 +1046,9 @@ pub enum ProtocolResponse {
     /// Thread-stop result.
     #[serde(rename = "thread.stop")]
     ThreadStop(ThreadStopResult),
+    /// Profile-home resolution or admission result.
+    #[serde(rename = "profile.open")]
+    ProfileOpen(ProfileOpenResult),
     /// Workspace-creation result.
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateResult),
@@ -1063,6 +1094,7 @@ impl ProtocolResponse {
             Self::ThreadSend(_) => ProtocolMethod::ThreadSend,
             Self::ThreadEvents(_) => ProtocolMethod::ThreadEvents,
             Self::ThreadStop(_) => ProtocolMethod::ThreadStop,
+            Self::ProfileOpen(_) => ProtocolMethod::ProfileOpen,
             Self::WorkspaceCreate(_) => ProtocolMethod::WorkspaceCreate,
             Self::WorkspaceList(_) => ProtocolMethod::WorkspaceList,
             Self::WorkspaceStatus(_) => ProtocolMethod::WorkspaceStatus,
@@ -1111,6 +1143,7 @@ impl ProtocolResponse {
             ProtocolMethod::ThreadSend => decode_result(result, method).map(Self::ThreadSend),
             ProtocolMethod::ThreadEvents => decode_result(result, method).map(Self::ThreadEvents),
             ProtocolMethod::ThreadStop => decode_result(result, method).map(Self::ThreadStop),
+            ProtocolMethod::ProfileOpen => decode_result(result, method).map(Self::ProfileOpen),
             ProtocolMethod::WorkspaceCreate => {
                 decode_result(result, method).map(Self::WorkspaceCreate)
             }
@@ -1154,6 +1187,7 @@ impl ProtocolResponse {
             Self::ThreadSend(result) => serialize_sorted_field(envelope, "result", result),
             Self::ThreadEvents(result) => serialize_sorted_field(envelope, "result", result),
             Self::ThreadStop(result) => serialize_sorted_field(envelope, "result", result),
+            Self::ProfileOpen(result) => serialize_sorted_field(envelope, "result", result),
             Self::WorkspaceCreate(result) => serialize_sorted_field(envelope, "result", result),
             Self::WorkspaceList(result) => serialize_sorted_field(envelope, "result", result),
             Self::WorkspaceStatus(result) => serialize_sorted_field(envelope, "result", result),
@@ -1707,6 +1741,44 @@ impl fmt::Display for ThreadApprovalPolicy {
     }
 }
 
+/// Durable lifecycle role of one thread authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadKind {
+    /// The profile's single active-tree root.
+    Home,
+    /// A same-profile descendant of the home thread.
+    Child,
+    /// Historical authority retained only for replay and audit.
+    #[default]
+    Legacy,
+}
+
+impl ThreadKind {
+    /// Returns the exact wire and persistence value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Home => "home",
+            Self::Child => "child",
+            Self::Legacy => "legacy",
+        }
+    }
+
+    /// Parses an exact thread-kind value.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "home" => Some(Self::Home),
+            "child" => Some(Self::Child),
+            "legacy" => Some(Self::Legacy),
+            _ => None,
+        }
+    }
+}
+
+fn thread_kind_is_legacy(kind: &ThreadKind) -> bool {
+    *kind == ThreadKind::Legacy
+}
+
 /// One server-created worktree granted to a thread.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1771,9 +1843,8 @@ pub struct ThreadGrantedPath {
 
 /// Complete immutable authority written before a spawned thread becomes live.
 ///
-/// The new fields default when decoding an older eight-field record. `cwd` is
-/// deliberately ignored on that compatibility path; persistence converts it
-/// to one writable granted path.
+/// Profile classification fields default to legacy when decoding older v1
+/// records.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ThreadAuthorityRecord {
     /// Stable daemon-minted thread identifier.
@@ -1782,9 +1853,21 @@ pub struct ThreadAuthorityRecord {
     pub parent_thread_id: Option<String>,
     /// Actor whose approval admitted this spawn.
     pub spawning_actor: String,
-    /// Agent profile resolved for this thread, absent only on legacy records.
+    /// Exact working directory selected for this authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Historical agent identity, absent on profile-based authorities.
     #[serde(default)]
     pub agent_id: Option<AgentId>,
+    /// Workspace-bound profile identity, absent only on unscoped legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<ProfileId>,
+    /// Profile revision resolved when this authority was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_revision: Option<u64>,
+    /// Durable home, child, or legacy classification.
+    #[serde(default, skip_serializing_if = "thread_kind_is_legacy")]
+    pub thread_kind: ThreadKind,
     /// Exact model requested for the thread.
     pub model: String,
     /// Exact provider reasoning effort requested for the thread.
@@ -1817,6 +1900,15 @@ pub struct ThreadStatusAuthority {
     pub parent_thread_id: Option<String>,
     /// Actor whose approval admitted this spawn.
     pub spawning_actor: String,
+    /// Workspace-bound profile identity, absent only on unscoped legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<ProfileId>,
+    /// Profile revision resolved when this authority was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_revision: Option<u64>,
+    /// Durable home, child, or legacy classification.
+    #[serde(default, skip_serializing_if = "thread_kind_is_legacy")]
+    pub thread_kind: ThreadKind,
     /// Canonical compatibility working directory for this thread.
     pub cwd: String,
     /// Exact model requested for the thread.
@@ -1833,6 +1925,9 @@ pub struct ThreadStatusAuthority {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadLiveState {
+    /// Daemon-lifetime epoch paired with every live event cursor.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub live_epoch_id: String,
     /// Whether this daemon process currently has the thread loaded.
     pub loaded: bool,
     /// Active turn identifier, or none while the loaded thread is idle.
@@ -1881,7 +1976,7 @@ pub enum ThreadSpawnDecision {
 pub enum ThreadSpawnParams {
     /// Start one spawn admission.
     Start {
-        /// Parent thread, or none for a locally approved root thread.
+        /// Required same-profile parent thread. `None` is retained only for v1 decoding.
         parent_thread_id: Option<String>,
         /// Requested working directory.
         cwd: String,
@@ -1943,6 +2038,110 @@ pub enum ThreadSpawnResult {
         thread_id: String,
         /// Actor canceling the spawn.
         actor: String,
+    },
+}
+
+/// Decision resolving one pending profile-home reservation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "decision")]
+pub enum ProfileOpenDecision {
+    /// Grant the reserved home authority.
+    Grant,
+    /// Deny the reservation with an operator-visible reason.
+    Deny {
+        /// Human-readable denial reason.
+        reason: String,
+    },
+    /// Cancel the reservation without creating authority.
+    Cancel,
+}
+
+/// Parameters for resolving, starting, or deciding one profile home.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "action")]
+pub enum ProfileOpenParams {
+    /// Read the existing home designation without mutation.
+    Resolve {
+        /// Profile whose home should be resolved.
+        profile_id: ProfileId,
+    },
+    /// Reserve one idempotent home proposal.
+    Start {
+        /// Profile whose home should be created.
+        profile_id: ProfileId,
+        /// Caller-stable idempotency key for this exact proposal.
+        idempotency_key: String,
+        /// Repositories assigned to the home authority.
+        repositories: Vec<ThreadRepositoryRequest>,
+        /// Repository containing the initial working directory.
+        working_repository: String,
+        /// Relative directory beneath `working_repository`.
+        #[serde(default = "default_working_subdir")]
+        working_subdir: String,
+    },
+    /// Resolve one pending reservation.
+    Decide {
+        /// Server-minted reservation identifier.
+        home_reservation_id: String,
+        /// Grant, deny, or cancel decision.
+        decision: ProfileOpenDecision,
+    },
+}
+
+fn default_working_subdir() -> String {
+    ".".into()
+}
+
+/// Typed outcome returned by `profile.open`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum ProfileOpenResult {
+    /// The profile exists but has no durable home designation.
+    NoHome {
+        /// Exact profile that was resolved.
+        profile_id: ProfileId,
+    },
+    /// The proposal is reserved and requires an explicit decision.
+    ApprovalRequired {
+        /// Exact profile awaiting home admission.
+        profile_id: ProfileId,
+        /// Server-minted pending reservation identifier.
+        home_reservation_id: String,
+        /// Thread identifier reserved for the proposed home.
+        thread_id: String,
+        /// Typed effect evaluated for admission.
+        effect: EffectClass,
+        /// Policy reason presented to the operator.
+        reason: String,
+    },
+    /// The durable home was created or resolved.
+    Opened {
+        /// Exact profile owning the home.
+        profile_id: ProfileId,
+        /// Durable authority joined with current daemon state.
+        thread: ThreadStatus,
+        /// Whether this request committed the home authority.
+        created: bool,
+    },
+    /// The reservation was durably denied.
+    Denied {
+        /// Exact profile whose reservation was denied.
+        profile_id: ProfileId,
+        /// Resolved reservation identifier.
+        home_reservation_id: String,
+        /// Thread identifier that was not admitted.
+        thread_id: String,
+        /// Durable denial reason.
+        reason: String,
+    },
+    /// The reservation was durably canceled.
+    Canceled {
+        /// Exact profile whose reservation was canceled.
+        profile_id: ProfileId,
+        /// Resolved reservation identifier.
+        home_reservation_id: String,
+        /// Thread identifier that was not admitted.
+        thread_id: String,
     },
 }
 
@@ -2209,6 +2408,9 @@ pub enum ThreadSendResult {
 pub struct ThreadEventsParams {
     /// Durable thread whose live events should be observed.
     pub thread_id: String,
+    /// Daemon epoch paired with `from_offset`, when continuing a live cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_epoch_id: Option<String>,
     /// First thread-local offset, or the current tip when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_offset: Option<u64>,
@@ -2232,12 +2434,28 @@ pub struct BufferedThreadEvent {
     pub event: StreamEvent,
 }
 
+/// Why a live thread cursor must restart at the returned offset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadEventsResetReason {
+    /// The cursor belongs to a prior daemon lifetime.
+    EpochChanged,
+    /// The cursor fell behind the retained in-memory buffer.
+    Lagged,
+}
+
 /// Retained event page returned by `thread.events`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadEventsResult {
     /// Exact durable thread whose events were read.
     pub thread_id: String,
+    /// Daemon-lifetime epoch paired with this page's offsets.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub live_epoch_id: String,
+    /// Typed reset reason, absent for an ordinary contiguous page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset: Option<ThreadEventsResetReason>,
     /// First requested thread-local offset.
     pub from_offset: u64,
     /// Offset to use for the next page.
@@ -3127,6 +3345,7 @@ mod tests {
                 "thread.send",
                 "thread.events",
                 "thread.stop",
+                "profile.open",
                 "workspace.create",
                 "workspace.list",
                 "workspace.status",
@@ -3155,6 +3374,8 @@ mod tests {
                 ERROR_THREAD_SEND_FAILED,
                 ERROR_THREAD_STATUS_FAILED,
                 ERROR_THREAD_STOP_FAILED,
+                ERROR_PROFILE_OPEN_CONFLICT,
+                ERROR_PROFILE_OPEN_FAILED,
                 ERROR_UNSUPPORTED_METHOD,
                 ERROR_UNSUPPORTED_VERSION,
                 ERROR_WORKSPACE_MISMATCH,
@@ -3181,6 +3402,8 @@ mod tests {
                 "thread_send_failed",
                 "thread_status_failed",
                 "thread_stop_failed",
+                "profile_open_conflict",
+                "profile_open_failed",
                 "unsupported_method",
                 "unsupported_version",
                 "workspace_mismatch",
@@ -3282,6 +3505,10 @@ mod tests {
             (
                 ProtocolMethod::ThreadStop,
                 r#"{"v":1,"id":"stop_1","kind":"request","method":"thread.stop","params":{"actor":"terminal","thread_id":"thread-1"}}"#,
+            ),
+            (
+                ProtocolMethod::ProfileOpen,
+                r#"{"v":1,"id":"profile_open_1","kind":"request","method":"profile.open","params":{"action":"resolve","profile_id":"profile-1"}}"#,
             ),
             (
                 ProtocolMethod::WorkspaceCreate,
@@ -3394,6 +3621,10 @@ mod tests {
                 r#"{"v":1,"id":"stop_1","kind":"response","method":"thread.stop","result":{"status":"stopped","stopped_at_ms":43,"stopped_turn_id":null,"thread_id":"thread-1"}}"#,
             ),
             (
+                ProtocolMethod::ProfileOpen,
+                r#"{"v":1,"id":"profile_open_1","kind":"response","method":"profile.open","result":{"profile_id":"profile-1","status":"no_home"}}"#,
+            ),
+            (
                 ProtocolMethod::WorkspaceCreate,
                 r#"{"v":1,"id":"workspace_create_1","kind":"response","method":"workspace.create","result":{"workspace":{"created_at_ms":41,"health":"present","id":"workspace-1","ledger_path":"/state/agent.db","name":"alpha","root":"/work"}}}"#,
             ),
@@ -3419,7 +3650,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(REQUESTS.len(), 27);
+        assert_eq!(REQUESTS.len(), 28);
         assert_eq!(RESPONSES.len(), REQUESTS.len());
         for ((request_method, request_fixture), (response_method, response_fixture)) in
             REQUESTS.iter().zip(RESPONSES)
@@ -3622,17 +3853,17 @@ mod tests {
         const SPAWN_START_REQUEST: &str = r#"{"v":1,"id":"spawn_start_1","kind":"request","method":"thread.spawn","params":{"action":"start","approval_policy":"prompt","cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh"}}"#;
         const SPAWN_DECIDE_REQUEST: &str = r#"{"v":1,"id":"spawn_decide_1","kind":"request","method":"thread.spawn","params":{"action":"decide","approval":{"actor":"stdin","decision":"grant"},"spawn_id":"spawn_1"}}"#;
         const SPAWN_REQUIRED_RESPONSE: &str = r#"{"v":1,"id":"spawn_start_1","kind":"response","method":"thread.spawn","result":{"effect":"workspace_write","reason":"thread.spawn requires approval","spawn_id":"spawn_1","status":"approval_required","thread_id":"thread_1"}}"#;
-        const STATUS_RESPONSE: &str = r#"{"v":1,"id":"status_1","kind":"response","method":"thread.status","result":{"thread":{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1"},"live":{"current_turn_id":null,"last_activity_at_ms":47,"loaded":true}}}}"#;
-        const LIST_RESPONSE: &str = r#"{"v":1,"id":"list_1","kind":"response","method":"thread.list","result":{"threads":[{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1"},"live":{"current_turn_id":null,"loaded":false}}]}}"#;
+        const STATUS_RESPONSE: &str = r#"{"v":1,"id":"status_1","kind":"response","method":"thread.status","result":{"thread":{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","profile_id":"profile_builder","profile_revision":1,"reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1","thread_kind":"child"},"live":{"current_turn_id":null,"last_activity_at_ms":47,"live_epoch_id":"live_epoch_1","loaded":true}}}}"#;
+        const LIST_RESPONSE: &str = r#"{"v":1,"id":"list_1","kind":"response","method":"thread.list","result":{"threads":[{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","profile_id":"profile_builder","profile_revision":1,"reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1","thread_kind":"child"},"live":{"current_turn_id":null,"live_epoch_id":"live_epoch_1","loaded":false}}]}}"#;
         const AUTHORITY_REQUEST: &str = r#"{"v":1,"id":"authority_1","kind":"request","method":"thread.authority","params":{"thread_id":"thread_1"}}"#;
-        const AUTHORITY_RESPONSE: &str = r#"{"v":1,"id":"authority_1","kind":"response","method":"thread.authority","result":{"authority":{"agent_id":"plato","approval_policy":"prompt","created_at_ms":42,"granted_paths":[{"path":"/tmp/work","writable":true}],"model":"gpt-5.6-sol","network":false,"parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1","toolset":["file.read","file.write"],"worktrees":[]}}}"#;
+        const AUTHORITY_RESPONSE: &str = r#"{"v":1,"id":"authority_1","kind":"response","method":"thread.authority","result":{"authority":{"agent_id":null,"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","granted_paths":[{"path":"/tmp/work","writable":true}],"model":"gpt-5.6-sol","network":false,"parent_thread_id":"thread_parent","profile_id":"profile_builder","profile_revision":1,"reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1","thread_kind":"child","toolset":["file.read","file.write"],"worktrees":[]}}}"#;
         const SEND_START_REQUEST: &str = r#"{"v":1,"id":"send_1","kind":"request","method":"thread.send","params":{"controller_id":"terminal_a","message":"inspect it","thread_id":"thread_1"}}"#;
         const SEND_STEER_REQUEST: &str = r#"{"v":1,"id":"send_2","kind":"request","method":"thread.send","params":{"controller_id":"terminal_a","message":"also summarize","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
         const SEND_STARTED_RESPONSE: &str = r#"{"v":1,"id":"send_1","kind":"response","method":"thread.send","result":{"status":"started","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
         const SEND_STEERED_RESPONSE: &str = r#"{"v":1,"id":"send_2","kind":"response","method":"thread.send","result":{"status":"steered","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
         const SEND_REJECTED_RESPONSE: &str = r#"{"v":1,"id":"send_3","kind":"response","method":"thread.send","result":{"reason":"controller_owned","status":"rejected","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
         const EVENTS_REQUEST: &str = r#"{"v":1,"id":"events_1","kind":"request","method":"thread.events","params":{"from_offset":0,"limit":128,"thread_id":"thread_1","wait_ms":1000}}"#;
-        const EVENTS_RESPONSE: &str = r#"{"v":1,"id":"events_1","kind":"response","method":"thread.events","result":{"current_turn_id":"thread_turn_1","events":[],"from_offset":0,"next_offset":0,"thread_id":"thread_1"}}"#;
+        const EVENTS_RESPONSE: &str = r#"{"v":1,"id":"events_1","kind":"response","method":"thread.events","result":{"current_turn_id":"thread_turn_1","events":[],"from_offset":0,"live_epoch_id":"live_epoch_1","next_offset":0,"thread_id":"thread_1"}}"#;
         const STOP_REQUEST: &str = r#"{"v":1,"id":"stop_1","kind":"request","method":"thread.stop","params":{"actor":"stdin","thread_id":"thread_1"}}"#;
         const STOP_RESPONSE: &str = r#"{"v":1,"id":"stop_1","kind":"response","method":"thread.stop","result":{"status":"stopped","stopped_at_ms":52,"stopped_turn_id":"turn_1","thread_id":"thread_1"}}"#;
 
@@ -3673,7 +3904,11 @@ mod tests {
             thread_id: "thread_1".into(),
             parent_thread_id: Some("thread_parent".into()),
             spawning_actor: "stdin".into(),
-            agent_id: Some(AgentId::new("plato").unwrap()),
+            cwd: Some("/tmp/work".into()),
+            agent_id: None,
+            profile_id: Some(ProfileId::new("profile_builder").unwrap()),
+            profile_revision: Some(1),
+            thread_kind: ThreadKind::Child,
             model: "gpt-5.6-sol".into(),
             reasoning_effort: ReasoningEffort::Xhigh,
             approval_policy: ThreadApprovalPolicy::Prompt,
@@ -3691,6 +3926,9 @@ mod tests {
                 thread_id: "thread_1".into(),
                 parent_thread_id: Some("thread_parent".into()),
                 spawning_actor: "stdin".into(),
+                profile_id: Some(ProfileId::new("profile_builder").unwrap()),
+                profile_revision: Some(1),
+                thread_kind: ThreadKind::Child,
                 cwd: "/tmp/work".into(),
                 model: "gpt-5.6-sol".into(),
                 reasoning_effort: ReasoningEffort::Xhigh,
@@ -3698,6 +3936,7 @@ mod tests {
                 created_at_ms: 42,
             },
             live: ThreadLiveState {
+                live_epoch_id: "live_epoch_1".into(),
                 loaded: true,
                 current_turn_id: None,
                 last_activity_at_ms: Some(47),
@@ -3813,6 +4052,8 @@ mod tests {
             Some("thread.events".into()),
             ThreadEventsResult {
                 thread_id: "thread_1".into(),
+                live_epoch_id: "live_epoch_1".into(),
+                reset: None,
                 from_offset: 0,
                 next_offset: 0,
                 current_turn_id: Some("thread_turn_1".into()),

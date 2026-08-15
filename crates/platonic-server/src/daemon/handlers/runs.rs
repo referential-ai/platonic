@@ -31,9 +31,10 @@ use crate::{
     tool_catalog::SHELL_EXEC,
     tools::ThreadSpawnToolHandler,
 };
-use platonic_core::{ActorId, AgentId, EffectClass, HarnessEvent, RunId};
+use platonic_core::{ActorId, EffectClass, HarnessEvent, RunId, RunIdentity};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -196,7 +197,7 @@ struct ThreadTurnDriver {
 }
 
 struct RunAuthorityProjection {
-    agent_id: Option<AgentId>,
+    identity: Option<platonic_core::RunIdentity>,
     toolset: Option<Vec<String>>,
     thread_spawn: Option<ThreadSpawnToolHandler>,
     confinement: ChildConfinement,
@@ -256,7 +257,16 @@ pub(super) fn start_run(
     let session_id = session.session_id().to_string();
     let voice_interruption_context = match prior_interrupted_run_id.as_deref() {
         Some(prior_run_id) => {
-            match prior_voice_interruption_context(runtime, &session_id, prior_run_id) {
+            let context = match thread_context.as_ref() {
+                Some(thread) => prior_thread_interruption_context(
+                    runtime,
+                    &session_id,
+                    prior_run_id,
+                    &thread.identity,
+                ),
+                None => prior_voice_interruption_context(runtime, &session_id, prior_run_id),
+            };
+            match context {
                 Ok(context) => Some(context),
                 Err(error) => {
                     return Err(Box::new(Envelope::error(
@@ -377,9 +387,9 @@ pub(super) fn start_run(
         cancel: None,
         voice_interruption_context,
     };
-    let run_agent_id = thread_context
+    let run_identity = thread_context
         .as_ref()
-        .map(|context| context.agent_id.clone());
+        .map(|context| context.identity.clone());
     let run_toolset = thread_context
         .as_ref()
         .map(|context| context.toolset.clone());
@@ -390,7 +400,7 @@ pub(super) fn start_run(
         .as_ref()
         .map_or(one_shot_confinement, |context| context.confinement.clone());
     let authority = RunAuthorityProjection {
-        agent_id: run_agent_id,
+        identity: run_identity,
         toolset: run_toolset,
         thread_spawn,
         confinement: child_confinement,
@@ -398,7 +408,7 @@ pub(super) fn start_run(
 
     let (prepared, recorder) = match crate::app::prepare_run_for_thread(
         &options,
-        authority.agent_id.clone(),
+        authority.identity.clone(),
         authority.toolset.as_deref(),
     ) {
         Ok(admission) => admission,
@@ -991,6 +1001,81 @@ fn require_voice_ledger(runtime: &DaemonRuntime, run_id: &str) -> AppResult<()> 
     Ok(())
 }
 
+fn prior_thread_interruption_context(
+    runtime: &DaemonRuntime,
+    session_id: &str,
+    prior_run_id: &str,
+    expected_identity: &RunIdentity,
+) -> AppResult<String> {
+    RunId::new(prior_run_id.to_owned())?;
+    let _state = runtime.state.lock().expect("daemon state lock poisoned");
+    require_voice_ledger(runtime, prior_run_id)?;
+    let ledger = SqliteLedger::open_default_readonly(&runtime.paths.default_ledger())?;
+    let session = ledger.read_session(session_id)?;
+    let prior = session
+        .runs
+        .iter()
+        .find(|run| run.run_id == prior_run_id)
+        .ok_or_else(|| {
+            AppError::Config(format!(
+                "prior interrupted run {prior_run_id} does not belong to thread session {session_id}"
+            ))
+        })?;
+    if prior.status != RunStateName::Interrupted {
+        return Err(AppError::Config(format!(
+            "prior interrupted run {prior_run_id} is not interrupted"
+        )));
+    }
+    let identity = prior.records.iter().find_map(|record| match &record.event {
+        HarnessEvent::RunStarted(started) => Some(&started.identity),
+        _ => None,
+    });
+    if identity != Some(expected_identity) {
+        return Err(AppError::Config(format!(
+            "prior interrupted run {prior_run_id} belongs to another profile"
+        )));
+    }
+
+    let mut uncertain = BTreeSet::new();
+    let mut committed = Vec::new();
+    for record in &prior.records {
+        match &record.event {
+            HarnessEvent::ToolStarted { call_id, .. } => {
+                uncertain.insert(call_id.to_string());
+            }
+            HarnessEvent::ToolFinished { result, .. } => {
+                uncertain.remove(result.call_id.as_str());
+                committed.push(format!(
+                    "completed tool {}: {}",
+                    result.call_id, result.summary
+                ));
+            }
+            HarnessEvent::ToolFailed {
+                call_id, reason, ..
+            } => {
+                uncertain.remove(call_id.as_str());
+                committed.push(format!("failed tool {call_id}: {reason}"));
+            }
+            _ => {}
+        }
+    }
+    let mut context = format!(
+        "Prior run {prior_run_id} was interrupted. Only durable committed facts are carried forward; no provider request, worker, effect, or live turn is resumed. Prior question: {}.",
+        prior.question
+    );
+    if !committed.is_empty() {
+        context.push_str(" Committed tool facts: ");
+        context.push_str(&committed.join("; "));
+        context.push('.');
+    }
+    if !uncertain.is_empty() {
+        context.push_str(" Uncertain prior effects started without a terminal fact: ");
+        context.push_str(&uncertain.into_iter().collect::<Vec<_>>().join(", "));
+        context.push_str(". Do not retry them automatically; require a new explicit proposal.");
+    }
+    Ok(context)
+}
+
 fn prior_voice_interruption_context(
     runtime: &DaemonRuntime,
     session_id: &str,
@@ -1415,7 +1500,8 @@ pub(in crate::daemon::handlers) mod tests {
     };
     use platonic_core::{
         AgentId, ContextPack, EffectClass, HarnessEvent, Message, MessageRole, ModelName,
-        RecordedEvent, RunId, ToolCallId, TurnId,
+        PolicyDecision, ProfileId, RecordedEvent, ResultVisibility, RunId, RunIdentity, ToolCall,
+        ToolCallId, ToolName, ToolProposal, ToolResult, TurnId,
     };
     use serde_json::json;
     #[cfg(target_os = "linux")]
@@ -1554,8 +1640,160 @@ enabled = ["file.read"]
         ledger.append_voice_events(&events).unwrap();
     }
 
+    fn seed_interrupted_profile_run(
+        runtime: &DaemonRuntime,
+        session_id: &str,
+        run_id: &str,
+        identity: RunIdentity,
+    ) {
+        let run_id = RunId::new(run_id).unwrap();
+        let completed_call = ToolCallId::new("call_completed").unwrap();
+        let uncertain_call = ToolCallId::new("call_uncertain").unwrap();
+        let completed_turn = TurnId::new("turn_completed").unwrap();
+        let uncertain_turn = TurnId::new("turn_uncertain").unwrap();
+        let tool = ToolName::new("file.read").unwrap();
+        let input = json!({"path": "committed.txt"});
+        let mut ledger =
+            SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
+        ledger
+            .begin_session_run(session_id, &run_id, "interrupted question", true)
+            .unwrap();
+        for (seq, event) in [
+            HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
+                run_id: run_id.clone(),
+                identity,
+            }),
+            HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id: completed_turn.clone(),
+                context: ContextPack {
+                    token_budget: 1,
+                    fragments: Vec::new(),
+                },
+            },
+            HarnessEvent::ModelRequested {
+                run_id: run_id.clone(),
+                turn_id: completed_turn.clone(),
+                step: 0,
+                model: ModelName::new("model").unwrap(),
+            },
+            HarnessEvent::ModelResponded {
+                run_id: run_id.clone(),
+                turn_id: completed_turn.clone(),
+                step: 0,
+                output: Message {
+                    role: MessageRole::Assistant,
+                    content: "read the committed file".into(),
+                },
+                proposed_calls: vec![ToolProposal {
+                    tool: tool.clone(),
+                    input: input.clone(),
+                }],
+                served_model: None,
+                usage: None,
+            },
+            HarnessEvent::ToolCallProposed {
+                run_id: run_id.clone(),
+                turn_id: completed_turn,
+                call: ToolCall {
+                    id: completed_call.clone(),
+                    tool: tool.clone(),
+                    effect: EffectClass::ReadOnly,
+                    input: input.clone(),
+                },
+            },
+            HarnessEvent::PolicyEvaluated {
+                run_id: run_id.clone(),
+                call_id: completed_call.clone(),
+                decision: PolicyDecision::Allow,
+            },
+            HarnessEvent::ToolStarted {
+                run_id: run_id.clone(),
+                call_id: completed_call.clone(),
+            },
+            HarnessEvent::ToolFinished {
+                run_id: run_id.clone(),
+                result: ToolResult {
+                    call_id: completed_call,
+                    summary: "committed result".into(),
+                    data: json!({"private": "not carried"}),
+                    artifacts: Vec::new(),
+                    visibility: ResultVisibility::Both,
+                },
+            },
+            HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id: uncertain_turn.clone(),
+                context: ContextPack {
+                    token_budget: 1,
+                    fragments: Vec::new(),
+                },
+            },
+            HarnessEvent::ModelRequested {
+                run_id: run_id.clone(),
+                turn_id: uncertain_turn.clone(),
+                step: 1,
+                model: ModelName::new("model").unwrap(),
+            },
+            HarnessEvent::ModelResponded {
+                run_id: run_id.clone(),
+                turn_id: uncertain_turn.clone(),
+                step: 1,
+                output: Message {
+                    role: MessageRole::Assistant,
+                    content: "read another file".into(),
+                },
+                proposed_calls: vec![ToolProposal {
+                    tool: tool.clone(),
+                    input: input.clone(),
+                }],
+                served_model: None,
+                usage: None,
+            },
+            HarnessEvent::ToolCallProposed {
+                run_id: run_id.clone(),
+                turn_id: uncertain_turn,
+                call: ToolCall {
+                    id: uncertain_call.clone(),
+                    tool,
+                    effect: EffectClass::ReadOnly,
+                    input,
+                },
+            },
+            HarnessEvent::PolicyEvaluated {
+                run_id: run_id.clone(),
+                call_id: uncertain_call.clone(),
+                decision: PolicyDecision::Allow,
+            },
+            HarnessEvent::ToolStarted {
+                run_id: run_id.clone(),
+                call_id: uncertain_call,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ledger
+                .append(
+                    run_id.as_str(),
+                    &RecordedEvent {
+                        seq: seq as u64,
+                        occurred_at_ms: seq as u64,
+                        event,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            ledger
+                .interrupt_running_session_runs("daemon restarted")
+                .unwrap(),
+            1
+        );
+    }
+
     #[test]
-    fn prior_interruption_context_is_server_derived_and_bound_to_the_latest_session_run() {
+    fn prior_voice_interruption_context_is_server_derived_and_bound_to_the_latest_session_run() {
         let (_root, runtime) = bare_thread_test_runtime();
         seed_terminal_voice_run(&runtime, "session_voice", "run_prior", true, true);
 
@@ -1573,6 +1811,183 @@ enabled = ["file.read"]
 
         seed_terminal_voice_run(&runtime, "session_voice", "run_latest", false, false);
         assert!(prior_voice_interruption_context(&runtime, "session_voice", "run_prior").is_err());
+    }
+
+    #[test]
+    fn prior_thread_interruption_is_profile_bound_and_marks_uncertain_effects() {
+        let (_root, runtime) = bare_thread_test_runtime();
+        let identity = RunIdentity::Profile {
+            profile_id: ProfileId::new("profile_a").unwrap(),
+            profile_revision: 3,
+        };
+        seed_interrupted_profile_run(
+            &runtime,
+            "session_thread_a",
+            "run_interrupted",
+            identity.clone(),
+        );
+
+        let context = prior_thread_interruption_context(
+            &runtime,
+            "session_thread_a",
+            "run_interrupted",
+            &identity,
+        )
+        .unwrap();
+        assert!(context.contains("completed tool call_completed: committed result"));
+        assert!(context.contains("call_uncertain"));
+        assert!(context.contains("Do not retry them automatically"));
+        assert!(!context.contains("not carried"));
+        assert!(
+            prior_thread_interruption_context(
+                &runtime,
+                "session_thread_a",
+                "run_interrupted",
+                &RunIdentity::Profile {
+                    profile_id: ProfileId::new("profile_b").unwrap(),
+                    profile_revision: 3,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            prior_thread_interruption_context(
+                &runtime,
+                "session_other",
+                "run_interrupted",
+                &identity,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn profile_home_restart_resolves_unloaded_and_send_starts_a_new_turn() {
+        let (_root, runtime) = thread_test_runtime();
+        let (reservation_id, thread_id) = pending_spawn(
+            start_thread(
+                &runtime,
+                None,
+                &runtime.paths.workspace_root,
+                ThreadApprovalPolicy::Prompt,
+            )
+            .unwrap(),
+        );
+        grant_thread(&runtime, &reservation_id, "test");
+        let authority = runtime
+            .paths
+            .server_store()
+            .unwrap()
+            .thread_authority(&thread_id)
+            .unwrap()
+            .unwrap();
+        let profile_id = authority.profile_id.clone().unwrap();
+        let identity = RunIdentity::Profile {
+            profile_id: profile_id.clone(),
+            profile_revision: authority.profile_revision.unwrap(),
+        };
+        let session_id = thread_session_id(&thread_id);
+        seed_interrupted_profile_run(&runtime, &session_id, "run_before_restart", identity);
+
+        let old_epoch = runtime.live_epoch_id();
+        let restarted = DaemonRuntime::new(runtime.paths.clone());
+        assert_ne!(restarted.live_epoch_id(), old_epoch);
+        let resolved = handle_line(
+            &restarted,
+            &format!(
+                r#"{{"v":1,"id":"resolve","kind":"request","method":"profile.open","params":{{"action":"resolve","profile_id":"{profile_id}"}}}}"#
+            ),
+        );
+        let resolved: crate::daemon::protocol::ProfileOpenResult = response_result(&resolved);
+        match resolved {
+            crate::daemon::protocol::ProfileOpenResult::Opened {
+                thread, created, ..
+            } => {
+                assert_eq!(thread.authority.thread_id, thread_id);
+                assert!(!created);
+                assert!(!thread.live.loaded);
+                assert_eq!(thread.live.live_epoch_id, restarted.live_epoch_id());
+            }
+            result => panic!("expected resolved home, got {result:?}"),
+        }
+
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        restarted.set_run_execution_barriers(reached.clone(), release.clone());
+        let response = temp_env::with_var("OPENROUTER_API_KEY", Some("test-key"), || {
+            handle_line(
+                &restarted,
+                &format!(
+                    r#"{{"v":1,"id":"send","kind":"request","method":"thread.send","params":{{"thread_id":"{thread_id}","controller_id":"test","prior_interrupted_run_id":"run_before_restart","message":"continue explicitly"}}}}"#
+                ),
+            )
+        });
+        assert!(matches!(
+            response_result::<ThreadSendResult>(&response),
+            ThreadSendResult::Started { .. }
+        ));
+        reached.wait();
+        assert!(restarted.thread_is_loaded(&thread_id));
+        let new_run = restarted
+            .state
+            .lock()
+            .unwrap()
+            .runs
+            .values()
+            .find(|run| run.session_id == session_id)
+            .cloned()
+            .unwrap();
+        assert_ne!(new_run.run_id, "run_before_restart");
+        assert_eq!(new_run.status().state, RunStateName::Running);
+        assert_eq!(
+            std::fs::metadata(
+                crate::ledger::run_jsonl_path(&restarted.paths.ledger_path, &new_run.run_id)
+                    .unwrap()
+            )
+            .unwrap()
+            .len(),
+            0,
+            "the admitted replacement turn must not replay a prior effect before execution"
+        );
+        let connection = rusqlite::Connection::open(&restarted.paths.ledger_path).unwrap();
+        let statuses = connection
+            .prepare(
+                "SELECT run_id, status FROM session_runs WHERE session_id = ?1 ORDER BY session_index",
+            )
+            .unwrap()
+            .query_map([&session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(
+            statuses[0],
+            ("run_before_restart".into(), "interrupted".into())
+        );
+        assert_eq!(statuses[1].0, new_run.run_id);
+        assert_eq!(statuses[1].1, "running");
+        let canceled = cancel_run(&restarted, "cancel-replacement", &new_run.run_id);
+        assert_eq!(
+            response_result::<CommandAcceptedResult>(&canceled),
+            CommandAcceptedResult {
+                run_id: new_run.run_id.clone(),
+                status: RunStateName::CancelRequested,
+            }
+        );
+        release.wait();
+        wait_for_run_terminal(&restarted, &new_run.run_id);
+        assert!(restarted.thread_is_loaded(&thread_id));
+        assert!(
+            restarted
+                .paths
+                .server_store()
+                .unwrap()
+                .thread_stop(&thread_id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn assert_running_admission(

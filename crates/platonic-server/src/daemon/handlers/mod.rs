@@ -76,6 +76,9 @@ pub(super) fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Enve
         ProtocolRequest::ThreadStop(params) => {
             threads::handle_thread_stop(runtime, request, params)
         }
+        ProtocolRequest::ProfileOpen(params) => {
+            threads::handle_profile_open(runtime, request, params)
+        }
         ProtocolRequest::WorkspaceCreate(params) => {
             registry::handle_workspace_create(runtime, request, params)
         }

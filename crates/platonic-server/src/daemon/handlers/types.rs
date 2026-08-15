@@ -7,14 +7,14 @@ use crate::{
     },
     model::RunOverrides,
 };
-use platonic_core::AgentId;
+use platonic_core::RunIdentity;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
 pub(super) struct ThreadRunContext {
     pub(super) workspace_root: PathBuf,
     pub(super) approval_policy: ThreadApprovalPolicy,
-    pub(super) agent_id: AgentId,
+    pub(super) identity: RunIdentity,
     pub(super) toolset: Vec<String>,
     pub(super) turn: ThreadTurnBinding,
     pub(super) confinement: ChildConfinement,

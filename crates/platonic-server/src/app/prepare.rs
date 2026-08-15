@@ -15,7 +15,7 @@ use crate::{
     provider::openai_compat::{OpenAiCompatibleClient, TokenLimitField},
     tool_catalog::{ToolSpec, tool_specs},
 };
-use platonic_core::{AgentId, RunId};
+use platonic_core::{AgentId, RunId, RunIdentity};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
@@ -27,7 +27,7 @@ pub(crate) struct PreparedRun {
     pub(super) workspace_root: PathBuf,
     pub(super) voice_interruption_context: Option<String>,
     pub(super) config: RunConfigSnapshot,
-    pub(super) agent_id: AgentId,
+    pub(super) identity: RunIdentity,
     pub(super) run_id: RunId,
     pub(super) session_hydration: Option<SessionHydration>,
     pub(super) messages: Vec<ModelMessage>,
@@ -70,13 +70,16 @@ enabled = ["file.read", "file.write"]
             voice_interruption_context: None,
         };
         let agent_id = AgentId::new("coordinator").unwrap();
+        let identity = RunIdentity::LegacyAgent {
+            agent_id: agent_id.clone(),
+        };
         let resolved_toolset = vec!["file.read".into(), THREAD_SPAWN.into()];
 
         let (prepared, _) =
-            prepare_run_for_thread(&options, Some(agent_id.clone()), Some(&resolved_toolset))
+            prepare_run_for_thread(&options, Some(identity.clone()), Some(&resolved_toolset))
                 .unwrap();
 
-        assert_eq!(prepared.agent_id, agent_id);
+        assert_eq!(prepared.identity, identity);
         assert!(prepared.has_tool(THREAD_SPAWN));
         assert_eq!(prepared.config.tools.enabled, resolved_toolset);
         assert_eq!(
@@ -181,7 +184,7 @@ pub(crate) fn prepare_run(options: &RunOptions) -> AppResult<(PreparedRun, Event
 
 pub(crate) fn prepare_run_for_thread(
     options: &RunOptions,
-    agent_id: Option<AgentId>,
+    identity: Option<RunIdentity>,
     toolset: Option<&[String]>,
 ) -> AppResult<(PreparedRun, EventRecorder)> {
     if options.question.trim().is_empty() {
@@ -265,7 +268,9 @@ pub(crate) fn prepare_run_for_thread(
                 tools: config.tools,
                 computer: config.computer,
             },
-            agent_id: agent_id.unwrap_or(AgentId::new("plato")?),
+            identity: identity.unwrap_or(RunIdentity::LegacyAgent {
+                agent_id: AgentId::new("plato")?,
+            }),
             run_id,
             session_hydration,
             messages,

@@ -19,7 +19,8 @@ pub(crate) use queries::{
 };
 pub(crate) use types::{
     AgentRecord, BranchClaimConflict, BranchClaimRecord, DurableThreadAuthority,
-    MAX_PROFILE_LIST_ENTRIES, ProfileRecord, ProfileRevisionContent, ProfileRevisionRecord,
-    ProfileValidationError, RunCancellationRecord, ToolCallApprovalDecision,
+    HomeReservationRecord, HomeReservationState, MAX_PROFILE_LIST_ENTRIES, ProfileHomeProposal,
+    ProfileRecord, ProfileRevisionContent, ProfileRevisionRecord, ProfileValidationError,
+    ReserveProfileHomeResult, RunCancellationRecord, ToolCallApprovalDecision,
     ToolCallApprovalRecord, WorkspaceHealth, WorkspaceRecord, mint_profile_id, mint_workspace_id,
 };
