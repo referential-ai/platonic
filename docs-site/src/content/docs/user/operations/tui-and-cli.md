@@ -17,7 +17,7 @@ Run Plato Agent from a registered Git workspace:
 plato
 ```
 
-Bare `plato` in a terminal ensures the host server, asks before admitting a durable root thread, and attaches the TUI to it. The thread keeps its server-minted ID and authority after the TUI exits.
+Bare `plato` in a terminal ensures the host server and selects a workspace profile. With no profiles it prompts for a name, checks provider readiness, creates one, and asks before admitting its durable home. With one profile it selects it automatically; with several it prompts by name or number. Use `plato --profile NAME` for an explicit choice. Every later launch resolves and attaches the same home instead of creating another root.
 
 Write in the composer and press `Enter` to submit. Use `Shift+Enter`, `Alt+Enter`, `Ctrl+J`, or `Ctrl+M` for a newline. Bracketed paste is inserted literally as one undoable edit.
 
@@ -40,6 +40,22 @@ plato --remote THREAD_ID
 Attachment does not mint a thread or change its model, toolset, paths, network grant, or approval policy. Multiple clients can observe a thread; the server still enforces active-turn controller rules.
 
 The ordinary `plato` TUI is attached to a durable thread, so `/new` is unavailable there. In an unattached standalone TUI session, `/new` clears the selected session so the next message starts fresh.
+
+## Manage profile defaults
+
+Use the server operator command to inspect or change profile defaults:
+
+```bash
+platonic profile list
+platonic profile status PROFILE_ID
+platonic profile update PROFILE_ID --model MODEL --instructions INSTRUCTIONS.md
+platonic profile open PROFILE_ID --approve
+```
+
+`profile update` changes defaults for future threads and appends a content
+revision; it never rewrites existing thread authority. `profile open` resolves
+the existing home, or proposes one when absent. Exact content and tool flags are
+listed in the [command reference](../../../reference/operations/commands/).
 
 ## Use one-shot sessions
 
@@ -90,6 +106,6 @@ The audit view includes the exact ordered events already available to the client
 
 `q` with an empty composer, `Esc` from the idle main view, `/quit`, and `/exit` close the TUI. Closing it leaves the server and durable thread available.
 
-`plato thread stop THREAD_ID` is different: it cancels any active child, runs the server-owned repository integration and cleanup path, and writes a durable stop record. Do not use it merely to close a client.
+`plato thread stop THREAD_ID` is different: for a child it cancels active work, runs the server-owned repository integration and cleanup path, and writes a durable stop record. A profile home rejects `thread.stop`; close the client instead.
 
 For exact syntax and context-sensitive controls, use the [command reference](../../../reference/operations/commands/) and [TUI reference](../../../reference/operations/tui/).

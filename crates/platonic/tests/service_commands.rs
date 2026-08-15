@@ -23,7 +23,7 @@ fn daemon_command_execs_sibling_with_argv_output_and_exit_status() {
         .unwrap();
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
-    for command in ["serve", "status", "shutdown", "workspace", "agent"] {
+    for command in ["serve", "status", "shutdown", "workspace", "profile"] {
         assert!(help.contains(command), "missing {command} in:\n{help}");
     }
 }
@@ -88,15 +88,21 @@ fn gateway_command_hellos_then_execs_sibling_with_environment_and_exit_status() 
 }
 
 #[test]
-fn agent_commands_resolve_config_defaults_and_explicit_overrides_end_to_end() {
+fn profile_commands_resolve_config_defaults_and_explicit_overrides_end_to_end() {
     let _guard = SERVER_TEST.lock().unwrap();
-    let fixture = ServerFixture::start("agent-verbs");
+    let fixture = ServerFixture::start("profile-verbs");
+    let removed_agent = fixture.command(["agent", "list"]).output().unwrap();
+    assert!(!removed_agent.status.success());
+    assert!(
+        String::from_utf8_lossy(&removed_agent.stderr).contains("unrecognized subcommand 'agent'")
+    );
+    init_git_repository(&fixture.workspace);
     fs::write(
-        fixture.workspace.join("agent.toml"),
+        fixture.workspace.join("profile.toml"),
         r#"
 [provider]
 model = "configured-model"
-api_key_env = "PLATONIC_AGENT_TEST_KEY"
+api_key_env = "PLATONIC_PROFILE_TEST_KEY"
 
 [tools]
 enabled = ["file.read"]
@@ -110,7 +116,7 @@ enabled = ["file.read"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|workspace| workspace["name"] == "agent-verbs")
+        .find(|workspace| workspace["name"] == "profile-verbs")
         .unwrap()["id"]
         .as_str()
         .unwrap()
@@ -118,7 +124,7 @@ enabled = ["file.read"]
 
     let configured = fixture
         .command([
-            "agent",
+            "profile",
             "create",
             "builder",
             &workspace_id,
@@ -127,26 +133,27 @@ enabled = ["file.read"]
             "--approval-policy",
             "yolo",
             "--config",
-            "agent.toml",
+            "profile.toml",
         ])
-        .env("PLATONIC_AGENT_TEST_KEY", "test-key")
+        .env("PLATONIC_PROFILE_TEST_KEY", "test-key")
         .output()
         .unwrap();
     assert_success(&configured);
     let configured: Value = serde_json::from_slice(&configured.stdout).unwrap();
-    assert_eq!(configured["agent"]["id"], "builder");
-    assert_eq!(configured["agent"]["workspace_id"], workspace_id);
-    assert_eq!(configured["agent"]["model"], "configured-model");
-    assert_eq!(configured["agent"]["reasoning_effort"], "high");
-    assert_eq!(configured["agent"]["approval_policy"], "yolo");
+    let configured_profile = &configured["status"]["profile"];
+    assert_eq!(configured_profile["display_name"], "builder");
+    assert_eq!(configured_profile["workspace_id"], workspace_id);
+    assert_eq!(configured_profile["model"], "configured-model");
+    assert_eq!(configured_profile["reasoning_effort"], "high");
+    assert_eq!(configured_profile["approval_policy"], "yolo");
     assert_eq!(
-        configured["agent"]["toolset"],
+        configured_profile["toolset"],
         serde_json::json!(["file.read"])
     );
 
     let overridden = fixture
         .command([
-            "agent",
+            "profile",
             "create",
             "reviewer",
             &workspace_id,
@@ -155,41 +162,106 @@ enabled = ["file.read"]
             "--tool",
             "file.list",
             "--config",
-            "agent.toml",
+            "profile.toml",
         ])
-        .env("PLATONIC_AGENT_TEST_KEY", "test-key")
+        .env("PLATONIC_PROFILE_TEST_KEY", "test-key")
         .output()
         .unwrap();
     assert_success(&overridden);
     let overridden: Value = serde_json::from_slice(&overridden.stdout).unwrap();
-    assert_eq!(overridden["agent"]["model"], "override-model");
-    assert_eq!(overridden["agent"]["reasoning_effort"], "none");
-    assert_eq!(overridden["agent"]["approval_policy"], "prompt");
+    assert_eq!(overridden["status"]["profile"]["model"], "override-model");
+    assert_eq!(overridden["status"]["profile"]["reasoning_effort"], "none");
+    assert_eq!(overridden["status"]["profile"]["approval_policy"], "prompt");
     assert_eq!(
-        overridden["agent"]["toolset"],
+        overridden["status"]["profile"]["toolset"],
         serde_json::json!(["file.list"])
     );
 
-    let listed = fixture.command(["agent", "list"]).output().unwrap();
+    let listed = fixture.command(["profile", "list"]).output().unwrap();
     assert_success(&listed);
     let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(listed["agents"].as_array().unwrap().len(), 2);
+    assert_eq!(listed["profiles"].as_array().unwrap().len(), 2);
+    let profile_id = configured_profile["id"].as_str().unwrap();
     let status = fixture
-        .command(["agent", "status", "builder"])
+        .command(["profile", "status", profile_id])
         .output()
         .unwrap();
     assert_success(&status);
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(status["agent"], configured["agent"]);
+    assert_eq!(&status["status"]["profile"], configured_profile);
+
+    fs::write(
+        fixture.workspace.join("instructions.md"),
+        "Use the bounded profile.\n",
+    )
+    .unwrap();
+    let updated = fixture
+        .command([
+            "profile",
+            "update",
+            profile_id,
+            "--model",
+            "updated-model",
+            "--reasoning-effort",
+            "medium",
+            "--approval-policy",
+            "prompt",
+            "--tool",
+            "file.read",
+            "--tool",
+            "thread.spawn",
+            "--instructions",
+            "instructions.md",
+            "--skill",
+            "bounded-skill",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&updated);
+    let updated: Value = serde_json::from_slice(&updated.stdout).unwrap();
+    assert_eq!(updated["status"]["profile"]["model"], "updated-model");
+    assert_eq!(updated["status"]["profile"]["reasoning_effort"], "medium");
+    assert_eq!(updated["status"]["profile"]["approval_policy"], "prompt");
+    assert_eq!(updated["status"]["revision"]["revision"], 2);
+    assert_eq!(
+        updated["status"]["revision"]["content"]["instructions_markdown"],
+        "Use the bounded profile.\n"
+    );
+    assert_eq!(
+        updated["status"]["revision"]["content"]["skill_refs"],
+        serde_json::json!(["bounded-skill"])
+    );
+
+    let opened = fixture
+        .command(["profile", "open", profile_id, "--approve"])
+        .output()
+        .unwrap();
+    assert_success(&opened);
+    let opened: Value = serde_json::from_slice(&opened.stdout).unwrap();
+    assert_eq!(opened["status"], "opened");
+    assert_eq!(opened["created"], true);
+    assert_eq!(opened["profile_id"], profile_id);
+    assert_eq!(opened["thread"]["authority"]["thread_kind"], "home");
+    let home_thread_id = opened["thread"]["authority"]["thread_id"].as_str().unwrap();
+
+    let reopened = fixture
+        .command(["profile", "open", profile_id])
+        .output()
+        .unwrap();
+    assert_success(&reopened);
+    let reopened: Value = serde_json::from_slice(&reopened.stdout).unwrap();
+    assert_eq!(reopened["status"], "opened");
+    assert_eq!(reopened["created"], false);
+    assert_eq!(reopened["thread"]["authority"]["thread_id"], home_thread_id);
 }
 
 #[test]
-fn agent_create_refuses_a_missing_configured_provider_key_without_a_row() {
+fn profile_create_refuses_a_missing_configured_provider_key_without_a_row() {
     let _guard = SERVER_TEST.lock().unwrap();
-    let fixture = ServerFixture::start("agent-missing-key");
+    let fixture = ServerFixture::start("profile-missing-key");
     fs::write(
-        fixture.workspace.join("agent.toml"),
-        "[provider]\napi_key_env = \"PLATONIC_AGENT_MISSING_KEY\"\n",
+        fixture.workspace.join("profile.toml"),
+        "[provider]\napi_key_env = \"PLATONIC_PROFILE_MISSING_KEY\"\n",
     )
     .unwrap();
     let workspaces = fixture.command(["workspace", "list"]).output().unwrap();
@@ -199,27 +271,27 @@ fn agent_create_refuses_a_missing_configured_provider_key_without_a_row() {
 
     let refused = fixture
         .command([
-            "agent",
+            "profile",
             "create",
             "builder",
             workspace_id,
             "--config",
-            "agent.toml",
+            "profile.toml",
         ])
-        .env_remove("PLATONIC_AGENT_MISSING_KEY")
+        .env_remove("PLATONIC_PROFILE_MISSING_KEY")
         .output()
         .unwrap();
     assert!(!refused.status.success());
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        stderr.contains("set PLATONIC_AGENT_MISSING_KEY"),
+        stderr.contains("set PLATONIC_PROFILE_MISSING_KEY"),
         "{stderr}"
     );
     assert!(stderr.contains("provider.api_key_env"), "{stderr}");
-    let listed = fixture.command(["agent", "list"]).output().unwrap();
+    let listed = fixture.command(["profile", "list"]).output().unwrap();
     assert_success(&listed);
     let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
-    assert!(listed["agents"].as_array().unwrap().is_empty());
+    assert!(listed["profiles"].as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -387,6 +459,29 @@ impl Drop for ServerFixture {
             let _ = child.wait();
         }
     }
+}
+
+fn init_git_repository(path: &Path) {
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(path)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--quiet", "--initial-branch", "main"]);
+    git(&["config", "user.name", "Platonic Test"]);
+    git(&["config", "user.email", "platonic@example.invalid"]);
+    fs::write(path.join(".gitkeep"), "").unwrap();
+    git(&["add", ".gitkeep"]);
+    git(&["commit", "--quiet", "-m", "initial"]);
 }
 
 fn assert_success(output: &Output) {

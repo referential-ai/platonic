@@ -20,6 +20,9 @@ platform decisions of 2026-08-06/07.
 >   statement below is historical.
 > - **A workspace is a first-class registered entity with a server-minted id**
 >   (P006, P021). Nothing derives from a mutable path.
+> - **The native daemon wire is protocol v2** (D010). Profiles own one durable
+>   home, `thread.spawn` is parent-required and same-profile, and v1 is rejected
+>   before dispatch rather than aliased.
 > - **The Sequence section is history**, not a plan.
 >
 > Sections not contradicted above still hold: the single-writer rule, the
@@ -36,7 +39,7 @@ platform decisions of 2026-08-06/07.
 - Permanent invariant: `plato` one-shot auto-ensures the host server; `plato replay` remains offline and works without the server binary.
 - Host-loop rule: `platonic serve` owns the one run-driving implementation. Clients do not fork model/tool/policy event choreography.
 - Fallback rule: provider fallback is per-run ledger evidence. The process that computes it is mechanics; unrecorded fallback is forbidden.
-- Server noun: `platonic serve` is the persistent runtime. Gateways are ingress adapters and never own agent semantics.
+- Server noun: `platonic serve` is the persistent runtime. Gateways are ingress adapters and never own run semantics.
 - TUI decision: `plato-tui` is a separate binary in this crate once it exists.
 - Server ownership: `platonic serve` owns the host endpoint, workspace ledgers, and process lock. Unix uses a private UDS plus XDG runtime/state paths; Windows uses a current-user named pipe plus `LocalAppData` runtime/state paths.
 - Single-writer invariant: one live server owns a workspace store. A run child never opens the ledger or receives its path; it streams typed record operations to `platonic serve`, which alone appends per-run JSONL and writes SQLite state.

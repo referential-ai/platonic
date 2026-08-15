@@ -35,6 +35,7 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
                 Sha256::digest(rotated.token.as_bytes()).into(),
             ],
             workspace_ids: vec!["workspace-1".into()],
+            profile_ids: vec!["remote-profile".into()],
         }],
         root.path().join("idempotency.db"),
     )
@@ -48,65 +49,77 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
     };
 
     let cases = [
-        ("GET", "/v1/status", None, &STATUS_METHODS[..]),
-        ("GET", "/v1/workspaces", None, &WORKSPACE_METHODS[..]),
+        ("GET", "/v2/status", None, &STATUS_METHODS[..]),
+        ("GET", "/v2/workspaces", None, &WORKSPACE_METHODS[..]),
         (
             "GET",
-            "/v1/workspaces/workspace-1/threads",
+            "/v2/workspaces/workspace-1/profiles",
+            None,
+            &PROFILE_LIST_METHODS[..],
+        ),
+        (
+            "GET",
+            "/v2/workspaces/workspace-1/profiles/remote-profile",
+            None,
+            &PROFILE_STATUS_METHODS[..],
+        ),
+        (
+            "GET",
+            "/v2/workspaces/workspace-1/profiles/remote-profile/threads",
             None,
             &THREAD_LIST_METHODS[..],
         ),
         (
             "GET",
-            "/v1/workspaces/workspace-1/threads/thread-1",
+            "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-1",
             None,
             &THREAD_STATUS_METHODS[..],
         ),
         (
             "GET",
-            "/v1/workspaces/workspace-1/threads/thread-1/authority",
+            "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-1/authority",
             None,
             &THREAD_AUTHORITY_METHODS[..],
         ),
         (
             "POST",
-            "/v1/workspaces/workspace-1/threads/thread-1/messages",
+            "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-1/messages",
             Some(r#"{"message":"mapped"}"#),
             &THREAD_SEND_METHODS[..],
         ),
         (
             "GET",
-            "/v1/workspaces/workspace-1/threads/thread-1/events",
+            "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-1/events",
             None,
             &THREAD_EVENT_METHODS[..],
         ),
         (
             "POST",
-            "/v1/workspaces/workspace-1/threads/thread-1/stop",
+            "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-1/stop",
             Some("{}"),
             &THREAD_STOP_METHODS[..],
         ),
         (
             "GET",
-            "/v1/workspaces/workspace-1/runs/run-1/transcript",
+            "/v2/workspaces/workspace-1/profiles/remote-profile/runs/run-1/transcript",
             None,
             &TRANSCRIPT_METHODS[..],
         ),
         (
             "GET",
-            "/v1/workspaces/workspace-1/runs/run-1/events",
+            "/v2/workspaces/workspace-1/profiles/remote-profile/runs/run-1/events",
             None,
             &RUN_EVENT_METHODS[..],
         ),
         (
             "POST",
-            "/v1/workspaces/workspace-1/runs/run-1/cancel",
+            "/v2/workspaces/workspace-1/profiles/remote-profile/runs/run-1/cancel",
             Some("{}"),
             &RUN_CANCEL_METHODS[..],
         ),
         (
             "POST",
-            "/v1/workspaces/workspace-1/runs/run-1/approvals/call-1",
+            "/v2/workspaces/workspace-1/profiles/remote-profile/runs/run-1/approvals/call-1",
             Some(r#"{"decision":"deny","reason":"bounded"}"#),
             &APPROVAL_METHODS[..],
         ),
@@ -127,12 +140,17 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
             .map(|(method, _)| method.clone())
             .collect::<Vec<_>>();
         assert_eq!(methods, expected, "{method} {path}");
-        if path == "/v1/workspaces" {
+        if path == "/v2/workspaces" {
             let response = String::from_utf8_lossy(&response);
             assert!(response.contains("workspace-1"));
             assert!(!response.contains("workspace-other"));
         }
-        if path == "/v1/workspaces/workspace-1/threads" {
+        if path == "/v2/workspaces/workspace-1/profiles" {
+            let response = String::from_utf8_lossy(&response);
+            assert!(response.contains("remote-profile"));
+            assert!(!response.contains("other-profile"));
+        }
+        if path == "/v2/workspaces/workspace-1/profiles/remote-profile/threads" {
             let response = String::from_utf8_lossy(&response);
             assert!(response.contains("thread-1"));
             assert!(!response.contains("thread-cross"));
@@ -147,9 +165,9 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
         address,
         &rotated.token,
         "POST",
-        "/v1/workspaces/workspace-1/threads/thread-1/messages",
+        "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-1/messages",
         Some(r#"{"message":"mapped"}"#),
-        Some("mapping-5"),
+        Some("mapping-7"),
     );
     assert_eq!(calls.lock().unwrap().len(), calls_after_mapping);
     assert!(String::from_utf8_lossy(&replay).contains("Idempotency-Replayed: true"));
@@ -159,9 +177,9 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
         address,
         &generated.token,
         "POST",
-        "/v1/workspaces/workspace-1/threads/thread-1/messages",
+        "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-1/messages",
         Some(r#"{"message":"different"}"#),
-        Some("mapping-5"),
+        Some("mapping-7"),
     );
     assert_eq!(calls.lock().unwrap().len(), calls_after_mapping);
     assert!(String::from_utf8_lossy(&conflict).contains("idempotency_key_conflict"));
@@ -170,7 +188,7 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
         address,
         &generated.token,
         "POST",
-        "/v1/workspaces/workspace-1/threads/thread-1/messages",
+        "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-1/messages",
         Some(r#"{"message":"success"}"#),
         Some("success"),
     );
@@ -179,7 +197,7 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
         address,
         &generated.token,
         "POST",
-        "/v1/workspaces/workspace-1/threads/thread-1/messages",
+        "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-1/messages",
         Some(r#"{"message":"success"}"#),
         Some("success"),
     );
@@ -190,7 +208,7 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
         address,
         &generated.token,
         "POST",
-        "/v1/workspaces/workspace-1/threads/thread-1/messages",
+        "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-1/messages",
         Some(r#"{"message":"disconnect"}"#),
         Some("disconnect"),
     );
@@ -200,7 +218,7 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
         address,
         &generated.token,
         "POST",
-        "/v1/workspaces/workspace-1/threads/thread-1/messages",
+        "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-1/messages",
         Some(r#"{"message":"disconnect"}"#),
         Some("disconnect"),
     );
@@ -211,7 +229,7 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
         address,
         &generated.token,
         "POST",
-        "/v1/workspaces/workspace-1/threads/thread-1/messages",
+        "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-1/messages",
         Some(r#"{"message":"timeout"}"#),
         Some("timeout"),
     );
@@ -221,7 +239,7 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
         address,
         &generated.token,
         "POST",
-        "/v1/workspaces/workspace-1/threads/thread-1/messages",
+        "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-1/messages",
         Some(r#"{"message":"timeout"}"#),
         Some("timeout"),
     );
@@ -236,7 +254,7 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
                 address,
                 &token,
                 "POST",
-                "/v1/workspaces/workspace-1/threads/thread-1/messages",
+                "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-1/messages",
                 Some(r#"{"message":"slow"}"#),
                 Some("slow"),
             )
@@ -247,7 +265,7 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
         address,
         &generated.token,
         "POST",
-        "/v1/workspaces/workspace-1/threads/thread-1/messages",
+        "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-1/messages",
         Some(r#"{"message":"slow"}"#),
         Some("slow"),
     );
@@ -259,7 +277,7 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
     http_disconnect(
         address,
         &generated.token,
-        "/v1/workspaces/workspace-1/threads/thread-1/messages",
+        "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-1/messages",
         r#"{"message":"fire-and-forget"}"#,
         "fire-and-forget",
     );
@@ -268,12 +286,20 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
 
     for (path, token) in [
         (
-            "/v1/workspaces/workspace-other/threads",
+            "/v2/workspaces/workspace-other/profiles/remote-profile/threads",
             generated.token.as_str(),
         ),
-        ("/v1/native/arbitrary", generated.token.as_str()),
-        ("/v1/status", "not-a-token"),
-        ("/v1/native/arbitrary", "not-a-token"),
+        (
+            "/v2/workspaces/workspace-1/profiles/other-profile",
+            generated.token.as_str(),
+        ),
+        (
+            "/v2/workspaces/workspace-1/profiles/other-profile/threads",
+            generated.token.as_str(),
+        ),
+        ("/v2/native/arbitrary", generated.token.as_str()),
+        ("/v2/status", "not-a-token"),
+        ("/v2/native/arbitrary", "not-a-token"),
     ] {
         let before = calls.lock().unwrap().len();
         let _ = http_request(address, token, "GET", path, None, None);
@@ -284,7 +310,7 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
         address,
         &generated.token,
         "DELETE",
-        "/v1/status",
+        "/v2/status",
         None,
         None,
     );
@@ -296,7 +322,7 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
         address,
         &generated.token,
         "POST",
-        "/v1/workspaces/workspace-1/threads/thread-cross/messages",
+        "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-cross/messages",
         Some(r#"{"message":"do not dispatch"}"#),
         Some("crossed-thread"),
     );
@@ -309,8 +335,8 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
         [
             "workspace.status",
             "hello",
-            "thread.authority",
-            "agent.status"
+            "profile.status",
+            "thread.authority"
         ]
     );
     let after_crossed_thread = calls.lock().unwrap().len();
@@ -318,7 +344,7 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
         address,
         &generated.token,
         "POST",
-        "/v1/workspaces/workspace-1/threads/thread-cross/messages",
+        "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-cross/messages",
         Some(r#"{"message":"do not dispatch"}"#),
         Some("crossed-thread"),
     );
@@ -330,17 +356,22 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
         address,
         &generated.token,
         "GET",
-        "/v1/workspaces/workspace-1/runs/run-cross/events",
+        "/v2/workspaces/workspace-1/profiles/remote-profile/runs/run-cross/events",
         None,
         None,
     );
-    assert!(String::from_utf8_lossy(&crossed_run).contains("not_found"));
+    assert!(String::from_utf8_lossy(&crossed_run).contains("forbidden_scope"));
     assert_eq!(
         calls.lock().unwrap()[before_crossed_run..]
             .iter()
             .map(|(method, _)| method.as_str())
             .collect::<Vec<_>>(),
-        ["workspace.status", "hello", "transcript.read"]
+        [
+            "workspace.status",
+            "hello",
+            "profile.status",
+            "events.stream"
+        ]
     );
     for (method, params) in calls.lock().unwrap().iter() {
         match method.as_str() {
@@ -360,62 +391,70 @@ fn all_http_routes_map_only_to_bounded_native_methods_and_complete_via_tls_proxy
 
 static STATUS_METHODS: [&str; 3] = ["workspace.status", "hello", "daemon.status"];
 static WORKSPACE_METHODS: [&str; 1] = ["workspace.list"];
-static THREAD_LIST_METHODS: [&str; 7] = [
-    "workspace.status",
-    "hello",
-    "thread.list",
-    "thread.authority",
-    "agent.status",
-    "thread.authority",
-    "agent.status",
-];
+static PROFILE_LIST_METHODS: [&str; 1] = ["profile.list"];
+static PROFILE_STATUS_METHODS: [&str; 1] = ["profile.status"];
+static THREAD_LIST_METHODS: [&str; 4] =
+    ["profile.status", "workspace.status", "hello", "thread.list"];
 static THREAD_STATUS_METHODS: [&str; 5] = [
     "workspace.status",
     "hello",
+    "profile.status",
     "thread.authority",
-    "agent.status",
     "thread.status",
 ];
 static THREAD_AUTHORITY_METHODS: [&str; 4] = [
     "workspace.status",
     "hello",
+    "profile.status",
     "thread.authority",
-    "agent.status",
 ];
 static THREAD_SEND_METHODS: [&str; 5] = [
     "workspace.status",
     "hello",
+    "profile.status",
     "thread.authority",
-    "agent.status",
     "thread.send",
 ];
 static THREAD_EVENT_METHODS: [&str; 5] = [
     "workspace.status",
     "hello",
+    "profile.status",
     "thread.authority",
-    "agent.status",
     "thread.events",
 ];
 static THREAD_STOP_METHODS: [&str; 5] = [
     "workspace.status",
     "hello",
+    "profile.status",
     "thread.authority",
-    "agent.status",
     "thread.stop",
 ];
-static TRANSCRIPT_METHODS: [&str; 3] = ["workspace.status", "hello", "transcript.read"];
-static RUN_EVENT_METHODS: [&str; 4] = [
+static TRANSCRIPT_METHODS: [&str; 5] = [
     "workspace.status",
     "hello",
+    "profile.status",
+    "events.stream",
     "transcript.read",
+];
+static RUN_EVENT_METHODS: [&str; 5] = [
+    "workspace.status",
+    "hello",
+    "profile.status",
+    "events.stream",
     "events.stream",
 ];
-static RUN_CANCEL_METHODS: [&str; 4] =
-    ["workspace.status", "hello", "transcript.read", "run.cancel"];
-static APPROVAL_METHODS: [&str; 4] = [
+static RUN_CANCEL_METHODS: [&str; 5] = [
     "workspace.status",
     "hello",
-    "transcript.read",
+    "profile.status",
+    "events.stream",
+    "run.cancel",
+];
+static APPROVAL_METHODS: [&str; 5] = [
+    "workspace.status",
+    "hello",
+    "profile.status",
+    "events.stream",
     "approval.decide",
 ];
 
@@ -486,22 +525,35 @@ fn native_connection(
                 json!({"daemon_version": "test", "workspace_id": "workspace-1", "ledger_path": root.join("ledger.db"), "capabilities": REQUIRED_CAPABILITIES, "daemon_scope": "host"}),
             ),
             "daemon.status" => Some(daemon_status(root)),
+            "profile.list" => Some(json!({
+                "profiles": [
+                    profile_summary("remote-profile"),
+                    profile_summary("other-profile")
+                ],
+                "truncated": false
+            })),
+            "profile.status" => Some(json!({
+                "status": profile_status(params["profile_id"].as_str().unwrap())
+            })),
             "thread.list" => Some(json!({
                 "threads": [thread_status("thread-1"), thread_status("thread-cross")]
             })),
             "thread.authority" => {
                 let thread_id = params["thread_id"].as_str().unwrap();
-                let agent_id = if thread_id == "thread-cross" {
-                    "other-agent"
+                let profile_id = if thread_id == "thread-cross" {
+                    "other-profile"
                 } else {
-                    "remote-agent"
+                    "remote-profile"
                 };
                 Some(json!({
                     "authority": {
                         "thread_id": thread_id,
                         "parent_thread_id": null,
                         "spawning_actor": "local",
-                        "agent_id": agent_id,
+                        "cwd": "/tmp/workspace",
+                        "profile_id": profile_id,
+                        "profile_revision": 1,
+                        "thread_kind": "home",
                         "model": "test",
                         "reasoning_effort": "medium",
                         "approval_policy": "prompt",
@@ -512,25 +564,6 @@ fn native_connection(
                         "created_at_ms": 1
                     },
                     "confinement": "none"
-                }))
-            }
-            "agent.status" => {
-                let agent_id = params["agent_id"].as_str().unwrap();
-                let workspace_id = if agent_id == "other-agent" {
-                    "workspace-other"
-                } else {
-                    "workspace-1"
-                };
-                Some(json!({
-                    "agent": {
-                        "id": agent_id,
-                        "workspace_id": workspace_id,
-                        "model": "test",
-                        "reasoning_effort": "medium",
-                        "approval_policy": "prompt",
-                        "toolset": [],
-                        "created_at_ms": 1
-                    }
                 }))
             }
             "thread.status" => Some(json!({
@@ -549,6 +582,8 @@ fn native_connection(
                 };
                 Some(json!({
                     "thread_id": "thread-tls",
+                    "live_epoch_id": "epoch-test",
+                    "reset": null,
                     "from_offset": from_offset,
                     "next_offset": 1,
                     "current_turn_id": "turn-tls",
@@ -570,18 +605,38 @@ fn native_connection(
                 "pending_approval": null,
                 "completion_claim": null
             })),
-            "events.stream" if params["run_id"] == "run-tls" => {
+            "events.stream"
+                if params["run_id"] != "run-1" || params["limit"].as_u64() == Some(1) =>
+            {
                 let from_offset = params["from_offset"].as_u64().unwrap_or(0);
+                let run_id = params["run_id"].as_str().unwrap();
+                let profile_id = if run_id == "run-cross" {
+                    "other-profile"
+                } else {
+                    "remote-profile"
+                };
                 let events = if from_offset == 0 {
                     vec![json!({
                         "offset": 0,
-                        "event": {"kind": "canceled", "run_id": "run-tls"}
+                        "event": {
+                            "kind": "ledger",
+                            "record": {
+                                "seq": 0,
+                                "occurred_at_ms": 0,
+                                "event": {
+                                    "event": "run_started",
+                                    "run_id": run_id,
+                                    "profile_id": profile_id,
+                                    "profile_revision": 1
+                                }
+                            }
+                        }
                     })]
                 } else {
                     Vec::new()
                 };
                 Some(json!({
-                    "run_id": "run-tls",
+                    "run_id": run_id,
                     "from_offset": from_offset,
                     "next_offset": 1,
                     "status": "running",
@@ -609,8 +664,8 @@ fn native_connection(
             _ => None,
         };
         let response = result.map_or_else(
-            || json!({"v": 1, "id": request["id"], "kind": "error", "method": method, "error": {"code": "not_found", "message": "deterministic native rejection"}}),
-            |result| json!({"v": 1, "id": request["id"], "kind": "response", "method": method, "result": result}),
+            || json!({"v": 2, "id": request["id"], "kind": "error", "method": method, "error": {"code": "not_found", "message": "deterministic native rejection"}}),
+            |result| json!({"v": 2, "id": request["id"], "kind": "response", "method": method, "result": result}),
         );
         if serde_json::to_writer(&mut writer, &response).is_err()
             || writer.write_all(b"\n").is_err()
@@ -623,6 +678,40 @@ fn native_connection(
 
 fn workspace(id: &str, root: &std::path::Path) -> Value {
     json!({"id": id, "name": id, "root": root, "ledger_path": root.join(format!("{id}.db")), "created_at_ms": 1, "health": "present"})
+}
+
+fn profile_summary(profile_id: &str) -> Value {
+    json!({
+        "id": profile_id,
+        "display_name": profile_id,
+        "workspace_id": "workspace-1",
+        "model": "test",
+        "reasoning_effort": "medium",
+        "approval_policy": "prompt",
+        "toolset": [],
+        "current_revision": 1,
+        "home_thread_id": if profile_id == "remote-profile" { Some("thread-1") } else { Some("thread-cross") },
+        "workspace_health": "present",
+        "created_at_ms": 1
+    })
+}
+
+fn profile_status(profile_id: &str) -> Value {
+    json!({
+        "profile": profile_summary(profile_id),
+        "revision": {
+            "revision": 1,
+            "parent_revision": null,
+            "actor": "host_operator",
+            "created_at_ms": 1,
+            "content_hash": "test",
+            "content": {
+                "instructions_markdown": "",
+                "memory_markdown": "",
+                "skill_refs": []
+            }
+        }
+    })
 }
 
 fn daemon_status(root: &std::path::Path) -> Value {
@@ -661,18 +750,28 @@ fn daemon_status(root: &std::path::Path) -> Value {
 }
 
 fn thread_status(thread_id: &str) -> Value {
+    let crossed = thread_id == "thread-cross";
     json!({
         "authority": {
             "thread_id": thread_id,
             "parent_thread_id": null,
             "spawning_actor": "local",
+            "profile_id": if crossed { "other-profile" } else { "remote-profile" },
+            "profile_revision": 1,
+            "thread_kind": "home",
+            "home_thread_id": thread_id,
             "cwd": "/tmp/workspace",
             "model": "test",
             "reasoning_effort": "medium",
             "approval_policy": "prompt",
             "created_at_ms": 1
         },
-        "live": {"loaded": false, "current_turn_id": null}
+        "live": {
+            "live_epoch_id": "epoch-test",
+            "loaded": false,
+            "current_turn_id": null
+        },
+        "return_availability": {"child_returns": 0, "parent_answers": 0}
     })
 }
 
@@ -791,18 +890,20 @@ key_path = sys.argv[3]
 token = sys.stdin.read().strip()
 
 cases = [
-    ("GET", "/v1/status", None, False),
-    ("GET", "/v1/workspaces", None, False),
-    ("GET", "/v1/workspaces/workspace-1/threads", None, False),
-    ("GET", "/v1/workspaces/workspace-1/threads/thread-tls", None, False),
-    ("GET", "/v1/workspaces/workspace-1/threads/thread-tls/authority", None, False),
-    ("POST", "/v1/workspaces/workspace-1/threads/thread-tls/messages", '{"message":"tls-success"}', False),
-    ("GET", "/v1/workspaces/workspace-1/threads/thread-tls/events", None, True),
-    ("GET", "/v1/workspaces/workspace-1/runs/run-tls/transcript", None, False),
-    ("GET", "/v1/workspaces/workspace-1/runs/run-tls/events", None, True),
-    ("POST", "/v1/workspaces/workspace-1/runs/run-tls/approvals/call-tls", '{"decision":"deny","reason":"bounded"}', False),
-    ("POST", "/v1/workspaces/workspace-1/runs/run-tls/cancel", '{}', False),
-    ("POST", "/v1/workspaces/workspace-1/threads/thread-tls/stop", '{}', False),
+    ("GET", "/v2/status", None, False),
+    ("GET", "/v2/workspaces", None, False),
+    ("GET", "/v2/workspaces/workspace-1/profiles", None, False),
+    ("GET", "/v2/workspaces/workspace-1/profiles/remote-profile", None, False),
+    ("GET", "/v2/workspaces/workspace-1/profiles/remote-profile/threads", None, False),
+    ("GET", "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-tls", None, False),
+    ("GET", "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-tls/authority", None, False),
+    ("POST", "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-tls/messages", '{"message":"tls-success"}', False),
+    ("GET", "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-tls/events", None, True),
+    ("GET", "/v2/workspaces/workspace-1/profiles/remote-profile/runs/run-tls/transcript", None, False),
+    ("GET", "/v2/workspaces/workspace-1/profiles/remote-profile/runs/run-tls/events", None, True),
+    ("POST", "/v2/workspaces/workspace-1/profiles/remote-profile/runs/run-tls/approvals/call-tls", '{"decision":"deny","reason":"bounded"}', False),
+    ("POST", "/v2/workspaces/workspace-1/profiles/remote-profile/runs/run-tls/cancel", '{}', False),
+    ("POST", "/v2/workspaces/workspace-1/profiles/remote-profile/threads/thread-tls/stop", '{}', False),
 ]
 
 server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

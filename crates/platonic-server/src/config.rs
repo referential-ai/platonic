@@ -112,6 +112,7 @@ pub struct HttpGatewayPrincipal {
     pub name: String,
     pub token_sha256: Vec<[u8; 32]>,
     pub workspace_ids: Vec<String>,
+    pub profile_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -208,6 +209,8 @@ struct RawHttpPrincipal {
     name: String,
     token_sha256: Vec<String>,
     workspace_ids: Vec<String>,
+    #[serde(default)]
+    profile_ids: Vec<String>,
 }
 
 #[derive(Default, Debug, Deserialize)]
@@ -670,10 +673,28 @@ fn server_http_principals_with(
                 workspace_ids.push(workspace_id);
             }
         }
+        let mut profile_ids = Vec::with_capacity(principal.profile_ids.len());
+        let mut unique_profile_ids = HashSet::new();
+        for profile_id in principal.profile_ids {
+            if profile_id.is_empty()
+                || profile_id.len() > 128
+                || profile_id
+                    .bytes()
+                    .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+            {
+                return Err(AppError::Config(format!(
+                    "principals.http.{name}.profile_ids contains an invalid profile id"
+                )));
+            }
+            if unique_profile_ids.insert(profile_id.clone()) {
+                profile_ids.push(profile_id);
+            }
+        }
         principals.push(HttpGatewayPrincipal {
             name,
             token_sha256: parsed_hashes,
             workspace_ids,
+            profile_ids,
         });
     }
     principals.sort_by(|left, right| left.name.cmp(&right.name));
@@ -976,6 +997,7 @@ token_sha256 = [
   "2222222222222222222222222222222222222222222222222222222222222222",
 ]
 workspace_ids = ["workspace-1", "workspace-2"]
+profile_ids = ["profile-1", "profile-1", "profile-2"]
 "#,
         )
         .unwrap();
@@ -989,6 +1011,7 @@ workspace_ids = ["workspace-1", "workspace-2"]
             principals[0].workspace_ids,
             vec!["workspace-1", "workspace-2"]
         );
+        assert_eq!(principals[0].profile_ids, vec!["profile-1", "profile-2"]);
     }
 
     #[cfg(unix)]
@@ -1024,6 +1047,7 @@ workspace_ids = ["workspace-1", "workspace-2"]
                 assert_eq!(principals.len(), 1);
                 assert_eq!(principals[0].name, "remote_laptop");
                 assert_eq!(principals[0].workspace_ids, vec!["workspace-1"]);
+                assert!(principals[0].profile_ids.is_empty());
             },
         );
     }
@@ -1044,6 +1068,10 @@ workspace_ids = ["workspace-1", "workspace-2"]
             (
                 "invalid-name",
                 "[principals.http.remote]\nname = \"   \"\ntoken_sha256 = [\"1111111111111111111111111111111111111111111111111111111111111111\"]\nworkspace_ids = [\"workspace-1\"]\n",
+            ),
+            (
+                "invalid-profile-scope",
+                "[principals.http.remote]\nname = \"remote\"\ntoken_sha256 = [\"1111111111111111111111111111111111111111111111111111111111111111\"]\nworkspace_ids = [\"workspace-1\"]\nprofile_ids = [\"bad profile\"]\n",
             ),
         ] {
             let path = root.path().join(format!("{name}.toml"));

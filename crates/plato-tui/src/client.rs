@@ -8,7 +8,7 @@ use platonic_client::{
 };
 use platonic_protocol::{
     ApprovalDecisionName, ApprovalProfile, BufferedStreamEvent, CommandAcceptedResult,
-    DaemonStatusResult, ERROR_LAGGED, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
+    DaemonStatusResult, ERROR_LAGGED, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
     ERROR_WORKSPACE_MISMATCH, EventsStreamResult, HarnessEvent, IssuePrepResult,
     IssuePrepStartResult, RunOverrides, RunStartResult, RunStateName,
     SessionApprovalProfileSetResult, StreamEvent, ThreadEventsResult, ThreadListResult,
@@ -71,14 +71,19 @@ fn load_connected_thread_state(
     let status = client.thread_status(attachment.thread_id.clone())?;
     let sessions = client.sessions_list()?;
     let session_id = format!("session_{}", attachment.thread_id);
-    let approval_profile = client
-        .daemon_status(Some(session_id.clone()), None)?
-        .trust
-        .approval_profile;
-    let (transcript, approval) = if sessions
+    let has_session = sessions
         .iter()
-        .any(|session| session.session_id == session_id)
-    {
+        .any(|session| session.session_id == session_id);
+    let approval_profile = match client.daemon_status(Some(session_id.clone()), None) {
+        Ok(status) => status.trust.approval_profile,
+        Err(ClientError::DaemonResponse(error))
+            if !has_session && error.code == ERROR_NOT_FOUND =>
+        {
+            ApprovalProfile::Prompt
+        }
+        Err(error) => return Err(error),
+    };
+    let (transcript, approval) = if has_session {
         match client.transcript_read_session(&session_id) {
             Ok(transcript) => loaded_transcript_state(transcript),
             Err(error) => (
@@ -99,7 +104,7 @@ fn load_connected_thread_state(
         sessions,
         transcript,
     );
-    state.selected_session_id = Some(session_id.clone());
+    state.selected_session_id = has_session.then_some(session_id.clone());
     state.selected_thread_id = Some(attachment.thread_id.clone());
     state.approval_profile = approval_profile;
     state.approval = approval;
@@ -1167,7 +1172,7 @@ pub(super) fn apply_client_event(
         }
         ClientEvent::EventsPolled(result) => apply_events_result(state, runtime, commands, result),
         ClientEvent::ThreadEventsPolled(result) => {
-            apply_thread_events_result(state, runtime, result)
+            apply_thread_events_result(state, runtime, commands, result)
         }
         ClientEvent::ApprovalDecided {
             result,
@@ -1466,6 +1471,7 @@ pub(super) fn apply_events_result(
 fn apply_thread_events_result(
     state: &mut TuiState,
     runtime: &mut UiRuntime,
+    commands: &Sender<ClientCommand>,
     result: ThreadEventsResult,
 ) {
     if runtime
@@ -1502,6 +1508,13 @@ fn apply_thread_events_result(
                 .elapsed_at(Instant::now())
                 .map(|elapsed| elapsed.as_secs());
             runtime.active_timer.stop();
+            send_command(
+                commands,
+                ClientCommand::Load {
+                    run_id: Some(run_id),
+                },
+                state,
+            );
         } else if !runtime.active_timer.is_active() {
             runtime
                 .active_timer
@@ -1999,6 +2012,7 @@ mod tests {
         apply_thread_events_result(
             &mut state,
             &mut runtime,
+            &mpsc::channel().0,
             ThreadEventsResult {
                 thread_id: "thread_old".into(),
                 live_epoch_id: "epoch_old".into(),

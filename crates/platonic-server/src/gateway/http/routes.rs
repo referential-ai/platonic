@@ -26,43 +26,60 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 enum Route<'a> {
     Status,
     Workspaces,
+    Profiles {
+        workspace_id: &'a str,
+    },
+    Profile {
+        workspace_id: &'a str,
+        profile_id: &'a str,
+    },
     Threads {
         workspace_id: &'a str,
+        profile_id: &'a str,
     },
     Thread {
         workspace_id: &'a str,
+        profile_id: &'a str,
         thread_id: &'a str,
     },
     ThreadAuthority {
         workspace_id: &'a str,
+        profile_id: &'a str,
         thread_id: &'a str,
     },
     Messages {
         workspace_id: &'a str,
+        profile_id: &'a str,
         thread_id: &'a str,
     },
     ThreadEvents {
         workspace_id: &'a str,
+        profile_id: &'a str,
         thread_id: &'a str,
     },
     Stop {
         workspace_id: &'a str,
+        profile_id: &'a str,
         thread_id: &'a str,
     },
     Transcript {
         workspace_id: &'a str,
+        profile_id: &'a str,
         run_id: &'a str,
     },
     RunEvents {
         workspace_id: &'a str,
+        profile_id: &'a str,
         run_id: &'a str,
     },
     Cancel {
         workspace_id: &'a str,
+        profile_id: &'a str,
         run_id: &'a str,
     },
     Approval {
         workspace_id: &'a str,
+        profile_id: &'a str,
         run_id: &'a str,
         tool_call_id: &'a str,
     },
@@ -72,10 +89,12 @@ enum Route<'a> {
 enum MutationTarget<'a> {
     Thread {
         workspace_id: &'a str,
+        profile_id: &'a str,
         thread_id: &'a str,
     },
     Run {
         workspace_id: &'a str,
+        profile_id: &'a str,
         run_id: &'a str,
     },
 }
@@ -84,6 +103,12 @@ impl<'a> MutationTarget<'a> {
     fn workspace_id(self) -> &'a str {
         match self {
             Self::Thread { workspace_id, .. } | Self::Run { workspace_id, .. } => workspace_id,
+        }
+    }
+
+    fn profile_id(self) -> &'a str {
+        match self {
+            Self::Thread { profile_id, .. } | Self::Run { profile_id, .. } => profile_id,
         }
     }
 }
@@ -168,31 +193,65 @@ pub(super) fn handle(
     match route {
         Route::Status => read_status(gateway, &principal, &request),
         Route::Workspaces => read_workspaces(gateway, &principal, &request),
-        Route::Threads { workspace_id } => {
-            read_threads(gateway, &principal, workspace_id, &request)
+        Route::Profiles { workspace_id } => {
+            read_profiles(gateway, &principal, workspace_id, &request)
         }
+        Route::Profile {
+            workspace_id,
+            profile_id,
+        } => read_profile(gateway, &principal, workspace_id, profile_id, &request),
+        Route::Threads {
+            workspace_id,
+            profile_id,
+        } => read_threads(gateway, &principal, workspace_id, profile_id, &request),
         Route::Thread {
             workspace_id,
+            profile_id,
             thread_id,
-        } => read_thread(gateway, &principal, workspace_id, thread_id, &request),
+        } => read_thread(
+            gateway,
+            &principal,
+            workspace_id,
+            profile_id,
+            thread_id,
+            &request,
+        ),
         Route::ThreadAuthority {
             workspace_id,
+            profile_id,
             thread_id,
-        } => read_authority(gateway, &principal, workspace_id, thread_id, &request),
+        } => read_authority(
+            gateway,
+            &principal,
+            workspace_id,
+            profile_id,
+            thread_id,
+            &request,
+        ),
         Route::Transcript {
             workspace_id,
+            profile_id,
             run_id,
-        } => read_transcript(gateway, &principal, workspace_id, run_id, &request),
+        } => read_transcript(
+            gateway,
+            &principal,
+            workspace_id,
+            profile_id,
+            run_id,
+            &request,
+        ),
         Route::Messages {
             workspace_id,
+            profile_id,
             thread_id,
         } => mutation(
             gateway,
             &principal,
             &request,
-            ("thread.send", &[workspace_id, thread_id]),
+            ("thread.send", &[workspace_id, profile_id, thread_id]),
             MutationTarget::Thread {
                 workspace_id,
+                profile_id,
                 thread_id,
             },
             parse_message,
@@ -208,14 +267,16 @@ pub(super) fn handle(
         ),
         Route::Stop {
             workspace_id,
+            profile_id,
             thread_id,
         } => mutation(
             gateway,
             &principal,
             &request,
-            ("thread.stop", &[workspace_id, thread_id]),
+            ("thread.stop", &[workspace_id, profile_id, thread_id]),
             MutationTarget::Thread {
                 workspace_id,
+                profile_id,
                 thread_id,
             },
             parse_empty,
@@ -227,14 +288,16 @@ pub(super) fn handle(
         ),
         Route::Cancel {
             workspace_id,
+            profile_id,
             run_id,
         } => mutation(
             gateway,
             &principal,
             &request,
-            ("run.cancel", &[workspace_id, run_id]),
+            ("run.cancel", &[workspace_id, profile_id, run_id]),
             MutationTarget::Run {
                 workspace_id,
+                profile_id,
                 run_id,
             },
             parse_empty,
@@ -242,15 +305,20 @@ pub(super) fn handle(
         ),
         Route::Approval {
             workspace_id,
+            profile_id,
             run_id,
             tool_call_id,
         } => mutation(
             gateway,
             &principal,
             &request,
-            ("approval.decide", &[workspace_id, run_id, tool_call_id]),
+            (
+                "approval.decide",
+                &[workspace_id, profile_id, run_id, tool_call_id],
+            ),
             MutationTarget::Run {
                 workspace_id,
+                profile_id,
                 run_id,
             },
             parse_approval,
@@ -268,12 +336,14 @@ pub(super) fn handle(
         ),
         Route::ThreadEvents {
             workspace_id,
+            profile_id,
             thread_id,
         } => {
             stream_thread_events(
                 gateway,
                 &principal,
                 workspace_id,
+                profile_id,
                 thread_id,
                 &request,
                 stream,
@@ -282,9 +352,18 @@ pub(super) fn handle(
         }
         Route::RunEvents {
             workspace_id,
+            profile_id,
             run_id,
         } => {
-            stream_run_events(gateway, &principal, workspace_id, run_id, &request, stream);
+            stream_run_events(
+                gateway,
+                &principal,
+                workspace_id,
+                profile_id,
+                run_id,
+                &request,
+                stream,
+            );
             None
         }
     }
@@ -296,86 +375,148 @@ fn parse_route(target: &str) -> Option<Route<'_>> {
         return None;
     }
     match segments.as_slice() {
-        ["v1", "status"] => Some(Route::Status),
-        ["v1", "workspaces"] => Some(Route::Workspaces),
-        ["v1", "workspaces", workspace_id, "threads"] => Some(Route::Threads { workspace_id }),
-        ["v1", "workspaces", workspace_id, "threads", thread_id] => Some(Route::Thread {
+        ["v2", "status"] => Some(Route::Status),
+        ["v2", "workspaces"] => Some(Route::Workspaces),
+        ["v2", "workspaces", workspace_id, "profiles"] => Some(Route::Profiles { workspace_id }),
+        ["v2", "workspaces", workspace_id, "profiles", profile_id] => Some(Route::Profile {
             workspace_id,
+            profile_id,
+        }),
+        [
+            "v2",
+            "workspaces",
+            workspace_id,
+            "profiles",
+            profile_id,
+            "threads",
+        ] => Some(Route::Threads {
+            workspace_id,
+            profile_id,
+        }),
+        [
+            "v2",
+            "workspaces",
+            workspace_id,
+            "profiles",
+            profile_id,
+            "threads",
+            thread_id,
+        ] => Some(Route::Thread {
+            workspace_id,
+            profile_id,
             thread_id,
         }),
         [
-            "v1",
+            "v2",
             "workspaces",
             workspace_id,
+            "profiles",
+            profile_id,
             "threads",
             thread_id,
             "authority",
         ] => Some(Route::ThreadAuthority {
             workspace_id,
+            profile_id,
             thread_id,
         }),
         [
-            "v1",
+            "v2",
             "workspaces",
             workspace_id,
+            "profiles",
+            profile_id,
             "threads",
             thread_id,
             "messages",
         ] => Some(Route::Messages {
             workspace_id,
+            profile_id,
             thread_id,
         }),
         [
-            "v1",
+            "v2",
             "workspaces",
             workspace_id,
+            "profiles",
+            profile_id,
             "threads",
             thread_id,
             "events",
         ] => Some(Route::ThreadEvents {
             workspace_id,
+            profile_id,
             thread_id,
         }),
         [
-            "v1",
+            "v2",
             "workspaces",
             workspace_id,
+            "profiles",
+            profile_id,
             "threads",
             thread_id,
             "stop",
         ] => Some(Route::Stop {
             workspace_id,
+            profile_id,
             thread_id,
         }),
         [
-            "v1",
+            "v2",
             "workspaces",
             workspace_id,
+            "profiles",
+            profile_id,
             "runs",
             run_id,
             "transcript",
         ] => Some(Route::Transcript {
             workspace_id,
-            run_id,
-        }),
-        ["v1", "workspaces", workspace_id, "runs", run_id, "events"] => Some(Route::RunEvents {
-            workspace_id,
-            run_id,
-        }),
-        ["v1", "workspaces", workspace_id, "runs", run_id, "cancel"] => Some(Route::Cancel {
-            workspace_id,
+            profile_id,
             run_id,
         }),
         [
-            "v1",
+            "v2",
             "workspaces",
             workspace_id,
+            "profiles",
+            profile_id,
+            "runs",
+            run_id,
+            "events",
+        ] => Some(Route::RunEvents {
+            workspace_id,
+            profile_id,
+            run_id,
+        }),
+        [
+            "v2",
+            "workspaces",
+            workspace_id,
+            "profiles",
+            profile_id,
+            "runs",
+            run_id,
+            "cancel",
+        ] => Some(Route::Cancel {
+            workspace_id,
+            profile_id,
+            run_id,
+        }),
+        [
+            "v2",
+            "workspaces",
+            workspace_id,
+            "profiles",
+            profile_id,
             "runs",
             run_id,
             "approvals",
             tool_call_id,
         ] => Some(Route::Approval {
             workspace_id,
+            profile_id,
             run_id,
             tool_call_id,
         }),
@@ -405,7 +546,17 @@ fn read_status(
         Ok(client) => client,
         Err(response) => return Some(response),
     };
-    native_json(client.daemon_status(None, None))
+    match client.daemon_status(None, None) {
+        Ok(status) => read_json_response(
+            200,
+            &serde_json::json!({
+                "protocol_version": platonic_protocol::PROTOCOL_VERSION,
+                "daemon": status.daemon,
+                "model": status.model,
+            }),
+        ),
+        Err(error) => Some(native_error(&error)),
+    }
 }
 
 fn read_workspaces(
@@ -432,13 +583,70 @@ fn read_workspaces(
     read_json_response(200, &serde_json::json!({ "workspaces": workspaces }))
 }
 
-fn read_threads(
+fn read_profiles(
     gateway: &Gateway,
     principal: &super::HttpGatewayPrincipal,
     workspace_id: &str,
     request: &HttpRequest,
 ) -> Option<HttpResponse> {
     if let Err(response) = require_empty_body(request) {
+        return Some(response);
+    }
+    if let Err(response) = gateway.authorize_workspace(principal, workspace_id) {
+        return Some(response);
+    }
+    let mut client = match gateway.control_client() {
+        Ok(client) => client,
+        Err(error) => return Some(native_transport_error(&error)),
+    };
+    let result = match client.profile_list(Some(workspace_id.into()), Some(100)) {
+        Ok(result) => result,
+        Err(error) => return Some(native_error(&error)),
+    };
+    let profiles = result
+        .profiles
+        .into_iter()
+        .filter(|profile| {
+            principal.profile_ids.is_empty()
+                || principal
+                    .profile_ids
+                    .iter()
+                    .any(|id| id == profile.id.as_str())
+        })
+        .collect::<Vec<_>>();
+    read_json_response(
+        200,
+        &serde_json::json!({ "profiles": profiles, "truncated": result.truncated }),
+    )
+}
+
+fn read_profile(
+    gateway: &Gateway,
+    principal: &super::HttpGatewayPrincipal,
+    workspace_id: &str,
+    profile_id: &str,
+    request: &HttpRequest,
+) -> Option<HttpResponse> {
+    if let Err(response) = require_empty_body(request) {
+        return Some(response);
+    }
+    match gateway.authorize_profile(principal, workspace_id, profile_id) {
+        Ok(status) => read_json_response(200, &status),
+        Err(response) => Some(response),
+    }
+}
+
+fn read_threads(
+    gateway: &Gateway,
+    principal: &super::HttpGatewayPrincipal,
+    workspace_id: &str,
+    profile_id: &str,
+    request: &HttpRequest,
+) -> Option<HttpResponse> {
+    if let Err(response) = require_empty_body(request) {
+        return Some(response);
+    }
+    if let Err(response) = gateway.authorize_profile(principal, workspace_id, profile_id) {
         return Some(response);
     }
     let mut client = match gateway.workspace_client(principal, workspace_id) {
@@ -449,14 +657,17 @@ fn read_threads(
         Ok(result) => result,
         Err(error) => return Some(native_error(&error)),
     };
-    let mut threads = Vec::new();
-    for thread in result.threads {
-        match gateway.authorize_thread(&mut client, workspace_id, &thread.authority.thread_id) {
-            Ok(_) => threads.push(thread),
-            Err(response) if matches!(response.status, 403 | 404) => {}
-            Err(response) => return Some(response),
-        }
-    }
+    let threads = result
+        .threads
+        .into_iter()
+        .filter(|thread| {
+            thread
+                .authority
+                .profile_id
+                .as_ref()
+                .is_some_and(|id| id.as_str() == profile_id)
+        })
+        .collect::<Vec<_>>();
     read_json_response(200, &serde_json::json!({ "threads": threads }))
 }
 
@@ -464,17 +675,23 @@ fn read_thread(
     gateway: &Gateway,
     principal: &super::HttpGatewayPrincipal,
     workspace_id: &str,
+    profile_id: &str,
     thread_id: &str,
     request: &HttpRequest,
 ) -> Option<HttpResponse> {
     if let Err(response) = require_empty_body(request) {
         return Some(response);
     }
+    if let Err(response) = gateway.authorize_profile_scope(principal, workspace_id, profile_id) {
+        return Some(response);
+    }
     let mut client = match gateway.workspace_client(principal, workspace_id) {
         Ok(client) => client,
         Err(response) => return Some(response),
     };
-    if let Err(response) = gateway.authorize_thread(&mut client, workspace_id, thread_id) {
+    if let Err(response) =
+        gateway.authorize_thread(principal, &mut client, workspace_id, profile_id, thread_id)
+    {
         return Some(response);
     }
     match client.thread_status(thread_id.into()) {
@@ -487,17 +704,21 @@ fn read_authority(
     gateway: &Gateway,
     principal: &super::HttpGatewayPrincipal,
     workspace_id: &str,
+    profile_id: &str,
     thread_id: &str,
     request: &HttpRequest,
 ) -> Option<HttpResponse> {
     if let Err(response) = require_empty_body(request) {
         return Some(response);
     }
+    if let Err(response) = gateway.authorize_profile_scope(principal, workspace_id, profile_id) {
+        return Some(response);
+    }
     let mut client = match gateway.workspace_client(principal, workspace_id) {
         Ok(client) => client,
         Err(response) => return Some(response),
     };
-    match gateway.authorize_thread(&mut client, workspace_id, thread_id) {
+    match gateway.authorize_thread(principal, &mut client, workspace_id, profile_id, thread_id) {
         Ok(result) => read_json_response(200, &result),
         Err(response) => Some(response),
     }
@@ -507,16 +728,25 @@ fn read_transcript(
     gateway: &Gateway,
     principal: &super::HttpGatewayPrincipal,
     workspace_id: &str,
+    profile_id: &str,
     run_id: &str,
     request: &HttpRequest,
 ) -> Option<HttpResponse> {
     if let Err(response) = require_empty_body(request) {
         return Some(response);
     }
+    if let Err(response) = gateway.authorize_profile_scope(principal, workspace_id, profile_id) {
+        return Some(response);
+    }
     let mut client = match gateway.workspace_client(principal, workspace_id) {
         Ok(client) => client,
         Err(response) => return Some(response),
     };
+    if let Err(response) =
+        gateway.authorize_run(principal, &mut client, workspace_id, profile_id, run_id)
+    {
+        return Some(response);
+    }
     match client.transcript_read(run_id) {
         Ok(result) => read_json_response(200, &result),
         Err(error) => Some(target_error(&error)),
@@ -544,6 +774,11 @@ where
         Err(response) => return Some(response),
     };
     if let Err(response) = gateway.authorize_workspace(principal, target.workspace_id()) {
+        return Some(response);
+    }
+    if let Err(response) =
+        gateway.authorize_profile_scope(principal, target.workspace_id(), target.profile_id())
+    {
         return Some(response);
     }
     let canonical = match canonical_request_body(request) {
@@ -650,11 +885,16 @@ where
     let scope = match target {
         MutationTarget::Thread {
             workspace_id,
+            profile_id,
             thread_id,
         } => gateway
-            .authorize_thread(&mut client, workspace_id, thread_id)
+            .authorize_thread(principal, &mut client, workspace_id, profile_id, thread_id)
             .map(|_| ()),
-        MutationTarget::Run { run_id, .. } => gateway.authorize_run(&mut client, run_id),
+        MutationTarget::Run {
+            workspace_id,
+            profile_id,
+            run_id,
+        } => gateway.authorize_run(principal, &mut client, workspace_id, profile_id, run_id),
     };
     if let Err(response) = scope {
         if store_response(gateway, principal, &key_hash, &fingerprint, &response, true).is_err() {
@@ -737,6 +977,7 @@ fn stream_thread_events(
     gateway: &Gateway,
     principal: &super::HttpGatewayPrincipal,
     workspace_id: &str,
+    profile_id: &str,
     thread_id: &str,
     request: &HttpRequest,
     stream: &mut TcpStream,
@@ -748,6 +989,10 @@ fn stream_thread_events(
         );
         return;
     }
+    if let Err(response) = gateway.authorize_profile_scope(principal, workspace_id, profile_id) {
+        let _ = wire::write_response(stream, &response);
+        return;
+    }
     let _stream_guard = match gateway.limits.acquire_stream(&principal.name) {
         Ok(guard) => guard,
         Err(response) => {
@@ -755,29 +1000,13 @@ fn stream_thread_events(
             return;
         }
     };
-    let mut offset = match event_offset(request) {
-        Ok(offset) => offset,
+    let cursor = match thread_event_cursor(request) {
+        Ok(cursor) => cursor,
         Err(response) => {
             let _ = wire::write_response(stream, &response);
             return;
         }
     };
-    if let Err(response) = gateway.authorize_workspace(principal, workspace_id) {
-        let _ = wire::write_response(stream, &response);
-        return;
-    }
-    let target = format!("thread\0{workspace_id}\0{thread_id}");
-    let generation = match gateway.daemon_generation() {
-        Ok(generation) => generation,
-        Err(response) => {
-            let _ = wire::write_response(stream, &response);
-            return;
-        }
-    };
-    if let Err(response) = gateway.admit_stream_cursor(&target, generation, offset) {
-        let _ = wire::write_response(stream, &response);
-        return;
-    }
     let mut client = match gateway.workspace_client(principal, workspace_id) {
         Ok(client) => client,
         Err(response) => {
@@ -785,61 +1014,52 @@ fn stream_thread_events(
             return;
         }
     };
-    if let Err(response) = gateway.authorize_thread(&mut client, workspace_id, thread_id) {
+    if let Err(response) =
+        gateway.authorize_thread(principal, &mut client, workspace_id, profile_id, thread_id)
+    {
         let _ = wire::write_response(stream, &response);
         return;
     }
-    if let Some(requested) = offset
-        && gateway.known_stream_tip(&target, generation).is_none()
-    {
-        let tip = match client.thread_events(thread_id.into(), None, 1, 0) {
-            Ok(page) => page.next_offset,
-            Err(error) => {
-                let _ = wire::write_response(stream, &event_error(&error));
-                return;
-            }
-        };
-        if requested > tip {
-            let _ = wire::write_response(stream, &super::cursor_unavailable());
-            return;
-        }
-    }
-    let first = match client.thread_events(thread_id.into(), offset, EVENT_LIMIT, THREAD_POLL_MS) {
+    let (requested_epoch, mut offset) = cursor
+        .map(|(epoch, offset)| (Some(epoch), Some(offset)))
+        .unwrap_or((None, None));
+    let first = match client.thread_events_in_epoch(
+        thread_id.into(),
+        requested_epoch,
+        offset,
+        EVENT_LIMIT,
+        THREAD_POLL_MS,
+    ) {
         Ok(page) => page,
         Err(error) => {
             let _ = wire::write_response(stream, &event_error(&error));
             return;
         }
     };
-    if gateway.daemon_generation().ok() != Some(generation) {
+    if first.reset.is_some() {
         let _ = wire::write_response(stream, &super::cursor_unavailable());
         return;
     }
-    if let Err(response) =
-        gateway.record_stream_cursor(target.clone(), generation, first.next_offset)
-    {
-        let _ = wire::write_response(stream, &response);
-        return;
-    }
+    let live_epoch_id = first.live_epoch_id.clone();
     if wire::write_sse_headers(stream).is_err() {
         return;
     }
     offset = Some(first.next_offset);
-    if write_thread_page(stream, first.events).is_err() {
+    if write_thread_page(stream, &live_epoch_id, first.events).is_err() {
         return;
     }
     let started = Instant::now();
     while started.elapsed() < STREAM_LIFETIME {
-        if gateway.daemon_generation().ok() != Some(generation) {
-            let _ = wire::write_sse_error(stream, &super::cursor_unavailable().body);
-            return;
-        }
-        match client.thread_events(thread_id.into(), offset, EVENT_LIMIT, THREAD_POLL_MS) {
+        match client.thread_events_in_epoch(
+            thread_id.into(),
+            Some(live_epoch_id.clone()),
+            offset,
+            EVENT_LIMIT,
+            THREAD_POLL_MS,
+        ) {
             Ok(page) => {
-                if let Err(response) =
-                    gateway.record_stream_cursor(target.clone(), generation, page.next_offset)
-                {
-                    let _ = wire::write_sse_error(stream, &response.body);
+                if page.reset.is_some() || page.live_epoch_id != live_epoch_id {
+                    let _ = wire::write_sse_error(stream, &super::cursor_unavailable().body);
                     return;
                 }
                 offset = Some(page.next_offset);
@@ -847,7 +1067,7 @@ fn stream_thread_events(
                     if wire::write_sse_keepalive(stream).is_err() {
                         return;
                     }
-                } else if write_thread_page(stream, page.events).is_err() {
+                } else if write_thread_page(stream, &live_epoch_id, page.events).is_err() {
                     return;
                 }
             }
@@ -864,6 +1084,7 @@ fn stream_run_events(
     gateway: &Gateway,
     principal: &super::HttpGatewayPrincipal,
     workspace_id: &str,
+    profile_id: &str,
     run_id: &str,
     request: &HttpRequest,
     stream: &mut TcpStream,
@@ -873,6 +1094,10 @@ fn stream_run_events(
             stream,
             &error_response(400, "malformed_request", "GET requests have no body"),
         );
+        return;
+    }
+    if let Err(response) = gateway.authorize_profile_scope(principal, workspace_id, profile_id) {
+        let _ = wire::write_response(stream, &response);
         return;
     }
     let _stream_guard = match gateway.limits.acquire_stream(&principal.name) {
@@ -889,11 +1114,7 @@ fn stream_run_events(
             return;
         }
     };
-    if let Err(response) = gateway.authorize_workspace(principal, workspace_id) {
-        let _ = wire::write_response(stream, &response);
-        return;
-    }
-    let target = format!("run\0{workspace_id}\0{run_id}");
+    let target = format!("run\0{workspace_id}\0{profile_id}\0{run_id}");
     let generation = match gateway.daemon_generation() {
         Ok(generation) => generation,
         Err(response) => {
@@ -912,7 +1133,9 @@ fn stream_run_events(
             return;
         }
     };
-    if let Err(response) = gateway.authorize_run(&mut client, run_id) {
+    if let Err(response) =
+        gateway.authorize_run(principal, &mut client, workspace_id, profile_id, run_id)
+    {
         let _ = wire::write_response(stream, &response);
         return;
     }
@@ -990,12 +1213,19 @@ fn stream_run_events(
 
 fn write_thread_page(
     stream: &mut TcpStream,
+    live_epoch_id: &str,
     events: Vec<BufferedThreadEvent>,
 ) -> std::io::Result<()> {
     for buffered in events {
-        let data = serde_json::to_vec(&buffered)
-            .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
-        wire::write_sse_event(stream, event_cursor(buffered.offset)?, &data)?;
+        let next_offset = event_cursor(buffered.offset)?;
+        let data = serde_json::to_vec(&serde_json::json!({
+            "live_epoch_id": live_epoch_id,
+            "offset": buffered.offset,
+            "turn_id": buffered.turn_id,
+            "event": buffered.event,
+        }))
+        .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+        wire::write_sse_event(stream, format!("{live_epoch_id}:{next_offset}"), &data)?;
     }
     Ok(())
 }
@@ -1028,6 +1258,39 @@ fn event_offset(request: &HttpRequest) -> Result<Option<u64>, HttpResponse> {
                     400,
                     "invalid_event_cursor",
                     "Last-Event-ID must be an exact unsigned native offset",
+                )
+            }),
+        _ => Err(error_response(
+            400,
+            "invalid_event_cursor",
+            "Last-Event-ID must occur at most once",
+        )),
+    }
+}
+
+fn thread_event_cursor(request: &HttpRequest) -> Result<Option<(String, u64)>, HttpResponse> {
+    let values = request.header_values("last-event-id").collect::<Vec<_>>();
+    match values.as_slice() {
+        [] => Ok(None),
+        [value] => std::str::from_utf8(value)
+            .ok()
+            .and_then(|value| value.split_once(':'))
+            .and_then(|(epoch, offset)| {
+                (!epoch.is_empty())
+                    .then(|| {
+                        offset
+                            .parse::<u64>()
+                            .ok()
+                            .map(|offset| (epoch.into(), offset))
+                    })
+                    .flatten()
+            })
+            .map(Some)
+            .ok_or_else(|| {
+                error_response(
+                    400,
+                    "invalid_event_cursor",
+                    "Last-Event-ID must be <live_epoch_id>:<native_offset>",
                 )
             }),
         _ => Err(error_response(
@@ -1178,7 +1441,7 @@ fn fingerprint(
     let body_hash = Sha256::digest(canonical_body);
     let mut hasher = Sha256::new();
     for value in std::iter::once(principal)
-        .chain(std::iter::once("v1"))
+        .chain(std::iter::once("v2"))
         .chain(std::iter::once(operation))
         .chain(targets.iter().copied())
     {
@@ -1289,13 +1552,6 @@ fn mark_ambiguous(
         .map_err(|_| ())
 }
 
-fn native_json<T: Serialize>(result: Result<T, ClientError>) -> Option<HttpResponse> {
-    match result {
-        Ok(result) => read_json_response(200, &result),
-        Err(error) => Some(native_error(&error)),
-    }
-}
-
 fn native_error(error: &ClientError) -> HttpResponse {
     match error {
         ClientError::DaemonResponse(error) => native_protocol_error(error),
@@ -1355,7 +1611,7 @@ mod tests {
     fn request(body: &[u8], headers: &[(&str, &str)]) -> HttpRequest {
         HttpRequest {
             method: "POST".into(),
-            target: "/v1/workspaces/ws/threads/thread/messages".into(),
+            target: "/v2/workspaces/ws/profiles/profile/threads/thread/messages".into(),
             headers: headers
                 .iter()
                 .map(|(name, value)| ((*name).into(), value.as_bytes().to_vec()))
@@ -1365,26 +1621,28 @@ mod tests {
     }
 
     #[test]
-    fn route_table_admits_only_the_twelve_v1_targets() {
+    fn route_table_admits_only_the_fourteen_v2_targets() {
         for path in [
-            "/v1/status",
-            "/v1/workspaces",
-            "/v1/workspaces/ws/threads",
-            "/v1/workspaces/ws/threads/t",
-            "/v1/workspaces/ws/threads/t/authority",
-            "/v1/workspaces/ws/threads/t/messages",
-            "/v1/workspaces/ws/threads/t/events",
-            "/v1/workspaces/ws/threads/t/stop",
-            "/v1/workspaces/ws/runs/r/transcript",
-            "/v1/workspaces/ws/runs/r/events",
-            "/v1/workspaces/ws/runs/r/cancel",
-            "/v1/workspaces/ws/runs/r/approvals/c",
+            "/v2/status",
+            "/v2/workspaces",
+            "/v2/workspaces/ws/profiles",
+            "/v2/workspaces/ws/profiles/p",
+            "/v2/workspaces/ws/profiles/p/threads",
+            "/v2/workspaces/ws/profiles/p/threads/t",
+            "/v2/workspaces/ws/profiles/p/threads/t/authority",
+            "/v2/workspaces/ws/profiles/p/threads/t/messages",
+            "/v2/workspaces/ws/profiles/p/threads/t/events",
+            "/v2/workspaces/ws/profiles/p/threads/t/stop",
+            "/v2/workspaces/ws/profiles/p/runs/r/transcript",
+            "/v2/workspaces/ws/profiles/p/runs/r/events",
+            "/v2/workspaces/ws/profiles/p/runs/r/cancel",
+            "/v2/workspaces/ws/profiles/p/runs/r/approvals/c",
         ] {
             assert!(parse_route(path).is_some(), "missing route {path}");
         }
-        assert!(parse_route("/v1/workspaces/ws/agents").is_none());
-        assert!(parse_route("/v1/workspaces/ws/threads/t/create").is_none());
-        assert!(parse_route("/v1/status/").is_none());
+        assert!(parse_route("/v2/workspaces/ws/agents").is_none());
+        assert!(parse_route("/v2/workspaces/ws/threads").is_none());
+        assert!(parse_route("/v2/status/").is_none());
     }
 
     #[test]
@@ -1430,11 +1688,16 @@ mod tests {
     }
 
     #[test]
-    fn last_event_id_is_the_exact_native_offset() {
+    fn last_event_id_uses_native_run_offsets_and_thread_epochs() {
         let valid = request(b"", &[("Last-Event-ID", "42")]);
         assert_eq!(event_offset(&valid).unwrap(), Some(42));
         assert_eq!(event_cursor(41).unwrap(), 42);
         assert!(event_offset(&request(b"", &[("Last-Event-ID", "42x")])).is_err());
+        assert_eq!(
+            thread_event_cursor(&request(b"", &[("Last-Event-ID", "epoch_1:42")])).unwrap(),
+            Some(("epoch_1".into(), 42))
+        );
+        assert!(thread_event_cursor(&valid).is_err());
     }
 
     #[test]

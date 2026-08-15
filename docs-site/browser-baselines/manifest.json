@@ -16,8 +16,8 @@
       "viewport": { "width": 1440, "height": 900 },
       "theme": "light",
       "fullPage": true,
-      "rationale": "Initial pinned Ubuntu 24.04 capture: desktop overview locks the primary entrances, five-step product model, and repository/license section.",
-      "sha256": "f81d72fa06b7019e704c81cae06e2edd86c9d865eb6bea43fe1f4048faabb623"
+      "rationale": "Pinned Ubuntu 24.04 Phase 5 capture: the desktop overview names workspace profiles and the five-step product model uses Profile instead of Agent.",
+      "sha256": "cf4b20842535c72b8008f08f457ab4124fa1e1b6d913fb21808b6f2c436da510"
     },
     {
       "name": "user",
@@ -26,8 +26,8 @@
       "viewport": { "width": 390, "height": 844 },
       "theme": "light",
       "fullPage": true,
-      "rationale": "Initial pinned Ubuntu 24.04 capture: mobile User guide locks responsive navigation, code, output, and instructional TUI media.",
-      "sha256": "aa7b4c01461992f2e5b46af2429926560b77fdf61c8740099c5f58852fc876b2"
+      "rationale": "Pinned Ubuntu 24.04 Phase 5 capture: the mobile TUI and CLI guide covers profile-home selection, reuse, and profile default operations.",
+      "sha256": "d8f4ae2e568c1a778434f724d626ec774a18af33524484b19aa15b35ceede0f5"
     },
     {
       "name": "developer",
@@ -36,8 +36,8 @@
       "viewport": { "width": 1440, "height": 900 },
       "theme": "dark",
       "fullPage": true,
-      "rationale": "Initial pinned Ubuntu 24.04 capture: desktop Developer guide locks the semantic request flow, migrated navigation, and final confinement references.",
-      "sha256": "2b9db5b36d7079f59957a7eed2fd26fb777f35fd92e7eb00fb45fbe590174e48"
+      "rationale": "Pinned Ubuntu 24.04 Phase 5 capture: the request lifecycle routes TUI work through profile.open, home attachment, and profile revisions.",
+      "sha256": "74261f1dc98a4b776f9fadddccc0327d842b7836de6ecf06bcd668a6102aaa36"
     },
     {
       "name": "search",

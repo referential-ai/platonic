@@ -95,12 +95,17 @@ pub(super) fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Enve
         ProtocolRequest::WorkspaceStatus(params) => {
             registry::handle_workspace_status(runtime, request, params)
         }
-        ProtocolRequest::AgentCreate(params) => {
-            registry::handle_agent_create(runtime, request, params)
+        ProtocolRequest::ProfileCreate(params) => {
+            registry::handle_profile_create(runtime, request, params)
         }
-        ProtocolRequest::AgentList(params) => registry::handle_agent_list(runtime, request, params),
-        ProtocolRequest::AgentStatus(params) => {
-            registry::handle_agent_status(runtime, request, params)
+        ProtocolRequest::ProfileList(params) => {
+            registry::handle_profile_list(runtime, request, params)
+        }
+        ProtocolRequest::ProfileStatus(params) => {
+            registry::handle_profile_status(runtime, request, params)
+        }
+        ProtocolRequest::ProfileUpdate(params) => {
+            registry::handle_profile_update(runtime, request, params)
         }
     }
 }

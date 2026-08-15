@@ -1,4 +1,4 @@
-//! Authenticated HTTP/SSE adapter over the native Platonic v1 client.
+//! Authenticated HTTP/SSE adapter over the native Platonic v2 client.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -23,12 +23,12 @@ use idempotency::IdempotencyStore;
 use platonic_client::transport;
 use platonic_client::{ClientError, client::DaemonClient, paths as client_paths};
 use platonic_protocol::{
-    CAPABILITY_AGENT_STATUS, CAPABILITY_APPROVAL_DECIDE, CAPABILITY_DAEMON_STATUS,
-    CAPABILITY_EVENTS_STREAM, CAPABILITY_HELLO, CAPABILITY_RUN_CANCEL, CAPABILITY_THREAD_AUTHORITY,
-    CAPABILITY_THREAD_EVENTS, CAPABILITY_THREAD_LIST, CAPABILITY_THREAD_SEND,
-    CAPABILITY_THREAD_STATUS, CAPABILITY_THREAD_STOP, CAPABILITY_TRANSCRIPT_READ,
-    CAPABILITY_WORKSPACE_LIST, CAPABILITY_WORKSPACE_STATUS, Capability, HelloResult,
-    ThreadAuthorityResult,
+    CAPABILITY_APPROVAL_DECIDE, CAPABILITY_DAEMON_STATUS, CAPABILITY_EVENTS_STREAM,
+    CAPABILITY_HELLO, CAPABILITY_PROFILE_LIST, CAPABILITY_PROFILE_STATUS, CAPABILITY_RUN_CANCEL,
+    CAPABILITY_THREAD_AUTHORITY, CAPABILITY_THREAD_EVENTS, CAPABILITY_THREAD_LIST,
+    CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_STATUS, CAPABILITY_THREAD_STOP,
+    CAPABILITY_TRANSCRIPT_READ, CAPABILITY_WORKSPACE_LIST, CAPABILITY_WORKSPACE_STATUS, Capability,
+    HelloResult, ProfileId, ProfileStatusResult, StreamEvent, ThreadAuthorityResult,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -61,7 +61,8 @@ const REQUIRED_CAPABILITIES: &[Capability] = &[
     CAPABILITY_HELLO,
     CAPABILITY_WORKSPACE_LIST,
     CAPABILITY_WORKSPACE_STATUS,
-    CAPABILITY_AGENT_STATUS,
+    CAPABILITY_PROFILE_LIST,
+    CAPABILITY_PROFILE_STATUS,
     CAPABILITY_DAEMON_STATUS,
     CAPABILITY_THREAD_LIST,
     CAPABILITY_THREAD_STATUS,
@@ -348,35 +349,94 @@ impl Gateway {
 
     fn authorize_thread(
         &self,
+        principal: &HttpGatewayPrincipal,
         client: &mut DaemonClient,
         workspace_id: &str,
+        profile_id: &str,
         thread_id: &str,
     ) -> Result<ThreadAuthorityResult, HttpResponse> {
+        self.authorize_profile(principal, workspace_id, profile_id)?;
         let authority = client
             .thread_authority(thread_id.into())
             .map_err(|error| scope_error(&error))?;
-        let agent_id = authority
+        if authority
             .authority
-            .agent_id
-            .clone()
-            .ok_or_else(forbidden_target)?;
-        let mut control = self
-            .control_client()
-            .map_err(|error| native_transport_error(&error))?;
-        let agent = control
-            .agent_status(agent_id)
-            .map_err(|error| scope_error(&error))?;
-        if agent.agent.workspace_id != workspace_id {
+            .profile_id
+            .as_ref()
+            .map(ProfileId::as_str)
+            != Some(profile_id)
+        {
             return Err(forbidden_target());
         }
         Ok(authority)
     }
 
-    fn authorize_run(&self, client: &mut DaemonClient, run_id: &str) -> Result<(), HttpResponse> {
-        client
-            .transcript_read(run_id)
-            .map(|_| ())
-            .map_err(|error| target_error(&error))
+    fn authorize_profile(
+        &self,
+        principal: &HttpGatewayPrincipal,
+        workspace_id: &str,
+        profile_id: &str,
+    ) -> Result<ProfileStatusResult, HttpResponse> {
+        self.authorize_profile_scope(principal, workspace_id, profile_id)?;
+        let mut control = self
+            .control_client()
+            .map_err(|error| native_transport_error(&error))?;
+        let status = control
+            .profile_status(ProfileId::new(profile_id.to_owned()).map_err(|_| forbidden_target())?)
+            .map_err(|error| scope_error(&error))?;
+        if status.status.profile.workspace_id != workspace_id {
+            return Err(forbidden_target());
+        }
+        Ok(status)
+    }
+
+    fn authorize_profile_scope(
+        &self,
+        principal: &HttpGatewayPrincipal,
+        workspace_id: &str,
+        profile_id: &str,
+    ) -> Result<(), HttpResponse> {
+        self.authorize_workspace(principal, workspace_id)?;
+        if !principal.profile_ids.is_empty()
+            && !principal
+                .profile_ids
+                .iter()
+                .any(|allowed| allowed == profile_id)
+        {
+            return Err(forbidden_target());
+        }
+        Ok(())
+    }
+
+    fn authorize_run(
+        &self,
+        principal: &HttpGatewayPrincipal,
+        client: &mut DaemonClient,
+        workspace_id: &str,
+        profile_id: &str,
+        run_id: &str,
+    ) -> Result<(), HttpResponse> {
+        self.authorize_profile(principal, workspace_id, profile_id)?;
+        let page = client
+            .events_stream(run_id, Some(0), 1)
+            .map_err(|error| scope_error(&error))?;
+        let matches_profile = page.events.first().is_some_and(|buffered| {
+            matches!(
+                &buffered.event,
+                StreamEvent::Ledger { record }
+                    if matches!(
+                        &record.event,
+                        platonic_core::HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
+                            identity: platonic_core::RunIdentity::Profile {
+                                profile_id: run_profile_id,
+                                ..
+                            },
+                            ..
+                        }) if run_profile_id.as_str() == profile_id
+                    )
+            )
+        });
+        matches_profile.then_some(()).ok_or_else(forbidden_target)
     }
 
     #[cfg(unix)]
@@ -682,7 +742,7 @@ fn validate_native_contract(workspace_id: &str, hello: &HelloResult) -> Result<(
         return Err(error_response(
             503,
             "native_version_skew",
-            "the native daemon does not satisfy the HTTP v1 contract",
+            "the native daemon does not satisfy the HTTP v2 contract",
         ));
     }
     Ok(())
@@ -740,7 +800,7 @@ fn native_transport_error(error: &ClientError) -> HttpResponse {
         ClientError::DaemonProtocol(_) => error_response(
             503,
             "native_version_skew",
-            "the native daemon does not satisfy the HTTP v1 contract",
+            "the native daemon does not satisfy the HTTP v2 contract",
         ),
         _ => error_response(
             503,
@@ -844,7 +904,7 @@ mod tests {
         );
         HttpRequest {
             method: "GET".into(),
-            target: "/v1/status".into(),
+            target: "/v2/status".into(),
             headers,
             body: Vec::new(),
         }
@@ -915,6 +975,7 @@ mod tests {
                 Sha256::digest(rotated.token.as_bytes()).into(),
             ],
             workspace_ids: vec!["workspace-1".into()],
+            profile_ids: Vec::new(),
         };
         let gateway = Gateway::new(
             root.path().join("daemon.sock"),

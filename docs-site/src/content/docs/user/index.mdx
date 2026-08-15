@@ -14,8 +14,8 @@ sidebar:
 > from its exact source commit and must not be published as release-current
 > until `platonic-v0.2.0` exists.
 
-**Platonic** is the self-hosted agent server. It owns workspaces, agent
-profiles, threads, provider calls, tools, policy, approvals, and ledgers.
+**Platonic** is the self-hosted agent server. It owns workspaces, profiles,
+threads, provider calls, tools, policy, approvals, and ledgers.
 **Plato Agent** is the client distribution built on Platonic; its commands are
 `plato` and `plato-tui`.
 
@@ -27,16 +27,16 @@ terms below.
 | Part | What it means |
 | --- | --- |
 | **Workspace** | A named, registered directory with a server-minted id and one ledger. Registration is explicit; identity is not inferred from the directory name. |
-| **Agent profile** | Immutable configured data bound to one workspace: model, reasoning effort, approval policy, and default toolset. It is not a process or plugin. The first-run path uses the built-in `plato` identity and resolved defaults, so it does not require a separate `platonic agent create`. |
-| **Thread** | A durable conversation with immutable authority: working directory, model, approval policy, and allowed effects. A thread can carry many turns and runs. |
+| **Profile** | Configured data bound to one workspace: model, reasoning effort, approval policy, default toolset, and versioned instructions, memory, and skill references. It is not a process or plugin. |
+| **Thread** | A durable conversation with immutable authority: profile revision, working directory, model, approval policy, and allowed effects. Each profile has one durable home; children remain in that profile. |
 | **Run** | One submitted task driven by the server. Provider requests, tool decisions, results, and the final answer belong to that run. |
 | **Ledger** | The workspace-owned durable record used for status, transcript loading, and offline replay. It is the audit record, not a cache of the TUI screen. |
 
 ## Profile defaults, thread authority
 
-An agent profile supplies defaults when a thread is created. The created
-thread records the authority it actually received; later profile or config
-changes do not rewrite that record. A child thread may receive a narrower
+Each profile supplies defaults when a thread is created. Updating a profile
+appends a content revision and changes defaults only for future threads or
+turns. Existing thread authority is never rewritten. A child thread may receive a narrower
 toolset, path set, repository set, network grant, or approval policy than its
 parent, but it cannot use inheritance to widen the parent's authority.
 
@@ -51,10 +51,10 @@ do?"
   transcript again.
 - `plato replay` reads the committed ledger without a server, provider call, or
   tool execution.
-- Restarting the server preserves registered workspaces, agent profiles,
-  thread authority, and completed ledger records. Live thread state is
-  process-local, so an old thread is listed as unloaded after restart; start a
-  new TUI thread for new work.
+- Restarting the server preserves registered workspaces, profiles, home and
+  child authority, and completed ledger records. Live thread state is
+  process-local, but opening the profile again resolves the same home and its
+  next `thread.send` reloads execution for a new turn.
 - If the server stops during a run, restart recovery records the interrupted
   run as failed. Partial streaming text is not promoted into a completed
   replay answer.

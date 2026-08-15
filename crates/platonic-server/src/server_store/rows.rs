@@ -1,7 +1,9 @@
+#[cfg(test)]
+use super::types::AgentRecord;
 use super::types::{
-    AgentRecord, ChildReturnKind, ChildReturnRecord, DeliveryState, ParentAnswerKind,
-    ParentAnswerRecord, ProfileRecord, ProfileRevisionContent, ProfileRevisionRecord,
-    ThreadRunAdmission, ToolCallApprovalDecision, ToolCallApprovalRecord, WorkspaceRecord,
+    ChildReturnKind, ChildReturnRecord, DeliveryState, ParentAnswerKind, ParentAnswerRecord,
+    ProfileRecord, ProfileRevisionContent, ProfileRevisionRecord, ThreadRunAdmission,
+    ToolCallApprovalDecision, ToolCallApprovalRecord, WorkspaceRecord,
 };
 use crate::{
     AppError, AppResult,
@@ -320,6 +322,7 @@ pub(super) fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Wo
     })
 }
 
+#[cfg(test)]
 pub(super) fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
     let id = AgentId::new(row.get::<_, String>(0)?)
         .map_err(|error| invalid_agent_column(0, error.to_string()))?;
@@ -415,6 +418,7 @@ pub(super) fn profile_revision_from_row(
     })
 }
 
+#[cfg(test)]
 fn invalid_agent_column(index: usize, message: String) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(index, Type::Text, message.into())
 }

@@ -213,7 +213,11 @@ pub(super) fn write_sse_headers(stream: &mut TcpStream) -> std::io::Result<()> {
     stream.flush()
 }
 
-pub(super) fn write_sse_event(stream: &mut TcpStream, id: u64, data: &[u8]) -> std::io::Result<()> {
+pub(super) fn write_sse_event(
+    stream: &mut TcpStream,
+    id: impl std::fmt::Display,
+    data: &[u8],
+) -> std::io::Result<()> {
     write!(stream, "id: {id}\ndata: ")?;
     stream.write_all(data)?;
     stream.write_all(b"\n\n")?;
@@ -279,7 +283,7 @@ mod tests {
     #[test]
     fn parses_one_bounded_http_11_request() {
         let request = parse(
-            b"POST /v1/workspaces/ws/threads/t/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"
+            b"POST /v2/workspaces/ws/profiles/p/threads/t/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"
                 .to_vec(),
         )
         .unwrap();
@@ -290,21 +294,21 @@ mod tests {
     #[test]
     fn rejects_oversized_bodies_and_transfer_encoding() {
         let oversized = format!(
-            "POST /v1/status HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            "POST /v2/status HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
             MAX_BODY_BYTES + 1
         )
         .into_bytes();
         assert!(matches!(parse(oversized), Err(WireError::BodyTooLarge)));
         assert!(matches!(
             parse(
-                b"POST /v1/status HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+                b"POST /v2/status HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
                     .to_vec()
             ),
             Err(WireError::TransferEncoding)
         ));
         assert!(matches!(
             parse(
-                b"POST /v1/status HTTP/1.1\r\nHost: localhost\r\nContent-Length: +2\r\n\r\n{}"
+                b"POST /v2/status HTTP/1.1\r\nHost: localhost\r\nContent-Length: +2\r\n\r\n{}"
                     .to_vec()
             ),
             Err(WireError::Malformed)
@@ -314,15 +318,15 @@ mod tests {
     #[test]
     fn rejects_ambiguous_or_unbounded_request_metadata() {
         assert!(matches!(
-            parse(b"GET /v1/status HTTP/1.0\r\nHost: localhost\r\n\r\n".to_vec()),
+            parse(b"GET /v2/status HTTP/1.0\r\nHost: localhost\r\n\r\n".to_vec()),
             Err(WireError::Malformed)
         ));
         assert!(matches!(
-            parse(b"GET /v1/status HTTP/1.1\r\nHost: one\r\nHost: two\r\n\r\n".to_vec()),
+            parse(b"GET /v2/status HTTP/1.1\r\nHost: one\r\nHost: two\r\n\r\n".to_vec()),
             Err(WireError::Malformed)
         ));
 
-        let mut too_many = b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+        let mut too_many = b"GET /v2/status HTTP/1.1\r\nHost: localhost\r\n".to_vec();
         for index in 0..MAX_HEADER_COUNT {
             too_many.extend_from_slice(format!("X-{index}: value\r\n").as_bytes());
         }

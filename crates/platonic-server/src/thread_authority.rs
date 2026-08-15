@@ -531,6 +531,7 @@ pub(crate) fn legacy_status_authority(
         profile_id: authority.profile_id.clone(),
         profile_revision: authority.profile_revision,
         thread_kind: authority.thread_kind,
+        home_thread_id: None,
         cwd: cwd.to_string_lossy().into_owned(),
         model: authority.model.clone(),
         reasoning_effort: authority.reasoning_effort,

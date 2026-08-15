@@ -131,6 +131,12 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: cargo build --workspace --locked --all-targets
 
+      - name: Run protocol v2 profile-home journey (#580)
+        timeout-minutes: 10
+        run: >-
+          cargo test --locked -p plato-agent --test semantic_conformance
+          issue_580_profile_home_product_journey_survives_restart -- --exact --nocapture
+
       - name: Run clippy
         timeout-minutes: 30
         run: cargo clippy --workspace --locked --all-targets -- -D warnings

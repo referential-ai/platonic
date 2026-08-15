@@ -1,4 +1,4 @@
-//! Version 1 daemon wire types shared by Plato Agent clients and servers.
+//! Version 2 daemon wire types shared by Plato Agent clients and servers.
 //!
 //! This crate owns serialization and validation for the newline-delimited JSON
 //! protocol. It performs no I/O and contains no runtime or application policy.
@@ -19,10 +19,11 @@ mod voice;
 pub use voice::{VOICE_EVENT_VERSION, VoiceEvent, VoiceEventEnvelope};
 
 /// Provider reasoning effort carried by daemon run overrides.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
     /// Disable provider reasoning.
+    #[default]
     None,
     /// Request minimal reasoning.
     Minimal,
@@ -93,7 +94,7 @@ impl RunOverrides {
 }
 
 /// Current daemon protocol version.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Maximum JSON payload bytes in one protocol NDJSON line before decode.
 pub const MAX_PROTOCOL_LINE_BYTES: usize = 1024 * 1024;
@@ -122,7 +123,7 @@ pub const PLATONIC_BUILD_IDENTITY: &str = env!("PLATONIC_BUILD_IDENTITY");
 /// Locked Platonic diagnostic identity, including the product command name.
 pub const PLATONIC_DIAGNOSTIC_IDENTITY: &str = env!("PLATONIC_DIAGNOSTIC_IDENTITY");
 
-/// One capability advertised during the protocol v1 handshake.
+/// One capability advertised during the protocol v2 handshake.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum Capability {
     /// Initial daemon handshake.
@@ -206,15 +207,18 @@ pub enum Capability {
     /// Read one registered workspace.
     #[serde(rename = "workspace.status")]
     WorkspaceStatus,
-    /// Create one configured agent profile.
-    #[serde(rename = "agent.create")]
-    AgentCreate,
-    /// List every configured agent profile.
-    #[serde(rename = "agent.list")]
-    AgentList,
-    /// Read one configured agent profile.
-    #[serde(rename = "agent.status")]
-    AgentStatus,
+    /// Create one workspace-bound profile.
+    #[serde(rename = "profile.create")]
+    ProfileCreate,
+    /// List workspace-bound profiles.
+    #[serde(rename = "profile.list")]
+    ProfileList,
+    /// Read one workspace-bound profile.
+    #[serde(rename = "profile.status")]
+    ProfileStatus,
+    /// Update one profile's defaults and content revision.
+    #[serde(rename = "profile.update")]
+    ProfileUpdate,
 }
 
 impl Capability {
@@ -248,9 +252,10 @@ impl Capability {
             Self::WorkspaceCreate => "workspace.create",
             Self::WorkspaceList => "workspace.list",
             Self::WorkspaceStatus => "workspace.status",
-            Self::AgentCreate => "agent.create",
-            Self::AgentList => "agent.list",
-            Self::AgentStatus => "agent.status",
+            Self::ProfileCreate => "profile.create",
+            Self::ProfileList => "profile.list",
+            Self::ProfileStatus => "profile.status",
+            Self::ProfileUpdate => "profile.update",
         }
     }
 }
@@ -317,15 +322,17 @@ pub const CAPABILITY_WORKSPACE_CREATE: Capability = Capability::WorkspaceCreate;
 pub const CAPABILITY_WORKSPACE_LIST: Capability = Capability::WorkspaceList;
 /// Capability name for reading one registered workspace.
 pub const CAPABILITY_WORKSPACE_STATUS: Capability = Capability::WorkspaceStatus;
-/// Capability name for creating one configured agent profile.
-pub const CAPABILITY_AGENT_CREATE: Capability = Capability::AgentCreate;
-/// Capability name for listing every configured agent profile.
-pub const CAPABILITY_AGENT_LIST: Capability = Capability::AgentList;
-/// Capability name for reading one configured agent profile.
-pub const CAPABILITY_AGENT_STATUS: Capability = Capability::AgentStatus;
+/// Capability name for creating one workspace-bound profile.
+pub const CAPABILITY_PROFILE_CREATE: Capability = Capability::ProfileCreate;
+/// Capability name for listing workspace-bound profiles.
+pub const CAPABILITY_PROFILE_LIST: Capability = Capability::ProfileList;
+/// Capability name for reading one workspace-bound profile.
+pub const CAPABILITY_PROFILE_STATUS: Capability = Capability::ProfileStatus;
+/// Capability name for updating one profile's defaults and content revision.
+pub const CAPABILITY_PROFILE_UPDATE: Capability = Capability::ProfileUpdate;
 
-/// Capabilities advertised by a protocol v1 daemon, in wire order.
-pub const CAPABILITIES: [Capability; 30] = [
+/// Capabilities advertised by a protocol v2 daemon, in wire order.
+pub const CAPABILITIES: [Capability; 31] = [
     CAPABILITY_HELLO,
     CAPABILITY_RUN_START,
     CAPABILITY_MESSAGE_APPEND,
@@ -353,9 +360,10 @@ pub const CAPABILITIES: [Capability; 30] = [
     CAPABILITY_WORKSPACE_CREATE,
     CAPABILITY_WORKSPACE_LIST,
     CAPABILITY_WORKSPACE_STATUS,
-    CAPABILITY_AGENT_CREATE,
-    CAPABILITY_AGENT_LIST,
-    CAPABILITY_AGENT_STATUS,
+    CAPABILITY_PROFILE_CREATE,
+    CAPABILITY_PROFILE_LIST,
+    CAPABILITY_PROFILE_STATUS,
+    CAPABILITY_PROFILE_UPDATE,
 ];
 
 /// Stable machine-readable protocol error code.
@@ -571,7 +579,7 @@ pub enum EnvelopeKind {
     Error,
 }
 
-/// Closed protocol v1 method set shared by requests and responses.
+/// Closed protocol v2 method set shared by requests and responses.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum ProtocolMethod {
     /// Initial daemon handshake.
@@ -649,15 +657,18 @@ pub enum ProtocolMethod {
     /// Read one registered workspace.
     #[serde(rename = "workspace.status")]
     WorkspaceStatus,
-    /// Create one configured agent profile.
-    #[serde(rename = "agent.create")]
-    AgentCreate,
-    /// List every configured agent profile.
-    #[serde(rename = "agent.list")]
-    AgentList,
-    /// Read one configured agent profile.
-    #[serde(rename = "agent.status")]
-    AgentStatus,
+    /// Create one workspace-bound profile.
+    #[serde(rename = "profile.create")]
+    ProfileCreate,
+    /// List workspace-bound profiles.
+    #[serde(rename = "profile.list")]
+    ProfileList,
+    /// Read one workspace-bound profile.
+    #[serde(rename = "profile.status")]
+    ProfileStatus,
+    /// Update one profile's defaults and content revision.
+    #[serde(rename = "profile.update")]
+    ProfileUpdate,
 }
 
 impl ProtocolMethod {
@@ -689,9 +700,10 @@ impl ProtocolMethod {
             Self::WorkspaceCreate => "workspace.create",
             Self::WorkspaceList => "workspace.list",
             Self::WorkspaceStatus => "workspace.status",
-            Self::AgentCreate => "agent.create",
-            Self::AgentList => "agent.list",
-            Self::AgentStatus => "agent.status",
+            Self::ProfileCreate => "profile.create",
+            Self::ProfileList => "profile.list",
+            Self::ProfileStatus => "profile.status",
+            Self::ProfileUpdate => "profile.update",
         }
     }
 }
@@ -750,15 +762,16 @@ impl ProtocolMethod {
             "workspace.create" => Some(Self::WorkspaceCreate),
             "workspace.list" => Some(Self::WorkspaceList),
             "workspace.status" => Some(Self::WorkspaceStatus),
-            "agent.create" => Some(Self::AgentCreate),
-            "agent.list" => Some(Self::AgentList),
-            "agent.status" => Some(Self::AgentStatus),
+            "profile.create" => Some(Self::ProfileCreate),
+            "profile.list" => Some(Self::ProfileList),
+            "profile.status" => Some(Self::ProfileStatus),
+            "profile.update" => Some(Self::ProfileUpdate),
             _ => None,
         }
     }
 }
 
-/// Closed protocol v1 request set with method-specific parameters.
+/// Closed protocol v2 request set with method-specific parameters.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum ProtocolRequest {
@@ -837,15 +850,18 @@ pub enum ProtocolRequest {
     /// Read one registered workspace.
     #[serde(rename = "workspace.status")]
     WorkspaceStatus(WorkspaceStatusParams),
-    /// Create one configured agent profile.
-    #[serde(rename = "agent.create")]
-    AgentCreate(AgentCreateParams),
-    /// List every configured agent profile.
-    #[serde(rename = "agent.list")]
-    AgentList(AgentListParams),
-    /// Read one configured agent profile.
-    #[serde(rename = "agent.status")]
-    AgentStatus(AgentStatusParams),
+    /// Create one workspace-bound profile.
+    #[serde(rename = "profile.create")]
+    ProfileCreate(ProfileCreateParams),
+    /// List workspace-bound profiles.
+    #[serde(rename = "profile.list")]
+    ProfileList(ProfileListParams),
+    /// Read one workspace-bound profile.
+    #[serde(rename = "profile.status")]
+    ProfileStatus(ProfileStatusParams),
+    /// Update one profile's defaults and content revision.
+    #[serde(rename = "profile.update")]
+    ProfileUpdate(ProfileUpdateParams),
 }
 
 impl ProtocolRequest {
@@ -877,9 +893,10 @@ impl ProtocolRequest {
             Self::WorkspaceCreate(_) => ProtocolMethod::WorkspaceCreate,
             Self::WorkspaceList(_) => ProtocolMethod::WorkspaceList,
             Self::WorkspaceStatus(_) => ProtocolMethod::WorkspaceStatus,
-            Self::AgentCreate(_) => ProtocolMethod::AgentCreate,
-            Self::AgentList(_) => ProtocolMethod::AgentList,
-            Self::AgentStatus(_) => ProtocolMethod::AgentStatus,
+            Self::ProfileCreate(_) => ProtocolMethod::ProfileCreate,
+            Self::ProfileList(_) => ProtocolMethod::ProfileList,
+            Self::ProfileStatus(_) => ProtocolMethod::ProfileStatus,
+            Self::ProfileUpdate(_) => ProtocolMethod::ProfileUpdate,
         }
     }
 
@@ -934,9 +951,10 @@ impl ProtocolRequest {
             ProtocolMethod::WorkspaceStatus => {
                 decode_params(params, method).map(Self::WorkspaceStatus)
             }
-            ProtocolMethod::AgentCreate => decode_params(params, method).map(Self::AgentCreate),
-            ProtocolMethod::AgentList => decode_params(params, method).map(Self::AgentList),
-            ProtocolMethod::AgentStatus => decode_params(params, method).map(Self::AgentStatus),
+            ProtocolMethod::ProfileCreate => decode_params(params, method).map(Self::ProfileCreate),
+            ProtocolMethod::ProfileList => decode_params(params, method).map(Self::ProfileList),
+            ProtocolMethod::ProfileStatus => decode_params(params, method).map(Self::ProfileStatus),
+            ProtocolMethod::ProfileUpdate => decode_params(params, method).map(Self::ProfileUpdate),
         }
     }
 
@@ -972,14 +990,15 @@ impl ProtocolRequest {
             Self::WorkspaceCreate(params) => serialize_sorted_field(envelope, "params", params),
             Self::WorkspaceList(params) => serialize_sorted_field(envelope, "params", params),
             Self::WorkspaceStatus(params) => serialize_sorted_field(envelope, "params", params),
-            Self::AgentCreate(params) => serialize_sorted_field(envelope, "params", params),
-            Self::AgentList(params) => serialize_sorted_field(envelope, "params", params),
-            Self::AgentStatus(params) => serialize_sorted_field(envelope, "params", params),
+            Self::ProfileCreate(params) => serialize_sorted_field(envelope, "params", params),
+            Self::ProfileList(params) => serialize_sorted_field(envelope, "params", params),
+            Self::ProfileStatus(params) => serialize_sorted_field(envelope, "params", params),
+            Self::ProfileUpdate(params) => serialize_sorted_field(envelope, "params", params),
         }
     }
 }
 
-/// Closed protocol v1 response set with method-specific results.
+/// Closed protocol v2 response set with method-specific results.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "result")]
 pub enum ProtocolResponse {
@@ -1058,15 +1077,18 @@ pub enum ProtocolResponse {
     /// Workspace status.
     #[serde(rename = "workspace.status")]
     WorkspaceStatus(WorkspaceStatusResult),
-    /// Agent-creation result.
-    #[serde(rename = "agent.create")]
-    AgentCreate(AgentCreateResult),
-    /// Agent list.
-    #[serde(rename = "agent.list")]
-    AgentList(AgentListResult),
-    /// Agent status.
-    #[serde(rename = "agent.status")]
-    AgentStatus(AgentStatusResult),
+    /// Profile-creation result.
+    #[serde(rename = "profile.create")]
+    ProfileCreate(ProfileCreateResult),
+    /// Profile list.
+    #[serde(rename = "profile.list")]
+    ProfileList(ProfileListResult),
+    /// Profile status.
+    #[serde(rename = "profile.status")]
+    ProfileStatus(ProfileStatusResult),
+    /// Profile-update result.
+    #[serde(rename = "profile.update")]
+    ProfileUpdate(ProfileUpdateResult),
 }
 
 impl ProtocolResponse {
@@ -1098,9 +1120,10 @@ impl ProtocolResponse {
             Self::WorkspaceCreate(_) => ProtocolMethod::WorkspaceCreate,
             Self::WorkspaceList(_) => ProtocolMethod::WorkspaceList,
             Self::WorkspaceStatus(_) => ProtocolMethod::WorkspaceStatus,
-            Self::AgentCreate(_) => ProtocolMethod::AgentCreate,
-            Self::AgentList(_) => ProtocolMethod::AgentList,
-            Self::AgentStatus(_) => ProtocolMethod::AgentStatus,
+            Self::ProfileCreate(_) => ProtocolMethod::ProfileCreate,
+            Self::ProfileList(_) => ProtocolMethod::ProfileList,
+            Self::ProfileStatus(_) => ProtocolMethod::ProfileStatus,
+            Self::ProfileUpdate(_) => ProtocolMethod::ProfileUpdate,
         }
     }
 
@@ -1151,9 +1174,10 @@ impl ProtocolResponse {
             ProtocolMethod::WorkspaceStatus => {
                 decode_result(result, method).map(Self::WorkspaceStatus)
             }
-            ProtocolMethod::AgentCreate => decode_result(result, method).map(Self::AgentCreate),
-            ProtocolMethod::AgentList => decode_result(result, method).map(Self::AgentList),
-            ProtocolMethod::AgentStatus => decode_result(result, method).map(Self::AgentStatus),
+            ProtocolMethod::ProfileCreate => decode_result(result, method).map(Self::ProfileCreate),
+            ProtocolMethod::ProfileList => decode_result(result, method).map(Self::ProfileList),
+            ProtocolMethod::ProfileStatus => decode_result(result, method).map(Self::ProfileStatus),
+            ProtocolMethod::ProfileUpdate => decode_result(result, method).map(Self::ProfileUpdate),
         }
     }
 
@@ -1191,9 +1215,10 @@ impl ProtocolResponse {
             Self::WorkspaceCreate(result) => serialize_sorted_field(envelope, "result", result),
             Self::WorkspaceList(result) => serialize_sorted_field(envelope, "result", result),
             Self::WorkspaceStatus(result) => serialize_sorted_field(envelope, "result", result),
-            Self::AgentCreate(result) => serialize_sorted_field(envelope, "result", result),
-            Self::AgentList(result) => serialize_sorted_field(envelope, "result", result),
-            Self::AgentStatus(result) => serialize_sorted_field(envelope, "result", result),
+            Self::ProfileCreate(result) => serialize_sorted_field(envelope, "result", result),
+            Self::ProfileList(result) => serialize_sorted_field(envelope, "result", result),
+            Self::ProfileStatus(result) => serialize_sorted_field(envelope, "result", result),
+            Self::ProfileUpdate(result) => serialize_sorted_field(envelope, "result", result),
         }
     }
 }
@@ -1368,6 +1393,15 @@ struct WireEnvelope {
     result: Option<Value>,
     #[serde(default)]
     error: Option<ProtocolError>,
+}
+
+#[derive(Deserialize)]
+struct VersionedEnvelope {
+    v: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    method: Option<Value>,
 }
 
 impl WireEnvelope {
@@ -1699,10 +1733,11 @@ pub struct DaemonStatusTrust {
 }
 
 /// Immutable startup approval policy carried by a thread authority record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadApprovalPolicy {
     /// Effects requiring approval pause for an explicit actor decision.
+    #[default]
     Prompt,
     /// Eligible workspace-write effects follow the existing yolo auto-grant rules.
     Yolo,
@@ -1857,7 +1892,7 @@ pub struct ThreadAuthorityRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     /// Historical agent identity, absent on profile-based authorities.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
     /// Workspace-bound profile identity, absent only on unscoped legacy records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1890,7 +1925,7 @@ pub struct ThreadAuthorityRecord {
     pub created_at_ms: u64,
 }
 
-/// Protocol-v1-compatible authority projection used by thread spawn, list, and status.
+/// Protocol-v2 authority projection used by thread spawn, list, and status.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadStatusAuthority {
@@ -1909,6 +1944,9 @@ pub struct ThreadStatusAuthority {
     /// Durable home, child, or legacy classification.
     #[serde(default, skip_serializing_if = "thread_kind_is_legacy")]
     pub thread_kind: ThreadKind,
+    /// Root home thread for this profile tree, absent only for legacy authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_thread_id: Option<String>,
     /// Canonical compatibility working directory for this thread.
     pub cwd: String,
     /// Exact model requested for the thread.
@@ -1941,10 +1979,23 @@ pub struct ThreadLiveState {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadStatus {
-    /// Protocol-v1-compatible durable authority projection.
+    /// Protocol-v2 durable authority projection.
     pub authority: ThreadStatusAuthority,
     /// Transient state queried from the serving daemon.
     pub live: ThreadLiveState,
+    /// Unconsumed spawn-edge messages waiting for a future turn.
+    #[serde(default)]
+    pub return_availability: ThreadReturnAvailability,
+}
+
+/// Counts of durable spawn-edge messages available to a future thread turn.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadReturnAvailability {
+    /// Child returns waiting for this parent thread.
+    pub child_returns: u64,
+    /// Parent answers waiting for this child thread.
+    pub parent_answers: u64,
 }
 
 /// Typed decision resolving a prompting `thread.spawn` request.
@@ -1976,8 +2027,8 @@ pub enum ThreadSpawnDecision {
 pub enum ThreadSpawnParams {
     /// Start one spawn admission.
     Start {
-        /// Required same-profile parent thread. `None` is retained only for v1 decoding.
-        parent_thread_id: Option<String>,
+        /// Required same-profile parent thread.
+        parent_thread_id: String,
         /// Requested working directory.
         cwd: String,
         /// Requested model.
@@ -2119,7 +2170,7 @@ pub enum ProfileOpenResult {
         /// Exact profile owning the home.
         profile_id: ProfileId,
         /// Durable authority joined with current daemon state.
-        thread: ThreadStatus,
+        thread: Box<ThreadStatus>,
         /// Whether this request committed the home authority.
         created: bool,
     },
@@ -2225,79 +2276,175 @@ pub struct WorkspaceStatusResult {
     pub workspace: WorkspaceSummary,
 }
 
-/// One configured agent profile as reported over the wire.
+/// Versioned profile context authored by an operator.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileContent {
+    /// Markdown instructions selected into bounded turn context.
+    #[serde(default)]
+    pub instructions_markdown: String,
+    /// Markdown memory selected into bounded turn context.
+    #[serde(default)]
+    pub memory_markdown: String,
+    /// Immutable server-resolved context references.
+    #[serde(default)]
+    pub skill_refs: Vec<String>,
+}
+
+/// One immutable profile-content revision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentSummary {
-    /// Operator-chosen stable agent identifier.
-    pub id: AgentId,
+pub struct ProfileRevision {
+    /// Monotonic revision number.
+    pub revision: u64,
+    /// Previous revision, absent only for revision one.
+    pub parent_revision: Option<u64>,
+    /// Server-derived actor that authored this revision.
+    pub actor: String,
+    /// Revision creation time in Unix milliseconds.
+    pub created_at_ms: u64,
+    /// Lowercase SHA-256 hash of the serialized content.
+    pub content_hash: String,
+    /// Exact content stored for this revision.
+    pub content: ProfileContent,
+}
+
+/// One workspace-bound profile as reported over the wire.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileSummary {
+    /// Stable server-minted profile identity.
+    pub id: ProfileId,
+    /// Operator-authored name, unique inside the workspace.
+    pub display_name: String,
     /// Hard workspace binding, resolved before any thread runs.
     pub workspace_id: String,
-    /// Default model used by threads created from this profile.
+    /// Default model used by future threads.
     pub model: String,
-    /// Default provider reasoning effort.
+    /// Default provider reasoning effort used by future threads.
     pub reasoning_effort: ReasoningEffort,
-    /// Default immutable approval policy.
+    /// Default approval policy used by future threads.
     pub approval_policy: ThreadApprovalPolicy,
-    /// Default validated internal tool names.
+    /// Default validated internal tool names used by future threads.
     pub toolset: Vec<String>,
+    /// Current profile-content revision.
+    pub current_revision: u64,
+    /// The profile's durable home thread, once opened.
+    pub home_thread_id: Option<String>,
+    /// Whether the bound workspace directory is present.
+    pub workspace_health: WorkspaceHealthName,
     /// When the profile was created, in Unix milliseconds.
     pub created_at_ms: u64,
 }
 
-/// Parameters for `agent.create`.
+/// Complete profile status with its current content revision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentCreateParams {
-    /// Operator-chosen stable agent identifier.
-    pub agent_id: AgentId,
+pub struct ProfileStatus {
+    /// Stable metadata and future-thread defaults.
+    pub profile: ProfileSummary,
+    /// Current immutable content revision.
+    pub revision: ProfileRevision,
+}
+
+/// Parameters for `profile.create`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileCreateParams {
     /// Existing present workspace to bind permanently.
     pub workspace_id: String,
-    /// Default model.
-    pub model: String,
+    /// Operator-authored name, unique inside the workspace.
+    pub display_name: String,
+    /// Default model, or the resolved provider model when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Default provider reasoning effort.
+    #[serde(default)]
     pub reasoning_effort: ReasoningEffort,
-    /// Default immutable approval policy.
+    /// Default approval policy.
+    #[serde(default)]
     pub approval_policy: ThreadApprovalPolicy,
-    /// Default internal tool names.
-    pub toolset: Vec<String>,
+    /// Default toolset, or the resolved server toolset when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolset: Option<Vec<String>>,
+    /// Initial profile content.
+    #[serde(default)]
+    pub content: ProfileContent,
+    /// Optional authorized configuration path used for provider readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
 }
 
-/// Result returned by `agent.create`.
+/// Result returned by `profile.create`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentCreateResult {
-    /// The profile that was created.
-    pub agent: AgentSummary,
+pub struct ProfileCreateResult {
+    /// The profile and revision that were created.
+    pub status: ProfileStatus,
 }
 
-/// Parameters for `agent.list`.
+/// Parameters for `profile.list`.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentListParams {}
-
-/// Result returned by `agent.list`.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentListResult {
-    /// Every configured profile in creation order.
-    pub agents: Vec<AgentSummary>,
+pub struct ProfileListParams {
+    /// Optional workspace filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    /// Requested result ceiling; defaults to 50 and may not exceed 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
 }
 
-/// Parameters for `agent.status`.
+/// Result returned by `profile.list`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentStatusParams {
-    /// Agent profile to read.
-    pub agent_id: AgentId,
+pub struct ProfileListResult {
+    /// Profiles in creation order.
+    pub profiles: Vec<ProfileSummary>,
+    /// Whether more profiles exist beyond the requested ceiling.
+    pub truncated: bool,
 }
 
-/// Result returned by `agent.status`.
+/// Parameters for `profile.status`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentStatusResult {
-    /// The configured profile.
-    pub agent: AgentSummary,
+pub struct ProfileStatusParams {
+    /// Profile to read.
+    pub profile_id: ProfileId,
+}
+
+/// Result returned by `profile.status`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileStatusResult {
+    /// Complete current profile status.
+    pub status: ProfileStatus,
+}
+
+/// Parameters for `profile.update`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileUpdateParams {
+    /// Profile to update.
+    pub profile_id: ProfileId,
+    /// Default model used by future threads.
+    pub model: String,
+    /// Default provider reasoning effort used by future threads.
+    pub reasoning_effort: ReasoningEffort,
+    /// Default approval policy used by future threads.
+    pub approval_policy: ThreadApprovalPolicy,
+    /// Default toolset used by future threads.
+    pub toolset: Vec<String>,
+    /// Complete new profile content revision.
+    pub content: ProfileContent,
+}
+
+/// Result returned by `profile.update`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileUpdateResult {
+    /// Complete profile status after the update.
+    pub status: ProfileStatus,
 }
 
 /// Result returned by `thread.list`.
@@ -3189,6 +3336,37 @@ pub enum TypedTranscriptEntry {
 ///
 /// Validation failures are returned as ready-to-send protocol error envelopes.
 pub fn decode_request(line: &str) -> Result<Envelope, Box<Envelope>> {
+    decode_request_for_version(line, PROTOCOL_VERSION)
+}
+
+fn decode_request_for_version(
+    line: &str,
+    supported_version: u32,
+) -> Result<Envelope, Box<Envelope>> {
+    let versioned = serde_json::from_str::<VersionedEnvelope>(line).map_err(|error| {
+        Box::new(Envelope::error(
+            None,
+            None,
+            ERROR_MALFORMED_REQUEST,
+            format!("request is not a valid protocol envelope: {error}"),
+        ))
+    })?;
+    if versioned.v != supported_version {
+        let mut response = Envelope::error(
+            versioned.id,
+            versioned
+                .method
+                .as_ref()
+                .and_then(Value::as_str)
+                .and_then(ProtocolMethod::parse)
+                .map(|method| method.to_string()),
+            ERROR_UNSUPPORTED_VERSION,
+            format!("unsupported protocol version: {}", versioned.v),
+        );
+        response.v = supported_version;
+        return Err(Box::new(response));
+    }
+
     let wire = serde_json::from_str::<WireEnvelope>(line).map_err(|error| {
         Box::new(Envelope::error(
             None,
@@ -3198,14 +3376,6 @@ pub fn decode_request(line: &str) -> Result<Envelope, Box<Envelope>> {
         ))
     })?;
 
-    if wire.v != PROTOCOL_VERSION {
-        return Err(Box::new(Envelope::error(
-            wire.id,
-            wire.method.map(|method| method.to_string()),
-            ERROR_UNSUPPORTED_VERSION,
-            format!("unsupported protocol version: {}", wire.v),
-        )));
-    }
     if wire.kind != EnvelopeKind::Request {
         return Err(Box::new(Envelope::error(
             wire.id,
@@ -3317,7 +3487,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_names_and_error_codes_keep_exact_v1_literals() {
+    fn capability_names_and_error_codes_keep_exact_v2_literals() {
         assert_eq!(MAX_PROTOCOL_LINE_BYTES, 1_048_576);
         assert_eq!(
             CAPABILITIES.map(Capability::as_str),
@@ -3349,9 +3519,10 @@ mod tests {
                 "workspace.create",
                 "workspace.list",
                 "workspace.status",
-                "agent.create",
-                "agent.list",
-                "agent.status",
+                "profile.create",
+                "profile.list",
+                "profile.status",
+                "profile.update",
             ]
         );
         assert_eq!(
@@ -3420,237 +3591,245 @@ mod tests {
     }
 
     #[test]
-    fn every_current_method_keeps_exact_v1_request_and_response_bytes() {
+    fn every_current_method_keeps_exact_v2_request_and_response_bytes() {
         const REQUESTS: &[(ProtocolMethod, &str)] = &[
             (
                 ProtocolMethod::Hello,
-                r#"{"v":1,"id":"hello_1","kind":"request","method":"hello","params":{"workspace_id":"work-1","workspace_root":"/work"}}"#,
+                r#"{"v":2,"id":"hello_1","kind":"request","method":"hello","params":{"workspace_id":"work-1","workspace_root":"/work"}}"#,
             ),
             (
                 ProtocolMethod::RunStart,
-                r#"{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{"config_path":null,"question":"hello","wait":false}}"#,
+                r#"{"v":2,"id":"run_1","kind":"request","method":"run.start","params":{"config_path":null,"question":"hello","wait":false}}"#,
             ),
             (
                 ProtocolMethod::MessageAppend,
-                r#"{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{"config_path":null,"message":"again","session_id":"session-1","wait":false}}"#,
+                r#"{"v":2,"id":"append_1","kind":"request","method":"message.append","params":{"config_path":null,"message":"again","session_id":"session-1","wait":false}}"#,
             ),
             (
                 ProtocolMethod::IssuePrepStart,
-                r#"{"v":1,"id":"prep_1","kind":"request","method":"issue-prep.start","params":{"config_path":null,"input":"rough issue"}}"#,
+                r#"{"v":2,"id":"prep_1","kind":"request","method":"issue-prep.start","params":{"config_path":null,"input":"rough issue"}}"#,
             ),
             (
                 ProtocolMethod::EventsStream,
-                r#"{"v":1,"id":"events_1","kind":"request","method":"events.stream","params":{"from_offset":0,"limit":64,"run_id":"run-1"}}"#,
+                r#"{"v":2,"id":"events_1","kind":"request","method":"events.stream","params":{"from_offset":0,"limit":64,"run_id":"run-1"}}"#,
             ),
             (
                 ProtocolMethod::VoiceEventsCommit,
-                r#"{"v":1,"id":"voice_commit_1","kind":"request","method":"voice.events.commit","params":{"events":[{"event":"voice_spoken","interrupted_at":null,"run_id":"run-1","sentence_count":2,"ttfa_ms":287,"turn_id":"turn-1"}],"run_id":"run-1"}}"#,
+                r#"{"v":2,"id":"voice_commit_1","kind":"request","method":"voice.events.commit","params":{"events":[{"event":"voice_spoken","interrupted_at":null,"run_id":"run-1","sentence_count":2,"ttfa_ms":287,"turn_id":"turn-1"}],"run_id":"run-1"}}"#,
             ),
             (
                 ProtocolMethod::VoiceEventsRead,
-                r#"{"v":1,"id":"voice_read_1","kind":"request","method":"voice.events.read","params":{"run_id":"run-1"}}"#,
+                r#"{"v":2,"id":"voice_read_1","kind":"request","method":"voice.events.read","params":{"run_id":"run-1"}}"#,
             ),
             (
                 ProtocolMethod::ApprovalDecide,
-                r#"{"v":1,"id":"approval_1","kind":"request","method":"approval.decide","params":{"decision":"grant","reason":null,"run_id":"run-1","tool_call_id":"call-1"}}"#,
+                r#"{"v":2,"id":"approval_1","kind":"request","method":"approval.decide","params":{"decision":"grant","reason":null,"run_id":"run-1","tool_call_id":"call-1"}}"#,
             ),
             (
                 ProtocolMethod::RunCancel,
-                r#"{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"run_id":"run-1"}}"#,
+                r#"{"v":2,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"run_id":"run-1"}}"#,
             ),
             (
                 ProtocolMethod::SessionsList,
-                r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#,
+                r#"{"v":2,"id":"sessions_1","kind":"request","method":"sessions.list"}"#,
             ),
             (
                 ProtocolMethod::TranscriptRead,
-                r#"{"v":1,"id":"transcript_1","kind":"request","method":"transcript.read","params":{"run_id":"run-1","session_id":null}}"#,
+                r#"{"v":2,"id":"transcript_1","kind":"request","method":"transcript.read","params":{"run_id":"run-1","session_id":null}}"#,
             ),
             (
                 ProtocolMethod::DaemonStatus,
-                r#"{"v":1,"id":"status_1","kind":"request","method":"daemon.status","params":{"config_path":null,"session_id":null}}"#,
+                r#"{"v":2,"id":"status_1","kind":"request","method":"daemon.status","params":{"config_path":null,"session_id":null}}"#,
             ),
             (
                 ProtocolMethod::SessionApprovalProfileSet,
-                r#"{"v":1,"id":"profile_1","kind":"request","method":"session.approval_profile.set","params":{"profile":"yolo","session_id":"session-1"}}"#,
+                r#"{"v":2,"id":"profile_1","kind":"request","method":"session.approval_profile.set","params":{"profile":"yolo","session_id":"session-1"}}"#,
             ),
             (
                 ProtocolMethod::DaemonShutdownIfIdle,
-                r#"{"v":1,"id":"shutdown_1","kind":"request","method":"daemon.shutdown_if_idle"}"#,
+                r#"{"v":2,"id":"shutdown_1","kind":"request","method":"daemon.shutdown_if_idle"}"#,
             ),
             (
                 ProtocolMethod::ThreadSpawn,
-                r#"{"v":1,"id":"spawn_1","kind":"request","method":"thread.spawn","params":{"action":"start","approval_policy":"prompt","cwd":"/work","model":"gpt-5","parent_thread_id":null,"reasoning_effort":"high"}}"#,
+                r#"{"v":2,"id":"spawn_1","kind":"request","method":"thread.spawn","params":{"action":"start","approval_policy":"prompt","cwd":"/work","model":"gpt-5","parent_thread_id":"thread-home","reasoning_effort":"high"}}"#,
             ),
             (
                 ProtocolMethod::ThreadList,
-                r#"{"v":1,"id":"threads_1","kind":"request","method":"thread.list"}"#,
+                r#"{"v":2,"id":"threads_1","kind":"request","method":"thread.list"}"#,
             ),
             (
                 ProtocolMethod::ThreadStatus,
-                r#"{"v":1,"id":"thread_status_1","kind":"request","method":"thread.status","params":{"thread_id":"thread-1"}}"#,
+                r#"{"v":2,"id":"thread_status_1","kind":"request","method":"thread.status","params":{"thread_id":"thread-1"}}"#,
             ),
             (
                 ProtocolMethod::ThreadAuthority,
-                r#"{"v":1,"id":"authority_1","kind":"request","method":"thread.authority","params":{"thread_id":"thread-1"}}"#,
+                r#"{"v":2,"id":"authority_1","kind":"request","method":"thread.authority","params":{"thread_id":"thread-1"}}"#,
             ),
             (
                 ProtocolMethod::ThreadSend,
-                r#"{"v":1,"id":"send_1","kind":"request","method":"thread.send","params":{"controller_id":"terminal","message":"inspect","thread_id":"thread-1"}}"#,
+                r#"{"v":2,"id":"send_1","kind":"request","method":"thread.send","params":{"controller_id":"terminal","message":"inspect","thread_id":"thread-1"}}"#,
             ),
             (
                 ProtocolMethod::ThreadEvents,
-                r#"{"v":1,"id":"thread_events_1","kind":"request","method":"thread.events","params":{"from_offset":0,"limit":64,"thread_id":"thread-1","wait_ms":1000}}"#,
+                r#"{"v":2,"id":"thread_events_1","kind":"request","method":"thread.events","params":{"from_offset":0,"limit":64,"thread_id":"thread-1","wait_ms":1000}}"#,
             ),
             (
                 ProtocolMethod::ThreadStop,
-                r#"{"v":1,"id":"stop_1","kind":"request","method":"thread.stop","params":{"actor":"terminal","thread_id":"thread-1"}}"#,
+                r#"{"v":2,"id":"stop_1","kind":"request","method":"thread.stop","params":{"actor":"terminal","thread_id":"thread-1"}}"#,
             ),
             (
                 ProtocolMethod::ProfileOpen,
-                r#"{"v":1,"id":"profile_open_1","kind":"request","method":"profile.open","params":{"action":"resolve","profile_id":"profile-1"}}"#,
+                r#"{"v":2,"id":"profile_open_1","kind":"request","method":"profile.open","params":{"action":"resolve","profile_id":"profile-1"}}"#,
             ),
             (
                 ProtocolMethod::WorkspaceCreate,
-                r#"{"v":1,"id":"workspace_create_1","kind":"request","method":"workspace.create","params":{"name":"alpha","root":"/work"}}"#,
+                r#"{"v":2,"id":"workspace_create_1","kind":"request","method":"workspace.create","params":{"name":"alpha","root":"/work"}}"#,
             ),
             (
                 ProtocolMethod::WorkspaceList,
-                r#"{"v":1,"id":"workspace_list_1","kind":"request","method":"workspace.list","params":{}}"#,
+                r#"{"v":2,"id":"workspace_list_1","kind":"request","method":"workspace.list","params":{}}"#,
             ),
             (
                 ProtocolMethod::WorkspaceStatus,
-                r#"{"v":1,"id":"workspace_status_1","kind":"request","method":"workspace.status","params":{"workspace_id":"workspace-1"}}"#,
+                r#"{"v":2,"id":"workspace_status_1","kind":"request","method":"workspace.status","params":{"workspace_id":"workspace-1"}}"#,
             ),
             (
-                ProtocolMethod::AgentCreate,
-                r#"{"v":1,"id":"agent_create_1","kind":"request","method":"agent.create","params":{"agent_id":"builder","approval_policy":"prompt","model":"gpt-5","reasoning_effort":"high","toolset":["file.read"],"workspace_id":"workspace-1"}}"#,
+                ProtocolMethod::ProfileCreate,
+                r#"{"v":2,"id":"profile_create_1","kind":"request","method":"profile.create","params":{"approval_policy":"prompt","content":{"instructions_markdown":"","memory_markdown":"","skill_refs":[]},"display_name":"builder","model":"gpt-5","reasoning_effort":"high","toolset":["file.read"],"workspace_id":"workspace-1"}}"#,
             ),
             (
-                ProtocolMethod::AgentList,
-                r#"{"v":1,"id":"agent_list_1","kind":"request","method":"agent.list","params":{}}"#,
+                ProtocolMethod::ProfileList,
+                r#"{"v":2,"id":"profile_list_1","kind":"request","method":"profile.list","params":{}}"#,
             ),
             (
-                ProtocolMethod::AgentStatus,
-                r#"{"v":1,"id":"agent_status_1","kind":"request","method":"agent.status","params":{"agent_id":"builder"}}"#,
+                ProtocolMethod::ProfileStatus,
+                r#"{"v":2,"id":"profile_status_1","kind":"request","method":"profile.status","params":{"profile_id":"profile-builder"}}"#,
+            ),
+            (
+                ProtocolMethod::ProfileUpdate,
+                r#"{"v":2,"id":"profile_update_1","kind":"request","method":"profile.update","params":{"approval_policy":"prompt","content":{"instructions_markdown":"build","memory_markdown":"","skill_refs":[]},"model":"gpt-5","profile_id":"profile-builder","reasoning_effort":"high","toolset":["file.read"]}}"#,
             ),
         ];
         const RESPONSES: &[(ProtocolMethod, &str)] = &[
             (
                 ProtocolMethod::Hello,
-                r#"{"v":1,"id":"hello_1","kind":"response","method":"hello","result":{"capabilities":["hello"],"daemon_version":"0.2.0 test test","ledger_path":"/state/agent.db","workspace_id":"work-1"}}"#,
+                r#"{"v":2,"id":"hello_1","kind":"response","method":"hello","result":{"capabilities":["hello"],"daemon_version":"0.2.0 test test","ledger_path":"/state/agent.db","workspace_id":"work-1"}}"#,
             ),
             (
                 ProtocolMethod::RunStart,
-                r#"{"v":1,"id":"run_1","kind":"response","method":"run.start","result":{"final_answer":null,"ledger_path":"/state/agent.db","run_id":"run-1","session_id":"session-1","status":"running"}}"#,
+                r#"{"v":2,"id":"run_1","kind":"response","method":"run.start","result":{"final_answer":null,"ledger_path":"/state/agent.db","run_id":"run-1","session_id":"session-1","status":"running"}}"#,
             ),
             (
                 ProtocolMethod::MessageAppend,
-                r#"{"v":1,"id":"append_1","kind":"response","method":"message.append","result":{"final_answer":"done","ledger_path":"/state/agent.db","run_id":"run-2","session_id":"session-1","status":"finished"}}"#,
+                r#"{"v":2,"id":"append_1","kind":"response","method":"message.append","result":{"final_answer":"done","ledger_path":"/state/agent.db","run_id":"run-2","session_id":"session-1","status":"finished"}}"#,
             ),
             (
                 ProtocolMethod::IssuePrepStart,
-                r#"{"v":1,"id":"prep_1","kind":"response","method":"issue-prep.start","result":{"outcome":{"markdown":"Prepared issue","status":"candidate"},"run_dir":"/work/.plato/issue-prep/run-1"}}"#,
+                r#"{"v":2,"id":"prep_1","kind":"response","method":"issue-prep.start","result":{"outcome":{"markdown":"Prepared issue","status":"candidate"},"run_dir":"/work/.plato/issue-prep/run-1"}}"#,
             ),
             (
                 ProtocolMethod::EventsStream,
-                r#"{"v":1,"id":"events_1","kind":"response","method":"events.stream","result":{"events":[],"from_offset":0,"next_offset":0,"run_id":"run-1","status":"running"}}"#,
+                r#"{"v":2,"id":"events_1","kind":"response","method":"events.stream","result":{"events":[],"from_offset":0,"next_offset":0,"run_id":"run-1","status":"running"}}"#,
             ),
             (
                 ProtocolMethod::VoiceEventsCommit,
-                r#"{"v":1,"id":"voice_commit_1","kind":"response","method":"voice.events.commit","result":{"events":[{"event":{"event":"voice_spoken","interrupted_at":null,"run_id":"run-1","sentence_count":2,"ttfa_ms":287,"turn_id":"turn-1"},"sequence":0,"v":1}],"run_id":"run-1"}}"#,
+                r#"{"v":2,"id":"voice_commit_1","kind":"response","method":"voice.events.commit","result":{"events":[{"event":{"event":"voice_spoken","interrupted_at":null,"run_id":"run-1","sentence_count":2,"ttfa_ms":287,"turn_id":"turn-1"},"sequence":0,"v":1}],"run_id":"run-1"}}"#,
             ),
             (
                 ProtocolMethod::VoiceEventsRead,
-                r#"{"v":1,"id":"voice_read_1","kind":"response","method":"voice.events.read","result":{"events":[{"event":{"event":"voice_spoken","interrupted_at":null,"run_id":"run-1","sentence_count":2,"ttfa_ms":287,"turn_id":"turn-1"},"sequence":0,"v":1}],"run_id":"run-1"}}"#,
+                r#"{"v":2,"id":"voice_read_1","kind":"response","method":"voice.events.read","result":{"events":[{"event":{"event":"voice_spoken","interrupted_at":null,"run_id":"run-1","sentence_count":2,"ttfa_ms":287,"turn_id":"turn-1"},"sequence":0,"v":1}],"run_id":"run-1"}}"#,
             ),
             (
                 ProtocolMethod::ApprovalDecide,
-                r#"{"v":1,"id":"approval_1","kind":"response","method":"approval.decide","result":{"run_id":"run-1","status":"running"}}"#,
+                r#"{"v":2,"id":"approval_1","kind":"response","method":"approval.decide","result":{"run_id":"run-1","status":"running"}}"#,
             ),
             (
                 ProtocolMethod::RunCancel,
-                r#"{"v":1,"id":"cancel_1","kind":"response","method":"run.cancel","result":{"run_id":"run-1","status":"cancel_requested"}}"#,
+                r#"{"v":2,"id":"cancel_1","kind":"response","method":"run.cancel","result":{"run_id":"run-1","status":"cancel_requested"}}"#,
             ),
             (
                 ProtocolMethod::SessionsList,
-                r#"{"v":1,"id":"sessions_1","kind":"response","method":"sessions.list","result":{"sessions":[]}}"#,
+                r#"{"v":2,"id":"sessions_1","kind":"response","method":"sessions.list","result":{"sessions":[]}}"#,
             ),
             (
                 ProtocolMethod::TranscriptRead,
-                r#"{"v":1,"id":"transcript_1","kind":"response","method":"transcript.read","result":{"final_answer":"done","run_id":"run-1","status":"finished","transcript":"[turn-1] assistant: done\n"}}"#,
+                r#"{"v":2,"id":"transcript_1","kind":"response","method":"transcript.read","result":{"final_answer":"done","run_id":"run-1","status":"finished","transcript":"[turn-1] assistant: done\n"}}"#,
             ),
             (
                 ProtocolMethod::DaemonStatus,
-                r#"{"v":1,"id":"status_1","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":null,"build_date_utc":null,"endpoint_path":"/tmp/agent.sock","package_version":"0.2.0","uptime_ms":0,"workspace_id":"work-1"},"model":{"key_present":false,"provider_kind":"open_ai","requested_alias":"gpt-5","served_model":null},"session":{"core_event_count":0,"human_turn_count":0,"latest_run_id":null,"ledger_path":"/state/agent.db","session_id":null},"trust":{"approval_denied_count":0,"approval_granted_count":0,"shell_session_grant":false},"usage":{"last_run":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0},"session":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0}}}}"#,
+                r#"{"v":2,"id":"status_1","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":null,"build_date_utc":null,"endpoint_path":"/tmp/agent.sock","package_version":"0.2.0","uptime_ms":0,"workspace_id":"work-1"},"model":{"key_present":false,"provider_kind":"open_ai","requested_alias":"gpt-5","served_model":null},"session":{"core_event_count":0,"human_turn_count":0,"latest_run_id":null,"ledger_path":"/state/agent.db","session_id":null},"trust":{"approval_denied_count":0,"approval_granted_count":0,"shell_session_grant":false},"usage":{"last_run":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0},"session":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0}}}}"#,
             ),
             (
                 ProtocolMethod::SessionApprovalProfileSet,
-                r#"{"v":1,"id":"profile_1","kind":"response","method":"session.approval_profile.set","result":{"profile":"yolo","session_id":"session-1"}}"#,
+                r#"{"v":2,"id":"profile_1","kind":"response","method":"session.approval_profile.set","result":{"profile":"yolo","session_id":"session-1"}}"#,
             ),
             (
                 ProtocolMethod::DaemonShutdownIfIdle,
-                r#"{"v":1,"id":"shutdown_1","kind":"response","method":"daemon.shutdown_if_idle","result":{"result":"shutdown"}}"#,
+                r#"{"v":2,"id":"shutdown_1","kind":"response","method":"daemon.shutdown_if_idle","result":{"result":"shutdown"}}"#,
             ),
             (
                 ProtocolMethod::ThreadSpawn,
-                r#"{"v":1,"id":"spawn_1","kind":"response","method":"thread.spawn","result":{"actor":"terminal","reason":"denied","spawn_id":"spawn-1","status":"denied","thread_id":"thread-1"}}"#,
+                r#"{"v":2,"id":"spawn_1","kind":"response","method":"thread.spawn","result":{"actor":"terminal","reason":"denied","spawn_id":"spawn-1","status":"denied","thread_id":"thread-1"}}"#,
             ),
             (
                 ProtocolMethod::ThreadList,
-                r#"{"v":1,"id":"threads_1","kind":"response","method":"thread.list","result":{"threads":[]}}"#,
+                r#"{"v":2,"id":"threads_1","kind":"response","method":"thread.list","result":{"threads":[]}}"#,
             ),
             (
                 ProtocolMethod::ThreadStatus,
-                r#"{"v":1,"id":"thread_status_1","kind":"response","method":"thread.status","result":{"thread":{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/work","model":"gpt-5","parent_thread_id":null,"reasoning_effort":"high","spawning_actor":"terminal","thread_id":"thread-1"},"live":{"current_turn_id":null,"loaded":false}}}}"#,
+                r#"{"v":2,"id":"thread_status_1","kind":"response","method":"thread.status","result":{"thread":{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/work","home_thread_id":"thread-home","model":"gpt-5","parent_thread_id":null,"profile_id":"profile-1","profile_revision":1,"reasoning_effort":"high","spawning_actor":"terminal","thread_id":"thread-home","thread_kind":"home"},"live":{"current_turn_id":null,"live_epoch_id":"epoch-1","loaded":false},"return_availability":{"child_returns":0,"parent_answers":0}}}}"#,
             ),
             (
                 ProtocolMethod::ThreadAuthority,
-                r#"{"v":1,"id":"authority_1","kind":"response","method":"thread.authority","result":{"authority":{"agent_id":"plato","approval_policy":"prompt","created_at_ms":42,"granted_paths":[{"path":"/work","writable":true}],"model":"gpt-5","network":false,"parent_thread_id":null,"reasoning_effort":"high","spawning_actor":"terminal","thread_id":"thread-1","toolset":["file.read"],"worktrees":[]}}}"#,
+                r#"{"v":2,"id":"authority_1","kind":"response","method":"thread.authority","result":{"authority":{"agent_id":"plato","approval_policy":"prompt","created_at_ms":42,"granted_paths":[{"path":"/work","writable":true}],"model":"gpt-5","network":false,"parent_thread_id":null,"reasoning_effort":"high","spawning_actor":"terminal","thread_id":"thread-1","toolset":["file.read"],"worktrees":[]}}}"#,
             ),
             (
                 ProtocolMethod::ThreadSend,
-                r#"{"v":1,"id":"send_1","kind":"response","method":"thread.send","result":{"status":"started","thread_id":"thread-1","turn_id":"turn-1"}}"#,
+                r#"{"v":2,"id":"send_1","kind":"response","method":"thread.send","result":{"status":"started","thread_id":"thread-1","turn_id":"turn-1"}}"#,
             ),
             (
                 ProtocolMethod::ThreadEvents,
-                r#"{"v":1,"id":"thread_events_1","kind":"response","method":"thread.events","result":{"current_turn_id":null,"events":[],"from_offset":0,"next_offset":0,"thread_id":"thread-1"}}"#,
+                r#"{"v":2,"id":"thread_events_1","kind":"response","method":"thread.events","result":{"current_turn_id":null,"events":[],"from_offset":0,"next_offset":0,"thread_id":"thread-1"}}"#,
             ),
             (
                 ProtocolMethod::ThreadStop,
-                r#"{"v":1,"id":"stop_1","kind":"response","method":"thread.stop","result":{"status":"stopped","stopped_at_ms":43,"stopped_turn_id":null,"thread_id":"thread-1"}}"#,
+                r#"{"v":2,"id":"stop_1","kind":"response","method":"thread.stop","result":{"status":"stopped","stopped_at_ms":43,"stopped_turn_id":null,"thread_id":"thread-1"}}"#,
             ),
             (
                 ProtocolMethod::ProfileOpen,
-                r#"{"v":1,"id":"profile_open_1","kind":"response","method":"profile.open","result":{"profile_id":"profile-1","status":"no_home"}}"#,
+                r#"{"v":2,"id":"profile_open_1","kind":"response","method":"profile.open","result":{"profile_id":"profile-1","status":"no_home"}}"#,
             ),
             (
                 ProtocolMethod::WorkspaceCreate,
-                r#"{"v":1,"id":"workspace_create_1","kind":"response","method":"workspace.create","result":{"workspace":{"created_at_ms":41,"health":"present","id":"workspace-1","ledger_path":"/state/agent.db","name":"alpha","root":"/work"}}}"#,
+                r#"{"v":2,"id":"workspace_create_1","kind":"response","method":"workspace.create","result":{"workspace":{"created_at_ms":41,"health":"present","id":"workspace-1","ledger_path":"/state/agent.db","name":"alpha","root":"/work"}}}"#,
             ),
             (
                 ProtocolMethod::WorkspaceList,
-                r#"{"v":1,"id":"workspace_list_1","kind":"response","method":"workspace.list","result":{"workspaces":[]}}"#,
+                r#"{"v":2,"id":"workspace_list_1","kind":"response","method":"workspace.list","result":{"workspaces":[]}}"#,
             ),
             (
                 ProtocolMethod::WorkspaceStatus,
-                r#"{"v":1,"id":"workspace_status_1","kind":"response","method":"workspace.status","result":{"workspace":{"created_at_ms":41,"health":"present","id":"workspace-1","ledger_path":"/state/agent.db","name":"alpha","root":"/work"}}}"#,
+                r#"{"v":2,"id":"workspace_status_1","kind":"response","method":"workspace.status","result":{"workspace":{"created_at_ms":41,"health":"present","id":"workspace-1","ledger_path":"/state/agent.db","name":"alpha","root":"/work"}}}"#,
             ),
             (
-                ProtocolMethod::AgentCreate,
-                r#"{"v":1,"id":"agent_create_1","kind":"response","method":"agent.create","result":{"agent":{"approval_policy":"prompt","created_at_ms":42,"id":"builder","model":"gpt-5","reasoning_effort":"high","toolset":["file.read"],"workspace_id":"workspace-1"}}}"#,
+                ProtocolMethod::ProfileCreate,
+                r#"{"v":2,"id":"profile_create_1","kind":"response","method":"profile.create","result":{"status":{"profile":{"approval_policy":"prompt","created_at_ms":42,"current_revision":1,"display_name":"builder","home_thread_id":null,"id":"profile-builder","model":"gpt-5","reasoning_effort":"high","toolset":["file.read"],"workspace_health":"present","workspace_id":"workspace-1"},"revision":{"actor":"host_operator","content":{"instructions_markdown":"","memory_markdown":"","skill_refs":[]},"content_hash":"hash","created_at_ms":42,"parent_revision":null,"revision":1}}}}"#,
             ),
             (
-                ProtocolMethod::AgentList,
-                r#"{"v":1,"id":"agent_list_1","kind":"response","method":"agent.list","result":{"agents":[]}}"#,
+                ProtocolMethod::ProfileList,
+                r#"{"v":2,"id":"profile_list_1","kind":"response","method":"profile.list","result":{"profiles":[],"truncated":false}}"#,
             ),
             (
-                ProtocolMethod::AgentStatus,
-                r#"{"v":1,"id":"agent_status_1","kind":"response","method":"agent.status","result":{"agent":{"approval_policy":"prompt","created_at_ms":42,"id":"builder","model":"gpt-5","reasoning_effort":"high","toolset":["file.read"],"workspace_id":"workspace-1"}}}"#,
+                ProtocolMethod::ProfileStatus,
+                r#"{"v":2,"id":"profile_status_1","kind":"response","method":"profile.status","result":{"status":{"profile":{"approval_policy":"prompt","created_at_ms":42,"current_revision":1,"display_name":"builder","home_thread_id":null,"id":"profile-builder","model":"gpt-5","reasoning_effort":"high","toolset":["file.read"],"workspace_health":"present","workspace_id":"workspace-1"},"revision":{"actor":"host_operator","content":{"instructions_markdown":"","memory_markdown":"","skill_refs":[]},"content_hash":"hash","created_at_ms":42,"parent_revision":null,"revision":1}}}}"#,
+            ),
+            (
+                ProtocolMethod::ProfileUpdate,
+                r#"{"v":2,"id":"profile_update_1","kind":"response","method":"profile.update","result":{"status":{"profile":{"approval_policy":"prompt","created_at_ms":42,"current_revision":2,"display_name":"builder","home_thread_id":null,"id":"profile-builder","model":"gpt-5","reasoning_effort":"high","toolset":["file.read"],"workspace_health":"present","workspace_id":"workspace-1"},"revision":{"actor":"host_operator","content":{"instructions_markdown":"build","memory_markdown":"","skill_refs":[]},"content_hash":"hash-2","created_at_ms":43,"parent_revision":1,"revision":2}}}}"#,
             ),
         ];
 
-        assert_eq!(REQUESTS.len(), 28);
+        assert_eq!(REQUESTS.len(), 29);
         assert_eq!(RESPONSES.len(), REQUESTS.len());
         for ((request_method, request_fixture), (response_method, response_fixture)) in
             REQUESTS.iter().zip(RESPONSES)
@@ -3692,23 +3871,23 @@ mod tests {
     #[test]
     fn unknown_methods_and_unknown_params_fail_at_the_envelope_boundary() {
         let unknown_method =
-            r#"{"v":1,"id":"future_1","kind":"request","method":"future.run","params":{}}"#;
+            r#"{"v":2,"id":"future_1","kind":"request","method":"future.run","params":{}}"#;
         assert!(serde_json::from_str::<Envelope>(unknown_method).is_err());
         let error = decode_request(unknown_method).unwrap_err();
         assert_eq!(error.error.unwrap().code, ERROR_MALFORMED_REQUEST);
 
-        let unknown_param = r#"{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"future":true,"run_id":"run-1"}}"#;
+        let unknown_param = r#"{"v":2,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"future":true,"run_id":"run-1"}}"#;
         assert!(serde_json::from_str::<Envelope>(unknown_param).is_err());
         let error = decode_request(unknown_param).unwrap_err();
         assert_eq!(error.method, Some(ProtocolMethod::RunCancel));
         assert_eq!(error.error.unwrap().code, ERROR_MALFORMED_REQUEST);
 
-        let client_minted_envelope = r#"{"v":1,"id":"voice_1","kind":"request","method":"voice.events.commit","params":{"events":[{"event":"voice_spoken","run_id":"run-1","turn_id":"turn-1","ttfa_ms":1,"sentence_count":1,"interrupted_at":null,"sequence":0}],"run_id":"run-1"}}"#;
+        let client_minted_envelope = r#"{"v":2,"id":"voice_1","kind":"request","method":"voice.events.commit","params":{"events":[{"event":"voice_spoken","run_id":"run-1","turn_id":"turn-1","ttfa_ms":1,"sentence_count":1,"interrupted_at":null,"sequence":0}],"run_id":"run-1"}}"#;
         let error = decode_request(client_minted_envelope).unwrap_err();
         assert_eq!(error.method, Some(ProtocolMethod::VoiceEventsCommit));
         assert_eq!(error.error.unwrap().code, ERROR_MALFORMED_REQUEST);
 
-        let unknown_result = r#"{"v":1,"id":"voice_1","kind":"response","method":"voice.events.read","result":{"events":[],"future":true,"run_id":"run-1"}}"#;
+        let unknown_result = r#"{"v":2,"id":"voice_1","kind":"response","method":"voice.events.read","result":{"events":[],"future":true,"run_id":"run-1"}}"#;
         assert!(serde_json::from_str::<Envelope>(unknown_result).is_err());
     }
 
@@ -3731,141 +3910,46 @@ mod tests {
     }
 
     #[test]
-    fn workspace_and_agent_control_fixtures_keep_exact_v1_bytes() {
-        const WORKSPACE_CREATE_REQUEST: &str = r#"{"v":1,"id":"wc_1","kind":"request","method":"workspace.create","params":{"name":"alpha","root":"/tmp/alpha"}}"#;
-        const WORKSPACE_LIST_REQUEST: &str =
-            r#"{"v":1,"id":"wl_1","kind":"request","method":"workspace.list","params":{}}"#;
-        const WORKSPACE_STATUS_REQUEST: &str = r#"{"v":1,"id":"ws_1","kind":"request","method":"workspace.status","params":{"workspace_id":"ws-alpha"}}"#;
-        const WORKSPACE_CREATE_RESPONSE: &str = r#"{"v":1,"id":"wc_1","kind":"response","method":"workspace.create","result":{"workspace":{"created_at_ms":41,"health":"present","id":"ws-alpha","ledger_path":"/state/alpha.db","name":"alpha","root":"/tmp/alpha"}}}"#;
-        const WORKSPACE_LIST_RESPONSE: &str = r#"{"v":1,"id":"wl_1","kind":"response","method":"workspace.list","result":{"workspaces":[{"created_at_ms":41,"health":"present","id":"ws-alpha","ledger_path":"/state/alpha.db","name":"alpha","root":"/tmp/alpha"}]}}"#;
-        const WORKSPACE_STATUS_RESPONSE: &str = r#"{"v":1,"id":"ws_1","kind":"response","method":"workspace.status","result":{"workspace":{"created_at_ms":41,"health":"present","id":"ws-alpha","ledger_path":"/state/alpha.db","name":"alpha","root":"/tmp/alpha"}}}"#;
-        const AGENT_CREATE_REQUEST: &str = r#"{"v":1,"id":"ac_1","kind":"request","method":"agent.create","params":{"agent_id":"builder","approval_policy":"prompt","model":"gpt-5.6-sol","reasoning_effort":"xhigh","toolset":["file.read","file.write"],"workspace_id":"ws-alpha"}}"#;
-        const AGENT_LIST_REQUEST: &str =
-            r#"{"v":1,"id":"al_1","kind":"request","method":"agent.list","params":{}}"#;
-        const AGENT_STATUS_REQUEST: &str = r#"{"v":1,"id":"as_1","kind":"request","method":"agent.status","params":{"agent_id":"builder"}}"#;
-        const AGENT_CREATE_RESPONSE: &str = r#"{"v":1,"id":"ac_1","kind":"response","method":"agent.create","result":{"agent":{"approval_policy":"prompt","created_at_ms":42,"id":"builder","model":"gpt-5.6-sol","reasoning_effort":"xhigh","toolset":["file.read","file.write"],"workspace_id":"ws-alpha"}}}"#;
-        const AGENT_LIST_RESPONSE: &str = r#"{"v":1,"id":"al_1","kind":"response","method":"agent.list","result":{"agents":[{"approval_policy":"prompt","created_at_ms":42,"id":"builder","model":"gpt-5.6-sol","reasoning_effort":"xhigh","toolset":["file.read","file.write"],"workspace_id":"ws-alpha"}]}}"#;
-        const AGENT_STATUS_RESPONSE: &str = r#"{"v":1,"id":"as_1","kind":"response","method":"agent.status","result":{"agent":{"approval_policy":"prompt","created_at_ms":42,"id":"builder","model":"gpt-5.6-sol","reasoning_effort":"xhigh","toolset":["file.read","file.write"],"workspace_id":"ws-alpha"}}}"#;
-
-        for fixture in [
-            WORKSPACE_CREATE_REQUEST,
-            WORKSPACE_LIST_REQUEST,
-            WORKSPACE_STATUS_REQUEST,
-            AGENT_CREATE_REQUEST,
-            AGENT_LIST_REQUEST,
-            AGENT_STATUS_REQUEST,
-        ] {
-            let request = decode_request(fixture).unwrap();
-            match request.params.as_ref().unwrap() {
-                ProtocolRequest::WorkspaceCreate(_)
-                | ProtocolRequest::WorkspaceList(_)
-                | ProtocolRequest::WorkspaceStatus(_)
-                | ProtocolRequest::AgentCreate(_)
-                | ProtocolRequest::AgentList(_)
-                | ProtocolRequest::AgentStatus(_) => {}
-                request => panic!("unexpected control request: {request:?}"),
-            }
-            assert_eq!(serde_json::to_string(&request).unwrap(), fixture);
-        }
-
-        let workspace = WorkspaceSummary {
-            id: "ws-alpha".into(),
-            name: "alpha".into(),
-            root: "/tmp/alpha".into(),
-            ledger_path: "/state/alpha.db".into(),
-            created_at_ms: 41,
-            health: WorkspaceHealthName::Present,
-        };
-        let agent = AgentSummary {
-            id: AgentId::new("builder").unwrap(),
-            workspace_id: "ws-alpha".into(),
-            model: "gpt-5.6-sol".into(),
-            reasoning_effort: ReasoningEffort::Xhigh,
-            approval_policy: ThreadApprovalPolicy::Prompt,
-            toolset: vec!["file.read".into(), "file.write".into()],
-            created_at_ms: 42,
-        };
-        let responses = [
-            (
-                Envelope::response_from(
-                    Some("wc_1".into()),
-                    Some("workspace.create".into()),
-                    WorkspaceCreateResult {
-                        workspace: workspace.clone(),
-                    },
-                ),
-                WORKSPACE_CREATE_RESPONSE,
-            ),
-            (
-                Envelope::response_from(
-                    Some("wl_1".into()),
-                    Some("workspace.list".into()),
-                    WorkspaceListResult {
-                        workspaces: vec![workspace.clone()],
-                    },
-                ),
-                WORKSPACE_LIST_RESPONSE,
-            ),
-            (
-                Envelope::response_from(
-                    Some("ws_1".into()),
-                    Some("workspace.status".into()),
-                    WorkspaceStatusResult { workspace },
-                ),
-                WORKSPACE_STATUS_RESPONSE,
-            ),
-            (
-                Envelope::response_from(
-                    Some("ac_1".into()),
-                    Some("agent.create".into()),
-                    AgentCreateResult {
-                        agent: agent.clone(),
-                    },
-                ),
-                AGENT_CREATE_RESPONSE,
-            ),
-            (
-                Envelope::response_from(
-                    Some("al_1".into()),
-                    Some("agent.list".into()),
-                    AgentListResult {
-                        agents: vec![agent.clone()],
-                    },
-                ),
-                AGENT_LIST_RESPONSE,
-            ),
-            (
-                Envelope::response_from(
-                    Some("as_1".into()),
-                    Some("agent.status".into()),
-                    AgentStatusResult { agent },
-                ),
-                AGENT_STATUS_RESPONSE,
-            ),
+    fn profile_control_fixtures_keep_exact_v2_bytes() {
+        let fixtures = [
+            r#"{"v":2,"id":"create","kind":"request","method":"profile.create","params":{"approval_policy":"prompt","content":{"instructions_markdown":"","memory_markdown":"","skill_refs":[]},"display_name":"builder","model":"gpt-5.6-sol","reasoning_effort":"xhigh","toolset":["file.read"],"workspace_id":"ws-alpha"}}"#,
+            r#"{"v":2,"id":"list","kind":"request","method":"profile.list","params":{"limit":10,"workspace_id":"ws-alpha"}}"#,
+            r#"{"v":2,"id":"status","kind":"request","method":"profile.status","params":{"profile_id":"profile-builder"}}"#,
+            r#"{"v":2,"id":"update","kind":"request","method":"profile.update","params":{"approval_policy":"yolo","content":{"instructions_markdown":"Build it.","memory_markdown":"Remember it.","skill_refs":["skill:rust"]},"model":"gpt-5.6-sol","profile_id":"profile-builder","reasoning_effort":"high","toolset":["file.read"]}}"#,
         ];
-        for (response, fixture) in responses {
-            assert_eq!(serde_json::to_string(&response).unwrap(), fixture);
+        for fixture in fixtures {
+            let request = decode_request(fixture).unwrap();
+            assert!(matches!(
+                request.params,
+                Some(
+                    ProtocolRequest::ProfileCreate(_)
+                        | ProtocolRequest::ProfileList(_)
+                        | ProtocolRequest::ProfileStatus(_)
+                        | ProtocolRequest::ProfileUpdate(_)
+                )
+            ));
+            assert_eq!(serde_json::to_string(&request).unwrap(), fixture);
         }
     }
 
     #[test]
-    fn thread_management_fixtures_keep_exact_v1_bytes() {
-        const SPAWN_START_REQUEST: &str = r#"{"v":1,"id":"spawn_start_1","kind":"request","method":"thread.spawn","params":{"action":"start","approval_policy":"prompt","cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh"}}"#;
-        const SPAWN_DECIDE_REQUEST: &str = r#"{"v":1,"id":"spawn_decide_1","kind":"request","method":"thread.spawn","params":{"action":"decide","approval":{"actor":"stdin","decision":"grant"},"spawn_id":"spawn_1"}}"#;
-        const SPAWN_REQUIRED_RESPONSE: &str = r#"{"v":1,"id":"spawn_start_1","kind":"response","method":"thread.spawn","result":{"effect":"workspace_write","reason":"thread.spawn requires approval","spawn_id":"spawn_1","status":"approval_required","thread_id":"thread_1"}}"#;
-        const STATUS_RESPONSE: &str = r#"{"v":1,"id":"status_1","kind":"response","method":"thread.status","result":{"thread":{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","profile_id":"profile_builder","profile_revision":1,"reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1","thread_kind":"child"},"live":{"current_turn_id":null,"last_activity_at_ms":47,"live_epoch_id":"live_epoch_1","loaded":true}}}}"#;
-        const LIST_RESPONSE: &str = r#"{"v":1,"id":"list_1","kind":"response","method":"thread.list","result":{"threads":[{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","profile_id":"profile_builder","profile_revision":1,"reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1","thread_kind":"child"},"live":{"current_turn_id":null,"live_epoch_id":"live_epoch_1","loaded":false}}]}}"#;
-        const AUTHORITY_REQUEST: &str = r#"{"v":1,"id":"authority_1","kind":"request","method":"thread.authority","params":{"thread_id":"thread_1"}}"#;
-        const AUTHORITY_RESPONSE: &str = r#"{"v":1,"id":"authority_1","kind":"response","method":"thread.authority","result":{"authority":{"agent_id":null,"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","granted_paths":[{"path":"/tmp/work","writable":true}],"model":"gpt-5.6-sol","network":false,"parent_thread_id":"thread_parent","profile_id":"profile_builder","profile_revision":1,"reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1","thread_kind":"child","toolset":["file.read","file.write"],"worktrees":[]}}}"#;
-        const SEND_START_REQUEST: &str = r#"{"v":1,"id":"send_1","kind":"request","method":"thread.send","params":{"controller_id":"terminal_a","message":"inspect it","thread_id":"thread_1"}}"#;
-        const SEND_STEER_REQUEST: &str = r#"{"v":1,"id":"send_2","kind":"request","method":"thread.send","params":{"controller_id":"terminal_a","message":"also summarize","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
-        const SEND_STARTED_RESPONSE: &str = r#"{"v":1,"id":"send_1","kind":"response","method":"thread.send","result":{"status":"started","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
-        const SEND_STEERED_RESPONSE: &str = r#"{"v":1,"id":"send_2","kind":"response","method":"thread.send","result":{"status":"steered","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
-        const SEND_REJECTED_RESPONSE: &str = r#"{"v":1,"id":"send_3","kind":"response","method":"thread.send","result":{"reason":"controller_owned","status":"rejected","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
-        const EVENTS_REQUEST: &str = r#"{"v":1,"id":"events_1","kind":"request","method":"thread.events","params":{"from_offset":0,"limit":128,"thread_id":"thread_1","wait_ms":1000}}"#;
-        const EVENTS_RESPONSE: &str = r#"{"v":1,"id":"events_1","kind":"response","method":"thread.events","result":{"current_turn_id":"thread_turn_1","events":[],"from_offset":0,"live_epoch_id":"live_epoch_1","next_offset":0,"thread_id":"thread_1"}}"#;
-        const STOP_REQUEST: &str = r#"{"v":1,"id":"stop_1","kind":"request","method":"thread.stop","params":{"actor":"stdin","thread_id":"thread_1"}}"#;
-        const STOP_RESPONSE: &str = r#"{"v":1,"id":"stop_1","kind":"response","method":"thread.stop","result":{"status":"stopped","stopped_at_ms":52,"stopped_turn_id":"turn_1","thread_id":"thread_1"}}"#;
+    fn thread_management_fixtures_keep_exact_v2_bytes() {
+        const SPAWN_START_REQUEST: &str = r#"{"v":2,"id":"spawn_start_1","kind":"request","method":"thread.spawn","params":{"action":"start","approval_policy":"prompt","cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh"}}"#;
+        const SPAWN_DECIDE_REQUEST: &str = r#"{"v":2,"id":"spawn_decide_1","kind":"request","method":"thread.spawn","params":{"action":"decide","approval":{"actor":"stdin","decision":"grant"},"spawn_id":"spawn_1"}}"#;
+        const SPAWN_REQUIRED_RESPONSE: &str = r#"{"v":2,"id":"spawn_start_1","kind":"response","method":"thread.spawn","result":{"effect":"workspace_write","reason":"thread.spawn requires approval","spawn_id":"spawn_1","status":"approval_required","thread_id":"thread_1"}}"#;
+        const STATUS_RESPONSE: &str = r#"{"v":2,"id":"status_1","kind":"response","method":"thread.status","result":{"thread":{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","home_thread_id":"thread_home","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","profile_id":"profile_builder","profile_revision":1,"reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1","thread_kind":"child"},"live":{"current_turn_id":null,"last_activity_at_ms":47,"live_epoch_id":"live_epoch_1","loaded":true},"return_availability":{"child_returns":2,"parent_answers":1}}}}"#;
+        const LIST_RESPONSE: &str = r#"{"v":2,"id":"list_1","kind":"response","method":"thread.list","result":{"threads":[{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","home_thread_id":"thread_home","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","profile_id":"profile_builder","profile_revision":1,"reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1","thread_kind":"child"},"live":{"current_turn_id":null,"live_epoch_id":"live_epoch_1","loaded":false},"return_availability":{"child_returns":2,"parent_answers":1}}]}}"#;
+        const AUTHORITY_REQUEST: &str = r#"{"v":2,"id":"authority_1","kind":"request","method":"thread.authority","params":{"thread_id":"thread_1"}}"#;
+        const AUTHORITY_RESPONSE: &str = r#"{"v":2,"id":"authority_1","kind":"response","method":"thread.authority","result":{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","granted_paths":[{"path":"/tmp/work","writable":true}],"model":"gpt-5.6-sol","network":false,"parent_thread_id":"thread_parent","profile_id":"profile_builder","profile_revision":1,"reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1","thread_kind":"child","toolset":["file.read","file.write"],"worktrees":[]}}}"#;
+        const SEND_START_REQUEST: &str = r#"{"v":2,"id":"send_1","kind":"request","method":"thread.send","params":{"controller_id":"terminal_a","message":"inspect it","thread_id":"thread_1"}}"#;
+        const SEND_STEER_REQUEST: &str = r#"{"v":2,"id":"send_2","kind":"request","method":"thread.send","params":{"controller_id":"terminal_a","message":"also summarize","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
+        const SEND_STARTED_RESPONSE: &str = r#"{"v":2,"id":"send_1","kind":"response","method":"thread.send","result":{"status":"started","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
+        const SEND_STEERED_RESPONSE: &str = r#"{"v":2,"id":"send_2","kind":"response","method":"thread.send","result":{"status":"steered","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
+        const SEND_REJECTED_RESPONSE: &str = r#"{"v":2,"id":"send_3","kind":"response","method":"thread.send","result":{"reason":"controller_owned","status":"rejected","thread_id":"thread_1","turn_id":"thread_turn_1"}}"#;
+        const EVENTS_REQUEST: &str = r#"{"v":2,"id":"events_1","kind":"request","method":"thread.events","params":{"from_offset":0,"limit":128,"thread_id":"thread_1","wait_ms":1000}}"#;
+        const EVENTS_RESPONSE: &str = r#"{"v":2,"id":"events_1","kind":"response","method":"thread.events","result":{"current_turn_id":"thread_turn_1","events":[],"from_offset":0,"live_epoch_id":"live_epoch_1","next_offset":0,"thread_id":"thread_1"}}"#;
+        const STOP_REQUEST: &str = r#"{"v":2,"id":"stop_1","kind":"request","method":"thread.stop","params":{"actor":"stdin","thread_id":"thread_1"}}"#;
+        const STOP_RESPONSE: &str = r#"{"v":2,"id":"stop_1","kind":"response","method":"thread.stop","result":{"status":"stopped","stopped_at_ms":52,"stopped_turn_id":"turn_1","thread_id":"thread_1"}}"#;
 
         for fixture in [SPAWN_START_REQUEST, SPAWN_DECIDE_REQUEST] {
             let request = decode_request(fixture).unwrap();
@@ -3929,6 +4013,7 @@ mod tests {
                 profile_id: Some(ProfileId::new("profile_builder").unwrap()),
                 profile_revision: Some(1),
                 thread_kind: ThreadKind::Child,
+                home_thread_id: Some("thread_home".into()),
                 cwd: "/tmp/work".into(),
                 model: "gpt-5.6-sol".into(),
                 reasoning_effort: ReasoningEffort::Xhigh,
@@ -3940,6 +4025,10 @@ mod tests {
                 loaded: true,
                 current_turn_id: None,
                 last_activity_at_ms: Some(47),
+            },
+            return_availability: ThreadReturnAvailability {
+                child_returns: 2,
+                parent_answers: 1,
             },
         };
         let legacy = serde_json::from_str::<ThreadAuthorityRecord>(
@@ -4075,106 +4164,6 @@ mod tests {
     }
 
     #[test]
-    fn base_v1_thread_list_and_status_decode_new_server_legacy_bytes() {
-        const STATUS_RESPONSE: &str = r#"{"v":1,"id":"status_1","kind":"response","method":"thread.status","result":{"thread":{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1"},"live":{"current_turn_id":null,"last_activity_at_ms":47,"loaded":true}}}}"#;
-        const LIST_RESPONSE: &str = r#"{"v":1,"id":"list_1","kind":"response","method":"thread.list","result":{"threads":[{"authority":{"approval_policy":"prompt","created_at_ms":42,"cwd":"/tmp/work","model":"gpt-5.6-sol","parent_thread_id":"thread_parent","reasoning_effort":"xhigh","spawning_actor":"stdin","thread_id":"thread_1"},"live":{"current_turn_id":null,"loaded":false}}]}}"#;
-
-        #[derive(Debug, Eq, PartialEq, Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct BaseV1Authority {
-            thread_id: String,
-            parent_thread_id: Option<String>,
-            spawning_actor: String,
-            cwd: String,
-            model: String,
-            reasoning_effort: ReasoningEffort,
-            approval_policy: ThreadApprovalPolicy,
-            created_at_ms: u64,
-        }
-
-        #[derive(Debug, Eq, PartialEq, Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct BaseV1LiveState {
-            loaded: bool,
-            current_turn_id: Option<String>,
-            #[serde(default)]
-            last_activity_at_ms: Option<u64>,
-        }
-
-        #[derive(Debug, Eq, PartialEq, Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct BaseV1ThreadStatus {
-            authority: BaseV1Authority,
-            live: BaseV1LiveState,
-        }
-
-        #[derive(Debug, Eq, PartialEq, Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct BaseV1ListResult {
-            threads: Vec<BaseV1ThreadStatus>,
-        }
-
-        #[derive(Debug, Eq, PartialEq, Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct BaseV1StatusResult {
-            thread: BaseV1ThreadStatus,
-        }
-
-        fn authority() -> BaseV1Authority {
-            BaseV1Authority {
-                thread_id: "thread_1".into(),
-                parent_thread_id: Some("thread_parent".into()),
-                spawning_actor: "stdin".into(),
-                cwd: "/tmp/work".into(),
-                model: "gpt-5.6-sol".into(),
-                reasoning_effort: ReasoningEffort::Xhigh,
-                approval_policy: ThreadApprovalPolicy::Prompt,
-                created_at_ms: 42,
-            }
-        }
-
-        let status_envelope: Envelope = serde_json::from_str(STATUS_RESPONSE).unwrap();
-        let Some(ProtocolResponse::ThreadStatus(status)) = status_envelope.result else {
-            panic!("expected thread.status response")
-        };
-        let status: BaseV1StatusResult =
-            serde_json::from_value(serde_json::to_value(status).unwrap()).unwrap();
-        assert_eq!(
-            status,
-            BaseV1StatusResult {
-                thread: BaseV1ThreadStatus {
-                    authority: authority(),
-                    live: BaseV1LiveState {
-                        loaded: true,
-                        current_turn_id: None,
-                        last_activity_at_ms: Some(47),
-                    },
-                },
-            }
-        );
-
-        let list_envelope: Envelope = serde_json::from_str(LIST_RESPONSE).unwrap();
-        let Some(ProtocolResponse::ThreadList(list)) = list_envelope.result else {
-            panic!("expected thread.list response")
-        };
-        let list: BaseV1ListResult =
-            serde_json::from_value(serde_json::to_value(list).unwrap()).unwrap();
-        assert_eq!(
-            list,
-            BaseV1ListResult {
-                threads: vec![BaseV1ThreadStatus {
-                    authority: authority(),
-                    live: BaseV1LiveState {
-                        loaded: false,
-                        current_turn_id: None,
-                        last_activity_at_ms: None,
-                    },
-                }],
-            }
-        );
-    }
-
-    #[test]
     fn thread_request_dtos_reject_unknown_fields() {
         for value in [
             json!({
@@ -4223,9 +4212,9 @@ mod tests {
     }
 
     #[test]
-    fn request_and_error_envelopes_keep_exact_v1_bytes() {
-        const RUN_CANCEL_REQUEST: &str = r#"{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"run_id":"run_1"}}"#;
-        const RUN_FAILED_RESPONSE: &str = r#"{"v":1,"id":"run_1","kind":"error","method":"run.start","error":{"code":"run_failed","message":"synthetic failure"}}"#;
+    fn request_and_error_envelopes_keep_exact_v2_bytes() {
+        const RUN_CANCEL_REQUEST: &str = r#"{"v":2,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"run_id":"run_1"}}"#;
+        const RUN_FAILED_RESPONSE: &str = r#"{"v":2,"id":"run_1","kind":"error","method":"run.start","error":{"code":"run_failed","message":"synthetic failure"}}"#;
 
         let request = decode_request(RUN_CANCEL_REQUEST).unwrap();
         assert_eq!(serde_json::to_string(&request).unwrap(), RUN_CANCEL_REQUEST);
@@ -4243,10 +4232,10 @@ mod tests {
     }
 
     #[test]
-    fn daemon_status_known_and_unknown_fixtures_keep_exact_v1_bytes() {
-        const STATUS_REQUEST: &str = r#"{"v":1,"id":"status_1","kind":"request","method":"daemon.status","params":{"config_path":"config/plato.toml","session_id":"session_1"}}"#;
-        const STATUS_KNOWN_RESPONSE: &str = r#"{"v":1,"id":"status_1","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":"0123456789abcdef0123456789abcdef01234567","build_date_utc":"2026-08-01","endpoint_path":"/tmp/agent.sock","package_version":"0.1.0","uptime_ms":42,"workspace_id":"work-1234"},"model":{"key_present":true,"provider_kind":"open_router","requested_alias":"~openai/gpt-latest","served_model":"openai/gpt-5.5-2026-08-01"},"session":{"core_event_count":17,"human_turn_count":2,"latest_run_id":"run_2","ledger_path":"/tmp/agent.db","session_id":"session_1"},"trust":{"approval_denied_count":1,"approval_granted_count":2,"shell_session_grant":true},"usage":{"last_run":{"input_tokens":7,"output_tokens":3,"unknown_response_count":1},"session":{"input_tokens":17,"output_tokens":8,"unknown_response_count":2}}}}"#;
-        const STATUS_UNKNOWN_RESPONSE: &str = r#"{"v":1,"id":"status_2","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":null,"build_date_utc":null,"endpoint_path":"/tmp/agent.sock","package_version":"0.1.0","uptime_ms":0,"workspace_id":"work-1234"},"model":{"key_present":false,"provider_kind":"open_ai","requested_alias":"gpt-5.5","served_model":null},"session":{"core_event_count":0,"human_turn_count":0,"latest_run_id":null,"ledger_path":"/tmp/agent.db","session_id":null},"trust":{"approval_denied_count":0,"approval_granted_count":0,"shell_session_grant":false},"usage":{"last_run":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0},"session":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0}}}}"#;
+    fn daemon_status_known_and_unknown_fixtures_keep_exact_v2_bytes() {
+        const STATUS_REQUEST: &str = r#"{"v":2,"id":"status_1","kind":"request","method":"daemon.status","params":{"config_path":"config/plato.toml","session_id":"session_1"}}"#;
+        const STATUS_KNOWN_RESPONSE: &str = r#"{"v":2,"id":"status_1","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":"0123456789abcdef0123456789abcdef01234567","build_date_utc":"2026-08-01","endpoint_path":"/tmp/agent.sock","package_version":"0.1.0","uptime_ms":42,"workspace_id":"work-1234"},"model":{"key_present":true,"provider_kind":"open_router","requested_alias":"~openai/gpt-latest","served_model":"openai/gpt-5.5-2026-08-01"},"session":{"core_event_count":17,"human_turn_count":2,"latest_run_id":"run_2","ledger_path":"/tmp/agent.db","session_id":"session_1"},"trust":{"approval_denied_count":1,"approval_granted_count":2,"shell_session_grant":true},"usage":{"last_run":{"input_tokens":7,"output_tokens":3,"unknown_response_count":1},"session":{"input_tokens":17,"output_tokens":8,"unknown_response_count":2}}}}"#;
+        const STATUS_UNKNOWN_RESPONSE: &str = r#"{"v":2,"id":"status_2","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":null,"build_date_utc":null,"endpoint_path":"/tmp/agent.sock","package_version":"0.1.0","uptime_ms":0,"workspace_id":"work-1234"},"model":{"key_present":false,"provider_kind":"open_ai","requested_alias":"gpt-5.5","served_model":null},"session":{"core_event_count":0,"human_turn_count":0,"latest_run_id":null,"ledger_path":"/tmp/agent.db","session_id":null},"trust":{"approval_denied_count":0,"approval_granted_count":0,"shell_session_grant":false},"usage":{"last_run":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0},"session":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0}}}}"#;
 
         let request = decode_request(STATUS_REQUEST).unwrap();
         let Some(ProtocolRequest::DaemonStatus(params)) = request.params.as_ref() else {
@@ -4677,7 +4666,7 @@ mod tests {
     #[test]
     fn decodes_request_envelope() {
         let envelope = decode_request(
-            r#"{"v":1,"id":"req_1","kind":"request","method":"hello","params":{"workspace_root":"/tmp/work","workspace_id":"work-1234"}}"#,
+            r#"{"v":2,"id":"req_1","kind":"request","method":"hello","params":{"workspace_root":"/tmp/work","workspace_id":"work-1234"}}"#,
         )
         .unwrap();
 
@@ -4686,13 +4675,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_version_with_typed_error() {
-        let error =
-            decode_request(r#"{"v":2,"id":"req_1","kind":"request","method":"hello","params":{}}"#)
-                .unwrap_err();
+    fn v1_and_v2_reject_each_other_before_method_dispatch() {
+        let v1_to_v2 = decode_request(
+            r#"{"v":1,"id":"legacy","kind":"request","method":"agent.create","params":{}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            serde_json::to_string(&v1_to_v2).unwrap(),
+            r#"{"v":2,"id":"legacy","kind":"error","error":{"code":"unsupported_version","message":"unsupported protocol version: 1"}}"#
+        );
 
-        assert_eq!(error.kind, EnvelopeKind::Error);
-        assert_eq!(error.error.unwrap().code, ERROR_UNSUPPORTED_VERSION);
+        let v2_to_v1 = decode_request_for_version(
+            r#"{"v":2,"id":"current","kind":"request","method":"hello","params":{"workspace_id":"work","workspace_root":"/tmp/work"}}"#,
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(
+            serde_json::to_string(&v2_to_v1).unwrap(),
+            r#"{"v":1,"id":"current","kind":"error","method":"hello","error":{"code":"unsupported_version","message":"unsupported protocol version: 2"}}"#
+        );
     }
 
     #[test]
