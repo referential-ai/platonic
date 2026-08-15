@@ -1,4 +1,6 @@
-use platonic_core::{AgentId, EffectClass, ProfileId};
+#[cfg(test)]
+use platonic_core::AgentId;
+use platonic_core::{EffectClass, ProfileId};
 use platonic_protocol::{
     ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadRepositoryRequest,
 };
@@ -33,7 +35,8 @@ pub(crate) struct WorkspaceRecord {
     pub(crate) created_at_ms: u64,
 }
 
-/// One immutable configured agent profile in server-wide state.
+/// One configured profile in server-wide state.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentRecord {
     pub(crate) id: AgentId,

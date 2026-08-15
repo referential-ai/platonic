@@ -1,6 +1,6 @@
 ---
 title: First run
-description: Build exact-head commands, finish one read-only TUI task, and prove its durable record.
+description: Build exact-head commands, create a profile home, finish one read-only TUI task, and prove restart reuse.
 sidebar:
   order: 3
 ---
@@ -148,7 +148,7 @@ without exposing the key:
 `served_model` is `null` because this clean workspace has not completed a
 provider response yet.
 
-## 5. Open the TUI and approve the thread
+## 5. Create a profile and approve its home
 
 From the registered workspace, run the client with no question or subcommand:
 
@@ -156,20 +156,25 @@ From the registered workspace, run the client with no question or subcommand:
 plato
 ```
 
-Before the TUI opens, Plato Agent proposes a root thread with workspace-write
-authority. The generated thread id varies:
+On first use, Plato Agent asks for a profile name. Press `Enter` to accept the
+workspace directory name. It creates that workspace-bound profile from the
+resolved provider and tool defaults, then proposes the profile's one durable
+home with workspace-write authority. The generated profile and thread ids vary:
 
 <figure class="expected-output">
   <figcaption>
-    Stable approval prompt
-    <span>The underlined thread id is minted by the server.</span>
+    Stable first-use prompt
+    <span>The underlined ids are minted by the server.</span>
   </figcaption>
-  <pre tabindex="0"><samp>thread.spawn <var>&lt;thread-id&gt;</var> (WorkspaceWrite): thread.spawn requires approval before authority is created
-Approve thread.spawn? [y/N/c]</samp></pre>
+  <pre tabindex="0"><samp>Profile name [platonic-first-run]:
+Profile: platonic-first-run (<var>&lt;profile-id&gt;</var>)
+profile.open <var>&lt;thread-id&gt;</var> (WorkspaceWrite): profile.open requires approval before authority is created
+Approve profile home? [y/N/c]</samp></pre>
 </figure>
 
-Type `y` and press Enter. This approves creation of the durable thread; it does
-not approve every future tool call.
+Type `y` and press Enter. This approves creation of the durable home; it does
+not approve every future tool call. Plato Agent prints
+`Home: <thread-id> (created)` before entering the TUI.
 
 **Checkpoint:** the Plato Agent TUI opens with an empty transcript and the
 composer ready for input.
@@ -215,20 +220,24 @@ git status --short
 
 **Checkpoint:** `git status --short` prints nothing.
 
-## 7. Inspect status, transcript, and replay
+## 7. Inspect profile, status, transcript, and replay
 
-List the durable threads and copy the `authority.thread_id` value from the JSON
-line for the thread you just used:
+List the profile and copy its `id`, then inspect its current revision. List the
+durable threads and copy the home `authority.thread_id`:
 
 ```bash
+platonic profile list
+profile_id=<paste-profile-id>
+platonic profile status "$profile_id"
 plato thread list
 thread_id=<paste-thread-id>
 plato thread status "$thread_id"
 ```
 
-**Checkpoint:** status returns that same id and working directory under
-`authority`. After the completed task, `live.loaded` is `true` and
-`live.current_turn_id` is `null`.
+**Checkpoint:** profile status reports `home_thread_id` equal to `thread_id` and
+revision `1`. Thread status reports `"thread_kind":"home"`, that profile id,
+and the working directory under `authority`. After the completed task,
+`live.loaded` is `true` and `live.current_turn_id` is `null`.
 
 Reattach to the same live thread:
 
@@ -264,18 +273,22 @@ env -u OPENROUTER_API_KEY plato replay
 still prints the same finished run.
 
 Start `platonic serve` again from the credential terminal. In the workspace
-terminal, inspect the same records:
+terminal, inspect the same records, then reopen Plato Agent:
 
 ```bash
 platonic status --workspace "$PWD"
+platonic profile status "$profile_id"
 plato thread list
 plato replay
+plato
 ```
 
-**Checkpoint:** the workspace and completed replay survive. The old thread id
-also remains, but `live.loaded` is now `false` because live execution state
-belongs to one server process. Start bare `plato` and approve a new root thread
-for future work rather than trying to continue the unloaded authority record.
+**Checkpoint:** before `plato` starts, the same home appears with
+`live.loaded:false` because live execution state belongs to one server process.
+Plato Agent selects the existing profile without another creation or approval
+prompt, prints `Home: <thread-id> (reused)`, and attaches that same home. Submit
+`Reply with exactly: home reused.` and verify the new turn completes. This loads
+the durable home into the new server process without minting another root.
 
 ## Recover by symptom
 
@@ -284,9 +297,10 @@ for future work rather than trying to continue the unloaded authority record.
 | Looking for a 0.2.0 archive returns HTTP 404 | The release gate is still closed. Do not substitute or rename 0.1.0; build the exact-head commands in step 1 or wait for `platonic-v0.2.0`. |
 | `platonic serve` reports a missing provider key, or status shows `"key_present":false` | Stop the idle server. Load `OPENROUTER_API_KEY` in the terminal that will own `platonic serve`, verify only that it is nonempty, and restart the server. |
 | `plato` reports `workspace_unregistered` | Return to the intended Git repository and run `platonic workspace create first-run "$PWD"` once. If the name is already used, inspect `platonic workspace list` instead of creating a competing record. |
-| Thread creation reports that the directory is not a Git repository or has no usable commit | Complete the `git init`, `git add`, and initial commit commands above, then rerun bare `plato`. |
-| `thread spawn denied` appears | Rerun bare `plato`, review the proposed root authority, and type `y` only if it matches this workspace. |
-| The task fails before a final answer | Check `platonic status --workspace "$PWD"`. Confirm `provider_kind` is `open_router` and `key_present` is `true`; then retry in a new TUI thread. The failed attempt remains in the ledger. |
+| Profile creation reports that the provider key is unavailable | Load the configured key into the `platonic serve` environment, restart the idle server, and rerun bare `plato`. No incomplete profile row is retained. |
+| Home creation reports that the directory is not a Git repository or has no usable commit | Complete the `git init`, `git add`, and initial commit commands above, then rerun bare `plato`. |
+| `profile home denied` appears | Review the proposed home authority. To retry a deliberate denial, use `platonic profile open PROFILE_ID --idempotency-key NEW_KEY --approve`; do not edit server state. |
+| The task fails before a final answer | Check `platonic status --workspace "$PWD"`. Confirm `provider_kind` is `open_router` and `key_present` is `true`; then reopen the same profile home and submit a deliberate new turn. The failed attempt remains in the ledger. |
 | `plato replay` reports no sessions | Finish one task from this registered workspace first. Replay selects that workspace's latest recorded session. |
 
 Continue with the [User operations guide](../operations/) for daily operation,

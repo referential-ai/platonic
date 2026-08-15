@@ -1,22 +1,23 @@
 use super::{
     BranchClaimConflict, BranchClaimRecord,
     rows::{
-        agent_from_row, child_return_from_row, effect_to_text, invalid_thread_column,
-        parent_answer_from_row, profile_from_row, profile_revision_from_row,
-        thread_authority_from_row, thread_profile_authority_from_row,
-        thread_run_admission_from_row, tool_call_approval_from_row, workspace_from_row,
+        child_return_from_row, effect_to_text, invalid_thread_column, parent_answer_from_row,
+        profile_from_row, profile_revision_from_row, thread_authority_from_row,
+        thread_profile_authority_from_row, thread_run_admission_from_row,
+        tool_call_approval_from_row, workspace_from_row,
     },
     schema::migrate_server_schema,
     types::{
-        AgentRecord, ChildReturnDraft, ChildReturnRecord, DurableThreadAuthority,
-        HomeReservationRecord, HomeReservationState, MAX_CHILD_RETURN_PAYLOAD_BYTES,
-        MAX_UNCONSUMED_NONTERMINAL_RETURNS, ParentAnswerDraft, ParentAnswerRecord,
-        PersistChildReturnResult, PersistParentAnswerResult, ProfileHomeProposal, ProfileRecord,
-        ProfileRevisionContent, ProfileRevisionRecord, ReserveProfileHomeResult,
-        RunCancellationRecord, ThreadRunAdmission, ToolCallApprovalDecision,
-        ToolCallApprovalRecord, WorkspaceRecord,
+        ChildReturnDraft, ChildReturnRecord, DurableThreadAuthority, HomeReservationRecord,
+        HomeReservationState, MAX_CHILD_RETURN_PAYLOAD_BYTES, MAX_UNCONSUMED_NONTERMINAL_RETURNS,
+        ParentAnswerDraft, ParentAnswerRecord, PersistChildReturnResult, PersistParentAnswerResult,
+        ProfileHomeProposal, ProfileRecord, ProfileRevisionContent, ProfileRevisionRecord,
+        ReserveProfileHomeResult, RunCancellationRecord, ThreadRunAdmission,
+        ToolCallApprovalDecision, ToolCallApprovalRecord, WorkspaceRecord,
     },
 };
+#[cfg(test)]
+use super::{rows::agent_from_row, types::AgentRecord};
 use crate::{
     AppError, AppResult,
     ledger::{row_u64, sqlite_i64},
@@ -28,7 +29,9 @@ use crate::{
     },
 };
 use platonic_core::{AgentId, ProfileId};
-use platonic_protocol::{ThreadAuthorityRecord, ThreadConfinement, ThreadKind};
+use platonic_protocol::{
+    ReasoningEffort, ThreadApprovalPolicy, ThreadAuthorityRecord, ThreadConfinement, ThreadKind,
+};
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use std::{
     path::{Path, PathBuf},
@@ -342,6 +345,7 @@ impl ServerStore {
     }
 
     /// Insert one complete profile after its workspace and toolset are validated.
+    #[cfg(test)]
     pub(crate) fn register_agent(&self, record: &AgentRecord) -> AppResult<bool> {
         let toolset = serde_json::to_string(&record.toolset)?;
         let changed = self.connection.execute(
@@ -363,6 +367,7 @@ impl ServerStore {
         Ok(changed == 1)
     }
 
+    #[cfg(test)]
     pub(crate) fn agent(&self, id: &AgentId) -> AppResult<Option<AgentRecord>> {
         Ok(self
             .connection
@@ -376,6 +381,7 @@ impl ServerStore {
             .optional()?)
     }
 
+    #[cfg(test)]
     pub(crate) fn agents(&self) -> AppResult<Vec<AgentRecord>> {
         let mut statement = self.connection.prepare(
             "SELECT id, workspace_id, model, reasoning_effort,
@@ -609,12 +615,50 @@ impl ServerStore {
             .optional()?)
     }
 
+    #[cfg(test)]
     pub(crate) fn update_profile_content(
         &mut self,
         profile_id: &ProfileId,
         actor: &str,
         created_at_ms: u64,
         content: ProfileRevisionContent,
+    ) -> AppResult<Option<ProfileRevisionRecord>> {
+        self.update_profile_revision(profile_id, actor, created_at_ms, content, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn update_profile(
+        &mut self,
+        profile_id: &ProfileId,
+        model: &str,
+        reasoning_effort: ReasoningEffort,
+        approval_policy: ThreadApprovalPolicy,
+        toolset: &[String],
+        actor: &str,
+        created_at_ms: u64,
+        content: ProfileRevisionContent,
+    ) -> AppResult<Option<ProfileRevisionRecord>> {
+        if model.trim().is_empty() || toolset.is_empty() {
+            return Err(AppError::Config(
+                "profile model and toolset must not be empty".into(),
+            ));
+        }
+        self.update_profile_revision(
+            profile_id,
+            actor,
+            created_at_ms,
+            content,
+            Some((model, reasoning_effort, approval_policy, toolset)),
+        )
+    }
+
+    fn update_profile_revision(
+        &mut self,
+        profile_id: &ProfileId,
+        actor: &str,
+        created_at_ms: u64,
+        content: ProfileRevisionContent,
+        defaults: Option<(&str, ReasoningEffort, ThreadApprovalPolicy, &[String])>,
     ) -> AppResult<Option<ProfileRevisionRecord>> {
         if actor.trim().is_empty() || actor.len() > super::MAX_PROFILE_REVISION_ACTOR_BYTES {
             return Err(AppError::Config(format!(
@@ -663,15 +707,33 @@ impl ServerStore {
                 skill_refs,
             ],
         )?;
-        let changed = transaction.execute(
-            "UPDATE profiles SET current_revision = ?2
-             WHERE id = ?1 AND current_revision = ?3",
-            params![
-                profile_id.as_str(),
-                sqlite_i64(revision, "profile revision")?,
-                sqlite_i64(parent_revision, "profile parent revision")?,
-            ],
-        )?;
+        let changed = if let Some((model, reasoning_effort, approval_policy, toolset)) = defaults {
+            transaction.execute(
+                "UPDATE profiles
+                 SET current_revision = ?2, model = ?4, reasoning_effort = ?5,
+                     approval_policy = ?6, toolset = ?7
+                 WHERE id = ?1 AND current_revision = ?3",
+                params![
+                    profile_id.as_str(),
+                    sqlite_i64(revision, "profile revision")?,
+                    sqlite_i64(parent_revision, "profile parent revision")?,
+                    model,
+                    reasoning_effort.as_str(),
+                    approval_policy.as_str(),
+                    serde_json::to_string(toolset)?,
+                ],
+            )?
+        } else {
+            transaction.execute(
+                "UPDATE profiles SET current_revision = ?2
+                 WHERE id = ?1 AND current_revision = ?3",
+                params![
+                    profile_id.as_str(),
+                    sqlite_i64(revision, "profile revision")?,
+                    sqlite_i64(parent_revision, "profile parent revision")?,
+                ],
+            )?
+        };
         if changed != 1 {
             return Err(AppError::Config(format!(
                 "profile revision update changed {changed} rows for {profile_id}"
@@ -1681,6 +1743,23 @@ impl ServerStore {
         Ok(statement
             .query_map(params![child_thread_id, run_id], parent_answer_from_row)?
             .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn thread_return_availability(&self, thread_id: &str) -> AppResult<(u64, u64)> {
+        Ok(self.connection.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM child_returns
+                  WHERE parent_thread_id = ?1 AND state = 'available'),
+                (SELECT COUNT(*) FROM parent_answers
+                  WHERE child_thread_id = ?1 AND state = 'available')",
+            params![thread_id],
+            |row| {
+                Ok((
+                    row_u64(row, 0, "available child returns")?,
+                    row_u64(row, 1, "available parent answers")?,
+                ))
+            },
+        )?)
     }
 
     pub(crate) fn admit_thread_run_and_reserve(

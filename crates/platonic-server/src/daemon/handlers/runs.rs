@@ -2024,7 +2024,7 @@ enabled = ["file.read"]
         let resolved = handle_line(
             &restarted,
             &format!(
-                r#"{{"v":1,"id":"resolve","kind":"request","method":"profile.open","params":{{"action":"resolve","profile_id":"{profile_id}"}}}}"#
+                r#"{{"v":2,"id":"resolve","kind":"request","method":"profile.open","params":{{"action":"resolve","profile_id":"{profile_id}"}}}}"#
             ),
         );
         let resolved: crate::daemon::protocol::ProfileOpenResult = response_result(&resolved);
@@ -2047,7 +2047,7 @@ enabled = ["file.read"]
             handle_line(
                 &restarted,
                 &format!(
-                    r#"{{"v":1,"id":"send","kind":"request","method":"thread.send","params":{{"thread_id":"{thread_id}","controller_id":"test","prior_interrupted_run_id":"run_before_restart","message":"continue explicitly"}}}}"#
+                    r#"{{"v":2,"id":"send","kind":"request","method":"thread.send","params":{{"thread_id":"{thread_id}","controller_id":"test","prior_interrupted_run_id":"run_before_restart","message":"continue explicitly"}}}}"#
                 ),
             )
         });
@@ -2216,7 +2216,7 @@ enabled = ["file.read"]
         let response = handle_line(
             &runtime,
             &format!(
-                r#"{{"v":1,"id":"start","kind":"request","method":"run.start","params":{{"question":"first question","config_path":"{}"}}}}"#,
+                r#"{{"v":2,"id":"start","kind":"request","method":"run.start","params":{{"question":"first question","config_path":"{}"}}}}"#,
                 config_path.display()
             ),
         );
@@ -2244,7 +2244,7 @@ enabled = ["file.read"]
         let response = handle_line(
             &runtime,
             &format!(
-                r#"{{"v":1,"id":"append","kind":"request","method":"message.append","params":{{"session_id":"{}","message":"follow up","config_path":"{}"}}}}"#,
+                r#"{{"v":2,"id":"append","kind":"request","method":"message.append","params":{{"session_id":"{}","message":"follow up","config_path":"{}"}}}}"#,
                 started.session_id,
                 config_path.display()
             ),
@@ -2293,7 +2293,7 @@ enabled = ["file.read"]
             handle_line(
                 &runtime,
                 &format!(
-                    r#"{{"v":1,"id":"send","kind":"request","method":"thread.send","params":{{"thread_id":"{thread_id}","controller_id":"test","message":"thread question"}}}}"#
+                    r#"{{"v":2,"id":"send","kind":"request","method":"thread.send","params":{{"thread_id":"{thread_id}","controller_id":"test","message":"thread question"}}}}"#
                 ),
             )
         });
@@ -2360,7 +2360,7 @@ enabled = ["file.read"]
         let response = handle_line(
             &jsonl_runtime,
             &format!(
-                r#"{{"v":1,"id":"start","kind":"request","method":"run.start","params":{{"question":"cannot create log","config_path":"{}"}}}}"#,
+                r#"{{"v":2,"id":"start","kind":"request","method":"run.start","params":{{"question":"cannot create log","config_path":"{}"}}}}"#,
                 jsonl_config.display()
             ),
         );
@@ -2388,7 +2388,7 @@ enabled = ["file.read"]
         let response = handle_line(
             &sqlite_runtime,
             &format!(
-                r#"{{"v":1,"id":"append","kind":"request","method":"message.append","params":{{"session_id":"session_active","message":"rejected","config_path":"{}"}}}}"#,
+                r#"{{"v":2,"id":"append","kind":"request","method":"message.append","params":{{"session_id":"session_active","message":"rejected","config_path":"{}"}}}}"#,
                 sqlite_config.display()
             ),
         );
@@ -2421,7 +2421,7 @@ enabled = ["file.read"]
         let response = handle_line(
             &one_shot_handoff,
             &format!(
-                r#"{{"v":1,"id":"start","kind":"request","method":"run.start","params":{{"question":"handoff fails","config_path":"{}"}}}}"#,
+                r#"{{"v":2,"id":"start","kind":"request","method":"run.start","params":{{"question":"handoff fails","config_path":"{}"}}}}"#,
                 config_path.display()
             ),
         );
@@ -2453,7 +2453,7 @@ enabled = ["file.read"]
             handle_line(
                 &handoff_runtime,
                 &format!(
-                    r#"{{"v":1,"id":"send","kind":"request","method":"thread.send","params":{{"thread_id":"{thread_id}","controller_id":"test","message":"handoff fails"}}}}"#
+                    r#"{{"v":2,"id":"send","kind":"request","method":"thread.send","params":{{"thread_id":"{thread_id}","controller_id":"test","message":"handoff fails"}}}}"#
                 ),
             )
         });
@@ -2510,7 +2510,7 @@ enabled = ["file.read"]
         let response = handle_line(
             &runtime,
             &format!(
-                r#"{{"v":1,"id":"start","kind":"request","method":"run.start","params":{{"question":"synchronous question","config_path":"{}","wait":true}}}}"#,
+                r#"{{"v":2,"id":"start","kind":"request","method":"run.start","params":{{"question":"synchronous question","config_path":"{}","wait":true}}}}"#,
                 config_path.display()
             ),
         );
@@ -2544,7 +2544,7 @@ enabled = ["file.read"]
         let response = handle_line(
             &runtime,
             &format!(
-                r#"{{"v":1,"id":"append","kind":"request","method":"message.append","params":{{"session_id":"{}","message":"continued question","config_path":"{}","wait":true}}}}"#,
+                r#"{{"v":2,"id":"append","kind":"request","method":"message.append","params":{{"session_id":"{}","message":"continued question","config_path":"{}","wait":true}}}}"#,
                 session.session_id,
                 config_path.display()
             ),
@@ -2596,7 +2596,7 @@ enabled = ["file.read"]
         let response = handle_line(
             &fallback,
             &format!(
-                r#"{{"v":1,"id":"fallback","kind":"request","method":"run.start","params":{{"question":"fallback","config_path":"{}","wait":true}}}}"#,
+                r#"{{"v":2,"id":"fallback","kind":"request","method":"run.start","params":{{"question":"fallback","config_path":"{}","wait":true}}}}"#,
                 config_path.display()
             ),
         );
@@ -2619,7 +2619,7 @@ enabled = ["file.read"]
         let response = handle_line(
             &required,
             &format!(
-                r#"{{"v":1,"id":"required","kind":"request","method":"run.start","params":{{"question":"required","config_path":"{}"}}}}"#,
+                r#"{{"v":2,"id":"required","kind":"request","method":"run.start","params":{{"question":"required","config_path":"{}"}}}}"#,
                 config_path.display()
             ),
         );
@@ -3085,7 +3085,7 @@ enabled = ["file.read"]
         let conflicting = handle_line(
             &runtime,
             &format!(
-                r#"{{"v":1,"id":"conflicting","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"deny"}}}}"#,
+                r#"{{"v":2,"id":"conflicting","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"deny"}}}}"#,
                 record.run_id
             ),
         );
@@ -3500,7 +3500,7 @@ enabled = ["file.read"]
         handle_line(
             runtime,
             &format!(
-                r#"{{"v":1,"id":"{request_id}","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
+                r#"{{"v":2,"id":"{request_id}","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
             ),
         )
     }
@@ -3514,7 +3514,7 @@ enabled = ["file.read"]
         handle_line(
             runtime,
             &format!(
-                r#"{{"v":1,"id":"{request_id}","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}","actor":"{actor}"}}}}"#
+                r#"{{"v":2,"id":"{request_id}","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}","actor":"{actor}"}}}}"#
             ),
         )
     }
@@ -3528,7 +3528,7 @@ enabled = ["file.read"]
         handle_line(
             runtime,
             &format!(
-                r#"{{"v":1,"id":"{request_id}","kind":"request","method":"approval.decide","params":{{"run_id":"{run_id}","tool_call_id":"{call_id}","decision":"grant_session"}}}}"#
+                r#"{{"v":2,"id":"{request_id}","kind":"request","method":"approval.decide","params":{{"run_id":"{run_id}","tool_call_id":"{call_id}","decision":"grant_session"}}}}"#
             ),
         )
     }
@@ -3890,7 +3890,7 @@ IFS= read -r _
         let response = handle_line(
             runtime,
             &format!(
-                r#"{{"v":1,"id":"{request_id}","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":128}}}}"#
+                r#"{{"v":2,"id":"{request_id}","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":128}}}}"#
             ),
         );
         assert_eq!(
@@ -3929,7 +3929,7 @@ IFS= read -r _
     }
 
     #[test]
-    fn context_compaction_uses_v1_ledger_stream_envelope() {
+    fn context_compaction_uses_v2_protocol_and_preserves_the_typed_ledger_event() {
         let runtime = DaemonRuntime::new(crate::daemon::server::DaemonPaths {
             workspace_root: PathBuf::from("/tmp/workspace"),
             workspace_id: "workspace-1".into(),
@@ -3959,7 +3959,7 @@ IFS= read -r _
         let response = handle_events_stream(
             &runtime,
             Envelope {
-                v: 1,
+                v: 2,
                 id: Some("stream_1".into()),
                 kind: crate::daemon::protocol::EnvelopeKind::Request,
                 method: Some("events.stream".into()),
@@ -3974,7 +3974,7 @@ IFS= read -r _
             },
         );
 
-        assert_eq!(response.v, 1);
+        assert_eq!(response.v, 2);
         let result: EventsStreamResult = response_result(&response);
         assert_eq!(result.events.len(), 1);
         let wire = serde_json::to_value(&result.events[0]).unwrap();

@@ -2,7 +2,7 @@
 
 Terminal client library for Plato Agent. It owns terminal state, daemon-event reduction, rendering, keyboard handling, thread selection, and client-local voice integration.
 
-The standalone `plato-tui` binary attaches to an existing `platonic serve` host endpoint. It never starts, supervises, restarts, or stops the server, and it does not call providers, execute tools, decide server policy, or write the workspace ledger directly. The `plato` distribution binary owns the ordinary auto-ensuring TUI entrypoint.
+The standalone `plato-tui` binary attaches to an existing `platonic serve` host endpoint, selects or creates a workspace profile, resolves or approves its durable home, and reuses that home on later starts. It never starts, supervises, restarts, or stops the server, and it does not call providers, execute tools, decide server policy, or write the workspace ledger directly. The `plato` distribution binary owns the ordinary auto-ensuring TUI entrypoint.
 
 User documentation:
 

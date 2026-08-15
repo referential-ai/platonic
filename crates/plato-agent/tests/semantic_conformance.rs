@@ -1,17 +1,18 @@
 use platonic_client::{ClientError, client::DaemonClient};
-use platonic_core::{AgentId, EffectClass, HarnessEvent, ProfileId};
+use platonic_core::{EffectClass, HarnessEvent, ProfileId};
 #[cfg(target_os = "linux")]
 use platonic_protocol::RunStateName;
 use platonic_protocol::{
-    BufferedThreadEvent, CAPABILITY_AGENT_CREATE, CAPABILITY_AGENT_LIST, CAPABILITY_AGENT_STATUS,
-    CAPABILITY_PROFILE_OPEN, CAPABILITY_THREAD_AUTHORITY, CAPABILITY_THREAD_EVENTS,
-    CAPABILITY_THREAD_LIST, CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_SPAWN,
-    CAPABILITY_THREAD_STATUS, CAPABILITY_THREAD_STOP, CAPABILITY_WORKSPACE_CREATE,
-    CAPABILITY_WORKSPACE_LIST, CAPABILITY_WORKSPACE_STATUS, ERROR_NOT_FOUND,
-    ERROR_THREAD_STOP_FAILED, ERROR_WORKSPACE_UNREGISTERED, ProfileOpenDecision, ProfileOpenResult,
-    ReasoningEffort, ShutdownIfIdleResultName, StreamEvent, ThreadApprovalPolicy, ThreadKind,
-    ThreadRepositoryRequest, ThreadSendRejectedReason, ThreadSendResult, ThreadSpawnResult,
-    ThreadStopResult,
+    BufferedThreadEvent, CAPABILITY_PROFILE_CREATE, CAPABILITY_PROFILE_LIST,
+    CAPABILITY_PROFILE_OPEN, CAPABILITY_PROFILE_STATUS, CAPABILITY_PROFILE_UPDATE,
+    CAPABILITY_THREAD_AUTHORITY, CAPABILITY_THREAD_EVENTS, CAPABILITY_THREAD_LIST,
+    CAPABILITY_THREAD_SEND, CAPABILITY_THREAD_SPAWN, CAPABILITY_THREAD_STATUS,
+    CAPABILITY_THREAD_STOP, CAPABILITY_WORKSPACE_CREATE, CAPABILITY_WORKSPACE_LIST,
+    CAPABILITY_WORKSPACE_STATUS, ERROR_NOT_FOUND, ERROR_THREAD_STOP_FAILED,
+    ERROR_WORKSPACE_UNREGISTERED, ProfileContent, ProfileCreateParams, ProfileOpenDecision,
+    ProfileOpenResult, ProfileUpdateParams, ReasoningEffort, ShutdownIfIdleResultName, StreamEvent,
+    ThreadApprovalPolicy, ThreadConfinement, ThreadKind, ThreadRepositoryRequest,
+    ThreadSendRejectedReason, ThreadSendResult, ThreadSpawnResult, ThreadStopResult,
 };
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
@@ -127,7 +128,7 @@ fn open_profile_home(
         } => {
             assert_eq!(opened_profile, profile_id);
             assert_eq!(thread.authority.thread_id, thread_id);
-            thread
+            *thread
         }
         result => panic!("expected opened home, got {result:?}"),
     }
@@ -221,7 +222,7 @@ fn killed_wedged_child_has_no_ledger_handle_and_other_run_stays_healthy() {
 #[test]
 fn one_host_daemon_serves_two_workspaces() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
-    let root = Arc::new(tempfile::tempdir().unwrap());
+    let root = Arc::new(ProofRoot::Temporary(tempfile::tempdir().unwrap()));
     let first = ProofContext::in_root(Arc::clone(&root), "workspace-a");
     let second = ProofContext::in_root(root, "workspace-b");
     let host = ProofDaemon::start(&first);
@@ -250,7 +251,7 @@ fn one_host_daemon_serves_two_workspaces() {
     host.stop(first_client);
 }
 #[test]
-fn workspace_and_agent_six_method_control_plane_is_semantically_conformant() {
+fn workspace_and_profile_control_plane_is_semantically_conformant() {
     let _serial = SCENARIO_SERIAL.lock().unwrap();
     let proof = ProofContext::new();
     let host = ProofDaemon::start(&proof);
@@ -260,17 +261,18 @@ fn workspace_and_agent_six_method_control_plane_is_semantically_conformant() {
         CAPABILITY_WORKSPACE_CREATE,
         CAPABILITY_WORKSPACE_LIST,
         CAPABILITY_WORKSPACE_STATUS,
-        CAPABILITY_AGENT_CREATE,
-        CAPABILITY_AGENT_LIST,
-        CAPABILITY_AGENT_STATUS,
+        CAPABILITY_PROFILE_CREATE,
+        CAPABILITY_PROFILE_LIST,
+        CAPABILITY_PROFILE_STATUS,
+        CAPABILITY_PROFILE_UPDATE,
     ] {
         assert!(hello.capabilities.contains(&capability));
     }
 
-    let second = proof.workspace.with_file_name("agent-control-workspace");
+    let second = proof.workspace.with_file_name("profile-control-workspace");
     fs::create_dir(&second).unwrap();
     let created = client
-        .workspace_create("agent-control".into(), second.clone())
+        .workspace_create("profile-control".into(), second.clone())
         .unwrap()
         .workspace;
     assert_eq!(Path::new(&created.root), second);
@@ -284,27 +286,51 @@ fn workspace_and_agent_six_method_control_plane_is_semantically_conformant() {
         created
     );
 
-    let created_agent = client
-        .agent_create(
-            AgentId::new("builder").unwrap(),
-            created.id.clone(),
-            "gpt-5.6-sol".into(),
-            ReasoningEffort::High,
-            ThreadApprovalPolicy::Prompt,
-            vec!["file.read".into(), "file.write".into()],
-        )
+    let created_profile = client
+        .profile_create(ProfileCreateParams {
+            workspace_id: created.id.clone(),
+            display_name: "builder".into(),
+            model: Some("gpt-5.6-sol".into()),
+            reasoning_effort: ReasoningEffort::High,
+            approval_policy: ThreadApprovalPolicy::Prompt,
+            toolset: Some(vec!["file.read".into(), "file.write".into()]),
+            content: ProfileContent::default(),
+            config_path: None,
+        })
         .unwrap()
-        .agent;
-    assert_eq!(created_agent.workspace_id, created.id);
-    assert_eq!(created_agent.toolset, ["file.read", "file.write"]);
-    assert_eq!(client.agent_list().unwrap().agents, [created_agent.clone()]);
+        .status;
+    assert_eq!(created_profile.profile.workspace_id, created.id);
+    assert_eq!(created_profile.profile.toolset, ["file.read", "file.write"]);
     assert_eq!(
         client
-            .agent_status(AgentId::new("builder").unwrap())
+            .profile_list(Some(created.id.clone()), None)
             .unwrap()
-            .agent,
-        created_agent
+            .profiles,
+        [created_profile.profile.clone()]
     );
+    assert_eq!(
+        client
+            .profile_status(created_profile.profile.id.clone())
+            .unwrap()
+            .status,
+        created_profile
+    );
+    let updated = client
+        .profile_update(ProfileUpdateParams {
+            profile_id: created_profile.profile.id,
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: ReasoningEffort::Xhigh,
+            approval_policy: ThreadApprovalPolicy::Yolo,
+            toolset: vec!["file.read".into()],
+            content: ProfileContent {
+                instructions_markdown: "Build carefully.".into(),
+                ..ProfileContent::default()
+            },
+        })
+        .unwrap()
+        .status;
+    assert_eq!(updated.profile.current_revision, 2);
+    assert_eq!(updated.revision.parent_revision, Some(1));
     host.stop(client);
 }
 
@@ -430,7 +456,7 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
 
     let child_status = match client
         .thread_spawn_start(
-            Some(root_thread_id.clone()),
+            root_thread_id.clone(),
             child_cwd
                 .canonicalize()
                 .unwrap()
@@ -571,7 +597,7 @@ fn thread_spawn_list_and_status_are_semantically_conformant_on_host_daemon() {
     );
     let stale_parent = restarted_client
         .thread_spawn_start(
-            Some(root_thread_id),
+            root_thread_id,
             proof.workspace.to_string_lossy().into_owned(),
             "gpt-5.6-sol".into(),
             ReasoningEffort::High,
@@ -661,6 +687,195 @@ fn pending_profile_home_replays_and_grants_after_daemon_restart() {
         } if thread.authority.thread_id == thread_id
             && Path::new(&thread.authority.cwd).is_dir()
     ));
+    restarted.stop(client);
+}
+
+#[test]
+fn issue_580_profile_home_product_journey_survives_restart() {
+    const QUESTION: &str = "Which release label should the child use?";
+    const ANSWER: &str = "Use protocol-v2.";
+
+    let _serial = SCENARIO_SERIAL.lock().unwrap();
+    let proof = ProofContext::issue_580();
+    let worker_cwd = Arc::new(Mutex::new(proof.workspace.clone()));
+    let provider = ProfileJourneyProvider::start(Arc::clone(&worker_cwd), QUESTION, ANSWER);
+    write_journey_config(&proof.config_path, &provider.base_url);
+    let host = ProofDaemon::start(&proof);
+    let mut client = host.connect();
+    let hello = client.hello(&proof.workspace).unwrap();
+    client.daemon_status(None, None).unwrap();
+    let profile = client
+        .profile_create(ProfileCreateParams {
+            workspace_id: hello.workspace_id,
+            display_name: "journey".into(),
+            model: Some("test-model".into()),
+            reasoning_effort: ReasoningEffort::High,
+            approval_policy: ThreadApprovalPolicy::Prompt,
+            toolset: Some(vec![
+                "file.read".into(),
+                "thread.spawn".into(),
+                "thread.return".into(),
+                "thread.answer".into(),
+            ]),
+            content: ProfileContent {
+                instructions_markdown: "Complete the bounded protocol journey.".into(),
+                ..ProfileContent::default()
+            },
+            config_path: None,
+        })
+        .unwrap()
+        .status
+        .profile;
+    let profile_id = profile.id.clone();
+    let home = open_profile_home(&mut client, profile_id.clone());
+    let home_thread_id = home.authority.thread_id;
+    let home_confinement = client
+        .thread_authority(home_thread_id.clone())
+        .unwrap()
+        .confinement
+        .expect("new home authority records confinement");
+    assert!(matches!(
+        home_confinement,
+        ThreadConfinement::Landlock | ThreadConfinement::None
+    ));
+    #[cfg(target_os = "macos")]
+    assert_eq!(home_confinement, ThreadConfinement::None);
+    *worker_cwd.lock().unwrap() = PathBuf::from(home.authority.cwd);
+
+    assert!(matches!(
+        client
+            .thread_send(
+                home_thread_id.clone(),
+                "journey-home".into(),
+                None,
+                "Spawn the bounded child.".into(),
+            )
+            .unwrap(),
+        ThreadSendResult::Started { .. }
+    ));
+    drive_thread_turn_granting_approvals(&mut client, &home_thread_id);
+    let child = client
+        .thread_list()
+        .unwrap()
+        .threads
+        .into_iter()
+        .find(|thread| thread.authority.parent_thread_id.as_deref() == Some(&home_thread_id));
+    let child_thread_id = child
+        .unwrap_or_else(|| {
+            panic!(
+                "home did not spawn a child: {:?}",
+                client
+                    .thread_events(home_thread_id.clone(), Some(0), 128, 0)
+                    .unwrap()
+                    .events
+            )
+        })
+        .authority
+        .thread_id;
+    let child_confinement = client
+        .thread_authority(child_thread_id.clone())
+        .unwrap()
+        .confinement
+        .expect("new child authority records confinement");
+    assert!(matches!(
+        child_confinement,
+        ThreadConfinement::Landlock | ThreadConfinement::None
+    ));
+    #[cfg(target_os = "macos")]
+    assert_eq!(child_confinement, ThreadConfinement::None);
+
+    assert!(matches!(
+        client
+            .thread_send(
+                child_thread_id.clone(),
+                "journey-child".into(),
+                None,
+                "Ask the parent for the release label.".into(),
+            )
+            .unwrap(),
+        ThreadSendResult::Started { .. }
+    ));
+    provider.question_ready.recv_timeout(PROOF_TIMEOUT).unwrap();
+    assert_eq!(
+        client
+            .thread_status(home_thread_id.clone())
+            .unwrap()
+            .thread
+            .return_availability
+            .child_returns,
+        1
+    );
+
+    assert!(matches!(
+        client
+            .thread_send(
+                home_thread_id.clone(),
+                "journey-home".into(),
+                None,
+                "Answer the child's question.".into(),
+            )
+            .unwrap(),
+        ThreadSendResult::Started { .. }
+    ));
+    drive_thread_turn_granting_approvals(&mut client, &home_thread_id);
+    wait_for_thread_idle(&mut client, &child_thread_id);
+    assert_eq!(
+        client
+            .thread_status(child_thread_id.clone())
+            .unwrap()
+            .thread
+            .return_availability
+            .parent_answers,
+        1
+    );
+
+    assert!(matches!(
+        client
+            .thread_send(
+                child_thread_id.clone(),
+                "journey-child".into(),
+                None,
+                "Confirm the parent's answer.".into(),
+            )
+            .unwrap(),
+        ThreadSendResult::Started { .. }
+    ));
+    wait_for_thread_idle(&mut client, &child_thread_id);
+    host.stop(client);
+
+    let restarted = ProofDaemon::start(&proof);
+    let mut client = restarted.connect();
+    let reopened = client.profile_open_resolve(profile_id).unwrap();
+    assert!(matches!(
+        reopened,
+        ProfileOpenResult::Opened {
+            created: false,
+            ref thread,
+            ..
+        } if thread.authority.thread_id == home_thread_id
+    ));
+    assert_eq!(
+        client
+            .thread_authority(home_thread_id.clone())
+            .unwrap()
+            .confinement,
+        Some(home_confinement)
+    );
+    assert!(matches!(
+        client
+            .thread_send(
+                home_thread_id.clone(),
+                "journey-home-restarted".into(),
+                None,
+                "Start the post-restart turn.".into(),
+            )
+            .unwrap(),
+        ThreadSendResult::Started { .. }
+    ));
+    wait_for_thread_idle(&mut client, &home_thread_id);
+    let proof = provider.join();
+    assert_eq!(proof.child_thread_id, child_thread_id);
+    assert_eq!(proof.request_count, 8);
     restarted.stop(client);
 }
 
@@ -1137,6 +1352,48 @@ fn wait_for_thread_idle(client: &mut DaemonClient, thread_id: &str) {
     }
 }
 
+fn drive_thread_turn_granting_approvals(client: &mut DaemonClient, thread_id: &str) {
+    let Some(turn_id) = client
+        .thread_status(thread_id.into())
+        .unwrap()
+        .thread
+        .live
+        .current_turn_id
+    else {
+        return;
+    };
+    let deadline = Instant::now() + PROOF_TIMEOUT;
+    let mut offset = 0;
+    loop {
+        let page = client
+            .thread_events(thread_id.into(), Some(offset), 128, 1_000)
+            .unwrap();
+        offset = page.next_offset;
+        for (run_id, tool_call_id) in page.events.iter().filter_map(|event| {
+            if event.turn_id != turn_id {
+                return None;
+            }
+            let StreamEvent::ApprovalRequested {
+                run_id,
+                tool_call_id,
+                ..
+            } = &event.event
+            else {
+                return None;
+            };
+            Some((run_id, tool_call_id))
+        }) {
+            client
+                .approval_grant_as(run_id, tool_call_id, "journey-proof".into())
+                .unwrap();
+        }
+        if page.current_turn_id.as_deref() != Some(&turn_id) && page.events.is_empty() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "thread turn did not finish");
+    }
+}
+
 #[test]
 fn accepted_provider_stream_blocks_until_delayed_request_bytes_arrive() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1158,8 +1415,24 @@ fn accepted_provider_stream_blocks_until_delayed_request_bytes_arrive() {
     assert_eq!(server.join().unwrap(), json!({"delayed": true}));
 }
 
+enum ProofRoot {
+    Temporary(tempfile::TempDir),
+    #[cfg(unix)]
+    Issue580(PathBuf),
+}
+
+impl ProofRoot {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Temporary(root) => root.path(),
+            #[cfg(unix)]
+            Self::Issue580(root) => root,
+        }
+    }
+}
+
 struct ProofContext {
-    _root: Arc<tempfile::TempDir>,
+    _root: Arc<ProofRoot>,
     workspace: PathBuf,
     config_path: PathBuf,
     /// The host's server-wide store, where thread state lives.
@@ -1184,10 +1457,28 @@ impl Drop for ProofContext {
 
 impl ProofContext {
     fn new() -> Self {
-        Self::in_root(Arc::new(tempfile::tempdir().unwrap()), "workspace")
+        Self::in_root(
+            Arc::new(ProofRoot::Temporary(tempfile::tempdir().unwrap())),
+            "workspace",
+        )
     }
 
-    fn in_root(root: Arc<tempfile::TempDir>, workspace_name: &str) -> Self {
+    #[cfg(unix)]
+    fn issue_580() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = PathBuf::from("/tmp/p580");
+        fs::create_dir(&root).expect("issue #580 proof root /tmp/p580 must be pre-absent");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        Self::in_root(Arc::new(ProofRoot::Issue580(root)), "workspace")
+    }
+
+    #[cfg(not(unix))]
+    fn issue_580() -> Self {
+        Self::new()
+    }
+
+    fn in_root(root: Arc<ProofRoot>, workspace_name: &str) -> Self {
         let root_path = root.path().canonicalize().unwrap();
         let workspace = root_path.join(workspace_name);
         fs::create_dir(&workspace).unwrap();
@@ -1210,9 +1501,15 @@ impl ProofContext {
                 root_path.hash(&mut hasher);
                 hasher.finish() as u32
             };
-            let runtime_root =
-                PathBuf::from(format!("/tmp/pconf-{}-{root_key:08x}", std::process::id()));
+            let runtime_root = match root.as_ref() {
+                ProofRoot::Temporary(_) => {
+                    PathBuf::from(format!("/tmp/pconf-{}-{root_key:08x}", std::process::id()))
+                }
+                ProofRoot::Issue580(root) => root.clone(),
+            };
             fs::create_dir_all(&runtime_root).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700)).unwrap();
             let state_root = root_path.join("state");
             (runtime_root, state_root)
         };
@@ -1340,6 +1637,7 @@ struct ProofDaemon {
 impl ProofDaemon {
     fn start(proof: &ProofContext) -> Self {
         let socket_path = proof.host_socket_path();
+        eprintln!("external daemon socket: {}", socket_path.display());
         let mut child = proof.daemon_command().spawn().unwrap();
         wait_for_endpoint(&socket_path, &mut child);
         let daemon = Self {
@@ -1410,7 +1708,16 @@ fn connect_registered_workspace(socket_path: &Path, workspace: &Path) -> DaemonC
 fn wait_for_endpoint(socket_path: &Path, child: &mut Child) {
     let deadline = Instant::now() + PROOF_TIMEOUT;
     loop {
-        if DaemonClient::connect_with_timeout(socket_path, Duration::from_millis(200)).is_ok() {
+        #[cfg(unix)]
+        let socket_ready = {
+            use std::os::unix::fs::FileTypeExt;
+            fs::symlink_metadata(socket_path).is_ok_and(|meta| meta.file_type().is_socket())
+        };
+        #[cfg(not(unix))]
+        let socket_ready = socket_path.exists();
+        if socket_ready
+            && DaemonClient::connect_with_timeout(socket_path, Duration::from_millis(200)).is_ok()
+        {
             return;
         }
         if let Some(status) = child.try_wait().unwrap() {
@@ -1589,6 +1896,31 @@ impl ProviderReply {
     }
 }
 
+fn provider_request_has_tool(request: &Value, provider_name: &str) -> bool {
+    request["tools"].as_array().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == provider_name)
+    })
+}
+
+fn provider_tool_output(request: &Value, internal_name: &str) -> Value {
+    let wrapped = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .expect("provider request omitted the tool result");
+    let prefix = format!("<tool_output name=\"{internal_name}\" trust=\"untrusted\">\n");
+    let body = wrapped
+        .strip_prefix(&prefix)
+        .and_then(|body| body.strip_suffix("\n</tool_output>"))
+        .expect("tool result was not wrapped as untrusted output");
+    serde_json::from_str(body).unwrap()
+}
+
 fn event_stream(events: [Value; 2], usage: UsageFixture) -> String {
     let mut body = String::new();
     for mut event in events {
@@ -1630,10 +1962,196 @@ struct CoordinatorProvider {
     handle: Option<thread::JoinHandle<CoordinatorProviderProof>>,
 }
 
+struct ProfileJourneyProvider {
+    base_url: String,
+    question_ready: mpsc::Receiver<()>,
+    handle: Option<thread::JoinHandle<ProfileJourneyProviderProof>>,
+}
+
+struct ProfileJourneyProviderProof {
+    child_thread_id: String,
+    request_count: usize,
+}
+
 struct CoordinatorProviderProof {
     thread_id: String,
     wrapped_result: String,
     request_count: usize,
+}
+
+impl ProfileJourneyProvider {
+    fn start(
+        worker_cwd: Arc<Mutex<PathBuf>>,
+        question: &'static str,
+        answer: &'static str,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (question_sender, question_ready) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut request_count = 0;
+
+            let mut home_spawn = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let home_spawn_request = read_http_request(&mut home_spawn);
+            request_count += 1;
+            assert!(provider_request_has_tool(
+                &home_spawn_request,
+                "thread_spawn"
+            ));
+            assert!(provider_request_has_tool(
+                &home_spawn_request,
+                "thread_answer"
+            ));
+            write_http_response(
+                &mut home_spawn,
+                &ProviderReply::tool_call(
+                    "thread_spawn",
+                    json!({
+                        "cwd": worker_cwd.lock().unwrap().to_string_lossy(),
+                        "toolset": ["file.read", "thread.return"]
+                    }),
+                    UsageFixture::Known(8, 3),
+                )
+                .body,
+            );
+
+            let mut home_spawn_result = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let home_spawn_result_request = read_http_request(&mut home_spawn_result);
+            request_count += 1;
+            let spawned = provider_tool_output(&home_spawn_result_request, "thread.spawn");
+            let child_thread_id = spawned["thread_id"].as_str().unwrap().to_owned();
+            write_http_response(
+                &mut home_spawn_result,
+                &ProviderReply::answer("The bounded child is ready.", UsageFixture::Known(9, 3))
+                    .body,
+            );
+
+            let mut child_question = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let child_question_request = read_http_request(&mut child_question);
+            request_count += 1;
+            assert!(provider_request_has_tool(
+                &child_question_request,
+                "thread_return"
+            ));
+            assert!(!provider_request_has_tool(
+                &child_question_request,
+                "thread_answer"
+            ));
+            write_http_response(
+                &mut child_question,
+                &ProviderReply::tool_call(
+                    "thread_return",
+                    json!({"kind": "question", "payload": question}),
+                    UsageFixture::Known(7, 3),
+                )
+                .body,
+            );
+
+            let mut waiting_child = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let waiting_child_request = read_http_request(&mut waiting_child);
+            request_count += 1;
+            assert_eq!(
+                provider_tool_output(&waiting_child_request, "thread.return")["status"],
+                "delivered"
+            );
+            question_sender.send(()).unwrap();
+
+            let mut parent_answer = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let parent_answer_request = read_http_request(&mut parent_answer);
+            request_count += 1;
+            assert!(parent_answer_request.to_string().contains(question));
+            assert!(provider_request_has_tool(
+                &parent_answer_request,
+                "thread_answer"
+            ));
+            write_http_response(
+                &mut parent_answer,
+                &ProviderReply::tool_call(
+                    "thread_answer",
+                    json!({
+                        "child_thread_id": child_thread_id.clone(),
+                        "kind": "answer",
+                        "payload": answer
+                    }),
+                    UsageFixture::Known(10, 3),
+                )
+                .body,
+            );
+
+            let mut parent_answer_result = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let parent_answer_result_request = read_http_request(&mut parent_answer_result);
+            request_count += 1;
+            assert_eq!(
+                provider_tool_output(&parent_answer_result_request, "thread.answer")["status"],
+                "delivered"
+            );
+            write_http_response(
+                &mut parent_answer_result,
+                &ProviderReply::answer("The child was answered.", UsageFixture::Known(11, 3)).body,
+            );
+            write_http_response(
+                &mut waiting_child,
+                &ProviderReply::answer(
+                    "The child paused after its question.",
+                    UsageFixture::Known(8, 3),
+                )
+                .body,
+            );
+
+            let mut child_confirmation = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let child_confirmation_request = read_http_request(&mut child_confirmation);
+            request_count += 1;
+            assert!(child_confirmation_request.to_string().contains(answer));
+            write_http_response(
+                &mut child_confirmation,
+                &ProviderReply::answer(
+                    "The child observed the parent answer.",
+                    UsageFixture::Known(9, 3),
+                )
+                .body,
+            );
+
+            let mut restarted_home = accept_before(&listener, Instant::now() + PROOF_TIMEOUT);
+            let restarted_home_request = read_http_request(&mut restarted_home);
+            request_count += 1;
+            assert!(
+                restarted_home_request
+                    .to_string()
+                    .contains("post-restart turn")
+            );
+            write_http_response(
+                &mut restarted_home,
+                &ProviderReply::answer(
+                    "The same home completed a new turn after restart.",
+                    UsageFixture::Known(9, 3),
+                )
+                .body,
+            );
+
+            ProfileJourneyProviderProof {
+                child_thread_id,
+                request_count,
+            }
+        });
+        Self {
+            base_url,
+            question_ready,
+            handle: Some(handle),
+        }
+    }
+
+    fn join(mut self) -> ProfileJourneyProviderProof {
+        self.handle.take().unwrap().join().unwrap()
+    }
+}
+
+impl Drop for ProfileJourneyProvider {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl CoordinatorProvider {
@@ -1930,6 +2448,32 @@ max_spawn_depth = 1
 [tools]
 enabled = ["file.read", "thread.spawn"]
 "#
+        ),
+    )
+    .unwrap();
+}
+
+fn write_journey_config(path: &Path, base_url: &str) {
+    fs::write(
+        path,
+        format!(
+            r#"[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "{API_KEY_ENV}"
+base_url = "{base_url}"
+connect_timeout_ms = 5000
+stream_idle_timeout_ms = 5000
+
+[limits]
+token_budget = 8000
+max_output_tokens = 64
+max_turns = 2
+max_spawn_depth = 1
+
+[tools]
+enabled = ["file.read", "thread.spawn", "thread.return", "thread.answer"]
+"#,
         ),
     )
     .unwrap();

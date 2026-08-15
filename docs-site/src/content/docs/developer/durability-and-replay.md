@@ -15,11 +15,18 @@ The server is the only ledger writer. New run events are append-only JSONL; SQLi
 
 | Store | Durable responsibility |
 | --- | --- |
-| `server.db` | Registered workspaces, immutable agent profiles, immutable thread authority, pending tool approvals and their one-time decisions, branch claims, and other host-wide state. See [`server_store`](https://github.com/referential-ai/platonic/tree/develop/crates/platonic-server/src/server_store). |
+| `server.db` | Registered workspaces, profiles and immutable profile revisions, one home relation per profile, immutable thread authority, pending tool approvals and their one-time decisions, branch claims, and other host-wide state. See [`server_store`](https://github.com/referential-ai/platonic/tree/develop/crates/platonic-server/src/server_store). |
 | `workspaces/<id>/ledger.db` | Workspace session and run indexes, mutable outcomes, and legacy event and voice compatibility. See [`SqliteLedger`](https://github.com/referential-ai/platonic/blob/develop/crates/platonic-server/src/ledger/sqlite.rs). |
 | `workspaces/<id>/runs/<run-id>.jsonl` | The ordered, versioned event history and companion voice records for each new run. See [`run_jsonl_path`](https://github.com/referential-ai/platonic/blob/develop/crates/platonic-server/src/ledger/jsonl.rs). |
 
 The split is deliberate: a per-run log remains inspectable and append-only, while relational state supports queries and atomic mutable facts. Legacy SQLite event rows remain readable; they are not the write path for new run histories.
+
+Protocol v2 migration preserves old facts rather than inventing profile
+authority. Existing agent rows become profiles, existing pre-profile threads
+read back with `thread_kind: legacy`, and v1 JSONL events remain replayable.
+New run context records `profile_id` and the exact profile revision/hash used.
+Native v1 envelopes are still rejected; storage compatibility is not a wire
+alias.
 
 ## The acknowledgement boundary
 

@@ -177,9 +177,10 @@ fn is_control_method(method: ProtocolMethod) -> bool {
             | ProtocolMethod::WorkspaceCreate
             | ProtocolMethod::WorkspaceList
             | ProtocolMethod::WorkspaceStatus
-            | ProtocolMethod::AgentCreate
-            | ProtocolMethod::AgentList
-            | ProtocolMethod::AgentStatus
+            | ProtocolMethod::ProfileCreate
+            | ProtocolMethod::ProfileList
+            | ProtocolMethod::ProfileStatus
+            | ProtocolMethod::ProfileUpdate
     )
 }
 

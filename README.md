@@ -3,7 +3,7 @@
 *by Referential.ai*
 
 Platonic is a self-hosted agent server. One host server runs many registered
-workspaces, agent profiles, and durable threads while owning provider calls,
+workspaces, profiles, and durable threads while owning provider calls,
 tools, policy, approvals, and ledgers. Plato Agent is the client distribution
 built on Platonic.
 
@@ -66,21 +66,24 @@ npm run crawl
 
 ### Unreleased profile thread lifecycle
 
-Protocol v1 clients use `profile.open` to resolve, reserve, and decide one lazy
-home thread per profile. Home threads persist across server restarts and reject
-`thread.stop`; `thread.send` starts a new turn when an unloaded home or
-same-profile child is targeted again. Thread event cursors pair offsets with the
-server-provided `live_epoch_id` and reset when that epoch is stale.
+Protocol v2 clients use `profile.create`, `profile.list`, `profile.status`,
+`profile.update`, and `profile.open` to manage a profile and its one lazy home
+thread. Home threads persist across server restarts and reject `thread.stop`;
+`thread.send` starts a new turn when an unloaded home or same-profile child is
+targeted again. Thread event cursors pair offsets with the server-provided
+`live_epoch_id` and reset when that epoch is stale.
 
 Each new profile turn selects the latest immutable instruction, memory, and
 skill-reference revision and records its exact revision hash in durable context.
 Profile-configured logical read tools expose only bounded, paginated content,
 same-profile thread metadata, and committed event or transcript history. Native
-wire and CLI management for these internal profile operations remains deferred.
+model tools let a same-profile child return a bounded value and its parent
+answer it. `platonic profile` is the operator surface; bare `plato` selects or
+creates a profile and reuses its home.
 
 ### Unreleased HTTP gateway
 
-`platonic gateway http` exposes the bounded authenticated `/v1` HTTP/SSE
+`platonic gateway http` exposes the bounded authenticated `/v2` HTTP/SSE
 adapter on `127.0.0.1:8787` by default. It is plaintext and intended only for
 a loopback hop behind an operator-owned TLS proxy. Generate a bearer token and
 its configuration hash without persisting either value:
@@ -100,12 +103,17 @@ bind = "127.0.0.1:8787"
 name = "remote_laptop"
 token_sha256 = ["<emitted lowercase SHA-256 hash>"]
 workspace_ids = ["<server workspace id>"]
+profile_ids = ["<optional admitted profile id>"]
 ```
 
 Then run `platonic gateway http`. A non-loopback bind additionally requires
 `allow_non_loopback = true` or `--allow-non-loopback` and still requires
-external TLS. The generated OpenAPI 3.1 contract is
-[`openapi/gateway-v1.yaml`](openapi/gateway-v1.yaml).
+external TLS. An empty `profile_ids` list admits every profile within the
+principal's workspace ceiling; a nonempty list only narrows that ceiling. The
+generated OpenAPI 3.1 contract is
+[`openapi/gateway-v2.yaml`](openapi/gateway-v2.yaml). The earlier `/v1` gateway
+was merged but never released, so v2 replaces it rather than serving a legacy
+adapter or deprecation window.
 
 ### Unreleased Linux desktop observation
 

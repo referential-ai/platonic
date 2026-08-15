@@ -1,7 +1,7 @@
 use clap::Parser;
 use plato_agent::{
-    attach_server_interactive,
-    tui::{TuiOptions, run_tui, voice_control},
+    attach_server_interactive, select_profile_home,
+    tui::{ThreadAttachment, TuiOptions, run_tui, voice_control},
 };
 use platonic_client::{
     ClientError,
@@ -41,6 +41,9 @@ struct Cli {
     #[arg(long, value_name = "PATH", help = "Config path passed to daemon runs")]
     config: Option<PathBuf>,
 
+    #[arg(long, value_name = "NAME", help = "Select a workspace profile")]
+    profile: Option<String>,
+
     #[arg(
         long,
         value_name = "FILE",
@@ -64,6 +67,11 @@ fn main() {
 
 fn run() -> plato_agent::AppResult<()> {
     let cli = Cli::parse();
+    if cli.run.is_some() && cli.profile.is_some() {
+        return Err(plato_agent::AppError::Config(
+            "--run cannot be combined with --profile".into(),
+        ));
+    }
     let local_interactive = local_registration_prompt(
         cli.socket.as_deref(),
         cli.snapshot,
@@ -76,23 +84,57 @@ fn run() -> plato_agent::AppResult<()> {
         None => paths::host_socket_path()?,
     };
     let config = DaemonConnectionConfig::resolve(&cli.workspace, Some(socket.clone()))?;
-    match DaemonClient::connect_with_timeout(&config.socket_path, LOCAL_ENDPOINT_PROBE_TIMEOUT) {
-        Ok(mut client) => {
-            if local_interactive {
-                drop(client);
-                attach_server_interactive(
-                    &config.workspace_root,
-                    &config.socket_path,
-                    &mut io::stdin().lock(),
-                    &mut io::stderr(),
-                )?;
-            } else {
-                client.hello(&config.workspace_root)?;
+    let client =
+        match DaemonClient::connect_with_timeout(&config.socket_path, LOCAL_ENDPOINT_PROBE_TIMEOUT)
+        {
+            Ok(mut client) => {
+                if local_interactive {
+                    drop(client);
+                    attach_server_interactive(
+                        &config.workspace_root,
+                        &config.socket_path,
+                        &mut io::stdin().lock(),
+                        &mut io::stderr(),
+                    )?
+                } else {
+                    client.hello(&config.workspace_root)?;
+                    client
+                }
             }
-        }
-        Err(ClientError::Io(error)) if endpoint_is_unavailable(&error) => {}
-        Err(error) => return Err(error.into()),
-    }
+            Err(ClientError::Io(error)) if endpoint_is_unavailable(&error) => {
+                if cli.profile.is_some() {
+                    return Err(plato_agent::AppError::Config(
+                        "--profile requires an available Platonic server".into(),
+                    ));
+                }
+                let voice = voice_control(cli.voice_config.as_deref())?;
+                return run_tui(TuiOptions {
+                    workspace: cli.workspace,
+                    socket: Some(socket),
+                    run: cli.run,
+                    config: cli.config,
+                    snapshot: cli.snapshot,
+                    reduced_motion: cli.reduced_motion,
+                    thread: None,
+                    voice: Some(voice),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+    let mut client = client;
+    let thread = if cli.run.is_some() {
+        None
+    } else {
+        Some(ThreadAttachment::new(select_profile_home(
+            &mut client,
+            &config.workspace_root,
+            cli.profile.as_deref(),
+            cli.config.as_deref(),
+            &mut io::stdin().lock(),
+            &mut io::stderr(),
+        )?))
+    };
+    drop(client);
     let voice = voice_control(cli.voice_config.as_deref())?;
     run_tui(TuiOptions {
         workspace: cli.workspace,
@@ -101,7 +143,7 @@ fn run() -> plato_agent::AppResult<()> {
         config: cli.config,
         snapshot: cli.snapshot,
         reduced_motion: cli.reduced_motion,
-        thread: None,
+        thread,
         voice: Some(voice),
     })
 }

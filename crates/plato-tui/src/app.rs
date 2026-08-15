@@ -270,9 +270,16 @@ pub fn run_tui(mut options: TuiOptions) -> ClientResult<()> {
                 }
             }
             UiEvent::Daemon(event) => {
+                let redraw = !matches!(
+                    event.as_ref(),
+                    ClientEvent::ThreadEventsPolled(result)
+                        if result.events.is_empty() && state.stream_warning.is_none()
+                );
                 apply_client_event(&mut state, &mut runtime, *event, &commands);
                 terminal.sync_audit_scroll(&state);
-                frames.schedule_frame();
+                if redraw {
+                    frames.schedule_frame();
+                }
             }
         }
     }

@@ -586,7 +586,7 @@ fn grant_profile_home(
         joined_thread_status(runtime, authority).map_err(|_| ProfileOpenFailure::Persistence)?;
     Ok(ProfileOpenResult::Opened {
         profile_id: reservation.profile_id,
-        thread,
+        thread: Box::new(thread),
         created,
     })
 }
@@ -610,8 +610,10 @@ fn opened_profile_home(
     }
     Ok(ProfileOpenResult::Opened {
         profile_id: profile_id.clone(),
-        thread: joined_thread_status(runtime, authority)
-            .map_err(|_| ProfileOpenFailure::Persistence)?,
+        thread: Box::new(
+            joined_thread_status(runtime, authority)
+                .map_err(|_| ProfileOpenFailure::Persistence)?,
+        ),
         created,
     })
 }
@@ -738,7 +740,7 @@ fn thread_spawn(
 
 fn start_thread_spawn(
     runtime: &DaemonRuntime,
-    parent_thread_id: Option<String>,
+    parent_thread_id: String,
     cwd: &Path,
     model: String,
     reasoning_effort: crate::model::ReasoningEffort,
@@ -775,9 +777,6 @@ fn start_thread_spawn(
             )));
         }
     }
-    let parent_thread_id = parent_thread_id.ok_or(ThreadSpawnFailure::Authority(
-        ThreadAuthorityError::ParentRequired,
-    ))?;
     let parent = store
         .thread_authority(&parent_thread_id)
         .map_err(|_| ThreadSpawnFailure::Persistence)?
@@ -2059,9 +2058,22 @@ fn joined_thread_status(
     authority: crate::daemon::protocol::ThreadAuthorityRecord,
 ) -> AppResult<ThreadStatus> {
     let live = runtime.thread_live_state(&authority.thread_id);
+    let store = runtime.paths.server_store()?;
+    let mut projected = legacy_status_authority(&authority)?;
+    projected.home_thread_id = match (authority.thread_kind, authority.profile_id.as_ref()) {
+        (ThreadKind::Home | ThreadKind::Child, Some(profile_id)) => store
+            .profile(profile_id)?
+            .and_then(|profile| profile.home_thread_id),
+        (ThreadKind::Home | ThreadKind::Child | ThreadKind::Legacy, _) => None,
+    };
+    let (child_returns, parent_answers) = store.thread_return_availability(&authority.thread_id)?;
     Ok(ThreadStatus {
-        authority: legacy_status_authority(&authority)?,
+        authority: projected,
         live,
+        return_availability: crate::daemon::protocol::ThreadReturnAvailability {
+            child_returns,
+            parent_answers,
+        },
     })
 }
 
@@ -2081,10 +2093,7 @@ pub(in crate::daemon::handlers) mod tests {
 
     #[cfg(target_os = "linux")]
     use crate::daemon::handlers::runs::{finish_run_after_event_collection, spawn_event_collector};
-    use crate::daemon::handlers::{
-        handle_line, handle_request, registry::tests::workspace_request,
-        runs::tests::response_result,
-    };
+    use crate::daemon::handlers::{handle_line, runs::tests::response_result};
     #[cfg(target_os = "linux")]
     use crate::{ApprovalMode, RunLedger, RunOptions};
     use crate::{
@@ -2161,26 +2170,17 @@ pub(in crate::daemon::handlers) mod tests {
     }
 
     #[test]
-    fn thread_spawn_rejects_an_unregistered_workspace_with_the_attach_error() {
+    fn thread_spawn_requires_a_parent_before_workspace_attachment() {
         let (_root, runtime) = bare_thread_test_runtime();
-        let response = handle_request(
+        let response = handle_line(
             &runtime,
-            workspace_request(
-                "spawn",
-                "thread.spawn",
-                json!({
-                    "action": "start",
-                    "parent_thread_id": null,
-                    "cwd": runtime.paths.workspace_root.to_string_lossy(),
-                    "model": "gpt-5.6-sol",
-                    "reasoning_effort": "none",
-                    "approval_policy": "prompt"
-                }),
+            &format!(
+                r#"{{"v":2,"id":"spawn","kind":"request","method":"thread.spawn","params":{{"action":"start","parent_thread_id":null,"cwd":"{}","model":"gpt-5.6-sol","reasoning_effort":"none","approval_policy":"prompt"}}}}"#,
+                runtime.paths.workspace_root.display()
             ),
         );
         let error = response.error.unwrap();
-        assert_eq!(error.code, ERROR_WORKSPACE_UNREGISTERED);
-        assert!(error.message.contains("platonic workspace create"));
+        assert_eq!(error.code, ERROR_MALFORMED_REQUEST);
         assert!(
             runtime
                 .paths
@@ -2212,7 +2212,7 @@ pub(in crate::daemon::handlers) mod tests {
         thread_spawn(
             runtime,
             ThreadSpawnParams::Start {
-                parent_thread_id,
+                parent_thread_id: parent_thread_id.expect("test child has a parent"),
                 cwd: cwd.to_string_lossy().into_owned(),
                 model: "gpt-5.6-sol".into(),
                 reasoning_effort: crate::daemon::protocol::ReasoningEffort::Xhigh,
@@ -2294,7 +2294,9 @@ pub(in crate::daemon::handlers) mod tests {
                 effect,
                 reason,
             }),
-            ProfileOpenResult::Opened { thread, .. } => Ok(ThreadSpawnResult::Spawned { thread }),
+            ProfileOpenResult::Opened { thread, .. } => {
+                Ok(ThreadSpawnResult::Spawned { thread: *thread })
+            }
             unexpected => Err(ThreadSpawnFailure::Conflict(format!(
                 "unexpected test home result: {unexpected:?}"
             ))),
@@ -2430,7 +2432,7 @@ pub(in crate::daemon::handlers) mod tests {
                 .map_err(profile_open_test_failure)?
             {
                 ProfileOpenResult::Opened { thread, .. } => {
-                    Ok(ThreadSpawnResult::Spawned { thread })
+                    Ok(ThreadSpawnResult::Spawned { thread: *thread })
                 }
                 ProfileOpenResult::Denied {
                     home_reservation_id,
@@ -2521,6 +2523,25 @@ pub(in crate::daemon::handlers) mod tests {
         );
         grant_thread(runtime, &spawn_id, "root_approver");
         thread_id
+    }
+
+    #[test]
+    fn legacy_status_does_not_fabricate_a_home_relation() {
+        let (_root, runtime) = thread_test_runtime();
+        let home_thread_id = coordinator_root(&runtime);
+        let mut legacy = runtime
+            .paths
+            .server_store()
+            .unwrap()
+            .thread_authority(&home_thread_id)
+            .unwrap()
+            .unwrap();
+        legacy.thread_id = "thread_legacy".into();
+        legacy.thread_kind = ThreadKind::Legacy;
+
+        let status = joined_thread_status(&runtime, legacy).unwrap();
+        assert!(status.authority.profile_id.is_some());
+        assert_eq!(status.authority.home_thread_id, None);
     }
 
     fn model_spawn_input(
@@ -3015,7 +3036,7 @@ pub(in crate::daemon::handlers) mod tests {
         handle_line(
             runtime,
             &format!(
-                r#"{{"v":1,"id":"stop","kind":"request","method":"thread.stop","params":{{"thread_id":"{thread_id}","actor":"{actor}"}}}}"#
+                r#"{{"v":2,"id":"stop","kind":"request","method":"thread.stop","params":{{"thread_id":"{thread_id}","actor":"{actor}"}}}}"#
             ),
         )
     }
@@ -3056,7 +3077,7 @@ pub(in crate::daemon::handlers) mod tests {
         let authority_response = handle_line(
             &runtime,
             &format!(
-                r#"{{"v":1,"id":"authority","kind":"request","method":"thread.authority","params":{{"thread_id":"{thread_id}"}}}}"#
+                r#"{{"v":2,"id":"authority","kind":"request","method":"thread.authority","params":{{"thread_id":"{thread_id}"}}}}"#
             ),
         );
         let authority: ThreadAuthorityResult = response_result(&authority_response);
@@ -3393,7 +3414,7 @@ pub(in crate::daemon::handlers) mod tests {
         let response = handle_line(
             &runtime,
             &format!(
-                r#"{{"v":1,"id":"authority","kind":"request","method":"thread.authority","params":{{"thread_id":"{thread_id}"}}}}"#
+                r#"{{"v":2,"id":"authority","kind":"request","method":"thread.authority","params":{{"thread_id":"{thread_id}"}}}}"#
             ),
         );
         let status: ThreadAuthorityResult = response_result(&response);
@@ -3507,7 +3528,7 @@ pub(in crate::daemon::handlers) mod tests {
         let fallback_status = handle_line(
             &fallback,
             &format!(
-                r#"{{"v":1,"id":"fallback-status","kind":"request","method":"thread.authority","params":{{"thread_id":"{fallback_thread}"}}}}"#
+                r#"{{"v":2,"id":"fallback-status","kind":"request","method":"thread.authority","params":{{"thread_id":"{fallback_thread}"}}}}"#
             ),
         );
         let fallback_status: ThreadAuthorityResult = response_result(&fallback_status);
@@ -3532,7 +3553,7 @@ pub(in crate::daemon::handlers) mod tests {
         let unavailable = handle_line(
             &required,
             &format!(
-                r#"{{"v":1,"id":"required","kind":"request","method":"profile.open","params":{{"action":"decide","home_reservation_id":"{spawn_id}","decision":{{"decision":"grant"}}}}}}"#
+                r#"{{"v":2,"id":"required","kind":"request","method":"profile.open","params":{{"action":"decide","home_reservation_id":"{spawn_id}","decision":{{"decision":"grant"}}}}}}"#
             ),
         );
         assert_eq!(
@@ -4108,7 +4129,7 @@ IFS= read -r _
             thread_spawn(
                 &runtime,
                 ThreadSpawnParams::Start {
-                    parent_thread_id: Some(parent.authority.thread_id),
+                    parent_thread_id: parent.authority.thread_id,
                     cwd: outside_dir.to_string_lossy().into_owned(),
                     model: "gpt-5.6-sol".into(),
                     reasoning_effort: crate::daemon::protocol::ReasoningEffort::Xhigh,
@@ -4250,7 +4271,7 @@ IFS= read -r _
         ));
         let list = handle_line(
             &restarted,
-            r#"{"v":1,"id":"list","kind":"request","method":"thread.list"}"#,
+            r#"{"v":2,"id":"list","kind":"request","method":"thread.list"}"#,
         );
         let listed: ThreadListResult = response_result(&list);
         assert_eq!(listed.threads.len(), 2);
@@ -4264,7 +4285,7 @@ IFS= read -r _
         let status = handle_line(
             &restarted,
             &format!(
-                r#"{{"v":1,"id":"status","kind":"request","method":"thread.status","params":{{"thread_id":"{}"}}}}"#,
+                r#"{{"v":2,"id":"status","kind":"request","method":"thread.status","params":{{"thread_id":"{}"}}}}"#,
                 child.authority.thread_id
             ),
         );
@@ -4302,13 +4323,15 @@ IFS= read -r _
         let store = runtime.paths.server_store().unwrap();
         assert_eq!(store.thread_authorities().unwrap().len(), 1);
         assert_eq!(
-            legacy_status_authority(
-                &store
+            joined_thread_status(
+                &runtime,
+                store
                     .thread_authority(&thread_id)
                     .unwrap()
                     .expect("granted authority is durable")
             )
-            .unwrap(),
+            .unwrap()
+            .authority,
             first.authority
         );
     }
@@ -4327,7 +4350,7 @@ IFS= read -r _
         ));
         let response = handle_line(
             &runtime,
-            r#"{"v":1,"id":"bad","kind":"request","method":"thread.spawn","params":{"action":"start","parent_thread_id":null,"cwd":"/tmp","model":"gpt-5.6-sol","reasoning_effort":"xhigh","approval_policy":"prompt","extra":true}}"#,
+            r#"{"v":2,"id":"bad","kind":"request","method":"thread.spawn","params":{"action":"start","parent_thread_id":null,"cwd":"/tmp","model":"gpt-5.6-sol","reasoning_effort":"xhigh","approval_policy":"prompt","extra":true}}"#,
         );
         assert_eq!(response.error.unwrap().code, ERROR_MALFORMED_REQUEST);
         let store = runtime.paths.server_store().unwrap();
@@ -4339,7 +4362,7 @@ IFS= read -r _
         let (_root, runtime) = thread_test_runtime();
         let response = handle_line(
             &runtime,
-            r#"{"v":1,"id":"bad","kind":"request","method":"thread.authority","params":{"thread_id":"thread_1","future":true}}"#,
+            r#"{"v":2,"id":"bad","kind":"request","method":"thread.authority","params":{"thread_id":"thread_1","future":true}}"#,
         );
         assert_eq!(response.error.unwrap().code, ERROR_MALFORMED_REQUEST);
     }
@@ -4360,7 +4383,7 @@ IFS= read -r _
         let malformed = handle_line(
             &runtime,
             &format!(
-                r#"{{"v":1,"id":"bad","kind":"request","method":"thread.send","params":{{"thread_id":"{thread_id}","controller_id":"","message":"no"}}}}"#
+                r#"{{"v":2,"id":"bad","kind":"request","method":"thread.send","params":{{"thread_id":"{thread_id}","controller_id":"","message":"no"}}}}"#
             ),
         );
         assert_eq!(malformed.error.unwrap().code, ERROR_MALFORMED_REQUEST);
@@ -4368,7 +4391,7 @@ IFS= read -r _
         let stale = handle_line(
             &runtime,
             &format!(
-                r#"{{"v":1,"id":"stale","kind":"request","method":"thread.send","params":{{"thread_id":"{thread_id}","controller_id":"controller_a","turn_id":"thread_turn_stale","message":"no"}}}}"#
+                r#"{{"v":2,"id":"stale","kind":"request","method":"thread.send","params":{{"thread_id":"{thread_id}","controller_id":"controller_a","turn_id":"thread_turn_stale","message":"no"}}}}"#
             ),
         );
         assert_eq!(
@@ -4383,20 +4406,22 @@ IFS= read -r _
         let invalid_events = handle_line(
             &runtime,
             &format!(
-                r#"{{"v":1,"id":"events","kind":"request","method":"thread.events","params":{{"thread_id":"{thread_id}","limit":0}}}}"#
+                r#"{{"v":2,"id":"events","kind":"request","method":"thread.events","params":{{"thread_id":"{thread_id}","limit":0}}}}"#
             ),
         );
         assert_eq!(invalid_events.error.unwrap().code, ERROR_MALFORMED_REQUEST);
         assert_eq!(runtime.thread_live_state(&thread_id).current_turn_id, None);
         let store = runtime.paths.server_store().unwrap();
         assert_eq!(
-            legacy_status_authority(
-                &store
+            joined_thread_status(
+                &runtime,
+                store
                     .thread_authority(&thread_id)
                     .unwrap()
                     .expect("granted authority is durable")
             )
-            .unwrap(),
+            .unwrap()
+            .authority,
             authority
         );
         // The workspace ledger holds session_runs; the server store holds

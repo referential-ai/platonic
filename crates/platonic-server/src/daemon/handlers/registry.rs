@@ -2,18 +2,20 @@ use super::control::store_error;
 use crate::{
     daemon::{
         protocol::{
-            AgentCreateParams, AgentCreateResult, AgentListParams, AgentListResult,
-            AgentStatusParams, AgentStatusResult, AgentSummary, ERROR_MALFORMED_REQUEST,
-            ERROR_NOT_FOUND, ERROR_WORKSPACE_BROKEN, Envelope, ProtocolResponse,
-            WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceHealthName, WorkspaceListParams,
-            WorkspaceListResult, WorkspaceStatusParams, WorkspaceStatusResult, WorkspaceSummary,
+            ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_WORKSPACE_BROKEN, Envelope,
+            ProfileContent, ProfileCreateParams, ProfileCreateResult, ProfileListParams,
+            ProfileListResult, ProfileRevision, ProfileStatus, ProfileStatusParams,
+            ProfileStatusResult, ProfileSummary, ProfileUpdateParams, ProfileUpdateResult,
+            ProtocolResponse, WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceHealthName,
+            WorkspaceListParams, WorkspaceListResult, WorkspaceStatusParams, WorkspaceStatusResult,
+            WorkspaceSummary,
         },
         runtime::DaemonRuntime,
     },
-    server_store::AgentRecord,
     thread_authority::now_ms,
     tool_catalog::is_known_tool,
 };
+use std::path::Path;
 
 fn workspace_summary(record: &crate::server_store::WorkspaceRecord) -> WorkspaceSummary {
     WorkspaceSummary {
@@ -188,159 +190,6 @@ pub(super) fn handle_workspace_status(
     }
 }
 
-fn agent_summary(record: &AgentRecord) -> AgentSummary {
-    AgentSummary {
-        id: record.id.clone(),
-        workspace_id: record.workspace_id.clone(),
-        model: record.model.clone(),
-        reasoning_effort: record.reasoning_effort,
-        approval_policy: record.approval_policy,
-        toolset: record.toolset.clone(),
-        created_at_ms: record.created_at_ms,
-    }
-}
-
-pub(super) fn handle_agent_create(
-    runtime: &DaemonRuntime,
-    request: Envelope,
-    params: AgentCreateParams,
-) -> Envelope {
-    if params.model.trim().is_empty() {
-        return Envelope::error(
-            request.id,
-            Some("agent.create".into()),
-            ERROR_MALFORMED_REQUEST,
-            "agent model must not be empty",
-        );
-    }
-    if params.toolset.is_empty() {
-        return Envelope::error(
-            request.id,
-            Some("agent.create".into()),
-            ERROR_MALFORMED_REQUEST,
-            "agent toolset must not be empty",
-        );
-    }
-    if let Some(tool) = params.toolset.iter().find(|tool| !is_known_tool(tool)) {
-        return Envelope::error(
-            request.id,
-            Some("agent.create".into()),
-            ERROR_MALFORMED_REQUEST,
-            format!("unknown tool in agent toolset: {tool}"),
-        );
-    }
-    let store = match runtime.paths.server_store() {
-        Ok(store) => store,
-        Err(error) => return store_error(request.id, "agent.create", error),
-    };
-    match store.workspace(&params.workspace_id) {
-        Ok(Some(workspace))
-            if workspace.health() == crate::server_store::WorkspaceHealth::Present => {}
-        Ok(Some(_)) => {
-            return Envelope::error(
-                request.id,
-                Some("agent.create".into()),
-                ERROR_WORKSPACE_BROKEN,
-                format!("workspace directory is missing: {}", params.workspace_id),
-            );
-        }
-        Ok(None) => {
-            return Envelope::error(
-                request.id,
-                Some("agent.create".into()),
-                ERROR_NOT_FOUND,
-                format!("workspace not found: {}", params.workspace_id),
-            );
-        }
-        Err(error) => return store_error(request.id, "agent.create", error),
-    }
-    match store.agent(&params.agent_id) {
-        Ok(Some(_)) => {
-            return Envelope::error(
-                request.id,
-                Some("agent.create".into()),
-                ERROR_MALFORMED_REQUEST,
-                format!("agent already exists: {}", params.agent_id),
-            );
-        }
-        Ok(None) => {}
-        Err(error) => return store_error(request.id, "agent.create", error),
-    }
-    let record = AgentRecord {
-        id: params.agent_id,
-        workspace_id: params.workspace_id,
-        model: params.model,
-        reasoning_effort: params.reasoning_effort,
-        approval_policy: params.approval_policy,
-        toolset: params.toolset,
-        created_at_ms: now_ms(),
-    };
-    match store.register_agent(&record) {
-        Ok(true) => Envelope::typed_response(
-            request.id,
-            ProtocolResponse::AgentCreate(AgentCreateResult {
-                agent: agent_summary(&record),
-            }),
-        ),
-        Ok(false) => Envelope::error(
-            request.id,
-            Some("agent.create".into()),
-            ERROR_MALFORMED_REQUEST,
-            format!("agent already exists: {}", record.id),
-        ),
-        Err(error) => store_error(request.id, "agent.create", error),
-    }
-}
-
-pub(super) fn handle_agent_list(
-    runtime: &DaemonRuntime,
-    request: Envelope,
-    _params: AgentListParams,
-) -> Envelope {
-    let store = match runtime.paths.server_store() {
-        Ok(store) => store,
-        Err(error) => return store_error(request.id, "agent.list", error),
-    };
-    match store.agents() {
-        Ok(records) => Envelope::typed_response(
-            request.id,
-            ProtocolResponse::AgentList(AgentListResult {
-                agents: records.iter().map(agent_summary).collect(),
-            }),
-        ),
-        Err(error) => store_error(request.id, "agent.list", error),
-    }
-}
-
-pub(super) fn handle_agent_status(
-    runtime: &DaemonRuntime,
-    request: Envelope,
-    params: AgentStatusParams,
-) -> Envelope {
-    let store = match runtime.paths.server_store() {
-        Ok(store) => store,
-        Err(error) => return store_error(request.id, "agent.status", error),
-    };
-    match store.agent(&params.agent_id) {
-        Ok(Some(record)) => Envelope::typed_response(
-            request.id,
-            ProtocolResponse::AgentStatus(AgentStatusResult {
-                agent: agent_summary(&record),
-            }),
-        ),
-        Ok(None) => Envelope::error(
-            request.id,
-            Some("agent.status".into()),
-            ERROR_NOT_FOUND,
-            format!("agent not found: {}", params.agent_id),
-        ),
-        Err(error) => store_error(request.id, "agent.status", error),
-    }
-}
-
-// Phase 1 installs daemon-owned profile operations without adding protocol-v1
-// methods. The v2 routing that calls these entry points belongs to a later issue.
-#[allow(dead_code)]
 pub(crate) mod profiles {
     use super::*;
     use crate::{
@@ -372,9 +221,21 @@ pub(crate) mod profiles {
         pub(crate) limit: usize,
     }
 
+    #[cfg(test)]
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub(crate) struct ProfileUpdateRequest {
         pub(crate) profile_id: ProfileId,
+        pub(crate) content: ProfileRevisionContent,
+        pub(crate) actor: String,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct ProfileFullUpdateRequest {
+        pub(crate) profile_id: ProfileId,
+        pub(crate) model: String,
+        pub(crate) reasoning_effort: ReasoningEffort,
+        pub(crate) approval_policy: ThreadApprovalPolicy,
+        pub(crate) toolset: Vec<String>,
         pub(crate) content: ProfileRevisionContent,
         pub(crate) actor: String,
     }
@@ -560,6 +421,7 @@ pub(crate) mod profiles {
         status_from_records(runtime, &workspace, profile, revision)
     }
 
+    #[cfg(test)]
     pub(crate) fn update(
         runtime: &DaemonRuntime,
         request: ProfileUpdateRequest,
@@ -583,6 +445,67 @@ pub(crate) mod profiles {
             .ok_or_else(|| {
                 ProfileRegistryError::ProfileNotFound(request.profile_id.as_str().into())
             })
+    }
+
+    pub(crate) fn update_all(
+        runtime: &DaemonRuntime,
+        request: ProfileFullUpdateRequest,
+    ) -> Result<ProfileStatus, ProfileRegistryError> {
+        validate_revision_input(
+            &request.model,
+            &request.toolset,
+            &request.actor,
+            &request.content,
+        )?;
+        let mut store = runtime.paths.server_store()?;
+        store
+            .update_profile(
+                &request.profile_id,
+                &request.model,
+                request.reasoning_effort,
+                request.approval_policy,
+                &request.toolset,
+                &request.actor,
+                now_ms(),
+                request.content,
+            )?
+            .ok_or_else(|| {
+                ProfileRegistryError::ProfileNotFound(request.profile_id.as_str().into())
+            })?;
+        status(runtime, &request.profile_id)
+    }
+
+    fn validate_revision_input(
+        model: &str,
+        toolset: &[String],
+        actor: &str,
+        content: &ProfileRevisionContent,
+    ) -> Result<(), ProfileRegistryError> {
+        if model.trim().is_empty() || toolset.is_empty() {
+            return Err(ProfileRegistryError::Invalid(
+                "model and toolset must not be empty".into(),
+            ));
+        }
+        ModelName::new(model.to_owned())
+            .map_err(|error| ProfileRegistryError::Invalid(error.to_string()))?;
+        ActorId::new(actor.to_owned())
+            .map_err(|error| ProfileRegistryError::Invalid(error.to_string()))?;
+        if actor.len() > MAX_PROFILE_REVISION_ACTOR_BYTES {
+            return Err(ProfileRegistryError::Invalid(format!(
+                "revision actor exceeds {MAX_PROFILE_REVISION_ACTOR_BYTES} bytes"
+            )));
+        }
+        for tool in toolset {
+            ToolName::new(tool.clone())
+                .map_err(|error| ProfileRegistryError::Invalid(error.to_string()))?;
+            if !is_known_tool(tool) {
+                return Err(ProfileRegistryError::Invalid(format!(
+                    "unknown tool in profile toolset: {tool}"
+                )));
+            }
+        }
+        content.validate()?;
+        Ok(())
     }
 
     fn status_from_records(
@@ -615,6 +538,221 @@ pub(crate) mod profiles {
     }
 }
 
+const NATIVE_OPERATOR: &str = "host_operator";
+
+pub(super) fn handle_profile_create(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: ProfileCreateParams,
+) -> Envelope {
+    let (model, toolset) = match profile_create_defaults(runtime, &params, request.id.clone()) {
+        Ok(defaults) => defaults,
+        Err(response) => return *response,
+    };
+    let result = profiles::create(
+        runtime,
+        profiles::ProfileCreateRequest {
+            workspace_id: params.workspace_id,
+            display_name: params.display_name,
+            model,
+            reasoning_effort: params.reasoning_effort,
+            approval_policy: params.approval_policy,
+            toolset,
+            content: store_content(params.content),
+            actor: NATIVE_OPERATOR.into(),
+        },
+    );
+    match result {
+        Ok(status) => Envelope::typed_response(
+            request.id,
+            ProtocolResponse::ProfileCreate(ProfileCreateResult {
+                status: wire_status(status),
+            }),
+        ),
+        Err(error) => profile_error(request.id, "profile.create", error),
+    }
+}
+
+pub(super) fn handle_profile_list(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: ProfileListParams,
+) -> Envelope {
+    match profiles::list(
+        runtime,
+        profiles::ProfileListRequest {
+            workspace_id: params.workspace_id,
+            limit: params.limit.unwrap_or(50),
+        },
+    ) {
+        Ok(result) => Envelope::typed_response(
+            request.id,
+            ProtocolResponse::ProfileList(ProfileListResult {
+                profiles: result.profiles.into_iter().map(wire_summary).collect(),
+                truncated: result.truncated,
+            }),
+        ),
+        Err(error) => profile_error(request.id, "profile.list", error),
+    }
+}
+
+pub(super) fn handle_profile_status(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: ProfileStatusParams,
+) -> Envelope {
+    match profiles::status(runtime, &params.profile_id) {
+        Ok(status) => Envelope::typed_response(
+            request.id,
+            ProtocolResponse::ProfileStatus(ProfileStatusResult {
+                status: wire_status(status),
+            }),
+        ),
+        Err(error) => profile_error(request.id, "profile.status", error),
+    }
+}
+
+pub(super) fn handle_profile_update(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: ProfileUpdateParams,
+) -> Envelope {
+    match profiles::update_all(
+        runtime,
+        profiles::ProfileFullUpdateRequest {
+            profile_id: params.profile_id,
+            model: params.model,
+            reasoning_effort: params.reasoning_effort,
+            approval_policy: params.approval_policy,
+            toolset: params.toolset,
+            content: store_content(params.content),
+            actor: NATIVE_OPERATOR.into(),
+        },
+    ) {
+        Ok(status) => Envelope::typed_response(
+            request.id,
+            ProtocolResponse::ProfileUpdate(ProfileUpdateResult {
+                status: wire_status(status),
+            }),
+        ),
+        Err(error) => profile_error(request.id, "profile.update", error),
+    }
+}
+
+fn profile_create_defaults(
+    runtime: &DaemonRuntime,
+    params: &ProfileCreateParams,
+    request_id: Option<String>,
+) -> Result<(String, Vec<String>), Box<Envelope>> {
+    if let (Some(model), Some(toolset)) = (&params.model, &params.toolset) {
+        return Ok((model.clone(), toolset.clone()));
+    }
+    let store = runtime
+        .paths
+        .server_store()
+        .map_err(|error| Box::new(store_error(request_id.clone(), "profile.create", error)))?;
+    let workspace = store
+        .workspace(&params.workspace_id)
+        .map_err(|error| Box::new(store_error(request_id.clone(), "profile.create", error)))?
+        .ok_or_else(|| {
+            Box::new(Envelope::error(
+                request_id.clone(),
+                Some("profile.create".into()),
+                ERROR_NOT_FOUND,
+                format!("workspace not found: {}", params.workspace_id),
+            ))
+        })?;
+    if workspace.health() == crate::server_store::WorkspaceHealth::Broken {
+        return Err(Box::new(Envelope::error(
+            request_id,
+            Some("profile.create".into()),
+            ERROR_WORKSPACE_BROKEN,
+            format!("workspace directory is missing: {}", params.workspace_id),
+        )));
+    }
+    let config = crate::config::Config::load(
+        Path::new(&workspace.root),
+        params.config_path.as_deref().map(Path::new),
+    )
+    .map_err(|error| {
+        Box::new(Envelope::error(
+            request_id,
+            Some("profile.create".into()),
+            ERROR_MALFORMED_REQUEST,
+            error.to_string(),
+        ))
+    })?;
+    Ok((
+        params.model.clone().unwrap_or(config.provider.model),
+        params.toolset.clone().unwrap_or(config.tools.enabled),
+    ))
+}
+
+fn store_content(content: ProfileContent) -> crate::server_store::ProfileRevisionContent {
+    crate::server_store::ProfileRevisionContent {
+        instructions_markdown: content.instructions_markdown,
+        memory_markdown: content.memory_markdown,
+        skill_refs: content.skill_refs,
+    }
+}
+
+fn wire_status(status: profiles::ProfileStatus) -> ProfileStatus {
+    ProfileStatus {
+        profile: wire_summary(status.summary),
+        revision: ProfileRevision {
+            revision: status.revision.revision,
+            parent_revision: status.revision.parent_revision,
+            actor: status.revision.actor,
+            created_at_ms: status.revision.created_at_ms,
+            content_hash: status.revision.content_hash,
+            content: ProfileContent {
+                instructions_markdown: status.revision.content.instructions_markdown,
+                memory_markdown: status.revision.content.memory_markdown,
+                skill_refs: status.revision.content.skill_refs,
+            },
+        },
+    }
+}
+
+fn wire_summary(summary: profiles::ProfileSummary) -> ProfileSummary {
+    let profile = summary.profile;
+    ProfileSummary {
+        id: profile.id,
+        display_name: profile.display_name,
+        workspace_id: profile.workspace_id,
+        model: profile.model,
+        reasoning_effort: profile.reasoning_effort,
+        approval_policy: profile.approval_policy,
+        toolset: profile.toolset,
+        current_revision: profile.current_revision,
+        home_thread_id: profile.home_thread_id,
+        workspace_health: match summary.workspace_health {
+            crate::server_store::WorkspaceHealth::Present => WorkspaceHealthName::Present,
+            crate::server_store::WorkspaceHealth::Broken => WorkspaceHealthName::Broken,
+        },
+        created_at_ms: profile.created_at_ms,
+    }
+}
+
+fn profile_error(
+    request_id: Option<String>,
+    method: &'static str,
+    error: profiles::ProfileRegistryError,
+) -> Envelope {
+    let code = match error {
+        profiles::ProfileRegistryError::WorkspaceNotFound(_)
+        | profiles::ProfileRegistryError::ProfileNotFound(_) => ERROR_NOT_FOUND,
+        profiles::ProfileRegistryError::WorkspaceBroken(_) => ERROR_WORKSPACE_BROKEN,
+        profiles::ProfileRegistryError::DuplicateName { .. }
+        | profiles::ProfileRegistryError::Invalid(_)
+        | profiles::ProfileRegistryError::Content(_) => ERROR_MALFORMED_REQUEST,
+        profiles::ProfileRegistryError::Store(error) => {
+            return store_error(request_id, method, error);
+        }
+    };
+    Envelope::error(request_id, Some(method.into()), code, error.to_string())
+}
+
 #[cfg(test)]
 pub(in crate::daemon::handlers) mod tests {
     use super::profiles::{
@@ -642,7 +780,7 @@ pub(in crate::daemon::handlers) mod tests {
         params: serde_json::Value,
     ) -> Envelope {
         serde_json::from_value(json!({
-            "v": 1,
+            "v": 2,
             "id": id,
             "kind": "request",
             "method": method,
@@ -660,7 +798,7 @@ pub(in crate::daemon::handlers) mod tests {
         handle_line(
             runtime,
             &json!({
-                "v": 1,
+                "v": 2,
                 "id": id,
                 "kind": "request",
                 "method": method,
@@ -863,9 +1001,9 @@ pub(in crate::daemon::handlers) mod tests {
     }
 
     #[test]
-    fn agent_create_list_and_status_are_typed_and_fail_before_partial_rows() {
+    fn profile_wire_create_list_status_and_update_are_typed() {
         let (root, runtime) = bare_thread_test_runtime();
-        let workspace_root = root.path().join("agent-workspace");
+        let workspace_root = root.path().join("profile-wire-workspace");
         std::fs::create_dir(&workspace_root).unwrap();
         let created_workspace = handle_request(
             &runtime,
@@ -878,62 +1016,81 @@ pub(in crate::daemon::handlers) mod tests {
         let workspace: WorkspaceCreateResult = response_result(&created_workspace);
         let workspace_id = workspace.workspace.id;
         let create_params = json!({
-            "agent_id": "builder",
             "workspace_id": workspace_id,
+            "display_name": "builder",
             "model": "gpt-5.6-sol",
             "reasoning_effort": "xhigh",
             "approval_policy": "prompt",
-            "toolset": ["file.read", "file.write"]
+            "toolset": ["file.read", "file.write"],
+            "content": {
+                "instructions_markdown": "Build carefully.",
+                "memory_markdown": "No secrets.",
+                "skill_refs": ["skill:review"]
+            }
         });
 
         let created = handle_request(
             &runtime,
-            workspace_request("ac", "agent.create", create_params.clone()),
+            workspace_request("pc", "profile.create", create_params.clone()),
         );
-        let created: AgentCreateResult = response_result(&created);
-        assert_eq!(created.agent.id.as_str(), "builder");
-        assert_eq!(created.agent.workspace_id, workspace_id);
-        assert_eq!(created.agent.model, "gpt-5.6-sol");
-        assert_eq!(
-            created.agent.reasoning_effort,
-            crate::daemon::protocol::ReasoningEffort::Xhigh
-        );
-        assert_eq!(created.agent.approval_policy, ThreadApprovalPolicy::Prompt);
-        assert_eq!(created.agent.toolset, ["file.read", "file.write"]);
+        let created: ProfileCreateResult = response_result(&created);
+        let profile_id = created.status.profile.id.clone();
+        assert_eq!(created.status.profile.display_name, "builder");
+        assert_eq!(created.status.profile.workspace_id, workspace_id);
+        assert_eq!(created.status.revision.revision, 1);
 
-        let listed = handle_request(&runtime, workspace_request("al", "agent.list", json!({})));
-        let listed: AgentListResult = response_result(&listed);
-        assert_eq!(listed.agents, [created.agent.clone()]);
+        let listed = handle_request(
+            &runtime,
+            workspace_request("pl", "profile.list", json!({"workspace_id": workspace_id})),
+        );
+        let listed: ProfileListResult = response_result(&listed);
+        assert_eq!(listed.profiles, [created.status.profile.clone()]);
         let status = handle_request(
             &runtime,
-            workspace_request("as", "agent.status", json!({"agent_id": "builder"})),
+            workspace_request("ps", "profile.status", json!({"profile_id": profile_id})),
         );
-        let status: AgentStatusResult = response_result(&status);
-        assert_eq!(status.agent, created.agent);
+        let status: ProfileStatusResult = response_result(&status);
+        assert_eq!(status.status, created.status);
+
+        let updated = handle_request(
+            &runtime,
+            workspace_request(
+                "pu",
+                "profile.update",
+                json!({
+                    "profile_id": profile_id,
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                    "approval_policy": "yolo",
+                    "toolset": ["file.read"],
+                    "content": {
+                        "instructions_markdown": "Review carefully.",
+                        "memory_markdown": "No secrets.",
+                        "skill_refs": []
+                    }
+                }),
+            ),
+        );
+        let updated: ProfileUpdateResult = response_result(&updated);
+        assert_eq!(updated.status.profile.current_revision, 2);
+        assert_eq!(
+            updated.status.profile.approval_policy,
+            ThreadApprovalPolicy::Yolo
+        );
+        assert_eq!(updated.status.revision.parent_revision, Some(1));
 
         let duplicate = handle_request(
             &runtime,
-            workspace_request("dup", "agent.create", create_params),
+            workspace_request("dup", "profile.create", create_params),
         );
         assert_eq!(duplicate.error.unwrap().code, ERROR_MALFORMED_REQUEST);
-        let invalid_id = handle_workspace_line(
-            &runtime,
-            "bad-id",
-            "agent.create",
-            json!({
-                "agent_id": " ", "workspace_id": workspace_id,
-                "model": "gpt-5.6-sol", "reasoning_effort": "none",
-                "approval_policy": "prompt", "toolset": ["file.read"]
-            }),
-        );
-        assert_eq!(invalid_id.error.unwrap().code, ERROR_MALFORMED_REQUEST);
         let invalid_tool = handle_request(
             &runtime,
             workspace_request(
                 "bad-tool",
-                "agent.create",
+                "profile.create",
                 json!({
-                    "agent_id": "bad-tool", "workspace_id": workspace_id,
+                    "display_name": "bad-tool", "workspace_id": workspace_id,
                     "model": "gpt-5.6-sol", "reasoning_effort": "none",
                     "approval_policy": "prompt", "toolset": ["credential.store"]
                 }),
@@ -944,55 +1101,39 @@ pub(in crate::daemon::handlers) mod tests {
             &runtime,
             workspace_request(
                 "missing-workspace",
-                "agent.create",
+                "profile.create",
                 json!({
-                    "agent_id": "orphan", "workspace_id": "ws-missing",
+                    "display_name": "orphan", "workspace_id": "ws-missing",
                     "model": "gpt-5.6-sol", "reasoning_effort": "none",
                     "approval_policy": "prompt", "toolset": ["file.read"]
                 }),
             ),
         );
         assert_eq!(missing_workspace.error.unwrap().code, ERROR_NOT_FOUND);
-        let unknown_field = handle_workspace_line(
-            &runtime,
-            "unknown",
-            "agent.create",
-            json!({
-                "agent_id": "unknown", "workspace_id": workspace_id,
-                "model": "gpt-5.6-sol", "reasoning_effort": "none",
-                "approval_policy": "prompt", "toolset": ["file.read"],
-                "credential": "must-not-land"
-            }),
-        );
-        assert_eq!(unknown_field.error.unwrap().code, ERROR_MALFORMED_REQUEST);
-        let missing_agent = handle_request(
+        let missing_profile = handle_request(
             &runtime,
             workspace_request(
-                "missing-agent",
-                "agent.status",
-                json!({"agent_id": "missing"}),
+                "missing-profile",
+                "profile.status",
+                json!({"profile_id": "profile-missing"}),
             ),
         );
-        assert_eq!(missing_agent.error.unwrap().code, ERROR_NOT_FOUND);
+        assert_eq!(missing_profile.error.unwrap().code, ERROR_NOT_FOUND);
 
         std::fs::remove_dir_all(&workspace_root).unwrap();
         let broken_workspace = handle_request(
             &runtime,
             workspace_request(
                 "broken",
-                "agent.create",
+                "profile.create",
                 json!({
-                    "agent_id": "broken", "workspace_id": workspace_id,
+                    "display_name": "broken", "workspace_id": workspace_id,
                     "model": "gpt-5.6-sol", "reasoning_effort": "none",
                     "approval_policy": "prompt", "toolset": ["file.read"]
                 }),
             ),
         );
         assert_eq!(broken_workspace.error.unwrap().code, ERROR_WORKSPACE_BROKEN);
-
-        let listed = handle_request(&runtime, workspace_request("al2", "agent.list", json!({})));
-        let listed: AgentListResult = response_result(&listed);
-        assert_eq!(listed.agents.len(), 1);
     }
 
     fn profile_create_request(workspace_id: &str, display_name: &str) -> ProfileCreateRequest {

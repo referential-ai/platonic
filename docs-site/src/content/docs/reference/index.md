@@ -16,7 +16,7 @@ Use this section for exact names and interface shapes. Narrative operating guida
 | --- | --- |
 | `platonic serve` | Run the persistent host server |
 | `platonic workspace ...` | Register and inspect workspaces |
-| `platonic agent ...` | Manage configured agent profiles |
+| `platonic profile ...` | Create, update, inspect, and open workspace profiles |
 | `plato "..."` | Run a one-shot prompt |
 | `plato replay` | Read and validate recorded work offline |
 
@@ -27,6 +27,6 @@ The [configuration shell](./configuration/#resolution-order) records precedence 
 ## Stable terms
 
 - **Workspace:** a named, registered directory with one ledger.
-- **Agent:** a configured profile bound to one workspace.
+- **Profile:** configured, revisioned defaults bound to one workspace.
 - **Thread:** durable authority that carries runs.
 - **Run:** one bounded execution recorded in the ledger.

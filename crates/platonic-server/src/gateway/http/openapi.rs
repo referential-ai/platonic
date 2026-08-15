@@ -8,6 +8,12 @@ enum RequestBody {
 }
 
 #[derive(Clone, Copy)]
+enum EventCursor {
+    Thread,
+    Run,
+}
+
+#[derive(Clone, Copy)]
 struct Operation {
     method: &'static str,
     path: &'static str,
@@ -15,117 +21,135 @@ struct Operation {
     summary: &'static str,
     path_parameters: &'static [&'static str],
     body: Option<RequestBody>,
-    sse: bool,
+    sse: Option<EventCursor>,
 }
 
 const OPERATIONS: &[Operation] = &[
     Operation {
         method: "get",
-        path: "/v1/status",
+        path: "/v2/status",
         operation_id: "getStatus",
         summary: "Read authoritative daemon status",
         path_parameters: &[],
         body: None,
-        sse: false,
+        sse: None,
     },
     Operation {
         method: "get",
-        path: "/v1/workspaces",
+        path: "/v2/workspaces",
         operation_id: "listWorkspaces",
         summary: "List workspaces admitted for the principal",
         path_parameters: &[],
         body: None,
-        sse: false,
+        sse: None,
     },
     Operation {
         method: "get",
-        path: "/v1/workspaces/{workspace_id}/threads",
-        operation_id: "listThreads",
-        summary: "List existing threads",
+        path: "/v2/workspaces/{workspace_id}/profiles",
+        operation_id: "listProfiles",
+        summary: "List profiles admitted for the principal",
         path_parameters: &["workspace_id"],
         body: None,
-        sse: false,
+        sse: None,
     },
     Operation {
         method: "get",
-        path: "/v1/workspaces/{workspace_id}/threads/{thread_id}",
+        path: "/v2/workspaces/{workspace_id}/profiles/{profile_id}",
+        operation_id: "getProfile",
+        summary: "Read an admitted profile",
+        path_parameters: &["workspace_id", "profile_id"],
+        body: None,
+        sse: None,
+    },
+    Operation {
+        method: "get",
+        path: "/v2/workspaces/{workspace_id}/profiles/{profile_id}/threads",
+        operation_id: "listThreads",
+        summary: "List existing threads",
+        path_parameters: &["workspace_id", "profile_id"],
+        body: None,
+        sse: None,
+    },
+    Operation {
+        method: "get",
+        path: "/v2/workspaces/{workspace_id}/profiles/{profile_id}/threads/{thread_id}",
         operation_id: "getThread",
         summary: "Read an existing thread",
-        path_parameters: &["workspace_id", "thread_id"],
+        path_parameters: &["workspace_id", "profile_id", "thread_id"],
         body: None,
-        sse: false,
+        sse: None,
     },
     Operation {
         method: "get",
-        path: "/v1/workspaces/{workspace_id}/threads/{thread_id}/authority",
+        path: "/v2/workspaces/{workspace_id}/profiles/{profile_id}/threads/{thread_id}/authority",
         operation_id: "getThreadAuthority",
         summary: "Read immutable thread authority",
-        path_parameters: &["workspace_id", "thread_id"],
+        path_parameters: &["workspace_id", "profile_id", "thread_id"],
         body: None,
-        sse: false,
+        sse: None,
     },
     Operation {
         method: "post",
-        path: "/v1/workspaces/{workspace_id}/threads/{thread_id}/messages",
+        path: "/v2/workspaces/{workspace_id}/profiles/{profile_id}/threads/{thread_id}/messages",
         operation_id: "sendThreadMessage",
         summary: "Start or steer a turn on an existing thread",
-        path_parameters: &["workspace_id", "thread_id"],
+        path_parameters: &["workspace_id", "profile_id", "thread_id"],
         body: Some(RequestBody::Message),
-        sse: false,
+        sse: None,
     },
     Operation {
         method: "get",
-        path: "/v1/workspaces/{workspace_id}/threads/{thread_id}/events",
+        path: "/v2/workspaces/{workspace_id}/profiles/{profile_id}/threads/{thread_id}/events",
         operation_id: "streamThreadEvents",
         summary: "Stream live thread events",
-        path_parameters: &["workspace_id", "thread_id"],
+        path_parameters: &["workspace_id", "profile_id", "thread_id"],
         body: None,
-        sse: true,
+        sse: Some(EventCursor::Thread),
     },
     Operation {
         method: "post",
-        path: "/v1/workspaces/{workspace_id}/threads/{thread_id}/stop",
+        path: "/v2/workspaces/{workspace_id}/profiles/{profile_id}/threads/{thread_id}/stop",
         operation_id: "stopThread",
         summary: "Stop an existing thread",
-        path_parameters: &["workspace_id", "thread_id"],
+        path_parameters: &["workspace_id", "profile_id", "thread_id"],
         body: Some(RequestBody::Empty),
-        sse: false,
+        sse: None,
     },
     Operation {
         method: "get",
-        path: "/v1/workspaces/{workspace_id}/runs/{run_id}/transcript",
+        path: "/v2/workspaces/{workspace_id}/profiles/{profile_id}/runs/{run_id}/transcript",
         operation_id: "getRunTranscript",
         summary: "Read a durable run transcript",
-        path_parameters: &["workspace_id", "run_id"],
+        path_parameters: &["workspace_id", "profile_id", "run_id"],
         body: None,
-        sse: false,
+        sse: None,
     },
     Operation {
         method: "get",
-        path: "/v1/workspaces/{workspace_id}/runs/{run_id}/events",
+        path: "/v2/workspaces/{workspace_id}/profiles/{profile_id}/runs/{run_id}/events",
         operation_id: "streamRunEvents",
         summary: "Stream run events",
-        path_parameters: &["workspace_id", "run_id"],
+        path_parameters: &["workspace_id", "profile_id", "run_id"],
         body: None,
-        sse: true,
+        sse: Some(EventCursor::Run),
     },
     Operation {
         method: "post",
-        path: "/v1/workspaces/{workspace_id}/runs/{run_id}/cancel",
+        path: "/v2/workspaces/{workspace_id}/profiles/{profile_id}/runs/{run_id}/cancel",
         operation_id: "cancelRun",
         summary: "Cancel an active run with principal attribution",
-        path_parameters: &["workspace_id", "run_id"],
+        path_parameters: &["workspace_id", "profile_id", "run_id"],
         body: Some(RequestBody::Empty),
-        sse: false,
+        sse: None,
     },
     Operation {
         method: "post",
-        path: "/v1/workspaces/{workspace_id}/runs/{run_id}/approvals/{tool_call_id}",
+        path: "/v2/workspaces/{workspace_id}/profiles/{profile_id}/runs/{run_id}/approvals/{tool_call_id}",
         operation_id: "decideApproval",
         summary: "Grant or deny one pending approval",
-        path_parameters: &["workspace_id", "run_id", "tool_call_id"],
+        path_parameters: &["workspace_id", "profile_id", "run_id", "tool_call_id"],
         body: Some(RequestBody::Approval),
-        sse: false,
+        sse: None,
     },
 ];
 
@@ -145,16 +169,16 @@ pub fn gateway_openapi() -> String {
         "openapi": "3.1.0",
         "info": {
             "title": "Platonic authenticated HTTP gateway",
-            "version": "1.0.0",
-            "description": "A translating adapter over the native typed NDJSON v1 protocol. It is plaintext, has no CORS, cookies, browser session, proxy-header identity, or in-process TLS, and is intended to sit behind an operator-owned TLS proxy. Actor and controller identity always come from the authenticated principal."
+            "version": "2.0.0",
+            "description": "A translating adapter over the native typed NDJSON v2 protocol. It is plaintext, has no CORS, cookies, browser session, proxy-header identity, or in-process TLS, and is intended to sit behind an operator-owned TLS proxy. Actor and controller identity always come from the authenticated principal."
         },
         "servers": [{"url": "http://127.0.0.1:8787"}],
         "security": [{"bearerAuth": []}],
         "paths": paths,
         "components": components(),
-        "x-workspace-scoping": "Every path workspace and target is checked against the authenticated principal's fixed workspace allowlist. Crossed or unavailable targets fail closed.",
+        "x-profile-scoping": "Every path workspace, profile, and target is checked against the authenticated principal's fixed workspace allowlist and optional profile allowlist. Profile scope may narrow its workspace ceiling and never widen it. Crossed or unavailable targets fail closed.",
         "x-idempotency": "Message, stop, cancel, and approval mutations provide at-most-once gateway submission per principal and Idempotency-Key. Completed outcomes replay exactly; crash-ambiguous outcomes require readback and a new key.",
-        "x-sse-cursors": "Last-Event-ID is the exact next native offset. Resume is promised only while the same daemon-lifetime buffer and cursor remain available. Restart, expiry, lag, or an unknown cursor returns event_cursor_unavailable and requires status or transcript readback.",
+        "x-sse-cursors": "Thread Last-Event-ID is <live_epoch_id>:<next_native_offset>; run Last-Event-ID is the next native offset. Resume is promised only while the referenced native buffer remains available. Epoch change, restart, expiry, lag, or an unknown cursor returns event_cursor_unavailable and requires status or transcript readback.",
         "x-limits": {
             "json_body_bytes": 786432,
             "message_bytes": 262144,
@@ -210,8 +234,13 @@ fn operation(spec: &Operation) -> Value {
     if spec.body.is_some() {
         parameters.push(json!({"$ref": "#/components/parameters/IdempotencyKey"}));
     }
-    if spec.sse {
-        parameters.push(json!({"$ref": "#/components/parameters/LastEventId"}));
+    if let Some(cursor) = spec.sse {
+        parameters.push(json!({
+            "$ref": match cursor {
+                EventCursor::Thread => "#/components/parameters/ThreadLastEventId",
+                EventCursor::Run => "#/components/parameters/RunLastEventId",
+            }
+        }));
     }
 
     let mut value = json!({
@@ -237,13 +266,16 @@ fn operation(spec: &Operation) -> Value {
 }
 
 fn responses(spec: &Operation) -> Value {
-    let success = if spec.sse {
+    let success = if let Some(cursor) = spec.sse {
         json!({
             "description": "SSE events with stable cursor IDs and JSON native event data",
             "content": {
                 "text/event-stream": {
                     "schema": {"type": "string"},
-                    "example": "id: 8\\ndata: {\"offset\":7,\"event\":{\"kind\":\"test\"}}\\n\\n"
+                    "example": match cursor {
+                        EventCursor::Thread => "id: epoch_1:8\\ndata: {\"live_epoch_id\":\"epoch_1\",\"offset\":7,\"event\":{\"kind\":\"test\"}}\\n\\n",
+                        EventCursor::Run => "id: 8\\ndata: {\"offset\":7,\"event\":{\"kind\":\"test\"}}\\n\\n",
+                    }
                 }
             }
         })
@@ -333,11 +365,19 @@ fn components() -> Value {
                 "schema": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^\\S+$"},
                 "example": "01J5Z9Y7Z8Y4VQG9G6H3M2K1PT"
             },
-            "LastEventId": {
+            "ThreadLastEventId": {
                 "name": "Last-Event-ID",
                 "in": "header",
                 "required": false,
-                "description": "Exact next native event offset emitted by a prior SSE event in the same available daemon-lifetime cursor.",
+                "description": "Exact live epoch and next native event offset emitted by a prior thread SSE event.",
+                "schema": {"type": "string", "pattern": "^[^:]+:[0-9]+$"},
+                "example": "epoch_1:8"
+            },
+            "RunLastEventId": {
+                "name": "Last-Event-ID",
+                "in": "header",
+                "required": false,
+                "description": "Exact next native event offset emitted by a prior run SSE event in the same available daemon-lifetime cursor.",
                 "schema": {"type": "integer", "format": "uint64", "minimum": 0},
                 "example": 8
             }
@@ -375,7 +415,7 @@ fn components() -> Value {
             },
             "NativeOutcome": {
                 "type": "object",
-                "description": "The exact typed native v1 result for the mapped operation.",
+                "description": "The exact typed native v2 result for the mapped operation.",
                 "additionalProperties": true
             },
             "Error": {
@@ -413,7 +453,7 @@ mod tests {
         assert_eq!(gateway_openapi(), generated);
         let parsed: Value = serde_json::from_str(&generated).unwrap();
         assert_eq!(parsed["openapi"], "3.1.0");
-        assert_eq!(parsed["info"]["version"], "1.0.0");
+        assert_eq!(parsed["info"]["version"], "2.0.0");
         assert_eq!(parsed["paths"].as_object().unwrap().len(), OPERATIONS.len());
         for spec in OPERATIONS {
             let operation = &parsed["paths"][spec.path][spec.method];
@@ -424,14 +464,20 @@ mod tests {
                     parameter["$ref"] == "#/components/parameters/IdempotencyKey"
                 }));
             }
-            if spec.sse {
-                assert!(parameters.iter().any(|parameter| {
-                    parameter["$ref"] == "#/components/parameters/LastEventId"
-                }));
+            if let Some(cursor) = spec.sse {
+                let reference = match cursor {
+                    EventCursor::Thread => "#/components/parameters/ThreadLastEventId",
+                    EventCursor::Run => "#/components/parameters/RunLastEventId",
+                };
+                assert!(
+                    parameters
+                        .iter()
+                        .any(|parameter| parameter["$ref"] == reference)
+                );
             }
         }
         assert_eq!(parsed["security"][0]["bearerAuth"], json!([]));
-        assert!(parsed["x-workspace-scoping"].is_string());
+        assert!(parsed["x-profile-scoping"].is_string());
         assert!(parsed["x-limits"].is_object());
         assert!(
             parsed["x-gateway-error-codes"]
@@ -442,7 +488,7 @@ mod tests {
         );
 
         let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../openapi/gateway-v1.yaml");
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../openapi/gateway-v2.yaml");
         if std::env::var_os("PLATONIC_UPDATE_OPENAPI").is_some() {
             std::fs::write(&path, &generated).unwrap();
         }

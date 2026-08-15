@@ -150,15 +150,21 @@ owns the architecture: the server, not the gateway, owns runs, tools, policy,
 approvals, and the ledger.
 
 In terminal 2, register the workspace and use the configured provider credential
-to create the mapped thread. Then remove provider credentials and start the
+to create a profile and its mapped home. Copy the server-minted ids from each
+JSON result. Then remove provider credentials and start the
 gateway from the private L5 environment that loads the approved file without
 terminal or pane input:
 
 ```bash
 cd "$HOME/plato-discord-workspace"
 platonic workspace create discord "$PWD"
-# Approve the prompt, then replace thread_123 in gateway.toml with the printed id.
-plato thread spawn --model '~openai/gpt-latest' --reasoning-effort none
+# Copy the workspace id from the result above.
+workspace_id=<workspace-id>
+platonic profile create discord "$workspace_id" \
+  --model '~openai/gpt-latest' --reasoning-effort none
+# Copy the profile id, approve its home, then put the returned thread id in gateway.toml.
+profile_id=<profile-id>
+platonic profile open "$profile_id" --approve
 unset OPENAI_API_KEY OPENROUTER_API_KEY
 platonic gateway discord --workspace "$PWD" \
   --config "$HOME/.config/plato/gateway.toml"

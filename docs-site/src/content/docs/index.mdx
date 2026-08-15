@@ -30,11 +30,11 @@ Platonic is the self-hosted agent server. **Plato Agent** is the client distribu
 
 ## One working model
 
-A workspace owns agent profiles. Agent profiles supply defaults to durable threads. The Platonic server owns provider calls, tools, policy, approvals, and the replayable ledger; clients attach through the typed protocol.
+A workspace owns profiles. Each profile supplies versioned defaults and owns one durable home thread. The Platonic server owns provider calls, tools, policy, approvals, and the replayable ledger; clients attach through the typed protocol.
 
-<ol class="system-flow" aria-label="Workspace to agent profile to thread to run to ledger">
+<ol class="system-flow" aria-label="Workspace to profile to thread to run to ledger">
   <li><small aria-hidden="true">01</small><strong>Workspace</strong></li>
-  <li><small aria-hidden="true">02</small><strong>Agent profile</strong></li>
+  <li><small aria-hidden="true">02</small><strong>Profile</strong></li>
   <li><small aria-hidden="true">03</small><strong>Thread</strong></li>
   <li><small aria-hidden="true">04</small><strong>Run</strong></li>
   <li><small aria-hidden="true">05</small><strong>Ledger</strong></li>

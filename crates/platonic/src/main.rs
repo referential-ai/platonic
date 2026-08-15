@@ -3,7 +3,10 @@ use platonic_client::{
     client::{DaemonClient, DaemonConnectionConfig},
     paths,
 };
-use platonic_protocol::{AgentId, ReasoningEffort, ThreadApprovalPolicy};
+use platonic_protocol::{
+    ProfileContent, ProfileCreateParams, ProfileId, ProfileOpenDecision, ProfileOpenResult,
+    ProfileUpdateParams, ReasoningEffort, ThreadApprovalPolicy, ThreadRepositoryRequest,
+};
 use platonic_server::{
     AppError, AppResult,
     config::Config,
@@ -71,10 +74,10 @@ enum Command {
         #[arg(long, value_name = "PATH", global = true)]
         socket: Option<PathBuf>,
     },
-    /// Manage configured agent profiles.
-    Agent {
+    /// Manage workspace-bound profiles.
+    Profile {
         #[command(subcommand)]
-        command: AgentCommand,
+        command: ProfileCommand,
         #[arg(long, value_name = "PATH", global = true)]
         socket: Option<PathBuf>,
     },
@@ -104,11 +107,11 @@ enum WorkspaceCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum AgentCommand {
-    /// Create a configured agent profile.
+enum ProfileCommand {
+    /// Create a workspace-bound profile.
     Create {
-        #[arg(value_name = "AGENT_ID")]
-        agent_id: String,
+        #[arg(value_name = "NAME")]
+        display_name: String,
         #[arg(value_name = "WORKSPACE_ID")]
         workspace_id: String,
         #[arg(long, value_name = "FILE")]
@@ -131,13 +134,62 @@ enum AgentCommand {
         approval_policy: ThreadApprovalPolicy,
         #[arg(long = "tool", value_name = "TOOL")]
         toolset: Vec<String>,
+        #[arg(long, value_name = "FILE")]
+        instructions: Option<PathBuf>,
+        #[arg(long, value_name = "FILE")]
+        memory: Option<PathBuf>,
+        #[arg(long = "skill", value_name = "REF")]
+        skills: Vec<String>,
     },
-    /// List every configured agent profile.
-    List,
-    /// Read one configured agent profile.
+    /// List profiles, optionally within one workspace.
+    List {
+        #[arg(long, value_name = "WORKSPACE_ID")]
+        workspace: Option<String>,
+        #[arg(long, value_name = "COUNT")]
+        limit: Option<usize>,
+    },
+    /// Read one profile and its current content revision.
     Status {
-        #[arg(value_name = "AGENT_ID")]
-        agent_id: String,
+        #[arg(value_name = "PROFILE_ID")]
+        profile_id: String,
+    },
+    /// Update future-thread defaults and append one content revision.
+    Update {
+        #[arg(value_name = "PROFILE_ID")]
+        profile_id: String,
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        #[arg(long, value_name = "EFFORT", value_parser = parse_reasoning_effort)]
+        reasoning_effort: Option<ReasoningEffort>,
+        #[arg(long, value_name = "POLICY", value_parser = parse_approval_policy)]
+        approval_policy: Option<ThreadApprovalPolicy>,
+        #[arg(long = "tool", value_name = "TOOL")]
+        toolset: Vec<String>,
+        #[arg(long, value_name = "FILE")]
+        instructions: Option<PathBuf>,
+        #[arg(long, value_name = "FILE")]
+        memory: Option<PathBuf>,
+        #[arg(long = "skill", value_name = "REF", conflicts_with = "clear_skills")]
+        skills: Vec<String>,
+        #[arg(long)]
+        clear_skills: bool,
+    },
+    /// Resolve or create a profile's durable home thread.
+    Open {
+        #[arg(value_name = "PROFILE_ID")]
+        profile_id: String,
+        #[arg(long = "repo", value_name = "PATH")]
+        repositories: Vec<String>,
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        working_repository: String,
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        working_subdir: String,
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
+        #[arg(long)]
+        approve: bool,
     },
 }
 
@@ -213,7 +265,7 @@ fn run() -> AppResult<()> {
             Ok(())
         }
         Some(Command::Workspace { command, socket }) => run_workspace(command, socket),
-        Some(Command::Agent { command, socket }) => run_agent(command, socket),
+        Some(Command::Profile { command, socket }) => run_profile(command, socket),
         Some(Command::Gateway { command }) => match command {
             GatewayCommand::Discord {
                 workspace,
@@ -279,23 +331,26 @@ fn connect_control(socket: Option<PathBuf>) -> AppResult<DaemonClient> {
     )?)
 }
 
-fn run_agent(command: AgentCommand, socket: Option<PathBuf>) -> AppResult<()> {
+fn run_profile(command: ProfileCommand, socket: Option<PathBuf>) -> AppResult<()> {
     let mut client = connect_control(socket)?;
     let output = match command {
-        AgentCommand::Create {
-            agent_id,
+        ProfileCommand::Create {
+            display_name,
             workspace_id,
             config,
             model,
             reasoning_effort,
             approval_policy,
             toolset,
+            instructions,
+            memory,
+            skills,
         } => {
             let workspace = client.workspace_status(workspace_id.clone())?.workspace;
             let config = Config::load(Path::new(&workspace.root), config.as_deref())?;
             if std::env::var_os(&config.provider.api_key_env).is_none() {
                 return Err(AppError::Config(format!(
-                    "provider key is unavailable: set {} (for example, export {}=<provider-key>), or set provider.api_key_env in --config, PLATO_CONFIG, or the user config before running platonic agent create",
+                    "provider key is unavailable: set {} (for example, export {}=<provider-key>), or set provider.api_key_env in --config, PLATO_CONFIG, or the user config before running platonic profile create",
                     config.provider.api_key_env, config.provider.api_key_env
                 )));
             }
@@ -305,23 +360,152 @@ fn run_agent(command: AgentCommand, socket: Option<PathBuf>) -> AppResult<()> {
             } else {
                 toolset
             };
-            let result = client.agent_create(
-                AgentId::new(agent_id)?,
+            let result = client.profile_create(ProfileCreateParams {
                 workspace_id,
-                model,
+                display_name,
+                model: Some(model),
                 reasoning_effort,
                 approval_policy,
-                toolset,
-            )?;
+                toolset: Some(toolset),
+                content: ProfileContent {
+                    instructions_markdown: read_content(instructions.as_deref())?,
+                    memory_markdown: read_content(memory.as_deref())?,
+                    skill_refs: skills,
+                },
+                config_path: None,
+            })?;
             serde_json::to_string(&result)?
         }
-        AgentCommand::List => serde_json::to_string(&client.agent_list()?)?,
-        AgentCommand::Status { agent_id } => {
-            serde_json::to_string(&client.agent_status(AgentId::new(agent_id)?)?)?
+        ProfileCommand::List { workspace, limit } => {
+            serde_json::to_string(&client.profile_list(workspace, limit)?)?
+        }
+        ProfileCommand::Status { profile_id } => {
+            serde_json::to_string(&client.profile_status(ProfileId::new(profile_id)?)?)?
+        }
+        ProfileCommand::Update {
+            profile_id,
+            config,
+            model,
+            reasoning_effort,
+            approval_policy,
+            toolset,
+            instructions,
+            memory,
+            skills,
+            clear_skills,
+        } => {
+            let profile_id = ProfileId::new(profile_id)?;
+            let current = client.profile_status(profile_id.clone())?.status;
+            let configured = match config.as_deref() {
+                Some(path) => {
+                    let workspace = client
+                        .workspace_status(current.profile.workspace_id.clone())?
+                        .workspace;
+                    let config = Config::load(Path::new(&workspace.root), Some(path))?;
+                    if std::env::var_os(&config.provider.api_key_env).is_none() {
+                        return Err(AppError::Config(format!(
+                            "provider key is unavailable: set {} before updating the profile",
+                            config.provider.api_key_env
+                        )));
+                    }
+                    Some(config)
+                }
+                None => None,
+            };
+            let content = ProfileContent {
+                instructions_markdown: match instructions.as_deref() {
+                    Some(path) => read_content(Some(path))?,
+                    None => current.revision.content.instructions_markdown,
+                },
+                memory_markdown: match memory.as_deref() {
+                    Some(path) => read_content(Some(path))?,
+                    None => current.revision.content.memory_markdown,
+                },
+                skill_refs: if clear_skills || !skills.is_empty() {
+                    skills
+                } else {
+                    current.revision.content.skill_refs
+                },
+            };
+            serde_json::to_string(
+                &client.profile_update(ProfileUpdateParams {
+                    profile_id,
+                    model: model
+                        .or_else(|| {
+                            configured
+                                .as_ref()
+                                .map(|config| config.provider.model.clone())
+                        })
+                        .unwrap_or(current.profile.model),
+                    reasoning_effort: reasoning_effort.unwrap_or(current.profile.reasoning_effort),
+                    approval_policy: approval_policy.unwrap_or(current.profile.approval_policy),
+                    toolset: if toolset.is_empty() {
+                        configured
+                            .map(|config| config.tools.enabled)
+                            .unwrap_or(current.profile.toolset)
+                    } else {
+                        toolset
+                    },
+                    content,
+                })?,
+            )?
+        }
+        ProfileCommand::Open {
+            profile_id,
+            repositories,
+            working_repository,
+            working_subdir,
+            idempotency_key,
+            approve,
+        } => {
+            let profile_id = ProfileId::new(profile_id)?;
+            let workspace_id = client
+                .profile_status(profile_id.clone())?
+                .status
+                .profile
+                .workspace_id;
+            let workspace = client.workspace_status(workspace_id)?.workspace;
+            client.hello(Path::new(&workspace.root))?;
+            let mut result = client.profile_open_resolve(profile_id.clone())?;
+            if matches!(result, ProfileOpenResult::NoHome { .. }) {
+                let repositories = if repositories.is_empty() {
+                    vec![".".into()]
+                } else {
+                    repositories
+                };
+                result = client.profile_open_start(
+                    profile_id.clone(),
+                    idempotency_key
+                        .unwrap_or_else(|| format!("platonic-profile-open-{profile_id}")),
+                    repositories
+                        .into_iter()
+                        .map(|repo| ThreadRepositoryRequest { repo, branch: None })
+                        .collect(),
+                    working_repository,
+                    working_subdir,
+                )?;
+            }
+            if approve
+                && let ProfileOpenResult::ApprovalRequired {
+                    home_reservation_id,
+                    ..
+                } = result
+            {
+                result =
+                    client.profile_open_decide(home_reservation_id, ProfileOpenDecision::Grant)?;
+            }
+            serde_json::to_string(&result)?
         }
     };
     println!("{output}");
     Ok(())
+}
+
+fn read_content(path: Option<&Path>) -> AppResult<String> {
+    match path {
+        Some(path) => Ok(std::fs::read_to_string(path)?),
+        None => Ok(String::new()),
+    }
 }
 
 fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort, String> {

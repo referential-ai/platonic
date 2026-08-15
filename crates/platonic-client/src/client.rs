@@ -6,14 +6,14 @@ use crate::{
     transport::{self, Stream},
 };
 use platonic_protocol::{
-    AgentCreateParams, AgentCreateResult, AgentId, AgentListParams, AgentListResult,
-    AgentStatusParams, AgentStatusResult, ApprovalDecideParams, ApprovalDecision, ApprovalProfile,
-    CommandAcceptedResult, DaemonStatusParams, DaemonStatusResult, Envelope, EnvelopeKind,
-    EventsStreamParams, EventsStreamResult, HelloParams, HelloResult, IssuePrepStartParams,
-    IssuePrepStartResult, MAX_PROTOCOL_LINE_BYTES, MessageAppendParams, PROTOCOL_VERSION,
-    ProfileId, ProfileOpenDecision, ProfileOpenParams, ProfileOpenResult, ProtocolMethod,
-    ProtocolRequest, ProtocolResponse, ReasoningEffort, RunCancelParams, RunOverrides,
-    RunStartParams, RunStartResult, SessionApprovalProfileSetParams,
+    ApprovalDecideParams, ApprovalDecision, ApprovalProfile, CommandAcceptedResult,
+    DaemonStatusParams, DaemonStatusResult, Envelope, EnvelopeKind, EventsStreamParams,
+    EventsStreamResult, HelloParams, HelloResult, IssuePrepStartParams, IssuePrepStartResult,
+    MAX_PROTOCOL_LINE_BYTES, MessageAppendParams, PROTOCOL_VERSION, ProfileCreateParams,
+    ProfileCreateResult, ProfileId, ProfileListParams, ProfileListResult, ProfileOpenDecision,
+    ProfileOpenParams, ProfileOpenResult, ProfileStatusParams, ProfileStatusResult,
+    ProfileUpdateParams, ProfileUpdateResult, ProtocolMethod, ProtocolRequest, ProtocolResponse,
+    RunCancelParams, RunOverrides, RunStartParams, RunStartResult, SessionApprovalProfileSetParams,
     SessionApprovalProfileSetResult, SessionSummary, SessionsListResult, ShutdownIfIdleResult,
     ThreadApprovalPolicy, ThreadAuthorityParams, ThreadAuthorityResult, ThreadEventsParams,
     ThreadEventsResult, ThreadListResult, ThreadSendParams, ThreadSendResult, ThreadSpawnDecision,
@@ -37,6 +37,7 @@ pub struct DaemonClient {
     writer: Stream,
     next_id: u64,
     request_timeout: Option<Duration>,
+    workspace_id: Option<String>,
 }
 
 impl DaemonClient {
@@ -74,6 +75,7 @@ impl DaemonClient {
             writer,
             next_id: 1,
             request_timeout,
+            workspace_id: None,
         })
     }
 
@@ -81,10 +83,17 @@ impl DaemonClient {
     pub fn hello(&mut self, workspace_root: &Path) -> ClientResult<HelloResult> {
         let workspace_root = workspace_root.canonicalize()?;
         let workspace_id = paths::workspace_id(&workspace_root)?;
-        self.request(ProtocolRequest::Hello(HelloParams {
+        let result: HelloResult = self.request(ProtocolRequest::Hello(HelloParams {
             workspace_root: workspace_root.to_string_lossy().into_owned(),
             workspace_id,
-        }))
+        }))?;
+        self.workspace_id = Some(result.workspace_id.clone());
+        Ok(result)
+    }
+
+    /// Returns the workspace selected by the successful handshake, if any.
+    pub fn workspace_id(&self) -> Option<&str> {
+        self.workspace_id.as_deref()
     }
 
     /// Lists daemon sessions for the connected workspace.
@@ -123,34 +132,39 @@ impl DaemonClient {
         }))
     }
 
-    /// Creates one configured agent profile with a hard workspace binding.
-    pub fn agent_create(
+    /// Creates one workspace-bound profile and its first content revision.
+    pub fn profile_create(
         &mut self,
-        agent_id: AgentId,
-        workspace_id: String,
-        model: String,
-        reasoning_effort: ReasoningEffort,
-        approval_policy: ThreadApprovalPolicy,
-        toolset: Vec<String>,
-    ) -> ClientResult<AgentCreateResult> {
-        self.request(ProtocolRequest::AgentCreate(AgentCreateParams {
-            agent_id,
+        params: ProfileCreateParams,
+    ) -> ClientResult<ProfileCreateResult> {
+        self.request(ProtocolRequest::ProfileCreate(params))
+    }
+
+    /// Lists profiles, optionally within one workspace.
+    pub fn profile_list(
+        &mut self,
+        workspace_id: Option<String>,
+        limit: Option<usize>,
+    ) -> ClientResult<ProfileListResult> {
+        self.request(ProtocolRequest::ProfileList(ProfileListParams {
             workspace_id,
-            model,
-            reasoning_effort,
-            approval_policy,
-            toolset,
+            limit,
         }))
     }
 
-    /// Lists every configured agent profile.
-    pub fn agent_list(&mut self) -> ClientResult<AgentListResult> {
-        self.request(ProtocolRequest::AgentList(AgentListParams::default()))
+    /// Reads one profile and its current content revision.
+    pub fn profile_status(&mut self, profile_id: ProfileId) -> ClientResult<ProfileStatusResult> {
+        self.request(ProtocolRequest::ProfileStatus(ProfileStatusParams {
+            profile_id,
+        }))
     }
 
-    /// Reads one configured agent profile.
-    pub fn agent_status(&mut self, agent_id: AgentId) -> ClientResult<AgentStatusResult> {
-        self.request(ProtocolRequest::AgentStatus(AgentStatusParams { agent_id }))
+    /// Atomically updates future-thread defaults and appends a content revision.
+    pub fn profile_update(
+        &mut self,
+        params: ProfileUpdateParams,
+    ) -> ClientResult<ProfileUpdateResult> {
+        self.request(ProtocolRequest::ProfileUpdate(params))
     }
 
     /// Resolves a profile's existing home without creating authority.
@@ -196,7 +210,7 @@ impl DaemonClient {
     /// Starts one typed thread spawn admission.
     pub fn thread_spawn_start(
         &mut self,
-        parent_thread_id: Option<String>,
+        parent_thread_id: String,
         cwd: String,
         model: String,
         reasoning_effort: platonic_protocol::ReasoningEffort,
@@ -215,7 +229,7 @@ impl DaemonClient {
     /// Starts one typed thread spawn admission with explicit repository claims.
     pub fn thread_spawn_start_with_repositories(
         &mut self,
-        parent_thread_id: Option<String>,
+        parent_thread_id: String,
         cwd: String,
         model: String,
         reasoning_effort: platonic_protocol::ReasoningEffort,
@@ -893,9 +907,10 @@ fn response_result_value(response: ProtocolResponse) -> serde_json::Result<Value
         ProtocolResponse::WorkspaceCreate(result) => serde_json::to_value(result),
         ProtocolResponse::WorkspaceList(result) => serde_json::to_value(result),
         ProtocolResponse::WorkspaceStatus(result) => serde_json::to_value(result),
-        ProtocolResponse::AgentCreate(result) => serde_json::to_value(result),
-        ProtocolResponse::AgentList(result) => serde_json::to_value(result),
-        ProtocolResponse::AgentStatus(result) => serde_json::to_value(result),
+        ProtocolResponse::ProfileCreate(result) => serde_json::to_value(result),
+        ProtocolResponse::ProfileList(result) => serde_json::to_value(result),
+        ProtocolResponse::ProfileStatus(result) => serde_json::to_value(result),
+        ProtocolResponse::ProfileUpdate(result) => serde_json::to_value(result),
     }
 }
 
@@ -1153,8 +1168,8 @@ mod timeout_tests {
 mod tests {
     use super::*;
     use platonic_protocol::{
-        DaemonStatusProviderKind, ERROR_NOT_FOUND, ProtocolError, RunStateName, SessionSummary,
-        ShutdownIfIdleResultName,
+        DaemonStatusProviderKind, ERROR_NOT_FOUND, ProfileContent, ProtocolError, RunStateName,
+        SessionSummary, ShutdownIfIdleResultName,
     };
     use serde_json::json;
     use std::{
@@ -1258,17 +1273,34 @@ mod tests {
             "created_at_ms": 41,
             "health": "present"
         });
-        let agent_json = json!({
-            "id": "builder",
+        let profile_json = json!({
+            "id": "profile-builder",
+            "display_name": "builder",
             "workspace_id": "ws-alpha",
             "model": "gpt-5.6-sol",
             "reasoning_effort": "xhigh",
             "approval_policy": "prompt",
             "toolset": ["file.read", "file.write"],
+            "current_revision": 1,
+            "home_thread_id": null,
+            "workspace_health": "present",
             "created_at_ms": 42
         });
+        let revision_json = json!({
+            "revision": 1,
+            "parent_revision": null,
+            "actor": "host_operator",
+            "created_at_ms": 42,
+            "content_hash": "hash-1",
+            "content": {
+                "instructions_markdown": "Build carefully.",
+                "memory_markdown": "",
+                "skill_refs": []
+            }
+        });
         let server_workspace = workspace_json.clone();
-        let server_agent = agent_json.clone();
+        let server_profile = profile_json.clone();
+        let server_revision = revision_json.clone();
         let handle = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut writer = stream.try_clone().unwrap();
@@ -1311,46 +1343,51 @@ mod tests {
             );
 
             let request = read_request(&mut reader);
-            assert_eq!(request.method.as_deref(), Some("agent.create"));
+            assert_eq!(request.method.as_deref(), Some("profile.create"));
             assert_eq!(
                 request_params_value(&request),
                 Some(json!({
-                    "agent_id": "builder",
                     "workspace_id": "ws-alpha",
+                    "display_name": "builder",
                     "model": "gpt-5.6-sol",
                     "reasoning_effort": "xhigh",
                     "approval_policy": "prompt",
-                    "toolset": ["file.read", "file.write"]
+                    "toolset": ["file.read", "file.write"],
+                    "content": {
+                        "instructions_markdown": "Build carefully.",
+                        "memory_markdown": "",
+                        "skill_refs": []
+                    }
                 }))
             );
             write_response(
                 &mut writer,
                 request.id,
-                "agent.create",
-                json!({"agent": server_agent.clone()}),
+                "profile.create",
+                json!({"status": {"profile": server_profile.clone(), "revision": server_revision.clone()}}),
             );
 
             let request = read_request(&mut reader);
-            assert_eq!(request.method.as_deref(), Some("agent.list"));
+            assert_eq!(request.method.as_deref(), Some("profile.list"));
             assert_eq!(request_params_value(&request), Some(json!({})));
             write_response(
                 &mut writer,
                 request.id,
-                "agent.list",
-                json!({"agents": [server_agent.clone()]}),
+                "profile.list",
+                json!({"profiles": [server_profile.clone()], "truncated": false}),
             );
 
             let request = read_request(&mut reader);
-            assert_eq!(request.method.as_deref(), Some("agent.status"));
+            assert_eq!(request.method.as_deref(), Some("profile.status"));
             assert_eq!(
                 request_params_value(&request),
-                Some(json!({"agent_id": "builder"}))
+                Some(json!({"profile_id": "profile-builder"}))
             );
             write_response(
                 &mut writer,
                 request.id,
-                "agent.status",
-                json!({"agent": server_agent}),
+                "profile.status",
+                json!({"status": {"profile": server_profile, "revision": server_revision}}),
             );
         });
 
@@ -1377,29 +1414,37 @@ mod tests {
         assert_eq!(
             serde_json::to_value(
                 client
-                    .agent_create(
-                        AgentId::new("builder").unwrap(),
-                        "ws-alpha".into(),
-                        "gpt-5.6-sol".into(),
-                        ReasoningEffort::Xhigh,
-                        ThreadApprovalPolicy::Prompt,
-                        vec!["file.read".into(), "file.write".into()],
-                    )
+                    .profile_create(ProfileCreateParams {
+                        workspace_id: "ws-alpha".into(),
+                        display_name: "builder".into(),
+                        model: Some("gpt-5.6-sol".into()),
+                        reasoning_effort: platonic_protocol::ReasoningEffort::Xhigh,
+                        approval_policy: ThreadApprovalPolicy::Prompt,
+                        toolset: Some(vec!["file.read".into(), "file.write".into()]),
+                        content: ProfileContent {
+                            instructions_markdown: "Build carefully.".into(),
+                            memory_markdown: String::new(),
+                            skill_refs: Vec::new(),
+                        },
+                        config_path: None,
+                    })
                     .unwrap()
-                    .agent
+                    .status
+                    .profile
             )
             .unwrap(),
-            agent_json
+            profile_json
         );
-        assert_eq!(client.agent_list().unwrap().agents.len(), 1);
+        assert_eq!(client.profile_list(None, None).unwrap().profiles.len(), 1);
         assert_eq!(
             client
-                .agent_status(AgentId::new("builder").unwrap())
+                .profile_status(ProfileId::new("profile-builder").unwrap())
                 .unwrap()
-                .agent
+                .status
+                .profile
                 .id
                 .as_str(),
-            "builder"
+            "profile-builder"
         );
         handle.join().unwrap();
     }
@@ -1411,9 +1456,12 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).unwrap();
         let authority = json!({
             "thread_id": "thread_1",
-            "parent_thread_id": null,
+            "parent_thread_id": "thread_home",
             "spawning_actor": "stdin",
-            "agent_id": "plato",
+            "profile_id": "profile_builder",
+            "profile_revision": 1,
+            "thread_kind": "child",
+            "cwd": "/tmp/work",
             "model": "gpt-5.6-sol",
             "reasoning_effort": "xhigh",
             "approval_policy": "prompt",
@@ -1423,10 +1471,14 @@ mod tests {
             "network": false,
             "created_at_ms": 42
         });
-        let legacy_authority = json!({
+        let status_authority = json!({
             "thread_id": "thread_1",
-            "parent_thread_id": null,
+            "parent_thread_id": "thread_home",
             "spawning_actor": "stdin",
+            "profile_id": "profile_builder",
+            "profile_revision": 1,
+            "thread_kind": "child",
+            "home_thread_id": "thread_home",
             "cwd": "/tmp/work",
             "model": "gpt-5.6-sol",
             "reasoning_effort": "xhigh",
@@ -1434,7 +1486,7 @@ mod tests {
             "created_at_ms": 42
         });
         let server_authority = authority.clone();
-        let server_legacy_authority = legacy_authority.clone();
+        let server_status_authority = status_authority.clone();
         let handle = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut writer = stream.try_clone().unwrap();
@@ -1446,7 +1498,7 @@ mod tests {
                 request_params_value(&start),
                 Some(json!({
                     "action": "start",
-                    "parent_thread_id": null,
+                    "parent_thread_id": "thread_home",
                     "cwd": "/tmp/work",
                     "model": "gpt-5.6-sol",
                     "reasoning_effort": "xhigh",
@@ -1483,8 +1535,9 @@ mod tests {
                 json!({
                     "status": "spawned",
                     "thread": {
-                        "authority": server_legacy_authority.clone(),
-                        "live": {"live_epoch_id": "epoch_1", "loaded": true, "current_turn_id": null, "last_activity_at_ms": 42}
+                        "authority": server_status_authority.clone(),
+                        "live": {"live_epoch_id": "epoch_1", "loaded": true, "current_turn_id": null, "last_activity_at_ms": 42},
+                        "return_availability": {"child_returns": 0, "parent_answers": 0}
                     }
                 }),
             );
@@ -1498,8 +1551,9 @@ mod tests {
                 "thread.list",
                 json!({
                     "threads": [{
-                        "authority": server_legacy_authority.clone(),
-                        "live": {"live_epoch_id": "epoch_1", "loaded": true, "current_turn_id": null}
+                        "authority": server_status_authority.clone(),
+                        "live": {"live_epoch_id": "epoch_1", "loaded": true, "current_turn_id": null},
+                        "return_availability": {"child_returns": 0, "parent_answers": 0}
                     }]
                 }),
             );
@@ -1516,8 +1570,9 @@ mod tests {
                 "thread.status",
                 json!({
                     "thread": {
-                        "authority": server_legacy_authority,
-                        "live": {"live_epoch_id": "epoch_1", "loaded": true, "current_turn_id": null}
+                        "authority": server_status_authority,
+                        "live": {"live_epoch_id": "epoch_1", "loaded": true, "current_turn_id": null},
+                        "return_availability": {"child_returns": 0, "parent_answers": 0}
                     }
                 }),
             );
@@ -1596,6 +1651,7 @@ mod tests {
                 "thread.events",
                 json!({
                     "thread_id": "thread_1",
+                    "live_epoch_id": "epoch_1",
                     "from_offset": 0,
                     "next_offset": 0,
                     "current_turn_id": "thread_turn_1",
@@ -1626,7 +1682,7 @@ mod tests {
         assert!(matches!(
             client
                 .thread_spawn_start(
-                    None,
+                    "thread_home".into(),
                     "/tmp/work".into(),
                     "gpt-5.6-sol".into(),
                     platonic_protocol::ReasoningEffort::Xhigh,
@@ -1654,7 +1710,7 @@ mod tests {
                     .authority
             )
             .unwrap(),
-            legacy_authority
+            status_authority
         );
         assert_eq!(
             serde_json::to_value(
@@ -1964,7 +2020,7 @@ mod tests {
         assert!(matches!(
             error,
             ClientError::DaemonProtocol(message)
-                if message == "unsupported response protocol version: 2"
+                if message == "unsupported response protocol version: 3"
         ));
     }
 

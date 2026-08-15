@@ -29,6 +29,32 @@ The auto-discovered workspace `plato.toml` is untrusted. It cannot contain `prov
 
 Server startup reads `limits.max_spawn_depth` and `confinement.require` only from `$HOME/.config/plato/config.toml`, then falls back to defaults. Restart an idle server after changing either field.
 
+## HTTP gateway scope
+
+The unreleased HTTP/SSE adapter serves `/v2` on loopback by default. Generate
+bearer material with `platonic gateway http --generate-token`, store only its
+lowercase SHA-256 hash, and bind each principal to at least one workspace:
+
+```toml
+[gateway.http]
+bind = "127.0.0.1:8787"
+
+[principals.http.remote_laptop]
+name = "remote_laptop"
+token_sha256 = ["<64 lowercase hex characters>"]
+workspace_ids = ["<workspace id>"]
+profile_ids = ["<optional profile id>"]
+```
+
+Omitting `profile_ids` admits every profile already inside the workspace
+ceiling; listing ids narrows and never widens it. Route ids are checked against
+both scopes. The listener is plaintext and has no cookies, CORS, proxy-header
+identity, or in-process TLS. A non-loopback bind requires
+`allow_non_loopback = true` or `--allow-non-loopback` and still belongs behind
+operator-owned TLS. Mutations require an `Idempotency-Key`; thread SSE cursors
+carry `live_epoch_id` with the offset. The generated contract is
+[`gateway-v2.yaml`](https://github.com/referential-ai/platonic/blob/develop/openapi/gateway-v2.yaml).
+
 ## Provider shapes
 
 OpenRouter is the shipped default:
@@ -116,7 +142,9 @@ enabled = [
 ]
 ```
 
-The `tools.enabled` list must be nonempty and every name must be known. `thread.spawn`, `computer.windows`, and `computer.observe` are implemented but are not enabled by default.
+The `tools.enabled` list must be nonempty and every name must be known. Profile
+and thread-tree tools plus `computer.windows` and `computer.observe` are
+implemented but are not enabled by default.
 
 | Tool | Effect and operational control |
 | --- | --- |
@@ -124,7 +152,9 @@ The `tools.enabled` list must be nonempty and every name must be known. `thread.
 | `file.write`, `file.edit` | Workspace write; prompts unless narrowly auto-granted by yolo |
 | `shell.exec` | External side effect; exact shipped tool always enters local approval policy |
 | `web.fetch` | Network; exact shipped tool always requires explicit local approval and never receives a yolo auto-grant |
+| `profile.read`, `thread.tree`, `thread.events`, `thread.transcript` | Read-only, bounded to the current profile, and paginated where applicable |
 | `thread.spawn` | Workspace write; also bounded by immutable parent authority and `max_spawn_depth` |
+| `thread.return`, `thread.answer` | Immediate parent/child return channel only; auto-allowed when enabled, with server-enforced same-profile relationship and bounded payloads |
 | `computer.windows`, `computer.observe` | Secret access; every window listing and the first observation of each opaque target require explicit local approval and never accept yolo |
 
 The root thread's resolved toolset determines whether it needs a writable path and whether it receives network authority. Removing `web.fetch` from the toolset prevents that tool and removes the network-effect source for newly admitted root threads. Existing thread authority does not change when TOML changes, and child threads cannot widen a parent's tools, paths, repositories, network, or approval policy.

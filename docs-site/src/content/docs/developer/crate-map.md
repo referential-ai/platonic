@@ -14,7 +14,7 @@ sidebar:
 | Crate | Responsibility |
 | --- | --- |
 | [`platonic-core`](https://github.com/referential-ai/platonic/tree/develop/crates/platonic-core) | Pure typed harness primitives: identifiers, events, run state, effect requests, and deterministic readback. Generated public API detail belongs on [docs.rs](https://docs.rs/platonic-core/0.3.1/platonic_core/). |
-| [`platonic-protocol`](https://github.com/referential-ai/platonic/tree/develop/crates/platonic-protocol) | Closed protocol v1 types, serialization, and validation. It has no transport or server policy. |
+| [`platonic-protocol`](https://github.com/referential-ai/platonic/tree/develop/crates/platonic-protocol) | Closed protocol v2 types, serialization, and validation. It has no transport or server policy. |
 | [`platonic-client`](https://github.com/referential-ai/platonic/tree/develop/crates/platonic-client) | Synchronous local connection, framing, deadlines, and typed request helpers. It does not own daemon run semantics. |
 | [`platonic-server`](https://github.com/referential-ai/platonic/tree/develop/crates/platonic-server) | Technical implementation crate for the Platonic server: registry, thread and run authority, policy, approvals, providers, tools, ledger, daemon, and gateways. |
 | [`platonic`](https://github.com/referential-ai/platonic/tree/develop/crates/platonic) | Thin crate for the Platonic product command, `platonic`, over `platonic-server`. |

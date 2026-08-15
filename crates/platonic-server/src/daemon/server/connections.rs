@@ -859,7 +859,7 @@ mod tests {
         }
         let response = server.handle_line(
             &json!({
-                "v": 1,
+                "v": 2,
                 "id": "workspace_create",
                 "kind": "request",
                 "method": "workspace.create",
@@ -951,7 +951,7 @@ mod tests {
         let turn_id = "turn_run_voice_validation";
 
         let missing = server.handle_line(
-            r#"{"v":1,"id":"read_missing","kind":"request","method":"voice.events.read","params":{"run_id":"run_absent"}}"#,
+            r#"{"v":2,"id":"read_missing","kind":"request","method":"voice.events.read","params":{"run_id":"run_absent"}}"#,
         );
         assert_eq!(missing.error.unwrap().code, ERROR_NOT_FOUND);
 
@@ -965,7 +965,7 @@ mod tests {
         );
         let empty = server.handle_line(
             &json!({
-                "v": 1,
+                "v": 2,
                 "id": "read_empty",
                 "kind": "request",
                 "method": "voice.events.read",
@@ -979,7 +979,7 @@ mod tests {
                 .is_empty()
         );
         let missing = server.handle_line(
-            r#"{"v":1,"id":"read_missing","kind":"request","method":"voice.events.read","params":{"run_id":"run_absent"}}"#,
+            r#"{"v":2,"id":"read_missing","kind":"request","method":"voice.events.read","params":{"run_id":"run_absent"}}"#,
         );
         assert_eq!(missing.error.unwrap().code, ERROR_NOT_FOUND);
 
@@ -1393,7 +1393,7 @@ mod tests {
             let mut attached = UnixStream::connect(&socket_path).unwrap();
             writeln!(
                 attached,
-                r#"{{"v":1,"id":"host_hello","kind":"request","method":"hello","params":{{"workspace_root":"{}","workspace_id":"{}"}}}}"#,
+                r#"{{"v":2,"id":"host_hello","kind":"request","method":"hello","params":{{"workspace_root":"{}","workspace_id":"{}"}}}}"#,
                 workspace.display(),
                 requested_workspace_id
             )
@@ -1538,7 +1538,7 @@ base_url = "https://example.invalid/v1"
             let paths = server.paths().clone();
             let request = |id: &str, session_id: Option<&str>, config_path: &Path| {
                 json!({
-                    "v": 1,
+                    "v": 2,
                     "id": id,
                     "kind": "request",
                     "method": "daemon.status",
@@ -1635,12 +1635,12 @@ base_url = "https://example.invalid/v1"
         .unwrap();
 
         let response = server.handle_line(
-            r#"{"v":1,"id":"shutdown_1","kind":"request","method":"daemon.shutdown_if_idle"}"#,
+            r#"{"v":2,"id":"shutdown_1","kind":"request","method":"daemon.shutdown_if_idle"}"#,
         );
         assert_eq!(
             serde_json::to_value(response).unwrap(),
             json!({
-                "v": 1,
+                "v": 2,
                 "id": "shutdown_1",
                 "kind": "response",
                 "method": "daemon.shutdown_if_idle",
@@ -1649,15 +1649,15 @@ base_url = "https://example.invalid/v1"
         );
 
         let duplicate = server.handle_line(
-            r#"{"v":1,"id":"shutdown_2","kind":"request","method":"daemon.shutdown_if_idle","params":{}}"#,
+            r#"{"v":2,"id":"shutdown_2","kind":"request","method":"daemon.shutdown_if_idle","params":{}}"#,
         );
         assert_eq!(duplicate.kind, EnvelopeKind::Error);
         assert_eq!(duplicate.error.unwrap().code, ERROR_DAEMON_SHUTTING_DOWN);
         for request in [
-            r#"{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{"question":"hello"}}"#,
-            r#"{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{"message":"hello"}}"#,
-            r#"{"v":1,"id":"append_2","kind":"request","method":"message.append","params":{"session_id":"session_1","message":"hello"}}"#,
-            r#"{"v":1,"id":"issue_prep_1","kind":"request","method":"issue-prep.start","params":{"input":"rough issue"}}"#,
+            r#"{"v":2,"id":"run_1","kind":"request","method":"run.start","params":{"question":"hello"}}"#,
+            r#"{"v":2,"id":"append_1","kind":"request","method":"message.append","params":{"message":"hello"}}"#,
+            r#"{"v":2,"id":"append_2","kind":"request","method":"message.append","params":{"session_id":"session_1","message":"hello"}}"#,
+            r#"{"v":2,"id":"issue_prep_1","kind":"request","method":"issue-prep.start","params":{"input":"rough issue"}}"#,
         ] {
             let response = server.handle_line(request);
             assert_eq!(response.kind, EnvelopeKind::Error);
@@ -1669,17 +1669,17 @@ base_url = "https://example.invalid/v1"
         let empty_server =
             bind_test(workspace.path(), Some(socket_dir.path().join("empty.sock"))).unwrap();
         let invalid = empty_server.handle_line(
-            r#"{"v":1,"id":"invalid","kind":"request","method":"daemon.shutdown_if_idle","params":{"force":true}}"#,
+            r#"{"v":2,"id":"invalid","kind":"request","method":"daemon.shutdown_if_idle","params":{"force":true}}"#,
         );
         assert_eq!(invalid.kind, EnvelopeKind::Error);
         assert_eq!(invalid.error.unwrap().code, ERROR_MALFORMED_REQUEST);
         let invalid = empty_server.handle_line(
-            r#"{"v":1,"id":"invalid_array","kind":"request","method":"daemon.shutdown_if_idle","params":[]}"#,
+            r#"{"v":2,"id":"invalid_array","kind":"request","method":"daemon.shutdown_if_idle","params":[]}"#,
         );
         assert_eq!(invalid.kind, EnvelopeKind::Error);
         assert_eq!(invalid.error.unwrap().code, ERROR_MALFORMED_REQUEST);
         let response = empty_server.handle_line(
-            r#"{"v":1,"id":"shutdown_3","kind":"request","method":"daemon.shutdown_if_idle","params":{}}"#,
+            r#"{"v":2,"id":"shutdown_3","kind":"request","method":"daemon.shutdown_if_idle","params":{}}"#,
         );
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(response_value(&response), json!({"result": "shutdown"}));
@@ -1703,7 +1703,7 @@ base_url = "https://example.invalid/v1"
 
         writeln!(
             shutdown_stream,
-            r#"{{"v":1,"id":"shutdown_1","kind":"request","method":"daemon.shutdown_if_idle"}}"#
+            r#"{{"v":2,"id":"shutdown_1","kind":"request","method":"daemon.shutdown_if_idle"}}"#
         )
         .unwrap();
         let response = read_envelope(&mut shutdown_reader);
@@ -1711,9 +1711,9 @@ base_url = "https://example.invalid/v1"
         assert!(socket_path.exists());
 
         for request in [
-            r#"{"v":1,"id":"shutdown_2","kind":"request","method":"daemon.shutdown_if_idle"}"#,
-            r#"{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{"question":"hello"}}"#,
-            r#"{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{"session_id":"session_1","message":"hello"}}"#,
+            r#"{"v":2,"id":"shutdown_2","kind":"request","method":"daemon.shutdown_if_idle"}"#,
+            r#"{"v":2,"id":"run_1","kind":"request","method":"run.start","params":{"question":"hello"}}"#,
+            r#"{"v":2,"id":"append_1","kind":"request","method":"message.append","params":{"session_id":"session_1","message":"hello"}}"#,
         ] {
             let mut stream = UnixStream::connect(&socket_path).unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -1763,7 +1763,7 @@ base_url = "https://example.invalid/v1"
 
         writeln!(
             stream,
-            r#"{{"v":1,"id":"shutdown_1","kind":"request","method":"daemon.shutdown_if_idle"}}"#
+            r#"{{"v":2,"id":"shutdown_1","kind":"request","method":"daemon.shutdown_if_idle"}}"#
         )
         .unwrap();
         let refused = read_envelope(&mut reader);
@@ -1776,7 +1776,7 @@ base_url = "https://example.invalid/v1"
 
         writeln!(
             stream,
-            r#"{{"v":1,"id":"hello_1","kind":"request","method":"hello","params":{{"workspace_root":"{}","workspace_id":"{}"}}}}"#,
+            r#"{{"v":2,"id":"hello_1","kind":"request","method":"hello","params":{{"workspace_root":"{}","workspace_id":"{}"}}}}"#,
             paths.workspace_root.display(),
             paths.workspace_id
         )
@@ -1785,7 +1785,7 @@ base_url = "https://example.invalid/v1"
 
         writeln!(
             stream,
-            r#"{{"v":1,"id":"deny_1","kind":"request","method":"approval.decide","params":{{"run_id":"run_1","tool_call_id":"call_1","decision":"deny"}}}}"#
+            r#"{{"v":2,"id":"deny_1","kind":"request","method":"approval.decide","params":{{"run_id":"run_1","tool_call_id":"call_1","decision":"deny"}}}}"#
         )
         .unwrap();
         assert_eq!(read_envelope(&mut reader).kind, EnvelopeKind::Response);
@@ -1793,7 +1793,7 @@ base_url = "https://example.invalid/v1"
         runtime.finish_run(&record, "done".into(), None);
         writeln!(
             stream,
-            r#"{{"v":1,"id":"shutdown_2","kind":"request","method":"daemon.shutdown_if_idle","params":{{}}}}"#
+            r#"{{"v":2,"id":"shutdown_2","kind":"request","method":"daemon.shutdown_if_idle","params":{{}}}}"#
         )
         .unwrap();
         let accepted = read_envelope(&mut reader);
@@ -1816,7 +1816,7 @@ base_url = "https://example.invalid/v1"
         let mut stream = UnixStream::connect(&socket_path).unwrap();
         writeln!(
             stream,
-            r#"{{"v":1,"id":"req_1","kind":"request","method":"hello","params":{{"workspace_root":"{}","workspace_id":"wrong"}}}}"#,
+            r#"{{"v":2,"id":"req_1","kind":"request","method":"hello","params":{{"workspace_root":"{}","workspace_id":"wrong"}}}}"#,
             workspace.path().display()
         )
         .unwrap();
@@ -1851,7 +1851,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
 
         let response = server.handle_line(&format!(
-            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"hello","config_path":"{}","wait":true}}}}"#,
+            r#"{{"v":2,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"hello","config_path":"{}","wait":true}}}}"#,
             config_path.display()
         ));
         let error = response.error.unwrap();
@@ -1875,7 +1875,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
 
         let response = server.handle_line(&format!(
-            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"hello","config_path":"{}","wait":true}}}}"#,
+            r#"{{"v":2,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"hello","config_path":"{}","wait":true}}}}"#,
             config_path.display()
         ));
         assert_eq!(
@@ -1972,7 +1972,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         writeln!(
             stream,
-            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"write a file","config_path":"{}"}}}}"#,
+            r#"{{"v":2,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"write a file","config_path":"{}"}}}}"#,
             config_path.display()
         )
         .unwrap();
@@ -1988,7 +1988,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         for attempt in 0..100 {
             writeln!(
                 stream,
-                r#"{{"v":1,"id":"events_{attempt}","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":32}}}}"#
+                r#"{{"v":2,"id":"events_{attempt}","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":32}}}}"#
             )
             .unwrap();
             let response = read_envelope(&mut reader);
@@ -2008,7 +2008,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         writeln!(
             stream,
-            r#"{{"v":1,"id":"transcript_pending","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
+            r#"{{"v":2,"id":"transcript_pending","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
         )
         .unwrap();
         let response = read_envelope(&mut reader);
@@ -2027,7 +2027,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         writeln!(
             stream,
-            r#"{{"v":1,"id":"grant_1","kind":"request","method":"approval.decide","params":{{"run_id":"{run_id}","tool_call_id":"call_1","decision":"grant"}}}}"#
+            r#"{{"v":2,"id":"grant_1","kind":"request","method":"approval.decide","params":{{"run_id":"{run_id}","tool_call_id":"call_1","decision":"grant"}}}}"#
         )
         .unwrap();
         let response = read_envelope(&mut reader);
@@ -2036,7 +2036,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         writeln!(
             stream,
-            r#"{{"v":1,"id":"transcript_resolved","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
+            r#"{{"v":2,"id":"transcript_resolved","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
         )
         .unwrap();
         let response = read_envelope(&mut reader);
@@ -2068,7 +2068,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let session_id = first.session_id.clone();
         wait_for_pending_call(&server, &first.run_id, "call_1");
         let allowed_once = server.handle_line(&format!(
-            r#"{{"v":1,"id":"allow_once","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"grant"}}}}"#,
+            r#"{{"v":2,"id":"allow_once","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"grant"}}}}"#,
             first.run_id
         ));
         assert_eq!(allowed_once.kind, EnvelopeKind::Response);
@@ -2077,14 +2077,14 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let establishing = append_test_run(&server, &config_path, &session_id, "grant session");
         wait_for_pending_call(&server, &establishing.run_id, "call_1");
         let granted_session = server.handle_line(&format!(
-            r#"{{"v":1,"id":"grant_session","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"grant_session"}}}}"#,
+            r#"{{"v":2,"id":"grant_session","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"grant_session"}}}}"#,
             establishing.run_id
         ));
         assert_eq!(granted_session.kind, EnvelopeKind::Response);
         wait_for_finished_run(&server, &establishing.run_id);
 
         let status = server.handle_line(&format!(
-            r#"{{"v":1,"id":"status_granted","kind":"request","method":"daemon.status","params":{{"session_id":"{session_id}","config_path":"{}"}}}}"#,
+            r#"{{"v":2,"id":"status_granted","kind":"request","method":"daemon.status","params":{{"session_id":"{session_id}","config_path":"{}"}}}}"#,
             config_path.display()
         ));
         assert_eq!(status.kind, EnvelopeKind::Response);
@@ -2100,7 +2100,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_ne!(different.session_id, session_id);
         wait_for_pending_call(&server, &different.run_id, "call_1");
         let other_status = server.handle_line(&format!(
-            r#"{{"v":1,"id":"status_other","kind":"request","method":"daemon.status","params":{{"session_id":"{}","config_path":"{}"}}}}"#,
+            r#"{{"v":2,"id":"status_other","kind":"request","method":"daemon.status","params":{{"session_id":"{}","config_path":"{}"}}}}"#,
             different.session_id,
             config_path.display()
         ));
@@ -2110,7 +2110,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             false
         );
         let denied = server.handle_line(&format!(
-            r#"{{"v":1,"id":"deny_other","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"deny","reason":"not this session"}}}}"#,
+            r#"{{"v":2,"id":"deny_other","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"deny","reason":"not this session"}}}}"#,
             different.run_id
         ));
         assert_eq!(denied.kind, EnvelopeKind::Response);
@@ -2123,7 +2123,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         );
 
         let transcript = server.handle_line(&format!(
-            r#"{{"v":1,"id":"transcript_actors","kind":"request","method":"transcript.read","params":{{"session_id":"{session_id}"}}}}"#
+            r#"{{"v":2,"id":"transcript_actors","kind":"request","method":"transcript.read","params":{{"session_id":"{session_id}"}}}}"#
         ));
         let typed: TypedTranscript =
             serde_json::from_value(response_value(&transcript)["typed"].clone()).unwrap();
@@ -2155,7 +2155,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         );
         wait_for_pending_call(&restarted, &after_restart.run_id, "call_1");
         let restarted_status = restarted.handle_line(&format!(
-            r#"{{"v":1,"id":"status_restarted","kind":"request","method":"daemon.status","params":{{"session_id":"{session_id}","config_path":"{}"}}}}"#,
+            r#"{{"v":2,"id":"status_restarted","kind":"request","method":"daemon.status","params":{{"session_id":"{session_id}","config_path":"{}"}}}}"#,
             config_path.display()
         ));
         assert_eq!(restarted_status.kind, EnvelopeKind::Response);
@@ -2164,7 +2164,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             false
         );
         let denied = restarted.handle_line(&format!(
-            r#"{{"v":1,"id":"deny_restarted","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"deny"}}}}"#,
+            r#"{{"v":2,"id":"deny_restarted","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"deny"}}}}"#,
             after_restart.run_id
         ));
         assert_eq!(denied.kind, EnvelopeKind::Response);
@@ -2196,7 +2196,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
 
         let response = server.handle_line(&format!(
-            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"write a file","config_path":"{}"}}}}"#,
+            r#"{{"v":2,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"write a file","config_path":"{}"}}}}"#,
             config_path.display()
         ));
         let run_id = response_value(&response)["run_id"]
@@ -2211,14 +2211,14 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         }
 
         let response = server.handle_line(&format!(
-            r#"{{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
+            r#"{{"v":2,"id":"cancel_1","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
         ));
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(response_value(&response)["status"], "cancel_requested");
         assert!(record.approvals.lock().unwrap().is_empty());
         assert_eq!(record.pending_approval(), None);
         let transcript = server.handle_line(&format!(
-            r#"{{"v":1,"id":"transcript_1","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
+            r#"{{"v":2,"id":"transcript_1","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
         ));
         assert_eq!(transcript.kind, EnvelopeKind::Response);
         assert!(
@@ -2227,7 +2227,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
                 .is_none()
         );
         let stale = server.handle_line(&format!(
-            r#"{{"v":1,"id":"approval_1","kind":"request","method":"approval.decide","params":{{"run_id":"{run_id}","tool_call_id":"call_1","decision":"grant"}}}}"#
+            r#"{{"v":2,"id":"approval_1","kind":"request","method":"approval.decide","params":{{"run_id":"{run_id}","tool_call_id":"call_1","decision":"grant"}}}}"#
         ));
         assert_eq!(stale.kind, EnvelopeKind::Error);
         assert_eq!(stale.error.unwrap().code, ERROR_NOT_FOUND);
@@ -2259,7 +2259,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
         let runtime = server.runtime.clone();
         let request = format!(
-            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"write a file","config_path":"{}","wait":true}}}}"#,
+            r#"{{"v":2,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"write a file","config_path":"{}","wait":true}}}}"#,
             config_path.display()
         );
         let run = thread::spawn(move || handle_line(&runtime, &request));
@@ -2285,7 +2285,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         };
 
         let cancel = server.handle_line(&format!(
-            r#"{{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{{"run_id":"{}"}}}}"#,
+            r#"{{"v":2,"id":"cancel_1","kind":"request","method":"run.cancel","params":{{"run_id":"{}"}}}}"#,
             record.run_id
         ));
         assert_eq!(cancel.kind, EnvelopeKind::Response);
@@ -2309,7 +2309,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
 
         let started = server.handle_line(&format!(
-            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"wait for an answer","config_path":"{}"}}}}"#,
+            r#"{{"v":2,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"wait for an answer","config_path":"{}"}}}}"#,
             config_path.display()
         ));
         assert_eq!(started.kind, EnvelopeKind::Response);
@@ -2323,7 +2323,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
         let cancel = server.handle_line(&format!(
-            r#"{{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
+            r#"{{"v":2,"id":"cancel_1","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
         ));
         assert_eq!(cancel.kind, EnvelopeKind::Response);
         assert_eq!(response_value(&cancel)["status"], "cancel_requested");
@@ -2342,18 +2342,18 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_canceled_terminal(&server, &record);
 
         let events = server.handle_line(&format!(
-            r#"{{"v":1,"id":"events_1","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0}}}}"#
+            r#"{{"v":2,"id":"events_1","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0}}}}"#
         ));
         assert_eq!(events.kind, EnvelopeKind::Response);
         assert_eq!(response_value(&events)["status"], "canceled");
         let sessions = server
-            .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
+            .handle_line(r#"{"v":2,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
         assert_eq!(sessions.kind, EnvelopeKind::Response);
         let sessions = response_value(&sessions);
         assert_eq!(sessions["sessions"][0]["session_id"], session_id);
         assert_eq!(sessions["sessions"][0]["status"], "canceled");
         let transcript = server.handle_line(&format!(
-            r#"{{"v":1,"id":"transcript_1","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
+            r#"{{"v":2,"id":"transcript_1","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
         ));
         assert_eq!(transcript.kind, EnvelopeKind::Response);
         assert_eq!(response_value(&transcript)["status"], "canceled");
@@ -2416,7 +2416,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
 
         let first = server.handle_line(&format!(
-            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"question one","config_path":"{}"}}}}"#,
+            r#"{{"v":2,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"question one","config_path":"{}"}}}}"#,
             config_path.display()
         ));
         assert_eq!(first.kind, EnvelopeKind::Response, "{:?}", first.error);
@@ -2424,7 +2424,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(first["status"], "running");
 
         let second = server.handle_line(&format!(
-            r#"{{"v":1,"id":"run_2","kind":"request","method":"run.start","params":{{"question":"question two","config_path":"{}"}}}}"#,
+            r#"{{"v":2,"id":"run_2","kind":"request","method":"run.start","params":{{"question":"question two","config_path":"{}"}}}}"#,
             config_path.display()
         ));
         assert_eq!(second.kind, EnvelopeKind::Response, "{:?}", second.error);
@@ -2494,7 +2494,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             clients.push(thread::spawn(move || {
                 barrier.wait();
                 server.handle_line(&format!(
-                    r#"{{"v":1,"id":"append_{index}","kind":"request","method":"message.append","params":{{"message":"write a file","session_id":"shared_session","config_path":"{}"}}}}"#,
+                    r#"{{"v":2,"id":"append_{index}","kind":"request","method":"message.append","params":{{"message":"write a file","session_id":"shared_session","config_path":"{}"}}}}"#,
                     config_path.display()
                 ))
             }));
@@ -2531,7 +2531,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         }
         for run_id in &admitted_run_ids {
             server.handle_line(&format!(
-                r#"{{"v":1,"id":"cancel","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
+                r#"{{"v":2,"id":"cancel","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
             ));
         }
         provider.handle.join().unwrap();
@@ -2561,7 +2561,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
 
         let response = server.handle_line(
-            r#"{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{}}"#,
+            r#"{"v":2,"id":"run_1","kind":"request","method":"run.start","params":{}}"#,
         );
         let error = response.error.unwrap();
 
@@ -2578,7 +2578,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         std::fs::write(&config_path, "").unwrap();
         let server = bind_test(workspace.path(), Some(socket_path)).unwrap();
         let request = serde_json::to_string(&json!({
-            "v": 1,
+            "v": 2,
             "id": "issue_prep_1",
             "kind": "request",
             "method": "issue-prep.start",
@@ -2599,7 +2599,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert!(!workspace.path().join(".plato").exists());
 
         let shutdown = server.handle_line(
-            r#"{"v":1,"id":"shutdown","kind":"request","method":"daemon.shutdown_if_idle"}"#,
+            r#"{"v":2,"id":"shutdown","kind":"request","method":"daemon.shutdown_if_idle"}"#,
         );
         assert_eq!(shutdown.kind, EnvelopeKind::Response);
         assert_eq!(response_value(&shutdown), json!({"result": "shutdown"}));
@@ -2626,7 +2626,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             .insert("run_1".into(), record);
 
         let response = server.handle_line(
-            r#"{"v":1,"id":"events_1","kind":"request","method":"events.stream","params":{"run_id":"run_1","from_offset":0,"limit":1}}"#,
+            r#"{"v":2,"id":"events_1","kind":"request","method":"events.stream","params":{"run_id":"run_1","from_offset":0,"limit":1}}"#,
         );
         let result = response_value(&response);
 
@@ -2658,10 +2658,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             .insert("run_1".into(), record);
 
         let first = server.handle_line(
-            r#"{"v":1,"id":"events_1","kind":"request","method":"events.stream","params":{"run_id":"run_1","from_offset":0,"limit":1}}"#,
+            r#"{"v":2,"id":"events_1","kind":"request","method":"events.stream","params":{"run_id":"run_1","from_offset":0,"limit":1}}"#,
         );
         let second = server.handle_line(
-            r#"{"v":1,"id":"events_2","kind":"request","method":"events.stream","params":{"run_id":"run_1","from_offset":1,"limit":1}}"#,
+            r#"{"v":2,"id":"events_2","kind":"request","method":"events.stream","params":{"run_id":"run_1","from_offset":1,"limit":1}}"#,
         );
 
         let first = response_value(&first);
@@ -2698,7 +2698,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             .insert("run_1".into(), record);
 
         let response = server.handle_line(
-            r#"{"v":1,"id":"events_1","kind":"request","method":"events.stream","params":{"run_id":"run_1","from_offset":0}}"#,
+            r#"{"v":2,"id":"events_1","kind":"request","method":"events.stream","params":{"run_id":"run_1","from_offset":0}}"#,
         );
         let error = response.error.unwrap();
 
@@ -2779,7 +2779,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         }
 
         let evicted = server.handle_line(
-            r#"{"v":1,"id":"events_old","kind":"request","method":"events.stream","params":{"run_id":"run_0","from_offset":0}}"#,
+            r#"{"v":2,"id":"events_old","kind":"request","method":"events.stream","params":{"run_id":"run_0","from_offset":0}}"#,
         );
         assert_eq!(evicted.kind, EnvelopeKind::Response);
         let evicted = response_value(&evicted);
@@ -2795,7 +2795,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         );
 
         let retained = server.handle_line(&format!(
-            r#"{{"v":1,"id":"events_new","kind":"request","method":"events.stream","params":{{"run_id":"run_{MAX_TERMINAL_RUNS}"}}}}"#
+            r#"{{"v":2,"id":"events_new","kind":"request","method":"events.stream","params":{{"run_id":"run_{MAX_TERMINAL_RUNS}"}}}}"#
         ));
         assert_eq!(retained.kind, EnvelopeKind::Response);
         let retained = response_value(&retained);
@@ -2805,7 +2805,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(retained["status"], "finished");
 
         let transcript = server.handle_line(
-            r#"{"v":1,"id":"transcript","kind":"request","method":"transcript.read","params":{"run_id":"run_0"}}"#,
+            r#"{"v":2,"id":"transcript","kind":"request","method":"transcript.read","params":{"run_id":"run_0"}}"#,
         );
         assert_eq!(transcript.kind, EnvelopeKind::Response);
         let transcript = response_value(&transcript);
@@ -2813,7 +2813,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(transcript["final_answer"], "persisted answer");
 
         let sessions = server
-            .handle_line(r#"{"v":1,"id":"sessions","kind":"request","method":"sessions.list"}"#);
+            .handle_line(r#"{"v":2,"id":"sessions","kind":"request","method":"sessions.list"}"#);
         assert_eq!(sessions.kind, EnvelopeKind::Response);
         assert_eq!(response_value(&sessions)["sessions"][0]["run_id"], "run_0");
     }
@@ -2985,7 +2985,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         );
 
         let run = server.handle_line(
-            r#"{"v":1,"id":"run_read","kind":"request","method":"transcript.read","params":{"run_id":"run_2"}}"#,
+            r#"{"v":2,"id":"run_read","kind":"request","method":"transcript.read","params":{"run_id":"run_2"}}"#,
         );
         assert_eq!(run.kind, EnvelopeKind::Response);
         assert_eq!(
@@ -3011,7 +3011,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         );
 
         let session = server.handle_line(
-            r#"{"v":1,"id":"session_read","kind":"request","method":"transcript.read","params":{"session_id":"session_1"}}"#,
+            r#"{"v":2,"id":"session_read","kind":"request","method":"transcript.read","params":{"session_id":"session_1"}}"#,
         );
         assert_eq!(session.kind, EnvelopeKind::Response);
         assert_eq!(
@@ -3069,7 +3069,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             bind_test(workspace.path(), Some(socket_dir.path().join("agent.sock"))).unwrap();
 
         let missing = server.handle_line(
-            r#"{"v":1,"id":"transcript_1","kind":"request","method":"transcript.read","params":{"run_id":"run_missing"}}"#,
+            r#"{"v":2,"id":"transcript_1","kind":"request","method":"transcript.read","params":{"run_id":"run_missing"}}"#,
         );
         assert_eq!(missing.kind, EnvelopeKind::Error);
         assert_eq!(missing.error.unwrap().code, ERROR_NOT_FOUND);
@@ -3077,7 +3077,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         std::fs::create_dir_all(server.paths().ledger_path.parent().unwrap()).unwrap();
         std::fs::write(&server.paths().ledger_path, b"not a sqlite database").unwrap();
         let corrupt = server.handle_line(
-            r#"{"v":1,"id":"transcript_2","kind":"request","method":"transcript.read","params":{"run_id":"run_missing"}}"#,
+            r#"{"v":2,"id":"transcript_2","kind":"request","method":"transcript.read","params":{"run_id":"run_missing"}}"#,
         );
         assert_eq!(corrupt.kind, EnvelopeKind::Error);
         assert_eq!(corrupt.error.unwrap().code, ERROR_INTERNAL);
@@ -3113,7 +3113,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{"run_id":"run_1","tool_call_id":"call_1","decision":"grant","actor":""}"#,
         ] {
             let response = server.handle_line(&format!(
-                r#"{{"v":1,"id":"invalid","kind":"request","method":"approval.decide","params":{invalid_params}}}"#
+                r#"{{"v":2,"id":"invalid","kind":"request","method":"approval.decide","params":{invalid_params}}}"#
             ));
 
             assert_eq!(response.kind, EnvelopeKind::Error);
@@ -3127,7 +3127,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{"run_id":"run_1","tool_call_id":"call_missing","decision":"grant","actor":"jerome"}"#,
         ] {
             let response = server.handle_line(&format!(
-                r#"{{"v":1,"id":"unauthorized","kind":"request","method":"approval.decide","params":{unauthorized}}}"#
+                r#"{{"v":2,"id":"unauthorized","kind":"request","method":"approval.decide","params":{unauthorized}}}"#
             ));
             assert_eq!(response.kind, EnvelopeKind::Error);
             assert_eq!(response.error.unwrap().code, ERROR_NOT_FOUND);
@@ -3135,7 +3135,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         }
 
         let response = server.handle_line(
-            r#"{"v":1,"id":"approval_1","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"grant","actor":"jerome"}}"#,
+            r#"{"v":2,"id":"approval_1","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"grant","actor":"jerome"}}"#,
         );
 
         assert_eq!(response.kind, EnvelopeKind::Response);
@@ -3157,19 +3157,19 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         ));
 
         let duplicate = server.handle_line(
-            r#"{"v":1,"id":"approval_duplicate","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"grant","actor":"jerome"}}"#,
+            r#"{"v":2,"id":"approval_duplicate","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"grant","actor":"jerome"}}"#,
         );
         assert_eq!(duplicate.kind, EnvelopeKind::Response);
         assert_eq!(server.runtime.session_tool_grant_count(), 0);
 
         let substituted_actor = server.handle_line(
-            r#"{"v":1,"id":"approval_substitution","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"grant","actor":"mallory"}}"#,
+            r#"{"v":2,"id":"approval_substitution","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"grant","actor":"mallory"}}"#,
         );
         assert_eq!(substituted_actor.kind, EnvelopeKind::Error);
         assert_eq!(substituted_actor.error.unwrap().code, ERROR_NOT_FOUND);
 
         let stale = server.handle_line(
-            r#"{"v":1,"id":"approval_2","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"deny","reason":"too late"}}"#,
+            r#"{"v":2,"id":"approval_2","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"deny","reason":"too late"}}"#,
         );
         assert_eq!(stale.kind, EnvelopeKind::Error);
         assert_eq!(stale.error.unwrap().code, ERROR_NOT_FOUND);
@@ -3187,7 +3187,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             PendingApproval::new("session_1".into(), pending_request("run_1", "call_2")),
         );
         let denied = server.handle_line(
-            r#"{"v":1,"id":"approval_3","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_2","decision":"deny"}}"#,
+            r#"{"v":2,"id":"approval_3","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_2","decision":"deny"}}"#,
         );
         assert_eq!(denied.kind, EnvelopeKind::Response);
         assert_eq!(
@@ -3200,7 +3200,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(record.pending_approval(), None);
 
         let duplicate = server.handle_line(
-            r#"{"v":1,"id":"approval_4","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_2","decision":"deny"}}"#,
+            r#"{"v":2,"id":"approval_4","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_2","decision":"deny"}}"#,
         );
         assert_eq!(duplicate.kind, EnvelopeKind::Response);
         assert_eq!(server.runtime.session_tool_grant_count(), 0);
@@ -3236,7 +3236,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             started_sender.send(()).unwrap();
             sender
                 .send(cancel_server.handle_line(
-                    r#"{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"run_id":"run_1"}}"#,
+                    r#"{"v":2,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"run_id":"run_1"}}"#,
                 ))
                 .unwrap();
         });
@@ -3274,7 +3274,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             .insert("run_1".into(), record);
 
         let response = server
-            .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
+            .handle_line(r#"{"v":2,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
         let result = response_value(&response);
 
         assert_eq!(response.kind, EnvelopeKind::Response);
@@ -3285,13 +3285,13 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(result["sessions"][0]["updated_at_ms"], 0);
 
         let cancel = server.handle_line(
-            r#"{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"run_id":"run_1"}}"#,
+            r#"{"v":2,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"run_id":"run_1"}}"#,
         );
         assert_eq!(cancel.kind, EnvelopeKind::Response);
         assert_eq!(response_value(&cancel)["status"], "cancel_requested");
 
         let response = server
-            .handle_line(r#"{"v":1,"id":"sessions_2","kind":"request","method":"sessions.list"}"#);
+            .handle_line(r#"{"v":2,"id":"sessions_2","kind":"request","method":"sessions.list"}"#);
         let result = response_value(&response);
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(result["sessions"][0]["run_id"], "run_1");
@@ -3326,7 +3326,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let second_socket = socket_dir.path().join("agent-2.sock");
         let second_server = bind_test(workspace.path(), Some(second_socket)).unwrap();
         let response = second_server
-            .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
+            .handle_line(r#"{"v":2,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
         let result = response_value(&response);
 
         assert_eq!(response.kind, EnvelopeKind::Response);
@@ -3351,7 +3351,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert!(!ledger_path.exists());
 
         let response = server
-            .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
+            .handle_line(r#"{"v":2,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
         let result = response_value(&response);
 
         assert_eq!(response.kind, EnvelopeKind::Response);
@@ -3370,7 +3370,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         std::fs::write(ledger_path, "not a sqlite database").unwrap();
 
         let response = server
-            .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
+            .handle_line(r#"{"v":2,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
         let error = response.error.unwrap();
 
         assert_eq!(response.kind, EnvelopeKind::Error);
@@ -3391,7 +3391,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let second_socket = socket_dir.path().join("agent-2.sock");
         let second_server = bind_test(workspace.path(), Some(second_socket)).unwrap();
         let response = second_server
-            .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
+            .handle_line(r#"{"v":2,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
         let result = response_value(&response);
 
         assert_eq!(response.kind, EnvelopeKind::Response);
@@ -3445,7 +3445,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         );
 
         let response = server
-            .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
+            .handle_line(r#"{"v":2,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
         let result = response_value(&response);
 
         assert_eq!(response.kind, EnvelopeKind::Response);
@@ -3476,7 +3476,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             .insert("run_1".into(), record);
 
         let response = server.handle_line(
-            r#"{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{"session_id":"session_1","message":"again"}}"#,
+            r#"{"v":2,"id":"append_1","kind":"request","method":"message.append","params":{"session_id":"session_1","message":"again"}}"#,
         );
         let error = response.error.unwrap();
 
@@ -3504,7 +3504,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         );
 
         let response = server.handle_line(&format!(
-            r#"{{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{{"session_id":"session_1","message":"follow up","config_path":"{}"}}}}"#,
+            r#"{{"v":2,"id":"append_1","kind":"request","method":"message.append","params":{{"session_id":"session_1","message":"follow up","config_path":"{}"}}}}"#,
             config_path.display()
         ));
         assert_eq!(response.kind, EnvelopeKind::Response);
@@ -3515,7 +3515,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let mut approval_seen = false;
         for attempt in 0..100 {
             let response = server.handle_line(&format!(
-                r#"{{"v":1,"id":"events_{attempt}","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":32}}}}"#
+                r#"{{"v":2,"id":"events_{attempt}","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":32}}}}"#
             ));
             assert_eq!(response.kind, EnvelopeKind::Response);
             let events = response_value(&response)["events"].clone();
@@ -3528,7 +3528,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert!(approval_seen);
 
         let response = server.handle_line(&format!(
-            r#"{{"v":1,"id":"deny_1","kind":"request","method":"approval.decide","params":{{"run_id":"{run_id}","tool_call_id":"call_1","decision":"deny","reason":"test done"}}}}"#
+            r#"{{"v":2,"id":"deny_1","kind":"request","method":"approval.decide","params":{{"run_id":"{run_id}","tool_call_id":"call_1","decision":"deny","reason":"test done"}}}}"#
         ));
         assert_eq!(response.kind, EnvelopeKind::Response);
         let _provider_request = provider.handle.join().unwrap();
@@ -3568,7 +3568,7 @@ enabled = ["file.read"]
         );
 
         let response = server.handle_line(&format!(
-            r#"{{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{{"session_id":"session_1","message":"follow up","config_path":"{}","wait":true}}}}"#,
+            r#"{{"v":2,"id":"append_1","kind":"request","method":"message.append","params":{{"session_id":"session_1","message":"follow up","config_path":"{}","wait":true}}}}"#,
             config_path.display()
         ));
         assert_eq!(response.kind, EnvelopeKind::Error);
@@ -3886,7 +3886,7 @@ enabled = ["{enabled_tool}"]
         let deadline = Instant::now() + FAKE_PROVIDER_TIMEOUT;
         loop {
             let response = server.handle_line(&format!(
-                r#"{{"v":1,"id":"events","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":1}}}}"#
+                r#"{{"v":2,"id":"events","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":1}}}}"#
             ));
             assert_eq!(response.kind, EnvelopeKind::Response);
             let result = response_value(&response);
@@ -3912,7 +3912,7 @@ enabled = ["{enabled_tool}"]
         question: &str,
     ) -> RunStartResult {
         let response = server.handle_line(&format!(
-            r#"{{"v":1,"id":"start","kind":"request","method":"run.start","params":{{"question":"{question}","config_path":"{}"}}}}"#,
+            r#"{{"v":2,"id":"start","kind":"request","method":"run.start","params":{{"question":"{question}","config_path":"{}"}}}}"#,
             config_path.display()
         ));
         assert_eq!(response.kind, EnvelopeKind::Response);
@@ -3926,7 +3926,7 @@ enabled = ["{enabled_tool}"]
         message: &str,
     ) -> RunStartResult {
         let response = server.handle_line(&format!(
-            r#"{{"v":1,"id":"append","kind":"request","method":"message.append","params":{{"session_id":"{session_id}","message":"{message}","config_path":"{}"}}}}"#,
+            r#"{{"v":2,"id":"append","kind":"request","method":"message.append","params":{{"session_id":"{session_id}","message":"{message}","config_path":"{}"}}}}"#,
             config_path.display()
         ));
         assert_eq!(response.kind, EnvelopeKind::Response);
@@ -4213,7 +4213,7 @@ enabled = ["{enabled_tool}"]
     ) -> Envelope {
         server.handle_line(
             &json!({
-                "v": 1,
+                "v": 2,
                 "id": "voice_commit",
                 "kind": "request",
                 "method": "voice.events.commit",

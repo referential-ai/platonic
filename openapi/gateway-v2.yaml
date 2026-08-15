@@ -14,8 +14,8 @@
           "type": "string"
         }
       },
-      "LastEventId": {
-        "description": "Exact next native event offset emitted by a prior SSE event in the same available daemon-lifetime cursor.",
+      "RunLastEventId": {
+        "description": "Exact next native event offset emitted by a prior run SSE event in the same available daemon-lifetime cursor.",
         "example": 8,
         "in": "header",
         "name": "Last-Event-ID",
@@ -24,6 +24,17 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        }
+      },
+      "ThreadLastEventId": {
+        "description": "Exact live epoch and next native event offset emitted by a prior thread SSE event.",
+        "example": "epoch_1:8",
+        "in": "header",
+        "name": "Last-Event-ID",
+        "required": false,
+        "schema": {
+          "pattern": "^[^:]+:[0-9]+$",
+          "type": "string"
         }
       }
     },
@@ -144,7 +155,7 @@
       },
       "NativeOutcome": {
         "additionalProperties": true,
-        "description": "The exact typed native v1 result for the mapped operation.",
+        "description": "The exact typed native v2 result for the mapped operation.",
         "type": "object"
       }
     },
@@ -158,13 +169,13 @@
     }
   },
   "info": {
-    "description": "A translating adapter over the native typed NDJSON v1 protocol. It is plaintext, has no CORS, cookies, browser session, proxy-header identity, or in-process TLS, and is intended to sit behind an operator-owned TLS proxy. Actor and controller identity always come from the authenticated principal.",
+    "description": "A translating adapter over the native typed NDJSON v2 protocol. It is plaintext, has no CORS, cookies, browser session, proxy-header identity, or in-process TLS, and is intended to sit behind an operator-owned TLS proxy. Actor and controller identity always come from the authenticated principal.",
     "title": "Platonic authenticated HTTP gateway",
-    "version": "1.0.0"
+    "version": "2.0.0"
   },
   "openapi": "3.1.0",
   "paths": {
-    "/v1/status": {
+    "/v2/status": {
       "get": {
         "operationId": "getStatus",
         "parameters": [],
@@ -312,7 +323,7 @@
         "summary": "Read authoritative daemon status"
       }
     },
-    "/v1/workspaces": {
+    "/v2/workspaces": {
       "get": {
         "operationId": "listWorkspaces",
         "parameters": [],
@@ -460,13 +471,347 @@
         "summary": "List workspaces admitted for the principal"
       }
     },
-    "/v1/workspaces/{workspace_id}/runs/{run_id}/approvals/{tool_call_id}": {
+    "/v2/workspaces/{workspace_id}/profiles": {
+      "get": {
+        "operationId": "listProfiles",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NativeOutcome"
+                }
+              }
+            },
+            "description": "Native typed outcome"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed input or missing/invalid idempotency key"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Bearer authentication failed"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "The principal is outside the workspace scope"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "The route or scoped target is unavailable"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "The method is not admitted for this route"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Idempotency conflict/ambiguity or unavailable event cursor",
+            "headers": {
+              "Retry-After": {
+                "description": "One second for idempotency_in_progress",
+                "schema": {
+                  "const": 1,
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request body or headers exceed a fixed ceiling"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "A JSON mutation has an unsupported content type"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "The principal request or mutation-rate ceiling is reached"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "The gateway could not serialize or persist a deterministic outcome"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "The native daemon returned an invalid or oversized outcome"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "The gateway is overloaded, version-skewed, or native state is unavailable"
+          }
+        },
+        "summary": "List profiles admitted for the principal"
+      }
+    },
+    "/v2/workspaces/{workspace_id}/profiles/{profile_id}": {
+      "get": {
+        "operationId": "getProfile",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "profile_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NativeOutcome"
+                }
+              }
+            },
+            "description": "Native typed outcome"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed input or missing/invalid idempotency key"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Bearer authentication failed"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "The principal is outside the workspace scope"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "The route or scoped target is unavailable"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "The method is not admitted for this route"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Idempotency conflict/ambiguity or unavailable event cursor",
+            "headers": {
+              "Retry-After": {
+                "description": "One second for idempotency_in_progress",
+                "schema": {
+                  "const": 1,
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Request body or headers exceed a fixed ceiling"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "A JSON mutation has an unsupported content type"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "The principal request or mutation-rate ceiling is reached"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "The gateway could not serialize or persist a deterministic outcome"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "The native daemon returned an invalid or oversized outcome"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "The gateway is overloaded, version-skewed, or native state is unavailable"
+          }
+        },
+        "summary": "Read an admitted profile"
+      }
+    },
+    "/v2/workspaces/{workspace_id}/profiles/{profile_id}/runs/{run_id}/approvals/{tool_call_id}": {
       "post": {
         "operationId": "decideApproval",
         "parameters": [
           {
             "in": "path",
             "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "profile_id",
             "required": true,
             "schema": {
               "minLength": 1,
@@ -658,13 +1003,22 @@
         "summary": "Grant or deny one pending approval"
       }
     },
-    "/v1/workspaces/{workspace_id}/runs/{run_id}/cancel": {
+    "/v2/workspaces/{workspace_id}/profiles/{profile_id}/runs/{run_id}/cancel": {
       "post": {
         "operationId": "cancelRun",
         "parameters": [
           {
             "in": "path",
             "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "profile_id",
             "required": true,
             "schema": {
               "minLength": 1,
@@ -847,13 +1201,22 @@
         "summary": "Cancel an active run with principal attribution"
       }
     },
-    "/v1/workspaces/{workspace_id}/runs/{run_id}/events": {
+    "/v2/workspaces/{workspace_id}/profiles/{profile_id}/runs/{run_id}/events": {
       "get": {
         "operationId": "streamRunEvents",
         "parameters": [
           {
             "in": "path",
             "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "profile_id",
             "required": true,
             "schema": {
               "minLength": 1,
@@ -870,7 +1233,7 @@
             }
           },
           {
-            "$ref": "#/components/parameters/LastEventId"
+            "$ref": "#/components/parameters/RunLastEventId"
           }
         ],
         "responses": {
@@ -1018,13 +1381,22 @@
         "summary": "Stream run events"
       }
     },
-    "/v1/workspaces/{workspace_id}/runs/{run_id}/transcript": {
+    "/v2/workspaces/{workspace_id}/profiles/{profile_id}/runs/{run_id}/transcript": {
       "get": {
         "operationId": "getRunTranscript",
         "parameters": [
           {
             "in": "path",
             "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "profile_id",
             "required": true,
             "schema": {
               "minLength": 1,
@@ -1185,13 +1557,22 @@
         "summary": "Read a durable run transcript"
       }
     },
-    "/v1/workspaces/{workspace_id}/threads": {
+    "/v2/workspaces/{workspace_id}/profiles/{profile_id}/threads": {
       "get": {
         "operationId": "listThreads",
         "parameters": [
           {
             "in": "path",
             "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "profile_id",
             "required": true,
             "schema": {
               "minLength": 1,
@@ -1343,13 +1724,22 @@
         "summary": "List existing threads"
       }
     },
-    "/v1/workspaces/{workspace_id}/threads/{thread_id}": {
+    "/v2/workspaces/{workspace_id}/profiles/{profile_id}/threads/{thread_id}": {
       "get": {
         "operationId": "getThread",
         "parameters": [
           {
             "in": "path",
             "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "profile_id",
             "required": true,
             "schema": {
               "minLength": 1,
@@ -1510,13 +1900,22 @@
         "summary": "Read an existing thread"
       }
     },
-    "/v1/workspaces/{workspace_id}/threads/{thread_id}/authority": {
+    "/v2/workspaces/{workspace_id}/profiles/{profile_id}/threads/{thread_id}/authority": {
       "get": {
         "operationId": "getThreadAuthority",
         "parameters": [
           {
             "in": "path",
             "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "profile_id",
             "required": true,
             "schema": {
               "minLength": 1,
@@ -1677,13 +2076,22 @@
         "summary": "Read immutable thread authority"
       }
     },
-    "/v1/workspaces/{workspace_id}/threads/{thread_id}/events": {
+    "/v2/workspaces/{workspace_id}/profiles/{profile_id}/threads/{thread_id}/events": {
       "get": {
         "operationId": "streamThreadEvents",
         "parameters": [
           {
             "in": "path",
             "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "profile_id",
             "required": true,
             "schema": {
               "minLength": 1,
@@ -1700,14 +2108,14 @@
             }
           },
           {
-            "$ref": "#/components/parameters/LastEventId"
+            "$ref": "#/components/parameters/ThreadLastEventId"
           }
         ],
         "responses": {
           "200": {
             "content": {
               "text/event-stream": {
-                "example": "id: 8\\ndata: {\"offset\":7,\"event\":{\"kind\":\"test\"}}\\n\\n",
+                "example": "id: epoch_1:8\\ndata: {\"live_epoch_id\":\"epoch_1\",\"offset\":7,\"event\":{\"kind\":\"test\"}}\\n\\n",
                 "schema": {
                   "type": "string"
                 }
@@ -1848,13 +2256,22 @@
         "summary": "Stream live thread events"
       }
     },
-    "/v1/workspaces/{workspace_id}/threads/{thread_id}/messages": {
+    "/v2/workspaces/{workspace_id}/profiles/{profile_id}/threads/{thread_id}/messages": {
       "post": {
         "operationId": "sendThreadMessage",
         "parameters": [
           {
             "in": "path",
             "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "profile_id",
             "required": true,
             "schema": {
               "minLength": 1,
@@ -2037,13 +2454,22 @@
         "summary": "Start or steer a turn on an existing thread"
       }
     },
-    "/v1/workspaces/{workspace_id}/threads/{thread_id}/stop": {
+    "/v2/workspaces/{workspace_id}/profiles/{profile_id}/threads/{thread_id}/stop": {
       "post": {
         "operationId": "stopThread",
         "parameters": [
           {
             "in": "path",
             "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "profile_id",
             "required": true,
             "schema": {
               "minLength": 1,
@@ -2286,6 +2712,6 @@
     "sse_streams_total": 16,
     "stop_deadline_seconds": 15
   },
-  "x-sse-cursors": "Last-Event-ID is the exact next native offset. Resume is promised only while the same daemon-lifetime buffer and cursor remain available. Restart, expiry, lag, or an unknown cursor returns event_cursor_unavailable and requires status or transcript readback.",
-  "x-workspace-scoping": "Every path workspace and target is checked against the authenticated principal's fixed workspace allowlist. Crossed or unavailable targets fail closed."
+  "x-profile-scoping": "Every path workspace, profile, and target is checked against the authenticated principal's fixed workspace allowlist and optional profile allowlist. Profile scope may narrow its workspace ceiling and never widen it. Crossed or unavailable targets fail closed.",
+  "x-sse-cursors": "Thread Last-Event-ID is <live_epoch_id>:<next_native_offset>; run Last-Event-ID is the next native offset. Resume is promised only while the referenced native buffer remains available. Epoch change, restart, expiry, lag, or an unknown cursor returns event_cursor_unavailable and requires status or transcript readback."
 }
