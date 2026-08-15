@@ -7,7 +7,7 @@ sidebar:
 
 <p class="section-kicker reference">Reference</p>
 
-This page is part of the [Platonic 0.2.0 operating guide](../../../user/operations/).
+This page is part of the [Platonic 0.2.1 operating guide](../../../user/operations/).
 
 These tables cover the core operating surface. Run a command with `--help` for its final-head parser output. Paths passed to client commands are resolved from the workspace unless the help says otherwise.
 
