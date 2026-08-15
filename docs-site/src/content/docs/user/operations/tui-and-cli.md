@@ -7,7 +7,7 @@ sidebar:
 
 <p class="section-kicker user">User docs</p>
 
-This page is part of the [unreleased 0.2.0 operating guide](../).
+This page is part of the [Platonic 0.2.0 operating guide](../).
 
 ## Start an interactive thread
 

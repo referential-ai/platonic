@@ -7,7 +7,7 @@ sidebar:
 
 <p class="section-kicker reference">Reference</p>
 
-This page is part of the [unreleased 0.2.0 operating guide](../../../user/operations/).
+This page is part of the [Platonic 0.2.0 operating guide](../../../user/operations/).
 
 Press `?` with an empty composer for the controls implemented by the running client. Text keys remain composer input when the composer is nonempty unless noted below.
 

@@ -1,55 +1,42 @@
 ---
 title: First run
-description: Build exact-head commands, create a profile home, finish one read-only TUI task, and prove restart reuse.
+description: Install the 0.2.0 commands, create a profile home, finish one read-only TUI task, and prove restart reuse.
 sidebar:
   order: 3
 ---
 
 <p class="section-kicker user">User docs</p>
 
-This is one linear OpenRouter journey through the unreleased 0.2.0 behavior on
-`develop`. It uses the built-in configuration and `OPENROUTER_API_KEY`; do not
-add a `plato.toml` for this path.
+This is one linear OpenRouter journey through Platonic 0.2.0. It uses the
+built-in configuration and `OPENROUTER_API_KEY`; do not add a `plato.toml` for
+this path.
 
-> **Release gate:** The public release is 0.1.0. No released 0.2.0 bundle or
-> bundle-install proof exists until the real `platonic-v0.2.0` release. This
-> journey therefore uses locally built binaries from one exact source commit.
-> Do not substitute or rename a 0.1.0 bundle, and do not publish this page as
-> release-current.
+> **Release track:** Install the supported 0.2.0 bundle with the
+> [tagged quickstart](https://github.com/referential-ai/platonic/blob/platonic-v0.2.0/docs/QUICKSTART.md).
+> Keep its tag, target, checksum, and commands together.
 
-## 1. Build the exact-head commands
+## 1. Install the 0.2.0 commands
 
-From the repository root at the commit under review, build all three commands
-with that source identity embedded:
+Follow the tagged quickstart for your supported target, then keep its install
+directory on this terminal's `PATH`:
 
 ```bash
-source_commit=$(git rev-parse --verify HEAD)
-build_date=$(date -u +%F)
-PLATONIC_BUILD_COMMIT="$source_commit" \
-PLATONIC_BUILD_DATE="$build_date" \
-PLATO_BUILD_IDENTITY="0.2.0 $source_commit $build_date" \
-  cargo build --locked --release \
-  --package plato-agent --package platonic \
-  --bin plato --bin plato-tui --bin platonic
-export PATH="$PWD/target/release:$PATH"
-
+export PATH="$HOME/.local/bin:$PATH"
 platonic --version
 plato --version
 plato-tui --version
 ```
 
 **Checkpoint:** each line contains the exact 40-character commit and UTC build
-date. `plato` and `plato-tui` report 0.2.0. `platonic` reports product version
-0.1.0 because the unreleased tree deliberately retains the current release
-contract; that output is not evidence of a 0.2.0 bundle. Keep this terminal's
-`PATH` for the rest of the journey.
+date. All three commands report 0.2.0; `platonic` keeps its commit and date in
+parentheses. Keep this terminal's `PATH` for the rest of the journey.
 
 <figure class="expected-output">
   <figcaption>
     Stable version shape
     <span>Underlined provenance values come from the exact source commit and UTC build date.</span>
   </figcaption>
-  <pre tabindex="0"><samp>platonic 0.1.0 (<var>&lt;source-commit&gt;</var>, <var>&lt;YYYY-MM-DD&gt;</var>)
+  <pre tabindex="0"><samp>platonic 0.2.0 (<var>&lt;source-commit&gt;</var>, <var>&lt;YYYY-MM-DD&gt;</var>)
 plato 0.2.0 <var>&lt;source-commit&gt;</var> <var>&lt;YYYY-MM-DD&gt;</var>
 plato-tui 0.2.0 <var>&lt;source-commit&gt;</var> <var>&lt;YYYY-MM-DD&gt;</var></samp></pre>
 </figure>
@@ -294,7 +281,7 @@ the durable home into the new server process without minting another root.
 
 | Symptom | Recovery |
 | --- | --- |
-| Looking for a 0.2.0 archive returns HTTP 404 | The release gate is still closed. Do not substitute or rename 0.1.0; build the exact-head commands in step 1 or wait for `platonic-v0.2.0`. |
+| A 0.2.0 archive download returns HTTP 404 | Use the exact `platonic-v0.2.0` tag and target name from the tagged quickstart; no other targets are published. |
 | `platonic serve` reports a missing provider key, or status shows `"key_present":false` | Stop the idle server. Load `OPENROUTER_API_KEY` in the terminal that will own `platonic serve`, verify only that it is nonempty, and restart the server. |
 | `plato` reports `workspace_unregistered` | Return to the intended Git repository and run `platonic workspace create first-run "$PWD"` once. If the name is already used, inspect `platonic workspace list` instead of creating a competing record. |
 | Profile creation reports that the provider key is unavailable | Load the configured key into the `platonic serve` environment, restart the idle server, and rerun bare `plato`. No incomplete profile row is retained. |
