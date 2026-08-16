@@ -211,15 +211,7 @@ fn local_interactive_one_shot_asks_once_and_enter_registers_the_directory() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + PROOF_TIMEOUT;
-    loop {
-        if DaemonClient::connect(&config.socket_path).is_ok() {
-            break;
-        }
-        assert!(daemon.try_wait().unwrap().is_none(), "host daemon exited");
-        assert!(Instant::now() < deadline, "host daemon did not bind");
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_unregistered_daemon(&config, &mut daemon);
     let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
 
     shell.write(
