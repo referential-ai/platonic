@@ -12,13 +12,13 @@ sidebar:
 
 The public release and current `develop` tree are not interchangeable. Choose one track and keep its version, commands, and proof together.
 
-## Current public release: 0.2.1
+## Current public release: 0.2.2
 
-Install the supported bundle with the tagged [0.2.1 quickstart](https://github.com/referential-ai/platonic/blob/platonic-v0.2.1/docs/QUICKSTART.md). Archive contents, target names, checksums, and signing expectations remain owned by the repository [release contract](https://github.com/referential-ai/platonic/blob/develop/docs/RELEASE.md).
+Install the supported bundle with the tagged [0.2.2 quickstart](https://github.com/referential-ai/platonic/blob/platonic-v0.2.2/docs/QUICKSTART.md). Archive contents, target names, checksums, and signing expectations remain owned by the repository [release contract](https://github.com/referential-ai/platonic/blob/develop/docs/RELEASE.md).
 
 ## Exact-head develop
 
-For behavior after 0.2.1, build binaries from one exact source commit and keep that identity separate from the tagged release bundle.
+For behavior after 0.2.2, build binaries from one exact source commit and keep that identity separate from the tagged release bundle.
 
 <span id="5-local-voice-activation-and-device-proof"></span>
 

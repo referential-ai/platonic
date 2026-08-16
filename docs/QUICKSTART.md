@@ -5,9 +5,9 @@ second copy of the user manual.
 
 <a id="0-one-time-setup"></a>
 
-## Current public release: 0.2.1
+## Current public release: 0.2.2
 
-Install the released 0.2.1 bundle for Linux x86-64 or macOS Apple silicon:
+Install the released 0.2.2 bundle for Linux x86-64 or macOS Apple silicon:
 
 ```bash
 case "$(uname -s)-$(uname -m)" in
@@ -16,8 +16,8 @@ case "$(uname -s)-$(uname -m)" in
   *) echo "unsupported platform" >&2; exit 1 ;;
 esac
 
-bundle="platonic-0.2.1-$target"
-release="https://github.com/referential-ai/platonic/releases/download/platonic-v0.2.1"
+bundle="platonic-0.2.2-$target"
+release="https://github.com/referential-ai/platonic/releases/download/platonic-v0.2.2"
 curl -fLO "$release/$bundle.tar.gz"
 curl -fLO "$release/$bundle.sha256"
 
@@ -39,11 +39,11 @@ plato --version
 plato-tui --version
 ```
 
-The tag is exactly `platonic-v0.2.1`. See the
+The tag is exactly `platonic-v0.2.2`. See the
 [release contract](https://github.com/referential-ai/platonic/blob/develop/docs/RELEASE.md)
 for archive contents, supported targets, and verification details.
 
-## Platonic 0.2.1 user guide
+## Platonic 0.2.2 user guide
 
 The Starlight [user overview](https://docs.referential.ai/user/) and
 [first productive journey](https://docs.referential.ai/user/first-run/)

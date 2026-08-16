@@ -25,8 +25,8 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/referential-ai/platonic"
 
 [workspace.metadata.platonic-release]
-product-version = "0.2.1"
-product-tag = "platonic-v0.2.1"
+product-version = "0.2.2"
+product-tag = "platonic-v0.2.2"
 product-channel = "bundles"
 public-code-crates = ["platonic-core"]
 bundle-targets = ["linux-x86_64", "macos-arm64"]

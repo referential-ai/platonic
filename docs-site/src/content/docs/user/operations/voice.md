@@ -7,7 +7,7 @@ sidebar:
 
 <p class="section-kicker user">User docs</p>
 
-This page is part of the [Platonic 0.2.1 operating guide](../).
+This page is part of the [Platonic 0.2.2 operating guide](../).
 
 Voice is an optional, local Plato Agent TUI feature. It captures and plays audio in the client; the Platonic server does not receive or parse the separate voice configuration.
 

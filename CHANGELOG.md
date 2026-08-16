@@ -1,5 +1,12 @@
 # Changelog
 
+## Platonic 0.2.2 - 2026-08-16
+
+- Keep restart-synthesized failure returns from replacing a recovered child's
+  real typed return.
+- Preserve a committed parent follow-up when an interrupted child resumes in a
+  fresh run.
+
 ## Platonic 0.2.1 - 2026-08-15
 
 - Preserve profile yolo auto-approval for eligible tool calls made by
