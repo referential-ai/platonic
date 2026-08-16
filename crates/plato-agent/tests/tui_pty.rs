@@ -2040,9 +2040,10 @@ fn streamed_markdown_smooths_holds_tables_and_survives_reload_and_resize() {
     shell.write(b"v");
     shell.wait_for_current_screen_text("final mid-tok");
 
+    let picker_at = shell.output_len();
     shell.write(b"/sessions\r");
-    let picker = shell.wait_for_current_screen_text("thread_pty_streaming_384");
-    assert!(picker.contains("Threads"));
+    let picker = shell.wait_for_current_screen_text_after(picker_at, "Threads");
+    assert!(picker.contains("thread_pty_streaming_384"));
     shell.write(b"\r");
     fake.wait_for_request_count("transcript.read", 2);
     let reloaded = shell.wait_for_current_screen_text("final mid-tok");
