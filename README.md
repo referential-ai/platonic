@@ -15,10 +15,10 @@ owns the product hierarchy and exact forms.
 
 ## Start here
 
-- **Current public release (0.2.0):** install the supported command bundle from
+- **Current public release (0.2.1):** install the supported command bundle from
   the concise [quickstart](docs/QUICKSTART.md), then use the
-  [matching release documentation](https://github.com/referential-ai/platonic/blob/platonic-v0.2.0/docs/QUICKSTART.md).
-- **Platonic 0.2.0 user guide:** read the Starlight
+  [matching release documentation](https://github.com/referential-ai/platonic/blob/platonic-v0.2.1/docs/QUICKSTART.md).
+- **Platonic 0.2.1 user guide:** read the Starlight
   [user overview](https://docs.referential.ai/user/) and complete the
   [first productive journey](https://docs.referential.ai/user/first-run/).
 - **Release artifacts and verification:** use the
