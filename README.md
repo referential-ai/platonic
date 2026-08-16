@@ -67,8 +67,9 @@ Protocol v2 clients use `profile.create`, `profile.list`, `profile.status`,
 `profile.update`, and `profile.open` to manage a profile and its one lazy home
 thread. Home threads persist across server restarts and reject `thread.stop`;
 `thread.send` starts a new turn when an unloaded home or same-profile child is
-targeted again. Thread event cursors pair offsets with the server-provided
-`live_epoch_id` and reset when that epoch is stale.
+targeted again. An interrupted child returns only its recovered terminal result
+to its parent, not the restart interruption. Thread event cursors pair offsets
+with the server-provided `live_epoch_id` and reset when that epoch is stale.
 
 Each new profile turn selects the latest immutable instruction, memory, and
 skill-reference revision and records its exact revision hash in durable context.
