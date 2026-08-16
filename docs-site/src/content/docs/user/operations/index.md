@@ -8,7 +8,7 @@ sidebar:
 
 <p class="section-kicker user">User docs</p>
 
-> **Platonic 0.2.1 documentation:** These pages describe the current public
+> **Platonic 0.2.2 documentation:** These pages describe the current public
 > release. Install its supported bundle through the [release track](../install/)
 > before using this guide.
 

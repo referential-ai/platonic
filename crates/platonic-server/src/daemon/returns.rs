@@ -16,7 +16,7 @@ use crate::{
     },
 };
 use platonic_core::{ArtifactId, HarnessEvent, RunIdentity, ToolCallId};
-use platonic_protocol::ThreadKind;
+use platonic_protocol::{RunStateName, ThreadKind};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -275,6 +275,7 @@ pub(super) fn reconcile_run(runtime: &DaemonRuntime, run_id: &str) -> AppResult<
     }
     let terminal_run = terminal.is_some();
     if is_child
+        && run.status != RunStateName::Interrupted
         && let Some((kind, occurred_at_ms, mut payload)) = terminal
         && !(kind == ChildReturnKind::Result && delivered_question)
     {
@@ -286,7 +287,7 @@ pub(super) fn reconcile_run(runtime: &DaemonRuntime, run_id: &str) -> AppResult<
     let mut store = runtime.paths.server_store()?;
     store.settle_thread_run_deliveries(
         run_id,
-        context_built_at.is_some(),
+        context_built_at.is_some() && run.status != RunStateName::Interrupted,
         context_built_at.unwrap_or(0),
     )?;
     if terminal_run {
@@ -1296,6 +1297,316 @@ mod tests {
         assert_eq!(
             consumed[0].consumed_by_run_id.as_deref(),
             Some(consumed_run_id)
+        );
+    }
+
+    #[test]
+    fn interrupted_child_recovery_preserves_the_real_terminal_return() {
+        let (root, runtime, home, child, _, _) = child_return_test_runtime();
+        let interrupted_run = admission(
+            &runtime,
+            "run-interrupted-child",
+            &child,
+            "turn-interrupted-child",
+        );
+        runtime
+            .paths
+            .server_store()
+            .unwrap()
+            .admit_thread_run_and_reserve(&interrupted_run, &[], &[])
+            .unwrap();
+        append_run_prefix(&runtime, &child, &interrupted_run.run_id, &[], None);
+
+        let mut ledger =
+            SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
+        assert_eq!(
+            ledger
+                .interrupt_running_session_runs("daemon restarted before run completed")
+                .unwrap(),
+            1
+        );
+        let interrupted = ledger.read_session_run(&interrupted_run.run_id).unwrap();
+        assert_eq!(interrupted.status, RunStateName::Interrupted);
+        assert!(matches!(
+            &interrupted.records.last().unwrap().event,
+            HarnessEvent::RunFailed { reason, .. }
+                if reason == "daemon restarted before run completed"
+        ));
+        drop(ledger);
+
+        let restarted = DaemonRuntime::new_with_max_spawn_depth(runtime.paths.clone(), 1);
+        reconcile_workspace(&restarted).unwrap();
+        assert!(
+            restarted
+                .paths
+                .server_store()
+                .unwrap()
+                .available_child_returns(&home, "unused")
+                .unwrap()
+                .is_empty()
+        );
+
+        let recovered_run = admission(
+            &restarted,
+            "run-recovered-child",
+            &child,
+            "turn-recovered-child",
+        );
+        restarted
+            .paths
+            .server_store()
+            .unwrap()
+            .admit_thread_run_and_reserve(&recovered_run, &[], &[])
+            .unwrap();
+        append_run_prefix(
+            &restarted,
+            &child,
+            &recovered_run.run_id,
+            &[],
+            Some(Ok("real recovered result")),
+        );
+        reconcile_run(&restarted, &recovered_run.run_id).unwrap();
+
+        let returns = restarted
+            .paths
+            .server_store()
+            .unwrap()
+            .available_child_returns(&home, "unused")
+            .unwrap();
+        assert_eq!(returns.len(), 1);
+        assert_eq!(returns[0].kind, ChildReturnKind::Result);
+        assert_eq!(returns[0].payload, "real recovered result");
+        assert_eq!(
+            returns[0].source_run_id.as_deref(),
+            Some(recovered_run.run_id.as_str())
+        );
+
+        let duplicate_run = admission(
+            &restarted,
+            "run-duplicate-child",
+            &child,
+            "turn-duplicate-child",
+        );
+        restarted
+            .paths
+            .server_store()
+            .unwrap()
+            .admit_thread_run_and_reserve(&duplicate_run, &[], &[])
+            .unwrap();
+        assert!(matches!(
+            persist_child_tool_return(
+                &restarted,
+                ChildReturnInvocation {
+                    child_thread_id: &child,
+                    source_turn_id: &duplicate_run.thread_turn_id,
+                    source_run_id: &duplicate_run.run_id,
+                    call_id: &ToolCallId::new("call-after-terminal").unwrap(),
+                    created_at_ms: 500,
+                },
+                ThreadReturnToolInput {
+                    kind: ThreadReturnToolKind::Progress,
+                    payload: "too late".into(),
+                    artifact_refs: Vec::new(),
+                },
+                Some(&HashSet::new()),
+            )
+            .unwrap(),
+            ThreadReturnToolOutput::Rejected { code, .. } if code == "child_terminal"
+        ));
+
+        let parent_run_id = "run-recovered-parent";
+        let parent_turn_id = "turn-recovered-parent";
+        let (mut parent, _recorder, parent_identity) = prepared(
+            &restarted,
+            &home,
+            parent_run_id,
+            &root.path().join("recovered-parent.jsonl"),
+        );
+        admit_spawn_edge_context(
+            &restarted,
+            &mut parent,
+            &parent_identity,
+            &home,
+            parent_turn_id,
+            parent_run_id,
+        )
+        .unwrap();
+        let parent_context = context_text(&parent);
+        assert!(parent_context.contains("real recovered result"));
+        assert!(!parent_context.contains("daemon restarted before run completed"));
+        append_run_prefix(
+            &restarted,
+            &home,
+            parent_run_id,
+            &[],
+            Some(Ok("parent consumed result")),
+        );
+        reconcile_run(&restarted, parent_run_id).unwrap();
+        let consumed = restarted
+            .paths
+            .server_store()
+            .unwrap()
+            .available_child_returns(&home, parent_run_id)
+            .unwrap();
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(consumed[0].state, DeliveryState::Consumed);
+        assert_eq!(
+            consumed[0].consumed_by_run_id.as_deref(),
+            Some(parent_run_id)
+        );
+    }
+
+    #[test]
+    fn interrupted_child_recovery_reuses_the_committed_parent_follow_up() {
+        let (root, runtime, home, child, _, _) = child_return_test_runtime();
+        let parent_run = admission(
+            &runtime,
+            "run-follow-up-parent",
+            &home,
+            "turn-follow-up-parent",
+        );
+        runtime
+            .paths
+            .server_store()
+            .unwrap()
+            .admit_thread_run_and_reserve(&parent_run, &[], &[])
+            .unwrap();
+        let answer = persist_parent_tool_answer(
+            &runtime,
+            &home,
+            &parent_run.thread_turn_id,
+            &parent_run.run_id,
+            &ToolCallId::new("call-follow-up").unwrap(),
+            ParentAnswerToolInput {
+                child_thread_id: child.clone(),
+                kind: ParentAnswerToolKind::FollowUp,
+                payload: "continue from this exact committed payload".into(),
+            },
+            100,
+        )
+        .unwrap();
+        let ParentAnswerToolOutput::Delivered { message_id, .. } = answer else {
+            panic!("parent follow-up is delivered");
+        };
+        discard_run_admission(&runtime, &parent_run.run_id).unwrap();
+
+        let interrupted_run_id = "run-follow-up-interrupted";
+        let interrupted_turn_id = "turn-follow-up-interrupted";
+        let (mut interrupted, _recorder, interrupted_identity) = prepared(
+            &runtime,
+            &child,
+            interrupted_run_id,
+            &root.path().join("follow-up-interrupted.jsonl"),
+        );
+        admit_spawn_edge_context(
+            &runtime,
+            &mut interrupted,
+            &interrupted_identity,
+            &child,
+            interrupted_turn_id,
+            interrupted_run_id,
+        )
+        .unwrap();
+        assert!(context_text(&interrupted).contains("continue from this exact committed payload"));
+        append_run_prefix(&runtime, &child, interrupted_run_id, &[], None);
+        let interrupted_run = RunId::new(interrupted_run_id).unwrap();
+        let mut ledger =
+            SqliteLedger::open_or_create_default(&runtime.paths.default_ledger()).unwrap();
+        ledger
+            .append(
+                interrupted_run_id,
+                &RecordedEvent {
+                    seq: 1,
+                    occurred_at_ms: 201,
+                    event: HarnessEvent::ContextBuilt {
+                        run_id: interrupted_run.clone(),
+                        turn_id: TurnId::new(interrupted_turn_id).unwrap(),
+                        context: ContextPack {
+                            token_budget: 1,
+                            fragments: Vec::new(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            ledger
+                .interrupt_running_session_runs("daemon restarted before run completed")
+                .unwrap(),
+            1
+        );
+        drop(ledger);
+
+        let restarted = DaemonRuntime::new_with_max_spawn_depth(runtime.paths.clone(), 1);
+        reconcile_workspace(&restarted).unwrap();
+        let released = restarted
+            .paths
+            .server_store()
+            .unwrap()
+            .available_parent_answers(&child, "unused")
+            .unwrap();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].message_id, message_id);
+        assert_eq!(released[0].state, DeliveryState::Available);
+        assert_eq!(released[0].source_run_id, parent_run.run_id);
+
+        let recovered_run_id = "run-follow-up-recovered";
+        let recovered_turn_id = "turn-follow-up-recovered";
+        let (mut recovered, _recorder, recovered_identity) = prepared(
+            &restarted,
+            &child,
+            recovered_run_id,
+            &root.path().join("follow-up-recovered.jsonl"),
+        );
+        admit_spawn_edge_context(
+            &restarted,
+            &mut recovered,
+            &recovered_identity,
+            &child,
+            recovered_turn_id,
+            recovered_run_id,
+        )
+        .unwrap();
+        assert_eq!(
+            context_text(&recovered)
+                .matches("continue from this exact committed payload")
+                .count(),
+            1
+        );
+        let reserved = restarted
+            .paths
+            .server_store()
+            .unwrap()
+            .available_parent_answers(&child, recovered_run_id)
+            .unwrap();
+        assert_eq!(reserved.len(), 1);
+        assert_eq!(reserved[0].message_id, message_id);
+        assert_eq!(reserved[0].state, DeliveryState::Reserved);
+        assert_eq!(
+            reserved[0].reserved_by_run_id.as_deref(),
+            Some(recovered_run_id)
+        );
+
+        append_run_prefix(
+            &restarted,
+            &child,
+            recovered_run_id,
+            &[],
+            Some(Ok("continued from committed follow-up")),
+        );
+        reconcile_run(&restarted, recovered_run_id).unwrap();
+        let consumed = restarted
+            .paths
+            .server_store()
+            .unwrap()
+            .available_parent_answers(&child, recovered_run_id)
+            .unwrap();
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(consumed[0].message_id, message_id);
+        assert_eq!(consumed[0].state, DeliveryState::Consumed);
+        assert_eq!(
+            consumed[0].consumed_by_run_id.as_deref(),
+            Some(recovered_run_id)
         );
     }
 

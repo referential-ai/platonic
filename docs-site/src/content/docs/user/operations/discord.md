@@ -9,7 +9,7 @@ sidebar:
 
 <p class="section-kicker user">User docs</p>
 
-This page is part of the [Platonic 0.2.1 operating guide](../).
+This page is part of the [Platonic 0.2.2 operating guide](../).
 
 Discord is an optional server-owned ingress connector. It maps configured channels and principals to existing durable threads; it does not own sessions, approvals, provider calls, or run semantics.
 

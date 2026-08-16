@@ -15,10 +15,10 @@ owns the product hierarchy and exact forms.
 
 ## Start here
 
-- **Current public release (0.2.1):** install the supported command bundle from
+- **Current public release (0.2.2):** install the supported command bundle from
   the concise [quickstart](docs/QUICKSTART.md), then use the
-  [matching release documentation](https://github.com/referential-ai/platonic/blob/platonic-v0.2.1/docs/QUICKSTART.md).
-- **Platonic 0.2.1 user guide:** read the Starlight
+  [matching release documentation](https://github.com/referential-ai/platonic/blob/platonic-v0.2.2/docs/QUICKSTART.md).
+- **Platonic 0.2.2 user guide:** read the Starlight
   [user overview](https://docs.referential.ai/user/) and complete the
   [first productive journey](https://docs.referential.ai/user/first-run/).
 - **Release artifacts and verification:** use the
@@ -67,7 +67,9 @@ Protocol v2 clients use `profile.create`, `profile.list`, `profile.status`,
 `profile.update`, and `profile.open` to manage a profile and its one lazy home
 thread. Home threads persist across server restarts and reject `thread.stop`;
 `thread.send` starts a new turn when an unloaded home or same-profile child is
-targeted again. Thread event cursors pair offsets with the server-provided
+targeted again. An interrupted child returns only its recovered terminal result
+to its parent, not the restart interruption, and sees committed parent answers
+again on recovery. Thread event cursors pair offsets with the server-provided
 `live_epoch_id` and reset when that epoch is stale.
 
 Each new profile turn selects the latest immutable instruction, memory, and
