@@ -1,21 +1,21 @@
 ---
 title: First run
-description: Install the 0.2.1 commands, create a profile home, finish one read-only TUI task, and prove restart reuse.
+description: Install the 0.2.2 commands, create a profile home, finish one read-only TUI task, and prove restart reuse.
 sidebar:
   order: 3
 ---
 
 <p class="section-kicker user">User docs</p>
 
-This is one linear OpenRouter journey through Platonic 0.2.1. It uses the
+This is one linear OpenRouter journey through Platonic 0.2.2. It uses the
 built-in configuration and `OPENROUTER_API_KEY`; do not add a `plato.toml` for
 this path.
 
-> **Release track:** Install the supported 0.2.1 bundle with the
-> [tagged quickstart](https://github.com/referential-ai/platonic/blob/platonic-v0.2.1/docs/QUICKSTART.md).
+> **Release track:** Install the supported 0.2.2 bundle with the
+> [tagged quickstart](https://github.com/referential-ai/platonic/blob/platonic-v0.2.2/docs/QUICKSTART.md).
 > Keep its tag, target, checksum, and commands together.
 
-## 1. Install the 0.2.1 commands
+## 1. Install the 0.2.2 commands
 
 Follow the tagged quickstart for your supported target, then keep its install
 directory on this terminal's `PATH`:
@@ -28,7 +28,7 @@ plato-tui --version
 ```
 
 **Checkpoint:** each line contains the exact 40-character commit and UTC build
-date. `platonic` reports product version 0.2.1; the two Plato Agent clients
+date. `platonic` reports product version 0.2.2; the two Plato Agent clients
 retain their independent package version 0.2.0. `platonic` keeps its commit and
 date in parentheses. Keep this terminal's `PATH` for the rest of the journey.
 
@@ -37,7 +37,7 @@ date in parentheses. Keep this terminal's `PATH` for the rest of the journey.
     Stable version shape
     <span>Underlined provenance values come from the exact source commit and UTC build date.</span>
   </figcaption>
-  <pre tabindex="0"><samp>platonic 0.2.1 (<var>&lt;source-commit&gt;</var>, <var>&lt;YYYY-MM-DD&gt;</var>)
+  <pre tabindex="0"><samp>platonic 0.2.2 (<var>&lt;source-commit&gt;</var>, <var>&lt;YYYY-MM-DD&gt;</var>)
 plato 0.2.0 <var>&lt;source-commit&gt;</var> <var>&lt;YYYY-MM-DD&gt;</var>
 plato-tui 0.2.0 <var>&lt;source-commit&gt;</var> <var>&lt;YYYY-MM-DD&gt;</var></samp></pre>
 </figure>
@@ -282,7 +282,7 @@ the durable home into the new server process without minting another root.
 
 | Symptom | Recovery |
 | --- | --- |
-| A 0.2.1 archive download returns HTTP 404 | Use the exact `platonic-v0.2.1` tag and target name from the tagged quickstart; no other targets are published. |
+| A 0.2.2 archive download returns HTTP 404 | Use the exact `platonic-v0.2.2` tag and target name from the tagged quickstart; no other targets are published. |
 | `platonic serve` reports a missing provider key, or status shows `"key_present":false` | Stop the idle server. Load `OPENROUTER_API_KEY` in the terminal that will own `platonic serve`, verify only that it is nonempty, and restart the server. |
 | `plato` reports `workspace_unregistered` | Return to the intended Git repository and run `platonic workspace create first-run "$PWD"` once. If the name is already used, inspect `platonic workspace list` instead of creating a competing record. |
 | Profile creation reports that the provider key is unavailable | Load the configured key into the `platonic serve` environment, restart the idle server, and rerun bare `plato`. No incomplete profile row is retained. |
