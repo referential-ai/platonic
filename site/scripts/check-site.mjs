@@ -32,16 +32,17 @@ const requiredFiles = [
 ];
 
 const requiredExternalLinks = [
-  "https://docs.rs/plato-agent/0.1.0/plato_agent/",
-  "https://docs.rs/platonic-core/0.1.0/platonic_core/",
+  "https://docs.referential.ai/developer/",
+  "https://docs.referential.ai/user/",
   "https://github.com/referential-ai/platonic",
-  "https://github.com/referential-ai/platonic/blob/main/docs/QUICKSTART.md",
+  "https://github.com/referential-ai/platonic/blob/platonic-v0.2.2/docs/QUICKSTART.md",
   "https://github.com/referential-ai/platonic/discussions",
   "https://github.com/referential-ai/platonic/releases",
+  "https://github.com/referential-ai/platonic/releases/tag/platonic-v0.2.2",
 ];
 
 const allowedExternalOrigins = new Set([
-  "https://docs.rs",
+  "https://docs.referential.ai",
   "https://github.com",
 ]);
 
@@ -231,10 +232,12 @@ for (const [route, path] of routes) {
   check(description.length === 1 && Boolean(attribute(description[0], "content")?.trim()), `${path}: expected one nonempty description meta tag`);
 
   const pageText = textContent(document).replace(/\s+/g, " ").trim();
-  check(pageText.includes("Platonic"), `${path}: missing Platonic framework name`);
-  check(pageText.includes("by Referential.ai"), `${path}: missing exact framework endorsement`);
-  check(pageText.includes("Plato Agent"), `${path}: missing Plato Agent runtime name`);
+  check(pageText.includes("Platonic"), `${path}: missing Platonic server name`);
+  check(pageText.includes("by Referential.ai"), `${path}: missing exact server endorsement`);
+  check(pageText.includes("Plato Agent"), `${path}: missing Plato Agent distribution name`);
   check(!pageText.includes("Platonic Runtime"), `${path}: must not rename Plato Agent to Platonic Runtime`);
+  check(!/\breference runtime\b/i.test(pageText), `${path}: must not describe Plato Agent as a reference runtime`);
+  check(!/\bframework\b/i.test(pageText), `${path}: must describe Platonic as the server, not a framework`);
   check(!source.includes("referential-ai/platonic-workspace"), `${path}: must not expose the private workspace authority URL`);
   check(!/discord(?:\.gg|\.com\/invite)/i.test(source), `${path}: Discord requires a separately approved public invite`);
 
@@ -302,13 +305,14 @@ for (const reference of discoveredLocalReferences) {
 const home = documents.get("/");
 if (home) {
   const h1 = elements(home, "h1")[0];
-  check(Boolean(h1) && textContent(h1).trim() === "Platonic", "index.html: h1 must be the framework name Platonic");
+  check(Boolean(h1) && textContent(h1).trim() === "Platonic", "index.html: h1 must be the server name Platonic");
   const homeText = textContent(home).replace(/\s+/g, " ");
   check(homeText.includes("plato replay"), "index.html: missing stable plato replay command");
 
-  const installCommands = elements(home, "code")
-    .filter((node) => textContent(node).trim() === "cargo install plato-agent --locked");
-  check(installCommands.length === 1, "index.html: expected one exact cargo install plato-agent --locked command");
+  check(!homeText.includes("cargo install plato-agent"), "index.html: must not advertise Cargo installation for Plato Agent");
+  const releaseTags = elements(home, "code")
+    .filter((node) => textContent(node).trim() === "platonic-v0.2.2");
+  check(releaseTags.length === 1, "index.html: expected one exact platonic-v0.2.2 release tag");
 
   const primaryActions = elements(home, "a")
     .filter((node) => textContent(node).replace(/\s+/g, " ").trim() === "Start with Plato Agent");
@@ -320,6 +324,17 @@ if (home) {
   const startSections = elements(home, "section")
     .filter((node) => attribute(node, "id") === "start");
   check(startSections.length === 1, "index.html: expected one #start section");
+  if (startSections.length === 1) {
+    const quickstartActions = elements(startSections[0], "a")
+      .filter((node) => textContent(node).replace(/\s+/g, " ").trim() === "Open the 0.2.2 quickstart");
+    check(quickstartActions.length === 1, "index.html: expected one tagged 0.2.2 quickstart action in #start");
+    if (quickstartActions.length === 1) {
+      check(
+        attribute(quickstartActions[0], "href") === "https://github.com/referential-ai/platonic/blob/platonic-v0.2.2/docs/QUICKSTART.md",
+        "index.html: 0.2.2 quickstart action must target the immutable tagged guide",
+      );
+    }
+  }
 }
 
 const cssBuffer = await readSiteFile("assets/site.css");

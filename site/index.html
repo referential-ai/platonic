@@ -6,14 +6,14 @@
     <title>Platonic | Visible, replayable agent work</title>
     <meta
       name="description"
-      content="Platonic is a framework for visible, replayable agent work. Plato Agent is its named reference runtime."
+      content="Platonic is a self-hosted agent server for visible, replayable work. Plato Agent is its client distribution."
     >
     <meta name="theme-color" content="#ffffff">
     <meta property="og:type" content="website">
     <meta property="og:title" content="Platonic">
     <meta
       property="og:description"
-      content="A framework for visible, replayable agent work, with Plato Agent as its reference runtime."
+      content="A self-hosted agent server for visible, replayable work, with Plato Agent as its client distribution."
     >
     <meta
       property="og:image"
@@ -39,7 +39,7 @@
           <small>by Referential.ai</small>
         </a>
         <nav class="primary-nav" aria-label="Primary" data-allow-scroll>
-          <a href="#why">Framework</a>
+          <a href="#why">Product</a>
           <a href="#replay">Replay</a>
           <a href="#resources">Resources</a>
           <a href="/blog/">Blog</a>
@@ -61,16 +61,16 @@
         <div class="hero-scrim" aria-hidden="true"></div>
         <div class="shell hero-inner">
           <div class="hero-copy">
-            <p class="eyebrow">Open agent framework</p>
+            <p class="eyebrow">Self-hosted agent server</p>
             <div class="lockup">
               <h1 id="hero-title">Platonic</h1>
               <p>by Referential.ai</p>
             </div>
-            <p class="hero-deck">A framework for visible, replayable agent work.</p>
+            <p class="hero-deck">A self-hosted agent server for visible, replayable work.</p>
             <p class="hero-detail">
-              <strong>Plato Agent</strong> is the named application and reference runtime
-              built on Platonic. Model calls, tool calls, and policy decisions cross typed
-              boundaries into a replayable ledger.
+              <strong>Plato Agent</strong> is the client distribution built on Platonic.
+              Model calls, tool calls, and policy decisions cross typed boundaries into a
+              replayable ledger.
             </p>
             <div class="hero-actions">
               <a
@@ -94,9 +94,9 @@
             <p class="section-kicker">Why Platonic</p>
             <h2 id="meaning-title">A common foundation, made concrete.</h2>
             <p>
-              Platonic names the framework and the standard it pursues: precise
-              boundaries, inspectable work, and replayable outcomes. Plato Agent is the
-              reference application that makes those commitments tangible.
+              Platonic is the server: it owns workspaces, agents, threads, tools, policy,
+              approvals, and ledgers. Plato Agent is the client distribution that makes
+              those boundaries visible.
             </p>
           </div>
         </div>
@@ -130,15 +130,14 @@
             <a href="/assets/plato-agent-desktop.png">
               <img
                 src="/assets/plato-agent-desktop.png"
-                alt="Plato Agent desktop showing a completed session explaining the Platonic framework boundary."
+                alt="Plato Agent TUI showing a completed read-only task and its recorded result."
                 width="1180"
                 height="760"
                 loading="lazy"
               >
             </a>
             <figcaption>
-              Plato Agent keeps the current session, runtime state, and recorded outcome in
-              view.
+              Plato Agent keeps the completed task and recorded outcome in view.
             </figcaption>
           </figure>
         </div>
@@ -147,27 +146,28 @@
       <section class="start-band" id="start" aria-labelledby="start-title">
         <div class="shell start-layout">
           <div>
-            <p class="section-kicker">Reference runtime</p>
+            <p class="section-kicker">Client distribution</p>
             <h2 id="start-title">Start with Plato Agent.</h2>
           </div>
           <div>
             <p>
-              Install the published runtime directly, or use the canonical five-minute
-              guide to build from source, run a bounded local task, and replay its ledger.
+              Install the supported Platonic 0.2.2 command bundle for Linux x86-64 or
+              macOS Apple silicon. The tagged quickstart owns target selection, checksum
+              verification, and install commands.
             </p>
-            <p class="install-command"><code>cargo install plato-agent --locked</code></p>
+            <p class="install-command"><code>platonic-v0.2.2</code></p>
             <div class="start-actions">
               <a
                 class="button button-light"
-                href="https://github.com/referential-ai/platonic/blob/main/docs/QUICKSTART.md"
+                href="https://github.com/referential-ai/platonic/blob/platonic-v0.2.2/docs/QUICKSTART.md"
               >
-                Open the quickstart
+                Open the 0.2.2 quickstart
               </a>
               <a
                 class="text-link text-link-light"
-                href="https://github.com/referential-ai/platonic/releases"
+                href="https://github.com/referential-ai/platonic/releases/tag/platonic-v0.2.2"
               >
-                View releases
+                View the 0.2.2 release
               </a>
             </div>
           </div>
@@ -187,18 +187,18 @@
               </a>
             </li>
             <li>
-              <a href="https://github.com/referential-ai/platonic/blob/main/docs/QUICKSTART.md">
-                <span>Build and run in five minutes</span><small>Quickstart</small>
+              <a href="https://github.com/referential-ai/platonic/blob/platonic-v0.2.2/docs/QUICKSTART.md">
+                <span>Install the 0.2.2 command bundle</span><small>Quickstart</small>
               </a>
             </li>
             <li>
-              <a href="https://docs.rs/plato-agent/0.1.0/plato_agent/">
-                <span>Application API</span><small>docs.rs</small>
+              <a href="https://docs.referential.ai/user/">
+                <span>Plato Agent user guide</span><small>Docs</small>
               </a>
             </li>
             <li>
-              <a href="https://docs.rs/platonic-core/0.1.0/platonic_core/">
-                <span>Framework kernel API</span><small>docs.rs</small>
+              <a href="https://docs.referential.ai/developer/">
+                <span>Platonic developer guide</span><small>Docs</small>
               </a>
             </li>
             <li>
@@ -219,7 +219,7 @@
         <div class="shell blog-layout">
           <div>
             <p class="section-kicker">Field notes</p>
-            <h2 id="blog-title">From the framework.</h2>
+            <h2 id="blog-title">From the product.</h2>
           </div>
           <article class="article-lead">
             <time datetime="2026-07-15">July 15, 2026</time>
@@ -229,7 +229,7 @@
               </a>
             </h3>
             <p>
-              Why the framework starts with typed boundaries and a durable ledger, and how
+              Why the server starts with typed boundaries and a durable ledger, and how
               Plato Agent puts them to work.
             </p>
           </article>
