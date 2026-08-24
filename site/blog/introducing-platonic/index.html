@@ -6,14 +6,14 @@
     <title>Introducing Platonic | Platonic field notes</title>
     <meta
       name="description"
-      content="Platonic starts with typed boundaries and a durable ledger. Plato Agent makes that framework concrete."
+      content="Platonic starts with typed boundaries and a durable ledger. Plato Agent makes those server guarantees visible."
     >
     <meta name="theme-color" content="#ffffff">
     <meta property="og:type" content="article">
     <meta property="og:title" content="Introducing Platonic: visible work, replayable by default">
     <meta
       property="og:description"
-      content="Why the framework starts with typed boundaries and a durable ledger."
+      content="Why the server starts with typed boundaries and a durable ledger."
     >
     <meta
       property="og:image"
@@ -38,7 +38,7 @@
           <small>by Referential.ai</small>
         </a>
         <nav class="primary-nav" aria-label="Primary" data-allow-scroll>
-          <a href="/#why">Framework</a>
+          <a href="/#why">Product</a>
           <a href="/#replay">Replay</a>
           <a href="/#resources">Resources</a>
           <a href="/blog/" aria-current="page">Blog</a>
@@ -59,7 +59,7 @@
             <a class="back-link" href="/blog/">Field notes</a>
             <h1>Introducing Platonic: visible work, replayable by default</h1>
             <p class="article-deck">
-              A framework for disciplined agent execution, made concrete by Plato Agent.
+              A self-hosted server for disciplined agent execution, used through Plato Agent.
             </p>
             <p class="byline">
               <time datetime="2026-07-15">July 15, 2026</time>
@@ -75,52 +75,50 @@
             changes an outcome should cross a typed boundary and leave durable evidence.
           </p>
 
-          <h2>The framework</h2>
+          <h2>The server</h2>
           <p>
-            Platonic is the common foundation. It assembles bounded context, separates tool
-            proposals from policy decisions, and treats the event ledger as the source of
-            truth for replay and audit. Hosts still own real IO; the framework keeps the
-            execution contract small and inspectable.
+            Platonic owns workspaces, agents, threads, provider calls, tools, policy,
+            approvals, and ledgers. It assembles bounded context, separates tool proposals
+            from policy decisions, and records replay and audit truth in the event ledger.
           </p>
 
-          <h2>The reference runtime</h2>
+          <h2>The client distribution</h2>
           <p>
-            Plato Agent is the named application and reference runtime built on Platonic. It
-            connects providers, local tools, approvals, persistence, daemon clients, and the
-            desktop experience without moving those concerns into the kernel.
+            Plato Agent is the client distribution built on Platonic. It packages the CLI,
+            TUI, and desktop clients with curated agent configurations and skills; server
+            execution stays in Platonic.
           </p>
           <p>
-            A session can continue across clients, pause for a local approval, recover after
-            interruption, and replay from recorded events. The application shows the
-            framework under real product pressure while preserving the boundary between
-            durable semantics and host mechanics.
+            A thread can continue across clients, pause for a local approval, recover after
+            interruption, and replay from recorded events. The clients make those server
+            boundaries visible without owning them.
           </p>
 
           <figure class="article-image">
             <a href="/assets/plato-agent-desktop.png">
               <img
                 src="/assets/plato-agent-desktop.png"
-                alt="Plato Agent desktop showing a completed session explaining the Platonic framework boundary."
+                alt="Plato Agent TUI showing a completed read-only task and its recorded result."
                 width="1180"
                 height="760"
               >
             </a>
-            <figcaption>Plato Agent is the reference runtime; Platonic is the framework.</figcaption>
+            <figcaption>Plato Agent is the client distribution; Platonic is the server.</figcaption>
           </figure>
 
           <h2>Start with evidence</h2>
           <p>
             The quickest way to understand the system is to run a bounded task and replay
-            its ledger. The canonical quickstart covers the build, first run, approvals, and
-            offline readback without creating a second documentation path here.
+            its ledger. The tagged quickstart covers the supported bundle, first run,
+            approvals, and offline readback without creating a second documentation path here.
           </p>
 
           <div class="article-actions">
             <a
               class="button"
-              href="https://github.com/referential-ai/platonic/blob/main/docs/QUICKSTART.md"
+              href="https://github.com/referential-ai/platonic/blob/platonic-v0.2.2/docs/QUICKSTART.md"
             >
-              Open the quickstart
+              Open the 0.2.2 quickstart
             </a>
             <a class="text-link" href="https://github.com/referential-ai/platonic">
               Explore the source

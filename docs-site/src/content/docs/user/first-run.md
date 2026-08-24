@@ -278,6 +278,25 @@ prompt, prints `Home: <thread-id> (reused)`, and attaches that same home. Submit
 `Reply with exactly: home reused.` and verify the new turn completes. This loads
 the durable home into the new server process without minting another root.
 
+## Verified 0.2.2 released-product proof
+
+The public [#588 completion record](https://github.com/referential-ai/platonic/issues/588#issuecomment-5309518721)
+is the source for this redacted journey. Credential values, local paths, exact
+effect bytes, and minted thread and run ids are omitted here.
+
+1. **Install.** The proof used the published [Platonic 0.2.2
+   bundle](https://github.com/referential-ai/platonic/releases/tag/platonic-v0.2.2),
+   built from the exact tagged source.
+2. **Bounded task.** One profile home dispatched one child with fewer worktrees
+   and tools, no network authority, and one local approval for the admitted
+   effect.
+3. **Restart and reuse.** A zero-effect child run was interrupted by a server
+   restart. Recovery reused the durable child authority and exact committed
+   parent follow-up, completed the effect once, and returned one typed result.
+4. **Replay.** Offline `plato replay` verified the spawn, follow-up,
+   interruption, recovery, and parent-consumption runs without provider or tool
+   IO. The parent consumed the typed return without repeating the effect.
+
 ## Recover by symptom
 
 | Symptom | Recovery |

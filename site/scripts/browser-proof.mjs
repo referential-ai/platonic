@@ -425,14 +425,20 @@ async function provePage(page, profile, route) {
 
   if (route === "/") {
     record((await page.locator("h1").allTextContents()).map((text) => text.trim()).join("|") === "Platonic", `${profile.name} /: expected one Platonic h1`);
-    record(await page.getByText("by Referential.ai", { exact: true }).first().isVisible(), `${profile.name} /: exact framework endorsement is not visible`);
+    record(await page.getByText("by Referential.ai", { exact: true }).first().isVisible(), `${profile.name} /: exact server endorsement is not visible`);
     record(await page.getByText("Plato Agent", { exact: false }).first().isVisible(), `${profile.name} /: Plato Agent is not visible`);
     const primaryAction = page.getByRole("link", { name: "Start with Plato Agent", exact: true });
     record(await primaryAction.isVisible(), `${profile.name} /: primary quickstart action is not visible`);
     record(await primaryAction.getAttribute("href") === "#start", `${profile.name} /: primary quickstart action must target #start`);
     record(
-      (await page.locator("#start code").allTextContents()).map((text) => text.trim()).join("|") === "cargo install plato-agent --locked",
-      `${profile.name} /: expected exact cargo install plato-agent --locked command in #start`,
+      (await page.locator("#start code").allTextContents()).map((text) => text.trim()).join("|") === "platonic-v0.2.2",
+      `${profile.name} /: expected exact platonic-v0.2.2 tag in #start`,
+    );
+    const taggedQuickstart = page.getByRole("link", { name: "Open the 0.2.2 quickstart", exact: true });
+    record(await taggedQuickstart.isVisible(), `${profile.name} /: tagged 0.2.2 quickstart action is not visible`);
+    record(
+      await taggedQuickstart.getAttribute("href") === "https://github.com/referential-ai/platonic/blob/platonic-v0.2.2/docs/QUICKSTART.md",
+      `${profile.name} /: tagged 0.2.2 quickstart action must target the immutable guide`,
     );
 
     const nextSectionTop = await page.locator("#why").evaluate((element) => element.getBoundingClientRect().top);
@@ -457,8 +463,8 @@ async function provePage(page, profile, route) {
           `${profile.name} /: hero crop must frame the top of the app (source y ${visibleCrop.sourceTop.toFixed(1)}-${visibleCrop.sourceBottom.toFixed(1)}, ${visibleCrop.objectPosition})`,
         );
         record(
-          visibleCrop.topUniqueColors >= 10 && visibleCrop.topNonWhitePixels >= 16,
-          `${profile.name} /: top app chrome is not meaningfully visible (${visibleCrop.topUniqueColors} colors, ${visibleCrop.topNonWhitePixels} nonwhite pixels)`,
+          visibleCrop.topUniqueColors >= 3 && visibleCrop.topNonWhitePixels >= 16,
+          `${profile.name} /: top of product capture is not meaningfully visible (${visibleCrop.topUniqueColors} colors, ${visibleCrop.topNonWhitePixels} nonwhite pixels)`,
         );
       }
     }
