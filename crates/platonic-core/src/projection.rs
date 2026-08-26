@@ -256,7 +256,9 @@ fn collect_entry(event: &HarnessEvent, entries: &mut Vec<ReadbackEntry>) {
             decision: PolicyDecision::Allow | PolicyDecision::RequireApproval { .. },
             ..
         }
+        | HarnessEvent::CredentialGranted { .. }
         | HarnessEvent::ToolStarted { .. }
+        | HarnessEvent::CredentialRevoked { .. }
         | HarnessEvent::RunFinished { .. }
         | HarnessEvent::RunFailed { .. } => {}
     }

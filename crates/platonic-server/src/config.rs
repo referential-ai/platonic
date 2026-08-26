@@ -30,6 +30,8 @@ const WORKSPACE_GATEWAY_ERROR: &str =
 const WORKSPACE_PRINCIPALS_ERROR: &str = "workspace plato.toml cannot set [principals]; define gateway principals only in the user config";
 const WORKSPACE_SPAWN_DEPTH_ERROR: &str = "workspace plato.toml cannot set limits.max_spawn_depth; use the user config and restart the server";
 const WORKSPACE_CONFINEMENT_ERROR: &str = "workspace plato.toml cannot set confinement.require; use the user config and restart the server";
+const WORKSPACE_CREDENTIALS_ERROR: &str =
+    "workspace plato.toml cannot set [credentials]; use the user config and restart the server";
 const WORKSPACE_COMPUTER_ERROR: &str = "workspace plato.toml cannot configure or enable computer tools; use --config, PLATO_CONFIG, or user config";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -157,6 +159,13 @@ struct RawConfig {
     confinement: Option<RawConfinementConfig>,
     gateway: Option<RawGatewayConfig>,
     principals: Option<RawPrincipalsConfig>,
+    credentials: Option<HashMap<String, RawCredentialSource>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCredentialSource {
+    source: PathBuf,
 }
 
 #[derive(Default, Debug, Deserialize)]
@@ -276,6 +285,9 @@ impl Config {
         if matches!(resolved, ResolvedConfigPath::Workspace(_)) && raw.confinement.is_some() {
             return Err(AppError::Config(WORKSPACE_CONFINEMENT_ERROR.into()));
         }
+        if matches!(resolved, ResolvedConfigPath::Workspace(_)) && raw.credentials.is_some() {
+            return Err(AppError::Config(WORKSPACE_CREDENTIALS_ERROR.into()));
+        }
         if matches!(resolved, ResolvedConfigPath::Workspace(_))
             && (raw.computer.is_some()
                 || raw.tools.as_ref().is_some_and(|tools| {
@@ -302,6 +314,7 @@ impl Config {
     }
 
     fn from_raw(raw: RawConfig) -> AppResult<Self> {
+        let _ = raw.credentials;
         let provider = raw.provider.unwrap_or_default();
         let limits = raw.limits.unwrap_or_default();
         let tools = raw.tools.unwrap_or_default();
@@ -780,6 +793,58 @@ pub(crate) fn server_require_confinement() -> AppResult<bool> {
     Ok(Config::load_resolved(resolved.as_ref())?
         .confinement
         .require)
+}
+
+pub(crate) fn server_credential_sources() -> AppResult<HashMap<String, PathBuf>> {
+    let home = user_home();
+    server_credential_sources_with(user_config_path(home.as_deref()))
+}
+
+fn server_credential_sources_with(
+    user_config: Option<PathBuf>,
+) -> AppResult<HashMap<String, PathBuf>> {
+    let Some(path) = user_config.filter(|path| path.exists()) else {
+        return Ok(HashMap::new());
+    };
+    let raw = Config::read_raw(&path)?;
+    let mut sources = HashMap::new();
+    for (credential_id, credential) in raw.credentials.unwrap_or_default() {
+        if !valid_credential_id(&credential_id) {
+            return Err(AppError::Config(
+                "credential ids must be 1-64 ASCII letters, digits, '.', '_', or '-', starting with a letter or digit"
+                    .into(),
+            ));
+        }
+        if !credential.source.is_absolute() {
+            return Err(AppError::Config(format!(
+                "credentials.{credential_id}.source must be an absolute path"
+            )));
+        }
+        let source = credential.source.canonicalize().map_err(|_| {
+            AppError::Config(format!(
+                "credentials.{credential_id}.source cannot be resolved"
+            ))
+        })?;
+        let metadata = fs::symlink_metadata(&source).map_err(|_| {
+            AppError::Config(format!(
+                "credentials.{credential_id}.source cannot be inspected"
+            ))
+        })?;
+        if !metadata.file_type().is_file() && !metadata.file_type().is_dir() {
+            return Err(AppError::Config(format!(
+                "credentials.{credential_id}.source must be a regular file or directory"
+            )));
+        }
+        sources.insert(credential_id, source);
+    }
+    Ok(sources)
+}
+
+pub(crate) fn valid_credential_id(credential_id: &str) -> bool {
+    let mut bytes = credential_id.bytes();
+    matches!(bytes.next(), Some(byte) if byte.is_ascii_alphanumeric())
+        && credential_id.len() <= 64
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 #[cfg(test)]
@@ -1595,6 +1660,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
             computer: None,
             gateway: None,
             principals: None,
+            credentials: None,
         };
 
         assert!(matches!(Config::from_raw(raw), Err(AppError::Config(_))));
@@ -1612,6 +1678,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
             }),
             gateway: None,
             principals: None,
+            credentials: None,
         };
         assert!(Config::from_raw(raw).unwrap().confinement.require);
 
@@ -1629,6 +1696,65 @@ api_key_env = "DISCORD_BOT_TOKEN"
     }
 
     #[test]
+    fn credential_sources_are_bound_only_from_canonical_user_config() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("host-credential");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("token"), "credential-value-sentinel").unwrap();
+        let user_config = root.path().join("config.toml");
+        std::fs::write(
+            &user_config,
+            format!(
+                "[credentials.github]\nsource = {:?}\n",
+                source.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let sources = server_credential_sources_with(Some(user_config)).unwrap();
+
+        assert_eq!(sources["github"], source.canonicalize().unwrap());
+        assert_eq!(sources.len(), 1);
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("plato.toml"),
+            format!(
+                "[credentials.github]\nsource = {:?}\n",
+                source.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let resolved = ResolvedConfigPath::Workspace(workspace.path().join("plato.toml"));
+        assert!(matches!(
+            Config::load_resolved(Some(&resolved)),
+            Err(AppError::Config(message)) if message == WORKSPACE_CREDENTIALS_ERROR
+        ));
+    }
+
+    #[test]
+    fn credential_source_errors_do_not_expose_source_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("missing-value-sentinel");
+        let user_config = root.path().join("config.toml");
+        std::fs::write(
+            &user_config,
+            format!(
+                "[credentials.github]\nsource = {:?}\n",
+                source.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let error = server_credential_sources_with(Some(user_config))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("credentials.github.source cannot be resolved"));
+        assert!(!error.contains("missing-value-sentinel"));
+    }
+
+    #[test]
     fn rejects_zero_max_output_tokens() {
         let raw = RawConfig {
             provider: None,
@@ -1643,6 +1769,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
             computer: None,
             gateway: None,
             principals: None,
+            credentials: None,
         };
 
         assert!(matches!(Config::from_raw(raw), Err(AppError::Config(_))));
@@ -1660,6 +1787,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
             computer: None,
             gateway: None,
             principals: None,
+            credentials: None,
         };
 
         let err = Config::from_raw(raw).unwrap_err();
@@ -1685,6 +1813,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
             computer: None,
             gateway: None,
             principals: None,
+            credentials: None,
         };
 
         assert!(matches!(Config::from_raw(raw), Err(AppError::Config(_))));
@@ -1705,6 +1834,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
             computer: None,
             gateway: None,
             principals: None,
+            credentials: None,
         };
 
         assert_eq!(Config::from_raw(raw).unwrap().limits.max_turns, 3);
@@ -1725,6 +1855,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
             computer: None,
             gateway: None,
             principals: None,
+            credentials: None,
         };
 
         assert!(matches!(Config::from_raw(raw), Err(AppError::Config(_))));
@@ -1828,6 +1959,7 @@ stream_idle_timeout_ms = 9000
             computer: None,
             gateway: None,
             principals: None,
+            credentials: None,
         };
 
         let config = Config::from_raw(raw).unwrap();

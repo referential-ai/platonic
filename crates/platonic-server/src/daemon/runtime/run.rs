@@ -432,6 +432,15 @@ pub(in crate::daemon) fn approval_handler(
                 "approval request does not match daemon run".into(),
             ));
         }
+        if request.credential_id.is_some()
+            && (request.tool_name != SHELL_EXEC
+                || request.effect != EffectClass::ExternalSideEffect
+                || request.yolo_eligible)
+        {
+            return Err(AppError::RunFailed(
+                "credential grant requires one explicitly approved shell.exec call".into(),
+            ));
+        }
         if record.cancel.load(Ordering::SeqCst) {
             return Ok(ExternalApprovalOutcome::Denied {
                 actor: "daemon".into(),
@@ -447,19 +456,23 @@ pub(in crate::daemon) fn approval_handler(
         if request.yolo_eligible && thread_yolo {
             return Ok(ExternalApprovalOutcome::Granted {
                 actor: "yolo".into(),
+                explicit: false,
             });
         }
         if request.yolo_eligible && runtime.session_yolo_enabled_for_decision(&record.session_id) {
             return Ok(ExternalApprovalOutcome::Granted {
                 actor: "tui_yolo".into(),
+                explicit: false,
             });
         }
         if request.tool_name == SHELL_EXEC
             && request.effect == EffectClass::ExternalSideEffect
+            && request.credential_id.is_none()
             && runtime.has_shell_session_grant(&record.session_id)
         {
             return Ok(ExternalApprovalOutcome::Granted {
                 actor: "session_grant".into(),
+                explicit: false,
             });
         }
         // Record the ask before announcing it. A daemon that dies between the
@@ -587,6 +600,7 @@ mod tests {
             approval_preview: None,
             diff_preview: None,
             yolo_eligible: eligible,
+            credential_id: None,
         }
     }
 
@@ -628,6 +642,7 @@ mod tests {
                     approval_preview: None,
                     diff_preview: None,
                     yolo_eligible: false,
+                    credential_id: None,
                 },
             ),
         );
@@ -682,6 +697,7 @@ mod tests {
             approval_preview: None,
             diff_preview: Some("--- a/note.txt\n+++ b/note.txt\n".into()),
             yolo_eligible: true,
+            credential_id: None,
         }))
         .unwrap();
 
@@ -701,6 +717,7 @@ mod tests {
             approval_preview: None,
             diff_preview: None,
             yolo_eligible: true,
+            credential_id: None,
         }))
         .unwrap();
 
@@ -719,6 +736,7 @@ mod tests {
             approval_preview: Some("command: cargo test\ncwd: /tmp/work".into()),
             diff_preview: None,
             yolo_eligible: true,
+            credential_id: None,
         }))
         .unwrap();
 
@@ -739,7 +757,8 @@ mod tests {
         assert_eq!(
             outcome,
             ExternalApprovalOutcome::Granted {
-                actor: "tui_yolo".into()
+                actor: "tui_yolo".into(),
+                explicit: false,
             }
         );
         assert!(record.approvals.lock().unwrap().is_empty());
@@ -758,7 +777,8 @@ mod tests {
         assert_eq!(
             outcome,
             ExternalApprovalOutcome::Granted {
-                actor: "yolo".into()
+                actor: "yolo".into(),
+                explicit: false,
             }
         );
         assert!(granted_record.approvals.lock().unwrap().is_empty());
@@ -796,6 +816,32 @@ mod tests {
     }
 
     #[test]
+    fn credential_request_bypasses_neither_yolo_nor_session_grant() {
+        let runtime = runtime();
+        runtime.set_approval_profile("session_1", ApprovalProfile::Yolo);
+        runtime.install_shell_session_grant("session_1");
+        let record = run_record(1);
+        let mut request = yolo_request("run_1", "call_1", false);
+        request.tool_name = SHELL_EXEC.into();
+        request.effect = EffectClass::ExternalSideEffect;
+        request.credential_id = Some("github".into());
+        let decide = approval_handler(runtime, record.clone(), true);
+        let worker = thread::spawn(move || decide(request).unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while record.pending_approval().is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+
+        assert_eq!(record.request_cancel(), Some(RunStateName::CancelRequested));
+        assert!(matches!(
+            worker.join().unwrap(),
+            ExternalApprovalOutcome::Denied { actor, reason }
+                if actor == "daemon" && reason == "run canceled"
+        ));
+    }
+
+    #[test]
     fn profile_toggle_after_yolo_decision_does_not_revoke_the_grant() {
         let runtime = runtime();
         runtime.set_approval_profile("session_1", ApprovalProfile::Yolo);
@@ -816,7 +862,8 @@ mod tests {
         assert_eq!(
             worker.join().unwrap(),
             ExternalApprovalOutcome::Granted {
-                actor: "tui_yolo".into()
+                actor: "tui_yolo".into(),
+                explicit: false,
             }
         );
         toggle.join().unwrap();
@@ -902,7 +949,8 @@ mod tests {
         assert_eq!(
             decision.join().unwrap(),
             ExternalApprovalOutcome::Granted {
-                actor: "tui_yolo".into()
+                actor: "tui_yolo".into(),
+                explicit: false,
             }
         );
         assert_eq!(
@@ -941,7 +989,8 @@ mod tests {
         assert_eq!(
             decision.join().unwrap(),
             ExternalApprovalOutcome::Granted {
-                actor: "tui_yolo".into()
+                actor: "tui_yolo".into(),
+                explicit: false,
             }
         );
         finished_receiver
@@ -992,6 +1041,7 @@ mod tests {
             approval_preview: None,
             diff_preview: None,
             yolo_eligible: true,
+            credential_id: None,
         })
         .unwrap();
 
@@ -1025,6 +1075,7 @@ mod tests {
                 approval_preview: None,
                 diff_preview: None,
                 yolo_eligible: true,
+                credential_id: None,
             })
             .unwrap()
         });

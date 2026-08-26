@@ -305,6 +305,12 @@ impl ToolInputSchema {
                         "description": "Optional timeout in seconds. Defaults to 120 and is capped at 600.",
                         "minimum": 1,
                         "maximum": 600
+                    },
+                    "credential": {
+                        "type": "string",
+                        "description": "Optional operator-configured file credential. It is available only for this approved call at $TMPDIR/credentials/<credential>.",
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+                        "maxLength": 64
                     }
                 },
                 "required": ["command"],
@@ -614,6 +620,12 @@ mod tests {
                         "description": "Optional timeout in seconds. Defaults to 120 and is capped at 600.",
                         "minimum": 1,
                         "maximum": 600
+                    },
+                    "credential": {
+                        "type": "string",
+                        "description": "Optional operator-configured file credential. It is available only for this approved call at $TMPDIR/credentials/<credential>.",
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+                        "maxLength": 64
                     }
                 },
                 "required": ["command"],

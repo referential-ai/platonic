@@ -213,7 +213,10 @@ impl ChildRpc {
         })?;
         match self.next_reply(request_id)? {
             ParentMessage::Approval { outcome, .. } => match outcome {
-                ApprovalReply::Granted { actor } => Ok(ExternalApprovalOutcome::Granted { actor }),
+                ApprovalReply::Granted { actor } => Ok(ExternalApprovalOutcome::Granted {
+                    actor,
+                    explicit: true,
+                }),
                 ApprovalReply::Denied { actor, reason } => {
                     Ok(ExternalApprovalOutcome::Denied { actor, reason })
                 }

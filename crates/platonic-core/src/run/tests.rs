@@ -347,6 +347,28 @@ fn approval_granted(seq: u64) -> RecordedEvent {
     )
 }
 
+fn credential_granted(seq: u64) -> RecordedEvent {
+    rec(
+        seq,
+        HarnessEvent::CredentialGranted {
+            run_id: run_id(),
+            call_id: call_id(),
+            credential_id: "github".into(),
+        },
+    )
+}
+
+fn credential_revoked(seq: u64) -> RecordedEvent {
+    rec(
+        seq,
+        HarnessEvent::CredentialRevoked {
+            run_id: run_id(),
+            call_id: call_id(),
+            credential_id: "github".into(),
+        },
+    )
+}
+
 fn tool_started(seq: u64) -> RecordedEvent {
     rec(
         seq,
@@ -684,6 +706,58 @@ fn happy_path_emits_expected_commands_and_finishes() {
     assert_eq!(state.phase(), &RunPhase::Finished);
     assert_eq!(state.next_seq(), 10);
     assert_eq!(apply_all(&events), state);
+}
+
+#[test]
+fn credential_grant_requires_explicit_approval_for_the_exact_call() {
+    let mut allowed = apply_all(&[
+        start_event(0),
+        context_event(1),
+        model_requested(2),
+        model_responded(3),
+        tool_proposed(4, EffectClass::ReadOnly),
+        allow_policy(5),
+    ]);
+    assert_eq!(
+        allowed.apply(&credential_granted(6)).unwrap_err(),
+        Error::InvalidTransition {
+            phase: "ready_to_execute_tool",
+            event: "credential_granted",
+        }
+    );
+
+    let mut approved = apply_all(&base_until_approval_required());
+    approved.apply(&approval_granted(6)).unwrap();
+    approved.apply(&credential_granted(7)).unwrap();
+    let mut revoked_before_start = approved.clone();
+    revoked_before_start.apply(&credential_revoked(8)).unwrap();
+    assert!(revoked_before_start.apply(&credential_granted(9)).is_err());
+    approved.apply(&tool_started(8)).unwrap();
+    approved.apply(&tool_finished(9)).unwrap();
+
+    for terminal in [
+        rec(10, HarnessEvent::RunFinished { run_id: run_id() }),
+        rec(
+            10,
+            HarnessEvent::RunFailed {
+                run_id: run_id(),
+                reason: "failed".into(),
+            },
+        ),
+    ] {
+        assert_eq!(
+            approved.clone().apply(&terminal).unwrap_err(),
+            Error::InvalidTransition {
+                phase: "turn_concluded",
+                event: terminal.event.name(),
+            }
+        );
+    }
+
+    approved.apply(&credential_revoked(10)).unwrap();
+    approved
+        .apply(&rec(11, HarnessEvent::RunFinished { run_id: run_id() }))
+        .unwrap();
 }
 
 #[test]

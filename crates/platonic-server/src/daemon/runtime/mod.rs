@@ -41,6 +41,7 @@ pub(super) struct DaemonRuntime {
     max_spawn_depth: u32,
     require_confinement: bool,
     confinement_support: ConfinementSupport,
+    pub(super) credential_sources: Arc<HashMap<String, std::path::PathBuf>>,
     started_at: Instant,
     pub(super) state: Arc<Mutex<RuntimeState>>,
     session_tool_grants: Arc<Mutex<HashSet<(String, String)>>>,
@@ -139,17 +140,20 @@ impl DaemonRuntime {
             max_spawn_depth,
             require_confinement,
             confinement_support,
+            Arc::new(HashMap::new()),
             Instant::now(),
             Arc::new(Mutex::new(RuntimeState::default())),
             Arc::new(AtomicBool::new(false)),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new_shared(
         paths: DaemonPaths,
         max_spawn_depth: u32,
         require_confinement: bool,
         confinement_support: ConfinementSupport,
+        credential_sources: Arc<HashMap<String, std::path::PathBuf>>,
         started_at: Instant,
         state: Arc<Mutex<RuntimeState>>,
         stop_requested: Arc<AtomicBool>,
@@ -159,6 +163,7 @@ impl DaemonRuntime {
             max_spawn_depth,
             require_confinement,
             confinement_support,
+            credential_sources,
             started_at,
             state,
             session_tool_grants: Arc::new(Mutex::new(HashSet::new())),
@@ -525,6 +530,7 @@ mod tests {
                     approval_preview: None,
                     diff_preview: None,
                     yolo_eligible: false,
+                    credential_id: None,
                 },
             ),
         );

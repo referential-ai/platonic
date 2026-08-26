@@ -33,6 +33,7 @@ impl HostRuntime {
     pub(super) fn new(socket_path: PathBuf) -> AppResult<Self> {
         let max_spawn_depth = crate::config::server_max_spawn_depth()?;
         let require_confinement = crate::config::server_require_confinement()?;
+        let credential_sources = Arc::new(crate::config::server_credential_sources()?);
         let confinement_support = crate::confinement::detect_support();
         let started_at = Instant::now();
         let state = Arc::new(Mutex::new(RuntimeState::default()));
@@ -46,6 +47,7 @@ impl HostRuntime {
             max_spawn_depth,
             require_confinement,
             confinement_support,
+            Arc::clone(&credential_sources),
             started_at,
             Arc::clone(&state),
             Arc::clone(&stop_requested),
@@ -114,6 +116,7 @@ impl HostRuntime {
             self.control_runtime.max_spawn_depth(),
             self.control_runtime.require_confinement(),
             self.control_runtime.confinement_support(),
+            Arc::clone(&self.control_runtime.credential_sources),
             self.started_at,
             Arc::clone(&self.state),
             Arc::clone(&self.control_runtime.stop_requested),

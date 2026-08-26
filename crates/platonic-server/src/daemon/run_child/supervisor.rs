@@ -12,8 +12,9 @@ use crate::{
         RunToolHandlers, ThreadReturnToolHandler, ThreadReturnToolInput,
     },
 };
-use platonic_core::{RecordedEvent, RunId};
+use platonic_core::{ActorId, HarnessEvent, RecordedEvent, RunId, ToolCallId};
 use std::{
+    collections::HashMap,
     ffi::OsStr,
     fs,
     io::{self, BufRead, BufReader, BufWriter, Read, Write},
@@ -77,6 +78,15 @@ struct ParentRunRecorder {
     terminal: Option<RecordOperation>,
 }
 
+struct ActiveCredentialGrant {
+    call_id: ToolCallId,
+    credential_id: String,
+    actor_id: ActorId,
+    path: PathBuf,
+    approval_recorded: bool,
+    grant_recorded: bool,
+}
+
 impl ParentRunRecorder {
     fn apply(&mut self, operation: RecordOperation) -> AppResult<Option<RecordedEvent>> {
         match operation {
@@ -133,6 +143,273 @@ impl ParentRunRecorder {
             },
         }
     }
+}
+
+fn materialize_credential_grant(
+    request: &crate::ApprovalRequest,
+    actor: &str,
+    sources: &HashMap<String, PathBuf>,
+    confinement: &crate::confinement::ChildConfinement,
+) -> AppResult<ActiveCredentialGrant> {
+    let credential_id = request
+        .credential_id
+        .as_deref()
+        .ok_or_else(|| AppError::SupervisedRun("credential grant omitted its identity".into()))?;
+    if request.tool_name != crate::tool_catalog::SHELL_EXEC
+        || request.effect != platonic_core::EffectClass::ExternalSideEffect
+        || request.yolo_eligible
+        || !crate::config::valid_credential_id(credential_id)
+    {
+        return Err(AppError::SupervisedRun(
+            "credential grant requires one explicitly approved shell.exec call".into(),
+        ));
+    }
+    let source = sources.get(credential_id).ok_or_else(|| {
+        AppError::SupervisedRun(format!("credential {credential_id} is not configured"))
+    })?;
+    let actor_id = ActorId::new(actor.to_owned())?;
+    let scratch = match confinement {
+        crate::confinement::ChildConfinement::Landlock {
+            writable_paths,
+            scratch,
+            ..
+        } if writable_paths.iter().any(|path| path == scratch) => scratch,
+        _ => {
+            return Err(AppError::SupervisedRun(format!(
+                "credential {credential_id} requires confined server scratch"
+            )));
+        }
+    };
+    let root = scratch.join(crate::tools::CREDENTIAL_GRANTS_DIR);
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.file_type().is_dir() => set_private_directory(&root)?,
+        Ok(_) => {
+            return Err(AppError::SupervisedRun(format!(
+                "credential {credential_id} scratch is unavailable"
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            crate::thread_repository::create_private_directory(&root)?;
+        }
+        Err(_) => {
+            return Err(AppError::SupervisedRun(format!(
+                "credential {credential_id} scratch is unavailable"
+            )));
+        }
+    }
+    let path = crate::tools::credential_grant_path(scratch, credential_id);
+    if fs::symlink_metadata(&path).is_ok() {
+        return Err(AppError::SupervisedRun(format!(
+            "credential {credential_id} scratch path is occupied"
+        )));
+    }
+    if copy_credential_tree(source, &path).is_err() {
+        remove_credential_path(&path).map_err(|_| {
+            AppError::SupervisedRun(format!(
+                "credential {credential_id} materialization cleanup failed"
+            ))
+        })?;
+        return Err(AppError::SupervisedRun(format!(
+            "credential {credential_id} materialization failed"
+        )));
+    }
+    Ok(ActiveCredentialGrant {
+        call_id: request.call_id.clone(),
+        credential_id: credential_id.into(),
+        actor_id,
+        path,
+        approval_recorded: false,
+        grant_recorded: false,
+    })
+}
+
+fn copy_credential_tree(source: &Path, destination: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::other(
+            "credential source contains a symbolic link",
+        ));
+    }
+    if metadata.file_type().is_file() {
+        fs::copy(source, destination)?;
+        return set_private_file(destination);
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::other("credential source is not file-backed"));
+    }
+    fs::create_dir(destination)?;
+    set_private_directory(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        copy_credential_tree(&entry.path(), &destination.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+fn set_private_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn set_private_file(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn remove_credential_path(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn clear_stale_credential_grants(
+    confinement: &crate::confinement::ChildConfinement,
+) -> AppResult<()> {
+    let crate::confinement::ChildConfinement::Landlock { scratch, .. } = confinement else {
+        return Ok(());
+    };
+    remove_credential_path(&scratch.join(crate::tools::CREDENTIAL_GRANTS_DIR))
+        .map_err(|_| AppError::SupervisedRun("stale credential grant cleanup failed".into()))
+}
+
+fn apply_child_record(
+    recorder: &mut ParentRunRecorder,
+    active: &mut Option<ActiveCredentialGrant>,
+    operation: RecordOperation,
+) -> AppResult<Option<RecordedEvent>> {
+    let mut recorded_approval = false;
+    let mut recorded_grant = false;
+    let mut recorded_revocation = false;
+    match (&operation, active.as_ref()) {
+        (RecordOperation::Event { event }, Some(grant)) if !grant.approval_recorded => {
+            match event {
+                HarnessEvent::ApprovalGranted {
+                    call_id, actor_id, ..
+                } if call_id == &grant.call_id && actor_id == &grant.actor_id => {
+                    recorded_approval = true;
+                }
+                _ => {
+                    return Err(AppError::SupervisedRun(
+                        "credential materialization was not followed by its approval record".into(),
+                    ));
+                }
+            }
+        }
+        (RecordOperation::Event { event }, Some(grant)) if !grant.grant_recorded => match event {
+            HarnessEvent::CredentialGranted {
+                call_id,
+                credential_id,
+                ..
+            } if call_id == &grant.call_id && credential_id == &grant.credential_id => {
+                recorded_grant = true;
+            }
+            _ => {
+                return Err(AppError::SupervisedRun(
+                    "approved credential materialization was not followed by its grant record"
+                        .into(),
+                ));
+            }
+        },
+        (
+            RecordOperation::Event {
+                event:
+                    HarnessEvent::CredentialRevoked {
+                        call_id,
+                        credential_id,
+                        ..
+                    },
+            },
+            Some(grant),
+        ) if call_id == &grant.call_id && credential_id == &grant.credential_id => {
+            remove_credential_path(&grant.path).map_err(|_| {
+                AppError::SupervisedRun(format!("credential {credential_id} revocation failed"))
+            })?;
+            recorded_revocation = true;
+        }
+        (
+            RecordOperation::Event {
+                event:
+                    HarnessEvent::CredentialGranted { .. } | HarnessEvent::CredentialRevoked { .. },
+            },
+            _,
+        ) => {
+            return Err(AppError::SupervisedRun(
+                "run child emitted an unmaterialized credential lifecycle record".into(),
+            ));
+        }
+        (RecordOperation::Finish { .. } | RecordOperation::Fail { .. }, Some(_)) => {
+            return Err(AppError::SupervisedRun(
+                "run child emitted terminal intent before credential revocation".into(),
+            ));
+        }
+        _ => {}
+    }
+
+    let record = recorder.apply(operation)?;
+    if let Some(grant) = active.as_mut() {
+        grant.approval_recorded |= recorded_approval;
+        grant.grant_recorded |= recorded_grant;
+    }
+    if recorded_revocation {
+        *active = None;
+    }
+    Ok(record)
+}
+
+fn revoke_after_child_exit(
+    recorder: &mut ParentRunRecorder,
+    run_id: &RunId,
+    active: &mut Option<ActiveCredentialGrant>,
+) -> AppResult<()> {
+    let Some(grant) = active.as_mut() else {
+        return Ok(());
+    };
+    remove_credential_path(&grant.path).map_err(|_| {
+        AppError::SupervisedRun(format!(
+            "credential {} revocation failed",
+            grant.credential_id
+        ))
+    })?;
+    if !grant.approval_recorded {
+        recorder.apply(RecordOperation::Event {
+            event: HarnessEvent::ApprovalGranted {
+                run_id: run_id.clone(),
+                call_id: grant.call_id.clone(),
+                actor_id: grant.actor_id.clone(),
+            },
+        })?;
+        grant.approval_recorded = true;
+    }
+    if !grant.grant_recorded {
+        recorder.apply(RecordOperation::Event {
+            event: HarnessEvent::CredentialGranted {
+                run_id: run_id.clone(),
+                call_id: grant.call_id.clone(),
+                credential_id: grant.credential_id.clone(),
+            },
+        })?;
+        grant.grant_recorded = true;
+    }
+    recorder.apply(RecordOperation::Event {
+        event: HarnessEvent::CredentialRevoked {
+            run_id: run_id.clone(),
+            call_id: grant.call_id.clone(),
+            credential_id: grant.credential_id.clone(),
+        },
+    })?;
+    *active = None;
+    Ok(())
 }
 
 pub(in crate::daemon) struct SupervisedRunCompletion {
@@ -481,6 +758,7 @@ pub(in crate::daemon) struct SupervisedTestLaunch {
     pub(in crate::daemon) terminal_stage_barriers: TerminalStageBarriers,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::daemon) fn run_supervised(
     prepared: PreparedRun,
     recorder: EventRecorder,
@@ -489,6 +767,7 @@ pub(in crate::daemon) fn run_supervised(
     cancel: Arc<AtomicBool>,
     handlers: RunToolHandlers,
     confinement: crate::confinement::ChildConfinement,
+    credential_sources: Arc<HashMap<String, PathBuf>>,
 ) -> SupervisedRunCompletion {
     let executable = match resolve_run_child_executable() {
         Ok(executable) => executable,
@@ -504,6 +783,7 @@ pub(in crate::daemon) fn run_supervised(
         event_sender,
         cancel,
         handlers,
+        credential_sources,
         ChildLaunch {
             limits: ChildLifecycleLimits::default(),
             executable,
@@ -537,6 +817,7 @@ pub(in crate::daemon) fn run_supervised_for_test(
             thread_return: None,
             parent_answer: None,
         },
+        Arc::new(HashMap::new()),
         ChildLaunch {
             limits: ChildLifecycleLimits::default(),
             executable: launch.executable,
@@ -594,6 +875,7 @@ fn resolve_run_child_executable_from(
     Ok(candidate)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_supervised_with_limits(
     prepared: PreparedRun,
     recorder: EventRecorder,
@@ -601,6 +883,7 @@ fn run_supervised_with_limits(
     event_sender: mpsc::Sender<RunEvent>,
     cancel: Arc<AtomicBool>,
     handlers: RunToolHandlers,
+    credential_sources: Arc<HashMap<String, PathBuf>>,
     launch: ChildLaunch,
 ) -> SupervisedRunCompletion {
     let ChildLaunch {
@@ -623,6 +906,10 @@ fn run_supervised_with_limits(
         event_sender,
         terminal: None,
     };
+    let mut active_credential_grant = None;
+    if let Err(error) = clear_stale_credential_grants(&confinement) {
+        return recorder.complete(&run_id, Err(error), false);
+    }
     let computer_enabled =
         prepared.has_tool(COMPUTER_WINDOWS) || prepared.has_tool(COMPUTER_OBSERVE);
     let child_env = match crate::tools::supervised_run_child_env(
@@ -716,7 +1003,11 @@ fn run_supervised_with_limits(
                     } => {
                         #[cfg(test)]
                         let terminal = !matches!(&operation, RecordOperation::Event { .. });
-                        let record = recorder.apply(operation)?;
+                        let record = apply_child_record(
+                            &mut recorder,
+                            &mut active_credential_grant,
+                            operation,
+                        )?;
                         #[cfg(test)]
                         if terminal && let Some(barriers) = terminal_stage_barriers.take() {
                             barriers.reached.wait();
@@ -740,9 +1031,30 @@ fn run_supervised_with_limits(
                         request_id,
                         request,
                     } => {
+                        if active_credential_grant.is_some() {
+                            return Err(AppError::SupervisedRun(
+                                "run child requested approval while a credential grant was active"
+                                    .into(),
+                            ));
+                        }
+                        let materialization_request = request.clone();
                         let outcome = approval_mode.decide_external(request)?;
                         let outcome = match outcome {
-                            ExternalApprovalOutcome::Granted { actor } => {
+                            ExternalApprovalOutcome::Granted { actor, explicit } => {
+                                if materialization_request.credential_id.is_some() {
+                                    if !explicit {
+                                        return Err(AppError::SupervisedRun(
+                                            "credential grant requires one explicit allow-once decision"
+                                                .into(),
+                                        ));
+                                    }
+                                    active_credential_grant = Some(materialize_credential_grant(
+                                        &materialization_request,
+                                        &actor,
+                                        &credential_sources,
+                                        &confinement,
+                                    )?);
+                                }
                                 ApprovalReply::Granted { actor }
                             }
                             ExternalApprovalOutcome::Denied { actor, reason } => {
@@ -808,6 +1120,11 @@ fn run_supervised_with_limits(
                         request_id,
                         result: child_result,
                     } => {
+                        if active_credential_grant.is_some() {
+                            return Err(AppError::SupervisedRun(
+                                "run child returned before credential revocation".into(),
+                            ));
+                        }
                         child.write(&ParentMessage::Ack {
                             request_id,
                             record: None,
@@ -844,6 +1161,24 @@ fn run_supervised_with_limits(
         Ok((result, stop_cause))
     })();
 
+    let result = match result {
+        Ok(result) => Ok(result),
+        Err(error) => Err(child.cleanup_failure(error)),
+    };
+    let credential_was_active = active_credential_grant.is_some();
+    if let Err(error) =
+        revoke_after_child_exit(&mut recorder, &run_id, &mut active_credential_grant)
+    {
+        return recorder.complete(&run_id, Err(error), false);
+    }
+    let result = if credential_was_active && result.is_ok() {
+        Err(AppError::SupervisedRun(
+            "run child exited before credential revocation".into(),
+        ))
+    } else {
+        result
+    };
+
     match result {
         Ok((result, stop_cause)) => {
             let outcome = match stop_cause {
@@ -862,10 +1197,7 @@ fn run_supervised_with_limits(
             };
             recorder.complete(&run_id, outcome, stop_cause.is_none())
         }
-        Err(error) => {
-            let error = child.cleanup_failure(error);
-            recorder.complete(&run_id, Err(error), false)
-        }
+        Err(error) => recorder.complete(&run_id, Err(error), false),
     }
 }
 
@@ -1114,6 +1446,121 @@ mod tests {
         os::unix::ffi::{OsStrExt, OsStringExt},
     };
 
+    #[cfg(target_os = "linux")]
+    fn credential_request(run_id: &RunId, call_id: &ToolCallId) -> ApprovalRequest {
+        ApprovalRequest {
+            run_id: run_id.clone(),
+            call_id: call_id.clone(),
+            tool_name: crate::tool_catalog::SHELL_EXEC.into(),
+            effect: EffectClass::ExternalSideEffect,
+            reason: "shell.exec requires explicit local approval".into(),
+            input_preview: Some(
+                r#"{"command":"test -r $TMPDIR/credentials/github/token","credential":"github"}"#
+                    .into(),
+            ),
+            approval_preview: Some(
+                "credential: github\ncredential path: $TMPDIR/credentials/github".into(),
+            ),
+            diff_preview: None,
+            yolo_eligible: false,
+            credential_id: Some("github".into()),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn record_until_approval(recorder: &mut EventRecorder, run_id: &RunId, call_id: &ToolCallId) {
+        let turn_id = platonic_core::TurnId::new("turn_credential").unwrap();
+        let tool = platonic_core::ToolName::new(crate::tool_catalog::SHELL_EXEC).unwrap();
+        let input = serde_json::json!({
+            "command": "test -r $TMPDIR/credentials/github/token",
+            "credential": "github"
+        });
+        let proposal = platonic_core::ToolProposal {
+            tool: tool.clone(),
+            input: input.clone(),
+        };
+        for event in [
+            HarnessEvent::RunStarted(platonic_core::RunStartedEvent {
+                run_id: run_id.clone(),
+                identity: platonic_core::RunIdentity::LegacyAgent {
+                    agent_id: platonic_core::AgentId::new("plato").unwrap(),
+                },
+            }),
+            HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                context: platonic_core::ContextPack {
+                    token_budget: 1,
+                    fragments: vec![],
+                },
+            },
+            HarnessEvent::ModelRequested {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 0,
+                model: platonic_core::ModelName::new("test-model").unwrap(),
+            },
+            HarnessEvent::ModelResponded {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 0,
+                output: platonic_core::Message {
+                    role: platonic_core::MessageRole::Assistant,
+                    content: String::new(),
+                },
+                proposed_calls: vec![proposal],
+                served_model: None,
+                usage: None,
+            },
+            HarnessEvent::ToolCallProposed {
+                run_id: run_id.clone(),
+                turn_id,
+                call: platonic_core::ToolCall {
+                    id: call_id.clone(),
+                    tool,
+                    effect: EffectClass::ExternalSideEffect,
+                    input,
+                },
+            },
+            HarnessEvent::PolicyEvaluated {
+                run_id: run_id.clone(),
+                call_id: call_id.clone(),
+                decision: platonic_core::PolicyDecision::RequireApproval {
+                    reason: "shell.exec requires explicit local approval".into(),
+                },
+            },
+        ] {
+            recorder.record(event).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn materialized_grant(
+        root: &Path,
+        run_id: &RunId,
+        call_id: &ToolCallId,
+    ) -> (ActiveCredentialGrant, PathBuf, PathBuf) {
+        let source = root.join("host-source");
+        let scratch = root.join("scratch");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("token"), "credential-value-sentinel").unwrap();
+        crate::thread_repository::create_private_directory(&scratch).unwrap();
+        let sources = HashMap::from([("github".into(), source.clone())]);
+        let confinement = crate::confinement::ChildConfinement::Landlock {
+            readable_paths: vec![scratch.clone()],
+            writable_paths: vec![scratch.clone()],
+            scratch: scratch.clone(),
+        };
+        let grant = materialize_credential_grant(
+            &credential_request(run_id, call_id),
+            "operator",
+            &sources,
+            &confinement,
+        )
+        .unwrap();
+        (grant, source, scratch)
+    }
+
     #[test]
     fn resolver_keeps_exact_agentd_image() {
         let root = tempfile::tempdir().unwrap();
@@ -1195,6 +1642,281 @@ mod tests {
         assert!(
             matches!(error, AppError::SupervisedRun(reason) if reason.contains("is not a regular file"))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn credential_materialization_is_private_atomic_on_failure_and_non_exposing() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let run_id = RunId::new("run_credential_materialize").unwrap();
+        let call_id = ToolCallId::new("call_credential_materialize").unwrap();
+        let source = root.path().join("host-source");
+        let scratch = root.path().join("scratch");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("token"), "credential-value-sentinel").unwrap();
+        crate::thread_repository::create_private_directory(&scratch).unwrap();
+        let sources = HashMap::from([("github".into(), source.clone())]);
+        let confinement = crate::confinement::ChildConfinement::Landlock {
+            readable_paths: vec![scratch.clone()],
+            writable_paths: vec![scratch.clone()],
+            scratch: scratch.clone(),
+        };
+        let request = credential_request(&run_id, &call_id);
+        let serialized = serde_json::to_string(&request).unwrap();
+        assert!(!serialized.contains("credential-value-sentinel"));
+        assert!(!serialized.contains(source.to_string_lossy().as_ref()));
+
+        assert!(materialize_credential_grant(&request, "  ", &sources, &confinement).is_err());
+        assert!(!scratch.join(crate::tools::CREDENTIAL_GRANTS_DIR).exists());
+
+        let grant =
+            materialize_credential_grant(&request, "operator", &sources, &confinement).unwrap();
+        assert_eq!(
+            fs::read_to_string(grant.path.join("token")).unwrap(),
+            "credential-value-sentinel"
+        );
+        assert_eq!(
+            fs::metadata(&grant.path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(grant.path.join("token"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        remove_credential_path(&grant.path).unwrap();
+
+        symlink(source.join("token"), source.join("linked-token")).unwrap();
+        let error = materialize_credential_grant(&request, "operator", &sources, &confinement)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("materialization failed"));
+        assert!(!error.contains("credential-value-sentinel"));
+        assert!(!crate::tools::credential_grant_path(&scratch, "github").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_grant_root_is_removed_before_a_noncredential_child_spawns() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("scratch");
+        let stale = crate::tools::credential_grant_path(&scratch, "github");
+        crate::thread_repository::create_private_directory(&stale).unwrap();
+        fs::write(stale.join("token"), "prior-run-credential-sentinel").unwrap();
+        let confinement = crate::confinement::ChildConfinement::Landlock {
+            readable_paths: vec![scratch.clone()],
+            writable_paths: vec![scratch.clone()],
+            scratch: scratch.clone(),
+        };
+
+        clear_stale_credential_grants(&confinement).unwrap();
+        let status = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("test ! -r \"$TMPDIR/credentials/github/token\"")
+            .env_clear()
+            .env("TMPDIR", scratch)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn credential_revocation_precedes_success_failure_and_cancellation_terminals() {
+        for terminal in ["success", "failure", "cancellation"] {
+            let root = tempfile::tempdir().unwrap();
+            let run_id = RunId::new(format!("run_credential_{terminal}")).unwrap();
+            let call_id = ToolCallId::new(format!("call_credential_{terminal}")).unwrap();
+            let ledger_path = root.path().join("events.jsonl");
+            let mut event_recorder = EventRecorder::create_jsonl(&ledger_path).unwrap();
+            record_until_approval(&mut event_recorder, &run_id, &call_id);
+            let (grant, _, _) = materialized_grant(root.path(), &run_id, &call_id);
+            let grant_path = grant.path.clone();
+            let (event_sender, _event_receiver) = mpsc::channel();
+            let mut recorder = ParentRunRecorder {
+                recorder: event_recorder,
+                event_sender,
+                terminal: None,
+            };
+            let mut active = Some(grant);
+            for event in [
+                HarnessEvent::ApprovalGranted {
+                    run_id: run_id.clone(),
+                    call_id: call_id.clone(),
+                    actor_id: ActorId::new("operator").unwrap(),
+                },
+                HarnessEvent::CredentialGranted {
+                    run_id: run_id.clone(),
+                    call_id: call_id.clone(),
+                    credential_id: "github".into(),
+                },
+                HarnessEvent::ToolStarted {
+                    run_id: run_id.clone(),
+                    call_id: call_id.clone(),
+                },
+            ] {
+                apply_child_record(&mut recorder, &mut active, RecordOperation::Event { event })
+                    .unwrap();
+            }
+            let tool_event = if terminal == "success" {
+                HarnessEvent::ToolFinished {
+                    run_id: run_id.clone(),
+                    result: platonic_core::ToolResult {
+                        call_id: call_id.clone(),
+                        summary: "done".into(),
+                        data: serde_json::json!({"exit_code": 0}),
+                        artifacts: vec![],
+                        visibility: platonic_core::ResultVisibility::Both,
+                    },
+                }
+            } else {
+                HarnessEvent::ToolFailed {
+                    run_id: run_id.clone(),
+                    call_id: call_id.clone(),
+                    reason: terminal.into(),
+                }
+            };
+            apply_child_record(
+                &mut recorder,
+                &mut active,
+                RecordOperation::Event { event: tool_event },
+            )
+            .unwrap();
+            apply_child_record(
+                &mut recorder,
+                &mut active,
+                RecordOperation::Event {
+                    event: HarnessEvent::CredentialRevoked {
+                        run_id: run_id.clone(),
+                        call_id: call_id.clone(),
+                        credential_id: "github".into(),
+                    },
+                },
+            )
+            .unwrap();
+            assert!(!grant_path.exists(), "{terminal} left credential bytes");
+
+            let (operation, outcome) = match terminal {
+                "success" => (
+                    RecordOperation::Finish {
+                        run_id: run_id.clone(),
+                        final_answer: "done".into(),
+                    },
+                    Ok(RunOutcome {
+                        run_id: run_id.clone(),
+                        final_answer: "done".into(),
+                        completion_claim: None,
+                    }),
+                ),
+                "failure" => (
+                    RecordOperation::Fail {
+                        run_id: run_id.clone(),
+                        error: "failure".into(),
+                        canceled: false,
+                    },
+                    Err(AppError::SupervisedRun("failure".into())),
+                ),
+                _ => (
+                    RecordOperation::Fail {
+                        run_id: run_id.clone(),
+                        error: RUN_CANCELED_REASON.into(),
+                        canceled: true,
+                    },
+                    Err(AppError::RunCanceled),
+                ),
+            };
+            apply_child_record(&mut recorder, &mut active, operation).unwrap();
+            let (_, terminal_record) = recorder.complete(&run_id, outcome, true).publish();
+            terminal_record.unwrap();
+            let records = crate::ledger::read_records(&ledger_path).unwrap();
+            assert!(matches!(
+                records[records.len() - 2].event,
+                HarnessEvent::CredentialRevoked { .. }
+            ));
+            assert!(matches!(
+                records.last().unwrap().event,
+                HarnessEvent::RunFinished { .. } | HarnessEvent::RunFailed { .. }
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_exit_removes_credential_before_synthetic_audit_and_terminal() {
+        let root = tempfile::tempdir().unwrap();
+        let run_id = RunId::new("run_credential_process_exit").unwrap();
+        let call_id = ToolCallId::new("call_credential_process_exit").unwrap();
+        let ledger_path = root.path().join("events.jsonl");
+        let mut event_recorder = EventRecorder::create_jsonl(&ledger_path).unwrap();
+        record_until_approval(&mut event_recorder, &run_id, &call_id);
+        let (grant, _, _) = materialized_grant(root.path(), &run_id, &call_id);
+        let grant_path = grant.path.clone();
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let mut recorder = ParentRunRecorder {
+            recorder: event_recorder,
+            event_sender,
+            terminal: None,
+        };
+        let mut active = Some(grant);
+
+        revoke_after_child_exit(&mut recorder, &run_id, &mut active).unwrap();
+        assert!(!grant_path.exists());
+        let (_, terminal_record) = recorder
+            .complete(
+                &run_id,
+                Err(AppError::SupervisedRun("child exited".into())),
+                false,
+            )
+            .publish();
+        terminal_record.unwrap();
+
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        let names = records
+            .iter()
+            .rev()
+            .take(4)
+            .map(|record| record.event.name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "run_failed",
+                "credential_revoked",
+                "credential_granted",
+                "approval_granted"
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn audit_failure_cannot_skip_physical_process_exit_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let run_id = RunId::new("run_credential_audit_failure").unwrap();
+        let call_id = ToolCallId::new("call_credential_audit_failure").unwrap();
+        let mut event_recorder =
+            EventRecorder::create_jsonl(&root.path().join("events.jsonl")).unwrap();
+        record_until_approval(&mut event_recorder, &run_id, &call_id);
+        let (grant, _, _) = materialized_grant(root.path(), &run_id, &call_id);
+        let grant_path = grant.path.clone();
+        let (event_sender, event_receiver) = mpsc::channel();
+        drop(event_receiver);
+        let mut recorder = ParentRunRecorder {
+            recorder: event_recorder,
+            event_sender,
+            terminal: None,
+        };
+        let mut active = Some(grant);
+
+        assert!(revoke_after_child_exit(&mut recorder, &run_id, &mut active).is_err());
+        assert!(!grant_path.exists());
     }
 
     #[test]
@@ -1286,6 +2008,7 @@ enabled = ["file.read"]
                         approval_preview: None,
                         diff_preview: None,
                         yolo_eligible: false,
+                        credential_id: None,
                     },
                 })
                 .unwrap();
@@ -1325,6 +2048,7 @@ while :; do :; done
                     event_sender,
                     Arc::new(AtomicBool::new(false)),
                     RunToolHandlers::default(),
+                    Arc::new(HashMap::new()),
                     ChildLaunch {
                         limits: ChildLifecycleLimits {
                             deadline: Duration::from_secs(5),
@@ -1445,6 +2169,7 @@ IFS= read -r _
                     healthy_event_sender,
                     Arc::new(AtomicBool::new(false)),
                     RunToolHandlers::default(),
+                    Arc::new(HashMap::new()),
                     ChildLaunch {
                         limits: ChildLifecycleLimits::default(),
                         executable: healthy_fixture,
@@ -1597,6 +2322,7 @@ while :; do :; done
                     event_sender,
                     cancel,
                     RunToolHandlers::default(),
+                    Arc::new(HashMap::new()),
                     ChildLaunch {
                         limits: ChildLifecycleLimits {
                             deadline,
@@ -1734,6 +2460,12 @@ while :; do :; done
                     .any(|window| window == RUN_CHILD_PROVIDER_SENTINEL.as_bytes()),
                 "provider credential reached captured child output"
             );
+            assert!(
+                !captured
+                    .windows("credential-value-sentinel".len())
+                    .any(|window| window == b"credential-value-sentinel"),
+                "file credential reached captured child output"
+            );
         }
     }
 
@@ -1743,7 +2475,12 @@ while :; do :; done
     fn supervised_environment_driver_fixture() {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
+        let scratch = root.path().join("scratch");
+        let credential_source = root.path().join("host-credential-source");
         fs::create_dir(&workspace).unwrap();
+        crate::thread_repository::create_private_directory(&scratch).unwrap();
+        fs::create_dir(&credential_source).unwrap();
+        fs::write(credential_source.join("token"), "credential-value-sentinel").unwrap();
 
         let (provider, base_url) = spawn_run_child_provider(RUN_CHILD_PROVIDER_SENTINEL);
         fs::write(
@@ -1803,7 +2540,7 @@ done
             config_path: Some("plato.toml".into()),
             overrides: Default::default(),
             ledger: RunLedger::Sqlite(ledger_path.clone()),
-            workspace_root: workspace,
+            workspace_root: workspace.clone(),
             approval_mode: ApprovalMode::Deny { actor: "test" },
             run_id: Some(run_id.clone()),
             session: Some(RunSession::Fresh {
@@ -1820,9 +2557,14 @@ done
         })
         .unwrap();
         assert!(!start_message.contains(RUN_CHILD_PROVIDER_SENTINEL));
+        assert!(!start_message.contains("credential-value-sentinel"));
+        assert!(!start_message.contains(credential_source.to_string_lossy().as_ref()));
 
         let (event_sender, event_receiver) = mpsc::channel();
         let (ready_sender, ready_receiver) = mpsc::channel();
+        let child_workspace = workspace.clone();
+        let child_scratch = scratch.clone();
+        let child_credential_source = credential_source.clone();
         let supervisor = thread::spawn(move || {
             publish_for_test(run_supervised_with_limits(
                 prepared,
@@ -1830,11 +2572,13 @@ done
                 ApprovalMode::external_with_actor("test", |_| {
                     Ok(ExternalApprovalOutcome::Granted {
                         actor: "test".into(),
+                        explicit: true,
                     })
                 }),
                 event_sender,
                 Arc::new(AtomicBool::new(false)),
                 RunToolHandlers::default(),
+                Arc::new(HashMap::from([("github".into(), child_credential_source)])),
                 ChildLaunch {
                     limits: ChildLifecycleLimits {
                         deadline: Duration::from_secs(10),
@@ -1842,7 +2586,11 @@ done
                     },
                     executable: fixture,
                     ready_child: Some(ready_sender),
-                    confinement: crate::confinement::ChildConfinement::None,
+                    confinement: crate::confinement::ChildConfinement::Landlock {
+                        readable_paths: vec![child_workspace.clone(), child_scratch.clone()],
+                        writable_paths: vec![child_workspace, child_scratch.clone()],
+                        scratch: child_scratch,
+                    },
                     terminal_stage_barriers: None,
                 },
             ))
@@ -1877,6 +2625,22 @@ done
             RUN_CHILD_PROVIDER_ENV.as_bytes().to_vec(),
             RUN_CHILD_PROVIDER_SENTINEL.as_bytes().to_vec(),
         );
+        expected_env.insert(b"TMPDIR".to_vec(), scratch.as_os_str().as_bytes().to_vec());
+        expected_env.insert(b"PLATONIC_CHILD_CONFINEMENT".to_vec(), b"landlock".to_vec());
+        expected_env.insert(
+            b"PLATONIC_CHILD_READABLE_PATHS".to_vec(),
+            serde_json::to_vec(&vec![workspace.clone(), scratch.clone()]).unwrap(),
+        );
+        expected_env.insert(
+            b"PLATONIC_CHILD_WRITABLE_PATHS".to_vec(),
+            serde_json::to_vec(&vec![workspace, scratch.clone()]).unwrap(),
+        );
+        expected_env.insert(b"GIT_CONFIG_GLOBAL".to_vec(), b"/dev/null".to_vec());
+        expected_env.insert(b"GIT_CONFIG_NOSYSTEM".to_vec(), b"1".to_vec());
+        expected_env.insert(
+            b"XDG_CONFIG_HOME".to_vec(),
+            scratch.join("xdg-config").as_os_str().as_bytes().to_vec(),
+        );
         assert_eq!(
             actual_env.keys().collect::<Vec<_>>(),
             expected_env.keys().collect::<Vec<_>>()
@@ -1892,11 +2656,18 @@ done
         assert_eq!(event_records.len() + 1, records.len());
         let live = serde_json::to_string(&event_records).unwrap();
         assert!(!live.contains(RUN_CHILD_PROVIDER_SENTINEL));
+        assert!(!live.contains("credential-value-sentinel"));
+        assert!(!live.contains(credential_source.to_string_lossy().as_ref()));
         let durable = serde_json::to_string(&records).unwrap();
         assert!(durable.contains("runtime-and-scrub-ok"));
         assert!(!durable.contains(RUN_CHILD_PROVIDER_SENTINEL));
+        assert!(!durable.contains("credential-value-sentinel"));
+        assert!(!durable.contains(credential_source.to_string_lossy().as_ref()));
+        assert!(!crate::tools::credential_grant_path(&scratch, "github").exists());
         let outcome = serde_json::to_string(&outcome).unwrap();
         assert!(!outcome.contains(RUN_CHILD_PROVIDER_SENTINEL));
+        assert!(!outcome.contains("credential-value-sentinel"));
+        assert!(!outcome.contains(credential_source.to_string_lossy().as_ref()));
 
         let provider_proof = provider.handle.join().unwrap();
         assert_eq!(provider_proof.request_count, 2);
@@ -1927,6 +2698,8 @@ done
                 "test -n \"$PATH\" && test -n \"$HOME\" && ",
                 "test -n \"$TMPDIR\" && test -n \"$CARGO_HOME\" && ",
                 "test -n \"$RUSTUP_HOME\" && ",
+                "test -s \"$TMPDIR/credentials/github/token\" && ",
+                "test \"${PLATONIC_CHILD_CONFINEMENT+x}\" != x && ",
                 "test \"${PLATONIC_RUN_CHILD_CUSTOM_PROVIDER+x}\" != x && ",
                 "test \"${OPENAI_API_KEY+x}\" != x && ",
                 "test \"${GITHUB_TOKEN+x}\" != x && ",
@@ -1938,7 +2711,8 @@ done
                 "printf runtime-and-scrub-ok"
             );
             let arguments = serde_json::to_string(&serde_json::json!({
-                "command": shell_command
+                "command": shell_command,
+                "credential": "github"
             }))
             .unwrap();
             let responses = [

@@ -22,7 +22,9 @@ pub(crate) use logical::{
 pub(crate) use memory::{
     PLATONIC_MEMORY_FILENAME, PLATONIC_MEMORY_MAX_BYTES, targets_platonic_memory,
 };
-pub(crate) use shell::supervised_run_child_env;
+pub(crate) use shell::{
+    CREDENTIAL_GRANTS_DIR, credential_grant_path, shell_credential_id, supervised_run_child_env,
+};
 
 use computer::ComputerToolHandler;
 use files::{list_directory, read_file, write_file};
