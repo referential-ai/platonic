@@ -2181,7 +2181,8 @@ fn streamed_markdown_smooths_holds_tables_and_survives_reload_and_resize() {
 
     let picker_at = shell.output_len();
     shell.write(b"/sessions\r");
-    let picker = shell.wait_for_current_screen_text_after(picker_at, "Threads");
+    let picker = shell.wait_for_current_screen_text_after(picker_at, "thread_pty_streaming_384");
+    assert!(picker.contains("Threads"));
     assert!(picker.contains("thread_pty_streaming_384"));
     shell.write(b"\r");
     fake.wait_for_request_count("transcript.read", 2);
