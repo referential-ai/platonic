@@ -72,6 +72,10 @@ to its parent, not the restart interruption, and sees committed parent answers
 again on recovery. Thread event cursors pair offsets with the server-provided
 `live_epoch_id` and reset when that epoch is stale.
 
+An attached TUI marks daemon loss as offline and keeps an attempted draft in
+the composer. Restart the existing server, press `r` to reconnect to the same
+durable thread, then submit the draft explicitly.
+
 Each new profile turn selects the latest immutable instruction, memory, and
 skill-reference revision and records its exact revision hash in durable context.
 Profile-configured logical read tools expose only bounded, paginated content,

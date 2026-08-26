@@ -520,6 +520,153 @@ fn standalone_tui_reconnects_to_registered_host_after_restart() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "inline PTY viewport omits the preserved title on macOS; #465"
+)]
+fn attached_tui_preserves_one_draft_across_daemon_restart() {
+    const DRAFT: &str = "send this exactly once";
+    const ANSWER: &str = "accepted exactly once";
+
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    for directory in [&workspace, &runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+    }
+    init_git_repository(&workspace);
+    let provider = spawn_pty_answer_provider(ANSWER);
+    let user_config = home.join(".config/plato/config.toml");
+    fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+    fs::write(
+        &user_config,
+        format!(
+            r#"
+[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "{}"
+timeout_ms = 5000
+
+[limits]
+token_budget = 100000
+max_output_tokens = 32
+max_turns = 1
+
+[tools]
+enabled = ["file.read"]
+"#,
+            provider.base_url
+        ),
+    )
+    .unwrap();
+
+    let endpoint = runtime.join("platonic").join("host").join("agent.sock");
+    let config = DaemonConnectionConfig::resolve(&workspace, Some(endpoint.clone())).unwrap();
+    let mut daemon = spawn_host_daemon(&workspace, &runtime, &state, &home);
+    wait_for_unregistered_daemon(&config, &mut daemon);
+    let _daemon_cleanup = HostDaemonCleanup {
+        config: config.clone(),
+        endpoint: endpoint.clone(),
+    };
+    let mut shell = PtyShell::spawn(&workspace, &runtime, &state, &home);
+
+    shell.write(
+        br#""$PLATO_BIN"; printf '\n%sSTATUS:%s\n' "$PTY_MARK" "$?"
+"#,
+    );
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Workspace name [workspace]");
+    shell.write(b"\r");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Profile name [workspace]");
+    shell.write(b"\r");
+    shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Approve profile home?");
+    shell.write(b"y\r");
+    shell.wait_for_screen_text(
+        INITIAL_ROWS,
+        INITIAL_COLS,
+        "Try \"read README.md and summarize it\"",
+    );
+
+    let mut control = connect_pty_daemon(&config);
+    control.hello(&workspace).unwrap();
+    let home_thread_id = control.profile_list(None, None).unwrap().profiles[0]
+        .home_thread_id
+        .clone()
+        .unwrap();
+    shell.write(DRAFT.as_bytes());
+    shell.wait_for_current_screen_text(DRAFT);
+
+    assert_eq!(
+        control.shutdown_if_idle().unwrap().result,
+        ShutdownIfIdleResultName::Shutdown
+    );
+    drop(control);
+    wait_for_endpoint_removal(&endpoint);
+    assert!(wait_for_daemon_exit(&mut daemon).success());
+    let offline = shell.wait_for_current_screen_text("daemon unavailable");
+    assert!(offline.contains(DRAFT), "{offline}");
+    assert!(
+        offline.contains("daemon unavailable — r to reconnect"),
+        "{offline}"
+    );
+
+    let mut restarted = spawn_host_daemon(&workspace, &runtime, &state, &home);
+    let mut restarted_control = connect_pty_daemon(&config);
+    restarted_control.hello(&workspace).unwrap();
+
+    let submit_at = shell.output_len();
+    shell.write(b"\r\x1b[D");
+    shell.wait_for_output_after(submit_at);
+    let rejected = shell.wait_for_current_screen_text(DRAFT);
+    assert!(rejected.contains(DRAFT), "{rejected}");
+    assert!(
+        rejected.contains("daemon unavailable — r to reconnect"),
+        "{rejected}"
+    );
+    assert!(restarted_control.sessions_list().unwrap().is_empty());
+    assert!(
+        restarted_control
+            .thread_status(home_thread_id.clone())
+            .unwrap()
+            .thread
+            .live
+            .current_turn_id
+            .is_none()
+    );
+
+    shell.write(b"r");
+    let reconnected =
+        shell.wait_for_screen_without_text(INITIAL_ROWS, INITIAL_COLS, "daemon unavailable");
+    assert!(reconnected.contains(DRAFT), "{reconnected}");
+    shell.write(b"\r");
+    shell.wait_for_current_screen_text(ANSWER);
+
+    let session_id = wait_for_finished_session(&mut restarted_control, DRAFT);
+    assert_eq!(session_id, format!("session_{home_thread_id}"));
+    let transcript = restarted_control
+        .transcript_read_session(&session_id)
+        .unwrap();
+    assert_eq!(transcript.transcript.matches(DRAFT).count(), 1);
+    assert_eq!(transcript.final_answer.as_deref(), Some(ANSWER));
+
+    shell.write(b"q");
+    assert_eq!(shell.wait_for_marker("STATUS"), "0");
+    shell.write(b"exit\r");
+    assert!(shell.wait_bounded(PROOF_TIMEOUT).success());
+    assert_eq!(
+        shutdown_when_idle(&mut restarted_control),
+        ShutdownIfIdleResultName::Shutdown
+    );
+    drop(restarted_control);
+    wait_for_endpoint_removal(&endpoint);
+    assert!(wait_for_daemon_exit(&mut restarted).success());
+    assert_eq!(provider.handle.join().unwrap(), 1);
+}
+
+#[test]
 fn standalone_tui_surfaces_registration_io_failure_after_prompt() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
@@ -2974,6 +3121,36 @@ fn inline_scrollback_count(output: &[u8]) -> usize {
 struct PtyShellSequenceProvider {
     base_url: String,
     handle: JoinHandle<usize>,
+}
+
+fn spawn_pty_answer_provider(answer: &str) -> PtyShellSequenceProvider {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let answer = answer.to_owned();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_pty_provider_request(&mut stream);
+        let content = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"content": answer},
+                "finish_reason": null
+            }]
+        });
+        let finish = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        });
+        write_pty_provider_response(
+            &mut stream,
+            &format!("data: {content}\n\ndata: {finish}\n\ndata: [DONE]\n\n"),
+        );
+        1
+    });
+    PtyShellSequenceProvider { base_url, handle }
 }
 
 fn spawn_pty_shell_sequence_provider(runs: &[(&str, &str)]) -> PtyShellSequenceProvider {

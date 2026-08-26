@@ -902,6 +902,9 @@ fn submit_composer(
     if message.is_empty() {
         return true;
     }
+    if is_disconnected(state) && !message.starts_with('/') {
+        return true;
+    }
     state.record_input_history(&message);
     state.clear_composer();
     if let Some(keep_running) = handle_composer_command(
@@ -1818,6 +1821,24 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
         assert!(state.composer.is_empty());
+    }
+
+    #[test]
+    fn disconnected_submission_stays_in_the_composer() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.connection = crate::ConnectionState::Disconnected {
+            error: "connection closed".into(),
+        };
+        state.set_composer_text("send after reconnect");
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+
+        assert_eq!(state.composer_text(), "send after reconnect");
+        assert!(state.live_events.is_empty());
+        assert!(state.input_history.is_empty());
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
