@@ -13,6 +13,8 @@ const fixtureRoot = resolve(scriptRoot, "fixtures/browser");
 const manifest = JSON.parse(await readFile(resolve(baselineRoot, "manifest.json"), "utf8"));
 const origin = process.env.DOCS_BROWSER_ORIGIN;
 const require = createRequire(import.meta.url);
+const notFoundConsole =
+  /^Failed to load resource: the server responded with a status of 404(?: .*)?$/;
 
 if (!origin) throw new Error("DOCS_BROWSER_ORIGIN is required; run scripts/browser-run.mjs");
 
@@ -31,7 +33,7 @@ function watchPage(page, allowedStatus = null) {
     if (
       allowedStatus &&
       message.type() === "error" &&
-      message.text() === "Failed to load resource: the server responded with a status of 404 (Not Found)"
+      notFoundConsole.test(message.text())
     ) {
       return;
     }
@@ -56,6 +58,15 @@ function watchPage(page, allowedStatus = null) {
   });
   return failures;
 }
+
+test("404 console compatibility remains status-scoped", () => {
+  expect(notFoundConsole.test("Failed to load resource: the server responded with a status of 404 (Not Found)"))
+    .toBe(true);
+  expect(notFoundConsole.test("Failed to load resource: the server responded with a status of 404 ()"))
+    .toBe(true);
+  expect(notFoundConsole.test("Failed to load resource: the server responded with a status of 500 ()"))
+    .toBe(false);
+});
 
 async function openPage(page, url, status = 200) {
   const failures = watchPage(page, status === 404 ? url : null);
