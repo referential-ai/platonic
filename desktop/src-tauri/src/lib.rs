@@ -1527,6 +1527,8 @@ fn ledger_event_into_desktop(event: HarnessEvent, offset: u64) -> Option<Desktop
         | HarnessEvent::ModelRequested { .. }
         | HarnessEvent::ModelFailed { .. }
         | HarnessEvent::ToolProposalsRejected { .. }
+        | HarnessEvent::CredentialGranted { .. }
+        | HarnessEvent::CredentialRevoked { .. }
         | HarnessEvent::ToolStarted { .. }
         | HarnessEvent::RunFinished { .. }
         | HarnessEvent::RunFailed { .. } => None,
