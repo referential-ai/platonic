@@ -45,6 +45,7 @@ const INITIAL_COLS: u16 = 80;
 const RESIZED_ROWS: u16 = 30;
 const RESIZED_COLS: u16 = 100;
 const PROOF_TIMEOUT: Duration = Duration::from_secs(15);
+static PTY_SERIAL: Mutex<()> = Mutex::new(());
 const MARKER: &str = "__PLATO_TUI_PTY_237__";
 const EXPECTED_DRAFT: &str = "ask hello café pasted text";
 const PENDING_RUN_ID: &str = "run_pty_pending";
@@ -2358,6 +2359,7 @@ fn sgr_parameters(output: &[u8]) -> impl Iterator<Item = u16> + '_ {
 }
 
 struct PtyShell {
+    _serial: std::sync::MutexGuard<'static, ()>,
     pty: Pty,
     child: Child,
     output: Arc<Mutex<Vec<u8>>>,
@@ -2662,6 +2664,9 @@ impl PtyShell {
         home: &Path,
         no_color: Option<&str>,
     ) -> Self {
+        let serial = PTY_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (pty, pts) = open().unwrap();
         pty.resize(Size::new(INITIAL_ROWS, INITIAL_COLS)).unwrap();
         let reader_file = File::from(pty.as_fd().try_clone_to_owned().unwrap());
@@ -2696,6 +2701,7 @@ impl PtyShell {
         };
         let child = command.spawn(pts).unwrap();
         Self {
+            _serial: serial,
             pty,
             child,
             output,
