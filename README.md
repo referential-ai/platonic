@@ -76,6 +76,9 @@ An attached TUI marks daemon loss as offline and keeps an attempted draft in
 the composer. Restart the existing server, press `r` to reconnect to the same
 durable thread, then submit the draft explicitly.
 
+While a turn is active, the TUI working row labels its exact durable `run ID`
+and removes it when the run terminates.
+
 Each new profile turn selects the latest immutable instruction, memory, and
 skill-reference revision and records its exact revision hash in durable context.
 Profile-configured logical read tools expose only bounded, paginated content,
