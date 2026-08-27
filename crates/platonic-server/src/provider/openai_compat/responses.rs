@@ -46,8 +46,6 @@ enum ResponsesInputItem {
     Message {
         role: ResponsesMessageRole,
         content: Vec<ResponsesInputContent>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        status: Option<&'static str>,
     },
     FunctionCall {
         call_id: String,
@@ -71,7 +69,6 @@ enum ResponsesMessageRole {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ResponsesInputContent {
     InputText { text: String },
-    OutputText { text: String, annotations: Vec<()> },
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +78,7 @@ struct ResponsesTool {
     name: String,
     description: String,
     parameters: Value,
+    strict: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,7 +128,6 @@ impl ResponsesInputItem {
                 Ok(vec![Self::Message {
                     role: ResponsesMessageRole::User,
                     content,
-                    status: None,
                 }])
             }
             ModelRole::Assistant => message
@@ -139,11 +136,7 @@ impl ResponsesInputItem {
                 .map(|block| match block {
                     ModelBlock::Text { text } => Ok(Self::Message {
                         role: ResponsesMessageRole::Assistant,
-                        content: vec![ResponsesInputContent::OutputText {
-                            text: text.clone(),
-                            annotations: Vec::new(),
-                        }],
-                        status: Some("completed"),
+                        content: vec![ResponsesInputContent::InputText { text: text.clone() }],
                     }),
                     ModelBlock::ToolUse { id, name, input } => {
                         let name = provider_name_for_internal(name).ok_or_else(|| {
@@ -202,6 +195,7 @@ impl From<&ToolSpec> for ResponsesTool {
             name: spec.name.clone(),
             description: spec.description.clone(),
             parameters: spec.input_schema.clone(),
+            strict: false,
         }
     }
 }
@@ -544,6 +538,8 @@ impl ResponsesStreamState {
             | "response.reasoning_summary_part.done"
             | "response.reasoning_summary_text.delta"
             | "response.reasoning_summary_text.done"
+            | "response.reasoning.delta"
+            | "response.reasoning.done"
             | "response.reasoning_text.delta"
             | "response.reasoning_text.done" => {}
             _ => return Err(AppError::Provider(UNKNOWN_STREAM_EVENT_ERROR.into())),
@@ -665,11 +661,9 @@ mod tests {
                     {
                         "type": "message",
                         "role": "assistant",
-                        "status": "completed",
                         "content": [{
-                            "type": "output_text",
-                            "text": "I will read it.",
-                            "annotations": []
+                            "type": "input_text",
+                            "text": "I will read it."
                         }]
                     },
                     {
@@ -692,7 +686,8 @@ mod tests {
                         "type": "object",
                         "properties": {"path": {"type": "string"}},
                         "required": ["path"]
-                    }
+                    },
+                    "strict": false
                 }],
                 "tool_choice": "auto",
                 "parallel_tool_calls": false,
@@ -865,6 +860,8 @@ mod tests {
         });
         let raw = [
             sse(json!({"type": "response.created", "response": {"status": "in_progress"}})),
+            sse(json!({"type": "response.reasoning.delta", "delta": "ignored"})),
+            sse(json!({"type": "response.reasoning.done"})),
             sse(json!({"type": "response.output_text.delta", "delta": "Hel"})),
             sse(json!({"type": "response.output_text.delta", "delta": "lo"})),
             sse(json!({
