@@ -4441,7 +4441,7 @@ enabled = ["file.read"]
         ] {
             let trial_result = run_stalled_stream_cancel_trial(0, delays);
             trial_result.assert_canceled_session();
-            let failure = trial_result.timings.first_failure().unwrap();
+            let failure = trial_result.timings.failure_for(phase).unwrap();
             eprintln!(
                 "STALLED_STREAM_CANCEL_MUTATION phase={} elapsed_ms={:.3} limit_ms={:.3}",
                 failure.phase.name(),
@@ -4457,6 +4457,33 @@ enabled = ["file.read"]
                 failure.limit
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stalled_stream_phase_bounds_requested_phase_is_not_masked_by_earlier_failure() {
+        let now = std::time::Instant::now();
+        let earlier_failure = now + CANCEL_OBSERVATION_LIMIT + std::time::Duration::from_millis(1);
+        let later_failure = now + TERMINAL_READBACK_LIMIT + std::time::Duration::from_millis(1);
+        let timings = StalledStreamTimings {
+            canceled_at: now,
+            cancellation_observed_at: earlier_failure,
+            terminal_event_observed_at: earlier_failure,
+            run_returned_at: earlier_failure,
+            session_ready_at: later_failure,
+        };
+
+        assert_eq!(
+            timings.first_failure().unwrap().phase,
+            StalledStreamPhase::ResponseReadCancellation
+        );
+        assert_eq!(
+            timings
+                .failure_for(StalledStreamPhase::SessionReadyReadback)
+                .unwrap()
+                .phase,
+            StalledStreamPhase::SessionReadyReadback
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -4557,39 +4584,41 @@ enabled = ["file.read"]
                 .saturating_duration_since(self.canceled_at)
         }
 
-        fn first_failure(self) -> Option<StalledStreamTimingFailure> {
-            let phases = [
-                (
-                    StalledStreamPhase::ResponseReadCancellation,
-                    self.cancel_to_observation(),
-                    CANCEL_OBSERVATION_LIMIT,
-                ),
-                (
-                    StalledStreamPhase::TerminalLedgerCommit,
+        fn failure_for(self, phase: StalledStreamPhase) -> Option<StalledStreamTimingFailure> {
+            let (elapsed, limit) = match phase {
+                StalledStreamPhase::ResponseReadCancellation => {
+                    (self.cancel_to_observation(), CANCEL_OBSERVATION_LIMIT)
+                }
+                StalledStreamPhase::TerminalLedgerCommit => (
                     self.terminal_committed_at()
                         .saturating_duration_since(self.canceled_at),
                     TERMINAL_READBACK_LIMIT,
                 ),
-                (
-                    StalledStreamPhase::RunReturn,
+                StalledStreamPhase::RunReturn => (
                     self.run_returned_at
                         .saturating_duration_since(self.canceled_at),
                     TERMINAL_READBACK_LIMIT,
                 ),
-                (
-                    StalledStreamPhase::SessionReadyReadback,
-                    self.cancel_to_readback(),
-                    TERMINAL_READBACK_LIMIT,
-                ),
-            ];
-            phases
-                .into_iter()
-                .find(|(_, elapsed, limit)| elapsed >= limit)
-                .map(|(phase, elapsed, limit)| StalledStreamTimingFailure {
-                    phase,
-                    elapsed,
-                    limit,
-                })
+                StalledStreamPhase::SessionReadyReadback => {
+                    (self.cancel_to_readback(), TERMINAL_READBACK_LIMIT)
+                }
+            };
+            (elapsed >= limit).then_some(StalledStreamTimingFailure {
+                phase,
+                elapsed,
+                limit,
+            })
+        }
+
+        fn first_failure(self) -> Option<StalledStreamTimingFailure> {
+            [
+                StalledStreamPhase::ResponseReadCancellation,
+                StalledStreamPhase::TerminalLedgerCommit,
+                StalledStreamPhase::RunReturn,
+                StalledStreamPhase::SessionReadyReadback,
+            ]
+            .into_iter()
+            .find_map(|phase| self.failure_for(phase))
         }
 
         fn assert_within_limits(self, trial: usize) {
