@@ -25,7 +25,7 @@ An explicit or `PLATO_CONFIG` path may start with `~`; a relative path resolves 
 
 A client-supplied `--config` path is carried by one-shot and unattached session runs. With `plato --tui --config FILE`, that file supplies the proposed root thread's model, but an attached durable-thread turn does not carry it in `thread.send`. Use `PLATO_CONFIG` in the server environment or user config for trusted provider settings that must govern attached turns. The thread's admitted model and toolset remain immutable.
 
-The auto-discovered workspace `plato.toml` is untrusted. It cannot contain `provider.api_key_env`, `provider.base_url`, `[gateway]`, `[principals]`, `[computer]`, `limits.max_spawn_depth`, `[confinement]`, or enable a `computer.*` tool. Put trusted provider and computer fields in an explicitly selected config, the `PLATO_CONFIG` file, or user config. The [Discord operations page](../../user/operations/discord/) routes gateway and principal configuration to its detailed owner.
+The auto-discovered workspace `plato.toml` is untrusted. It cannot contain `provider.api_key_env`, `provider.base_url`, `provider.protocol`, `[gateway]`, `[principals]`, `[computer]`, `limits.max_spawn_depth`, `[confinement]`, or enable a `computer.*` tool. Put trusted provider and computer fields in an explicitly selected config, the `PLATO_CONFIG` file, or user config. The [Discord operations page](../../user/operations/discord/) routes gateway and principal configuration to its detailed owner.
 
 Server startup reads `limits.max_spawn_depth` and `confinement.require` only from `$HOME/.config/plato/config.toml`, then falls back to defaults. Restart an idle server after changing either field.
 
@@ -62,15 +62,17 @@ OpenRouter is the shipped default:
 ```toml
 [provider]
 kind = "open_router"
+protocol = "chat_completions"
 model = "~openai/gpt-latest"
 api_key_env = "OPENROUTER_API_KEY"
 ```
 
-The only other provider kind is the generic OpenAI-compatible shape. Its defaults call OpenAI directly:
+The only other provider kind is the generic OpenAI-compatible shape. Its endpoint, key, and model defaults call OpenAI directly; select Responses explicitly:
 
 ```toml
 [provider]
 kind = "open_ai"
+protocol = "responses"
 model = "gpt-5.5"
 api_key_env = "OPENAI_API_KEY"
 base_url = "https://api.openai.com/v1"
@@ -86,17 +88,18 @@ api_key_env = "LOCAL_OPENAI_API_KEY"
 base_url = "http://127.0.0.1:8000/v1"
 ```
 
-The server's provider client trims trailing slashes from `base_url` and posts completions to `<base_url>/chat/completions`.
+The server trims trailing slashes from `base_url`. `protocol = "chat_completions"` posts to `<base_url>/chat/completions`; `protocol = "responses"` posts to `<base_url>/responses`. Omission preserves the `chat_completions` default. The protocol is trusted provider configuration and cannot be selected by an auto-discovered workspace `plato.toml`.
 
 The server reads the named variable from its own environment and sends it as the bearer credential. Set it outside TOML and restart the idle server when its environment changes. Do not print the variable during diagnosis.
 
-`provider.model` is the requested model or alias. A newly admitted durable thread records that value immutably; changing config does not rewrite an existing thread. Status reports the requested value separately from the provider-reported served model, which may be unknown.
+`provider.model` is the requested model or alias. A newly admitted durable thread records that value immutably; changing config does not rewrite an existing thread. Status reports the requested value separately from the provider-reported served model, which may be unknown, and reports the effective protocol as `daemon.status.model.provider_protocol`.
 
 ### Provider fields
 
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `provider.kind` | `open_router` | `open_router` or generic `open_ai` |
+| `provider.protocol` | `chat_completions` | `chat_completions` or `responses`; forbidden in workspace config |
 | `provider.model` | `~openai/gpt-latest` for OpenRouter; `gpt-5.5` for `open_ai` | Requested provider model or alias |
 | `provider.api_key_env` | `OPENROUTER_API_KEY` or `OPENAI_API_KEY` | Name of the server-environment variable; forbidden in workspace config |
 | `provider.base_url` | `https://openrouter.ai/api/v1` or `https://api.openai.com/v1` | API root; forbidden in workspace config |

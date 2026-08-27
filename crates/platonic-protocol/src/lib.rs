@@ -1630,6 +1630,8 @@ pub struct DaemonStatusModel {
     pub served_model: Option<String>,
     /// Configured provider kind.
     pub provider_kind: DaemonStatusProviderKind,
+    /// Effective provider wire protocol.
+    pub provider_protocol: DaemonStatusProviderProtocol,
     /// Whether the configured provider key environment variable is present.
     pub key_present: bool,
 }
@@ -1655,6 +1657,32 @@ impl DaemonStatusProviderKind {
 }
 
 impl fmt::Display for DaemonStatusProviderKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.pad(self.as_str())
+    }
+}
+
+/// Provider wire protocol returned by `daemon.status`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonStatusProviderProtocol {
+    /// OpenAI-compatible Chat Completions protocol.
+    ChatCompletions,
+    /// OpenAI-compatible Responses protocol.
+    Responses,
+}
+
+impl DaemonStatusProviderProtocol {
+    /// Returns the exact provider-protocol wire value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::Responses => "responses",
+        }
+    }
+}
+
+impl fmt::Display for DaemonStatusProviderProtocol {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.pad(self.as_str())
     }
@@ -3757,7 +3785,7 @@ mod tests {
             ),
             (
                 ProtocolMethod::DaemonStatus,
-                r#"{"v":2,"id":"status_1","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":null,"build_date_utc":null,"endpoint_path":"/tmp/agent.sock","package_version":"0.2.0","uptime_ms":0,"workspace_id":"work-1"},"model":{"key_present":false,"provider_kind":"open_ai","requested_alias":"gpt-5","served_model":null},"session":{"core_event_count":0,"human_turn_count":0,"latest_run_id":null,"ledger_path":"/state/agent.db","session_id":null},"trust":{"approval_denied_count":0,"approval_granted_count":0,"shell_session_grant":false},"usage":{"last_run":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0},"session":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0}}}}"#,
+                r#"{"v":2,"id":"status_1","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":null,"build_date_utc":null,"endpoint_path":"/tmp/agent.sock","package_version":"0.2.0","uptime_ms":0,"workspace_id":"work-1"},"model":{"key_present":false,"provider_kind":"open_ai","provider_protocol":"chat_completions","requested_alias":"gpt-5","served_model":null},"session":{"core_event_count":0,"human_turn_count":0,"latest_run_id":null,"ledger_path":"/state/agent.db","session_id":null},"trust":{"approval_denied_count":0,"approval_granted_count":0,"shell_session_grant":false},"usage":{"last_run":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0},"session":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0}}}}"#,
             ),
             (
                 ProtocolMethod::SessionApprovalProfileSet,
@@ -4234,8 +4262,8 @@ mod tests {
     #[test]
     fn daemon_status_known_and_unknown_fixtures_keep_exact_v2_bytes() {
         const STATUS_REQUEST: &str = r#"{"v":2,"id":"status_1","kind":"request","method":"daemon.status","params":{"config_path":"config/plato.toml","session_id":"session_1"}}"#;
-        const STATUS_KNOWN_RESPONSE: &str = r#"{"v":2,"id":"status_1","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":"0123456789abcdef0123456789abcdef01234567","build_date_utc":"2026-08-01","endpoint_path":"/tmp/agent.sock","package_version":"0.1.0","uptime_ms":42,"workspace_id":"work-1234"},"model":{"key_present":true,"provider_kind":"open_router","requested_alias":"~openai/gpt-latest","served_model":"openai/gpt-5.5-2026-08-01"},"session":{"core_event_count":17,"human_turn_count":2,"latest_run_id":"run_2","ledger_path":"/tmp/agent.db","session_id":"session_1"},"trust":{"approval_denied_count":1,"approval_granted_count":2,"shell_session_grant":true},"usage":{"last_run":{"input_tokens":7,"output_tokens":3,"unknown_response_count":1},"session":{"input_tokens":17,"output_tokens":8,"unknown_response_count":2}}}}"#;
-        const STATUS_UNKNOWN_RESPONSE: &str = r#"{"v":2,"id":"status_2","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":null,"build_date_utc":null,"endpoint_path":"/tmp/agent.sock","package_version":"0.1.0","uptime_ms":0,"workspace_id":"work-1234"},"model":{"key_present":false,"provider_kind":"open_ai","requested_alias":"gpt-5.5","served_model":null},"session":{"core_event_count":0,"human_turn_count":0,"latest_run_id":null,"ledger_path":"/tmp/agent.db","session_id":null},"trust":{"approval_denied_count":0,"approval_granted_count":0,"shell_session_grant":false},"usage":{"last_run":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0},"session":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0}}}}"#;
+        const STATUS_KNOWN_RESPONSE: &str = r#"{"v":2,"id":"status_1","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":"0123456789abcdef0123456789abcdef01234567","build_date_utc":"2026-08-01","endpoint_path":"/tmp/agent.sock","package_version":"0.1.0","uptime_ms":42,"workspace_id":"work-1234"},"model":{"key_present":true,"provider_kind":"open_router","provider_protocol":"responses","requested_alias":"~openai/gpt-latest","served_model":"openai/gpt-5.5-2026-08-01"},"session":{"core_event_count":17,"human_turn_count":2,"latest_run_id":"run_2","ledger_path":"/tmp/agent.db","session_id":"session_1"},"trust":{"approval_denied_count":1,"approval_granted_count":2,"shell_session_grant":true},"usage":{"last_run":{"input_tokens":7,"output_tokens":3,"unknown_response_count":1},"session":{"input_tokens":17,"output_tokens":8,"unknown_response_count":2}}}}"#;
+        const STATUS_UNKNOWN_RESPONSE: &str = r#"{"v":2,"id":"status_2","kind":"response","method":"daemon.status","result":{"daemon":{"build_commit":null,"build_date_utc":null,"endpoint_path":"/tmp/agent.sock","package_version":"0.1.0","uptime_ms":0,"workspace_id":"work-1234"},"model":{"key_present":false,"provider_kind":"open_ai","provider_protocol":"chat_completions","requested_alias":"gpt-5.5","served_model":null},"session":{"core_event_count":0,"human_turn_count":0,"latest_run_id":null,"ledger_path":"/tmp/agent.db","session_id":null},"trust":{"approval_denied_count":0,"approval_granted_count":0,"shell_session_grant":false},"usage":{"last_run":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0},"session":{"input_tokens":0,"output_tokens":0,"unknown_response_count":0}}}}"#;
 
         let request = decode_request(STATUS_REQUEST).unwrap();
         let Some(ProtocolRequest::DaemonStatus(params)) = request.params.as_ref() else {
@@ -4270,6 +4298,21 @@ mod tests {
             assert_eq!(kind.as_str(), wire_value);
             assert_eq!(kind.to_string(), wire_value);
             assert_eq!(serde_json::to_value(kind).unwrap(), wire_value);
+        }
+    }
+
+    #[test]
+    fn daemon_status_provider_protocols_keep_exact_wire_values() {
+        for (protocol, wire_value) in [
+            (
+                DaemonStatusProviderProtocol::ChatCompletions,
+                "chat_completions",
+            ),
+            (DaemonStatusProviderProtocol::Responses, "responses"),
+        ] {
+            assert_eq!(protocol.as_str(), wire_value);
+            assert_eq!(protocol.to_string(), wire_value);
+            assert_eq!(serde_json::to_value(protocol).unwrap(), wire_value);
         }
     }
 
@@ -4363,6 +4406,7 @@ mod tests {
                 "requested_alias": "gpt-5.5",
                 "served_model": null,
                 "provider_kind": "open_ai",
+                "provider_protocol": "chat_completions",
                 "key_present": false
             },
             "daemon": {
@@ -4403,6 +4447,7 @@ mod tests {
             "requested_alias": "gpt-5.5",
             "served_model": null,
             "provider_kind": "open_ai",
+            "provider_protocol": "chat_completions",
             "key_present": false,
             "future": true
         }));

@@ -2679,6 +2679,7 @@ mod tests {
                     "requested_alias": "test-model",
                     "served_model": null,
                     "provider_kind": "open_ai",
+                    "provider_protocol": "chat_completions",
                     "key_present": false
                 },
                 "daemon": {

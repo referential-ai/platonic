@@ -1524,6 +1524,7 @@ mod tests {
                     r#"
 [provider]
 kind = "open_ai"
+protocol = "responses"
 model = "requested-status-alias"
 api_key_env = "{KEY_ENV}"
 base_url = "https://example.invalid/v1"
@@ -1562,6 +1563,10 @@ base_url = "https://example.invalid/v1"
             assert_eq!(first.model.requested_alias, "requested-status-alias");
             assert_eq!(first.model.served_model, None);
             assert_eq!(first.model.provider_kind, DaemonStatusProviderKind::OpenAi);
+            assert_eq!(
+                first.model.provider_protocol,
+                platonic_protocol::DaemonStatusProviderProtocol::Responses
+            );
             assert!(first.model.key_present);
             assert_eq!(
                 first.daemon.endpoint_path,

@@ -1,6 +1,6 @@
 use super::{
     context::context_pack_with_profile_and_interruption,
-    prepare::{PreparedRun, token_limit_field},
+    prepare::PreparedRun,
     tool_exec::{
         EXTRA_TOOL_CALL_ERROR, ToolHandlerRefs, ToolMessage, evaluate_policy,
         execute_and_record_tool, mint_tool_call_id, proposals_from_response, provider_tool_output,
@@ -95,15 +95,7 @@ pub(crate) fn run_prepared_question(
         cancel,
         voice_interruption_context,
     };
-    let client = OpenAiCompatibleClient::from_config(
-        &config.provider.api_key_env,
-        config.provider.base_url.clone(),
-        config.provider.connect_timeout_ms,
-        config.provider.stream_idle_timeout_ms,
-        config.provider.http_referer.clone(),
-        config.provider.app_title.clone(),
-        token_limit_field(&config.provider.kind),
-    )?;
+    let client = OpenAiCompatibleClient::from_config(&config.provider)?;
     let tools = tool_specs(&config.tools.enabled, has_credential_sources);
     let model = ModelName::new(config.provider.model.clone())?;
     let stdin_actor_id = ActorId::new("stdin")?;
@@ -1306,7 +1298,7 @@ base_url = "http://{}"
 
         assert_eq!(
             error.to_string(),
-            "config error: workspace plato.toml cannot set provider.api_key_env or provider.base_url; use --config, PLATO_CONFIG, or user config"
+            "config error: workspace plato.toml cannot set provider.api_key_env, provider.base_url, or provider.protocol; use --config, PLATO_CONFIG, or user config"
         );
         assert!(!error.to_string().contains("top-secret"));
         assert_eq!(

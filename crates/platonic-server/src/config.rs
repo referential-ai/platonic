@@ -24,7 +24,7 @@ const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const PLATO_CONFIG_ENV: &str = "PLATO_CONFIG";
 pub(crate) const DEFAULT_HTTP_GATEWAY_BIND: &str = "127.0.0.1:8787";
-const WORKSPACE_PROVIDER_OVERRIDE_ERROR: &str = "workspace plato.toml cannot set provider.api_key_env or provider.base_url; use --config, PLATO_CONFIG, or user config";
+const WORKSPACE_PROVIDER_OVERRIDE_ERROR: &str = "workspace plato.toml cannot set provider.api_key_env, provider.base_url, or provider.protocol; use --config, PLATO_CONFIG, or user config";
 const WORKSPACE_GATEWAY_ERROR: &str =
     "workspace plato.toml cannot set [gateway]; use --config, PLATO_CONFIG, or user config";
 const WORKSPACE_PRINCIPALS_ERROR: &str = "workspace plato.toml cannot set [principals]; define gateway principals only in the user config";
@@ -120,6 +120,7 @@ pub struct HttpGatewayPrincipal {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub kind: ProviderKind,
+    pub protocol: ProviderProtocol,
     pub model: String,
     pub api_key_env: String,
     pub base_url: String,
@@ -134,6 +135,14 @@ pub struct ProviderConfig {
 pub enum ProviderKind {
     OpenAi,
     OpenRouter,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderProtocol {
+    #[default]
+    ChatCompletions,
+    Responses,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -226,6 +235,7 @@ struct RawHttpPrincipal {
 #[serde(deny_unknown_fields)]
 struct RawProviderConfig {
     kind: Option<ProviderKind>,
+    protocol: Option<ProviderProtocol>,
     model: Option<String>,
     api_key_env: Option<String>,
     base_url: Option<String>,
@@ -300,7 +310,9 @@ impl Config {
         }
         if matches!(resolved, ResolvedConfigPath::Workspace(_))
             && raw.provider.as_ref().is_some_and(|provider| {
-                provider.api_key_env.is_some() || provider.base_url.is_some()
+                provider.api_key_env.is_some()
+                    || provider.base_url.is_some()
+                    || provider.protocol.is_some()
             })
         {
             return Err(AppError::Config(WORKSPACE_PROVIDER_OVERRIDE_ERROR.into()));
@@ -379,6 +391,7 @@ impl Config {
 
         Ok(Self {
             provider: ProviderConfig {
+                protocol: provider.protocol.unwrap_or_default(),
                 model: provider
                     .model
                     .unwrap_or_else(|| default_model(&kind).into()),
@@ -417,6 +430,7 @@ impl Default for Config {
         let kind = ProviderKind::OpenRouter;
         Self {
             provider: ProviderConfig {
+                protocol: ProviderProtocol::default(),
                 model: default_model(&kind).into(),
                 api_key_env: default_api_key_env(&kind).into(),
                 base_url: default_base_url(&kind).into(),
@@ -972,6 +986,7 @@ mod tests {
         let config = Config::default();
 
         assert_eq!(config.provider.kind, ProviderKind::OpenRouter);
+        assert_eq!(config.provider.protocol, ProviderProtocol::ChatCompletions);
         assert_eq!(config.provider.model, "~openai/gpt-latest");
         assert_eq!(config.provider.api_key_env, "OPENROUTER_API_KEY");
         assert_eq!(config.provider.base_url, "https://openrouter.ai/api/v1");
@@ -997,6 +1012,19 @@ mod tests {
                 "web.fetch"
             ]
         );
+    }
+
+    #[test]
+    fn provider_protocol_accepts_only_the_two_exact_values() {
+        for (value, expected) in [
+            ("chat_completions", ProviderProtocol::ChatCompletions),
+            ("responses", ProviderProtocol::Responses),
+        ] {
+            let raw = toml::from_str(&format!("[provider]\nprotocol = \"{value}\"\n")).unwrap();
+            assert_eq!(Config::from_raw(raw).unwrap().provider.protocol, expected);
+        }
+
+        assert!(toml::from_str::<RawConfig>("[provider]\nprotocol = \"response\"\n").is_err());
     }
 
     #[test]
@@ -1255,6 +1283,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
         for field in [
             r#"api_key_env = "STOLEN_SECRET""#,
             r#"base_url = "https://attacker.invalid/v1""#,
+            r#"protocol = "responses""#,
         ] {
             let workspace = tempfile::tempdir().unwrap();
             std::fs::write(
@@ -1588,6 +1617,7 @@ enabled = ["file.read"]
 [provider]
 api_key_env = "AUTHORIZED_SECRET"
 base_url = "https://provider.example/v1"
+protocol = "responses"
 
 [computer]
 executable = "/opt/cua/bin/cua-driver"
@@ -1629,6 +1659,7 @@ api_key_env = "DISCORD_BOT_TOKEN"
             ));
             assert_eq!(config.provider.api_key_env, "AUTHORIZED_SECRET");
             assert_eq!(config.provider.base_url, "https://provider.example/v1");
+            assert_eq!(config.provider.protocol, ProviderProtocol::Responses);
             assert_eq!(
                 config.computer.executable,
                 Some(PathBuf::from("/opt/cua/bin/cua-driver"))
@@ -1944,6 +1975,7 @@ stream_idle_timeout_ms = 9000
         let raw = RawConfig {
             provider: Some(RawProviderConfig {
                 kind: Some(ProviderKind::OpenRouter),
+                protocol: None,
                 model: None,
                 api_key_env: None,
                 base_url: None,
@@ -1965,6 +1997,7 @@ stream_idle_timeout_ms = 9000
         let config = Config::from_raw(raw).unwrap();
 
         assert_eq!(config.provider.model, "~openai/gpt-latest");
+        assert_eq!(config.provider.protocol, ProviderProtocol::ChatCompletions);
         assert_eq!(config.provider.api_key_env, "OPENROUTER_API_KEY");
         assert_eq!(config.provider.base_url, "https://openrouter.ai/api/v1");
     }

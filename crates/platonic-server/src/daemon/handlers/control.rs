@@ -1,11 +1,11 @@
 use crate::{
     AppError, AppResult,
-    config::{Config, ProviderKind},
+    config::{Config, ProviderKind, ProviderProtocol},
     daemon::{
         protocol::{
             CAPABILITIES, DaemonStatusDaemon, DaemonStatusModel, DaemonStatusParams,
-            DaemonStatusProviderKind, DaemonStatusResult, DaemonStatusSession,
-            DaemonStatusTokenUsage, DaemonStatusTrust, DaemonStatusUsage,
+            DaemonStatusProviderKind, DaemonStatusProviderProtocol, DaemonStatusResult,
+            DaemonStatusSession, DaemonStatusTokenUsage, DaemonStatusTrust, DaemonStatusUsage,
             ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_NOT_FOUND, ERROR_WORKSPACE_MISMATCH,
             ERROR_WORKSPACE_UNREGISTERED, Envelope, HelloParams, HelloResult, ProtocolResponse,
             ShutdownIfIdleResult, ShutdownIfIdleResultName,
@@ -213,12 +213,17 @@ fn daemon_status(
         ProviderKind::OpenAi => DaemonStatusProviderKind::OpenAi,
         ProviderKind::OpenRouter => DaemonStatusProviderKind::OpenRouter,
     };
+    let provider_protocol = match config.provider.protocol {
+        ProviderProtocol::ChatCompletions => DaemonStatusProviderProtocol::ChatCompletions,
+        ProviderProtocol::Responses => DaemonStatusProviderProtocol::Responses,
+    };
 
     Ok(DaemonStatusResult {
         model: DaemonStatusModel {
             requested_alias: config.provider.model,
             served_model,
             provider_kind,
+            provider_protocol,
             key_present: std::env::var_os(&config.provider.api_key_env).is_some(),
         },
         daemon: DaemonStatusDaemon {
