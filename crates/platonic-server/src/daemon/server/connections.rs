@@ -624,6 +624,7 @@ mod tests {
             approval_preview: None,
             diff_preview: None,
             yolo_eligible: false,
+            credential_id: None,
         }
     }
 
@@ -3153,7 +3154,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
                 .as_ref()
                 .unwrap()
                 .outcome,
-            ExternalApprovalOutcome::Granted { actor } if actor == "jerome"
+            ExternalApprovalOutcome::Granted { actor, .. } if actor == "jerome"
         ));
 
         let duplicate = server.handle_line(

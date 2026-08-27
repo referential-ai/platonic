@@ -185,6 +185,15 @@ pub enum HarnessEvent {
         /// Durable denial reason for audit and continuation context.
         reason: String,
     },
+    /// Records that one approved call received a file-backed credential grant.
+    CredentialGranted {
+        /// Run containing the approved call.
+        run_id: RunId,
+        /// Exact call receiving the grant.
+        call_id: ToolCallId,
+        /// Operator-configured credential identity; never the credential value.
+        credential_id: String,
+    },
     /// Records that the host began executing the approved call.
     ToolStarted {
         /// Run containing the call.
@@ -207,6 +216,15 @@ pub enum HarnessEvent {
         call_id: ToolCallId,
         /// Durable host-reported failure reason.
         reason: String,
+    },
+    /// Records that a file-backed credential grant was removed after its call.
+    CredentialRevoked {
+        /// Run containing the approved call.
+        run_id: RunId,
+        /// Exact call whose grant was removed.
+        call_id: ToolCallId,
+        /// Operator-configured credential identity; never the credential value.
+        credential_id: String,
     },
     /// Terminates a concluded turn as a successful run.
     RunFinished {
@@ -237,9 +255,11 @@ impl HarnessEvent {
             | Self::PolicyEvaluated { run_id, .. }
             | Self::ApprovalGranted { run_id, .. }
             | Self::ApprovalDenied { run_id, .. }
+            | Self::CredentialGranted { run_id, .. }
             | Self::ToolStarted { run_id, .. }
             | Self::ToolFinished { run_id, .. }
             | Self::ToolFailed { run_id, .. }
+            | Self::CredentialRevoked { run_id, .. }
             | Self::RunFinished { run_id }
             | Self::RunFailed { run_id, .. } => run_id,
         }
@@ -259,9 +279,11 @@ impl HarnessEvent {
             Self::PolicyEvaluated { .. } => "policy_evaluated",
             Self::ApprovalGranted { .. } => "approval_granted",
             Self::ApprovalDenied { .. } => "approval_denied",
+            Self::CredentialGranted { .. } => "credential_granted",
             Self::ToolStarted { .. } => "tool_started",
             Self::ToolFinished { .. } => "tool_finished",
             Self::ToolFailed { .. } => "tool_failed",
+            Self::CredentialRevoked { .. } => "credential_revoked",
             Self::RunFinished { .. } => "run_finished",
             Self::RunFailed { .. } => "run_failed",
         }
@@ -452,6 +474,11 @@ mod tests {
                 actor_id: ActorId::new("actor_1").unwrap(),
                 reason: "not approved".into(),
             },
+            HarnessEvent::CredentialGranted {
+                run_id: run_id.clone(),
+                call_id: call_id.clone(),
+                credential_id: "github".into(),
+            },
             HarnessEvent::ToolStarted {
                 run_id: run_id.clone(),
                 call_id: call_id.clone(),
@@ -468,8 +495,13 @@ mod tests {
             },
             HarnessEvent::ToolFailed {
                 run_id: run_id.clone(),
-                call_id,
+                call_id: call_id.clone(),
                 reason: "file not found".into(),
+            },
+            HarnessEvent::CredentialRevoked {
+                run_id: run_id.clone(),
+                call_id,
+                credential_id: "github".into(),
             },
             HarnessEvent::RunFinished {
                 run_id: run_id.clone(),
@@ -637,6 +669,16 @@ mod tests {
                         "reason": "not approved"
                     }
                 }),
+                HarnessEvent::CredentialGranted { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "credential_granted",
+                        "run_id": "run_1",
+                        "call_id": "call_1",
+                        "credential_id": "github"
+                    }
+                }),
                 HarnessEvent::ToolStarted { .. } => json!({
                     "seq": 7,
                     "occurred_at_ms": 1_700_000_000_000_u64,
@@ -669,6 +711,16 @@ mod tests {
                         "run_id": "run_1",
                         "call_id": "call_1",
                         "reason": "file not found"
+                    }
+                }),
+                HarnessEvent::CredentialRevoked { .. } => json!({
+                    "seq": 7,
+                    "occurred_at_ms": 1_700_000_000_000_u64,
+                    "event": {
+                        "event": "credential_revoked",
+                        "run_id": "run_1",
+                        "call_id": "call_1",
+                        "credential_id": "github"
                     }
                 }),
                 HarnessEvent::RunFinished { .. } => json!({

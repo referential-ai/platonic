@@ -764,6 +764,7 @@ fn run_to_completion(
             parent_answer,
         },
         confinement,
+        Arc::clone(&runtime.credential_sources),
     )));
     let completion = match remove_one_shot_run_root(
         &runtime.paths.server_db_path,
@@ -1425,7 +1426,7 @@ pub(super) fn handle_approval_decide(
     }
     if let Some(existing) = &pending.decision {
         let existing_actor = match &existing.outcome {
-            ExternalApprovalOutcome::Granted { actor }
+            ExternalApprovalOutcome::Granted { actor, .. }
             | ExternalApprovalOutcome::Denied { actor, .. } => actor,
         };
         if existing.decision == params.decision && existing_actor == decision_actor {
@@ -1447,10 +1448,12 @@ pub(super) fn handle_approval_decide(
     let outcome = match params.decision {
         ApprovalDecision::Grant => ExternalApprovalOutcome::Granted {
             actor: decision_actor.into(),
+            explicit: true,
         },
         ApprovalDecision::GrantSession => {
             if pending.request.tool_name != SHELL_EXEC
                 || pending.request.effect != EffectClass::ExternalSideEffect
+                || pending.request.credential_id.is_some()
             {
                 return Envelope::error(
                     request.id,
@@ -1462,6 +1465,7 @@ pub(super) fn handle_approval_decide(
             runtime.install_shell_session_grant(&record.session_id);
             ExternalApprovalOutcome::Granted {
                 actor: "tui_session_grant".into(),
+                explicit: false,
             }
         }
         ApprovalDecision::Deny => ExternalApprovalOutcome::Denied {
@@ -1508,7 +1512,7 @@ fn record_approval_decision(
     outcome: &ExternalApprovalOutcome,
 ) -> AppResult<()> {
     let (granted, actor, reason) = match outcome {
-        ExternalApprovalOutcome::Granted { actor } => (true, actor.clone(), None),
+        ExternalApprovalOutcome::Granted { actor, .. } => (true, actor.clone(), None),
         ExternalApprovalOutcome::Denied { actor, reason } => {
             (false, actor.clone(), Some(reason.clone()))
         }
@@ -3010,6 +3014,26 @@ enabled = ["file.read"]
         }
 
         let runtime = test_runtime();
+        let record = test_run_record("credential");
+        let mut credential_request = test_approval_request(
+            &record.run_id,
+            "call_1",
+            SHELL_EXEC,
+            EffectClass::ExternalSideEffect,
+        );
+        credential_request.credential_id = Some("github".into());
+        record.approvals.lock().unwrap().insert(
+            "call_1".into(),
+            PendingApproval::new(record.session_id.clone(), credential_request),
+        );
+        runtime.reserve_run(record.clone()).unwrap();
+
+        let response = decide_session_grant(&runtime, "credential", &record.run_id, "call_1");
+        assert_eq!(response.kind, crate::daemon::protocol::EnvelopeKind::Error);
+        assert_eq!(runtime.session_tool_grant_count(), 0);
+        assert_eq!(record.approvals.lock().unwrap()["call_1"].decision, None);
+
+        let runtime = test_runtime();
         let record = test_run_record("exact");
         record.approvals.lock().unwrap().insert(
             "call_1".into(),
@@ -3077,7 +3101,8 @@ enabled = ["file.read"]
             Some(PendingApprovalDecision {
                 decision: ApprovalDecision::GrantSession,
                 outcome: ExternalApprovalOutcome::Granted {
-                    actor: "tui_session_grant".into()
+                    actor: "tui_session_grant".into(),
+                    explicit: false,
                 },
             })
         );
@@ -3204,7 +3229,8 @@ enabled = ["file.read"]
         assert_eq!(
             waiter.join().unwrap(),
             ExternalApprovalOutcome::Granted {
-                actor: "tui_session_grant".into()
+                actor: "tui_session_grant".into(),
+                explicit: false,
             }
         );
         assert_eq!(runtime.session_tool_grant_count(), 1);
@@ -3273,7 +3299,8 @@ enabled = ["file.read"]
         assert_eq!(
             waiter.join().unwrap(),
             ExternalApprovalOutcome::Granted {
-                actor: "tui_session_grant".into()
+                actor: "tui_session_grant".into(),
+                explicit: false,
             }
         );
         assert_eq!(runtime.session_tool_grant_count(), 1);
@@ -3549,6 +3576,7 @@ enabled = ["file.read"]
             approval_preview: None,
             diff_preview: None,
             yolo_eligible: false,
+            credential_id: None,
         }
     }
 

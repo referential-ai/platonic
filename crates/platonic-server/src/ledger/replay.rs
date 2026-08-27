@@ -527,9 +527,11 @@ fn harness_event_turn_id(event: &HarnessEvent) -> Option<&platonic_core::TurnId>
         | HarnessEvent::PolicyEvaluated { .. }
         | HarnessEvent::ApprovalGranted { .. }
         | HarnessEvent::ApprovalDenied { .. }
+        | HarnessEvent::CredentialGranted { .. }
         | HarnessEvent::ToolStarted { .. }
         | HarnessEvent::ToolFinished { .. }
         | HarnessEvent::ToolFailed { .. }
+        | HarnessEvent::CredentialRevoked { .. }
         | HarnessEvent::RunFinished { .. }
         | HarnessEvent::RunFailed { .. } => None,
     }

@@ -76,7 +76,7 @@ pub struct ApprovalHandler {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExternalApprovalOutcome {
-    Granted { actor: String },
+    Granted { actor: String, explicit: bool },
     Denied { actor: String, reason: String },
 }
 
@@ -117,4 +117,6 @@ pub struct ApprovalRequest {
     pub approval_preview: Option<String>,
     pub diff_preview: Option<String>,
     pub yolo_eligible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
 }

@@ -118,6 +118,24 @@ generated OpenAPI 3.1 contract is
 was merged but never released, so v2 replaces it rather than serving a legacy
 adapter or deprecation window.
 
+### One-call shell credentials
+
+On Linux, the canonical user configuration can bind a credential identity to
+one absolute host file or directory. Restart the server after changing it:
+
+```toml
+[credentials.github]
+source = "/home/alice/.config/gh"
+```
+
+A confined `shell.exec` call may request `"credential": "github"` and read it
+at `$TMPDIR/credentials/github`. The server copies it into private scratch only
+after an explicit allow-once decision, removes it before the run's terminal
+record on success, failure, cancellation, or child exit, and records only the
+identity and grant/revocation facts. Yolo and session grants never authorize a
+credential-bearing call. Workspace `plato.toml` files cannot define
+`[credentials]`.
+
 ### Linux desktop observation
 
 Platonic can expose screenshot-free, read-only X11/XWayland observation through

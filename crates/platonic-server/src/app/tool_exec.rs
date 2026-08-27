@@ -58,6 +58,7 @@ impl ApprovalMode {
         Self::external_with_actor(actor, move |request| match decide(request)? {
             ApprovalOutcome::Granted => Ok(ExternalApprovalOutcome::Granted {
                 actor: actor.into(),
+                explicit: true,
             }),
             ApprovalOutcome::Denied { reason } => Ok(ExternalApprovalOutcome::Denied {
                 actor: actor.into(),
@@ -532,6 +533,7 @@ pub(super) fn yolo_eligible(
     policy: &PolicyDecision,
 ) -> bool {
     matches!(policy, PolicyDecision::RequireApproval { .. })
+        && call.input.get("credential").is_none()
         && (call.tool.as_str() == SHELL_EXEC && call.effect == EffectClass::ExternalSideEffect
             || call.effect == EffectClass::WorkspaceWrite
                 && !targets_platonic_memory(workspace_root, call.tool.as_str(), &call.input))

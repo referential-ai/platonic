@@ -241,6 +241,8 @@ pub struct RunState {
     next_model_step: u32,
     used_turn_ids: BTreeSet<TurnId>,
     used_tool_call_ids: BTreeSet<ToolCallId>,
+    explicitly_approved_call: Option<ToolCallId>,
+    active_credential_grant: Option<(ToolCallId, String)>,
     pending_compaction_turn_id: Option<TurnId>,
     phase: RunPhase,
 }
@@ -260,6 +262,8 @@ impl RunState {
             next_model_step: 0,
             used_turn_ids: BTreeSet::new(),
             used_tool_call_ids: BTreeSet::new(),
+            explicitly_approved_call: None,
+            active_credential_grant: None,
             pending_compaction_turn_id: None,
             phase: RunPhase::NotStarted,
         }
@@ -368,7 +372,7 @@ impl RunState {
                 HarnessEvent::ContextBuilt {
                     turn_id, context, ..
                 },
-            ) => {
+            ) if self.active_credential_grant.is_none() => {
                 self.start_turn(turn_id, context)?;
                 self.pending_compaction_turn_id = None;
                 Ok(())
@@ -385,7 +389,7 @@ impl RunState {
                     dropped_turn_end_exclusive,
                     ..
                 },
-            ) => {
+            ) if self.active_credential_grant.is_none() => {
                 ensure_compaction_range(*dropped_turn_start, *dropped_turn_end_exclusive)?;
                 ensure_new_turn(&self.used_turn_ids, turn_id)?;
                 self.pending_compaction_turn_id = Some(turn_id.clone());
@@ -514,7 +518,27 @@ impl RunState {
                 HarnessEvent::ApprovalGranted { call_id, .. },
             ) => {
                 ensure_call(&call.id, call_id)?;
+                self.explicitly_approved_call = Some(call_id.clone());
                 self.phase = RunPhase::ReadyToExecuteTool { call: call.clone() };
+                Ok(())
+            }
+            (
+                RunPhase::ReadyToExecuteTool { call },
+                HarnessEvent::CredentialGranted {
+                    call_id,
+                    credential_id,
+                    ..
+                },
+            ) => {
+                ensure_call(&call.id, call_id)?;
+                if self.explicitly_approved_call.as_ref() != Some(call_id)
+                    || self.active_credential_grant.is_some()
+                    || credential_id.trim().is_empty()
+                {
+                    return Err(invalid(&self.phase, event));
+                }
+                self.explicitly_approved_call = None;
+                self.active_credential_grant = Some((call_id.clone(), credential_id.clone()));
                 Ok(())
             }
             (
@@ -532,6 +556,7 @@ impl RunState {
             }
             (RunPhase::ReadyToExecuteTool { call }, HarnessEvent::ToolStarted { call_id, .. }) => {
                 ensure_call(&call.id, call_id)?;
+                self.explicitly_approved_call = None;
                 self.phase = RunPhase::ToolRunning {
                     call_id: call.id.clone(),
                 };
@@ -557,11 +582,39 @@ impl RunState {
                 };
                 Ok(())
             }
-            (RunPhase::TurnConcluded, HarnessEvent::RunFinished { .. }) => {
+            (
+                phase,
+                HarnessEvent::CredentialRevoked {
+                    call_id,
+                    credential_id,
+                    ..
+                },
+            ) if !matches!(
+                phase,
+                RunPhase::NotStarted | RunPhase::Finished | RunPhase::Failed { .. }
+            ) =>
+            {
+                let Some((active_call_id, active_credential_id)) =
+                    self.active_credential_grant.as_ref()
+                else {
+                    return Err(invalid(&self.phase, event));
+                };
+                ensure_call(active_call_id, call_id)?;
+                if active_credential_id != credential_id {
+                    return Err(invalid(&self.phase, event));
+                }
+                self.active_credential_grant = None;
+                Ok(())
+            }
+            (RunPhase::TurnConcluded, HarnessEvent::RunFinished { .. })
+                if self.active_credential_grant.is_none() =>
+            {
                 self.phase = RunPhase::Finished;
                 Ok(())
             }
-            (phase, HarnessEvent::RunFailed { reason, .. }) if phase.can_fail() => {
+            (phase, HarnessEvent::RunFailed { reason, .. })
+                if phase.can_fail() && self.active_credential_grant.is_none() =>
+            {
                 self.pending_compaction_turn_id = None;
                 self.phase = RunPhase::Failed {
                     reason: reason.clone(),

@@ -6,8 +6,9 @@ use serde_json::{Value, json};
 use std::{
     env,
     ffi::OsString,
+    fs,
     io::{self, Read},
-    path::Path,
+    path::{Path, PathBuf},
     process::{ChildStderr, ChildStdout, Command, Stdio},
     sync::atomic::Ordering,
     thread,
@@ -20,6 +21,7 @@ const SHELL_OUTPUT_BYTES: usize = 32 * 1024;
 const SHELL_OUTPUT_TRUNCATED_MARKER: &str = "\n... output truncated";
 const SHELL_DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const SHELL_MAX_TIMEOUT_SECONDS: u64 = 600;
+pub(crate) const CREDENTIAL_GRANTS_DIR: &str = "credentials";
 const SHELL_ENV_ALLOWLIST: &[&str] = &[
     "PATH",
     "HOME",
@@ -53,7 +55,25 @@ type ShellChild = Child;
 pub(super) struct ShellExecInput {
     pub(super) command: String,
     pub(super) timeout_seconds: Option<u64>,
+    pub(super) credential: Option<String>,
 }
+
+pub(crate) fn shell_credential_id(input: &Value) -> AppResult<Option<String>> {
+    let input: ShellExecInput = serde_json::from_value(input.clone())?;
+    if input
+        .credential
+        .as_deref()
+        .is_some_and(|credential_id| !crate::config::valid_credential_id(credential_id))
+    {
+        return Err(AppError::Tool("shell.exec credential id is invalid".into()));
+    }
+    Ok(input.credential)
+}
+
+pub(crate) fn credential_grant_path(scratch: &Path, credential_id: &str) -> PathBuf {
+    scratch.join(CREDENTIAL_GRANTS_DIR).join(credential_id)
+}
+
 pub(super) fn shell_exec(
     context: ToolExecutionContext<'_>,
     call_id: platonic_core::ToolCallId,
@@ -63,6 +83,7 @@ pub(super) fn shell_exec(
     if input.command.trim().is_empty() {
         return Err(AppError::Tool("shell.exec command is empty".into()));
     }
+    validate_credential_grant(input.credential.as_deref())?;
     let timeout_seconds = normalize_timeout_seconds(input.timeout_seconds);
     let cwd = context.workspace_root.canonicalize()?;
     let env = shell_child_env(context.provider_api_key_env);
@@ -129,6 +150,37 @@ pub(super) fn shell_exec(
         artifacts: vec![],
         visibility: ResultVisibility::Both,
     })
+}
+
+fn validate_credential_grant(credential_id: Option<&str>) -> AppResult<()> {
+    let Some(credential_id) = credential_id else {
+        return Ok(());
+    };
+    if !crate::config::valid_credential_id(credential_id) {
+        return Err(AppError::Tool("shell.exec credential id is invalid".into()));
+    }
+    if env::var_os("PLATONIC_CHILD_CONFINEMENT").as_deref()
+        != Some(std::ffi::OsStr::new("landlock"))
+    {
+        return Err(AppError::Tool(format!(
+            "shell.exec credential {credential_id} requires confined server scratch"
+        )));
+    }
+    let scratch = env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::Tool("confined shell.exec omitted TMPDIR".into()))?;
+    let metadata =
+        fs::symlink_metadata(credential_grant_path(&scratch, credential_id)).map_err(|_| {
+            AppError::Tool(format!(
+                "shell.exec credential {credential_id} is unavailable"
+            ))
+        })?;
+    if !metadata.file_type().is_file() && !metadata.file_type().is_dir() {
+        return Err(AppError::Tool(format!(
+            "shell.exec credential {credential_id} is unavailable"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

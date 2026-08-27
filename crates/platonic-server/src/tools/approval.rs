@@ -84,13 +84,23 @@ pub fn approval_command_preview(
         Ok(input) => input,
         Err(_) => return Ok(None),
     };
+    if input
+        .credential
+        .as_deref()
+        .is_some_and(|credential_id| !crate::config::valid_credential_id(credential_id))
+    {
+        return Err(AppError::Tool("shell.exec credential id is invalid".into()));
+    }
     let timeout_seconds = normalize_timeout_seconds(input.timeout_seconds);
     let cwd = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
     let provider = provider_api_key_env.unwrap_or("configured provider key");
+    let credential = input.credential.as_deref().map_or_else(String::new, |id| {
+        format!("\ncredential: {id}\ncredential path: $TMPDIR/credentials/{id}\ncredential lifetime: this approved call only")
+    });
     Ok(Some(format!(
-        "command: {}\ncwd: {}\ntimeout: {}s\neffect: ExternalSideEffect\nenv: scrubbed allowlist; credential-like names and {provider} removed",
+        "command: {}\ncwd: {}\ntimeout: {}s{credential}\neffect: ExternalSideEffect\nenv: scrubbed allowlist; credential-like names and {provider} removed",
         input.command,
         cwd.display(),
         timeout_seconds

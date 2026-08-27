@@ -17,10 +17,11 @@ use crate::{
     ledger::{RUN_CANCELED_REASON, RunEventRecorder},
     model::{ModelMessage, ModelRequest, ModelStop},
     provider::openai_compat::OpenAiCompatibleClient,
-    tool_catalog::{COMPUTER_OBSERVE, COMPUTER_WINDOWS, tool_specs},
+    tool_catalog::{COMPUTER_OBSERVE, COMPUTER_WINDOWS, SHELL_EXEC, tool_specs},
     tools::{
         ApprovalOutcome, RunToolHandlers, approval_command_preview, approval_diff_preview,
         approval_input_preview, ask_for_approval, computer::ComputerToolHandler,
+        shell_credential_id,
     },
 };
 use platonic_core::{
@@ -496,6 +497,11 @@ pub(crate) fn run_prepared_question(
                         computer.as_ref(),
                     ) {
                         Ok(approval_preview) => {
+                            let credential_id = if call.tool.as_str() == SHELL_EXEC {
+                                shell_credential_id(&call.input)?
+                            } else {
+                                None
+                            };
                             let request = ApprovalRequest {
                                 run_id: run_id.clone(),
                                 call_id: call_id.clone(),
@@ -509,14 +515,22 @@ pub(crate) fn run_prepared_question(
                                     call.tool.as_str(),
                                     &call.input,
                                 ),
-                                yolo_eligible: yolo_eligible(
-                                    &options.workspace_root,
-                                    &call,
-                                    &policy,
-                                ),
+                                yolo_eligible: credential_id.is_none()
+                                    && yolo_eligible(&options.workspace_root, &call, &policy),
+                                credential_id: credential_id.clone(),
                             };
                             match (handler.decide)(request)? {
-                                ExternalApprovalOutcome::Granted { actor } => {
+                                ExternalApprovalOutcome::Granted { actor, explicit } => {
+                                    if credential_id.is_some() && !explicit {
+                                        return fail_run_with_computer(
+                                            recorder,
+                                            &options,
+                                            &run_id,
+                                            "credential grant requires one explicit allow-once decision",
+                                            false,
+                                            &mut computer,
+                                        );
+                                    }
                                     grant_computer_approval(&mut computer, &call)?;
                                     record_event(
                                         recorder,
@@ -527,7 +541,18 @@ pub(crate) fn run_prepared_question(
                                             actor_id: ActorId::new(actor.clone())?,
                                         },
                                     )?;
-                                    execute_and_record_tool(
+                                    if let Some(credential_id) = credential_id.as_ref() {
+                                        record_event(
+                                            recorder,
+                                            &options,
+                                            HarnessEvent::CredentialGranted {
+                                                run_id: run_id.clone(),
+                                                call_id: call_id.clone(),
+                                                credential_id: credential_id.clone(),
+                                            },
+                                        )?;
+                                    }
+                                    let tool_message = execute_and_record_tool(
                                         recorder,
                                         &options,
                                         &config,
@@ -541,7 +566,19 @@ pub(crate) fn run_prepared_question(
                                             parent_answer: parent_answer.as_ref(),
                                             computer: computer.as_mut(),
                                         },
-                                    )?
+                                    );
+                                    if let Some(credential_id) = credential_id {
+                                        record_event(
+                                            recorder,
+                                            &options,
+                                            HarnessEvent::CredentialRevoked {
+                                                run_id: run_id.clone(),
+                                                call_id: call_id.clone(),
+                                                credential_id,
+                                            },
+                                        )?;
+                                    }
+                                    tool_message?
                                 }
                                 ExternalApprovalOutcome::Denied { actor, reason } => {
                                     deny_computer_approval(&mut computer, &call);
@@ -1892,6 +1929,7 @@ base_url = "http://{}"
                 assert!(request.yolo_eligible);
                 Ok(ExternalApprovalOutcome::Granted {
                     actor: "tui_yolo".into(),
+                    explicit: false,
                 })
             }),
             "run_tui_yolo_ledger",
@@ -1930,6 +1968,92 @@ base_url = "http://{}"
                 .collect::<Vec<_>>(),
             [("call_1", "tui_yolo")]
         );
+    }
+
+    #[test]
+    fn credential_shell_rejects_non_explicit_external_grant_before_execution() {
+        let arguments = json!({
+            "command": "printf leaked > credential-ran",
+            "credential": "github"
+        })
+        .to_string();
+        let provider = spawn_provider_sequence(vec![json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "provider_shell",
+                        "type": "function",
+                        "function": {
+                            "name": "shell_exec",
+                            "arguments": arguments
+                        }
+                    }]
+                }
+            }]
+        })]);
+        let workspace = tempfile::tempdir().unwrap();
+        let config_path = workspace.path().join("plato.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "{}"
+timeout_ms = 5000
+
+[limits]
+token_budget = 100000
+max_output_tokens = 32
+max_turns = 1
+
+[tools]
+enabled = ["shell.exec"]
+"#,
+                provider.base_url
+            ),
+        )
+        .unwrap();
+        let ledger_path = workspace.path().join("events.jsonl");
+
+        let error = run_question(mutation_test_options(
+            workspace.path(),
+            &config_path,
+            &ledger_path,
+            ApprovalMode::external_with_actor("daemon", |request| {
+                assert_eq!(request.credential_id.as_deref(), Some("github"));
+                assert!(!request.yolo_eligible);
+                Ok(ExternalApprovalOutcome::Granted {
+                    actor: "session_grant".into(),
+                    explicit: false,
+                })
+            }),
+            "run_non_explicit_credential_grant",
+        ))
+        .unwrap_err();
+        provider.handle.join().unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            "run did not finish: credential grant requires one explicit allow-once decision"
+        );
+        assert!(!workspace.path().join("credential-ran").exists());
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        assert!(records.iter().any(|record| matches!(
+            &record.event,
+            HarnessEvent::RunFailed { reason, .. }
+                if reason == "credential grant requires one explicit allow-once decision"
+        )));
+        assert!(!records.iter().any(|record| matches!(
+            record.event,
+            HarnessEvent::ApprovalGranted { .. }
+                | HarnessEvent::CredentialGranted { .. }
+                | HarnessEvent::ToolStarted { .. }
+        )));
     }
 
     #[test]
@@ -2006,6 +2130,7 @@ enabled = ["shell.exec"]
                     } else {
                         "session_grant".into()
                     },
+                    explicit: false,
                 })
             }),
             run_id: Some(RunId::new("run_session_grant_actors").unwrap()),
