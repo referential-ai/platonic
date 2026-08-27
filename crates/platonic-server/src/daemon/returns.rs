@@ -837,6 +837,7 @@ mod tests {
             Some(identity.clone()),
             Some(&authority.toolset),
             Some(&revision),
+            false,
         )
         .unwrap();
         (prepared, recorder, identity)

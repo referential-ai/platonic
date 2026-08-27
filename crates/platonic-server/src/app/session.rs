@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn session_hydration_includes_prior_turns_and_current_question() {
         let config = Config::default();
-        let tools = tool_specs(&config.tools.enabled);
+        let tools = tool_specs(&config.tools.enabled, false);
         let turns = vec![SessionTurn {
             question: "first question".into(),
             final_answer: "first answer".into(),
@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn session_hydration_drops_oldest_turns_with_marker() {
         let mut config = Config::default();
-        let tools = tool_specs(&config.tools.enabled);
+        let tools = tool_specs(&config.tools.enabled, false);
         let turns = vec![
             SessionTurn {
                 question: "old question ".repeat(400),

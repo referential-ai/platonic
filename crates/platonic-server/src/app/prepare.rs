@@ -35,6 +35,7 @@ pub(crate) struct PreparedRun {
     pub(super) messages: Vec<ModelMessage>,
     pub(super) platonic_memory: Option<String>,
     pub(super) profile_context: Option<PreparedProfileContext>,
+    pub(super) has_credential_sources: bool,
     pub(super) system_context: String,
     pub(super) first_system_context: String,
 }
@@ -116,6 +117,7 @@ enabled = ["file.read", "file.write"]
             Some(identity.clone()),
             Some(&resolved_toolset),
             None,
+            false,
         )
         .unwrap();
 
@@ -123,7 +125,7 @@ enabled = ["file.read", "file.write"]
         assert!(prepared.has_tool(THREAD_SPAWN));
         assert_eq!(prepared.config.tools.enabled, resolved_toolset);
         assert_eq!(
-            tool_specs(&prepared.config.tools.enabled)
+            tool_specs(&prepared.config.tools.enabled, false)
                 .iter()
                 .map(|spec| spec.name.as_str())
                 .collect::<Vec<_>>(),
@@ -390,7 +392,7 @@ fn begin_default_jsonl_session_recorder(
     }
 }
 pub(crate) fn prepare_run(options: &RunOptions) -> AppResult<(PreparedRun, EventRecorder)> {
-    prepare_run_for_thread(options, None, None, None)
+    prepare_run_for_thread(options, None, None, None, false)
 }
 
 pub(crate) fn prepare_run_for_thread(
@@ -398,6 +400,7 @@ pub(crate) fn prepare_run_for_thread(
     identity: Option<RunIdentity>,
     toolset: Option<&[String]>,
     profile_revision: Option<&ProfileRevisionRecord>,
+    has_credential_sources: bool,
 ) -> AppResult<(PreparedRun, EventRecorder)> {
     if options.question.trim().is_empty() {
         return Err(AppError::EmptyQuestion);
@@ -459,7 +462,7 @@ pub(crate) fn prepare_run_for_thread(
         config.provider.app_title.clone(),
         token_limit_field(&config.provider.kind),
     )?;
-    let tools = tool_specs(&config.tools.enabled);
+    let tools = tool_specs(&config.tools.enabled, has_credential_sources);
     let (recorder, mut session_hydration) = match (&options.ledger, &options.session) {
         (RunLedger::Sqlite(path), Some(session)) => {
             let (recorder, hydration) = begin_session_recorder(
@@ -518,6 +521,7 @@ pub(crate) fn prepare_run_for_thread(
             messages,
             platonic_memory,
             profile_context,
+            has_credential_sources,
             system_context,
             first_system_context,
         },

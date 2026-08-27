@@ -1431,7 +1431,11 @@ mod tests {
     use std::fs;
 
     #[cfg(unix)]
-    use crate::{RunLedger, RunOptions, RunSession, app::prepare_run, ledger::SqliteLedger};
+    use crate::{
+        RunLedger, RunOptions, RunSession,
+        app::{prepare_run, prepare_run_for_thread},
+        ledger::SqliteLedger,
+    };
     #[cfg(target_os = "linux")]
     use platonic_core::{EffectClass, ToolCallId};
     #[cfg(unix)]
@@ -1934,6 +1938,64 @@ mod tests {
         assert_eq!(limits.kill_wait, Duration::from_secs(2));
         assert_eq!(limits.output_drain, Duration::from_secs(2));
         std::hint::black_box(run_supervised);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervised_start_transports_only_credential_source_availability() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("plato.toml");
+        fs::write(
+            &config_path,
+            r#"[provider]
+api_key_env = "PATH"
+
+[tools]
+enabled = ["shell.exec"]
+"#,
+        )
+        .unwrap();
+
+        for has_credential_sources in [false, true] {
+            let (prepared, _) = prepare_run_for_thread(
+                &RunOptions {
+                    question: "transport capability fact".into(),
+                    config_path: Some(config_path.clone()),
+                    overrides: Default::default(),
+                    ledger: RunLedger::Jsonl(
+                        root.path().join(format!("{has_credential_sources}.jsonl")),
+                    ),
+                    workspace_root: root.path().to_path_buf(),
+                    approval_mode: ApprovalMode::Deny { actor: "test" },
+                    run_id: Some(
+                        RunId::new(format!("run_transport_{has_credential_sources}")).unwrap(),
+                    ),
+                    session: None,
+                    event_sender: None,
+                    stream_to_stderr: false,
+                    cancel: None,
+                    voice_interruption_context: None,
+                },
+                None,
+                None,
+                None,
+                has_credential_sources,
+            )
+            .unwrap();
+            let encoded = serde_json::to_string(&ParentMessage::Start {
+                prepared: Box::new(prepared),
+            })
+            .unwrap();
+            let decoded: ParentMessage = serde_json::from_str(&encoded).unwrap();
+            let transported = serde_json::to_value(decoded).unwrap();
+
+            assert_eq!(
+                transported["prepared"]["has_credential_sources"],
+                has_credential_sources
+            );
+            assert!(!encoded.contains("github"));
+            assert!(!encoded.contains("credential-value"));
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2535,22 +2597,28 @@ done
             .map(|name| (*name, std::env::var_os(name).unwrap()))
             .collect::<Vec<_>>();
 
-        let (prepared, recorder) = prepare_run(&RunOptions {
-            question: "exercise the local provider and scrubbed shell".into(),
-            config_path: Some("plato.toml".into()),
-            overrides: Default::default(),
-            ledger: RunLedger::Sqlite(ledger_path.clone()),
-            workspace_root: workspace.clone(),
-            approval_mode: ApprovalMode::Deny { actor: "test" },
-            run_id: Some(run_id.clone()),
-            session: Some(RunSession::Fresh {
-                session_id: "session_minimal_child_environment".into(),
-            }),
-            event_sender: None,
-            stream_to_stderr: false,
-            cancel: None,
-            voice_interruption_context: None,
-        })
+        let (prepared, recorder) = prepare_run_for_thread(
+            &RunOptions {
+                question: "exercise the local provider and scrubbed shell".into(),
+                config_path: Some("plato.toml".into()),
+                overrides: Default::default(),
+                ledger: RunLedger::Sqlite(ledger_path.clone()),
+                workspace_root: workspace.clone(),
+                approval_mode: ApprovalMode::Deny { actor: "test" },
+                run_id: Some(run_id.clone()),
+                session: Some(RunSession::Fresh {
+                    session_id: "session_minimal_child_environment".into(),
+                }),
+                event_sender: None,
+                stream_to_stderr: false,
+                cancel: None,
+                voice_interruption_context: None,
+            },
+            None,
+            None,
+            None,
+            true,
+        )
         .unwrap();
         let start_message = serde_json::to_string(&ParentMessage::Start {
             prepared: Box::new(prepared.clone()),
@@ -2559,6 +2627,7 @@ done
         assert!(!start_message.contains(RUN_CHILD_PROVIDER_SENTINEL));
         assert!(!start_message.contains("credential-value-sentinel"));
         assert!(!start_message.contains(credential_source.to_string_lossy().as_ref()));
+        assert!(start_message.contains(r#""has_credential_sources":true"#));
 
         let (event_sender, event_receiver) = mpsc::channel();
         let (ready_sender, ready_receiver) = mpsc::channel();
@@ -2673,6 +2742,7 @@ done
         assert_eq!(provider_proof.request_count, 2);
         assert!(provider_proof.authorization_was_exact);
         assert!(provider_proof.shell_reported_scrubbed);
+        assert!(provider_proof.credential_was_advertised);
     }
 
     #[cfg(target_os = "linux")]
@@ -2686,6 +2756,7 @@ done
         request_count: usize,
         authorization_was_exact: bool,
         shell_reported_scrubbed: bool,
+        credential_was_advertised: bool,
     }
 
     #[cfg(target_os = "linux")]
@@ -2744,6 +2815,7 @@ done
             ];
             let mut authorization_was_exact = true;
             let mut shell_reported_scrubbed = false;
+            let mut credential_was_advertised = false;
             for (index, response) in responses.into_iter().enumerate() {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_run_child_provider_request(&mut stream);
@@ -2754,6 +2826,7 @@ done
                     })
                 });
                 if index == 0 {
+                    credential_was_advertised = request.contains(r#""credential":{"#);
                     release_receiver
                         .recv_timeout(Duration::from_secs(5))
                         .unwrap();
@@ -2772,6 +2845,7 @@ done
                 request_count: 2,
                 authorization_was_exact,
                 shell_reported_scrubbed,
+                credential_was_advertised,
             }
         });
         (

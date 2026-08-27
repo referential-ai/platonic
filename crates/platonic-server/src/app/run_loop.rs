@@ -69,6 +69,7 @@ pub(crate) fn run_prepared_question(
         mut messages,
         platonic_memory,
         profile_context,
+        has_credential_sources,
         system_context,
         first_system_context,
     } = prepared;
@@ -103,7 +104,7 @@ pub(crate) fn run_prepared_question(
         config.provider.app_title.clone(),
         token_limit_field(&config.provider.kind),
     )?;
-    let tools = tool_specs(&config.tools.enabled);
+    let tools = tool_specs(&config.tools.enabled, has_credential_sources);
     let model = ModelName::new(config.provider.model.clone())?;
     let stdin_actor_id = ActorId::new("stdin")?;
 
@@ -1591,7 +1592,7 @@ base_url = "http://{}"
             },
         ];
         seed_finished_session(&ledger_path, session_id, &turns);
-        let tools = tool_specs(&["file.read".into()]);
+        let tools = tool_specs(&["file.read".into()], false);
         let expected_before = estimated_context_tokens(
             system_prompt(),
             &session_messages_from(&turns, question, false),
@@ -1706,7 +1707,7 @@ base_url = "http://{}"
             final_answer: "first answer".into(),
         }];
         seed_finished_session(&ledger_path, session_id, &turns);
-        let tools = tool_specs(&["file.read".into()]);
+        let tools = tool_specs(&["file.read".into()], false);
         let token_budget = estimated_context_tokens(
             system_prompt(),
             &session_messages_from(&turns, question, false),
@@ -4289,7 +4290,7 @@ enabled = ["file.read"]
             session_id: "session_1".into(),
         };
         let config = Config::default();
-        let tools = tool_specs(&config.tools.enabled);
+        let tools = tool_specs(&config.tools.enabled, false);
         let (mut recorder, _) = begin_session_recorder(
             SqliteLedger::open_or_create(&ledger_path).unwrap(),
             &session,
