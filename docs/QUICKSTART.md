@@ -51,6 +51,9 @@ document the released behavior. They use one OpenRouter route and exact
 what-you-see checkpoints. The tagged quickstart above owns bundle installation;
 the journey owns first-use verification.
 
+On `develop`, trusted provider configuration can select Chat Completions or
+Responses as documented in the [configuration reference](../docs-site/src/content/docs/reference/configuration.md#provider-shapes).
+
 ## Develop: local inference comparison
 
 The develop command bundle can run one host-scoped, loopback-only reverse proxy

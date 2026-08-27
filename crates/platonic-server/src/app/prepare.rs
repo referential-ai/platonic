@@ -9,11 +9,11 @@ use super::{
 };
 use crate::{
     AppError, AppResult,
-    config::{ComputerConfig, Config, LimitsConfig, ProviderConfig, ProviderKind, ToolsConfig},
+    config::{ComputerConfig, Config, LimitsConfig, ProviderConfig, ToolsConfig},
     ledger::{EventRecorder, SqliteLedger, run_jsonl_path},
     model::{ModelBlock, ModelMessage, RunOverrides},
     paths::DefaultSqlitePath,
-    provider::openai_compat::{OpenAiCompatibleClient, TokenLimitField},
+    provider::openai_compat::OpenAiCompatibleClient,
     server_store::ProfileRevisionRecord,
     tool_catalog::{ToolSpec, tool_specs},
 };
@@ -453,15 +453,7 @@ pub(crate) fn prepare_run_for_thread(
         Some(run_id) => run_id,
         None => new_run_id()?,
     };
-    let _provider_preflight = OpenAiCompatibleClient::from_config(
-        &config.provider.api_key_env,
-        config.provider.base_url.clone(),
-        config.provider.connect_timeout_ms,
-        config.provider.stream_idle_timeout_ms,
-        config.provider.http_referer.clone(),
-        config.provider.app_title.clone(),
-        token_limit_field(&config.provider.kind),
-    )?;
+    let _provider_preflight = OpenAiCompatibleClient::from_config(&config.provider)?;
     let tools = tool_specs(&config.tools.enabled, has_credential_sources);
     let (recorder, mut session_hydration) = match (&options.ledger, &options.session) {
         (RunLedger::Sqlite(path), Some(session)) => {
@@ -603,10 +595,4 @@ fn truncate_profile_context(content: &str) -> (String, bool) {
         super::context::estimate_tokens(&truncated) <= PROFILE_CONTEXT_CONTENT_TOKEN_BUDGET
     );
     (truncated, true)
-}
-pub(super) fn token_limit_field(kind: &ProviderKind) -> TokenLimitField {
-    match kind {
-        ProviderKind::OpenAi => TokenLimitField::MaxCompletionTokens,
-        ProviderKind::OpenRouter => TokenLimitField::MaxTokens,
-    }
 }

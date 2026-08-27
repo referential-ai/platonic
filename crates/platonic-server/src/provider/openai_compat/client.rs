@@ -3,11 +3,13 @@ use super::{
         parse_non_stream_response, read_non_stream_response_with_cancel,
         read_streaming_response_with_cancel,
     },
+    responses::{ResponsesRequest, parse_responses_response, parse_responses_stream},
     stream::parse_chat_completion_stream,
     types::{ChatFunctionCall, ChatToolCall, ChatToolType},
 };
 use crate::{
     AppError, AppResult,
+    config::{ProviderConfig, ProviderKind, ProviderProtocol},
     model::{ModelBlock, ModelMessage, ModelRequest, ModelResponse, ModelRole, ReasoningEffort},
     tool_catalog::{ToolSpec, provider_name_for_internal},
 };
@@ -23,43 +25,40 @@ pub struct OpenAiCompatibleClient {
     http_referer: Option<String>,
     app_title: Option<String>,
     token_limit_field: TokenLimitField,
+    protocol: ProviderProtocol,
 }
 
 impl OpenAiCompatibleClient {
-    pub fn from_config(
-        api_key_env: &str,
-        base_url: String,
-        connect_timeout_ms: u64,
-        stream_idle_timeout_ms: u64,
-        http_referer: Option<String>,
-        app_title: Option<String>,
-        token_limit_field: TokenLimitField,
-    ) -> AppResult<Self> {
-        let api_key =
-            std::env::var(api_key_env).map_err(|_| AppError::MissingApiKey(api_key_env.into()))?;
-        if base_url.trim().is_empty() {
+    pub fn from_config(config: &ProviderConfig) -> AppResult<Self> {
+        let api_key = std::env::var(&config.api_key_env)
+            .map_err(|_| AppError::MissingApiKey(config.api_key_env.clone()))?;
+        if config.base_url.trim().is_empty() {
             return Err(AppError::Config(
                 "provider.base_url must not be empty".into(),
             ));
         }
-        if connect_timeout_ms == 0 {
+        if config.connect_timeout_ms == 0 {
             return Err(AppError::Config(
                 "provider.connect_timeout_ms must be positive".into(),
             ));
         }
-        if stream_idle_timeout_ms == 0 {
+        if config.stream_idle_timeout_ms == 0 {
             return Err(AppError::Config(
                 "provider.stream_idle_timeout_ms must be positive".into(),
             ));
         }
         Ok(Self {
             api_key,
-            base_url,
-            connect_timeout: Duration::from_millis(connect_timeout_ms),
-            stream_idle_timeout: Duration::from_millis(stream_idle_timeout_ms),
-            http_referer,
-            app_title,
-            token_limit_field,
+            base_url: config.base_url.clone(),
+            connect_timeout: Duration::from_millis(config.connect_timeout_ms),
+            stream_idle_timeout: Duration::from_millis(config.stream_idle_timeout_ms),
+            http_referer: config.http_referer.clone(),
+            app_title: config.app_title.clone(),
+            token_limit_field: match config.kind {
+                ProviderKind::OpenAi => TokenLimitField::MaxCompletionTokens,
+                ProviderKind::OpenRouter => TokenLimitField::MaxTokens,
+            },
+            protocol: config.protocol,
         })
     }
 
@@ -72,8 +71,24 @@ impl OpenAiCompatibleClient {
         request: &ModelRequest,
         cancel: Option<&AtomicBool>,
     ) -> AppResult<ModelResponse> {
-        let body = ChatCompletionRequest::from_model_request(request, self.token_limit_field)?;
-        self.send_body(body, cancel)
+        let response = match self.protocol {
+            ProviderProtocol::ChatCompletions => self.post(
+                "chat/completions",
+                ChatCompletionRequest::from_model_request(request, self.token_limit_field)?,
+            )?,
+            ProviderProtocol::Responses => {
+                self.post("responses", ResponsesRequest::from_model_request(request)?)?
+            }
+        };
+        match cancel {
+            Some(cancel) => read_non_stream_response_with_cancel(response, cancel, self.protocol),
+            None => match self.protocol {
+                ProviderProtocol::ChatCompletions => {
+                    parse_non_stream_response(response.into_reader())
+                }
+                ProviderProtocol::Responses => parse_responses_response(response.into_reader()),
+            },
+        }
     }
 
     pub fn send_streaming(
@@ -90,34 +105,40 @@ impl OpenAiCompatibleClient {
         cancel: Option<&AtomicBool>,
         mut on_delta: impl FnMut(&str) -> AppResult<()>,
     ) -> AppResult<ModelResponse> {
-        let mut body = ChatCompletionRequest::from_model_request(request, self.token_limit_field)?;
-        body.stream = Some(true);
-        body.stream_options = Some(ChatStreamOptions {
-            include_usage: true,
-        });
-        let response = self.post_completion(body)?;
-        match cancel {
-            Some(cancel) => read_streaming_response_with_cancel(response, cancel, &mut on_delta),
-            None => {
-                parse_chat_completion_stream(BufReader::new(response.into_reader()), &mut on_delta)
+        let response = match self.protocol {
+            ProviderProtocol::ChatCompletions => {
+                let mut body =
+                    ChatCompletionRequest::from_model_request(request, self.token_limit_field)?;
+                body.stream = Some(true);
+                body.stream_options = Some(ChatStreamOptions {
+                    include_usage: true,
+                });
+                self.post("chat/completions", body)?
             }
-        }
-    }
-
-    fn send_body(
-        &self,
-        body: ChatCompletionRequest,
-        cancel: Option<&AtomicBool>,
-    ) -> AppResult<ModelResponse> {
-        let response = self.post_completion(body)?;
+            ProviderProtocol::Responses => {
+                let mut body = ResponsesRequest::from_model_request(request)?;
+                body.stream = Some(true);
+                self.post("responses", body)?
+            }
+        };
         match cancel {
-            Some(cancel) => read_non_stream_response_with_cancel(response, cancel),
-            None => parse_non_stream_response(response.into_reader()),
+            Some(cancel) => {
+                read_streaming_response_with_cancel(response, cancel, self.protocol, &mut on_delta)
+            }
+            None => match self.protocol {
+                ProviderProtocol::ChatCompletions => parse_chat_completion_stream(
+                    BufReader::new(response.into_reader()),
+                    &mut on_delta,
+                ),
+                ProviderProtocol::Responses => {
+                    parse_responses_stream(BufReader::new(response.into_reader()), &mut on_delta)
+                }
+            },
         }
     }
 
-    fn post_completion(&self, body: ChatCompletionRequest) -> AppResult<ureq::Response> {
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+    fn post(&self, path: &str, body: impl Serialize) -> AppResult<ureq::Response> {
+        let url = format!("{}/{path}", self.base_url.trim_end_matches('/'));
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(self.connect_timeout)
             .timeout_write(self.connect_timeout)
@@ -163,7 +184,7 @@ fn parse_retry_after_seconds(value: &str) -> Option<f64> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TokenLimitField {
+enum TokenLimitField {
     MaxTokens,
     MaxCompletionTokens,
 }
@@ -755,18 +776,23 @@ pub(super) mod tests {
         connect_timeout_ms: u64,
         stream_idle_timeout_ms: u64,
     ) -> OpenAiCompatibleClient {
-        temp_env::with_var("PLATO_PROVIDER_TIMEOUT_TEST_KEY", Some("test-key"), || {
-            OpenAiCompatibleClient::from_config(
-                "PLATO_PROVIDER_TIMEOUT_TEST_KEY",
-                base_url,
-                connect_timeout_ms,
-                stream_idle_timeout_ms,
-                None,
-                None,
-                TokenLimitField::MaxTokens,
-            )
-            .unwrap()
+        let mut config = test_provider_config(base_url, ProviderProtocol::ChatCompletions);
+        config.connect_timeout_ms = connect_timeout_ms;
+        config.stream_idle_timeout_ms = stream_idle_timeout_ms;
+        temp_env::with_var(&config.api_key_env, Some("test-key"), || {
+            OpenAiCompatibleClient::from_config(&config).unwrap()
         })
+    }
+
+    pub(in super::super) fn test_provider_config(
+        base_url: String,
+        protocol: ProviderProtocol,
+    ) -> ProviderConfig {
+        let mut config = crate::config::Config::default().provider;
+        config.api_key_env = "PLATO_PROVIDER_TEST_KEY".into();
+        config.base_url = base_url;
+        config.protocol = protocol;
+        config
     }
     fn spawn_loopback_provider(
         handler: impl FnOnce(TcpStream) + Send + 'static,

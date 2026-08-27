@@ -1,4 +1,5 @@
 use super::{
+    responses::{parse_responses_response, parse_responses_stream},
     stream::parse_chat_completion_stream,
     types::{
         ASSISTANT_TEXT_LIMIT_ERROR, ChatFinishReason, ChatToolCall, ChatUsage,
@@ -9,6 +10,7 @@ use super::{
 };
 use crate::{
     AppError, AppResult,
+    config::ProviderProtocol,
     model::{ModelBlock, ModelResponse},
 };
 use platonic_core::ModelName;
@@ -45,12 +47,18 @@ pub(super) fn parse_non_stream_response(reader: impl Read) -> AppResult<ModelRes
 pub(super) fn read_non_stream_response_with_cancel(
     response: ureq::Response,
     cancel: &AtomicBool,
+    protocol: ProviderProtocol,
 ) -> AppResult<ModelResponse> {
     let (result_sender, result_receiver) = mpsc::sync_channel(0);
     let worker = thread::Builder::new()
         .name("plato-provider-body".into())
         .spawn(move || {
-            let result = parse_non_stream_response(response.into_reader());
+            let result = match protocol {
+                ProviderProtocol::ChatCompletions => {
+                    parse_non_stream_response(response.into_reader())
+                }
+                ProviderProtocol::Responses => parse_responses_response(response.into_reader()),
+            };
             let _ = result_sender.send(result);
         })?;
 
@@ -60,20 +68,27 @@ pub(super) fn read_non_stream_response_with_cancel(
 pub(super) fn read_streaming_response_with_cancel(
     response: ureq::Response,
     cancel: &AtomicBool,
+    protocol: ProviderProtocol,
     on_delta: &mut impl FnMut(&str) -> AppResult<()>,
 ) -> AppResult<ModelResponse> {
     let (message_sender, message_receiver) = mpsc::sync_channel(0);
     let worker = thread::Builder::new()
         .name("plato-provider-stream".into())
         .spawn(move || {
-            let result = parse_chat_completion_stream(
-                BufReader::new(response.into_reader()),
-                &mut |delta| {
-                    message_sender
-                        .send(StreamingBodyMessage::Delta(delta.to_owned()))
-                        .map_err(|_| AppError::RunCanceled)
-                },
-            );
+            let mut send_delta = |delta: &str| {
+                message_sender
+                    .send(StreamingBodyMessage::Delta(delta.to_owned()))
+                    .map_err(|_| AppError::RunCanceled)
+            };
+            let result = match protocol {
+                ProviderProtocol::ChatCompletions => parse_chat_completion_stream(
+                    BufReader::new(response.into_reader()),
+                    &mut send_delta,
+                ),
+                ProviderProtocol::Responses => {
+                    parse_responses_stream(BufReader::new(response.into_reader()), &mut send_delta)
+                }
+            };
             let _ = message_sender.send(StreamingBodyMessage::Finished(result));
         })?;
 
@@ -190,7 +205,7 @@ fn record_response_read_cancel_observation() {
 #[cfg(not(test))]
 fn record_response_read_cancel_observation() {}
 
-fn read_non_stream_body(reader: impl Read) -> AppResult<Vec<u8>> {
+pub(super) fn read_non_stream_body(reader: impl Read) -> AppResult<Vec<u8>> {
     let mut body = Vec::new();
     reader
         .take((MAX_NON_STREAM_BODY_BYTES + 1) as u64)

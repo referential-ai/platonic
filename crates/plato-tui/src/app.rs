@@ -1682,6 +1682,7 @@ mod tests {
                 "requested_alias": "~openai/gpt-latest",
                 "served_model": "openai/gpt-5.5-2026-08-01",
                 "provider_kind": "open_router",
+                "provider_protocol": "responses",
                 "key_present": true
             },
             "daemon": {

@@ -16,7 +16,7 @@ use crate::{
     AppError, AppResult,
     config::{Config, ProviderConfig, ProviderKind},
     model::{ModelMessage, ModelRequest, ModelResponse, ModelStop},
-    provider::openai_compat::{OpenAiCompatibleClient, TokenLimitField},
+    provider::openai_compat::OpenAiCompatibleClient,
 };
 use platonic_core::ModelUsage;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -321,18 +321,7 @@ impl RunManifest {
 }
 
 fn client_from_provider(config: &ProviderConfig) -> AppResult<OpenAiCompatibleClient> {
-    OpenAiCompatibleClient::from_config(
-        &config.api_key_env,
-        config.base_url.clone(),
-        config.connect_timeout_ms,
-        config.stream_idle_timeout_ms,
-        config.http_referer.clone(),
-        config.app_title.clone(),
-        match config.kind {
-            ProviderKind::OpenAi => TokenLimitField::MaxCompletionTokens,
-            ProviderKind::OpenRouter => TokenLimitField::MaxTokens,
-        },
-    )
+    OpenAiCompatibleClient::from_config(config)
 }
 
 fn provider_kind_name(kind: &ProviderKind) -> &'static str {

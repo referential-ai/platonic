@@ -4017,6 +4017,7 @@ fn fake_response(
                 "requested_alias": "~openai/gpt-latest",
                 "served_model": null,
                 "provider_kind": "open_router",
+                "provider_protocol": "chat_completions",
                 "key_present": false
             },
             "daemon": {

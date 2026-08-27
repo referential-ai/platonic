@@ -199,15 +199,30 @@ impl StreamingAssembler {
 }
 
 pub(super) fn parse_chat_completion_stream(
-    mut reader: impl BufRead,
+    reader: impl BufRead,
     on_delta: &mut impl FnMut(&str) -> AppResult<()>,
 ) -> AppResult<ModelResponse> {
     let mut assembler = StreamingAssembler::default();
+    let saw_done = parse_sse_stream(reader, |data| {
+        process_stream_data(data, &mut assembler, on_delta)
+    })?;
+    if !saw_done {
+        return Err(AppError::Provider(
+            "provider stream ended before [DONE]".into(),
+        ));
+    }
+    assembler.into_model_response()
+}
+
+pub(super) fn parse_sse_stream(
+    mut reader: impl BufRead,
+    mut on_event: impl FnMut(&str) -> AppResult<bool>,
+) -> AppResult<bool> {
     let mut event_data = String::new();
     let mut line = Vec::new();
     let mut decoded_bytes = 0;
     let mut event_bytes = 0;
-    let mut saw_done = false;
+    let mut terminal = false;
 
     loop {
         let remaining =
@@ -231,8 +246,8 @@ pub(super) fn parse_chat_completion_stream(
             line.pop();
             if append_stream_line(&line, &mut event_data)? {
                 if !event_data.is_empty() {
-                    if process_stream_data(&event_data, &mut assembler, on_delta)? {
-                        saw_done = true;
+                    if on_event(&event_data)? {
+                        terminal = true;
                         break;
                     }
                     event_data.clear();
@@ -243,20 +258,14 @@ pub(super) fn parse_chat_completion_stream(
         }
     }
 
-    if !line.is_empty() && !saw_done && append_stream_line(&line, &mut event_data)? {
-        saw_done =
-            !event_data.is_empty() && process_stream_data(&event_data, &mut assembler, on_delta)?;
+    if !line.is_empty() && !terminal && append_stream_line(&line, &mut event_data)? {
+        terminal = !event_data.is_empty() && on_event(&event_data)?;
         event_data.clear();
     }
-    if !event_data.is_empty() && !saw_done {
-        saw_done = process_stream_data(&event_data, &mut assembler, on_delta)?;
+    if !event_data.is_empty() && !terminal {
+        terminal = on_event(&event_data)?;
     }
-    if !saw_done {
-        return Err(AppError::Provider(
-            "provider stream ended before [DONE]".into(),
-        ));
-    }
-    assembler.into_model_response()
+    Ok(terminal)
 }
 
 fn append_stream_line(line: &[u8], event_data: &mut String) -> AppResult<bool> {
