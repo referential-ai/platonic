@@ -1707,7 +1707,7 @@ fn bare_plato_restores_pending_approval_after_lag_and_sends_exact_deny() {
     );
     assert!(decided.contains("Trace  approval | running"));
     assert!(!decided.contains("Trace  warning"));
-    assert!(!decided.contains(PENDING_RUN_ID));
+    assert!(decided.contains(&format!("run ID {PENDING_RUN_ID}")));
     assert!(!decided.contains(PENDING_CALL_ID));
 
     shell.write(b"v");
@@ -1991,7 +1991,8 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
     );
     let before_termios = shell.wait_for_marker("PRE");
     fake.wait_for_request_count("thread.events", 1);
-    let default = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, "Trace");
+    let active_run_label = format!("run ID {CONVERSATION_RUN_ID}");
+    let default = shell.wait_for_screen_text(INITIAL_ROWS, INITIAL_COLS, &active_run_label);
     assert!(default.contains("Plato"));
     assert!(default.contains("**Conversation-first PTY question**"));
     assert!(default.contains("Conversation-first PTY answer"));
@@ -2007,7 +2008,7 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
             .count(),
         1
     );
-    assert!(!default.contains(CONVERSATION_RUN_ID));
+    assert!(default.contains(&active_run_label));
     assert!(!default.contains("#7"));
     assert!(!default.contains(SCROLLBACK_SENTINEL));
     let inline_output = shell.output_since(0);
@@ -2031,6 +2032,11 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
         let rows = resized.lines().collect::<Vec<_>>();
         assert!(rows[usize::from(INITIAL_ROWS - 2)].starts_with("> "));
         assert!(rows[usize::from(INITIAL_ROWS - 1)].contains("? shortcuts"));
+        assert!(resized.contains("run ID"), "width {width}: {resized}");
+        assert!(
+            resized.contains(CONVERSATION_RUN_ID),
+            "width {width}: {resized}"
+        );
         let answer_copies = shell
             .output_since(0)
             .windows(b"Conversation-first PTY answer".len())
@@ -2041,7 +2047,7 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
 
     let overlay_at = shell.output_len();
     shell.write(b"v");
-    let audit = shell.wait_for_current_screen_text(CONVERSATION_RUN_ID);
+    let audit = shell.wait_for_current_screen_text("#7 model_stage");
     let overlay_output = shell.output_since(overlay_at);
     assert!(
         overlay_output
@@ -2079,14 +2085,14 @@ fn bare_plato_round_trips_conversation_and_audit_without_refetch() {
             .windows(LEAVE_ALTERNATE_SCREEN.len())
             .any(|bytes| bytes == LEAVE_ALTERNATE_SCREEN)
     );
-    assert!(!conversation.contains(CONVERSATION_RUN_ID));
+    assert!(conversation.contains(&active_run_label));
     assert!(!conversation.contains("#7"));
     assert!(conversation.contains("? shortcuts · Tab queue 0"));
     assert_inline_scrollback_sequence(&shell.output_since(0));
 
     let exit_overlay_at = shell.output_len();
     shell.write(b"v");
-    shell.wait_for_current_screen_text(CONVERSATION_RUN_ID);
+    shell.wait_for_current_screen_text("#7 model_stage");
     shell.write(b"q");
     let after_termios = shell.wait_for_marker("POST");
     let exit_output = shell.output_since(exit_overlay_at);

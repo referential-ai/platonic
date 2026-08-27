@@ -1073,7 +1073,7 @@ fn append_queue_preview(lines: &mut Vec<Line<'static>>, state: &TuiState) {
 }
 
 fn append_working_row(lines: &mut Vec<Line<'static>>, state: &TuiState) {
-    let Some((task, elapsed, interruptible)) = working_task(state) else {
+    let Some((task, elapsed, run_id, interruptible)) = working_task(state) else {
         return;
     };
     let marker = match state.motion_mode {
@@ -1091,19 +1091,31 @@ fn append_working_row(lines: &mut Vec<Line<'static>>, state: &TuiState) {
     if interruptible {
         spans.push(Span::styled("  Esc to interrupt", chrome_style()));
     }
-    append_spaced_rows(lines, std::iter::once(Line::from(spans)));
+    let mut rows = vec![Line::from(spans)];
+    if let Some(run_id) = run_id {
+        rows.push(Line::from(Span::styled(
+            format!("run ID {run_id}"),
+            chrome_style(),
+        )));
+    }
+    append_spaced_rows(lines, rows);
 }
 
-fn working_task(state: &TuiState) -> Option<(&'static str, u64, bool)> {
+fn working_task(state: &TuiState) -> Option<(&'static str, u64, Option<&str>, bool)> {
     if let Some(elapsed) = issue_prep_activity(state) {
-        return Some(("Preparing", elapsed, false));
+        return Some(("Preparing", elapsed, None, false));
     }
     state.active_run.as_ref().and_then(|run| {
         matches!(
             run.status,
             RunStateName::Running | RunStateName::CancelRequested
         )
-        .then_some(("Working", state.active_run_elapsed_secs.unwrap_or(0), true))
+        .then_some((
+            "Working",
+            state.active_run_elapsed_secs.unwrap_or(0),
+            Some(run.run_id.as_str()),
+            true,
+        ))
     })
 }
 
@@ -2766,10 +2778,55 @@ mod tests {
 
         assert!(output.contains("Working"));
         assert!(output.contains("Esc interrupt"));
-        assert!(!output.contains("run_1"));
+        assert!(output.contains("run ID run_1"));
         assert!(output.contains("assistant response"));
         assert!(output.contains("> summarize this file"));
         assert!(!output.contains("summarize|"));
+    }
+
+    #[test]
+    fn working_status_tracks_active_run_id_and_clears_at_terminal_status() {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+                daemon_scope: None,
+            },
+            Vec::new(),
+            TranscriptState::None,
+        );
+        let first = "run_pty_conversation_first_identifier";
+        let second = "run_pty_conversation_full_identifier";
+
+        state.active_run = Some(ActiveRunView::new(first.into(), RunStateName::Running));
+        let active = render_snapshot(&state, 96, 12).unwrap();
+        assert!(active.contains(&format!("run ID {first}")));
+
+        state.active_run = Some(ActiveRunView::new(
+            second.into(),
+            RunStateName::CancelRequested,
+        ));
+        let changed = render_snapshot(&state, 40, 12).unwrap();
+        let changed_lines = changed.lines().map(str::trim).collect::<Vec<_>>();
+        let label_row = changed_lines
+            .iter()
+            .position(|line| *line == "run ID")
+            .unwrap();
+        assert_eq!(changed_lines[label_row + 1], second);
+        assert!(!changed.contains(first));
+        assert!(changed.contains("> "));
+        assert!(changed.contains("? shortcuts"));
+
+        state.active_run = Some(ActiveRunView::new(second.into(), RunStateName::Finished));
+        let terminal = render_snapshot(&state, 40, 12).unwrap();
+        assert!(!terminal.contains("run ID"));
+        assert!(!terminal.contains(second));
+        assert!(terminal.contains("> "));
+        assert!(terminal.contains("? shortcuts"));
     }
 
     #[test]
@@ -2884,11 +2941,13 @@ mod tests {
             state.working_elapsed_millis = index as u64 * WORKING_FRAME_MILLIS;
             let output = render_to_text(&state);
             assert!(output.contains(&format!("{frame} Working  1m 00s  Esc to interrupt")));
+            assert!(output.contains("run ID run_working"));
         }
 
         state.set_reduced_motion(true);
         let output = render_to_text(&state);
         assert!(output.contains("• Working  1m 00s  Esc to interrupt"));
+        assert!(output.contains("run ID run_working"));
         assert!(!WORKING_FRAMES.iter().any(|frame| output.contains(frame)));
     }
 
@@ -3178,13 +3237,13 @@ mod tests {
         let mut state = approval_trace_fixture();
         assert_eq!(
             focused_snapshot(&state, 96, 24),
-            "You\n  Review the proposed edit.\n\nTrace  approval | running\n\n⣾ Working  0s  Esc to interrupt\n\n>   Try \"read README.md and summarize it\"\n? shortcuts · Tab queue 0 · Esc interrupt"
+            "You\n  Review the proposed edit.\n\nTrace  approval | running\n\n⣾ Working  0s  Esc to interrupt\nrun ID run_approval\n\n>   Try \"read README.md and summarize it\"\n? shortcuts · Tab queue 0 · Esc interrupt"
         );
 
         state.toggle_display_mode();
         assert_eq!(
             focused_snapshot(&state, 96, 24),
-            "status    run run_approval\n\nuser      Review the proposed edit.\n\ntranscript\nstatus    running run_approval\nwarning   #4 approval pending file.write (workspace_write)\nstatus    #5 approval granted call_approval\n\n⣾ Working  0s  Esc to interrupt\n\n>   Try \"read README.md and summarize it\"\n? shortcuts · Tab queue 0 · Esc interrupt"
+            "status    run run_approval\n\nuser      Review the proposed edit.\n\ntranscript\nstatus    running run_approval\nwarning   #4 approval pending file.write (workspace_write)\nstatus    #5 approval granted call_approval\n\n⣾ Working  0s  Esc to interrupt\nrun ID run_approval\n\n>   Try \"read README.md and summarize it\"\n? shortcuts · Tab queue 0 · Esc interrupt"
         );
     }
 
