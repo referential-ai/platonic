@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn platonic_memory_budget_can_drop_oldest_turn_without_trimming_memory() {
         let mut config = Config::default();
-        let tools = tool_specs(&config.tools.enabled);
+        let tools = tool_specs(&config.tools.enabled, false);
         let turns = vec![SessionTurn {
             question: "old question ".repeat(40),
             final_answer: "old answer ".repeat(40),

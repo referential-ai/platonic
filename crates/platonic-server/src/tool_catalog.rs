@@ -229,11 +229,11 @@ pub(crate) fn is_logical_read_tool(name: &str) -> bool {
     )
 }
 
-pub fn tool_specs(enabled_tools: &[String]) -> Vec<ToolSpec> {
+pub fn tool_specs(enabled_tools: &[String], has_credential_sources: bool) -> Vec<ToolSpec> {
     enabled_tools
         .iter()
         .filter_map(|name| lookup_internal(name))
-        .map(ToolSpec::from_definition)
+        .map(|definition| ToolSpec::from_definition(definition, has_credential_sources))
         .collect()
 }
 
@@ -244,18 +244,18 @@ fn lookup_internal(name: &str) -> Option<&'static ToolDefinition> {
 }
 
 impl ToolSpec {
-    fn from_definition(definition: &ToolDefinition) -> Self {
+    fn from_definition(definition: &ToolDefinition, has_credential_sources: bool) -> Self {
         Self {
             name: definition.provider_name.into(),
             description: definition.description.into(),
-            input_schema: definition.input_schema.to_json(),
+            input_schema: definition.input_schema.to_json(has_credential_sources),
         }
     }
 }
 
 impl ToolInputSchema {
-    fn to_json(self) -> Value {
-        match self {
+    fn to_json(self, has_credential_sources: bool) -> Value {
+        let mut schema = match self {
             Self::Read => json!({
                 "type": "object",
                 "properties": {
@@ -512,7 +512,14 @@ impl ToolInputSchema {
                 "required": ["window_ref"],
                 "additionalProperties": false
             }),
+        };
+        if self == Self::ShellExec && !has_credential_sources {
+            schema["properties"]
+                .as_object_mut()
+                .expect("tool schema properties are an object")
+                .remove("credential");
         }
+        schema
     }
 }
 
@@ -584,17 +591,20 @@ mod tests {
 
     #[test]
     fn emits_provider_tool_specs_from_catalog() {
-        let specs = tool_specs(&[
-            FILE_READ.into(),
-            FILE_LIST.into(),
-            FILE_WRITE.into(),
-            FILE_EDIT.into(),
-            SHELL_EXEC.into(),
-            WEB_FETCH.into(),
-            THREAD_SPAWN.into(),
-            COMPUTER_WINDOWS.into(),
-            COMPUTER_OBSERVE.into(),
-        ]);
+        let specs = tool_specs(
+            &[
+                FILE_READ.into(),
+                FILE_LIST.into(),
+                FILE_WRITE.into(),
+                FILE_EDIT.into(),
+                SHELL_EXEC.into(),
+                WEB_FETCH.into(),
+                THREAD_SPAWN.into(),
+                COMPUTER_WINDOWS.into(),
+                COMPUTER_OBSERVE.into(),
+            ],
+            true,
+        );
 
         assert_eq!(specs.len(), 9);
         assert_eq!(specs[0].name, PROVIDER_FILE_READ);
@@ -736,5 +746,26 @@ mod tests {
         assert!(!default_enabled_tools().contains(&THREAD_ANSWER.to_owned()));
         assert!(!default_enabled_tools().contains(&COMPUTER_WINDOWS.to_owned()));
         assert!(!default_enabled_tools().contains(&COMPUTER_OBSERVE.to_owned()));
+    }
+
+    #[test]
+    fn shell_exec_omits_credential_when_none_are_available() {
+        let schema = &tool_specs(&[SHELL_EXEC.into()], false)[0].input_schema;
+
+        assert_eq!(
+            schema["properties"],
+            json!({
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to run from the workspace root."
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": "Optional timeout in seconds. Defaults to 120 and is capped at 600.",
+                    "minimum": 1,
+                    "maximum": 600
+                }
+            })
+        );
     }
 }

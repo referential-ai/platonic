@@ -448,6 +448,7 @@ pub(super) fn start_run(
                 authority.identity.clone(),
                 authority.toolset.as_deref(),
                 revision.as_ref(),
+                !runtime.credential_sources.is_empty(),
             )?;
             if let (Some(context), Some(identity)) =
                 (thread_context.as_ref(), authority.identity.as_ref())
