@@ -51,6 +51,40 @@ document the released behavior. They use one OpenRouter route and exact
 what-you-see checkpoints. The tagged quickstart above owns bundle installation;
 the journey owns first-use verification.
 
+## Develop: local inference comparison
+
+The develop command bundle can run one host-scoped, loopback-only reverse proxy
+to the fixed `https://openrouter.ai` upstream:
+
+```bash
+platonic inference-proxy up
+platonic inference-proxy status
+platonic inference-proxy down
+```
+
+`up` prints JSON containing the selected `http://127.0.0.1:PORT/api/v1` base
+URL and is idempotent. Use that exact base URL as a Codex custom provider
+`base_url`, as Hermes `OPENROUTER_BASE_URL`, or as Platonic's trusted
+`provider.base_url`. The clients continue to supply `OPENROUTER_API_KEY`; the
+proxy has no configured or persisted provider key. `down` refuses while a flow
+is active.
+
+Capture is off by default. To compare application bodies, select a new or empty
+directory and reconstruct its bounded request semantics afterward:
+
+```bash
+platonic inference-proxy up --capture-dir /private/inference-capture
+platonic inference-proxy compare /private/inference-capture
+platonic inference-proxy down
+```
+
+The capture directory is mode `0700` and its append-only JSONL file is mode
+`0600`. Credential-bearing headers are never captured, but request and response
+bodies can contain sensitive prompts, tool schemas, and model output. `down`
+leaves the capture intact; remove only the directory you selected when its
+evidence is no longer needed. The credentialed disposable three-client proof is
+`OPENROUTER_API_KEY=... ./scripts/smoke-inference-proxy.sh`.
+
 ## 5. Local voice activation and device proof
 
 TUI voice is opt-in through a dedicated client file that the server never reads.

@@ -86,6 +86,11 @@ enum Command {
         #[command(subcommand)]
         command: GatewayCommand,
     },
+    /// Run and inspect the fixed local OpenRouter reverse proxy.
+    InferenceProxy {
+        #[command(subcommand)]
+        command: InferenceProxyCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -225,6 +230,33 @@ enum GatewayCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum InferenceProxyCommand {
+    /// Start the host-scoped loopback proxy.
+    Up {
+        #[arg(long, value_name = "ADDRESS", default_value = "127.0.0.1:0")]
+        bind: std::net::SocketAddr,
+        #[arg(long, value_name = "DIR")]
+        capture_dir: Option<PathBuf>,
+    },
+    /// Read the host-scoped proxy status.
+    Status,
+    /// Stop the proxy when it has no active flows.
+    Down,
+    /// Compare the bounded semantics in one capture directory.
+    Compare {
+        #[arg(value_name = "DIR")]
+        dir: PathBuf,
+    },
+    #[command(name = "__serve", hide = true)]
+    Serve {
+        #[arg(long, value_name = "ADDRESS")]
+        bind: std::net::SocketAddr,
+        #[arg(long, value_name = "DIR")]
+        capture_dir: Option<PathBuf>,
+    },
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error}");
@@ -280,8 +312,38 @@ fn run() -> AppResult<()> {
                 generate_token,
             } => http::run(socket, config, bind, allow_non_loopback, generate_token),
         },
+        Some(Command::InferenceProxy { command }) => run_inference_proxy(command),
         None => Err(AppError::Config("a command is required".into())),
     }
+}
+
+fn run_inference_proxy(command: InferenceProxyCommand) -> AppResult<()> {
+    use platonic_server::inference_proxy;
+
+    match command {
+        InferenceProxyCommand::Up { bind, capture_dir } => {
+            println!(
+                "{}",
+                serde_json::to_string(&inference_proxy::up(bind, capture_dir)?)?
+            );
+        }
+        InferenceProxyCommand::Status => {
+            println!("{}", serde_json::to_string(&inference_proxy::status()?)?);
+        }
+        InferenceProxyCommand::Down => {
+            println!("{}", serde_json::to_string(&inference_proxy::down()?)?);
+        }
+        InferenceProxyCommand::Compare { dir } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&inference_proxy::compare(&dir)?)?
+            );
+        }
+        InferenceProxyCommand::Serve { bind, capture_dir } => {
+            return inference_proxy::serve(bind, capture_dir);
+        }
+    }
+    Ok(())
 }
 
 fn serve() -> AppResult<()> {

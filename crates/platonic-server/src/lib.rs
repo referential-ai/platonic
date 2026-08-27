@@ -13,6 +13,7 @@ mod confinement;
 pub mod daemon;
 pub mod error;
 pub mod gateway;
+pub mod inference_proxy;
 pub mod ledger;
 pub mod model;
 pub mod paths;
