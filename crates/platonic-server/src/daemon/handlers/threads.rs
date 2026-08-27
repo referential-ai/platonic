@@ -3045,6 +3045,11 @@ pub(in crate::daemon::handlers) mod tests {
     #[test]
     fn profile_home_becomes_durable_without_becoming_live_or_stoppable() {
         let (_root, runtime) = thread_test_runtime();
+        let expected_toolset = Config::load(&runtime.paths.workspace_root, None)
+            .unwrap()
+            .tools
+            .enabled;
+        let expected_network = toolset_has_effect(&expected_toolset, EffectClass::Network);
         let (spawn_id, thread_id) = pending_spawn(
             start_thread(
                 &runtime,
@@ -3098,18 +3103,8 @@ pub(in crate::daemon::handlers) mod tests {
         assert_eq!(status.authority.cwd, authority.worktrees[0].path);
         assert_eq!(authority.granted_paths.len(), 1);
         assert!(authority.granted_paths[0].writable);
-        assert_eq!(
-            authority.toolset,
-            [
-                "file.read",
-                "file.list",
-                "file.write",
-                "file.edit",
-                "shell.exec",
-                "web.fetch",
-            ]
-        );
-        assert!(authority.network);
+        assert_eq!(authority.toolset, expected_toolset);
+        assert_eq!(authority.network, expected_network);
         assert_eq!(status.authority.model, "gpt-5.6-sol");
         assert_eq!(
             status.authority.reasoning_effort,
