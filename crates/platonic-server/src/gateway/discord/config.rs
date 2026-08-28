@@ -90,6 +90,7 @@ fn gateway_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{DiscordGatewayRoute, DiscordGatewayRouteTrigger};
     #[cfg(unix)]
     use crate::{
         daemon::server::HostDaemonServer,
@@ -106,7 +107,13 @@ mod tests {
     fn discord_config() -> DiscordGatewayConfig {
         DiscordGatewayConfig {
             api_key_env: "DISCORD_BOT_TOKEN".into(),
-            channel_threads: HashMap::from([(200, "thread_news".into())]),
+            channel_threads: HashMap::from([(
+                200,
+                DiscordGatewayRoute {
+                    thread_id: "thread_news".into(),
+                    trigger: DiscordGatewayRouteTrigger::AllMessages,
+                },
+            )]),
         }
     }
 
@@ -361,7 +368,11 @@ name = "jerome"
                     runtime.principals[&42].remote_ceiling,
                     platonic_protocol::ThreadApprovalPolicy::Prompt
                 );
-                assert_eq!(runtime.channel_thread_ids[&200], "thread_news");
+                assert_eq!(runtime.channel_routes[&200].thread_id, "thread_news");
+                assert_eq!(
+                    runtime.channel_routes[&200].trigger,
+                    DiscordGatewayRouteTrigger::AllMessages
+                );
                 assert_eq!(
                     runtime.daemon.socket_path,
                     workspace.path().join("daemon.sock")

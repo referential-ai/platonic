@@ -83,7 +83,19 @@ pub struct GatewayConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscordGatewayConfig {
     pub api_key_env: String,
-    pub channel_threads: HashMap<u64, String>,
+    pub channel_threads: HashMap<u64, DiscordGatewayRoute>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscordGatewayRoute {
+    pub thread_id: String,
+    pub trigger: DiscordGatewayRouteTrigger,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiscordGatewayRouteTrigger {
+    AllMessages,
+    Mention,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,7 +207,27 @@ struct RawGatewayConfig {
 struct RawDiscordGatewayConfig {
     api_key_env: String,
     #[serde(default)]
-    channel_threads: HashMap<String, String>,
+    channel_threads: HashMap<String, RawDiscordGatewayRoute>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawDiscordGatewayRoute {
+    Legacy(String),
+    Structured(RawDiscordMentionRoute),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDiscordMentionRoute {
+    thread_id: String,
+    trigger: RawDiscordRouteTrigger,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawDiscordRouteTrigger {
+    Mention,
 }
 
 #[derive(Default, Debug, Deserialize)]
@@ -489,7 +521,7 @@ fn discord_gateway_from_raw(raw: RawDiscordGatewayConfig) -> AppResult<DiscordGa
         ));
     }
     let mut channel_threads = HashMap::new();
-    for (channel_id, thread_id) in raw.channel_threads {
+    for (channel_id, route) in raw.channel_threads {
         if !channel_id.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(AppError::Config(
                 "gateway.discord.channel_threads keys must be positive numeric Discord channel IDs"
@@ -508,12 +540,24 @@ fn discord_gateway_from_raw(raw: RawDiscordGatewayConfig) -> AppResult<DiscordGa
                     .into(),
             ));
         }
-        ActorId::new(thread_id.clone()).map_err(|error| {
+        let route = match route {
+            RawDiscordGatewayRoute::Legacy(thread_id) => DiscordGatewayRoute {
+                thread_id,
+                trigger: DiscordGatewayRouteTrigger::AllMessages,
+            },
+            RawDiscordGatewayRoute::Structured(route) => DiscordGatewayRoute {
+                thread_id: route.thread_id,
+                trigger: match route.trigger {
+                    RawDiscordRouteTrigger::Mention => DiscordGatewayRouteTrigger::Mention,
+                },
+            },
+        };
+        ActorId::new(route.thread_id.clone()).map_err(|error| {
             AppError::Config(format!(
                 "gateway.discord.channel_threads contains an invalid thread id: {error}"
             ))
         })?;
-        if channel_threads.insert(channel_id, thread_id).is_some() {
+        if channel_threads.insert(channel_id, route).is_some() {
             return Err(AppError::Config(
                 "gateway.discord.channel_threads contains a duplicate numeric Discord channel ID"
                     .into(),
@@ -1050,8 +1094,78 @@ api_key_env = "DISCORD_BOT_TOKEN"
         assert_eq!(discord.api_key_env, "DISCORD_BOT_TOKEN");
         assert_eq!(
             discord.channel_threads,
-            HashMap::from([(111111111111111111, "thread_news".into())])
+            HashMap::from([(
+                111111111111111111,
+                DiscordGatewayRoute {
+                    thread_id: "thread_news".into(),
+                    trigger: DiscordGatewayRouteTrigger::AllMessages,
+                }
+            )])
         );
+    }
+
+    #[test]
+    fn parses_structured_mention_discord_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gateway.toml");
+        std::fs::write(
+            &path,
+            r#"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+
+[gateway.discord.channel_threads]
+"201" = { thread_id = "thread_fillmore", trigger = "mention" }
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_resolved(Some(&ResolvedConfigPath::Authorized(path))).unwrap();
+
+        assert_eq!(
+            config.gateway.unwrap().discord.unwrap().channel_threads,
+            HashMap::from([(
+                201,
+                DiscordGatewayRoute {
+                    thread_id: "thread_fillmore".into(),
+                    trigger: DiscordGatewayRouteTrigger::Mention,
+                }
+            )])
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_structured_discord_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, route) in [
+            (
+                "unknown-trigger",
+                r#"{ thread_id = "thread_fillmore", trigger = "prefix" }"#,
+            ),
+            (
+                "unknown-field",
+                r#"{ thread_id = "thread_fillmore", trigger = "mention", prefix = "@" }"#,
+            ),
+            ("empty-thread", r#"{ thread_id = "", trigger = "mention" }"#),
+            (
+                "invalid-thread",
+                r#"{ thread_id = "   ", trigger = "mention" }"#,
+            ),
+        ] {
+            let path = dir.path().join(format!("{name}.toml"));
+            std::fs::write(
+                &path,
+                format!(
+                    "[gateway.discord]\napi_key_env = \"DISCORD_BOT_TOKEN\"\n\n[gateway.discord.channel_threads]\n\"201\" = {route}\n"
+                ),
+            )
+            .unwrap();
+
+            assert!(
+                Config::load_resolved(Some(&ResolvedConfigPath::Authorized(path))).is_err(),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -1671,7 +1785,13 @@ api_key_env = "DISCORD_BOT_TOKEN"
             let discord = config.gateway.unwrap().discord.unwrap();
             assert_eq!(
                 discord.channel_threads,
-                HashMap::from([(200, "thread_news".into())])
+                HashMap::from([(
+                    200,
+                    DiscordGatewayRoute {
+                        thread_id: "thread_news".into(),
+                        trigger: DiscordGatewayRouteTrigger::AllMessages,
+                    }
+                )])
             );
         }
     }

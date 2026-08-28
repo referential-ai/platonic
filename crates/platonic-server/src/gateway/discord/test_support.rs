@@ -12,7 +12,7 @@ use super::{
     websocket::{DISCORD_INTENTS, DiscordGatewayReceiver, DiscordMessage},
 };
 use super::{DiscordGatewayTimings, GatewayResult};
-use crate::config::DiscordGatewayPrincipal;
+use crate::config::{DiscordGatewayPrincipal, DiscordGatewayRoute, DiscordGatewayRouteTrigger};
 use platonic_client::client::DaemonConnectionConfig;
 #[cfg(unix)]
 use platonic_protocol::Envelope;
@@ -776,6 +776,7 @@ pub(super) fn test_platform_messages(
     }
     DiscordPlatform {
         rest: DiscordRestClient::new(api_base, "test-token".into()),
+        bot_id: 100,
         messages,
         stop: Arc::new(AtomicBool::new(false)),
         worker: None,
@@ -792,7 +793,13 @@ pub(super) fn test_gateway(
     let mut gateway = DiscordGateway {
         platform,
         daemon,
-        channel_thread_ids: std::collections::HashMap::from([(200, "thread_news".into())]),
+        channel_routes: std::collections::HashMap::from([(
+            200,
+            DiscordGatewayRoute {
+                thread_id: "thread_news".into(),
+                trigger: DiscordGatewayRouteTrigger::AllMessages,
+            },
+        )]),
         principals: std::collections::HashMap::from([(
             42,
             DiscordGatewayPrincipal {
