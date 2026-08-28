@@ -103,6 +103,20 @@ either config. `channel_threads` must have at least one entry. A DM must be
 added by its numeric DM channel ID too. Channels select thread context only;
 they never grant identity authority.
 
+The string form routes every nonempty admitted message, preserving the original
+single-bot channel behavior. For a channel shared with another bot, require an
+exact mention of this gateway's bot instead:
+
+```toml
+[gateway.discord.channel_threads]
+"222222222222222222" = { thread_id = "thread_shared", trigger = "mention" }
+```
+
+A mention route accepts only this bot's exact `<@BOT_ID>` or `<@!BOT_ID>` token,
+removes that token, and routes the remaining text. Messages without that exact
+mention, including mentions of other bots, and messages empty after removal are
+silently ignored. The structured form accepts only `trigger = "mention"`.
+
 ```bash
 GATEWAY_CONFIG="$HOME/.config/plato/gateway.toml"
 touch "$GATEWAY_CONFIG"
@@ -185,6 +199,9 @@ From the allowlisted human account, send a simple text-only prompt in
 ```text
 Reply with one short greeting.
 ```
+
+For a structured mention route, prefix the same prompt with an actual Discord
+mention of the gateway bot. Do not type a display name in place of the mention.
 
 Wait for the bot's final reply before continuing. Messages from identities not
 listed in the home principal map are silently denied before channel lookup,

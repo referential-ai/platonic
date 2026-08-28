@@ -37,7 +37,8 @@ Architecture, protocol, and ledger internals are in the
 ## Reference routes
 
 - [Configuration](https://docs.referential.ai/reference/configuration/)
-- [Discord gateway](https://docs.referential.ai/user/operations/discord/)
+- [Discord gateway](https://docs.referential.ai/user/operations/discord/),
+  including mention-gated shared-channel routes
 - [Workspace ledgers](https://docs.referential.ai/developer/durability-and-replay/)
 - [Server request lifecycle](https://docs.referential.ai/developer/runtime-boundaries/)
 
