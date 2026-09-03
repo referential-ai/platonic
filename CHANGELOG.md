@@ -10,6 +10,8 @@
 - Preserve TUI drafts across a daemon restart.
 - Show the active run ID in the TUI working status.
 - Correct the public 0.2.2 install and proof journey.
+- Upgrade `rtrb` to 0.3.5 for RUSTSEC-2026-0274, a double free in
+  `ReadChunk::commit` when an element's `Drop` panics.
 
 ## Platonic 0.2.2 - 2026-08-16
 
