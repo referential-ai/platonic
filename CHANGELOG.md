@@ -1,5 +1,16 @@
 # Changelog
 
+## Platonic Unreleased
+
+- Add a selectable Responses provider protocol beside Chat Completions.
+- Add a local inference comparison proxy that Platonic, Codex, and Hermes
+  clients can use as an OpenAI-compatible base URL.
+- Add one-call shell credential grants.
+- Hide shell credentials that are unavailable on the host from the model.
+- Preserve TUI drafts across a daemon restart.
+- Show the active run ID in the TUI working status.
+- Correct the public 0.2.2 install and proof journey.
+
 ## Platonic 0.2.2 - 2026-08-16
 
 - Keep restart-synthesized failure returns from replacing a recovered child's
