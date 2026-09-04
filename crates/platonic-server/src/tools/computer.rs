@@ -2076,11 +2076,18 @@ if MODE == "shutdown_refusal":
             let source = fs::read_to_string(write_driver(directory.path(), mode, &log)).unwrap();
             fs::write(&executable, source).unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-            assert_eq!(
-                inspect_driver(&executable, None).unwrap_err(),
-                ComputerError::DriverVersionMismatch,
-                "{mode}"
-            );
+            // A sibling test thread that spawns a process forks before it execs,
+            // and its child holds a copy of the descriptor `fs::write` just used
+            // here until it reaches `execve`. Linux refuses to exec a file any
+            // process holds open for writing, so the probe can report ETXTBSY as
+            // DriverStartFailed until that sibling child execs.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut probed = inspect_driver(&executable, None).unwrap_err();
+            while probed == ComputerError::DriverStartFailed && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+                probed = inspect_driver(&executable, None).unwrap_err();
+            }
+            assert_eq!(probed, ComputerError::DriverVersionMismatch, "{mode}");
         }
     }
 
