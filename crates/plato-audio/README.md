@@ -107,7 +107,7 @@ session.
 ## Native runtime
 
 The crate pins `ort 2.0.0-rc.13` (ONNX Runtime 1.28, CUDA 13 build) and
-`cpal 0.18.1`, `rtrb 0.3.4`, and `rubato 4.0.0`. Root creates one explicit
+`cpal 0.18.1`, `rtrb 0.3.5`, and `rubato 4.0.0`. Root creates one explicit
 `OrtRuntime` owner and passes clones to Kokoro and Silero. Each model constructs
 one warm session through that owner; no frame or utterance constructs a runtime
 or session. On Linux x86_64 each ONNX model attempts CUDA device zero with
